@@ -16,7 +16,7 @@ pub mod transcribe;
 
 use crate::ast::{MacroCall, MacroRulesDef};
 use crate::def::DefId;
-use crate::diag::{CtxtId, Diag, Span, register_expansion};
+use crate::diag::{CtxtId, Diag, HygieneMark, Span, register_expansion, register_hygiene};
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree, build_trees};
 use std::hash::{Hash, Hasher};
@@ -452,6 +452,9 @@ pub struct MacroDef {
     /// it at store time; the worklist reads it from the def record.
     #[allow(dead_code)]
     pub exported: bool,
+    /// The def was written inside a body (not at item level), so its
+    /// tokens may read locals bound before the definition (ARCH 6.3).
+    pub local_def: bool,
     pub def_span: Span,
     /// Hash of the definition's raw tokens (ARCH 6.5 cache key input).
     pub fingerprint: u64,
@@ -499,6 +502,7 @@ pub fn compile_macro(
         name_span,
         arms,
         exported,
+        local_def: false,
         def_span,
         fingerprint: hash_tts(body, strings),
         name_text: interner.get(name).to_string(),
@@ -943,9 +947,12 @@ impl<'a> Expander<'a> {
                             Tt::Delim(_, inner, _) => inner.clone(),
                             _ => unreachable!(),
                         };
-                        let compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
+                        let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
+                        compiled.local_def = !at_module_list;
                         let idx = st.register(Rc::new(compiled), exported, false);
-                        st.module_defs.insert((module.clone(), def.name), idx);
+                        if at_module_list {
+                            st.module_defs.insert((module.clone(), def.name), idx);
+                        }
                     }
                     exported = false;
                     cfg_off = false;
@@ -1061,9 +1068,13 @@ impl<'a> Expander<'a> {
 
     /// Resolves a macro call path to a definition index. This is the
     /// single macro lookup entry point: today it reads this single
-    /// file's textual scope, imports, and path tables. When S7's frozen
-    /// `Binding` query fns land in `next`, this function is where macro
-    /// lookup moves behind them and nothing else changes.
+    /// file's textual scope, imports, and path tables. S7's frozen
+    /// `Program::macro_binding` query is landed, but it answers from a
+    /// collected `Program`, which holds no macro defs yet (expansion
+    /// runs before parse and collect, and macro answers are `Absent`
+    /// there by design until W-RESOLVE). When the 6.1 worklist makes
+    /// collect own macro defs, this function is the one place that
+    /// moves behind `macro_binding`; nothing else changes.
     fn lookup_macro(&self, segs: &[Seg], leading_colon: bool) -> Option<u32> {
         if segs.is_empty() {
             return None;
@@ -1139,6 +1150,7 @@ impl<'a> Expander<'a> {
             CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             let ctxt =
                 register_expansion(crate::diag::Expansion { macro_def: DefId::PLACEHOLDER, call_span: call.span, parent: call.span.ctxt });
+            register_hygiene(ctxt, HygieneMark { def_span: def.name_span, local_def: def.local_def });
             let mut out = cached;
             restamp_ctxt(&mut out, old_ctxt, ctxt);
             return Ok(out);
@@ -1180,6 +1192,7 @@ impl<'a> Expander<'a> {
         };
         let ctxt =
             register_expansion(crate::diag::Expansion { macro_def: DefId::PLACEHOLDER, call_span: call.span, parent: call.span.ctxt });
+        register_hygiene(ctxt, HygieneMark { def_span: def.name_span, local_def: def.local_def });
         let out = transcribe::transcribe(&def.arms[arm_i].template, &binds, ctxt, call.span, self.ctx.interner)
             .map_err(|d| d.with_label(def.def_span, "the macro is defined here"))?;
         let count = count_tokens(&out);
@@ -1468,7 +1481,7 @@ impl<'a> Expander<'a> {
             }
             // A macro definition never reaches the parser.
             if let Some(def) = macro_rules_at(&trees, i, self.ctx.interner) {
-                self.define_macro(&trees, &def, false)?;
+                self.define_macro(&trees, &def, false, !item_list)?;
                 i = def.end;
                 pending_macro_use = false;
                 continue;
@@ -1680,7 +1693,7 @@ impl<'a> Expander<'a> {
         }
         if exported || macro_rules_at(trees, after, self.ctx.interner).is_some() {
             if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
-                self.define_macro(trees, &def, exported)?;
+                self.define_macro(trees, &def, exported, !item_list)?;
                 return Ok(def.end);
             }
         }
@@ -1702,7 +1715,7 @@ impl<'a> Expander<'a> {
     }
 
     /// Compiles and registers the `macro_rules!` definition at `def`.
-    fn define_macro(&mut self, trees: &[Tt], def: &DefStart, exported: bool) -> Result<(), Diag> {
+    fn define_macro(&mut self, trees: &[Tt], def: &DefStart, exported: bool, local_def: bool) -> Result<(), Diag> {
         let Tt::Delim(_, body, _) = &trees[def.group] else { unreachable!() };
         let body = body.clone();
         // An exported def was already compiled in the prescan; the walk
@@ -1714,7 +1727,8 @@ impl<'a> Expander<'a> {
             self.textual.push((def.name, idx));
             return Ok(());
         }
-        let compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
+        let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
+        compiled.local_def = local_def;
         self.register(Rc::new(compiled), exported, true);
         Ok(())
     }

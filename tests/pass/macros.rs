@@ -171,4 +171,15 @@ fn main() {
         };
     }
     println!("local={}", local_mul!(14));
+
+    // A body-local macro reads locals bound before its definition.
+    let mut acc: i64 = 1;
+    macro_rules! bump {
+        ($v:expr) => {
+            acc += $v
+        };
+    }
+    bump!(10);
+    bump!(31);
+    println!("acc={}", acc);
 }

@@ -200,6 +200,58 @@ pub fn register_expansion(exp: Expansion) -> CtxtId {
     CtxtId(table.len() as u32)
 }
 
+/// What one expansion's tokens may see of the locals around the macro's
+/// definition point (ARCH 6.3). A macro defined inside a body reads
+/// locals that were bound before its definition, in the context its
+/// definition was written in; a macro defined at item level reads no
+/// body locals at all. Parallel to the process-wide expansion table.
+#[derive(Clone, Copy)]
+pub struct HygieneMark {
+    pub def_span: Span,
+    pub local_def: bool,
+}
+
+static HYGIENE_MARKS: std::sync::Mutex<Vec<Option<HygieneMark>>> = std::sync::Mutex::new(Vec::new());
+
+/// Records the hygiene mark for one expansion context. The expander
+/// calls this right after `register_expansion` for the same context.
+pub fn register_hygiene(ctxt: CtxtId, mark: HygieneMark) {
+    let mut table = HYGIENE_MARKS.lock().unwrap();
+    let idx = (ctxt.0 as usize).saturating_sub(1);
+    if table.len() <= idx {
+        table.resize(idx + 1, None);
+    }
+    table[idx] = Some(mark);
+}
+
+fn hygiene_mark(ctxt: CtxtId) -> Option<HygieneMark> {
+    if ctxt == CtxtId::ROOT {
+        return None;
+    }
+    HYGIENE_MARKS.lock().unwrap().get((ctxt.0 - 1) as usize).copied().flatten()
+}
+
+/// True when an identifier used under `use_ctxt` may bind the local
+/// bound at `binding` (whose span carries the binding's own context):
+/// same context always, and for a macro defined in a body, bindings
+/// from its definition context that were bound before the definition.
+pub fn ctxt_can_see_local(use_ctxt: CtxtId, binding: Span) -> bool {
+    if binding.ctxt == use_ctxt {
+        return true;
+    }
+    let mut cur = use_ctxt;
+    while let Some(mark) = hygiene_mark(cur) {
+        if !mark.local_def {
+            return false;
+        }
+        if binding.ctxt == mark.def_span.ctxt {
+            return binding.file == mark.def_span.file && binding.lo < mark.def_span.lo;
+        }
+        cur = mark.def_span.ctxt;
+    }
+    false
+}
+
 /// The ordinary-source span an expanded span reports at, through the
 /// process-wide table only. `line!`, `file!`, and `column!` read their
 /// call site through this during expansion (ARCH 6.4).

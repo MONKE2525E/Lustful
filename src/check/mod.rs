@@ -409,7 +409,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         l
     }
     fn lookup(&self, name: Sym, ctxt: CtxtId) -> Option<u32> {
-        self.scopes.iter().rev().find(|(n, _)| *n == (name, ctxt)).map(|&(_, l)| l)
+        // The newest visible binding of this name: same context, or one a
+        // body-local macro could already see at its definition (ARCH 6.3).
+        self.scopes
+            .iter()
+            .rev()
+            .find(|((n, _), l)| *n == name && crate::diag::ctxt_can_see_local(ctxt, self.out.locals[*l as usize].span))
+            .map(|&(_, l)| l)
     }
 
     // Cross-item reads go through the section 8.2 query functions on
