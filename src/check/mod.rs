@@ -1374,7 +1374,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 });
                 let elem = self.expr(*value, exp_elem);
                 self.expect_expr(*len, USIZE);
-                let n = crate::check::collect::eval_array_len(p.ast, *len);
+                let n = crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *len);
                 match n {
                     Some(n) => {
                         let const_val = self.out.const_exprs[self.ei(*value)].is_some();
@@ -3516,6 +3516,9 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         let p: &Program<'_> = self.cx.p;
         let t = self.cx.deep(t);
         crate::ty::layout::layout_of_ty(&self.cx.tys, p, t).ok()
+    }
+    fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
+        self.cx.p.adt(adt).repr
     }
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
         self.cx.p.adt(adt).variants[variant as usize].disc

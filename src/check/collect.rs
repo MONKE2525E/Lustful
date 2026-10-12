@@ -350,9 +350,11 @@ pub fn resolve_ty(
         }
         TyExpr::Array { inner, len } => {
             let e = resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty)?;
-            let n = eval_array_len(ast, *len).ok_or_else(|| {
-                Diag::new("L0110", span, "array length must be a constant integer", "Write a literal length such as `[u8; 4]`.")
-            })?;
+            let n = eval_array_len(ast, interner, known, *len)
+                .or_else(|| eval_len_layout_query(ast, interner, known, type_names, aliases, tys, *len))
+                .ok_or_else(|| {
+                    Diag::new("L0110", span, "array length must be a constant integer", "Write a literal length such as `[u8; 4]`.")
+                })?;
             let c = tys.intern_const(ConstKind::Int(n));
             Ok(tys.intern(TyKind::Array(e, c)))
         }
@@ -364,29 +366,47 @@ pub fn resolve_ty(
 /// Evaluates an array length expression at collection time. Only literal
 /// integer arithmetic is in the bound today; named consts join with the
 /// const evaluator (ARCH 2.13) in `ty::consteval`.
-pub fn eval_array_len(ast: &Ast, e: ast::ExprId) -> Option<u128> {
-    use crate::ast::{BinOp, Expr, UnOp};
-    match ast.expr(e) {
-        Expr::Int(v, _) => Some(*v as u128),
-        Expr::Unary { op: UnOp::Neg, .. } => None,
-        Expr::Binary { op, lhs, rhs } => {
-            let (a, b) = (eval_array_len(ast, *lhs)?, eval_array_len(ast, *rhs)?);
-            match op {
-                BinOp::Add => a.checked_add(b),
-                BinOp::Sub => a.checked_sub(b),
-                BinOp::Mul => a.checked_mul(b),
-                BinOp::Div => a.checked_div(b),
-                BinOp::Rem => a.checked_rem(b),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
+pub fn eval_array_len(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<u128> {
+    u128::try_from(eval_const_int(ast, interner, known, e)?).ok()
 }
 
-/// Parses a float literal's text the way the host Rust parser does, which is
-/// correctly rounded for both widths. Returns the bits (`f32` bits are
-/// zero-extended into the u64) and the suffix type when one is written.
+/// A `size_of::<T>()` or `align_of::<T>()` array length, for types whose
+/// layout needs no Adt fields (scalars, tuples, arrays). Adt lengths wait
+/// for the full evaluator at the end of collection.
+fn eval_len_layout_query(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    type_names: &HashMap<Sym, AdtId>,
+    aliases: &HashMap<Sym, Ty>,
+    tys: &mut impl TyIntern,
+    e: ast::ExprId,
+) -> Option<u128> {
+    let ast::Expr::Call { callee, args } = ast.expr(e) else { return None };
+    if !args.is_empty() {
+        return None;
+    }
+    let ast::Expr::Path(segs) = ast.expr(*callee) else { return None };
+    let last = segs.last()?;
+    let name = interner.get(last.name);
+    if !matches!(name, "size_of" | "align_of") {
+        return None;
+    }
+    let targs = last.type_args();
+    if targs.len() != 1 {
+        return None;
+    }
+    let t = resolve_ty(ast, interner, known, type_names, aliases, tys, targs[0], None).ok()?;
+    struct NoShapes;
+    impl crate::ty::layout::AdtShapes for NoShapes {
+        fn adt_shape(&self, _id: AdtId) -> Option<crate::ty::layout::AdtShape> {
+            None
+        }
+    }
+    let l = crate::ty::layout::layout_of_ty(tys, &NoShapes, t).ok()?;
+    Some(if name == "align_of" { l.align as u128 } else { l.size as u128 })
+}
+
 pub fn parse_float_literal(text: &str) -> Option<(u64, Option<FloatTy>)> {
     let clean: String = text.chars().filter(|&c| c != '_').collect();
     if let Some(t) = clean.strip_suffix("f32") {
@@ -404,20 +424,31 @@ pub fn parse_float_literal(text: &str) -> Option<(u64, Option<FloatTy>)> {
 /// evaluator lives in `ty::consteval` (ARCH 2.13); this is its scalar subset
 /// for discriminants and array lengths, which collect needs before bodies run.
 pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<i128> {
+    eval_const_int_depth(ast, interner, known, e, 0)
+}
+
+fn eval_const_int_depth(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, depth: u32) -> Option<i128> {
+    if depth > 32 {
+        return None;
+    }
+    let _ = interner;
     use crate::ast::{BinOp, Expr, UnOp};
     match ast.expr(e) {
         Expr::Int(v, _) => Some(*v as u128 as i128),
         Expr::Char(c) => Some(*c as i128),
         Expr::Bool(b) => Some(*b as i128),
         Expr::Unary { op, expr } => {
-            let v = eval_const_int(ast, interner, known, *expr)?;
+            let v = eval_const_int_depth(ast, interner, known, *expr, depth + 1)?;
             match op {
                 UnOp::Neg => v.checked_neg(),
                 UnOp::Not => Some(!v),
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let (a, b) = (eval_const_int(ast, interner, known, *lhs)?, eval_const_int(ast, interner, known, *rhs)?);
+            let (a, b) = (
+                eval_const_int_depth(ast, interner, known, *lhs, depth + 1)?,
+                eval_const_int_depth(ast, interner, known, *rhs, depth + 1)?,
+            );
             match op {
                 BinOp::Add => a.checked_add(b),
                 BinOp::Sub => a.checked_sub(b),
@@ -433,7 +464,7 @@ pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
             }
         }
         Expr::Cast { expr, ty } => {
-            let v = eval_const_int(ast, interner, known, *expr)?;
+            let v = eval_const_int_depth(ast, interner, known, *expr, depth + 1)?;
             let target = match ast.ty(*ty) {
                 TyExpr::Path(segs) if segs.len() == 1 => known.int_ty(segs[0].name),
                 _ => None,
@@ -445,13 +476,26 @@ pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
             }
         }
         Expr::Block(b) => match ast.block(*b).tail {
-            Some(tail) if ast.block(*b).stmts.is_empty() => eval_const_int(ast, interner, known, tail),
+            Some(tail) if ast.block(*b).stmts.is_empty() => eval_const_int_depth(ast, interner, known, tail, depth + 1),
             _ => None,
         },
-        _ => {
-            let _ = interner;
-            None
+        Expr::Path(segs) if segs.len() == 1 => {
+            // A reference to another const item, found by scanning the
+            // crate's items (collect evaluates all of them later anyway).
+            let name = segs[0].name;
+            let mut out = None;
+            for item in &ast.items {
+                if let ItemKind::Const(c) = &item.kind
+                    && c.name == Some(name)
+                    && let Some(v) = c.value
+                {
+                    out = eval_const_int_depth(ast, interner, known, v, depth + 1);
+                    break;
+                }
+            }
+            out
         }
+        _ => None,
     }
 }
 
@@ -1220,6 +1264,16 @@ impl CollectCx<'_, '_> {
         };
         match crate::ty::consteval::eval(self, expr, Some(ty)) {
             Ok((v, vt)) => {
+                if self.pending[idx].0.is_static.is_some() && !static_form(self.p, &v, ty) {
+                    self.errs.push(Diag::new(
+                        crate::ty::consteval::C_OUTSIDE,
+                        span,
+                        "this static value form is outside the bounded const evaluator",
+                        "Use a tagged enum form the static data emitter supports, or a const item.",
+                    ));
+                    self.pending[idx].1 = PendingState::Failed;
+                    return None;
+                }
                 let v = match coerce_const_value(self, v, vt, ty, span) {
                     Ok(v) => v,
                     Err(d) => {
@@ -1238,6 +1292,53 @@ impl CollectCx<'_, '_> {
                 None
             }
         }
+    }
+}
+
+/// True when static data emission can write this value as a C initializer:
+/// niche-filled enums only in their niche variant (other variants need
+/// statements to store the niche tag, which an initializer cannot do).
+fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> bool {
+    use crate::ty::consteval::ConstValue as CV;
+    use crate::ty::layout::EnumTag;
+    match v {
+        CV::Variant(variant, vals) => {
+            let elem_tys: Vec<Ty> = match p.tys.kind(ty) {
+                _ if p.tys.option_elem(ty).is_some() => vec![p.tys.option_elem(ty).unwrap()],
+                _ => match p.tys.local_adt(ty) {
+                    Some(a) => p.adt(a).variants[*variant as usize].fields.iter().map(|f| f.ty).collect(),
+                    None => vec![ERROR; vals.len()],
+                },
+            };
+            let tag_ok = match crate::ty::layout::layout_of_ty(&p.tys, p, ty) {
+                Ok(l) => match l.enum_tag {
+                    Some(EnumTag::NicheFilled { variant: nv, .. }) => *variant as usize == nv,
+                    _ => true,
+                },
+                Err(()) => true,
+            };
+            tag_ok && vals.iter().enumerate().all(|(i, x)| static_form(p, x, elem_tys.get(i).copied().unwrap_or(ERROR)))
+        }
+        CV::Aggregate(vals) => {
+            let elem_tys: Vec<Ty> = match p.tys.kind(ty) {
+                TyKind::Tuple(ts) => p.tys.tys_of(ts).to_vec(),
+                TyKind::Array(e, _) => vec![e; vals.len()],
+                _ => match p.tys.local_adt(ty) {
+                    Some(a) => p.adt(a).variants[0].fields.iter().map(|f| f.ty).collect(),
+                    None => vec![ERROR; vals.len()],
+                },
+            };
+            vals.iter().enumerate().all(|(i, x)| static_form(p, x, elem_tys.get(i).copied().unwrap_or(ERROR)))
+        }
+        CV::Repeat(x, _) => match p.tys.kind(ty) {
+            TyKind::Array(e, _) => static_form(p, x, e),
+            _ => true,
+        },
+        CV::Ref(inner) => match p.tys.kind(ty) {
+            TyKind::Ref(_, _, it) => static_form(p, inner, it),
+            _ => true,
+        },
+        _ => true,
     }
 }
 
@@ -1408,6 +1509,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
         let p: &Program<'_> = self.p;
         crate::ty::layout::layout_of_ty(&p.tys, p, t).ok()
+    }
+    fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
+        self.p.adt(adt).repr
     }
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
         self.p.adt(adt).variants[variant as usize].disc

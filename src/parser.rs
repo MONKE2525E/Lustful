@@ -1319,9 +1319,10 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while self.peek() != Tok::RParen {
             let fattrs = self.part_attributes()?;
+            let _vis = self.vis()?;
             let span = self.span();
             let ty = self.ty()?;
-            fields.push(FieldDef { name: Sym(0), vis: Vis::Private, attrs: fattrs.attrs, ty, span });
+            fields.push(FieldDef { name: Sym(0), vis: _vis, attrs: fattrs.attrs, ty, span });
             if !self.eat(Tok::Comma) {
                 break;
             }

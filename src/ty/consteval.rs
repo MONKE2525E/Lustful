@@ -108,6 +108,8 @@ pub trait ConstCx<'a> {
     fn layout(&mut self, t: Ty) -> Option<Layout>;
     /// The text of an interned name.
     fn sym_text(&self, s: Sym) -> &str;
+    /// The `repr` of an Adt, for `offset_of!` rules.
+    fn adt_repr(&self, adt: AdtId) -> super::layout::Repr;
     /// The discriminant of one variant of an enum type.
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128;
 }
@@ -430,6 +432,41 @@ impl Evaluator {
                     Some(vals) if cx.tys_ref().local_adt(ty).is_some() => (ConstValue::Aggregate(vals), ty),
                     _ => return Err(outside(span, "this struct literal")),
                 }
+            }
+            Expr::OffsetOf { ty, fields } => {
+                let mut cur = cx.resolve_ty(*ty);
+                let mut off: u64 = 0;
+                for &fname in fields {
+                    let Some(adt) = cx.tys_ref().local_adt(cur) else {
+                        return Err(outside(span, "this `offset_of!`"));
+                    };
+                    if !matches!(
+                        cx.adt_repr(adt).kind,
+                        super::layout::ReprKind::C | super::layout::ReprKind::Packed | super::layout::ReprKind::Transparent
+                    ) {
+                        return Err(Diag::new(
+                            "L0650",
+                            span,
+                            "`offset_of!` on a default-repr type is not supported",
+                            "Add `#[repr(C)]` to the type, or measure with `size_of`.",
+                        ));
+                    }
+                    let defs = cx.variant_fields(adt, 0);
+                    let Some(i) = defs.iter().position(|(n, _)| *n == fname) else {
+                        return Err(outside(span, "this `offset_of!` field"));
+                    };
+                    let Some(l) = cx.layout(cur) else {
+                        return Err(Diag::new(
+                            "L0652",
+                            span,
+                            "unsupported layout form in `offset_of!`",
+                            "Use a type inside the supported layout grammar.",
+                        ));
+                    };
+                    off += l.field_offsets.get(i).copied().unwrap_or(0);
+                    cur = defs[i].1;
+                }
+                (ConstValue::Int(off as i128), USIZE)
             }
             Expr::Call { callee, args } => return Ok(Flow::Val(self.call(cx, env, *callee, args, span)?)),
             Expr::MethodCall { .. } => return Err(outside(span, "method calls")),

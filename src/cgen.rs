@@ -2253,25 +2253,68 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Variant(variant, vals), CTy::Adt(a)) => {
             let adt = p.adt(*a);
-            if vals.is_empty() {
-                format!("((A{}){{ .tag = {variant} }})", a.0)
-            } else {
-                let parts: Vec<String> = vals
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| {
-                        format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter))
-                    })
-                    .collect();
-                format!("((A{}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", a.0, parts.join(", "))
+            let v = *variant as usize;
+            let parts: Vec<String> = vals
+                .iter()
+                .enumerate()
+                .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[v].fields[i].ty), pre, counter)))
+                .collect();
+            match c_layout(p, t) {
+                Some(l) => match l.enum_tag {
+                    Some(EnumTag::Explicit { size, signed }) => {
+                        let mut init = format!("._tag = {}", disc_lit(adt_discs(p, t)[v], size, signed));
+                        if !parts.is_empty() {
+                            init.push_str(", ");
+                            init.push_str(&parts.join(", "));
+                        }
+                        format!("(({}){{ .u = {{ .v{v} = {{ {init} }} }} }})", ctype(t))
+                    }
+                    _ => {
+                        if parts.is_empty() {
+                            format!("(({}){{0}})", ctype(t))
+                        } else {
+                            format!("(({}){{ .u = {{ .v{v} = {{ {} }} }} }})", ctype(t), parts.join(", "))
+                        }
+                    }
+                },
+                None => {
+                    if vals.is_empty() {
+                        format!("((A{}){{ .tag = {variant} }})", a.0)
+                    } else {
+                        format!("((A{}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", a.0, parts.join(", "))
+                    }
+                }
             }
         }
         (CV::Variant(variant, vals), CTy::Option(e)) => {
             let ct = ctype(t);
-            if *variant == 1 && !vals.is_empty() {
-                format!("(({ct}){{ .tag = 1, .v = {} }})", const_init(p, &vals[0], e, pre, counter))
-            } else {
-                format!("(({ct}){{ .tag = 0 }})")
+            let parts: Vec<String> =
+                vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, e, pre, counter))).collect();
+            match c_layout(p, t) {
+                Some(l) => match l.enum_tag {
+                    Some(EnumTag::Explicit { size, signed }) => {
+                        let mut init = format!("._tag = {}", disc_lit(*variant as i128, size, signed));
+                        if !parts.is_empty() {
+                            init.push_str(", ");
+                            init.push_str(&parts.join(", "));
+                        }
+                        format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
+                    }
+                    _ => {
+                        if parts.is_empty() {
+                            format!("(({ct}){{0}})")
+                        } else {
+                            format!("(({ct}){{ .u = {{ .v{variant} = {{ {} }} }} }})", parts.join(", "))
+                        }
+                    }
+                },
+                None => {
+                    if *variant == 1 && !vals.is_empty() {
+                        format!("(({ct}){{ .tag = 1, .v = {} }})", const_init(p, &vals[0], e, pre, counter))
+                    } else {
+                        format!("(({ct}){{ .tag = 0 }})")
+                    }
+                }
             }
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
