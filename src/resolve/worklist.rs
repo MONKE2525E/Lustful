@@ -53,6 +53,13 @@ pub struct ResolvedCrate {
     pub tables: ResolvedTables,
     pub fn_lines: Vec<u32>,
     pub body_hashes: Vec<u64>,
+    /// A hash of the crate's module and import structure: every `mod`,
+    /// `use`, and `extern crate` item (which flattening drops from the
+    /// Ast), per file in worklist order. The driver folds it into its
+    /// environment hash, so an import-only or module-tree edit is never
+    /// mistaken for a body-only edit. `Sym` ids hash directly: the
+    /// driver compares hashes inside one session only.
+    pub structure_hash: u64,
     /// Every file's text concatenated, for the diagnostic source hash.
     pub all_text: String,
     /// True when some file of the crate can mention a source std fn.
@@ -506,46 +513,124 @@ pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> 
     }
 
     // ---- Flatten: inline module bodies splice into top-level items;
-    // mod, use, and extern crate items drop.
-    let mut fn_module_map: FxMap<Sym, ModuleId> = FxMap::default();
-    for info in tables.def_info.values() {
-        if info.kind == ResKind::Fn {
-            fn_module_map.insert(info.flat, info.module);
-        }
-    }
+    // mod, use, and extern crate items drop. Each fn's module is
+    // recorded here from its origin (file plus inline module path):
+    // keying it by flat name loses impl methods, whose names are not
+    // module-mangled and repeat across modules, and the checker then
+    // ran method bodies in the root module (wrong bindings and field
+    // visibility). Per-fn lines and body hashes ride the same pass, in
+    // the flattened order collect uses.
     let mut chunks = Vec::new();
-    for mut w in works {
+    let mut fn_lines = Vec::new();
+    let mut body_hashes = Vec::new();
+    let mut fn_module = Vec::new();
+    let mut structure = crate::intern::FxHasher::default();
+    for (fi, mut w) in works.into_iter().enumerate() {
+        // Module/import structure, hashed before flattening drops it.
+        {
+            use std::hash::Hash;
+            w.path.to_string_lossy().hash(&mut structure);
+            structure_items(&w.ast.items, &mut structure);
+        }
         let mut flat_items = Vec::new();
-        flatten_items(std::mem::take(&mut w.ast.items), &mut flat_items);
+        let mut flat_mods: Vec<ModuleId> = Vec::new();
+        flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], list_module, &mut flat_items, &mut flat_mods);
+        for (item, module) in flat_items.iter().zip(flat_mods.iter()) {
+            let mut push = |def: &FnDef| {
+                fn_lines.push(map.line_col(def.name_span).0);
+                let text = map.text(def.name_span.file).unwrap_or("");
+                let body_span = def.body.map(|b| w.ast.block(b).span).unwrap_or(def.name_span);
+                let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
+                body_hashes.push(hash_str(slice));
+                fn_module.push(*module);
+            };
+            match &item.kind {
+                ItemKind::Fn(d) => push(d),
+                ItemKind::Impl(imp) => {
+                    for d in &imp.fns {
+                        push(d);
+                    }
+                }
+                _ => {}
+            }
+        }
         w.ast.items = flat_items;
         chunks.push(w.ast);
     }
     let ast = Ast::concat(chunks);
-    // Per-fn lines and body hashes, in the flattened order collect uses.
-    let mut fn_lines = Vec::new();
-    let mut body_hashes = Vec::new();
-    let mut fn_module = Vec::new();
-    for item in &ast.items {
-        let mut push = |def: &FnDef| {
-            fn_lines.push(map.line_col(def.name_span).0);
-            let text = map.text(def.name_span.file).unwrap_or("");
-            let body_span = def.body.map(|b| ast.block(b).span).unwrap_or(def.name_span);
-            let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
-            body_hashes.push(hash_str(slice));
-            fn_module.push(fn_module_map.get(&def.name).copied().unwrap_or(ROOT_MODULE));
-        };
-        match &item.kind {
-            ItemKind::Fn(d) => push(d),
-            ItemKind::Impl(imp) => {
-                for d in &imp.fns {
-                    push(d);
+    tables.fn_module = fn_module;
+    let structure_hash = {
+        use std::hash::Hasher;
+        structure.finish()
+    };
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std })
+}
+
+/// Hashes one item list's module and import structure for
+/// `ResolvedCrate::structure_hash`: `mod` edges (recursing into inline
+/// bodies), `use` trees, and `extern crate` items, in written order.
+/// Item visibility rides in through a coarse tag, because flipping a
+/// `use` or `mod` to `pub` changes re-export bindings.
+fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
+    use std::hash::Hash;
+    fn tree(t: &UseTree, h: &mut crate::intern::FxHasher) {
+        use std::hash::Hash;
+        t.leading_colon.hash(h);
+        (t.prefix.len() as u64).hash(h);
+        for s in &t.prefix {
+            s.name.hash(h);
+        }
+        match &t.kind {
+            UseKind::Simple { rename } => {
+                0u8.hash(h);
+                rename.hash(h);
+            }
+            UseKind::Glob => 1u8.hash(h),
+            UseKind::Group(children) => {
+                2u8.hash(h);
+                (children.len() as u64).hash(h);
+                for c in children {
+                    tree(c, h);
                 }
             }
-            _ => {}
         }
     }
-    tables.fn_module = fn_module;
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, all_text, needs_std })
+    (items.len() as u64).hash(h);
+    for item in items {
+        match &item.vis {
+            Vis::Private => 0u8.hash(h),
+            Vis::Public => 1u8.hash(h),
+            Vis::Restricted { path, .. } => {
+                2u8.hash(h);
+                for s in path {
+                    s.name.hash(h);
+                }
+            }
+        }
+        match &item.kind {
+            ItemKind::Mod(m) => {
+                0u8.hash(h);
+                m.name.hash(h);
+                match &m.body {
+                    Some(body) => structure_items(body, h),
+                    None => 0u8.hash(h),
+                }
+            }
+            ItemKind::Use(u) => {
+                1u8.hash(h);
+                tree(&u.tree, h);
+            }
+            ItemKind::ExternCrate(e) => {
+                2u8.hash(h);
+                e.name.hash(h);
+                e.rename.hash(h);
+            }
+            // Non-structure items matter only by their position between
+            // structure items (textual macro and shadowing order is in
+            // the driver's own Ast hashes).
+            _ => 3u8.hash(h),
+        }
+    }
 }
 
 /// Adds one extern crate to the prelude tables.
@@ -1873,16 +1958,34 @@ mod tests {
 
 /// Moves inline module bodies into the flat item list, dropping mod,
 /// use, and extern crate items (their bindings live in the tables).
-fn flatten_items(items: Vec<Item>, out: &mut Vec<Item>) {
+/// Flattens one file's items for the merged Ast, recording the module
+/// each surviving item came from in `out_mods` (parallel to `out`).
+/// Inline module bodies splice in with their child module from
+/// `list_module`; mod, use, and extern crate items drop.
+fn flatten_items_mods(
+    items: Vec<Item>,
+    module: ModuleId,
+    fi: usize,
+    prefix: &[Sym],
+    list_module: &FxMap<ItemListKey, ModuleId>,
+    out: &mut Vec<Item>,
+    out_mods: &mut Vec<ModuleId>,
+) {
     for item in items {
         match item.kind {
             ItemKind::Mod(m) => {
                 if let Some(body) = m.body {
-                    flatten_items(body, out);
+                    let mut key = prefix.to_vec();
+                    key.push(m.name);
+                    let child = list_module.get(&(fi, key.clone())).copied().unwrap_or(module);
+                    flatten_items_mods(body, child, fi, &key, list_module, out, out_mods);
                 }
             }
             ItemKind::Use(_) | ItemKind::ExternCrate(_) => {}
-            _ => out.push(item),
+            _ => {
+                out.push(item);
+                out_mods.push(module);
+            }
         }
     }
 }

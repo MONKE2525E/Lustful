@@ -1,0 +1,8 @@
+# Same method name and private field in two modules: each method body
+# must be checked in its own module (bindings, field visibility).
+[package]
+name = "same-method-mods"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
