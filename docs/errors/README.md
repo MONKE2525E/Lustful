@@ -1,0 +1,51 @@
+# Diagnostic codes
+
+Every error lust prints has a stable `L####` code. Run `lust explain L0301` to print
+the long-form text for one code, or `lust explain` to list all codes. Each page has a
+wrong example that fails with that code and a fixed example that passes.
+`scripts/check-explain.sh` checks every example against lust and rustc.
+
+| Code | Meaning |
+|---|---|
+| [L0001](L0001.md) | syntax error |
+| [L0101](L0101.md) | name not found |
+| [L0102](L0102.md) | type not found |
+| [L0103](L0103.md) | no such field |
+| [L0104](L0104.md) | no such method, variant, or associated function |
+| [L0105](L0105.md) | wrong number of arguments |
+| [L0106](L0106.md) | duplicate definition |
+| [L0107](L0107.md) | missing field |
+| [L0110](L0110.md) | mismatched types |
+| [L0111](L0111.md) | type cannot be inferred |
+| [L0112](L0112.md) | trait is not implemented |
+| [L0113](L0113.md) | operator cannot be applied |
+| [L0114](L0114.md) | value is not callable |
+| [L0115](L0115.md) | match is not exhaustive |
+| [L0116](L0116.md) | invalid cast |
+| [L0117](L0117.md) | recursive type has infinite size |
+| [L0118](L0118.md) | integer literal out of range |
+| [L0120](L0120.md) | break or continue outside a loop |
+| [L0121](L0121.md) | invalid assignment target |
+| [L0122](L0122.md) | `mut` binding under a reference |
+| [L0130](L0130.md) | no `main` function |
+| [L0201](L0201.md) | references in struct fields are not supported |
+| [L0202](L0202.md) | lifetime elision is ambiguous |
+| [L0203](L0203.md) | lifetime syntax is not supported |
+| [L0301](L0301.md) | use of moved value |
+| [L0302](L0302.md) | cannot assign to an immutable variable |
+| [L0303](L0303.md) | conflicting borrows |
+| [L0304](L0304.md) | two mutable borrows at the same time |
+| [L0305](L0305.md) | cannot move out of a reference or an index |
+| [L0306](L0306.md) | value does not live long enough |
+| [L0307](L0307.md) | cannot return a reference to a local value |
+| [L0308](L0308.md) | cannot borrow as mutable |
+| [L0309](L0309.md) | cannot assign through a shared reference |
+| [L0310](L0310.md) | value used before it is assigned |
+| [L0311](L0311.md) | cannot move a borrowed value |
+| [L0312](L0312.md) | cannot assign while borrowed |
+| [L0401](L0401.md) | user macros are not supported |
+| [L0402](L0402.md) | unsupported attribute |
+| [L0403](L0403.md) | cannot derive this trait |
+| [L0404](L0404.md) | `unsafe` is not supported |
+| [L0405](L0405.md) | `async` is not supported |
+| [L9001](L9001.md) | feature is not supported yet |

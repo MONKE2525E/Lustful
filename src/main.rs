@@ -14,6 +14,7 @@ mod collect;
 mod daemon;
 mod diag;
 mod driver;
+mod explain;
 mod intern;
 mod ir;
 mod lexer;
@@ -36,6 +37,7 @@ fn main() {
     // Agent-kit commands run in this process; they never go through the daemon.
     match args.first().map(String::as_str) {
         Some("test") => std::process::exit(testrun::run(&args[1..])),
+        Some("explain") => std::process::exit(explain::run(&args[1..])),
         _ => {}
     }
     match protocol::parse_args(&args) {
