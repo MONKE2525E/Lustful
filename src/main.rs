@@ -25,6 +25,7 @@ mod lower;
 mod parser;
 mod protocol;
 mod scan;
+mod stdload;
 mod tcc;
 mod testrun;
 mod ty;

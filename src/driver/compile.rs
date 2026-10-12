@@ -666,7 +666,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
     }
     let path = req.file.to_string_lossy().to_string();
-    let src = match std::fs::read_to_string(&req.file) {
+    let mut src = match std::fs::read_to_string(&req.file) {
         Ok(s) => s,
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };
@@ -674,8 +674,37 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // package and target identity, `Session::crate_ids`). For a single-file
     // program that is the synthetic one-file bin crate, as before.
     let crate_ids = session.crate_ids();
-    let Session { front, caches, .. } = session;
+    let Session { front, caches, std_cache, .. } = session;
     t.lap("read");
+
+    // Source std (S5): if this file can mention a source std fn, load the
+    // checked shipped library (once per session) and splice its fns after
+    // the user text. User spans do not move. `std_ranges` records which
+    // byte ranges of the combined source belong to which shipped crate;
+    // intrinsic privilege keys on them after collect. A file that cannot
+    // mention a source std fn pays one byte scan and nothing else.
+    let mut std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)> = Vec::new();
+    let mut std_routes: Vec<&'static crate::ty::lang::StdFnDef> = Vec::new();
+    if crate::ty::lang::needs_std_load(&src) {
+        let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
+        let load = match load {
+            Ok(l) => l,
+            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
+        };
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+        for (krate, text) in &load.splices {
+            let lo = src.len() as u32;
+            src.push_str(text);
+            if !src.ends_with('\n') {
+                src.push('\n');
+            }
+            std_ranges.push((lo, src.len() as u32, *krate));
+        }
+        std_routes = load.fns.clone();
+        t.lap("std load+splice");
+    }
 
     // Lex and scan in chunks of whole items, in parallel. Only the region an edit touched is
     // split and lexed again: chunks entirely before it are kept as they are, and chunks entirely
@@ -944,13 +973,37 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
 
-    let program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
+    let mut program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
             return errors(&mut ds, &map, &src, req);
         }
     };
+    // Route the spliced source std fns: resolve each registry row's
+    // mangled name to the local fn the splice defined. A missing fn is
+    // a broken std build (the loader found it standalone), so it is an
+    // installation error, not a user diagnostic.
+    if !std_ranges.is_empty() {
+        program.shipped_ranges = std_ranges;
+        for def in std_routes {
+            let mangled = front.interner.intern(def.mangled);
+            match program.fn_names.get(&mangled) {
+                Some(&f) => {
+                    let path: Vec<Sym> = def.path.iter().map(|s| front.interner.intern(s)).collect();
+                    program.std_fns.push((path, f));
+                }
+                None => {
+                    front.env_hash = None;
+                    return Response {
+                        stderr: format!("error: lust std load failed: spliced std fn `{}` is missing after collect\n", def.path.join("::")),
+                        code: 3,
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+    }
     if program.fns.len() != fn_count {
         // The scanner and the parser disagree (only possible with unusual syntax). Start over.
         front.env_hash = None;

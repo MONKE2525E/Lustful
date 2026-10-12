@@ -5,6 +5,7 @@ use crate::check::Builtin;
 use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
 use crate::ir::*;
+use crate::ty::lang::{self, SigTy};
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -635,6 +636,7 @@ impl FnGen<'_, '_, '_> {
                 format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, *f), self.slots[f.0 as usize], args.join(", "))
             }
             Rvalue::Builtin(b, ops) => self.builtin(*b, ops, loc, post),
+            Rvalue::Intrinsic(id, ops) => self.intrinsic(*id, ops, loc, post),
             Rvalue::Eq { a, b, ty, ne } => {
                 let (a, _) = self.operand(a, loc, post);
                 let (b, _) = self.operand(b, loc, post);
@@ -707,6 +709,31 @@ impl FnGen<'_, '_, '_> {
                 self.want(Glue::Eq, t);
                 format!("eq_{}({a}, {b})", mangle(t))
             }
+        }
+    }
+
+    /// Emits one intrinsic call as a plain runtime call (section 3.2: no
+    /// IR node per family, codegen emits the C call direct). This is the
+    /// second privilege line behind check: an intrinsic that reaches
+    /// codegen from a crate its registry row does not allow is a
+    /// compiler bug, so it stops here instead of emitting the call.
+    fn intrinsic(&mut self, id: u32, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+        let def = lang::intrinsic(id);
+        let krate = self.p.fn_shipped_crate(self.body.fn_id);
+        assert!(
+            def.allows(krate),
+            "internal: intrinsic `core::intrinsics::{}` reached codegen from a crate that may not call it",
+            def.name
+        );
+        assert!(def.implemented, "internal: intrinsic `core::intrinsics::{}` reached codegen with no body", def.name);
+        let args: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
+        if def.ret == SigTy::Never {
+            // The C callee never returns (its C type is void). The comma
+            // form still gives the assignment a value of the right shape
+            // for the dead continuation.
+            format!("({}({}), 0)", def.c_symbol, args.join(", "))
+        } else {
+            format!("{}({})", def.c_symbol, args.join(", "))
         }
     }
 
@@ -1648,7 +1675,11 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op_has(a) || op_has(b)
         }
-        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::Call(_, ops) | Rvalue::Builtin(_, ops) => ops.iter().any(op_has),
+        Rvalue::Aggregate(_, _, ops)
+        | Rvalue::VecLit(_, ops)
+        | Rvalue::Call(_, ops)
+        | Rvalue::Builtin(_, ops)
+        | Rvalue::Intrinsic(_, ops) => ops.iter().any(op_has),
         Rvalue::Opt(_, o) => o.as_ref().is_some_and(op_has),
         Rvalue::Format(parts) => parts_has(parts),
     }
