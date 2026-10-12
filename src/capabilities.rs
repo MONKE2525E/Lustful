@@ -358,7 +358,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("qualified paths", "L0621"),
     ("const generic arguments", "L0632"),
     ("inferred expressions (`_`)", "L0820"),
-    ("let chains", "L0820"),
     ("raw references (`&raw`)", "L0820"),
     ("tuple struct patterns with field numbers", "L0820"),
     ("variadic parameters", "L0820"),
@@ -406,7 +405,7 @@ const TYPES: &[&str] = &[
 
 const CONTROL_FLOW: &[&str] = &[
     "if / else",
-    "if let",
+    "if let and let chains",
     "match (guards, or patterns, ranges, nested patterns)",
     "loop (break with a value)",
     "while",

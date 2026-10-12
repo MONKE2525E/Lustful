@@ -884,6 +884,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     // ---------- Expressions ----------
 
+    /// The `&&` elements of a condition, left to right.
+    fn split_and(&self, e: ExprId, out: &mut Vec<ExprId>) {
+        match self.p.ast.expr(e) {
+            Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                self.split_and(*lhs, out);
+                self.split_and(*rhs, out);
+            }
+            _ => out.push(e),
+        }
+    }
+
+    /// True when a condition is a let chain (some `&&` element is a `let`).
+    fn is_let_chain(&self, cond: ExprId) -> bool {
+        let mut elems = Vec::new();
+        self.split_and(cond, &mut elems);
+        elems.iter().any(|&e| matches!(self.p.ast.expr(e), Expr::Let { .. }))
+    }
+
+    /// Checks a let-chain condition: each `let` element binds into the
+    /// current scope (visible to later elements and the then block, which
+    /// the caller checks before truncating), each other element is bool.
+    fn check_chain(&mut self, cond: ExprId) {
+        let mut elems = Vec::new();
+        self.split_and(cond, &mut elems);
+        for el in elems {
+            match self.p.ast.expr(el) {
+                Expr::Let { pat, scrut } => {
+                    let (pat, scrut) = (*pat, *scrut);
+                    let st = self.expr(scrut, None);
+                    self.set(el, BOOL);
+                    self.pattern(pat, st, true);
+                }
+                _ => {
+                    self.expect_expr(el, BOOL);
+                }
+            }
+        }
+    }
+
     fn expr(&mut self, e: ExprId, expected: Option<Ty>) -> Ty {
         let t = self.expr_inner(e, expected);
         self.set(e, t)
@@ -931,6 +970,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
             },
             Expr::Path(segs) => self.path_expr(e, segs, span),
             Expr::Block(b) => self.block(*b, expected),
+            Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
+                let scope = self.scopes.len();
+                self.check_chain(*cond);
+                match els {
+                    None => {
+                        let t = self.block(*then, Some(UNIT));
+                        let bspan = p.ast.block(*then).span;
+                        if let Some(tail) = p.ast.block(*then).tail {
+                            self.coerce_expr(tail, t, UNIT);
+                        } else {
+                            self.coerce_at(t, UNIT, bspan, None);
+                        }
+                        self.scopes.truncate(scope);
+                        UNIT
+                    }
+                    Some(els) => {
+                        let t1 = self.block(*then, expected);
+                        self.scopes.truncate(scope);
+                        let t2 = self.expr(*els, expected.or(Some(t1)));
+                        self.join(t1, t2, Some(*els), span)
+                    }
+                }
+            }
             Expr::If { cond, then, els } => {
                 self.expect_expr(*cond, BOOL);
                 match els {
@@ -950,6 +1012,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.join(t1, t2, Some(*els), span)
                     }
                 }
+            }
+            Expr::While { label, cond, body } if self.is_let_chain(*cond) => {
+                let scope = self.scopes.len();
+                self.check_chain(*cond);
+                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
+                let t = self.block(*body, Some(UNIT));
+                self.unit_body(t, *body);
+                self.loops.pop();
+                self.scopes.truncate(scope);
+                UNIT
             }
             Expr::While { label, cond, body } => {
                 self.expect_expr(*cond, BOOL);
@@ -1441,6 +1513,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
+            Expr::Let { .. } => {
+                self.errs.push(not_yet("L0820", span, "`let` outside an `if` or `while` condition chain"));
+                ERROR
+            }
             Expr::OffsetOf { ty, fields } => {
                 let t = self.resolve_written(*ty);
                 let mut cur = self.deep(t);
@@ -1498,7 +1574,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
-            | Expr::Let { .. }
             | Expr::QPath { .. }
             | Expr::Underscore
             | Expr::MacroCall(_) => ERROR,

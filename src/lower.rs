@@ -448,6 +448,22 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Block(b) => self.block_into(*b, dest),
+            Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
+                let (eb, end) = (self.new_block(), self.new_block());
+                self.scopes.push(Vec::new());
+                self.cond_chain(*cond, eb, span);
+                self.block_into(*then, dest);
+                self.pop_scope(span);
+                self.goto(end, span);
+                self.cur = eb;
+                if let Some(els) = els {
+                    self.expr_into(*els, dest);
+                } else if let Some(d) = dest {
+                    self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
+                }
+                self.goto(end, span);
+                self.cur = end;
+            }
             Expr::If { cond, then, els } => {
                 let cl = self.cond(*cond, span);
                 let (tb, eb, end) = (self.new_block(), self.new_block(), self.new_block());
@@ -464,6 +480,28 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
                 }
                 self.goto(end, span);
+            }
+            Expr::While { label, cond, body } if self.is_let_chain(*cond) => {
+                let (head, exit) = (self.new_block(), self.new_block());
+                self.goto(head, span);
+                self.scopes.push(Vec::new());
+                self.cond_chain(*cond, exit, span);
+                self.loops.push(LoopInfo {
+                    break_bb: exit,
+                    continue_bb: head,
+                    dest: None,
+                    depth: self.scopes.len() - 1,
+                    label: label.map(|l| (l.name, l.span)),
+                    is_block: false,
+                });
+                self.block_into(*body, None);
+                self.loops.pop();
+                self.pop_scope(span);
+                self.goto(head, span);
+                self.cur = exit;
+                if let Some(d) = dest {
+                    self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
+                }
             }
             Expr::While { label, cond, body } => {
                 let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
@@ -769,6 +807,62 @@ impl<'p, 'a> Lower<'p, 'a> {
             | Expr::ConstBlock(_)
             | Expr::Underscore
             | Expr::MacroCall(_) => {}
+        }
+    }
+
+    /// The `&&` elements of a condition, left to right.
+    fn split_and(&self, e: ExprId, out: &mut Vec<ExprId>) {
+        match self.p.ast.expr(e) {
+            Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                self.split_and(*lhs, out);
+                self.split_and(*rhs, out);
+            }
+            _ => out.push(e),
+        }
+    }
+
+    fn is_let_chain(&self, cond: ExprId) -> bool {
+        let mut elems = Vec::new();
+        self.split_and(cond, &mut elems);
+        elems.iter().any(|&e| matches!(self.p.ast.expr(e), Expr::Let { .. }))
+    }
+
+    /// Lowers a let-chain condition in the current (chain) scope: falls
+    /// through on success; each failing element drops what the chain has
+    /// bound so far and jumps to `els_bb`.
+    fn cond_chain(&mut self, cond: ExprId, els_bb: Bb, span: Span) {
+        let mut elems = Vec::new();
+        self.split_and(cond, &mut elems);
+        for el in elems {
+            match self.p.ast.expr(el) {
+                Expr::Let { pat, scrut } => {
+                    let (pat, scrut) = (*pat, *scrut);
+                    let es = self.span(el);
+                    let sp = self.place(scrut);
+                    let fail = self.new_block();
+                    let live = self.scopes.last().cloned().unwrap_or_default();
+                    self.test_pat(pat, sp.clone(), fail);
+                    let cont = self.cur;
+                    self.cur = fail;
+                    self.emit_drops(&live, es);
+                    self.goto(els_bb, es);
+                    self.cur = cont;
+                    self.bind_pat(pat, sp);
+                }
+                _ => {
+                    let cl = self.cond(el, span);
+                    let next = self.new_block();
+                    let fail = self.new_block();
+                    let live = self.scopes.last().cloned().unwrap_or_default();
+                    let b = &mut self.body.blocks[self.cur.0 as usize];
+                    b.term = Terminator::If(Operand::Copy(Place::local(cl)), next, fail);
+                    b.term_span = span;
+                    self.cur = fail;
+                    self.emit_drops(&live, span);
+                    self.goto(els_bb, span);
+                    self.cur = next;
+                }
+            }
         }
     }
 

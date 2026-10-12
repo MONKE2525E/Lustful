@@ -51,6 +51,9 @@ pub struct Parser<'a> {
     /// its old code. `parse` returns it after the parse, or in
     /// place of a later hard error.
     deferred: Option<Diag>,
+    /// True while parsing an `if` or `while` condition, where `let` may
+    /// appear as a chain element.
+    let_ok: bool,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -59,7 +62,8 @@ const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None };
+    let mut p =
+        Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
     p.ast.strings = lexed.strings.clone();
     while p.peek() != Tok::Eof {
         let before = p.pos;
@@ -138,7 +142,8 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     toks.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
-    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None };
+    let mut p =
+        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
@@ -162,7 +167,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
     f(&mut p)
 }
 
@@ -2433,10 +2438,7 @@ impl<'a> Parser<'a> {
             Tok::If => return self.if_expr(),
             Tok::While => {
                 self.bump();
-                if self.eat(Tok::Let) {
-                    return self.while_let(start, label);
-                }
-                let cond = self.expr_ctx(true)?;
+                let cond = self.condition()?;
                 let body = self.block()?;
                 Expr::While { label, cond, body }
             }
@@ -2478,12 +2480,18 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(e, start.to(self.prev_span())))
     }
 
+    /// An `if` or `while` condition, where let chains may appear.
+    fn condition(&mut self) -> PResult<ExprId> {
+        let old = self.let_ok;
+        self.let_ok = true;
+        let r = self.expr_ctx(true);
+        self.let_ok = old;
+        r
+    }
+
     fn if_expr(&mut self) -> PResult<ExprId> {
         let start = self.expect(Tok::If, "`if`")?;
-        if self.eat(Tok::Let) {
-            return self.if_let(start);
-        }
-        let cond = self.expr_ctx(true)?;
+        let cond = self.condition()?;
         let then = self.block()?;
         let els = if self.eat(Tok::Else) {
             if self.peek() == Tok::If {
@@ -2497,49 +2505,6 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(self.push_expr(Expr::If { cond, then, els }, start.to(self.prev_span())))
-    }
-
-    /// `if let P = e { a } else { b }` becomes `match e { P => { a } _ => { b } }`.
-    fn if_let(&mut self, start: Span) -> PResult<ExprId> {
-        let pat = self.pattern()?;
-        self.expect(Tok::Eq, "`=`")?;
-        let scrut = self.expr_ctx(true)?;
-        let then = self.block()?;
-        let then_span = self.ast.block(then).span;
-        let then_e = self.push_expr(Expr::Block(then), then_span);
-        let els = if self.eat(Tok::Else) {
-            if self.peek() == Tok::If {
-                self.if_expr()?
-            } else {
-                let s = self.span();
-                let b = self.block()?;
-                self.push_expr(Expr::Block(b), s.to(self.prev_span()))
-            }
-        } else {
-            self.push_expr(Expr::Unit, then_span)
-        };
-        let span = start.to(self.prev_span());
-        let wild = self.push_pat(Pat::Wild, span);
-        let arms =
-            vec![Arm { attrs: Vec::new(), pat, guard: None, body: then_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: els }];
-        Ok(self.push_expr(Expr::Match { scrut, arms }, span))
-    }
-
-    /// `while let P = e { body }` becomes `loop { match e { P => { body } _ => break } }`.
-    fn while_let(&mut self, start: Span, label: Option<Label>) -> PResult<ExprId> {
-        let pat = self.pattern()?;
-        self.expect(Tok::Eq, "`=`")?;
-        let scrut = self.expr_ctx(true)?;
-        let body = self.block()?;
-        let span = start.to(self.prev_span());
-        let body_e = self.push_expr(Expr::Block(body), span);
-        let brk = self.push_expr(Expr::Break { label: None, value: None }, span);
-        let wild = self.push_pat(Pat::Wild, span);
-        let arms =
-            vec![Arm { attrs: Vec::new(), pat, guard: None, body: body_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: brk }];
-        let m = self.push_expr(Expr::Match { scrut, arms }, span);
-        let block = self.push_block(Block { stmts: vec![Stmt::Expr { expr: m, semi: true }], tail: None, span });
-        Ok(self.push_expr(Expr::Loop { label, body: block }, span))
     }
 
     fn primary(&mut self, no_struct: bool) -> PResult<ExprId> {
@@ -2672,7 +2637,16 @@ impl<'a> Parser<'a> {
                     return Err(not_yet(C_CONST, start, "inline const blocks"));
                 }
             }
-            Tok::Let => return Err(not_yet(C_CORE, start, "let chains")),
+            Tok::Let if self.let_ok => {
+                self.bump();
+                let pat = self.pattern()?;
+                self.expect(Tok::Eq, "`=`")?;
+                // The scrutinee stops before a chain `&&` (and before `||`):
+                // only operators that bind tighter than `&&` are consumed.
+                let scrut = self.binary(3, true)?;
+                Expr::Let { pat, scrut }
+            }
+            Tok::Let => return Err(not_yet(C_CORE, start, "let chains outside conditions")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Expr::QPath { self_ty, trait_path, segs }
