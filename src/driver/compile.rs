@@ -1204,7 +1204,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         "full"
     };
 
-    let (mut changed, mention_only): (Vec<usize>, Vec<usize>) = if bodies_only {
+    let (changed, mention_only): (Vec<usize>, Vec<usize>) = if bodies_only {
         let changed: Vec<usize> = (0..fn_count)
             .filter(|&i| {
                 let slot = front.fn_slot[i] as usize;
