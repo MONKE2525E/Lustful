@@ -556,6 +556,7 @@ fn slot_update(
         caches.has_out.clear();
         caches.slot_reads.clear();
         caches.slot_used.clear();
+        caches.slot_fp.clear();
         front.slot_hash.clear();
         caches.glue = GlueSet::default();
         caches.objects = None;
@@ -598,6 +599,7 @@ fn slot_update(
     caches.out.resize_with(n_slots, FnOut::default);
     caches.slot_reads.resize_with(n_slots, || None);
     caches.slot_used.resize_with(n_slots, Vec::new);
+    caches.slot_fp.resize(n_slots, 0);
     front.slot_hash.resize(n_slots, 0);
     for slot in (0..n_slots).filter(|&s| !live[s]) {
         caches.out[slot] = FnOut::default();
@@ -605,6 +607,7 @@ fn slot_update(
         caches.ok[slot] = true;
         caches.slot_reads[slot] = None;
         caches.slot_used[slot].clear();
+        caches.slot_fp[slot] = 0;
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
     // function's name (only possible in the "signatures" case). A function in the last
@@ -1245,6 +1248,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
     for ((i, body), out) in bodies.iter().zip(outs) {
+        // Stable instance fingerprint: hash the emitted code (see
+        // `Caches::slot_fp` for why not the scan body hash).
+        if let Some(fp) = caches.slot_fp.get_mut(slot(*i)) {
+            let mut h = crate::intern::FxHasher::default();
+            std::hash::Hash::hash(&out.code, &mut h);
+            *fp = std::hash::Hasher::finish(&h);
+        }
         caches.out[slot(*i)] = out;
         caches.has_out[slot(*i)] = true;
         dirty_groups[slot(*i) / caches.per_unit] = true;
@@ -1392,8 +1402,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     // Per-unit object identity (section 4.2): each fn unit keys on its
-    // instances' fingerprints (today: body hashes, one instance per fn)
-    // plus its used-slots hash; the table unit keys on the full slot
+    // instances' fingerprints (today: stable per-fn C fingerprints, one
+    // instance per fn) plus its used-slots hash; the table unit keys on
+    // the full slot
     // manifest. The disk object cache folds the C text in as well (see
     // cache.rs), so a hit is exactly as sound as recompiling. Adding one
     // reachable fn changes no unrelated unit's key: its object is copied
@@ -1405,7 +1416,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             3 => crate::driver::graph::table_unit_key(&manifest),
             g if g >= FIRST_FN_UNIT => {
                 let range = &groups[g - FIRST_FN_UNIT];
-                let instances: Vec<Fingerprint> = range.clone().map(|s| Fingerprint(front.slot_hash[s])).collect();
+                let instances: Vec<Fingerprint> =
+                    range.clone().map(|s| Fingerprint(caches.slot_fp.get(s).copied().unwrap_or(0))).collect();
                 let mut pairs: Vec<(crate::driver::graph::InstanceKeyHash, u32)> = Vec::new();
                 for s in range.clone() {
                     if let Some(used) = caches.slot_used.get(s) {

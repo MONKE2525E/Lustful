@@ -139,11 +139,13 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     // replaying one resolved under the old graph. The build script
     // check only hashes recorded inputs while they hold; a stale
     // record re-runs the script through Cargo here.
-    let graph = crate::protocol::graph_key(&req.session);
+    // Build script first, graph after: a stale re-run can create
+    // Cargo.lock, and the key must describe the post-run graph.
     let build_script = match crate::protocol::manifest_dir(&req.session) {
         Some(dir) => crate::driver::buildscript::refresh(&dir, &cache_dir(&req.file)).hash(),
         None => 0,
     };
+    let graph = crate::protocol::graph_key(&req.session);
     let (a, b) = hash128(
         &[
             &id.0.to_le_bytes(),

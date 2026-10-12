@@ -86,6 +86,14 @@ pub(crate) struct Caches {
     /// targets), collected from the IR at codegen. A unit's used-slots
     /// hash (section 4.2) is computed over the union for its slots.
     pub(crate) slot_used: Vec<Vec<u32>>,
+    /// Per-slot instance fingerprint for unit keys: a hash of the slot's
+    /// generated C code, set exactly when its `FnOut` is. It must be
+    /// stable across sessions, so it cannot be the scan body hash:
+    /// `scan::hash_tok` hashes `Sym` ids, which follow interning order
+    /// and change across daemon restarts. The emitted code text is
+    /// stable (names and slot numbers, no session ids). Mono replaces
+    /// this with its IR fingerprint in wave B.
+    pub(crate) slot_fp: Vec<u64>,
     pub(crate) glue: GlueSet,
     /// Slots per function unit. Fixed until the next full rebuild, so units stay stable.
     pub(crate) per_unit: usize,
@@ -158,6 +166,7 @@ impl Session {
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
                 slot_used: Vec::new(),
+                slot_fp: Vec::new(),
                 glue: GlueSet::default(),
                 per_unit: 16,
                 table_cap: 0,

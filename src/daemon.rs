@@ -61,7 +61,9 @@ fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) 
 /// or build script; when this key moves, the entry's session is
 /// replaced before the request is served.
 fn refresh_key(key: &SessionKey) -> u64 {
-    let graph = protocol::graph_key(key);
+    // Build script first: a stale record re-runs Cargo, which can
+    // create or update Cargo.lock, and the graph key must describe
+    // the graph as it stands after that run, not before it.
     let build_script = match protocol::manifest_dir(key) {
         Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root)) {
             r @ crate::driver::buildscript::Refresh::Failed { .. } => {
@@ -74,7 +76,7 @@ fn refresh_key(key: &SessionKey) -> u64 {
         },
         None => 0,
     };
-    graph ^ build_script.rotate_left(17)
+    protocol::graph_key(key) ^ build_script.rotate_left(17)
 }
 
 struct Entry {

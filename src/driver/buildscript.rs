@@ -267,6 +267,15 @@ pub fn refresh(manifest_dir: &Path, cache_dir: &Path) -> Refresh {
 /// the OUT_DIR, and the script's stdout sits in the sibling `output`
 /// file Cargo keeps next to it.
 fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, String> {
+    // Cargo decides script freshness by mtime; an input edited within
+    // the same filesystem timestamp tick as the last run can look
+    // fresh to it while our content hashes already moved. Rewriting
+    // the script with its own bytes bumps its mtime and makes Cargo
+    // execute it, which is the only outcome this path wants. The
+    // record keys on contents, so the rewrite changes no hash.
+    if let Ok(bytes) = std::fs::read(script) {
+        let _ = std::fs::write(script, bytes);
+    }
     let out = std::process::Command::new("cargo")
         .args(["check", "--offline", "--message-format=json"])
         .current_dir(manifest_dir)
@@ -283,7 +292,8 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
             // The message is one JSON object per line; pull the two
             // string fields this record needs without a JSON parser.
             let field = |name: &str| -> Option<String> {
-                let at = line.find(&format!("\"{name}\":\""))? + name.len() + 3;
+                // Skip past the whole `"name":"` opener (quotes, name, colon).
+                let at = line.find(&format!("\"{name}\":\""))? + name.len() + 4;
                 let rest = &line[at..];
                 let mut s = String::new();
                 let mut chars = rest.chars();
@@ -301,7 +311,7 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
             }
         }
     }
-    let Some(out_dir_path) = out_dir else {
+    let Some(out_dir_path) = out_dir.filter(|d| !d.as_os_str().is_empty()) else {
         return Err("cargo check ran no build script for this manifest".to_string());
     };
     let output_file = out_dir_path.parent().map(|p| p.join("output"));
