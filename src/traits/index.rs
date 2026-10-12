@@ -675,7 +675,7 @@ impl ImplIndex {
     /// local to this crate. Two headers overlap when their full
     /// trait refs unify (Self, every input, and bindings) and no
     /// where clause of either is disprovable by the orphan test.
-    /// The caller reports each pair as `L0615` at the later impl.
+    /// The caller reports each pair as an overlapping-impls error at the later impl.
     pub fn coherence_overlaps(
         &self,
         tys: &mut impl TyIntern,

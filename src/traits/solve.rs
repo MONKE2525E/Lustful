@@ -54,7 +54,7 @@ pub enum Selection {
     /// One impl confirmed. `args` are the impl's parameters in
     /// declared order, deeply resolved; a parameter in `unbound`
     /// could not be bound by the header, an obligation binding, or
-    /// step 4, and defers (at body end it is `L0613`). `nested` are
+    /// step 4, and defers (at body end it is the impl-parameter error of step 4). `nested` are
     /// the impl's predicates, substituted and elaborated, which the
     /// caller must prove; a failure there is an error, never a
     /// reason to try another candidate.
@@ -67,10 +67,10 @@ pub enum Selection {
     /// head yet. The caller defers (step 6).
     Ambiguous,
     /// No candidate can apply and inference cannot change that
-    /// (step 5). The caller reports `L0612`.
+    /// (step 5). The caller reports the no-impl error.
     NoImpl,
     /// The depth cap or the cycle set stopped selection (step 7).
-    /// The caller reports `L0611`.
+    /// The caller reports the selection-overflow error.
     Overflow,
 }
 
@@ -1230,7 +1230,7 @@ mod tests {
     /// Step 4b: `impl<T, U> Tr for T where T: A<Item = U>` binds U
     /// from the equality once `<u8 as A>::Item` normalizes. With a
     /// Self that has no `A` impl the parameter stays unbound (the
-    /// `L0613` case), never guessed.
+    /// impl-parameter case), never guessed.
     #[test]
     fn step4_binds_impl_param_from_assoc_eq() {
         let mut g = GlobalTys::new();
@@ -1263,7 +1263,7 @@ mod tests {
         let obl = trait_ref(&mut cx.tys, tr, &[no_a_ty]);
         match Solver::new().select(&mut cx, &index, &[], obl) {
             Selection::Impl { args, unbound, .. } => {
-                assert_eq!(unbound, [ParamId(1)], "the L0613 split: impl param stays unbound, args {args:?}")
+                assert_eq!(unbound, [ParamId(1)], "the impl-parameter split: it stays unbound, args {args:?}")
             }
             other => panic!("expected an impl selection with an unbound param, got {other:?}"),
         }
