@@ -1294,3 +1294,34 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BitSet;
+
+    /// One-word sets stay inline; wider sets spill to the heap form; both
+    /// answer the same operations across the boundary.
+    #[test]
+    fn bitset_inline_and_wide_forms_agree() {
+        let mut one = BitSet::new(64);
+        one.insert(0);
+        one.insert(63);
+        assert!(one.contains(0) && one.contains(63) && !one.contains(1));
+        assert_eq!(one.iter().collect::<Vec<_>>(), vec![0, 63]);
+        one.remove(0);
+        assert!(!one.contains(0) && !one.is_empty());
+
+        let mut wide = BitSet::new(200);
+        wide.insert(64);
+        wide.insert(199);
+        assert!(wide.contains(64) && wide.contains(199) && !wide.contains(63));
+        assert_eq!(wide.iter().collect::<Vec<_>>(), vec![64, 199]);
+        let mut other = BitSet::new(200);
+        other.insert(199);
+        assert!(!wide.union(&other), "no new bit, no change");
+        other.insert(65);
+        assert!(wide.union(&other), "a new bit is a change");
+        wide.clear();
+        assert!(wide.is_empty());
+    }
+}
