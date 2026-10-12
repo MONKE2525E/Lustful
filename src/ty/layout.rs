@@ -712,7 +712,7 @@ fn compute(
         },
         TyKind::RawPtr(_, _) => Ok(raw_ptr_layout()),
         TyKind::FnPtr(_) => Ok(ptr_layout()),
-        TyKind::FnDef(..) => Ok(zst_layout(1)),
+        TyKind::FnDef(..) | TyKind::Closure(..) => Ok(zst_layout(1)),
         TyKind::Array(e, c) => {
             let len = match tys.const_kind(c) {
                 super::ConstKind::Int(n) => u64::try_from(n).map_err(|_| ())?,

@@ -54,7 +54,13 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
     };
-    if let Some(b) = body {
+    // A closure fn lowers its closure body expression instead of
+    // the enclosing fn's block (W-TRAITS-CORE through the owner).
+    if let Some(cf) = p.gx.closure_fns.get(&fid).copied() {
+        let ast::Expr::Closure { body: cbody, .. } = p.ast.expr(cf.expr) else { unreachable!() };
+        let body_e = *cbody;
+        lw.expr_into(body_e, Some(&Place::local(0)));
+    } else if let Some(b) = body {
         lw.block_into(b, Some(&Place::local(0)));
     }
     let root = lw.scopes.pop().unwrap();
@@ -833,9 +839,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span);
                 }
             }
+            // A closure value is zero-sized: calls name its
+            // instance directly, so the value is a unit constant.
+            Expr::Closure { .. } => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
             // AST v2 expression forms the parser still rejects.
             Expr::Float(_)
-            | Expr::Closure { .. }
             | Expr::Try(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }

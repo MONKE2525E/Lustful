@@ -404,6 +404,10 @@ struct Ctx<'p, 'a> {
     /// Generic call sites to turn into instance requests at
     /// finish: (expression index, template, args before zonking).
     generic_sites: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
+    /// Closure signature types to verify at finish: a signature
+    /// type still uninferred there is an annotation error, never
+    /// a silent default.
+    closure_sites: Vec<(ExprId, Vec<Ty>)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -460,10 +464,47 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             sc
         },
         generic_sites: Vec::new(),
+        closure_sites: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
     };
+    // A closure fn checks its closure body: parameters come from
+    // the closure's own parameter patterns (simple bindings only
+    // in this slice) and the body is one expression.
+    if let Some(cf) = p.gx.closure_fns.get(&fid).copied() {
+        let ast::Expr::Closure { params, body, .. } = p.ast.expr(cf.expr) else { unreachable!() };
+        if contains_ref_ty(&cx.tys, f.ret) {
+            let span = p.ast.expr_span(cf.expr);
+            cx.err("L0820", span, "closures returning references are not supported yet", "Return an owned value instead.");
+        }
+        for (i, cp) in params.iter().enumerate() {
+            match p.ast.pat(cp.pat) {
+                ast::Pat::Binding { name, mutable, by_ref: false } => {
+                    let l = cx.add_local(*name, f.params[i], *mutable, p.ast.pat_span(cp.pat));
+                    cx.out.param_locals.push(l);
+                }
+                _ => {
+                    cx.err(
+                        "L0820",
+                        cp.span,
+                        "patterns in closure parameters are not supported yet",
+                        "Bind a plain name and destructure inside the body.",
+                    );
+                    let l = cx.add_local(p.interner.intern("_"), f.params[i], false, cp.span);
+                    cx.out.param_locals.push(l);
+                }
+            }
+        }
+        let body = *body;
+        let bt = cx.expr(body, Some(f.ret));
+        cx.coerce_expr(body, bt, f.ret);
+        cx.finish();
+        let Ctx { out, tys, errs, .. } = cx;
+        let mut out = out;
+        out.tys = tys;
+        return (out, errs);
+    }
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
         let l = cx.add_local(p.known.self_value, f.params[0], sp.mutable, sp.span);
@@ -579,6 +620,255 @@ pub fn allow_attr(attr: &ast::Attr, interner: &Interner, name: &str) -> bool {
         })
     }
     has(trees, interner, name)
+}
+
+/// True when a reference occurs anywhere in a type.
+fn contains_ref_ty(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) => true,
+        TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => contains_ref_ty(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| contains_ref_ty(tys, e)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| contains_ref_ty(tys, e)))
+        }
+        _ => false,
+    }
+}
+
+/// The scan of one closure body for capture use: names bound
+/// inside the body shadow enclosing locals, everything else
+/// that names an enclosing local is a capture. Also reports a
+/// `return` at this closure's level. This is the first of two
+/// capture filters: the closure instance check is the backstop
+/// (it binds only the closure's own parameters).
+struct CaptureScan<'x> {
+    ast: &'x ast::Ast,
+    self_sym: Sym,
+    outer: &'x [(Sym, CtxtId)],
+    bound: Vec<(Sym, CtxtId)>,
+    capture: Option<(Sym, Span)>,
+    has_return: bool,
+}
+
+impl CaptureScan<'_> {
+    fn use_name(&mut self, name: Sym, span: Span) {
+        if self.capture.is_some() {
+            return;
+        }
+        let key = (name, span.ctxt);
+        if self.outer.contains(&key) && !self.bound.contains(&key) {
+            self.capture = Some((name, span));
+        }
+    }
+
+    fn bind_pat(&mut self, pat: PatId) {
+        match self.ast.pat(pat) {
+            ast::Pat::Binding { name, .. } => self.bound.push((*name, self.ast.pat_span(pat).ctxt)),
+            ast::Pat::At { name, inner, .. } => {
+                self.bound.push((*name, self.ast.pat_span(pat).ctxt));
+                self.bind_pat(*inner);
+            }
+            ast::Pat::TupleStruct { elems, .. } | ast::Pat::Or(elems) | ast::Pat::Tuple(elems) => {
+                for e in elems.iter() {
+                    self.bind_pat(*e);
+                }
+            }
+            ast::Pat::Struct { fields, .. } => {
+                for (_, f) in fields.iter() {
+                    self.bind_pat(*f);
+                }
+            }
+            ast::Pat::Slice { prefix, middle, suffix } => {
+                for e in prefix.iter() {
+                    self.bind_pat(*e);
+                }
+                if let Some(m) = middle {
+                    self.bind_pat(*m);
+                }
+                for e in suffix.iter() {
+                    self.bind_pat(*e);
+                }
+            }
+            ast::Pat::Ref { inner, .. } | ast::Pat::Paren(inner) => self.bind_pat(*inner),
+            ast::Pat::Lit(e) => self.expr(*e, true),
+            ast::Pat::Range { lo, hi, .. } => {
+                for e in [*lo, *hi].into_iter().flatten() {
+                    self.expr(e, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn block(&mut self, b: ast::BlockId, in_return: bool) {
+        let mark = self.bound.len();
+        let blk = self.ast.block(b);
+        for stmt in &blk.stmts {
+            match stmt {
+                ast::Stmt::Let { pat, init, els, .. } => {
+                    if let Some(i) = init {
+                        self.expr(*i, in_return);
+                    }
+                    if let Some(els) = els {
+                        self.block(*els, in_return);
+                    }
+                    self.bind_pat(*pat);
+                }
+                ast::Stmt::Expr { expr, .. } => self.expr(*expr, in_return),
+                ast::Stmt::Item(_) | ast::Stmt::Macro { .. } => {}
+            }
+        }
+        if let Some(tail) = blk.tail {
+            self.expr(tail, in_return);
+        }
+        self.bound.truncate(mark);
+    }
+
+    fn seg_args(&mut self, segs: &[ast::PathSeg], in_return: bool) {
+        for seg in segs {
+            if let ast::GenericArgs::Angle(args) = &seg.args {
+                for a in args {
+                    if let ast::GenericArg::Const(e) = a {
+                        self.expr(*e, in_return);
+                    }
+                }
+            }
+        }
+    }
+
+    fn expr(&mut self, e: ExprId, in_return: bool) {
+        match self.ast.expr(e) {
+            Expr::Path(segs) => {
+                if segs.len() == 1 {
+                    self.use_name(segs[0].name, self.ast.expr_span(e));
+                }
+                self.seg_args(segs, in_return);
+            }
+            Expr::SelfValue => {
+                // Any `self` here names the enclosing method's
+                // receiver: always a capture.
+                if self.capture.is_none() {
+                    let span = self.ast.expr_span(e);
+                    self.capture = Some((self.self_sym, span));
+                }
+            }
+            Expr::Return(v) => {
+                if in_return {
+                    self.has_return = true;
+                }
+                if let Some(v) = v {
+                    self.expr(*v, in_return);
+                }
+            }
+            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) | Expr::LabeledBlock { body: b, .. } => {
+                self.block(*b, in_return)
+            }
+            Expr::If { cond, then, els } => {
+                let mark = self.bound.len();
+                self.expr(*cond, in_return);
+                self.block(*then, in_return);
+                self.bound.truncate(mark);
+                if let Some(els) = els {
+                    self.expr(*els, in_return);
+                }
+            }
+            Expr::While { cond, body, .. } => {
+                let mark = self.bound.len();
+                self.expr(*cond, in_return);
+                self.block(*body, in_return);
+                self.bound.truncate(mark);
+            }
+            Expr::Loop { body, .. } => self.block(*body, in_return),
+            Expr::For { pat, iter, body, .. } => {
+                self.expr(*iter, in_return);
+                let mark = self.bound.len();
+                self.bind_pat(*pat);
+                self.block(*body, in_return);
+                self.bound.truncate(mark);
+            }
+            Expr::Match { scrut, arms } => {
+                self.expr(*scrut, in_return);
+                for arm in arms {
+                    let mark = self.bound.len();
+                    self.bind_pat(arm.pat);
+                    if let Some(g) = arm.guard {
+                        self.expr(g, in_return);
+                    }
+                    self.expr(arm.body, in_return);
+                    self.bound.truncate(mark);
+                }
+            }
+            Expr::Let { pat, scrut } => {
+                self.expr(*scrut, in_return);
+                self.bind_pat(*pat);
+            }
+            Expr::Closure { params, body, .. } => {
+                let mark = self.bound.len();
+                for cp in params {
+                    self.bind_pat(cp.pat);
+                }
+                self.expr(*body, false);
+                self.bound.truncate(mark);
+            }
+            Expr::Call { callee, args } => {
+                self.expr(*callee, in_return);
+                for &a in args {
+                    self.expr(a, in_return);
+                }
+            }
+            Expr::MethodCall { recv, args, generic_args, .. } => {
+                self.expr(*recv, in_return);
+                for &a in args {
+                    self.expr(a, in_return);
+                }
+                for a in generic_args {
+                    if let ast::GenericArg::Const(c) = a {
+                        self.expr(*c, in_return);
+                    }
+                }
+            }
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.expr(*base, in_return),
+            Expr::Index { base, index } => {
+                self.expr(*base, in_return);
+                self.expr(*index, in_return);
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                self.expr(*lhs, in_return);
+                self.expr(*rhs, in_return);
+            }
+            Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) | Expr::Await(expr)
+            | Expr::Cast { expr, .. } => self.expr(*expr, in_return),
+            Expr::StructLit { fields, update, .. } => {
+                for &(_, _, f) in fields {
+                    self.expr(f, in_return);
+                }
+                if let Some(u) = update {
+                    self.expr(*u, in_return);
+                }
+            }
+            Expr::Range { lo, hi, .. } => {
+                for e in [*lo, *hi].into_iter().flatten() {
+                    self.expr(e, in_return);
+                }
+            }
+            Expr::Break { value, .. } => {
+                if let Some(v) = value {
+                    self.expr(*v, in_return);
+                }
+            }
+            Expr::Macro { args, .. } | Expr::Tuple(args) | Expr::Array(args) => {
+                for &a in args {
+                    self.expr(a, in_return);
+                }
+            }
+            Expr::ArrayRepeat { value, len } => {
+                self.expr(*value, in_return);
+                self.expr(*len, in_return);
+            }
+            Expr::AsyncBlock { body, .. } => self.block(*body, in_return),
+            _ => {}
+        }
+    }
 }
 
 /// The name and binding span of an optional AST label.
@@ -1932,6 +2222,140 @@ impl<'p, 'a> Ctx<'p, 'a> {
         (params, ret, args)
     }
 
+    /// The enclosing fn's generic arguments in this body: the
+    /// instance args mono recorded, or none for a plain fn.
+    fn parent_generic_args(&self) -> Vec<GenericArg> {
+        match self.p.gx.instances.get(&self.fid) {
+            Some(info) => self.p.tys.args(info.args).to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Checks one closure expression. The signature types are
+    /// annotations where written and fresh variables otherwise;
+    /// the body is also checked once here, in isolation, only
+    /// to infer those variables (its errors and obligations are
+    /// dropped: the closure instance check is authoritative).
+    /// Captures and parameter patterns are rejected in this
+    /// slice. The result type names the closure template with
+    /// the enclosing args and signature types, and the site is
+    /// recorded for mono like a generic call.
+    fn closure_expr(
+        &mut self,
+        e: ExprId,
+        params: &[ast::ClosureParam],
+        ret: Option<ast::TyId>,
+        body: ExprId,
+        span: Span,
+    ) -> Ty {
+        let p = self.p;
+        let Some(&template) = p.gx.closure_by_expr.get(&e) else {
+            self.err("L0820", span, "closures are not supported here yet", "Move the closure into a function body.");
+            return ERROR;
+        };
+        let mut names: Vec<Option<(Sym, bool, Span)>> = Vec::new();
+        let mut sig: Vec<Ty> = Vec::new();
+        // The signature variables for the unwritten slots only:
+        // written types are fixed in the template (see
+        // collect_closures) and take no generic argument.
+        let mut var_sig: Vec<Ty> = Vec::new();
+        for cp in params {
+            match p.ast.pat(cp.pat) {
+                ast::Pat::Binding { name, mutable, by_ref: false } => {
+                    names.push(Some((*name, *mutable, p.ast.pat_span(cp.pat))));
+                }
+                _ => {
+                    self.err(
+                        "L0820",
+                        cp.span,
+                        "patterns in closure parameters are not supported yet",
+                        "Bind a plain name and destructure inside the body.",
+                    );
+                    names.push(None);
+                }
+            }
+            sig.push(match cp.ty {
+                Some(t) => self.resolve_written(t),
+                None => {
+                    let v = self.new_var(false);
+                    var_sig.push(v);
+                    v
+                }
+            });
+        }
+        let ret_ty = match ret {
+            Some(t) => self.resolve_written(t),
+            None => {
+                let v = self.new_var(false);
+                var_sig.push(v);
+                v
+            }
+        };
+        // Capture scan against the locals in scope right here.
+        let outer: Vec<(Sym, CtxtId)> = self.scopes.iter().map(|&((n, c), _)| (n, c)).collect();
+        let mut scan = CaptureScan { ast: p.ast, self_sym: p.known.self_value, outer: &outer, bound: Vec::new(), capture: None, has_return: false };
+        for cp in params {
+            scan.bind_pat(cp.pat);
+        }
+        scan.expr(body, true);
+        let has_return = scan.has_return;
+        if let Some((name, cspan)) = scan.capture {
+            let what = if name == p.known.self_value { "`self`".to_string() } else { format!("`{}`", self.name(name)) };
+            self.err(
+                "L0820",
+                cspan,
+                format!("capturing closures are not supported yet ({what} is from the enclosing scope)"),
+                "Pass the value as a closure parameter instead.",
+            );
+            return ERROR;
+        } else if !has_return {
+            // The in-place body check. In a concrete body it is
+            // inference-only and fully isolated: its errors,
+            // obligations, and sites are dropped, because the
+            // closure instance check is authoritative. In an
+            // abstract (template) body there is no closure
+            // instance check, so this check is authoritative
+            // and everything it records stays.
+            let keep = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
+            let saved_errs = if keep { Vec::new() } else { std::mem::take(&mut self.errs) };
+            let saved_obl = if keep { Vec::new() } else { self.obl.take() };
+            let saved_lits = if keep { Vec::new() } else { std::mem::take(&mut self.negated_lits) };
+            let saved_scopes = std::mem::take(&mut self.scopes);
+            let saved_loops = std::mem::take(&mut self.loops);
+            // Sites inside the body belong to the closure
+            // instance check, which re-records them in its own
+            // context (with the right enclosing args).
+            let saved_sites = self.generic_sites.len();
+            let saved_closure_sites = self.closure_sites.len();
+            for (n, &t) in names.iter().zip(&sig) {
+                if let Some((name, mutable, nspan)) = n {
+                    self.add_local(*name, t, *mutable, *nspan);
+                }
+            }
+            let bt = self.expr(body, Some(ret_ty));
+            self.coerce_expr(body, bt, ret_ty);
+            if !keep {
+                self.errs = saved_errs;
+                self.obl.take();
+                for ob in saved_obl {
+                    self.obl.push(ob);
+                }
+                self.negated_lits = saved_lits;
+                self.generic_sites.truncate(saved_sites);
+                self.closure_sites.truncate(saved_closure_sites);
+            }
+            self.scopes = saved_scopes;
+            self.loops = saved_loops;
+        }
+        let mut args = self.parent_generic_args();
+        args.extend(var_sig.iter().map(|&t| GenericArg::Ty(t)));
+        self.generic_sites.push((self.ei(e), template, args.clone()));
+        self.closure_sites.push((e, var_sig));
+        let def = p.def_id(template);
+        let args_id = self.tys.intern_args(&args);
+        self.tys.intern(TyKind::Closure(def, args_id))
+    }
+
     /// The explicit generic arguments written on a call path
     /// (`f::<u8, _>(..)`), resolved in this body's scope and
     /// aligned to parameter positions. Unwritten positions are
@@ -2731,9 +3155,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     USIZE
                 }
             }
+            Expr::Closure { params, ret, body, .. } => self.closure_expr(e, params, *ret, *body, span),
             // AST v2 expression forms the parser still rejects.
-            Expr::Closure { .. }
-            | Expr::Try(_)
+            Expr::Try(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
@@ -3393,15 +3817,140 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// A call through a value: a closure-typed callee calls its
+    /// closure instance directly (the value is zero-sized, so
+    /// lowering passes no environment), and an opaque callee in
+    /// an abstract check calls through its Fn bound's synthetic
+    /// record. Only side-effect-free callee shapes are accepted
+    /// (a local, a closure literal, a borrow of a local):
+    /// lowering does not evaluate the callee operand.
+    fn value_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
+        let p = self.p;
+        let simple = match p.ast.expr(callee) {
+            Expr::Path(_) | Expr::Closure { .. } => true,
+            Expr::Ref { expr, .. } => matches!(p.ast.expr(*expr), Expr::Path(_)),
+            _ => false,
+        };
+        let ct = self.expr(callee, None);
+        if !simple {
+            for &a in args {
+                self.expr(a, None);
+            }
+            self.err(
+                "L0114",
+                span,
+                "only a closure in a local can be called this way yet",
+                "Bind the closure with `let` first, then call the local.",
+            );
+            return ERROR;
+        }
+        let mut base = self.resolve(ct);
+        if base == ERROR {
+            for &a in args {
+                self.expr(a, None);
+            }
+            return ERROR;
+        }
+        if let TyKind::Ref(_, _, inner) = self.kind(base) {
+            base = self.resolve(inner);
+        }
+        match self.kind(base) {
+            TyKind::Closure(def, a) => {
+                let Some(&template) = p.gx.closure_by_def.get(&def) else {
+                    self.err("L0114", span, "this value is not a function", "Call a named function or a closure.");
+                    return ERROR;
+                };
+                let cargs: Vec<GenericArg> = self.tys.args(a).to_vec();
+                let info = p.fn_info(template);
+                let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &cargs)).collect();
+                let ret = subst(&mut self.tys, info.ret, &cargs);
+                self.check_args(&params, args, span);
+                self.set_res(e, Res::Fn(template));
+                self.generic_sites.push((self.ei(e), template, cargs));
+                self.normalize_here(ret)
+            }
+            TyKind::Adt(..) => {
+                // Abstract check: an opaque type standing for a
+                // parameter whose Fn bound was made an Abstract
+                // synthetic record (see generics.rs).
+                let lang = p.gx.lang;
+                let mut sig: Option<(Vec<Ty>, Ty)> = None;
+                // Rust's call preference order: Fn, then FnMut,
+                // then FnOnce. The first matching record wins;
+                // supertrait records (FnMut of an Fn bound) may
+                // carry a fresh Output opaque instead of the
+                // bound's written binding.
+                'outer: for tr in [lang.fn_, lang.fn_mut, lang.fn_once] {
+                    for &id in p.gx.index.impls_of_trait(tr) {
+                        let rec = p.gx.index.get(id);
+                        if rec.synthetic != crate::traits::index::Synthetic::Abstract {
+                            continue;
+                        }
+                        let rargs = p.tys.args(rec.trait_ref.args);
+                        if rargs.first().and_then(|g| g.as_ty()) != Some(base) {
+                            continue;
+                        }
+                        let inputs = match rargs.get(1).and_then(|g| g.as_ty()) {
+                            Some(t) => match p.tys.kind(t) {
+                                TyKind::Tuple(ts) => p.tys.tys_of(ts).to_vec(),
+                                _ => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        };
+                        let out = lang
+                            .output_of(tr)
+                            .and_then(|o| rec.assoc_ty(o))
+                            .unwrap_or_else(|| {
+                                let o = lang.output_of(tr).unwrap_or(tr);
+                                self.tys.intern(TyKind::Projection(AssocId(o), rec.trait_ref.args))
+                            });
+                        sig = Some((inputs, out));
+                        break 'outer;
+                    }
+                }
+                match sig {
+                    Some((params, ret)) => {
+                        self.check_args(&params, args, span);
+                        // Abstract bodies are lowered for borrow
+                        // checking only: give the call a default
+                        // value so its result temp is assigned.
+                        self.set_res(e, Res::DefaultVal);
+                        self.normalize_here(ret)
+                    }
+                    None => {
+                        for &a in args {
+                            self.expr(a, None);
+                        }
+                        self.err("L0114", span, "this value is not a function", "Call a named function or a closure.");
+                        ERROR
+                    }
+                }
+            }
+            _ => {
+                for &a in args {
+                    self.expr(a, None);
+                }
+                self.err("L0114", span, "this value is not a function", "Call a named function or a closure.");
+                ERROR
+            }
+        }
+    }
+
     fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
         let p = self.p;
+        // A callee that names a local (or is not a path at all)
+        // is a value call: closures and Fn-bound parameters.
+        let is_value = match p.ast.expr(callee) {
+            Expr::Path(segs) if segs.len() == 1 => self.lookup(segs[0].name, self.span(callee).ctxt).is_some(),
+            Expr::Path(_) | Expr::QPath { .. } => false,
+            _ => true,
+        };
+        if is_value {
+            return self.value_call(e, callee, args, span);
+        }
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
-                if self.lookup(name, self.span(callee).ctxt).is_some() {
-                    self.err("L0114", span, "this value is not a function", "Closures are not supported yet. Call a named function.");
-                    return ERROR;
-                }
                 match self.binding_fn(name) {
                     Some(f) => Res::Fn(f),
                     None if name == p.known.Some => Res::OptSome,
@@ -6807,6 +7356,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.locals[i].ty = z;
         }
         self.overflow_lint();
+        // A closure signature type nothing fixed is an
+        // annotation error (the E0282 class), never a default.
+        for (e, sig) in std::mem::take(&mut self.closure_sites) {
+            if sig.iter().any(|&t| self.zonk(t) == ERROR) {
+                let span = self.span(e);
+                self.err(
+                    "L0610",
+                    span,
+                    "cannot infer the closure's signature",
+                    "Annotate the closure parameters, or use the closure where an Fn bound fixes them.",
+                );
+            }
+        }
         // Generic call sites become instance requests for mono,
         // with their args zonked into place for lowering.
         for (ei, template, args) in std::mem::take(&mut self.generic_sites) {

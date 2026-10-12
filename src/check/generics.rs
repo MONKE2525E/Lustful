@@ -1192,12 +1192,16 @@ pub fn build_generics(
     w: &ast::WhereClause,
     errs: &mut Vec<Diag>,
 ) -> (Generics, Scope) {
-    build_generics_shifted(ast, interner, known, cx, tys, g, w, 0, errs)
+    build_generics_shifted(ast, interner, known, cx, tys, g, w, 0, &Scope::default(), errs)
 }
 
 /// `build_generics` with parameter indexes shifted by `shift`
 /// (a trait's synthetic `Self` at 0, or an impl's parameters
-/// before a method's own).
+/// before a method's own). `seed` is the enclosing scope (an
+/// impl's or trait's parameters): bounds on these parameters
+/// may name the seed's parameters, so pass 2 resolves through
+/// seed ++ own. The returned scope holds only the own
+/// parameters; callers merge as before.
 #[allow(clippy::too_many_arguments)]
 pub fn build_generics_shifted(
     ast: &Ast,
@@ -1208,6 +1212,7 @@ pub fn build_generics_shifted(
     g: &ast::Generics,
     w: &ast::WhereClause,
     shift: u32,
+    seed: &Scope,
     errs: &mut Vec<Diag>,
 ) -> (Generics, Scope) {
     let mut params: Vec<ParamDef> = Vec::new();
@@ -1242,6 +1247,12 @@ pub fn build_generics_shifted(
     // Pass 2: bounds on parameters, then where predicates. Each
     // parameter's sources join the scope as they are built, so a
     // later bound may name an earlier parameter's assoc types.
+    // Resolution runs through the seed ++ own scope (`rscope`);
+    // the returned `scope` keeps only the own parameters.
+    let mut rscope = seed.clone();
+    rscope.type_params.extend(scope.type_params.iter().copied());
+    rscope.const_params.extend(scope.const_params.iter().copied());
+    rscope.param_tys.extend(scope.type_params.iter().map(|&(n, i)| (n, tys.intern(TyKind::Param(ParamId(i))))));
     let mut predicates: Vec<Predicate> = Vec::new();
     let mut relaxed: Vec<u32> = Vec::new();
     let mut type_param_tys: Vec<(u32, Ty)> = Vec::new();
@@ -1256,20 +1267,24 @@ pub fn build_generics_shifted(
         {
             let lhs = tys.intern(TyKind::Param(ParamId(idx)));
             for b in bounds {
-                bound_predicates(ast, interner, known, cx, tys, &scope, lhs, b, &mut predicates, &mut relaxed, errs);
+                bound_predicates(ast, interner, known, cx, tys, &rscope, lhs, b, &mut predicates, &mut relaxed, errs);
             }
             scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
+            rscope.assoc_srcs.clone_from(&seed.assoc_srcs);
+            rscope.assoc_srcs.extend(scope.assoc_srcs.iter().cloned());
         }
     }
     for pred in &w.preds {
         match pred {
             ast::WherePred::Lifetime { lt, .. } => errs.push(lifetime_diag(lt.span)),
-            ast::WherePred::Type { ty, bounds, .. } => match resolve_scoped(ast, interner, known, cx, tys, *ty, &scope) {
+            ast::WherePred::Type { ty, bounds, .. } => match resolve_scoped(ast, interner, known, cx, tys, *ty, &rscope) {
                 Ok(lhs) => {
                     for b in bounds {
-                        bound_predicates(ast, interner, known, cx, tys, &scope, lhs, b, &mut predicates, &mut relaxed, errs);
+                        bound_predicates(ast, interner, known, cx, tys, &rscope, lhs, b, &mut predicates, &mut relaxed, errs);
                     }
                     scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
+                    rscope.assoc_srcs.clone_from(&seed.assoc_srcs);
+                    rscope.assoc_srcs.extend(scope.assoc_srcs.iter().cloned());
                 }
                 Err(d) => errs.push(d),
             },
@@ -1310,7 +1325,7 @@ pub fn build_trait_generics(
     supertraits: &[TraitBound],
     errs: &mut Vec<Diag>,
 ) -> (Generics, Scope) {
-    let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, errs);
+    let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, &Scope::default(), errs);
     let self_ty = tys.intern(TyKind::Param(ParamId(0)));
     generics.params.insert(0, ParamDef { name: known.self_type, kind: ParamKind::Type, span: Span::default() });
     scope.self_ty = Some(self_ty);
@@ -1381,6 +1396,16 @@ pub enum FnClass {
     Stub,
 }
 
+/// One closure template or instance fn: the AST closure
+/// expression whose body it checks and lowers. The fn's generics
+/// are the enclosing fn's generics followed by one type
+/// parameter per closure parameter and one for the return type,
+/// so a closure instance key carries its whole signature.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureFn {
+    pub expr: crate::ast::ExprId,
+}
+
 /// One materialized fn instance: its template and concrete args
 /// (combined parent+own order). Lowering reads `template_local`
 /// today; the rest is the instance's identity for slot and
@@ -1419,6 +1444,13 @@ pub struct GenTables<'a> {
     pub fn_scopes: Vec<FnScope>,
     pub fn_class: Vec<FnClass>,
     pub instances: FxMap<LocalDefId, InstanceInfo>,
+    /// Closure fns (templates and their instances) by local id.
+    pub closure_fns: FxMap<LocalDefId, ClosureFn>,
+    /// The closure template fn for each closure expression.
+    pub closure_by_expr: FxMap<crate::ast::ExprId, LocalDefId>,
+    /// The closure template fn for each closure def (the def a
+    /// `TyKind::Closure` names).
+    pub closure_by_def: FxMap<DefId, LocalDefId>,
     pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
     /// Abstract (template-check) instances by the same key.
     pub abstract_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
@@ -1455,6 +1487,9 @@ impl Default for GenTables<'_> {
             fn_scopes: Vec::new(),
             fn_class: Vec::new(),
             instances: FxMap::default(),
+            closure_fns: FxMap::default(),
+            closure_by_expr: FxMap::default(),
+            closure_by_def: FxMap::default(),
             instance_by_key: FxMap::default(),
             abstract_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
@@ -1849,7 +1884,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let shift = generics.params.len() as u32;
             let (own_generics, own_scope) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                build_generics_shifted(p.ast, p.interner, p.known, &cx, &mut p.tys, &fdef.generics, &fdef.where_clause, shift, errs)
+                build_generics_shifted(p.ast, p.interner, p.known, &cx, &mut p.tys, &fdef.generics, &fdef.where_clause, shift, &scope, errs)
             };
             let mut combined = generics.clone();
             combined.params.extend(own_generics.params.iter().cloned());
@@ -2263,6 +2298,51 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 true,
                 span,
             );
+        }
+    }
+    // Closures: one Fn/FnMut/FnOnce (plus Copy/Clone) record per
+    // closure template. The Self pattern is the closure type over
+    // the template's parameters; the Fn input is the tuple of the
+    // signature parameters and Output is the return parameter.
+    // Only non-capturing closures exist in this slice, and those
+    // always implement all three Fn traits.
+    let closures: Vec<(DefId, LocalDefId)> = p.gx.closure_by_def.iter().map(|(&d, &l)| (d, l)).collect();
+    for (def, local) in closures {
+        let Some(Some(tmpl)) = p.gx.fn_templates.get(local.0 as usize).cloned() else { continue };
+        let mut lt = 0u32;
+        let pat_args: Vec<GenericArg> = tmpl
+            .generics
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, pd)| match pd.kind {
+                ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+                ParamKind::Lifetime => {
+                    let a = GenericArg::Lifetime(Region::Param(lt));
+                    lt += 1;
+                    a
+                }
+                ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+            })
+            .collect();
+        let args_id = p.tys.intern_args(&pat_args);
+        let self_pat = p.tys.intern(TyKind::Closure(def, args_id));
+        // The signature pattern is the template's own FnInfo:
+        // annotated types are fixed there, unwritten ones are
+        // the signature parameters.
+        let (inputs, output) = {
+            let info = p.fn_info(local);
+            (info.params.clone(), info.ret)
+        };
+        let ts = p.tys.intern_tys(&inputs);
+        let tuple = p.tys.intern(TyKind::Tuple(ts));
+        let generics = Generics { parent: None, params: tmpl.generics.params.clone(), predicates: Vec::new() };
+        for tr in [lang.fn_, lang.fn_mut, lang.fn_once] {
+            let assoc: Vec<(DefId, Ty)> = lang.output_of(tr).map(|o| vec![(o, output)]).unwrap_or_default();
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[tuple], generics.clone(), assoc, Synthetic::Lang, false, span);
+        }
+        for tr in [lang.copy, lang.clone] {
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], generics.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
     }
     // Lang facts for builtin types.
@@ -3020,9 +3100,16 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
         adt_instance(p, AdtId(a as u32), &args);
     }
     // Abstract fn instances, then check them to a fixpoint like
-    // the concrete loop, but collecting real errors.
-    let templates: Vec<LocalDefId> =
-        (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some())).collect();
+    // the concrete loop, but collecting real errors. Closure
+    // templates get no abstract instance: a closure signature
+    // is inferred, not universally quantified, so arbitrary
+    // opaques would be wrong types for the body. The enclosing
+    // abstract body checks the closure body in place instead
+    // (see `closure_expr`), which is where its errors report.
+    let templates: Vec<LocalDefId> = (0..p.fns.len() as u32)
+        .map(LocalDefId)
+        .filter(|&f| p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) && !p.gx.closure_fns.contains_key(&f))
+        .collect();
     let mut queue: Vec<LocalDefId> = Vec::new();
     for t in templates {
         let tmpl = p.gx.fn_templates[t.0 as usize].clone().unwrap();
@@ -3106,6 +3193,12 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
             };
             errs.append(&mut body_errs);
             for (template, owned_args) in checked {
+                // Closure instances are concrete-only (see the
+                // template list above); the body was already
+                // checked in place.
+                if p.gx.closure_fns.contains_key(&template) {
+                    continue;
+                }
                 let mut lifted: Vec<GenericArg> = Vec::new();
                 for a in &owned_args {
                     lifted.push(match a {
@@ -3298,6 +3391,9 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class
     };
     p.gx.fn_scopes.push(FnScope { env: Vec::new(), scope });
     p.gx.fn_class.push(class);
+    if let Some(cf) = p.gx.closure_fns.get(&template).copied() {
+        p.gx.closure_fns.insert(id, cf);
+    }
     p.gx.instances.insert(id, InstanceInfo { template_def, template_local: Some(template), args: args_id });
     if class == FnClass::Abstract {
         p.gx.abstract_by_key.insert((template_def, args_id), id);
@@ -3616,10 +3712,139 @@ pub fn append_trait_default_templates(p: &mut Program) {
     }
 }
 
+/// Appends one template fn per closure expression in every
+/// collected fn body. A closure template's generics are its
+/// enclosing fn's generics (the immediately enclosing closure
+/// for a nested one) plus one type parameter per UNWRITTEN
+/// signature type (closure parameters first, then the return
+/// type); written types resolve in the enclosing scope and
+/// are fixed parts of the template signature. Body checking
+/// instantiates the signature parameters from the body and
+/// Fn obligations, so mono materializes closure instances
+/// exactly like fn instances. Only non-capturing closures
+/// are supported; capture use is rejected during body checking.
+pub fn collect_closures(p: &mut Program, errs: &mut Vec<Diag>) {
+    let sig_name = p.interner.intern("<closure>");
+    let hosts: Vec<LocalDefId> = (0..p.fns.len() as u32)
+        .map(LocalDefId)
+        .filter(|&f| matches!(p.gx.fn_class.get(f.0 as usize), Some(FnClass::Plain | FnClass::Template) | None))
+        .collect();
+    for host in hosts {
+        let (lo, hi) = p.fn_info(host).def.exprs;
+        let mut found: Vec<ast::ExprId> = Vec::new();
+        for raw in lo..hi {
+            let e = ast::ExprId(raw);
+            if matches!(p.ast.expr(e), ast::Expr::Closure { .. }) {
+                found.push(e);
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        p.gx.has_generics = true;
+        // Token order, outer before inner at equal starts.
+        found.sort_by(|&a, &b| {
+            let (sa, sb) = (p.ast.expr_span(a), p.ast.expr_span(b));
+            (sa.lo, std::cmp::Reverse(sa.hi), std::cmp::Reverse(a.0)).cmp(&(sb.lo, std::cmp::Reverse(sb.hi), std::cmp::Reverse(b.0)))
+        });
+        let contains = |outer: Span, inner: Span| outer.lo <= inner.lo && inner.hi <= outer.hi;
+        // (span, local id) of enclosing closures, innermost last.
+        let mut stack: Vec<(Span, LocalDefId)> = Vec::new();
+        // Ordinal among the closures of one enclosing body.
+        let mut ordinals: FxMap<LocalDefId, u32> = FxMap::default();
+        for e in found {
+            let span = p.ast.expr_span(e);
+            while stack.last().is_some_and(|(s, _)| !contains(*s, span)) {
+                stack.pop();
+            }
+            let parent = stack.last().map_or(host, |&(_, l)| l);
+            let ordinal = {
+                let o = ordinals.entry(parent).or_insert(0);
+                let v = *o;
+                *o += 1;
+                v
+            };
+            let (mut generics, env, scope) = match p.gx.fn_templates.get(parent.0 as usize).cloned().flatten() {
+                Some(t) => (t.generics, t.env, p.gx.fn_scopes[parent.0 as usize].scope.clone()),
+                None => (Generics::default(), p.gx.fn_scopes[parent.0 as usize].env.clone(), p.gx.fn_scopes[parent.0 as usize].scope.clone()),
+            };
+            generics.parent = None;
+            let n_parent = generics.params.len();
+            let (ctys, cret) = match p.ast.expr(e) {
+                ast::Expr::Closure { params: cparams, ret: cret, .. } => (cparams.iter().map(|c| c.ty).collect::<Vec<_>>(), *cret),
+                _ => unreachable!(),
+            };
+            // Written signature types are fixed template types
+            // resolved in the enclosing scope; unwritten ones
+            // become signature parameters, in written order.
+            let written = |p: &mut Program, t: ast::TyId, scope: &Scope, errs: &mut Vec<Diag>| {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, t, scope).unwrap_or_else(|d| {
+                    errs.push(d);
+                    ERROR
+                })
+            };
+            let mut next_param = n_parent as u32;
+            let mut mk = |p: &mut Program, generics: &mut Generics, t: Option<ast::TyId>, scope: &Scope, errs: &mut Vec<Diag>| match t {
+                Some(t) => written(p, t, scope, errs),
+                None => {
+                    let ty = p.tys.intern(TyKind::Param(ParamId(next_param)));
+                    next_param += 1;
+                    generics.params.push(ParamDef { name: sig_name, kind: ParamKind::Type, span });
+                    ty
+                }
+            };
+            let mut params: Vec<Ty> = Vec::new();
+            for ct in ctys {
+                params.push(mk(p, &mut generics, ct, &scope.clone(), errs));
+            }
+            let ret = mk(p, &mut generics, cret, &scope.clone(), errs);
+            let parent_def = p.def_id(parent);
+            let name = p.fn_info(parent).name;
+            let def = p.fn_info(host).def;
+            let def_id = DefId {
+                krate: p.krate,
+                hash: crate::def::item_hash(
+                    p.stable_crate,
+                    &["<closure>"],
+                    crate::def::DefKind::Fn,
+                    &format!("{}#{ordinal}", parent_def.hash.0),
+                    0,
+                ),
+            };
+            let local = LocalDefId(p.fns.len() as u32);
+            p.fn_defs.push(def_id);
+            p.def_by_hash.entry(def_id.hash).or_insert(local);
+            let mut data = crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Fn, None, name, crate::ty::defs::Vis::Priv, span);
+            data.generics = generics.clone();
+            data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
+            p.defs.insert(def_id, data);
+            p.fns.push(crate::check::collect::FnInfo {
+                name,
+                def,
+                owner: None,
+                self_kind: None,
+                params,
+                ret,
+                ret_borrows_from: None,
+                is_const: false,
+            });
+            p.gx.fn_templates.push(Some(FnTemplate { generics, env: env.clone() }));
+            p.gx.fn_scopes.push(FnScope { env, scope });
+            p.gx.fn_class.push(FnClass::Template);
+            p.gx.closure_fns.insert(local, ClosureFn { expr: e });
+            p.gx.closure_by_expr.insert(e, local);
+            p.gx.closure_by_def.insert(def_id, local);
+            stack.push((span, local));
+        }
+    }
+}
+
 /// The last collect step before mono: synthetic impls, then
 /// coherence over the whole index (section 2.6).
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
+    collect_closures(p, errs);
     add_synthetic_impls(p);
     let is_local = |d: DefId| d.krate == p.krate;
     let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &is_local);

@@ -1437,7 +1437,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let shift = parent_gen.generics.params.len() as u32;
         let (own_generics, own_scope) = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &def.generics, &def.where_clause, shift, errs)
+            generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &def.generics, &def.where_clause, shift, &parent_gen.scope, errs)
         };
         let mut generics = parent_gen.generics.clone();
         generics.params.extend(own_generics.params.iter().cloned());
@@ -2137,6 +2137,8 @@ fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
+        // Fn items, fn pointers, and (non-capturing) closures are Copy.
+        TyKind::FnDef(..) | TyKind::FnPtr(_) | TyKind::Closure(..) => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),

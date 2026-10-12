@@ -65,7 +65,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
                 Box::new(cty(tys, b.value.output)),
             )
         }
-        TyKind::FnDef(..) => CTy::Unit,
+        TyKind::FnDef(..) | TyKind::Closure(..) => CTy::Unit,
         TyKind::Str => CTy::Str,
         TyKind::Tuple(ts) => CTy::Tuple(tys.tys_of(ts).iter().map(|&e| cty(tys, e)).collect()),
         TyKind::Array(e, c) => {
