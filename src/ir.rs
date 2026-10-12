@@ -92,6 +92,14 @@ pub enum Rvalue {
     StringAdd(Operand, Operand),
     Format(Vec<FmtPart>),
     Discriminant(Place),
+    /// A tuple value of the given type from its elements, in order (W-CORELANG, wave A).
+    TupleAgg(Ty, Vec<Operand>),
+    /// An array value of the given type from its elements, in order (W-CORELANG, wave A).
+    /// Array repeat of a Copy element lowers to `ArrayRepeat` instead.
+    ArrayAgg(Ty, Vec<Operand>),
+    /// `[value; len]` of the given array type for a Copy element with len
+    /// above 1 (W-CORELANG, wave A).
+    ArrayRepeat(Ty, Operand, u64),
 }
 
 #[derive(Clone, Debug)]

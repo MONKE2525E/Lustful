@@ -250,7 +250,10 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
             f(a);
             f(b);
         }
-        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) => ops.iter().for_each(f),
+        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
+            ops.iter().for_each(f)
+        }
+        Rvalue::ArrayRepeat(_, o, _) => f(o),
         Rvalue::Format(parts) => parts.iter().for_each(|p| {
             if let FmtPart::Arg { value, .. } = p {
                 f(value)

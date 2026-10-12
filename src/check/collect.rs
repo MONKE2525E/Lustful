@@ -282,9 +282,51 @@ pub fn resolve_ty(
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
         }
-        // AST v2 type forms: the parser rejects each one today, so this is
-        // only a reject path for completeness.
+        TyExpr::Tuple(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for &e in elems {
+                out.push(resolve_ty(ast, interner, known, type_names, tys, e, self_ty)?);
+            }
+            let ts = tys.intern_tys(&out);
+            Ok(tys.intern(TyKind::Tuple(ts)))
+        }
+        TyExpr::Slice(inner) => {
+            let e = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
+            Ok(tys.intern(TyKind::Slice(e)))
+        }
+        TyExpr::Array { inner, len } => {
+            let e = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
+            let n = eval_array_len(ast, *len).ok_or_else(|| {
+                Diag::new("L0110", span, "array length must be a constant integer", "Write a literal length such as `[u8; 4]`.")
+            })?;
+            let c = tys.intern_const(ConstKind::Int(n));
+            Ok(tys.intern(TyKind::Array(e, c)))
+        }
+        TyExpr::Paren(inner) => resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty),
         _ => Err(not_yet("L0602", span, "this type form")),
+    }
+}
+
+/// Evaluates an array length expression at collection time. Only literal
+/// integer arithmetic is in the bound today; named consts join with the
+/// const evaluator (ARCH 2.13) in `ty::consteval`.
+pub fn eval_array_len(ast: &Ast, e: ast::ExprId) -> Option<u128> {
+    use crate::ast::{BinOp, Expr, UnOp};
+    match ast.expr(e) {
+        Expr::Int(v, _) => Some(*v as u128),
+        Expr::Unary { op: UnOp::Neg, .. } => None,
+        Expr::Binary { op, lhs, rhs } => {
+            let (a, b) = (eval_array_len(ast, *lhs)?, eval_array_len(ast, *rhs)?);
+            match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div => a.checked_div(b),
+                BinOp::Rem => a.checked_rem(b),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -646,6 +688,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
 pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Ref(..) => true,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| contains_ref(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => contains_ref(tys, e),
         _ if tys.is_chars_ty(t) => true,
         _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
             Some(e) => contains_ref(tys, e),
@@ -661,19 +705,30 @@ fn contains_adt_by_value(p: &Program, root: AdtId, cur: AdtId, seen: &mut Vec<bo
     seen[cur.0 as usize] = true;
     for v in &p.adt(cur).variants {
         for f in &v.fields {
-            // Option<T> holds T by value.
-            let mut t = f.ty;
-            while let Some(inner) = p.tys.option_elem(t) {
-                t = inner;
-            }
-            if let Some(a) = p.tys.local_adt(t)
-                && (a == root || contains_adt_by_value(p, root, a, seen))
-            {
+            if type_holds_adt_by_value(p, root, f.ty, seen) {
                 return true;
             }
         }
     }
     false
+}
+
+/// True when a field type holds the root Adt by value, through Option, tuple,
+/// and array wrappers (all of which store their elements inline).
+fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>) -> bool {
+    match p.tys.kind(t) {
+        TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().any(|&e| type_holds_adt_by_value(p, root, e, seen)),
+        TyKind::Array(e, _) => type_holds_adt_by_value(p, root, e, seen),
+        _ => {
+            if let Some(inner) = p.tys.option_elem(t) {
+                return type_holds_adt_by_value(p, root, inner, seen);
+            }
+            match p.tys.local_adt(t) {
+                Some(a) => a == root || contains_adt_by_value(p, root, a, seen),
+                None => false,
+            }
+        }
+    }
 }
 
 // Trait queries. Lust has no user traits yet, so these follow fixed rules plus derives.
@@ -686,6 +741,8 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),
+        TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
             if let Some(e) = tys.option_elem(t) {
                 return is_copy(p, tys, e);
@@ -699,6 +756,11 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| has_clone(p, tys, e)),
+        TyKind::Array(e, _) => return has_clone(p, tys, e),
+        _ => {}
+    }
     if tys.is_string_ty(t) {
         return true;
     }
@@ -716,6 +778,8 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => has_eq(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_eq(p, tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => has_eq(p, tys, e),
         _ => {
             if tys.is_string_ty(t) {
                 return true;
@@ -736,6 +800,8 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => has_debug(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_debug(p, tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => has_debug(p, tys, e),
         _ => {
             if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::Args) {
                 return true;
@@ -762,6 +828,11 @@ pub fn has_display(tys: &impl TyIntern, t: Ty) -> bool {
 
 /// True if values of this type own heap memory and need a drop call.
 pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop(p, tys, e)),
+        TyKind::Array(e, _) => return needs_drop(p, tys, e),
+        _ => {}
+    }
     if tys.is_string_ty(t) || tys.vec_elem(t).is_some() {
         return true;
     }

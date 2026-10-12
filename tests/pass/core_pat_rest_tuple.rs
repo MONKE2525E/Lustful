@@ -1,4 +1,3 @@
-// expect: L0820
 enum E {
     V(i64, i64, i64),
 }

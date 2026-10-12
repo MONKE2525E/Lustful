@@ -171,7 +171,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn is_place_expr(&self, e: ExprId) -> bool {
         match self.p.ast.expr(e) {
             Expr::Path(_) | Expr::SelfValue => matches!(self.ck.res(e), Res::Local(_)),
-            Expr::Field { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
+            Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
             _ => false,
         }
     }
@@ -193,6 +193,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         match (self.p.ast.expr(e), self.ck.res(e)) {
             (Expr::Path(_) | Expr::SelfValue, Res::Local(l)) => Place::local(self.local_map[l as usize]),
             (Expr::Field { base, .. }, Res::Field { derefs, index }) => {
+                let b = self.place(*base);
+                Self::derefs(b, derefs).project(Proj::Field(index))
+            }
+            (Expr::TupleField { base, .. }, Res::Field { derefs, index }) => {
                 let b = self.place(*base);
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
@@ -221,7 +225,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             // through `expr_into` would call `place` on this same expression
             // forever. The checker or borrow checker already reports the real
             // error; give lowering a dummy place and move on.
-            (Expr::Field { .. } | Expr::Index { .. }, _) => {
+            (Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. }, _) => {
                 let t = self.temp(self.ty(e));
                 Place::local(t)
             }
@@ -364,7 +368,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
                 _ => {}
             },
-            Expr::Field { .. } | Expr::Index { .. } | Expr::Deref(_) => {
+            Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
                 let pl = self.place(e);
                 if let Some(d) = dest {
                     let op = self.operand_from(pl, ty);
@@ -562,11 +566,35 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Return, span);
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_into(e, *kind, args, fmt, *repeat, dest, ty, span),
-            // AST v2 expression forms: the parser rejects each one today.
+            Expr::Tuple(elems) => {
+                let ops: Vec<Operand> = elems.iter().map(|&el| self.operand(el)).collect();
+                self.set_or_temp(dest, Rvalue::TupleAgg(ty, ops), ty, span);
+            }
+            Expr::Array(elems) => {
+                let ops: Vec<Operand> = elems.iter().map(|&el| self.operand(el)).collect();
+                self.set_or_temp(dest, Rvalue::ArrayAgg(ty, ops), ty, span);
+            }
+            Expr::ArrayRepeat { value, .. } => {
+                let n = match self.kind(ty) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => n as u64,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                if n == 0 {
+                    // Rust does not evaluate the element for a zero repeat.
+                    self.set_or_temp(dest, Rvalue::ArrayAgg(ty, Vec::new()), ty, span);
+                } else if n == 1 {
+                    let o = self.operand(*value);
+                    self.set_or_temp(dest, Rvalue::ArrayAgg(ty, vec![o]), ty, span);
+                } else {
+                    let o = self.operand(*value);
+                    self.set_or_temp(dest, Rvalue::ArrayRepeat(ty, o, n), ty, span);
+                }
+            }
+            // AST v2 expression forms the parser still rejects.
             Expr::Float(_)
-            | Expr::Tuple(_)
-            | Expr::Array(_)
-            | Expr::ArrayRepeat { .. }
             | Expr::Closure { .. }
             | Expr::Try(_)
             | Expr::Await(_)
@@ -574,7 +602,6 @@ impl<'p, 'a> Lower<'p, 'a> {
             | Expr::UnsafeBlock(_)
             | Expr::LabeledBlock { .. }
             | Expr::Let { .. }
-            | Expr::TupleField { .. }
             | Expr::QPath { .. }
             | Expr::ConstBlock(_)
             | Expr::Underscore
@@ -689,7 +716,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.pop_scope(span);
                 }
             }
-            _ => {}
+            _ => {
+                // A destructuring `let`: evaluate the initializer into a
+                // temporary, then bind the pattern out of it. The temporary
+                // stays in scope (before the bindings) so fields the pattern
+                // does not move still drop at scope exit.
+                if let Some(init) = init {
+                    let tty = self.ty(init);
+                    let t = self.new_local(tty, true, None);
+                    self.scopes.push(Vec::new());
+                    self.expr_into(init, Some(&Place::local(t)));
+                    self.pop_scope(span);
+                    self.scopes.last_mut().unwrap().push(t);
+                    self.bind_pat(pat, Place::local(t));
+                }
+            }
         }
     }
 
@@ -1106,15 +1147,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Goto(fail), span);
                 self.cur = cont;
             }
-            // AST v2 pattern forms: the parser rejects each one today.
-            Pat::Tuple(_)
-            | Pat::Slice { .. }
-            | Pat::Ref { .. }
-            | Pat::At { .. }
-            | Pat::Rest
-            | Pat::Paren(_)
-            | Pat::QPath { .. }
-            | Pat::MacroCall(_) => {}
+            Pat::Tuple(elems) => {
+                let n = match self.kind(ty) {
+                    TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
+                    _ => elems.len(),
+                };
+                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                    for (i, sub) in mapped {
+                        self.test_pat(sub, place.project(Proj::Field(i as u32)), fail);
+                    }
+                }
+            }
+            Pat::Rest => {}
+            Pat::Paren(inner) => self.test_pat(*inner, place, fail),
+            // AST v2 pattern forms the parser still rejects.
+            Pat::Slice { .. } | Pat::Ref { .. } | Pat::At { .. } | Pat::QPath { .. } | Pat::MacroCall(_) => {}
         }
     }
 
@@ -1122,7 +1169,14 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn sub_pats(&self, pat: PatId, a: AdtId, v: u32) -> Vec<(u32, PatId)> {
         let p = self.p;
         match p.ast.pat(pat) {
-            Pat::TupleStruct { elems, .. } => elems.iter().enumerate().map(|(i, &s)| (i as u32, s)).collect(),
+            Pat::TupleStruct { elems, .. } => {
+                let n = p.adt(a).variants[v as usize].fields.len();
+                crate::check::map_tuple_elems(p.ast, elems, n)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(i, s)| (i as u32, s))
+                    .collect()
+            }
             Pat::Struct { fields, .. } => {
                 let vf = &p.adt(a).variants[v as usize].fields;
                 fields.iter().filter_map(|&(n, s)| vf.iter().position(|f| f.name == n).map(|i| (i as u32, s))).collect()
@@ -1158,6 +1212,19 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.bind_pat(sub, base.project(Proj::Field(i)));
                 }
             }
+            (Pat::Tuple(elems), _) => {
+                let ty = self.ck.pat_ty(pat);
+                let n = match self.kind(ty) {
+                    TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
+                    _ => elems.len(),
+                };
+                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                    for (i, sub) in mapped {
+                        self.bind_pat(sub, place.project(Proj::Field(i as u32)));
+                    }
+                }
+            }
+            (Pat::Paren(inner), _) => self.bind_pat(*inner, place),
             _ => {}
         }
     }

@@ -1,4 +1,3 @@
-// expect: L0820
 fn main() {
     let a = [1, 2, 3];
     println!("{}", a[0]);

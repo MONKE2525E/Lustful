@@ -1,4 +1,3 @@
-// expect: L0602
 fn first(a: [i64; 3]) -> i64 {
     a[0]
 }

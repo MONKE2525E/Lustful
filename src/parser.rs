@@ -922,7 +922,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 VariantFields::Unit
             }
-            Tok::LParen => return Err(self.reject(C_CORE, "tuple structs")),
+            Tok::LParen => {
+                self.bump();
+                let fs = self.tuple_fields()?;
+                self.expect(Tok::Semi, "`;`")?;
+                VariantFields::Tuple(fs)
+            }
             _ => VariantFields::Struct(self.fields()?),
         };
         Ok(StructDef { name, name_span, generics: Generics::default(), fields, where_clause: WhereClause::default(), derives })
@@ -1038,9 +1043,34 @@ impl<'a> Parser<'a> {
                 if self.eat(Tok::RParen) {
                     return Ok(self.push_ty(TyExpr::Unit, start.to(self.prev_span())));
                 }
-                Err(not_yet(C_TY, start, "tuple types"))
+                let mut elems = vec![self.ty()?];
+                let mut tuple = false;
+                while self.eat(Tok::Comma) {
+                    tuple = true;
+                    if self.peek() == Tok::RParen {
+                        break;
+                    }
+                    elems.push(self.ty()?);
+                }
+                self.expect(Tok::RParen, "`)`")?;
+                if tuple {
+                    Ok(self.push_ty(TyExpr::Tuple(elems), start.to(self.prev_span())))
+                } else {
+                    Ok(elems[0])
+                }
             }
-            Tok::LBracket => Err(not_yet(C_TY, start, "array and slice types")),
+            Tok::LBracket => {
+                self.bump();
+                let inner = self.ty()?;
+                if self.eat(Tok::Semi) {
+                    let len = self.expr()?;
+                    self.expect(Tok::RBracket, "`]`")?;
+                    Ok(self.push_ty(TyExpr::Array { inner, len }, start.to(self.prev_span())))
+                } else {
+                    self.expect(Tok::RBracket, "`]`")?;
+                    Ok(self.push_ty(TyExpr::Slice(inner), start.to(self.prev_span())))
+                }
+            }
             Tok::Impl => Err(not_yet(C_TY, start, "`impl Trait` types")),
             Tok::Dyn => Err(not_yet(C_TY, start, "`dyn Trait` types")),
             Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
@@ -1265,9 +1295,12 @@ impl<'a> Parser<'a> {
                         let mut elems = Vec::new();
                         while self.peek() != Tok::RParen {
                             if self.peek() == Tok::DotDot {
-                                return Err(self.reject(C_CORE, "`..` in tuple patterns"));
+                                let s = self.span();
+                                self.bump();
+                                elems.push(self.push_pat(Pat::Rest, s));
+                            } else {
+                                elems.push(self.pattern()?);
                             }
-                            elems.push(self.pattern()?);
                             if !self.eat(Tok::Comma) {
                                 break;
                             }
@@ -1315,7 +1348,29 @@ impl<'a> Parser<'a> {
                     _ => Pat::Path(path),
                 }
             }
-            Tok::LParen => return Err(not_yet(C_CORE, start, "tuple patterns")),
+            Tok::LParen => {
+                self.bump();
+                let mut elems = Vec::new();
+                let mut tuple = false;
+                while self.peek() != Tok::RParen {
+                    if self.peek() == Tok::DotDot {
+                        let s = self.span();
+                        self.bump();
+                        elems.push(self.push_pat(Pat::Rest, s));
+                    } else {
+                        elems.push(self.pattern()?);
+                    }
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                    tuple = true;
+                }
+                self.expect(Tok::RParen, "`)`")?;
+                if !tuple && elems.len() == 1 {
+                    return Ok(elems[0]);
+                }
+                Pat::Tuple(elems)
+            }
             Tok::LBracket => return Err(not_yet(C_CORE, start, "slice patterns")),
             Tok::Amp | Tok::AndAnd => return Err(not_yet(C_CORE, start, "reference patterns")),
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
@@ -1548,8 +1603,29 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Dot => {
                     self.bump();
-                    if let Tok::Int(..) = self.peek() {
-                        return Err(self.reject(C_CORE, "tuple fields"));
+                    if let Tok::Float(i) = self.peek() {
+                        // `t.0.1` lexes the `0.1` as one float token; in field
+                        // position it is two tuple indexes, as in rustc.
+                        let text = self.ast.strings[(i + self.str_base) as usize].clone();
+                        let parts: Vec<&str> = text.split('.').collect();
+                        if parts.len() == 2 && parts.iter().all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+                            self.bump();
+                            for part in parts {
+                                let index: u32 = part.parse().map_err(|_| syntax(self.span(), "invalid tuple field index"))?;
+                                e = self.push_expr(Expr::TupleField { base: e, index }, start.to(self.prev_span()));
+                            }
+                            continue;
+                        }
+                        return Err(syntax(self.span(), "expected identifier, found float literal"));
+                    }
+                    if let Tok::Int(v, suffix) = self.peek() {
+                        if suffix.is_some() || v > u32::MAX as u64 {
+                            return Err(syntax(self.span(), "invalid tuple field index"));
+                        }
+                        let index = v as u32;
+                        self.bump();
+                        e = self.push_expr(Expr::TupleField { base: e, index }, start.to(self.prev_span()));
+                        continue;
                     }
                     if self.peek() == Tok::Await {
                         return Err(async_error(self.span()));
@@ -1742,15 +1818,46 @@ impl<'a> Parser<'a> {
                 if self.eat(Tok::RParen) {
                     Expr::Unit
                 } else {
-                    let inner = self.expr()?;
-                    if self.peek() == Tok::Comma {
-                        return Err(self.reject(C_CORE, "tuples"));
+                    let mut elems = vec![self.expr()?];
+                    let mut tuple = false;
+                    while self.eat(Tok::Comma) {
+                        tuple = true;
+                        if self.peek() == Tok::RParen {
+                            break;
+                        }
+                        elems.push(self.expr()?);
                     }
                     self.expect(Tok::RParen, "`)`")?;
-                    return Ok(inner);
+                    if tuple {
+                        Expr::Tuple(elems)
+                    } else {
+                        return Ok(elems[0]);
+                    }
                 }
             }
-            Tok::LBracket => return Err(not_yet(C_CORE, start, "array literals")),
+            Tok::LBracket => {
+                self.bump();
+                if self.eat(Tok::RBracket) {
+                    Expr::Array(Vec::new())
+                } else {
+                    let first = self.expr()?;
+                    if self.eat(Tok::Semi) {
+                        let len = self.expr()?;
+                        self.expect(Tok::RBracket, "`]`")?;
+                        Expr::ArrayRepeat { value: first, len }
+                    } else {
+                        let mut elems = vec![first];
+                        while self.eat(Tok::Comma) {
+                            if self.peek() == Tok::RBracket {
+                                break;
+                            }
+                            elems.push(self.expr()?);
+                        }
+                        self.expect(Tok::RBracket, "`]`")?;
+                        Expr::Array(elems)
+                    }
+                }
+            }
             Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace => return self.block_like_expr(),
             Tok::Break => {
                 self.bump();

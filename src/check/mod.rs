@@ -301,6 +301,35 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
+/// Maps written tuple pattern elements to field indexes. At most one `..`
+/// may appear; elements after it count from the end. None on an arity
+/// mismatch or a second `..`. Lowering uses the same mapping.
+pub fn map_tuple_elems(ast: &crate::ast::Ast, elems: &[PatId], nfields: usize) -> Option<Vec<(usize, PatId)>> {
+    let rest = elems.iter().position(|&s| matches!(ast.pat(s), Pat::Rest));
+    match rest {
+        None => {
+            if elems.len() != nfields {
+                return None;
+            }
+            Some(elems.iter().enumerate().map(|(i, &s)| (i, s)).collect())
+        }
+        Some(r) => {
+            if elems[r + 1..].iter().any(|&s| matches!(ast.pat(s), Pat::Rest)) {
+                return None;
+            }
+            let suffix = elems.len() - r - 1;
+            if r + suffix > nfields {
+                return None;
+            }
+            let mut out: Vec<(usize, PatId)> = elems[..r].iter().enumerate().map(|(i, &s)| (i, s)).collect();
+            for (j, &s) in elems[r + 1..].iter().enumerate() {
+                out.push((nfields - suffix + j, s));
+            }
+            Some(out)
+        }
+    }
+}
+
 fn string_eq_ok(ld: u8, lk_is_string: bool, rd: u8, rk_is_string: bool) -> bool {
     let peel = ld.min(rd);
     let (la, ra) = ((ld - peel, lk_is_string), (rd - peel, rk_is_string));
@@ -365,6 +394,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
         let p = self.p;
         p.binding(&mut self.out.reads, ROOT_MODULE, ns, name)
+    }
+
+    /// The tuple struct a value binding names as a constructor, if it names one.
+    fn tuple_struct_ctor(&mut self, name: Sym) -> Option<AdtId> {
+        match self.binding(Namespace::Value, name) {
+            BindingRes::Def(def) => match self.p.adt_by_def(def) {
+                Some(a) if !self.p.adt(a).is_enum && self.p.adt(a).variants[0].shape == VariantShape::Tuple => Some(a),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The free fn a value binding names, if it names one.
@@ -671,8 +711,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.out.pat_ty[pi] = ty;
                         }
                         _ => {
-                            let s = self.p.ast.pat_span(*pat);
-                            self.errs.push(unsupported(s, "destructuring in `let`"));
+                            if init.is_none() {
+                                let s = self.p.ast.pat_span(*pat);
+                                self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
+                            } else {
+                                self.pattern(*pat, ty, false);
+                                if !self.irrefutable(*pat) {
+                                    let s = self.p.ast.pat_span(*pat);
+                                    self.err(
+                                        "L0110",
+                                        s,
+                                        "refutable pattern in local binding",
+                                        "Use `match` or `if let` for a pattern that can fail.",
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -866,6 +919,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let (derefs, inner) = self.autoderef(bt);
                 self.expect_expr(*index, USIZE);
                 match self.kind(inner) {
+                    TyKind::Array(elem, _) | TyKind::Slice(elem) => {
+                        self.set_res(e, Res::Index { derefs });
+                        elem
+                    }
                     _ if self.tys.vec_elem(inner).is_some() => {
                         self.set_res(e, Res::Index { derefs });
                         self.tys.vec_elem(inner).unwrap()
@@ -1070,11 +1127,103 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 NEVER
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_expr(e, *kind, args, fmt, *repeat, span, expected),
-            // AST v2 expression forms: the parser rejects each one today.
+            Expr::Tuple(elems) => {
+                let exp: Option<Vec<Ty>> = expected.and_then(|t| match self.kind(t) {
+                    TyKind::Tuple(ts) if self.tys.tys_of(ts).len() == elems.len() => Some(self.tys.tys_of(ts).to_vec()),
+                    _ => None,
+                });
+                let mut out = Vec::with_capacity(elems.len());
+                for (i, &el) in elems.iter().enumerate() {
+                    out.push(self.expr(el, exp.as_ref().map(|v| v[i])));
+                }
+                let ts = self.tys.intern_tys(&out);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            Expr::Array(elems) => {
+                let exp_elem = expected.and_then(|t| match self.kind(t) {
+                    TyKind::Array(el, _) => Some(el),
+                    _ => None,
+                });
+                let elem = match (exp_elem, elems.first()) {
+                    (Some(el), _) => {
+                        for &el_e in elems {
+                            self.expect_expr(el_e, el);
+                        }
+                        el
+                    }
+                    (None, Some(&first)) => {
+                        let el = self.expr(first, None);
+                        for &el_e in &elems[1..] {
+                            self.expect_expr(el_e, el);
+                        }
+                        el
+                    }
+                    (None, None) => self.new_var(false),
+                };
+                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                self.tys.intern(TyKind::Array(elem, c))
+            }
+            Expr::ArrayRepeat { value, len } => {
+                let exp_elem = expected.and_then(|t| match self.kind(t) {
+                    TyKind::Array(el, _) => Some(el),
+                    _ => None,
+                });
+                let elem = self.expr(*value, exp_elem);
+                self.expect_expr(*len, USIZE);
+                let n = crate::check::collect::eval_array_len(p.ast, *len);
+                match n {
+                    Some(n) => {
+                        if n > 1 && !is_copy(p, &self.tys, self.resolve(elem)) {
+                            self.err(
+                                "L0110",
+                                span,
+                                "the trait `Copy` is not implemented for this type",
+                                "Array repeat with a length above 1 needs a Copy element, or write the elements out.",
+                            );
+                        }
+                        let c = self.tys.intern_const(ConstKind::Int(n));
+                        self.tys.intern(TyKind::Array(elem, c))
+                    }
+                    None => {
+                        self.err(
+                            "L0110",
+                            span,
+                            "array repeat length must be a constant integer",
+                            "Write a literal length such as `[0; 4]`.",
+                        );
+                        ERROR
+                    }
+                }
+            }
+            Expr::TupleField { base, index } => {
+                let bt = self.expr(*base, None);
+                self.obl.run_before_structural();
+                let (derefs, inner) = self.autoderef(bt);
+                let field_ty = match self.kind(inner) {
+                    TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
+                    _ => match self.tys.local_adt(inner) {
+                        Some(a) if !p.adt(a).is_enum && p.adt(a).variants[0].shape == VariantShape::Tuple => {
+                            p.adt(a).variants[0].fields.get(*index as usize).map(|f| f.ty)
+                        }
+                        _ => None,
+                    },
+                };
+                match field_ty {
+                    Some(t) => {
+                        self.set_res(e, Res::Field { derefs, index: *index });
+                        t
+                    }
+                    None => {
+                        if !matches!(self.kind(inner), TyKind::Error) {
+                            let tn = self.tn(bt);
+                            self.err("L0103", span, format!("no field `{index}` on type `{tn}`"), "Check the field index.");
+                        }
+                        ERROR
+                    }
+                }
+            }
+            // AST v2 expression forms the parser still rejects.
             Expr::Float(_)
-            | Expr::Tuple(_)
-            | Expr::Array(_)
-            | Expr::ArrayRepeat { .. }
             | Expr::Closure { .. }
             | Expr::Try(_)
             | Expr::Await(_)
@@ -1082,7 +1231,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | Expr::UnsafeBlock(_)
             | Expr::LabeledBlock { .. }
             | Expr::Let { .. }
-            | Expr::TupleField { .. }
             | Expr::QPath { .. }
             | Expr::ConstBlock(_)
             | Expr::Underscore
@@ -1122,7 +1270,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn place_check(&mut self, e: ExprId) {
         let ok = match self.p.ast.expr(e) {
             Expr::Path(segs) => segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)),
-            Expr::Field { .. } | Expr::Index { .. } | Expr::Deref(_) | Expr::SelfValue => true,
+            Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) | Expr::SelfValue => true,
             _ => false,
         };
         if !ok {
@@ -1386,7 +1534,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match self.binding_fn(name) {
                     Some(f) => Res::Fn(f),
                     None if name == p.known.Some => Res::OptSome,
-                    None => {
+                    None => match self.tuple_struct_ctor(name) {
+                        Some(a) => Res::Variant(a, 0),
+                        None => {
                         let cs = self.span(callee);
                         self.err(
                             "L0101",
@@ -1398,7 +1548,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.expr(a, None);
                         }
                         return ERROR;
-                    }
+                        }
+                    },
                 }
             }
             Expr::Path(segs) => {
@@ -2103,7 +2254,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut mode = mode;
         let opt = self.option_pattern(pat);
         let structural = opt.is_some()
-            || matches!(p.ast.pat(pat), Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(_) | Pat::Lit(_) | Pat::Range { .. });
+            || matches!(
+                p.ast.pat(pat),
+                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(_) | Pat::Lit(_) | Pat::Range { .. } | Pat::Tuple(_)
+            );
         if structural {
             let mut derefs = 0;
             while let TyKind::Ref(_, m, inner) = self.tys.kind(t) {
@@ -2228,7 +2382,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                     Pat::TupleStruct { elems, .. } => {
-                        if variant.shape != VariantShape::Tuple || variant.fields.len() != elems.len() {
+                        if variant.shape != VariantShape::Tuple {
                             self.err(
                                 "L0110",
                                 span,
@@ -2237,7 +2391,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             );
                             return;
                         }
-                        for (i, &sub) in elems.iter().enumerate() {
+                        let Some(mapped) = map_tuple_elems(p.ast, elems, variant.fields.len()) else {
+                            self.err(
+                                "L0110",
+                                span,
+                                format!("this variant has {} field(s)", variant.fields.len()),
+                                "Match every field, use `_`, or skip the middle with `..`.",
+                            );
+                            return;
+                        };
+                        for (i, sub) in mapped {
                             let ft = variant.fields[i].ty;
                             self.pattern_mode(sub, ft, mode, in_match);
                         }
@@ -2287,15 +2450,61 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            // AST v2 pattern forms: the parser rejects each one today.
-            Pat::Tuple(_)
-            | Pat::Slice { .. }
-            | Pat::Ref { .. }
-            | Pat::At { .. }
-            | Pat::Rest
-            | Pat::Paren(_)
-            | Pat::QPath { .. }
-            | Pat::MacroCall(_) => {}
+            Pat::Tuple(elems) => {
+                if elems.is_empty() {
+                    if !self.unify(t, UNIT) {
+                        self.mismatch(span, t, UNIT);
+                    }
+                    return;
+                }
+                let elem_tys: Vec<Ty> = (0..elems.len()).map(|_| self.new_var(false)).collect();
+                // A rest element means the arity is not the written count; take
+                // element types from the scrutinee tuple when it is known.
+                let known: Option<Vec<Ty>> = match self.kind(t) {
+                    TyKind::Tuple(ts) => Some(self.tys.tys_of(ts).to_vec()),
+                    _ => None,
+                };
+                match known {
+                    Some(kt) => {
+                        let Some(mapped) = map_tuple_elems(p.ast, elems, kt.len()) else {
+                            self.err(
+                                "L0110",
+                                span,
+                                format!("this tuple has {} element(s)", kt.len()),
+                                "Match every element, use `_`, or skip the middle with `..`.",
+                            );
+                            return;
+                        };
+                        for (i, sub) in mapped {
+                            self.pattern_mode(sub, kt[i], mode, in_match);
+                        }
+                    }
+                    None => {
+                        if elems.iter().any(|&s| matches!(p.ast.pat(s), Pat::Rest)) {
+                            self.err(
+                                "L0110",
+                                span,
+                                "cannot use `..` when the tuple type is not known",
+                                "Add a type annotation, or match every element.",
+                            );
+                            return;
+                        }
+                        for (i, &sub) in elems.iter().enumerate() {
+                            self.pattern_mode(sub, elem_tys[i], mode, in_match);
+                        }
+                        let ts = self.tys.intern_tys(&elem_tys);
+                        let tt = self.tys.intern(TyKind::Tuple(ts));
+                        if !self.unify(tt, t) {
+                            self.mismatch(span, t, tt);
+                        }
+                    }
+                }
+            }
+            // A bare `..` only appears inside tuple forms, which map it away.
+            Pat::Rest => {}
+            Pat::Paren(inner) => self.pattern_mode(*inner, t, mode, in_match),
+            // AST v2 pattern forms the parser still rejects.
+            Pat::Slice { .. } | Pat::Ref { .. } | Pat::At { .. } | Pat::QPath { .. } | Pat::MacroCall(_) => {}
         }
     }
 
@@ -2442,6 +2651,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     && elems.iter().all(|&s| self.irrefutable(s))
             }
             Pat::Path(_) => matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum),
+            Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
+            Pat::Paren(inner) => self.irrefutable(*inner),
+            Pat::Rest => true,
             _ => false,
         }
     }
