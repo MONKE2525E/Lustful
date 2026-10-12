@@ -430,6 +430,22 @@ pub(super) fn plain_inherent_probe(
         SigOf::Fn(info) => (info.params.clone(), info.ret),
         _ => return Probe::Miss,
     };
+    // The candidate set is keyed by the reference-peeled head, so a
+    // `&self` method of `S` also surfaces at a `&S` step under form
+    // `Ref`, where lowering would pass `&&S`. Unify the method's
+    // receiver type with what this step+form presents (as
+    // `confirm_method` does) and probe on when they differ: the
+    // same method then hits at the derefed step with the right
+    // deref count.
+    let snap_vars = cx.snapshot_vars();
+    let obl_len = cx.obl_len();
+    let want_recv = params.first().copied();
+    let got_recv = receiver_for_form(cx, step, form);
+    if want_recv.is_none_or(|want| !cx.unify(want, got_recv)) {
+        cx.rollback_vars(snap_vars);
+        cx.obl_truncate(obl_len);
+        return Probe::Miss;
+    }
     cx.set_res(e, Res::Method { f, derefs, autoref: autoref_of(form) });
     cx.check_args(&params[1.min(params.len())..], args, name_span);
     Probe::Hit(ret)
