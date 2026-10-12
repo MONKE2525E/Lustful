@@ -84,7 +84,7 @@ pub enum Builtin {
 pub enum Res {
     None,
     Local(u32),
-    Fn(FnId),
+    Fn(LocalDefId),
     /// A unit variant value, a tuple-variant constructor, or a struct literal target.
     Variant(AdtId, u32),
     Builtin(Builtin),
@@ -92,7 +92,7 @@ pub enum Res {
     OptNone,
     OptSome,
     Method {
-        f: FnId,
+        f: LocalDefId,
         derefs: u8,
         autoref: Autoref,
     },
@@ -215,7 +215,7 @@ struct Ctx<'p, 'a> {
 }
 
 /// Type-checks one function body.
-pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: FnId) -> (Checked<'p>, Vec<Diag>) {
+pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     let f = p.fn_info(fid);
     let def = f.def;
     let n_exprs = (def.exprs.1 - def.exprs.0) as usize;

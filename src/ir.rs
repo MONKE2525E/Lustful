@@ -2,7 +2,7 @@
 // The borrow checker and the C backend both read it.
 use crate::ast::{BinOp, UnOp};
 use crate::check::Builtin;
-use crate::check::collect::FnId;
+use crate::def::LocalDefId;
 use crate::diag::Span;
 use crate::ty::{AdtId, IntTy, Ty, Tys};
 
@@ -78,7 +78,7 @@ pub enum Rvalue {
     Opt(Ty, Option<Operand>),
     VecLit(Ty, Vec<Operand>),
     VecRepeat(Ty, Operand, Operand),
-    Call(FnId, Vec<Operand>),
+    Call(LocalDefId, Vec<Operand>),
     Builtin(Builtin, Vec<Operand>),
     /// `a == b` for any PartialEq type. Both operands are references to `ty`.
     Eq {
@@ -144,7 +144,7 @@ pub struct LocalDecl {
 
 /// Local 0 is the return value. Locals `1..=arg_count` are the parameters.
 pub struct Body<'g> {
-    pub fn_id: FnId,
+    pub fn_id: LocalDefId,
     pub tys: Tys<'g>,
     pub locals: Vec<LocalDecl>,
     pub blocks: Vec<BlockData>,

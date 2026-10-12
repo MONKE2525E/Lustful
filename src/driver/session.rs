@@ -4,8 +4,9 @@
 // session once. The pipeline itself is in compile.rs.
 use crate::ast::Ast;
 use crate::cgen::{FnOut, GlueSet};
+use crate::def::DiskDefId;
 use crate::diag::SourceMap;
-use crate::intern::{FxMap, Interner, Known, Sym};
+use crate::intern::{FxMap, Interner, Known};
 use crate::lexer::Lexed;
 use crate::scan;
 use std::path::{Path, PathBuf};
@@ -19,12 +20,23 @@ pub(crate) struct Front {
     pub(crate) env_hash: Option<u64>,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
-    /// Where each FnId's definition lives: item index, and index inside an impl block.
+    /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
     pub(crate) fn_loc: Vec<(usize, Option<usize>)>,
-    /// Each FnId's slot. A slot is a function's stable identity across edits (FnIds shift when
-    /// functions are added); cached code, objects, and the C function table all use slots.
+    /// Each LocalDefId's slot. A slot is a function's place in the final bin's one
+    /// table; cached code, objects, and the C function table all use slots. Local
+    /// ids shift when functions are added, slots do not: assignment is append-only.
     pub(crate) fn_slot: Vec<u32>,
-    pub(crate) slot_of: FxMap<(Sym, Sym), u32>,
+    /// Slot by stable function identity. The key is the disk pair
+    /// `(StableCrateHash, DefPathHash)` (docs/ARCH.md sections 1.7 and 4.2), never
+    /// a `Sym` or a local id, so the same source gets the same slots in any
+    /// session, in any interning order. The manifest type that persists this map
+    /// across daemon restarts is S7 work; the encode/decode pair below fixes the
+    /// byte shape it will carry.
+    pub(crate) slot_of: FxMap<DiskDefId, u32>,
+    /// Canonical def path text per slot key, for hash collision checks
+    /// (src/def.rs). A key keeps the path that first claimed it; a different
+    /// path under the same key is a collision.
+    pub(crate) slot_paths: FxMap<DiskDefId, Box<str>>,
     /// Body hash per slot, at the last parse.
     pub(crate) slot_hash: Vec<u64>,
     /// Lexed and scanned chunks from the last request, reused when their text is unchanged.
@@ -100,6 +112,7 @@ impl Session {
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),
                 slot_of: FxMap::default(),
+                slot_paths: FxMap::default(),
                 slot_hash: Vec::new(),
                 chunks: Vec::new(),
                 src: String::new(),
@@ -126,5 +139,95 @@ impl Session {
     }
     pub fn obj_dir(&self) -> &Path {
         &self.caches.obj_dir
+    }
+}
+
+/// The slot manifest byte shape (pre-S7): magic, entry count, then one 20-byte
+/// entry per slot (`DiskDefId` bytes + slot), sorted by slot. Only stable disk
+/// pairs are stored, so a restarted daemon that loads these bytes recovers the
+/// same slot assignment in any crate load or discovery order (docs/ARCH.md
+/// sections 4.2 and 8.4). S7 owns the manifest type and where it is stored;
+/// this pair fixes the encoding and its round-trip test now.
+const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS1";
+
+/// Serializes a slot map. See `SLOT_MANIFEST_MAGIC`.
+#[allow(dead_code)] // First caller is the S7 slot manifest store; the encoding and its test land with the key change.
+pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
+    let mut entries: Vec<(u32, DiskDefId)> = slot_of.iter().map(|(k, &s)| (s, *k)).collect();
+    entries.sort_unstable();
+    let mut out = Vec::with_capacity(8 + entries.len() * 20);
+    out.extend_from_slice(SLOT_MANIFEST_MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (slot, key) in entries {
+        out.extend_from_slice(&key.to_bytes());
+        out.extend_from_slice(&slot.to_le_bytes());
+    }
+    out
+}
+
+/// Reads bytes written by `encode_slot_manifest`. None on any shape error (bad
+/// magic, a truncated or trailing byte, or one slot claimed twice), so a bad
+/// file is a cache miss, never a wrong slot.
+#[allow(dead_code)] // See `encode_slot_manifest`.
+pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<FxMap<DiskDefId, u32>> {
+    if b.get(..4)? != SLOT_MANIFEST_MAGIC {
+        return None;
+    }
+    let n = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+    if b.len() != 8 + n.checked_mul(20)? {
+        return None;
+    }
+    let mut map = FxMap::default();
+    let mut slots: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let at = 8 + i * 20;
+        let key = DiskDefId::from_bytes(&b[at..at + 16])?;
+        let slot = u32::from_le_bytes(b[at + 16..at + 20].try_into().ok()?);
+        if slots.contains(&slot) || map.insert(key, slot).is_some() {
+            return None;
+        }
+        slots.push(slot);
+    }
+    Some(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::def::{DefPathHash, StableCrateHash};
+
+    fn key(krate: u64, hash: u64) -> DiskDefId {
+        DiskDefId { krate: StableCrateHash(krate), hash: DefPathHash(hash) }
+    }
+
+    /// Serialize, then read back in a fresh map (a restarted daemon): every
+    /// function keeps its slot, dead slots included, whatever order the map
+    /// held its entries in.
+    #[test]
+    fn slot_manifest_round_trips() {
+        let mut m = FxMap::default();
+        m.insert(key(1, 10), 0);
+        m.insert(key(1, 20), 1);
+        m.insert(key(1, 30), 5);
+        m.insert(key(2, 10), 3);
+        let back = decode_slot_manifest(&encode_slot_manifest(&m)).unwrap();
+        assert_eq!(back, m);
+        let empty: FxMap<DiskDefId, u32> = FxMap::default();
+        assert_eq!(decode_slot_manifest(&encode_slot_manifest(&empty)), Some(empty));
+    }
+
+    /// A bad manifest never decodes to wrong slots.
+    #[test]
+    fn slot_manifest_rejects_bad_bytes() {
+        let mut m = FxMap::default();
+        m.insert(key(1, 10), 0);
+        let bytes = encode_slot_manifest(&m);
+        assert_eq!(decode_slot_manifest(&bytes[..bytes.len() - 1]), None, "truncated");
+        let mut tail = bytes.clone();
+        tail.push(0);
+        assert_eq!(decode_slot_manifest(&tail), None, "trailing byte");
+        let mut wrong = bytes;
+        wrong[0] = b'X';
+        assert_eq!(decode_slot_manifest(&wrong), None, "magic");
     }
 }

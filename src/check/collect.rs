@@ -1,6 +1,8 @@
 // Collection: builds the item tables (types, functions, methods) and resolves all signatures.
 // This is the only stage that runs in sequence. Function bodies are checked after it, in parallel.
 use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
+pub use crate::def::{CrateId, DefId, DefPathHash, LocalDefId, StableCrateHash};
+use crate::def::{CrateIds, DiskDefId};
 use crate::diag::{Diag, Span, unsupported};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
@@ -53,8 +55,11 @@ pub struct FnInfo<'a> {
     pub ret_borrows_from: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FnId(pub u32);
+/// The old name for the session-local function index. New code uses
+/// `LocalDefId` (src/def.rs); the alias stays while S3b edits this file in
+/// parallel, then goes.
+#[allow(dead_code)]
+pub type FnId = LocalDefId;
 
 pub struct Program<'a> {
     pub ast: &'a Ast,
@@ -64,9 +69,18 @@ pub struct Program<'a> {
     pub adts: Vec<AdtDef>,
     pub fns: Vec<FnInfo<'a>>,
     pub type_names: HashMap<Sym, AdtId>,
-    pub fn_names: HashMap<Sym, FnId>,
-    pub methods: HashMap<(AdtId, Sym), FnId>,
-    pub main: Option<FnId>,
+    pub fn_names: HashMap<Sym, LocalDefId>,
+    pub methods: HashMap<(AdtId, Sym), LocalDefId>,
+    pub main: Option<LocalDefId>,
+    /// The crate this program was collected as: session-local id and stable hash.
+    pub krate: CrateId,
+    pub stable_crate: StableCrateHash,
+    /// Each function's stable identity, in `fns` order (the `Vec<DefId>` side
+    /// table of docs/ARCH.md section 1.7). Today functions are the only defs
+    /// with `DefId`s; `AdtId` joins them in S3a, when `TyKind::Adt` takes a `DefId`.
+    pub fn_defs: Vec<DefId>,
+    /// The `LocalDefId` of a function by its stable hash (section 1.7).
+    pub def_by_hash: HashMap<DefPathHash, LocalDefId>,
 }
 
 impl<'a> Program<'a> {
@@ -76,8 +90,25 @@ impl<'a> Program<'a> {
     pub fn adt(&self, id: AdtId) -> &AdtDef {
         &self.adts[id.0 as usize]
     }
-    pub fn fn_info(&self, id: FnId) -> &FnInfo<'a> {
+    pub fn fn_info(&self, id: LocalDefId) -> &FnInfo<'a> {
         &self.fns[id.0 as usize]
+    }
+    /// A function's stable identity in this crate.
+    #[allow(dead_code)] // First production readers are S3a defs and mono instance keys; tests use it now.
+    pub fn def_id(&self, id: LocalDefId) -> DefId {
+        self.fn_defs[id.0 as usize]
+    }
+    /// A function's disk identity: the only form that may enter disk or slot
+    /// keys (docs/ARCH.md sections 1.7 and 8.4).
+    #[allow(dead_code)] // See `def_id`.
+    pub fn disk_id(&self, id: LocalDefId) -> DiskDefId {
+        DiskDefId { krate: self.stable_crate, hash: self.def_id(id).hash }
+    }
+    /// The session-local id of the function with this stable hash, if this
+    /// crate defines it.
+    #[allow(dead_code)] // See `def_id`.
+    pub fn local_def(&self, hash: DefPathHash) -> Option<LocalDefId> {
+        self.def_by_hash.get(&hash).copied()
     }
 }
 
@@ -183,8 +214,9 @@ pub fn resolve_ty(
     }
 }
 
-/// Builds the program tables. Returns all collection errors.
-pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Result<Program<'a>, Vec<Diag>> {
+/// Builds the program tables. `crate_ids` names the crate for stable def
+/// identity (docs/ARCH.md section 1.7). Returns all collection errors.
+pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate_ids: CrateIds) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
         interner,
@@ -196,6 +228,10 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Re
         fn_names: HashMap::default(),
         methods: HashMap::default(),
         main: None,
+        krate: crate_ids.local,
+        stable_crate: crate_ids.stable,
+        fn_defs: Vec::new(),
+        def_by_hash: HashMap::default(),
     };
     let mut errs = Vec::new();
     let dup = |span: Span, n: &str| Diag::new("L0106", span, format!("`{n}` is defined more than once"), "Rename one of the definitions.");
@@ -342,8 +378,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Re
         }
     }
 
-    // Functions and methods.
-    let add_fn = |p: &mut Program<'a>, def: &'a ast::FnDef, owner: Option<AdtId>, errs: &mut Vec<Diag>| -> FnId {
+    // Functions and methods. Each gets the stable path hash its caller computed
+    // (src/def.rs). Hash collisions are checked by the driver when it assigns
+    // slots from the same hashes, before `collect` runs on any new def set;
+    // here the maps only record the hashes. A duplicate definition keeps the
+    // first local id in `def_by_hash`; the dup errors below report it.
+    let add_fn = |p: &mut Program<'a>, def: &'a ast::FnDef, owner: Option<AdtId>, hash: DefPathHash, errs: &mut Vec<Diag>| -> LocalDefId {
         let self_ty = owner.map(|a| p.tys.intern(TyKind::Adt(a)));
         let mut params = Vec::new();
         if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
@@ -390,7 +430,9 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Re
         if def.self_param.is_some() && owner.is_none() {
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
         }
-        let id = FnId(p.fns.len() as u32);
+        let id = LocalDefId(p.fns.len() as u32);
+        p.fn_defs.push(DefId { krate: p.krate, hash });
+        p.def_by_hash.entry(hash).or_insert(id);
         p.fns.push(FnInfo {
             name: def.name,
             def,
@@ -402,10 +444,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Re
         });
         id
     };
+    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
     for item in &ast.items {
         match &item.kind {
             ItemKind::Fn(def) => {
-                let id = add_fn(&mut p, def, None, &mut errs);
+                let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
+                let id = add_fn(&mut p, def, None, hash, &mut errs);
                 if p.fn_names.insert(def.name, id).is_some() {
                     errs.push(dup(def.name_span, interner.get(def.name)));
                 }
@@ -427,8 +471,13 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known) -> Re
                     ));
                     continue;
                 };
+                let header = interner.get(p.adts[owner.0 as usize].name).to_string();
+                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
+                impl_ordinals.insert(header.clone(), ordinal + 1);
+                let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
                 for def in &imp.fns {
-                    let id = add_fn(&mut p, def, Some(owner), &mut errs);
+                    let hash = crate::def::method_hash(parent, interner.get(def.name));
+                    let id = add_fn(&mut p, def, Some(owner), hash, &mut errs);
                     if p.methods.insert((owner, def.name), id).is_some() {
                         errs.push(dup(def.name_span, interner.get(def.name)));
                     }

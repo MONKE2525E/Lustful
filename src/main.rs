@@ -11,6 +11,7 @@ mod capabilities;
 mod cgen;
 mod check;
 mod daemon;
+mod def;
 mod diag;
 mod driver;
 mod explain;

@@ -5,7 +5,7 @@
 // concrete edits, and the hash of the exact bytes that were checked. Output is bounded: exact
 // duplicates are suppressed and at most `max_errors` diagnostics are shown, followed by an
 // explicit truncation record. Truncation never changes the exit status.
-use crate::intern::Sym;
+use crate::def::DefId;
 use std::fmt::Write;
 
 /// The version of the JSON diagnostic schema.
@@ -161,15 +161,17 @@ impl LineIndex {
     }
 }
 
-/// One macro expansion: the call site that produced a context, and the context the call
-/// itself was in. The chain of these records (through `parent` and each `call_span`) maps
-/// an expanded span back to ordinary source. No expansion exists until macro support
-/// lands; the record shape is fixed now so `Span` does not change again. The macro def's
-/// `DefId` (docs/ARCH.md section 6.3) takes the name's place when defs land.
-#[allow(dead_code)] // `macro_name` and `parent` are first read by macro expansion and its diagnostics.
+/// One macro expansion: the macro def that ran, the call site that produced a
+/// context, and the context the call itself was in. The chain of these records
+/// (through `parent` and each `call_span`) maps an expanded span back to
+/// ordinary source. No expansion exists until macro support lands; the record
+/// shape is fixed now so `Span` does not change again. `macro_def` is the
+/// macro's `DefId` (docs/ARCH.md section 6.3); until W-MACRO creates macro
+/// defs, records carry `DefId::PLACEHOLDER`.
+#[allow(dead_code)] // `macro_def` and `parent` are first read by macro expansion and its diagnostics.
 #[derive(Clone)]
 pub struct Expansion {
-    pub macro_name: Sym,
+    pub macro_def: DefId,
     pub call_span: Span,
     pub parent: CtxtId,
 }
@@ -440,9 +442,9 @@ mod tests {
         assert_eq!(map.line_col(Span::new(b, 3, 4)), (2, 2));
 
         let outer_call = Span::new(a, 0, 2);
-        let c1 = map.add_expansion(Expansion { macro_name: Sym(0), call_span: outer_call, parent: CtxtId::ROOT });
+        let c1 = map.add_expansion(Expansion { macro_def: DefId::PLACEHOLDER, call_span: outer_call, parent: CtxtId::ROOT });
         let inner_call = Span { file: b, lo: 2, hi: 3, ctxt: c1 };
-        let c2 = map.add_expansion(Expansion { macro_name: Sym(0), call_span: inner_call, parent: c1 });
+        let c2 = map.add_expansion(Expansion { macro_def: DefId::PLACEHOLDER, call_span: inner_call, parent: c1 });
         assert_eq!((c1, c2), (CtxtId(1), CtxtId(2)));
         let inner = Span { file: b, lo: 4, hi: 5, ctxt: c2 };
         assert_eq!(map.call_site(inner), outer_call);

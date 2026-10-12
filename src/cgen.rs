@@ -201,13 +201,13 @@ struct FnGen<'b, 'p, 'a> {
     /// Line of the function's `fn` keyword. Locations are stored relative to it, so the C for
     /// an unchanged function stays valid when code above it moves.
     base_line: u32,
-    /// FnId to table slot. Slots are stable across edits; FnIds are not.
+    /// LocalDefId to table slot. Slots are stable across edits; local ids are not.
     slots: &'b [u32],
     tmp: u32,
 }
 
 /// `(RET (*)(PARAMS))`, the cast that calls function `f` through the table.
-fn fn_ptr_cast(p: &Program, f: FnId) -> String {
+fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     let info = p.fn_info(f);
     let params: Vec<String> = info.params.iter().map(|&t| ctype(&cty(&p.tys, t))).collect();
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
@@ -215,7 +215,7 @@ fn fn_ptr_cast(p: &Program, f: FnId) -> String {
 }
 
 /// The C signature of function `f`, defined under the C name `f<slot>`.
-fn fn_sig(p: &Program, f: FnId, slot: u32) -> String {
+fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
     let info = p.fn_info(f);
     let params: Vec<String> = info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
@@ -223,7 +223,7 @@ fn fn_sig(p: &Program, f: FnId, slot: u32) -> String {
 }
 
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
-/// file that defines it; `slots` maps every FnId to its slot in `lust_fns`.
+/// file that defines it; `slots` maps every LocalDefId to its slot in `lust_fns`.
 pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
     let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
     let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
@@ -981,7 +981,7 @@ impl FnGen<'_, '_, '_> {
 //
 // Unit 0 holds the globals, the function line table, and `main`. Unit 1 holds the shared glue
 // (see `GlueSet`); other glue is static in the function units. The other units hold functions, in
-// fixed groups of FnIds. Grouping depends only on the function count, so an edit that keeps the
+// fixed groups of slots. Grouping depends only on the slot count, so an edit that keeps the
 // program's shape recompiles only the units it touches (plus unit 0).
 
 /// Function groups for units 2 and up.

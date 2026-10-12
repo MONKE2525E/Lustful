@@ -12,9 +12,10 @@ use super::session::{Caches, Chunk, Front, Session};
 use super::{Cmd, Request, Response};
 use crate::ast::{Ast, ItemKind};
 use crate::cgen::{self, FnOut, GlueSet};
-use crate::check::collect::{self, FnId};
+use crate::check::collect::{self, LocalDefId};
+use crate::def::{self, CrateIds, DiskDefId, StableCrateHash};
 use crate::diag::{self, Diag, FileId, LineIndex, SourceMap};
-use crate::intern::{FxMap, Sym};
+use crate::intern::{FxMap, Interner, Sym};
 use crate::lexer;
 use crate::scan;
 use crate::{borrowck, check, ir, lower, parser};
@@ -453,8 +454,10 @@ fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Resp
     r
 }
 
-/// After a parse that was not "bodies only": update item tables, assign slots by name, and pick the
-/// functions to re-check. Returns their FnIds.
+/// After a parse that was not "bodies only": update item tables, assign slots by
+/// stable def hash, and pick the functions to re-check. Returns their local ids
+/// as indexes. The one failure is a def hash collision (src/def.rs): an internal
+/// error the caller turns into a code 3 response.
 #[allow(clippy::too_many_arguments)]
 fn slot_update(
     front: &mut Front,
@@ -464,16 +467,18 @@ fn slot_update(
     changed_names: Option<Vec<Sym>>,
     fn_at: &[(usize, usize)],
     cores: usize,
+    crate_ids: CrateIds,
     scan_of: &dyn Fn(&Front, usize) -> (u64, u32),
     t: &mut Timer,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
     front.env_hash = Some(env);
     front.items = item_scans;
     if changed_names.is_none() {
-        // Full rebuild: fresh slots in FnId order, and empty caches.
+        // Full rebuild: fresh slots in def order, and empty caches.
         front.slot_of.clear();
+        front.slot_paths.clear();
         caches.ok.clear();
         caches.out.clear();
         caches.has_out.clear();
@@ -487,21 +492,32 @@ fn slot_update(
         caches.per_unit =
             if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
     }
-    // Assign slots by name. New functions get new slots; a removed function's slot is emptied.
-    let keys = fn_keys(&front.ast, &front.fn_loc);
+    // Assign slots by stable identity, append-only. New functions get new slots;
+    // a removed function's slot is emptied. A known hash with a different path
+    // text is a hash collision: stop with an internal error (section 1.7). The
+    // same path twice is a duplicate definition, which `collect` reports.
+    let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
     let mut live = vec![false; front.slot_of.len()];
-    front.fn_slot = keys
-        .iter()
-        .map(|k| {
-            let next = front.slot_of.len() as u32;
-            let slot = *front.slot_of.entry(*k).or_insert(next);
-            if slot as usize >= live.len() {
-                live.resize(slot as usize + 1, false);
+    let mut fn_slot = Vec::with_capacity(keys.len());
+    for k in &keys {
+        if let Err(c) = def::insert_path(&mut front.slot_paths, k.disk, &k.path) {
+            return Err(c.to_string());
+        }
+        let slot = match front.slot_of.get(&k.disk) {
+            Some(&slot) => slot,
+            None => {
+                let slot = front.slot_of.len() as u32;
+                front.slot_of.insert(k.disk, slot);
+                slot
             }
-            live[slot as usize] = true;
-            slot
-        })
-        .collect();
+        };
+        if slot as usize >= live.len() {
+            live.resize(slot as usize + 1, false);
+        }
+        live[slot as usize] = true;
+        fn_slot.push(slot);
+    }
+    front.fn_slot = fn_slot;
     let n_slots = front.slot_of.len();
     caches.ok.resize(n_slots, false);
     caches.has_out.resize(n_slots, false);
@@ -520,7 +536,7 @@ fn slot_update(
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
-        let mentions = idents.iter().any(|s| names.contains(s)) || keys[i].0 == Sym(u32::MAX) && names.contains(&keys[i].1);
+        let mentions = idents.iter().any(|s| names.contains(s)) || keys[i].free && names.contains(&keys[i].name);
         if front.slot_hash[slot] != hash || !caches.ok[slot] || mentions {
             front.slot_hash[slot] = hash;
             caches.has_out[slot] = false;
@@ -528,7 +544,7 @@ fn slot_update(
         }
     }
     t.lap(if names.is_empty() { "parse (par)" } else { "parse changed chunks" });
-    changed
+    Ok(changed)
 }
 
 /// Function names whose signature changed, or that were added or removed, if those are the only
@@ -547,26 +563,61 @@ fn fn_only_changes(old: &[scan::ItemScan], new: &[scan::ItemScan]) -> Option<Vec
     Some(names)
 }
 
-/// A function's stable name: (impl type name, function name). Top-level functions use
-/// `Sym(u32::MAX)` for the type.
-fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)]) -> Vec<(Sym, Sym)> {
+/// One function's slot key: its stable disk identity, the canonical path text
+/// (for collision checks), and the two facts the changed-name scan needs.
+struct FnKey {
+    disk: DiskDefId,
+    path: String,
+    /// A top-level function (not an impl method).
+    free: bool,
+    name: Sym,
+}
+
+/// The slot key of every function, in LocalDefId order. Identity comes from
+/// name strings through src/def.rs (free fn: its name; method: its impl's path
+/// plus its name), never from `Sym` values, so keys are the same in every
+/// session. An impl whose self type is not a plain path gets a placeholder
+/// header; `collect` rejects it later, so its slots are never used. The hashes
+/// computed here must equal the ones `collect` stores in `Program::fn_defs`;
+/// a test below checks both against one source.
+fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, stable: StableCrateHash) -> Vec<FnKey> {
+    // Each impl item's path, impls with the same header counted in file order.
+    let mut ordinals: FxMap<String, u32> = FxMap::default();
+    let mut impl_paths: Vec<Option<(def::DefPathHash, String)>> = Vec::with_capacity(ast.items.len());
+    for item in &ast.items {
+        let path = match &item.kind {
+            ItemKind::Impl(imp) => {
+                let header = match ast.ty(imp.self_ty) {
+                    crate::ast::TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
+                    _ => "<error>".to_string(),
+                };
+                let ordinal = ordinals.get(&header).copied().unwrap_or(0);
+                ordinals.insert(header.clone(), ordinal + 1);
+                Some(def::impl_path(stable, &[], &header, ordinal))
+            }
+            _ => None,
+        };
+        impl_paths.push(path);
+    }
+    let key = |hash, path, free, name| FnKey { disk: DiskDefId { krate: stable, hash }, path, free, name };
     fn_loc
         .iter()
         .map(|&(item, sub)| match (&ast.items[item].kind, sub) {
-            (ItemKind::Fn(d), None) => (Sym(u32::MAX), d.name),
+            (ItemKind::Fn(d), None) => {
+                let (hash, path) = def::free_fn_path(stable, &[], interner.get(d.name));
+                key(hash, path, true, d.name)
+            }
             (ItemKind::Impl(imp), Some(k)) => {
-                let owner = match ast.ty(imp.self_ty) {
-                    crate::ast::TyExpr::Path(segs) => segs[0].name,
-                    _ => Sym(u32::MAX - 1),
-                };
-                (owner, imp.fns[k].name)
+                let (ihash, itext) = impl_paths[item].as_ref().unwrap();
+                let (hash, path) = def::method_path(*ihash, itext, interner.get(imp.fns[k].name));
+                key(hash, path, false, imp.fns[k].name)
             }
             _ => unreachable!("fn_loc points at a function"),
         })
         .collect()
 }
 
-/// FnId order: top-level functions and impl methods, in item order. Same as `collect`.
+/// LocalDefId order: top-level functions and impl methods, in item order. Same as `collect`.
 fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
     let mut out = Vec::new();
     for (i, item) in ast.items.iter().enumerate() {
@@ -588,6 +639,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };
     let Session { front, caches } = session;
+    // The crate identity for stable defs: today's synthetic one-file bin crate
+    // (src/def.rs). `lust test` harness builds are a distinct test target.
+    let crate_ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash(&path, req.harness) };
     t.lap("read");
 
     // Lex and scan in chunks of whole items, in parallel. Only the region an edit touched is
@@ -734,7 +788,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let item_scans: Vec<scan::ItemScan> = front.chunks.iter().flat_map(|c| c.scan.items.iter().copied()).collect();
     let env = scan::env_hash(item_scans.iter());
     let fn_count = front.chunks.iter().map(|c| c.scan.fns.len()).sum::<usize>();
-    // (chunk, index in chunk) for every function, in FnId order.
+    // (chunk, index in chunk) for every function, in LocalDefId order.
     let fn_at: Vec<(usize, usize)> =
         front.chunks.iter().enumerate().flat_map(|(c, ch)| (0..ch.scan.fns.len()).map(move |k| (c, k))).collect();
     let scan_of = |front: &Front, i: usize| -> (u64, u32) {
@@ -812,7 +866,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             front.chunks[c].items = Some(start..items.len());
         }
         front.ast.items = items;
-        slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, &scan_of, &mut t)
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, &mut t) {
+            Ok(c) => c,
+            Err(e) => {
+                front.env_hash = None;
+                return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+            }
+        }
     } else {
         // Reused chunks carry shifted token spans (see chunk assembly), so every chunk is ready.
         let parsed = par_map(&front.chunks, |c| parser::parse(&c.lexed, &front.interner, &front.known));
@@ -842,10 +902,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         };
         front.ast = ast;
-        slot_update(front, caches, item_scans, env, None, &fn_at, cores, &scan_of, &mut t)
+        match slot_update(front, caches, item_scans, env, None, &fn_at, cores, crate_ids, &scan_of, &mut t) {
+            Ok(c) => c,
+            Err(e) => {
+                front.env_hash = None;
+                return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+            }
+        }
     };
 
-    let program = match collect::collect(&front.ast, &front.interner, &front.known) {
+    let program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
@@ -866,7 +932,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
     }
     let results = par_map(&work, |&i| {
-        let f = FnId(i as u32);
+        let f = LocalDefId(i as u32);
         let (checked, mut errs) = check::check_fn(&program, f);
         if !errs.is_empty() {
             return (None, errs);
@@ -1102,4 +1168,41 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         std::mem::forget(program);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intern::Known;
+
+    /// The driver's slot keys and `collect`'s stored def ids are computed in two
+    /// places from the same source. They must agree for every function, methods
+    /// in repeated impl blocks included, or slots and defs would name different
+    /// functions. The reverse map (`local_def`) must round-trip too.
+    #[test]
+    fn slot_keys_match_collect_def_ids() {
+        let src = "\
+struct Foo { x: i64 }
+fn helper() -> i64 { 1 }
+impl Foo { fn get(&self) -> i64 { self.x } }
+fn main() { println!(\"{}\", helper()); }
+impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
+";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
+        assert_eq!(keys.len(), program.fns.len());
+        assert_eq!(program.krate, def::LOCAL_CRATE);
+        for (i, k) in keys.iter().enumerate() {
+            let local = LocalDefId(i as u32);
+            assert_eq!(k.disk, program.disk_id(local), "fn {i}");
+            assert_eq!(program.def_id(local).krate, program.krate, "fn {i}");
+            assert_eq!(program.local_def(k.disk.hash), Some(local), "fn {i}");
+        }
+        assert_eq!(program.main.map(|m| program.def_id(m)), keys.get(2).map(|k| crate::def::DefId { krate: ids.local, hash: k.disk.hash }));
+    }
 }

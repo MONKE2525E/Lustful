@@ -27,7 +27,7 @@ struct Lower<'p, 'a> {
 }
 
 /// Lowers one checked function body to IR.
-pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: FnId, mut ck: Checked<'p>) -> Body<'p> {
+pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
     let f = p.fn_info(fid);
     let tys = std::mem::replace(&mut ck.tys, Tys::new(&p.tys));
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
