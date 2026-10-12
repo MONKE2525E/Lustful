@@ -1329,6 +1329,19 @@ impl Evaluator {
                 if *by_ref {
                     return Err(outside(span, "`ref` bindings in const"));
                 }
+                // A plain name that resolves to a const item compares
+                // against it, as the checker resolves it; a unit
+                // struct name matches its only value.
+                if !mutable && !env.iter().any(|(n, _, _)| n == name) {
+                    if let Some((cv, _)) = cx.const_item(*name) {
+                        return Ok(values_eq(v, &cv));
+                    }
+                    let segs = [ast::PathSeg::plain(*name)];
+                    if let Some((_, variant, _)) = cx.unit_variant(&segs, Some(t)) {
+                        return Ok(matches!(v, ConstValue::Variant(got, _) if *got == variant)
+                            || matches!(v, ConstValue::Aggregate(_)));
+                    }
+                }
                 binds.push((*name, (v.clone(), t), *mutable));
                 Ok(true)
             }

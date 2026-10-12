@@ -1533,6 +1533,29 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = ok;
             return;
         }
+        if let Some(cv) = self.ck.pat_const(pat).cloned() {
+            let op = self.const_operand(&cv, ty, span);
+            let c = self.temp(BOOL);
+            self.assign(Place::local(c), Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op), span);
+            let ok = self.new_block();
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
+            self.cur = ok;
+            return;
+        }
+        // A lone identifier that resolved to a unit variant tests the
+        // discriminant, exactly like the written path form.
+        if let (Pat::Binding { .. }, PatRes::Variant(a, v)) = (p.ast.pat(pat), self.ck.pat_res(pat))
+            && p.adt(a).is_enum
+        {
+            let d = self.temp(int(IntTy::U32));
+            self.assign(Place::local(d), Rvalue::Discriminant(place), span);
+            let ok = self.new_block();
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(v, ok)], fail);
+            self.cur = ok;
+            return;
+        }
         let branch = |this: &mut Self, cond: Rvalue| {
             let c = this.temp(BOOL);
             this.assign(Place::local(c), cond, span);

@@ -182,6 +182,14 @@ pub enum BindMode {
     Ref(bool),
 }
 
+/// What a lone pattern identifier resolves to (see `Ctx::pat_ident`).
+enum PatIdent {
+    Const(u32),
+    Static(u32),
+    Variant(AdtId, u32),
+    Other,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum PatRes {
     None,
@@ -216,6 +224,9 @@ pub struct Checked<'g> {
     pub coerce: Vec<Coerce>,
     pub pat_ty: Vec<Ty>,
     pub pat_res: Vec<PatRes>,
+    /// The const value of a pattern that is a primitive associated
+    /// const (`u8::MAX => ..`), parallel to `pat_res`.
+    pub pat_const: Vec<Option<crate::ty::consteval::ConstValue>>,
     /// Number of implicit derefs before matching each pattern (default binding modes).
     pub pat_derefs: Vec<u8>,
     /// Generic arguments of each generic call or method call, by
@@ -251,6 +262,9 @@ impl Checked<'_> {
     }
     pub fn pat_res(&self, p: PatId) -> PatRes {
         self.pat_res[(p.0 - self.pat_base) as usize]
+    }
+    pub fn pat_const(&self, p: PatId) -> Option<&crate::ty::consteval::ConstValue> {
+        self.pat_const[(p.0 - self.pat_base) as usize].as_ref()
     }
     pub fn const_value(&self, e: ExprId) -> Option<&crate::ty::consteval::ConstValue> {
         self.const_exprs[(e.0 - self.expr_base) as usize].as_ref()
@@ -335,6 +349,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             coerce: vec![Coerce::None; n_exprs],
             pat_ty: vec![ERROR; n_pats],
             pat_res: vec![PatRes::None; n_pats],
+            pat_const: vec![None; n_pats],
             pat_derefs: vec![0; n_pats],
             generic_args: vec![Vec::new(); n_exprs],
             inst_requests: Vec::new(),
@@ -376,6 +391,46 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             cx.err("L0106", param.span, format!("`{name}` is defined more than once"), "Rename one of the parameters.");
         }
         seen_params.push(param.name);
+        // A plain parameter name that resolves to a const item or a
+        // unit variant is a refutable pattern, not a binding (rustc
+        // E0005); a static name cannot be a pattern at all.
+        if param.pat.is_none() && !param.mutable {
+            match cx.pat_ident(param.name) {
+                PatIdent::Const(_) => {
+                    cx.err(
+                        "L0110",
+                        param.span,
+                        "refutable pattern in function argument",
+                        "Rename the parameter: this name is a const item, so it would be a pattern, not a binding.",
+                    );
+                }
+                PatIdent::Static(_) => {
+                    cx.err(
+                        "L0110",
+                        param.span,
+                        "statics cannot be used as patterns",
+                        "Rename the parameter: this name is a static item.",
+                    );
+                }
+                PatIdent::Variant(a, _) if p.adt(a).is_enum => {
+                    cx.err(
+                        "L0110",
+                        param.span,
+                        "refutable pattern in function argument",
+                        "Rename the parameter: this name is an enum variant, so it would be a pattern, not a binding.",
+                    );
+                }
+                PatIdent::Variant(a, _) => {
+                    // A unit struct name as a parameter is a unit
+                    // pattern: legal only against its own type.
+                    let at = cx.tys.adt_ty(a);
+                    if !cx.unify(at, f.params[pi]) {
+                        cx.mismatch(param.span, f.params[pi], at);
+                    }
+                }
+                _ => {}
+            }
+        }
         let l = cx.add_local(param.name, f.params[pi], param.mutable, param.span);
         cx.out.param_locals.push(l);
         pi += 1;
@@ -510,6 +565,98 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let module = self.module;
         p.binding(&mut self.out.reads, module, ns, name)
+    }
+
+    /// A primitive associated const used as a pattern (`u8::MAX`,
+    /// `char::MAX`): its value and type, if the path names one.
+    fn primitive_const_pattern(&mut self, segs: &[ast::PathSeg]) -> Option<(crate::ty::consteval::ConstValue, Ty)> {
+        use crate::ty::consteval::ConstValue;
+        if segs.len() != 2 {
+            return None;
+        }
+        let item = self.name(segs[1].name);
+        if let Some(it) = self.p.known.int_ty(segs[0].name) {
+            let t = int(it);
+            let v = match item {
+                "MAX" => crate::ty::consteval::truncate_to_int(it.max128() as i128, it),
+                "MIN" => {
+                    if it.signed() {
+                        if it.bits() >= 128 { i128::MIN } else { -(1i128 << (it.bits() - 1)) }
+                    } else {
+                        0
+                    }
+                }
+                "BITS" => return Some((ConstValue::Int(it.bits() as i128), int(IntTy::U32))),
+                _ => return None,
+            };
+            // u128::MAX is stored as its raw bits, as in the evaluator.
+            let v = if it == IntTy::U128 && item == "MAX" { -1 } else { v };
+            return Some((ConstValue::Int(v), t));
+        }
+        if segs[0].name == self.p.known.char {
+            let c = match item {
+                "MAX" => char::MAX,
+                "MIN" => char::MIN,
+                _ => return None,
+            };
+            return Some((ConstValue::Char(c), CHAR));
+        }
+        None
+    }
+
+    /// What a lone identifier in a pattern resolves to through the
+    /// module bindings (imports included): a const item, a static, or
+    /// a unit variant or struct constructor. Anything else stays a
+    /// fresh binding. The binding query records the read, so a body
+    /// rechecks when the name's target changes.
+    fn pat_ident(&mut self, name: Sym) -> PatIdent {
+        use crate::resolve::imports::{BindState, Target};
+        let p = self.p;
+        if let BindingRes::Def(def) = self.binding(Namespace::Value, name) {
+            let flat = p.resolved.as_ref().and_then(|t| t.def_info.get(&def)).map(|i| i.flat);
+            match p.binding_kind(def) {
+                Some(DefsKind::Const) => {
+                    if let Some(i) = p.const_by_def(def).or_else(|| flat.and_then(|f| p.const_names.get(&f).copied())) {
+                        return PatIdent::Const(i);
+                    }
+                }
+                Some(DefsKind::Static) => {
+                    if let Some(i) = p.static_by_def(def).or_else(|| flat.and_then(|f| p.static_names.get(&f).copied())) {
+                        return PatIdent::Static(i);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(a) = p.adt_by_def(def).or_else(|| flat.and_then(|f| p.type_names.get(&f).copied())) {
+                if p.adt(a).is_enum {
+                    // A variant import answers with the enum's def in
+                    // the binding query; the raw table keeps the variant.
+                    if let Some(tables) = &p.resolved
+                        && let Some(BindState::One(b)) = tables.lookup(self.module, Namespace::Value, name)
+                        && let Target::Variant(vdef, vname) = b.target
+                        && vdef == def
+                        && let Some(v) = p.adt(a).variants.iter().position(|x| x.name == vname)
+                    {
+                        return PatIdent::Variant(a, v as u32);
+                    }
+                    return PatIdent::Other;
+                }
+                return PatIdent::Variant(a, 0);
+            }
+        }
+        // Without resolver tables the flat name maps answer directly.
+        if let Some(&i) = p.const_names.get(&name) {
+            return PatIdent::Const(i);
+        }
+        if let Some(&i) = p.static_names.get(&name) {
+            return PatIdent::Static(i);
+        }
+        if let Some(&a) = p.type_names.get(&name)
+            && !p.adt(a).is_enum
+        {
+            return PatIdent::Variant(a, 0);
+        }
+        PatIdent::Other
     }
 
     /// Field visibility (ARCH 1.5): a private field of a struct from
@@ -1491,6 +1638,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (None, None) => self.new_var(false),
                     };
                     match self.p.ast.pat(*pat) {
+                        // A plain name that resolves to a const, static,
+                        // or unit path is a pattern, not a fresh binding:
+                        // check it like any destructuring let, which
+                        // rejects it as refutable where rustc does.
+                        Pat::Binding { name, mutable: false, by_ref: false }
+                            if self.lookup(*name, self.p.ast.pat_span(*pat).ctxt).is_none()
+                                && !matches!(self.pat_ident(*name), PatIdent::Other) =>
+                        {
+                            if init.is_none() {
+                                let s = self.p.ast.pat_span(*pat);
+                                self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
+                            } else {
+                                self.pattern(*pat, ty, false);
+                                if !self.irrefutable(*pat) {
+                                    let s = self.p.ast.pat_span(*pat);
+                                    self.err(
+                                        "L0110",
+                                        s,
+                                        "refutable pattern in local binding",
+                                        "Use `match` or `if let` for a pattern that can fail.",
+                                    );
+                                }
+                            }
+                        }
                         Pat::Binding { name, mutable, by_ref } => {
                             let (name, mutable, by_ref) = (*name, *mutable, *by_ref);
                             let lty = if by_ref { self.tys.mk_ref(mutable, ty) } else { ty };
@@ -1808,6 +1979,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let item = self.for_iter(e, *iter);
                 let scope = self.scopes.len();
                 self.pattern(*pat, item, false);
+                if !self.irrefutable(*pat) {
+                    let s = self.p.ast.pat_span(*pat);
+                    self.err(
+                        "L0110",
+                        s,
+                        "refutable pattern in `for` loop binding",
+                        "Use `while let` or `match` for a pattern that can fail.",
+                    );
+                }
                 self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
@@ -3676,7 +3856,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.binding(Namespace::Type, n);
             }
             let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
-            a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32))
+            match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32)) {
+                Some(v) => Some(v),
+                // An imported struct-like variant (`use E::*; C { .. }`).
+                None => match self.pat_ident(n) {
+                    PatIdent::Variant(a, v) => Some((a, v)),
+                    _ => None,
+                },
+            }
         } else {
             match self.resolve_assoc(path, span) {
                 Some(Res::Variant(a, v)) => Some((a, v)),
@@ -4102,39 +4289,90 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return;
         }
-        // A plain name that resolves to a const item is a const pattern, not
-        // a binding (unless a local binding shadows the name). The pattern
-        // consumes the const's value, so record its `Sig` read (the
-        // fingerprint folds the evaluated value): a value edit must
-        // recheck this body (ARCH 8.2), like a const in an expression.
+        // A plain name that resolves to a const item, a unit struct, or
+        // a unit variant is a path pattern, not a binding (unless a
+        // local binding shadows the name). Imports count: resolution
+        // goes through the module bindings, as in expressions. The
+        // pattern consumes the const's value, so record its `Sig` read
+        // (the fingerprint folds the evaluated value): a value edit
+        // must recheck this body (ARCH 8.2), like a const in an
+        // expression.
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
-            && let Some(&idx) = p.const_names.get(name)
         {
-            if let Some(&def) = p.const_defs.get(idx as usize) {
-                let _ = p.sig_of(&mut self.out.reads, def);
+            match self.pat_ident(*name) {
+                PatIdent::Const(idx) => {
+                    if let Some(&def) = p.const_defs.get(idx as usize) {
+                        let _ = p.sig_of(&mut self.out.reads, def);
+                    }
+                    let c = &p.consts[idx as usize];
+                    if !matches!(
+                        c.value,
+                        crate::ty::consteval::ConstValue::Int(_)
+                            | crate::ty::consteval::ConstValue::Bool(_)
+                            | crate::ty::consteval::ConstValue::Char(_)
+                    ) {
+                        self.errs.push(unsupported(span, "non-scalar const patterns"));
+                        return;
+                    }
+                    let ct = c.ty;
+                    if !self.unify(ct, t) {
+                        self.mismatch(span, t, ct);
+                        return;
+                    }
+                    self.out.pat_res[pi] = PatRes::ConstItem(idx);
+                    return;
+                }
+                PatIdent::Static => {
+                    self.err(
+                        "L0110",
+                        span,
+                        "statics cannot be used as patterns",
+                        "Use a const item for a pattern, or compare with the static in a guard.",
+                    );
+                    return;
+                }
+                PatIdent::Variant(a, v) => {
+                    let adt_ty = self.tys.adt_ty(a);
+                    if !self.unify(adt_ty, t) {
+                        self.mismatch(span, t, adt_ty);
+                        return;
+                    }
+                    if p.adt(a).variants[v as usize].shape != VariantShape::Unit {
+                        self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
+                        return;
+                    }
+                    self.out.pat_res[pi] = PatRes::Variant(a, v);
+                    return;
+                }
+                PatIdent::Other => {}
             }
-            let c = &p.consts[idx as usize];
-            if !matches!(
-                c.value,
-                crate::ty::consteval::ConstValue::Int(_)
-                    | crate::ty::consteval::ConstValue::Bool(_)
-                    | crate::ty::consteval::ConstValue::Char(_)
-            ) {
-                self.errs.push(unsupported(span, "non-scalar const patterns"));
-                return;
-            }
-            let ct = c.ty;
-            if !self.unify(ct, t) {
-                self.mismatch(span, t, ct);
-                return;
-            }
-            self.out.pat_res[pi] = PatRes::ConstItem(idx);
-            return;
         }
         match p.ast.pat(pat) {
             Pat::Wild => {}
             Pat::Binding { name, mutable, by_ref } => {
+                // A plain binding named the same as a variant of the
+                // matched enum type is an error (rustc E0170): it can
+                // never mean the variant. `mut`, `ref`, and `@` forms
+                // are plain bindings and stay legal.
+                if !mutable && !by_ref {
+                    let (_, base) = self.autoderef(t);
+                    if let Some(a) = self.tys.local_adt(self.resolve(base))
+                        && p.adt(a).is_enum
+                        && p.adt(a).variants.iter().any(|v| v.name == *name)
+                        && self.lookup(*name, span.ctxt).is_none()
+                        && !matches!(self.pat_ident(*name), PatIdent::Variant(b, _) if b == a)
+                    {
+                        let (vn, en) = (self.name(*name).to_string(), self.name(p.adt(a).name).to_string());
+                        self.err(
+                            "L0110",
+                            span,
+                            format!("pattern binding `{vn}` is named the same as one of the variants of the type `{en}`"),
+                            format!("Rename the binding, or match the variant with `{en}::{vn}` (or `use {en}::{vn};` first)."),
+                        );
+                        return;
+                    }
+                }
                 self.bind_pattern_local(pi, *name, *mutable, *by_ref, t, mode, span);
             }
             Pat::At { name, mutable, by_ref, inner } => {
@@ -4220,6 +4458,57 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Pat::Path(segs) | Pat::TupleStruct { path: segs, .. } | Pat::Struct { path: segs, .. } => {
+                // A path may also name a const item (`m::K`, rewritten
+                // to its flat name) or a primitive associated const
+                // (`u8::MAX`): both compare like literal patterns.
+                if matches!(p.ast.pat(pat), Pat::Path(_)) {
+                    if segs.len() == 1 {
+                        match self.pat_ident(segs[0].name) {
+                            PatIdent::Const(idx) => {
+                                if let Some(&def) = p.const_defs.get(idx as usize) {
+                                    let _ = p.sig_of(&mut self.out.reads, def);
+                                }
+                                let ct = p.consts[idx as usize].ty;
+                                if !self.unify(ct, t) {
+                                    self.mismatch(span, t, ct);
+                                    return;
+                                }
+                                self.out.pat_res[pi] = PatRes::ConstItem(idx);
+                                return;
+                            }
+                            PatIdent::Static(_) => {
+                                self.err(
+                                    "L0110",
+                                    span,
+                                    "statics cannot be used as patterns",
+                                    "Use a const item for a pattern, or compare with the static in a guard.",
+                                );
+                                return;
+                            }
+                            PatIdent::Variant(a, v) if p.adt(a).is_enum => {
+                                let adt_ty = self.tys.adt_ty(a);
+                                if !self.unify(adt_ty, t) {
+                                    self.mismatch(span, t, adt_ty);
+                                    return;
+                                }
+                                if p.adt(a).variants[v as usize].shape != VariantShape::Unit {
+                                    self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
+                                    return;
+                                }
+                                self.out.pat_res[pi] = PatRes::Variant(a, v);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    } else if let Some((cv, ct)) = self.primitive_const_pattern(segs) {
+                        if !self.unify(ct, t) {
+                            self.mismatch(span, t, ct);
+                            return;
+                        }
+                        self.out.pat_const[pi] = Some(cv);
+                        return;
+                    }
+                }
                 let target = if segs.len() == 1 {
                     let n = segs[0].name;
                     // The flat type table answers below; the binding query
@@ -4228,7 +4517,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.binding(Namespace::Type, n);
                     }
                     let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
-                    a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0))
+                    match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0)) {
+                        Some(v) => Some(v),
+                        // An imported variant in a tuple or struct pattern
+                        // (`use E::*; B(n)`): resolve through the bindings.
+                        None => match self.pat_ident(n) {
+                            PatIdent::Variant(a, v) => Some((a, v)),
+                            _ => None,
+                        },
+                    }
                 } else {
                     match self.resolve_assoc(segs, span) {
                         Some(Res::Variant(a, v)) => Some((a, v)),
@@ -4783,7 +5080,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         match p.ast.pat(pat) {
-            Pat::Wild | Pat::Binding { .. } => true,
+            Pat::Wild => true,
+            // A binding that resolved to a const item can fail; one
+            // that resolved to a unit struct cannot.
+            Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+                PatRes::ConstItem(_) => false,
+                PatRes::Variant(a, _) => !p.adt(a).is_enum,
+                _ if self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_some() => false,
+                _ => true,
+            },
             Pat::Or(alts) => alts.iter().any(|&a| self.irrefutable(a)),
             Pat::Struct { fields, .. } => {
                 matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
@@ -4793,7 +5098,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
                     && elems.iter().all(|&s| self.irrefutable(s))
             }
-            Pat::Path(_) => matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum),
+            Pat::Path(_) => {
+                self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_none()
+                    && !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_))
+                    && matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
+            }
             Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
             Pat::Ref { inner, .. } => self.irrefutable(*inner),
             Pat::At { inner, .. } => self.irrefutable(*inner),
