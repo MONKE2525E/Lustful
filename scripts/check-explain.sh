@@ -19,6 +19,11 @@ report() {
 }
 rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A unconditional_panic -A warnings)
 
+# 0. Registry: ranges, collisions, reserved codes, explain rows (no build needed).
+if ! "$root/scripts/check-codes.sh" "$root"; then
+  report bad registry "scripts/check-codes.sh failed (see above)"
+fi
+
 # 1. Coverage: source codes, pages, and index must agree.
 grep -rhoE 'L[0-9]{4}' "$root"/src/ | sort -u > "$work/src-codes"
 ls "$root"/docs/errors/L*.md | sed 's|.*/||; s|\.md||' | sort -u > "$work/doc-codes"
