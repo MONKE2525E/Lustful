@@ -65,6 +65,11 @@ fn main() {
             if let (Some(cache), Some(src)) = (&cache, &src) {
                 cache.store(&req, src, &resp);
             }
+            // This process exits inside `finish`. Leak the session instead of freeing it:
+            // dropping millions of small allocations (many made on worker threads) costs
+            // about 10 ms on a 31k-line crate, and the OS reclaims the memory for free.
+            // The daemon path never reaches this code, so it still frees normally.
+            std::mem::forget(session);
             protocol::finish(resp, run, &req.out, &args);
         }
         None => {

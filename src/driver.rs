@@ -633,14 +633,27 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         diags.push(Diag::new("L0130", diag::Span::default(), "no `main` function", "Add `fn main() { ... }`."));
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });
+    // A one-shot (non-persistent) process exits right after this call. Freeing the IR and
+    // program arenas, mostly built on worker threads, costs about 10 ms on a 31k-line crate,
+    // so leak them on every return below and let the OS reclaim the memory at exit.
+    let leak_at_exit = !caches.persistent;
     if !diags.is_empty() {
-        return errors(&mut diags, &path, &src, req);
+        let resp = errors(&mut diags, &path, &src, req);
+        if leak_at_exit {
+            std::mem::forget(results);
+            std::mem::forget(program);
+        }
+        return resp;
     }
     let mut resp = Response::default();
     if req.cmd == Cmd::Check {
         if req.timings {
             let _ = writeln!(resp.stderr, "lust check {path}: ok ({} functions, {mode}: {} rechecked)", program.fns.len(), work.len());
             t.render(&mut resp.stderr);
+        }
+        if leak_at_exit {
+            std::mem::forget(results);
+            std::mem::forget(program);
         }
         return resp;
     }
@@ -765,6 +778,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.overlays.len(),
         );
         t.render(&mut resp.stderr);
+    }
+    if leak_at_exit {
+        std::mem::forget(bodies);
+        std::mem::forget(units);
+        std::mem::forget(program);
     }
     resp
 }
