@@ -288,6 +288,9 @@ pub(super) fn trait_probe_for(
     #[allow(clippy::type_complexity)]
     let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>, RcvProbe, Option<(Ty, Ty)>)> =
         Vec::new();
+    // Traits whose selection stays ambiguous after the argument
+    // trial: (trait, method template, inferred inputs, variant).
+    let mut deferred: Vec<(DefId, TraitMethodTemplate, Vec<Ty>, RcvProbe)> = Vec::new();
     for trait_def in traits {
         if only.is_none() && !trait_in_scope(cx, trait_def) {
             continue;
@@ -415,6 +418,7 @@ pub(super) fn trait_probe_for(
                 let sites_len = cx.generic_sites.len();
                 let csites_len = cx.closure_sites.len();
                 let picks_len = cx.out.trait_picks.len();
+                let dmeth_len = cx.deferred_methods.len();
                 let mut input_vars: Vec<Ty> = Vec::new();
                 let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
                 for _ in 0..n_inputs {
@@ -463,6 +467,7 @@ pub(super) fn trait_probe_for(
                 cx.generic_sites.truncate(sites_len);
                 cx.closure_sites.truncate(csites_len);
                 cx.out.trait_picks.truncate(picks_len);
+                cx.deferred_methods.truncate(dmeth_len);
                 if let Some(inputs) = zonked {
                     let snap = cx.snapshot_vars();
                     let obl_len = cx.obl_len();
@@ -470,7 +475,9 @@ pub(super) fn trait_probe_for(
                     tr_args.extend(inputs.iter().map(|&t| GenericArg::Ty(t)));
                     let args_id = cx.tys.intern_args(&tr_args);
                     let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
-                    let found: Option<(LocalDefId, Vec<GenericArg>)> = match cx.select_obligation(tr) {
+                    let sel = cx.select_obligation(tr);
+                    let still_ambiguous = sel == Selection::Ambiguous;
+                    let found: Option<(LocalDefId, Vec<GenericArg>)> = match sel {
                         Selection::Impl { id, args: impl_args, .. } => {
                             let rec_impl = p.gx.index.get(id);
                             let by_name =
@@ -486,10 +493,30 @@ pub(super) fn trait_probe_for(
                     cx.obl_truncate(obl_len);
                     if let Some((local, prefix)) = found {
                         hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs), probe, None));
+                    } else if still_ambiguous {
+                        deferred.push((trait_def, t.clone(), inputs, probe));
                     }
                 }
             }
         }
+    }
+    // Only ambiguous traits: one is the call (its impl is picked at
+    // body end), two are ambiguous between traits (rustc E0034).
+    if hits.is_empty() && deferred.len() == 1 {
+        let (trait_def, t, inputs, probe) = deferred.pop().unwrap();
+        return confirm_deferred(cx, e, trait_def, &t, &inputs, probe, derefs, name_span, args, explicit);
+    }
+    if hits.is_empty() && deferred.len() > 1 {
+        cx.err(
+            "L0720",
+            name_span,
+            format!("multiple trait methods named `{}` apply here", cx.name(name)),
+            "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
+        );
+        for &a in args {
+            cx.expr(a, None);
+        }
+        return Probe::Failed;
     }
     match hits.len() {
         0 => Probe::Miss,
@@ -595,6 +622,96 @@ pub(super) fn trait_probe_for(
             }
             Probe::Failed
         }
+    }
+}
+
+/// A trait method call whose impl selection was still ambiguous at
+/// the call: body end selects the impl and sets the resolution.
+pub(super) struct DeferredMethod {
+    e: ExprId,
+    tr: TraitRef,
+    name: Sym,
+    /// The method's own generic args, after the trait's.
+    own: Vec<GenericArg>,
+    derefs: u8,
+    autoref: Autoref,
+}
+
+/// Confirms a trait method whose impl is still ambiguous (an input
+/// type only an argument or the expected type fixes, or a literal Self
+/// with several numeric impls), as rustc does: the call is typed by the
+/// trait's method signature, the trait obligation stays queued (the
+/// literal fallback can settle it), and `finish_deferred_methods`
+/// selects the impl at body end.
+#[allow(clippy::too_many_arguments)]
+fn confirm_deferred(
+    cx: &mut Ctx,
+    e: ExprId,
+    trait_def: DefId,
+    t: &TraitMethodTemplate,
+    inputs: &[Ty],
+    probe: RcvProbe,
+    derefs: u8,
+    name_span: Span,
+    args: &[ExprId],
+    explicit: &[Option<GenericArg>],
+) -> Probe {
+    let n_trait = 1 + inputs.len();
+    let snap = cx.snapshot_vars();
+    let obl_len = cx.obl_len();
+    let mut full: Vec<GenericArg> = vec![GenericArg::Ty(probe.self_ty)];
+    full.extend(inputs.iter().map(|&i| GenericArg::Ty(i)));
+    for (i, param) in t.generics.params.iter().enumerate().skip(n_trait) {
+        let given = explicit.get(i - n_trait).copied().flatten();
+        full.push(match (given, &param.kind) {
+            (Some(g), _) => g,
+            (None, ParamKind::Type) => GenericArg::Ty(cx.new_var(false)),
+            (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
+            (None, ParamKind::Const(_)) => GenericArg::Const(cx.fresh_const_var()),
+        });
+    }
+    let params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
+    let ret = subst(&mut cx.tys, t.ret, &full);
+    if params.is_empty() || !cx.unify(params[0], probe.recv_ty) {
+        cx.rollback_vars(snap);
+        cx.obl_truncate(obl_len);
+        return Probe::Miss;
+    }
+    let preds = t.generics.predicates.clone();
+    cx.push_predicates(&preds, &full, name_span);
+    let tr_args = cx.tys.intern_args(&full[..n_trait]);
+    let tr = TraitRef { def: trait_def, args: tr_args, bindings: EMPTY_BINDINGS };
+    cx.obl.push_trait_at(tr, name_span, 0);
+    let derefs = derefs + probe.extra_derefs;
+    cx.deferred_methods.push(DeferredMethod { e, tr, name: t.name, own: full[n_trait..].to_vec(), derefs, autoref: probe.autoref });
+    cx.record_pick(e, trait_def, derefs, probe.filter);
+    cx.check_args(&params[1..], args, name_span);
+    Probe::Hit(cx.normalize_here(ret))
+}
+
+/// Body end for `confirm_deferred` calls: after the hard obligation
+/// run, select each trait ref and point the call at the impl method
+/// (or the trait default), with its generic site for mono. A trait
+/// ref that still does not select was already reported by that run.
+pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
+    let p = cx.p;
+    for d in std::mem::take(&mut cx.deferred_methods) {
+        let Selection::Impl { id, args: impl_args, .. } = cx.select_obligation(d.tr) else { continue };
+        let rec = p.gx.index.get(id);
+        let target = match rec.items.iter().copied().find_map(|x| p.local_def(x.hash).filter(|&l| p.fn_info(l).name == d.name)) {
+            Some(l) => Some((l, impl_args)),
+            None => p.gx.index.trait_record(d.tr.def).and_then(|r| r.method_by_name(d.name)).and_then(|m| p.local_def(m.hash)).map(|l| {
+                let raw: Vec<GenericArg> = cx.tys.args(d.tr.args).to_vec();
+                (l, raw.iter().map(|&g| if let GenericArg::Ty(t) = g { GenericArg::Ty(cx.deep(t)) } else { g }).collect())
+            }),
+        };
+        let Some((local, mut prefix)) = target else { continue };
+        if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+            prefix.extend(d.own.iter().copied());
+            let ei = cx.ei(d.e);
+            cx.generic_sites.push((ei, local, prefix));
+        }
+        cx.set_res(d.e, Res::Method { f: local, derefs: d.derefs, autoref: d.autoref });
     }
 }
 

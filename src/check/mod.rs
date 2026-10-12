@@ -444,6 +444,9 @@ struct Ctx<'p, 'a> {
     /// Closures whose bodies get a second inference pass at
     /// finish when signature variables are still unbound.
     deferred_closures: Vec<DeferredClosure>,
+    /// Trait method calls whose impl is selected at finish (see
+    /// `method::confirm_deferred`).
+    deferred_methods: Vec<method::DeferredMethod>,
     /// Format arguments whose type was still a variable when
     /// the format check ran: (type, wants Debug, span). The
     /// Display/Debug test re-runs at finish (W-TRAITS-CORE).
@@ -514,6 +517,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closure_sites: Vec::new(),
         closure_arg_stack: Vec::new(),
         deferred_closures: Vec::new(),
+        deferred_methods: Vec::new(),
         deferred_fmt: Vec::new(),
         head_unknown_flag: false,
         in_norm: false,
@@ -2771,6 +2775,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let saved_sites = self.generic_sites.len();
         let saved_closure_sites = self.closure_sites.len();
         let saved_deferred = self.deferred_closures.len();
+        let saved_dmeth = self.deferred_methods.len();
         let saved_fmt = self.deferred_fmt.len();
         for (n, &t) in names.iter().zip(sig) {
             if let Some((name, mutable, nspan)) = n {
@@ -2800,6 +2805,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.generic_sites.truncate(saved_sites);
             self.closure_sites.truncate(saved_closure_sites);
             self.deferred_closures.truncate(saved_deferred);
+            self.deferred_methods.truncate(saved_dmeth);
             self.deferred_fmt.truncate(saved_fmt);
         }
         self.scopes = saved_scopes;
@@ -4381,6 +4387,62 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The Self type of `Type::name(..)` when the call goes through a
+    /// trait: `Type` is an Adt with no variant and no inherent fn called
+    /// `name`, or `picked` (the template check already resolved the call
+    /// through a trait). Type arguments are fresh variables.
+    fn trait_assoc_base(&mut self, segs: &[ast::PathSeg], picked: bool) -> Option<Ty> {
+        let p = self.p;
+        let (ty_name, item) = (segs[0].name, segs[1].name);
+        let a = if ty_name == p.known.self_type {
+            self.f.owner?
+        } else {
+            match self.binding(Namespace::Type, ty_name) {
+                BindingRes::Def(def) => p.adt_by_def(def)?,
+                _ => return None,
+            }
+        };
+        if !picked && (p.methods.contains_key(&(a, item)) || (p.adt(a).is_enum && p.adt(a).variants.iter().any(|v| v.name == item))) {
+            return None;
+        }
+        let generics = p.gx.adt_generics.get(a.0 as usize).cloned().unwrap_or_default();
+        if generics.params.is_empty() {
+            return Some(self.tys.adt_ty(a));
+        }
+        let args = self.fresh_args(&generics);
+        Some(self.tys.mk_adt(p.def_of_adt(a), &args))
+    }
+
+    /// `W::<u8>::new()`: type arguments written on the type segment
+    /// of a path call fix the Self type of the inherent impl, and so
+    /// the impl's parameters in the method's template args.
+    fn unify_written_self(&mut self, callee: ExprId, f: LocalDefId, inst_args: &[GenericArg], span: Span) {
+        let p = self.p;
+        let Expr::Path(segs) = p.ast.expr(callee) else { return };
+        if segs.len() != 2 || segs[0].type_args().is_empty() {
+            return;
+        }
+        let Some(owner) = p.fn_info(f).owner else { return };
+        let Some(self_tmpl) = p.gx.fn_scopes.get(f.0 as usize).and_then(|s| s.scope.self_ty) else { return };
+        let generics = p.gx.adt_generics.get(owner.0 as usize).cloned().unwrap_or_default();
+        let written: Vec<ast::TyId> = segs[0].type_args();
+        if written.len() != generics.params.len() || generics.params.iter().any(|g| g.kind != ParamKind::Type) {
+            self.err(
+                "L0105",
+                span,
+                format!("`{}` takes {} type argument(s) but {} were given", self.name(segs[0].name), generics.params.len(), written.len()),
+                "Write one type argument per type parameter.",
+            );
+            return;
+        }
+        let gargs: Vec<GenericArg> = written.iter().map(|&t| GenericArg::Ty(self.resolve_written(t))).collect();
+        let written_ty = self.tys.mk_adt(p.def_of_adt(owner), &gargs);
+        let self_ty = subst(&mut self.tys, self_tmpl, inst_args);
+        if !self.unify(self_ty, written_ty) {
+            self.mismatch(span, written_ty, self_ty);
+        }
+    }
+
     /// An associated function call through a trait:
     /// `<T as Tr>::name(..)` or `T::name(..)`. Selects the impl
     /// for the Self type and calls the method as a free fn (an
@@ -4405,7 +4467,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::FromCast);
                 return Some(base);
             }
-            if matches!(self.kind(src), TyKind::Int(_) | TyKind::Char | TyKind::Bool) {
+            let src_kind = self.kind(src);
+            if matches!(src_kind, TyKind::Int(_) | TyKind::Char | TyKind::Bool) || src_kind.is_int_infer() || src_kind.is_float_infer() {
                 // With the input type known from the argument,
                 // selection can pick between input-specific impls
                 // (the abstract synthetics for each From bound).
@@ -4823,6 +4886,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                 }
+                // `M::from(x)`: an Adt with no variant or inherent fn of
+                // that name finds it in the traits in scope (rustc
+                // probes inherent items first, then traits). A call the
+                // template check resolved through a trait keeps that
+                // trait (`Self::mk()` in a trait default body).
+                if segs.len() == 2
+                    && let Some(base) = self.trait_assoc_base(segs, self.replay_pick(e).is_some())
+                    && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
+                {
+                    return t;
+                }
                 let cs = self.span(callee);
                 match self.resolve_assoc(segs, cs) {
                     Some(r) => r,
@@ -4895,7 +4969,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
                 if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
                     let explicit = self.explicit_call_args(callee);
-                    let (params, ret, _) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
+                    let (params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
+                    self.unify_written_self(callee, f, &inst_args, span);
                     self.check_args(&params, args, span);
                     return self.normalize_here(ret);
                 }
@@ -8552,6 +8627,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
+        method::finish_deferred_methods(self);
         // A local whose element or item type was never decided (`let a = [];`,
         // `let v = Vec::new();`) is an annotation error (rustc E0282). This
         // scan runs before the zonk below defaults those variables away.
