@@ -1,0 +1,7 @@
+arena name=union total=6
+arena after mut: Payload { name: "union-grown", items: [1, 2, 3, 4] }
+arena clone total=10
+drops after arena scope: 0
+owned name=owned total=30
+owned clone: Payload { name: "owned", items: [10, 20] }
+drops after owned scope: 2

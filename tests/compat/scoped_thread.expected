@@ -1,0 +1,10 @@
+file 0: bytes=12 first_word=5
+file 1: bytes=42 first_word=6
+file 2: bytes=1 first_word=1
+file 3: bytes=30 first_word=2
+file 4: bytes=0 first_word=0
+file 5: bytes=29 first_word=9
+file 6: bytes=19 first_word=4
+file 7: bytes=35 first_word=9
+unique files: 8
+total bytes over 3 workers: 504

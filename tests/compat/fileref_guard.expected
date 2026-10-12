@@ -1,0 +1,9 @@
+static: lib.d.ts text (len 13) as_static=Some("lib.d.ts text") pinned=false
+arc strong before refs: 1
+pinned text: "const x = 1;"
+pinned name[2]: "z" clone: "z"
+pinned names: ["x", "y", "z"] count 3
+pinned as_static: None
+pin rc count with 4 guards: 4 (arc 1)
+pin rc count with 1 guard: 1 (arc 1)
+default empty: 0 items

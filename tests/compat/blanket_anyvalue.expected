@@ -1,0 +1,9 @@
+pos: describe=3:17 debug=Position { line: 3, character: 17 }
+pos: as Position=Some(Position { line: 3, character: 17 }) as Range=None as String=None
+range: describe=1:0-2:5 debug=Range { start: Position { line: 1, character: 0 }, end: Position { line: 2, character: 5 } }
+range: as Position=None as Range=Some((1, 2)) as String=None
+text: describe=hello debug="hello"
+text: as Position=None as Range=None as String=Some("hello")
+boxed box: as Position=None as Box=Some("hit")
+param 0: 1:0-2:5
+param 1: hello
