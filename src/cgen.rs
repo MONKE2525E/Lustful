@@ -387,9 +387,17 @@ fn zero_lit(p: &Program, t: &CTy) -> String {
 }
 
 /// The C expression that reads the variant index of an enum or Option
-/// value at the pointer expression `ptr`.
+/// value at the pointer expression `ptr`. Explicit tags read inline;
+/// only niche-filled enums go through the generated `disc_` helper.
 fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
-    if c_layout(p, t).is_some() { format!("disc_{}({ptr})", mangle(t)) } else { format!("({ptr})->tag") }
+    match c_layout(p, t) {
+        Some(l) => match l.enum_tag {
+            Some(EnumTag::Explicit { .. }) => format!("(({ptr})->u._tag)"),
+            Some(EnumTag::NicheFilled { .. }) => format!("disc_{}({ptr})", mangle(t)),
+            _ => "0".into(),
+        },
+        None => format!("({ptr})->tag"),
+    }
 }
 
 /// The C field access for field `fi` of variant `vi` in the enum or
@@ -937,23 +945,59 @@ impl FnGen<'_, '_, '_> {
         }
     }
 
-    /// Builds one enum or Option value in a fresh temporary: zero fill,
-    /// store the variant's fields, then store the discriminant. Field
-    /// stores come first so a niche-filled variant's own payload write
-    /// is the last write to the niche scalar, and the other variants'
-    /// field stores cannot clobber the niche tag value.
+    /// Builds one enum or Option value. Most shapes are one compound
+    /// literal that designates a single union member (the variant
+    /// struct, whose first member is the explicit tag when there is
+    /// one). A niche-filled enum's non-niche variants need statements:
+    /// zero fill, store the fields, then store the niche tag value.
+    /// Field stores come first so they cannot clobber the niche scalar.
     fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
-        let tmp = self.tmp();
-        let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(t), zero_lit(self.p, t));
-        for (i, v) in vals.iter().enumerate() {
-            let f = variant_field(self.p, t, &tmp, variant, i);
-            let _ = writeln!(self.out, "    {f} = {v};");
+        let ct = ctype(t);
+        let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
+        match c_layout(self.p, t) {
+            None => match t {
+                CTy::Option(_) => {
+                    if vals.is_empty() { format!("(({ct}){{ .tag = 0 }})") } else { format!("(({ct}){{ .tag = 1, .v = {} }})", vals[0]) }
+                }
+                _ => {
+                    if fields.is_empty() {
+                        format!("(({ct}){{ .tag = {variant} }})")
+                    } else {
+                        format!("(({ct}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
+                    }
+                }
+            },
+            Some(l) => match l.enum_tag {
+                Some(EnumTag::Explicit { .. }) => {
+                    let mut init = format!("._tag = {variant}");
+                    if !fields.is_empty() {
+                        init.push_str(", ");
+                        init.push_str(&fields.join(", "));
+                    }
+                    format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
+                }
+                Some(EnumTag::NicheFilled { variant: niche_variant, .. }) if variant != niche_variant => {
+                    let tmp = self.tmp();
+                    let _ = writeln!(self.out, "    {ct} {tmp} = {};", zero_lit(self.p, t));
+                    for (i, v) in vals.iter().enumerate() {
+                        let f = variant_field(self.p, t, &tmp, variant, i);
+                        let _ = writeln!(self.out, "    {f} = {v};");
+                    }
+                    let set = disc_set(self.p, t, &tmp, variant);
+                    if !set.is_empty() {
+                        let _ = writeln!(self.out, "    {set}");
+                    }
+                    tmp
+                }
+                _ => {
+                    if fields.is_empty() {
+                        zero_lit(self.p, t)
+                    } else {
+                        format!("(({ct}){{ .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
+                    }
+                }
+            },
         }
-        let set = disc_set(self.p, t, &tmp, variant);
-        if !set.is_empty() {
-            let _ = writeln!(self.out, "    {set}");
-        }
-        tmp
     }
 
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
@@ -2076,8 +2120,7 @@ fn layout_members(fields: &[(String, Layout, u64)], total: Option<u64>, struct_a
 /// The compile-time layout proof for one emitted type: the C sizeof and
 /// _Alignof must equal the layout the type was emitted from.
 fn layout_assert(out: &mut String, ct: &str, l: &Layout) {
-    let _ = writeln!(out, "_Static_assert(sizeof({ct}) == {}, \"lust layout size\");", l.size);
-    let _ = writeln!(out, "_Static_assert(_Alignof({ct}) == {}, \"lust layout align\");", l.align);
+    let _ = writeln!(out, "_Static_assert(sizeof({ct}) == {} && _Alignof({ct}) == {}, \"layout\");", l.size, l.align);
 }
 
 /// One field's layout for `layout_members`, for a parent whose own
@@ -2095,15 +2138,26 @@ fn field_layout(p: &Program, t: &CTy) -> Layout {
 fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants: &[Vec<CTy>], l: &Layout) {
     let ct = ctype(t);
     let _ = write!(out, "{opener} {{ union {{ ");
+    // An explicit tag also appears as the first member of every variant
+    // struct, so a value can be built with one compound literal that
+    // designates a single union member (see `make_variant`).
+    let explicit = match l.enum_tag {
+        Some(EnumTag::Explicit { size, signed }) => Some((size, signed)),
+        _ => None,
+    };
     for (vi, v) in variants.iter().enumerate() {
-        if v.is_empty() {
+        if v.is_empty() && explicit.is_none() {
             continue;
         }
-        let fields: Vec<(String, Layout, u64)> = v
-            .iter()
-            .enumerate()
-            .map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi]))
-            .collect();
+        let mut fields: Vec<(String, Layout, u64)> = Vec::new();
+        if let Some((size, signed)) = explicit {
+            fields.push((format!("{} _tag", tag_c_type(size, signed)), plain_layout(size, size), 0));
+        }
+        fields.extend(
+            v.iter()
+                .enumerate()
+                .map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi])),
+        );
         let _ = write!(out, "struct {{ {}}} v{vi}; ", layout_members(&fields, None, 1));
     }
     match l.enum_tag {
@@ -2128,9 +2182,6 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
     layout_assert(out, &ct, l);
     let m = mangle(t);
     match l.enum_tag {
-        Some(EnumTag::Explicit { .. }) => {
-            let _ = writeln!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ return (uint32_t)p->u._tag; }}");
-        }
         Some(EnumTag::NicheFilled { variant, niche }) => {
             let others: Vec<usize> = (0..variants.len()).filter(|&i| i != variant).collect();
             let start = niche.start as u64;
@@ -2146,9 +2197,7 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
                 start + others.len() as u64
             );
         }
-        _ => {
-            let _ = writeln!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ (void)p; return 0; }}");
-        }
+        _ => {}
     }
 }
 
