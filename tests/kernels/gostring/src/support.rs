@@ -86,12 +86,29 @@ pub mod memchr {
             }
             haystack.windows(needle.len()).position(|w| w == needle)
         }
+
+        /// `memchr::memmem::Finder`: a reusable substring searcher.
+        pub struct Finder<'n> {
+            needle: &'n [u8],
+        }
+
+        impl<'n> Finder<'n> {
+            pub fn new<B: AsRef<[u8]> + ?Sized>(needle: &'n B) -> Finder<'n> {
+                Finder {
+                    needle: needle.as_ref(),
+                }
+            }
+
+            pub fn find(&self, haystack: &[u8]) -> Option<usize> {
+                find(haystack, self.needle)
+            }
+        }
     }
 }
 
 /// Stand-in for the `rustc-hash` crate (FxHash over std maps).
 pub mod rustc_hash {
-    use std::hash::{BuildHasherDefault, Hasher};
+    use std::hash::{BuildHasher, Hasher};
 
     /// The FxHash seed constant (rustc-hash 2.x).
     const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
@@ -163,8 +180,18 @@ pub mod rustc_hash {
         }
     }
 
-    /// `rustc_hash::FxBuildHasher`.
-    pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    /// `rustc_hash::FxBuildHasher`: a unit struct in the real crate,
+    /// passed by value to with_hasher.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct FxBuildHasher;
+
+    impl BuildHasher for FxBuildHasher {
+        type Hasher = FxHasher;
+
+        fn build_hasher(&self) -> FxHasher {
+            FxHasher::default()
+        }
+    }
 
     /// `rustc_hash::FxHashMap`.
     pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
