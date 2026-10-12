@@ -1185,7 +1185,7 @@ fn main() {}
                     assert_eq!(*unwind, None, "no unwind edges exist yet");
                     match target {
                         CallTarget::Fn(_) => fn_calls += 1,
-                        CallTarget::Builtin(_) => builtin_calls += 1,
+                        CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => builtin_calls += 1,
                     }
                 }
             }
