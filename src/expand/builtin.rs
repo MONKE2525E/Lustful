@@ -1,0 +1,666 @@
+// Builtin macros (ARCH 6.4) and the cfg evaluator expansion runs on.
+// The parser's format macros (`println!`, `format!`, `vec!`, `panic!`,
+// `assert!` and friends) stay parser forms and pass through; everything
+// here expands at token level before the parser sees it.
+use super::*;
+use std::hash::Hash as _;
+
+/// Macros the parser owns as `Expr::Macro` forms, plus `format_args!`,
+/// which stays unexpanded (its `Arguments` type lands with source std)
+/// so the parser rejects it with its own code today.
+pub fn is_passthrough(name: &str) -> bool {
+    matches!(
+        name,
+        "println"
+            | "print"
+            | "eprintln"
+            | "eprint"
+            | "format"
+            | "panic"
+            | "vec"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "todo"
+            | "unreachable"
+            | "format_args"
+    )
+}
+
+/// Macros this file expands at token level.
+pub fn is_token_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "matches"
+            | "concat"
+            | "stringify"
+            | "cfg"
+            | "env"
+            | "option_env"
+            | "line"
+            | "column"
+            | "file"
+            | "module_path"
+            | "include"
+            | "include_str"
+            | "include_bytes"
+            | "compile_error"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "write"
+            | "writeln"
+            | "dbg"
+            | "unimplemented"
+            | "thread_local"
+            | "pin"
+            | "offset_of"
+    )
+}
+
+/// The cfg facts a `cfg!` or `#[cfg]` in this file sees. Lust builds for
+/// the host target with debug assertions on; a single file has no Cargo
+/// features. Unknown names are false, as in rustc with no `--cfg`.
+pub struct CfgEnv {
+    pub test: bool,
+    pub debug_assertions: bool,
+}
+
+impl CfgEnv {
+    fn name_is(&self, name: &str, value: Option<&str>) -> bool {
+        match (name, value) {
+            ("test", None) => self.test,
+            ("debug_assertions", None) => self.debug_assertions,
+            ("unix", None) => true,
+            ("windows", None) => false,
+            ("target_family", Some("unix")) => true,
+            ("target_family", Some(_)) => false,
+            ("target_os", Some("linux")) => true,
+            ("target_os", Some(_)) => false,
+            ("target_arch", Some(v)) => v == std::env::consts::ARCH,
+            ("target_pointer_width", Some("64")) => true,
+            ("target_endian", Some("little")) => true,
+            ("target_env", Some("gnu")) => true,
+            ("feature", Some(_)) => false,
+            _ => false,
+        }
+    }
+
+    /// The hash of these facts for the expansion cache key (ARCH 6.5).
+    pub fn hash(&self) -> u64 {
+        let mut h = crate::intern::FxHasher::default();
+        self.test.hash(&mut h);
+        self.debug_assertions.hash(&mut h);
+        "host-unix-linux".hash(&mut h);
+        std::hash::Hasher::finish(&h)
+    }
+}
+
+/// Evaluates the trees inside `cfg(...)` / `#[cfg(...)]`: `all`, `any`,
+/// `not`, `name`, and `name = "value"` forms, comma-separated.
+/// A shape this does not understand is an error, never a guess.
+pub fn eval_cfg(trees: &[Tt], env: &CfgEnv, st: &impl CfgRead, span: Span) -> Result<bool, Diag> {
+    let mut i = 0;
+    let value = cfg_expr(trees, &mut i, env, st)?;
+    if i != trees.len() {
+        return Err(err(C_CALL, span, "invalid cfg expression", "Check the cfg syntax."));
+    }
+    Ok(value)
+}
+
+/// What cfg evaluation needs from the expander: identifier and string
+/// text for the atoms it meets.
+pub trait CfgRead {
+    fn ident_text(&self, tok: Tok) -> Option<String>;
+    fn string_text(&self, tok: Tok) -> Option<String>;
+}
+
+fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Result<bool, Diag> {
+    let span = trees.get(*i).map_or(Span::default(), |t| t.span());
+    let Some(name_tok) = tok_at(trees, *i) else {
+        return Err(err(C_CALL, span, "invalid cfg expression", "Check the cfg syntax."));
+    };
+    let Some(name) = st.ident_text(name_tok.tok) else {
+        return Err(err(C_CALL, span, "invalid cfg expression", "Check the cfg syntax."));
+    };
+    *i += 1;
+    match name.as_str() {
+        "all" | "any" | "not" => {
+            let Some(Tt::Delim(Delim::Paren, inner, _)) = trees.get(*i) else {
+                return Err(err(C_CALL, span, format!("`cfg({name})` needs ( ... )"), "Write the cfg items in parentheses."));
+            };
+            let inner = inner.clone();
+            *i += 1;
+            let mut values = Vec::new();
+            let mut j = 0;
+            while j < inner.len() {
+                values.push(cfg_expr(&inner, &mut j, env, st)?);
+                if tok_at(&inner, j).map(|t| t.tok) == Some(Tok::Comma) {
+                    j += 1;
+                } else if j != inner.len() {
+                    return Err(err(C_CALL, span, "invalid cfg expression", "Check the cfg syntax."));
+                }
+            }
+            Ok(match name.as_str() {
+                // Empty all() is true and empty any() is false, as in rustc.
+                "all" => values.iter().all(|v| *v),
+                "any" => values.iter().any(|v| *v),
+                _ => values.len() == 1 && !values[0],
+            })
+        }
+        _ => {
+            if tok_at(trees, *i).map(|t| t.tok) == Some(Tok::Eq) {
+                let value = match tok_at(trees, *i + 1) {
+                    Some(t) => st.string_text(t.tok),
+                    None => None,
+                };
+                let Some(value) = value else {
+                    return Err(err(C_CALL, span, "cfg values must be string literals", "Write `name = \"value\"`."));
+                };
+                *i += 2;
+                Ok(env.name_is(&name, Some(&value)))
+            } else {
+                Ok(env.name_is(&name, None))
+            }
+        }
+    }
+}
+
+/// Splits call argument trees at top-level commas. A trailing comma's
+/// empty final piece is dropped, as in a call's own grammar.
+pub fn split_args(trees: &[Tt]) -> Vec<Vec<Tt>> {
+    let mut parts: Vec<Vec<Tt>> = vec![Vec::new()];
+    for tree in trees {
+        if tree.is_tok(Tok::Comma) {
+            parts.push(Vec::new());
+        } else {
+            parts.last_mut().unwrap().push(tree.clone());
+        }
+    }
+    if parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    if parts.len() == 1 && parts[0].is_empty() {
+        return Vec::new();
+    }
+    parts
+}
+
+/// The trees of one argument with fragments unwrapped one level when
+/// the whole argument is a single fragment.
+fn unwrap_frag(trees: &[Tt]) -> &[Tt] {
+    match trees {
+        [Tt::Frag(_, inner, _)] => inner,
+        _ => trees,
+    }
+}
+
+/// The string value of an argument that is one string literal, with its
+/// span (the span builtins use for errors about the path or value).
+fn literal_string(st: &Expander, trees: &[Tt]) -> Option<(String, Span)> {
+    match unwrap_frag(trees) {
+        [Tt::Tok(t)] => match t.tok {
+            Tok::Str(i) => st.strings.get(i as usize).map(|s| (s.clone(), t.span)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reads a file for an `include` family macro, relative to the current
+/// file's directory (ARCH 6.4). Returns the resolved path and bytes.
+fn read_include(st: &mut Expander, rel: &str, span: Span) -> Result<(std::path::PathBuf, Vec<u8>), Diag> {
+    let base = std::path::Path::new(&st.cur_file).parent().map_or_else(|| std::path::PathBuf::from("."), |p| p.to_path_buf());
+    let path = base.join(rel);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            st.read_dep(&path.to_string_lossy(), &bytes);
+            Ok((path, bytes))
+        }
+        Err(_) => Err(err(
+            C_INCLUDE,
+            span,
+            format!("include file `{}` was not found", path.display()),
+            "Check the path. It is read relative to the current file.",
+        )),
+    }
+}
+
+/// The compile-time environment snapshot `env!` reads (ARCH 6.4): the
+/// process environment at first use, which for the daemon is its start
+/// environment, so repeated requests in one session agree.
+fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
+    static SNAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| std::env::vars().collect())
+}
+
+/// Renders trees the way `stringify!` does: token text with a single
+/// space wherever the source had a gap between tokens.
+pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
+    struct Piece {
+        text: String,
+        lo: u32,
+        hi: u32,
+        file: crate::diag::FileId,
+    }
+    fn go(st: &Expander, trees: &[Tt], out: &mut Vec<Piece>) {
+        for tree in trees {
+            match tree {
+                Tt::Tok(t) => out.push(Piece {
+                    text: tok_text(&t.tok, &st.strings, st.ctx.interner),
+                    lo: t.span.lo,
+                    hi: t.span.hi,
+                    file: t.span.file,
+                }),
+                Tt::Delim(d, inner, span) => {
+                    let (open, close) = match d {
+                        Delim::Paren => ("(", ")"),
+                        Delim::Bracket => ("[", "]"),
+                        Delim::Brace => ("{", "}"),
+                    };
+                    out.push(Piece { text: open.to_string(), lo: span.lo, hi: span.hi, file: span.file });
+                    go(st, inner, out);
+                    // The closing delimiter has no span of its own in a
+                    // token tree; count it as right after what it closes.
+                    let lo = out.last().map_or(span.hi, |p| p.hi);
+                    out.push(Piece { text: close.to_string(), lo, hi: lo + 1, file: span.file });
+                }
+                Tt::Frag(_, inner, _) => go(st, inner, out),
+            }
+        }
+    }
+    let mut pieces = Vec::new();
+    go(st, trees, &mut pieces);
+    let mut text = String::new();
+    let mut prev: Option<&Piece> = None;
+    for piece in &pieces {
+        if let Some(prev) = prev
+            && (piece.file != prev.file || piece.lo > prev.hi)
+        {
+            text.push(' ');
+        }
+        text.push_str(&piece.text);
+        prev = Some(piece);
+    }
+    text
+}
+
+/// Expands one builtin macro call. `name` has no `!` and satisfied
+/// `is_token_builtin`. The walk re-walks output, so nested macro calls
+/// a builtin writes or forwards need no chase here, except where a
+/// builtin must read a literal its argument expands to.
+pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    let bad = |msg: String| err(C_CALL, span, msg, format!("Check the arguments to {name}!."));
+    match name {
+        "stringify" => {
+            let text = stringify_trees(st, &call.inner);
+            Ok(vec![st.str_tree(&text, span)])
+        }
+        "cfg" => {
+            let on = eval_cfg(&call.inner, &st.ctx.cfg, st, span)?;
+            Ok(vec![Tt::Tok(Token { tok: if on { Tok::True } else { Tok::False }, span })])
+        }
+        "line" | "column" => {
+            expect_args(name, call, 0)?;
+            let site = crate::diag::call_site_span(span);
+            let (line, col) = st.line_col(site);
+            let value = if name == "line" { line } else { col };
+            Ok(vec![Tt::Tok(Token { tok: Tok::Int(value as u64, Some(crate::lexer::IntSuffix::U32)), span })])
+        }
+        "file" => {
+            expect_args(name, call, 0)?;
+            let file = st.cur_file.clone();
+            Ok(vec![st.str_tree(&file, span)])
+        }
+        "module_path" => {
+            expect_args(name, call, 0)?;
+            let path = st.module_path_text();
+            Ok(vec![st.str_tree(&path, span)])
+        }
+        "env" | "option_env" => {
+            let args = split_args(&call.inner);
+            if args.len() != 1 {
+                return Err(bad(format!("{name}! takes one string literal")));
+            }
+            let expanded = st.expand_more(args.into_iter().next().unwrap(), depth)?;
+            let Some((var, _)) = literal_string(st, &expanded) else {
+                return Err(bad(format!("{name}! takes one string literal")));
+            };
+            let value = env_snapshot().get(&var).cloned();
+            st.read_dep(&format!("env:{var}"), value.as_deref().unwrap_or("").as_bytes());
+            match (name, value) {
+                ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),
+                ("env", None) => Err(err(
+                    C_CALL,
+                    span,
+                    format!("environment variable `{var}` not defined at compile time"),
+                    "Set the variable, or use option_env! and handle None.",
+                )),
+                (_, Some(v)) => {
+                    let inner = st.str_tree(&v, span);
+                    let some = st.ident_tree("Some", span);
+                    Ok(vec![some, Tt::Delim(Delim::Paren, vec![inner], span)])
+                }
+                (_, None) => Ok(vec![st.ident_tree("None", span)]),
+            }
+        }
+        "concat" => {
+            let mut text = String::new();
+            for arg in split_args(&call.inner) {
+                let expanded = st.expand_more(arg, depth)?;
+                let Some(part) = concat_value(st, &expanded) else {
+                    return Err(bad("concat! arguments must be literals".to_string()));
+                };
+                text.push_str(&part);
+            }
+            Ok(vec![st.str_tree(&text, span)])
+        }
+        "include_str" | "include_bytes" | "include" => include_macro(st, name, call, depth),
+        "compile_error" => {
+            let args = split_args(&call.inner);
+            let msg = if args.len() == 1 {
+                literal_string(st, &args[0]).map(|(s, _)| s).unwrap_or_else(|| "compile_error!".to_string())
+            } else {
+                "compile_error!".to_string()
+            };
+            Err(err(C_CALL, span, msg, "This code does not compile on purpose when this cfg holds."))
+        }
+        "matches" => matches_macro(st, call),
+        "debug_assert" | "debug_assert_eq" | "debug_assert_ne" => {
+            if !st.ctx.cfg.debug_assertions {
+                let _ = call;
+                return Ok(vec![Tt::Delim(Delim::Brace, Vec::new(), span)]);
+            }
+            let plain = name.strip_prefix("debug_").unwrap_or(name).to_string();
+            let mut out = vec![st.ident_tree(&plain, span), Tt::Tok(Token { tok: Tok::Bang, span })];
+            let inner = st.expand_more(call.inner.clone(), depth)?;
+            out.push(Tt::Delim(Delim::Paren, inner, span));
+            Ok(out)
+        }
+        "unimplemented" => {
+            let mut out = vec![st.ident_tree("todo", span), Tt::Tok(Token { tok: Tok::Bang, span })];
+            let inner = st.expand_more(call.inner.clone(), depth)?;
+            out.push(Tt::Delim(Delim::Paren, inner, span));
+            Ok(out)
+        }
+        "write" | "writeln" => write_macro(st, name == "writeln", call),
+        "dbg" => dbg_macro(st, call),
+        "thread_local" => thread_local_macro(st, call),
+        "pin" => {
+            let mut tpl = st.lex_template("::std::pin::Pin::new_unchecked(&mut (__lust_e))", span);
+            tpl = splice_placeholders(tpl, "__lust_e", &call.inner, st.ctx.interner);
+            Ok(tpl)
+        }
+        "offset_of" => Err(err(
+            C_UNSUPPORTED,
+            span,
+            "`offset_of!` is not supported yet",
+            "Compute the offset another way until offsets have a const path.",
+        )),
+        _ => Err(err(C_UNSUPPORTED, span, format!("`{name}!` is not supported yet"), "Rewrite this part with the supported subset.")),
+    }
+}
+
+fn expect_args(name: &str, call: &Call, n: usize) -> Result<(), Diag> {
+    if split_args(&call.inner).len() == n {
+        Ok(())
+    } else {
+        Err(err(C_CALL, call.span, format!("`{name}!` takes {n} argument(s)"), "Check the call."))
+    }
+}
+
+/// The text one `concat!` argument stands for, when it is a literal.
+fn concat_value(st: &Expander, trees: &[Tt]) -> Option<String> {
+    let trees = unwrap_frag(trees);
+    if let [Tt::Tok(neg), Tt::Tok(num)] = trees
+        && neg.tok == Tok::Minus
+        && matches!(num.tok, Tok::Int(..) | Tok::Float(_))
+    {
+        return Some(format!("-{}", tok_text(&num.tok, &st.strings, st.ctx.interner)));
+    }
+    let [Tt::Tok(t)] = trees else { return None };
+    Some(match t.tok {
+        Tok::Str(i) => st.strings.get(i as usize)?.clone(),
+        Tok::Char(c) => c.to_string(),
+        Tok::Int(..) | Tok::Float(_) => tok_text(&t.tok, &st.strings, st.ctx.interner),
+        Tok::True => "true".to_string(),
+        Tok::False => "false".to_string(),
+        _ => return None,
+    })
+}
+
+/// The `include!` family (ARCH 6.4): files read at expand time.
+fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    let args = split_args(&call.inner);
+    if args.len() != 1 {
+        return Err(err(C_CALL, span, format!("{name}! takes one path"), "Write one string literal path."));
+    }
+    let expanded = st.expand_more(args.into_iter().next().unwrap(), depth)?;
+    let Some((rel, rel_span)) = literal_string(st, &expanded) else {
+        return Err(err(C_CALL, span, format!("{name}! takes one path"), "Write one string literal path."));
+    };
+    let (path, bytes) = read_include(st, &rel, rel_span)?;
+    match name {
+        "include_str" => {
+            let text = String::from_utf8(bytes).map_err(|_| {
+                err(C_CALL, rel_span, format!("`{}` is not valid UTF-8", path.display()), "Use include_bytes! for byte data.")
+            })?;
+            Ok(vec![st.str_tree(&text, span)])
+        }
+        "include_bytes" => {
+            let text = String::from_utf8(bytes).map_err(|_| {
+                err(
+                    C_UNSUPPORTED,
+                    rel_span,
+                    "include_bytes! of non-UTF-8 data is not supported yet",
+                    "This rides on the byte-string form, which has no checker support yet.",
+                )
+            })?;
+            let lit = st.str_tree(&text, span);
+            let mut tpl = st.lex_template("__lust_s.as_bytes()", span);
+            tpl = splice_placeholders(tpl, "__lust_s", &[lit], st.ctx.interner);
+            Ok(tpl)
+        }
+        _ => {
+            let text = String::from_utf8(bytes)
+                .map_err(|_| err(C_CALL, rel_span, format!("`{}` is not valid UTF-8", path.display()), "Rust source must be UTF-8."))?;
+            let file = crate::diag::FileId(0);
+            let trees = st.lex_file_trees(&text, file)?;
+            let old_file = std::mem::replace(&mut st.cur_file, path.to_string_lossy().to_string());
+            let old_src = std::mem::replace(&mut st.cur_src, text);
+            let expanded = st.expand_list(trees, depth + 1, true, 0);
+            st.cur_file = old_file;
+            st.cur_src = old_src;
+            expanded
+        }
+    }
+}
+
+/// `matches!(expr, pat if guard)` in its rustc shape.
+fn matches_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    // Split once, at the first top-level comma: before it the value,
+    // after it the pattern (with any `if` guard as written).
+    let Some(comma) = call.inner.iter().position(|t| t.is_tok(Tok::Comma)) else {
+        return Err(err(C_CALL, span, "matches! takes a value and a pattern", "Write matches!(value, pattern)."));
+    };
+    let value = call.inner[..comma].to_vec();
+    let mut pat = call.inner[comma + 1..].to_vec();
+    if matches!(pat.last(), Some(Tt::Tok(t)) if t.tok == Tok::Comma) {
+        pat.pop();
+    }
+    let mut tpl = st.lex_template("match __lust_v { __lust_p => true, _ => false }", span);
+    tpl = splice_placeholders(tpl, "__lust_v", &value, st.ctx.interner);
+    tpl = splice_placeholders(tpl, "__lust_p", &pat, st.ctx.interner);
+    Ok(tpl)
+}
+
+/// `write!` and `writeln!` in their rustc shape:
+/// `dst.write_fmt(format_args!(...))`. `format_args!` stays for the
+/// parser until its `Arguments` type lands with source std (6.4).
+fn write_macro(st: &mut Expander, newline: bool, call: &Call) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    let Some(comma) = call.inner.iter().position(|t| t.is_tok(Tok::Comma)) else {
+        // writeln!(dst) alone writes one newline.
+        if newline && !call.inner.is_empty() {
+            let dst = call.inner.clone();
+            let lit = st.str_tree("\n", span);
+            return Ok(write_shape(st, span, dst, vec![lit]));
+        }
+        return Err(err(C_CALL, span, "write! takes a destination and a format string", "Write write!(dst, \"...\", args...)."));
+    };
+    let dst = call.inner[..comma].to_vec();
+    let mut fmt_args: Vec<Tt> = call.inner[comma + 1..].to_vec();
+    if newline {
+        // The format literal gains the newline, as writeln! writes it.
+        let mut done = false;
+        for tree in fmt_args.iter_mut() {
+            if let Tt::Tok(t) = tree
+                && let Tok::Str(i) = t.tok
+                && let Some(text) = st.strings.get(i as usize).cloned()
+            {
+                let i2 = st.push_string(format!("{text}\n"));
+                t.tok = Tok::Str(i2);
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            return Err(err(
+                C_UNSUPPORTED,
+                span,
+                "writeln! with a non-literal format is not supported yet",
+                "Write the format as a string literal.",
+            ));
+        }
+    }
+    Ok(write_shape(st, span, dst, fmt_args))
+}
+
+fn write_shape(st: &mut Expander, span: Span, dst: Vec<Tt>, fmt_args: Vec<Tt>) -> Vec<Tt> {
+    let mut tpl = st.lex_template("__lust_d.write_fmt(format_args!(__lust_a))", span);
+    tpl = splice_placeholders(tpl, "__lust_d", &dst, st.ctx.interner);
+    tpl = splice_placeholders(tpl, "__lust_a", &fmt_args, st.ctx.interner);
+    tpl
+}
+
+/// `dbg!` in its rustc shape: print the value with `{:?}` under its
+/// file, line, column, and source text, then give the value back.
+fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    let site = crate::diag::call_site_span(span);
+    let (line, col) = st.line_col(site);
+    let file = st.cur_file.clone();
+    let prefix = st.str_tree(&format!("[{file}:{line}:{col}]"), span);
+    if call.inner.is_empty() {
+        return Ok(vec![
+            st.ident_tree("eprintln", span),
+            Tt::Tok(Token { tok: Tok::Bang, span }),
+            Tt::Delim(Delim::Paren, vec![prefix], span),
+        ]);
+    }
+    let args = split_args(&call.inner);
+    if args.len() != 1 {
+        return Err(err(
+            C_UNSUPPORTED,
+            span,
+            "dbg! with several values needs tuples, which are not supported yet",
+            "Call dbg! once per value.",
+        ));
+    }
+    let value = args.into_iter().next().unwrap();
+    let name_text = stringify_trees(st, &value);
+    let mut tpl =
+        st.lex_template("match __lust_v { __lust_t => { eprintln!(\"{} {} = {:?}\", __lust_at, __lust_n, &__lust_t); __lust_t } }", span);
+    let name_tree = vec![st.str_tree(&name_text, span)];
+    tpl = splice_placeholders(tpl, "__lust_v", &value, st.ctx.interner);
+    tpl = splice_placeholders(tpl, "__lust_at", &[prefix], st.ctx.interner);
+    tpl = splice_placeholders(tpl, "__lust_n", &name_tree, st.ctx.interner);
+    Ok(tpl)
+}
+
+/// `thread_local!` in its ARCH 6.4 shape: one `LocalKey` static per
+/// declared static, with an init fn. Checker and thread support for
+/// `LocalKey` land with W-THREADS; the shape is fixed here.
+fn thread_local_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
+    let span = call.span;
+    let mut out = Vec::new();
+    let trees = &call.inner;
+    let mut i = 0;
+    while i < trees.len() {
+        // One static: attributes, visibility, `static`, name, `:`, type,
+        // `=`, init, `;`. Read it off the token shape.
+        let item_start = i;
+        while let Some(attr) = attr_at(trees, i, st.ctx.interner) {
+            i = attr.end;
+        }
+        let vis_start = i;
+        if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pub) {
+            i += 1;
+            if matches!(trees.get(i), Some(Tt::Delim(Delim::Paren, _, _))) {
+                i += 1;
+            }
+        }
+        let vis: Vec<Tt> = trees[vis_start..i].to_vec();
+        let attrs: Vec<Tt> = trees[item_start..vis_start].to_vec();
+        if tok_at(trees, i).map(|t| t.tok) != Some(Tok::Static) {
+            return Err(err(
+                C_CALL,
+                span,
+                "thread_local! holds static declarations",
+                "Write `static NAME: Type = init;` in thread_local!.",
+            ));
+        }
+        i += 1;
+        let Some(name_tok) = tok_at(trees, i) else {
+            return Err(err(
+                C_CALL,
+                span,
+                "thread_local! holds static declarations",
+                "Write `static NAME: Type = init;` in thread_local!.",
+            ));
+        };
+        let name_tree = std::slice::from_ref(&trees[i]).to_vec();
+        let _ = name_tok;
+        i += 1;
+        if tok_at(trees, i).map(|t| t.tok) != Some(Tok::Colon) {
+            return Err(err(C_CALL, span, "thread_local! statics need a type", "Write `static NAME: Type = init;` in thread_local!."));
+        }
+        i += 1;
+        let ty_start = i;
+        while i < trees.len() && tok_at(trees, i).map(|t| t.tok) != Some(Tok::Eq) {
+            i += 1;
+        }
+        let ty: Vec<Tt> = trees[ty_start..i].to_vec();
+        if i >= trees.len() {
+            return Err(err(
+                C_CALL,
+                span,
+                "thread_local! statics need an initializer",
+                "Write `static NAME: Type = init;` in thread_local!.",
+            ));
+        }
+        i += 1; // `=`
+        let init_start = i;
+        while i < trees.len() && !trees[i].is_tok(Tok::Semi) {
+            i += 1;
+        }
+        let init: Vec<Tt> = trees[init_start..i].to_vec();
+        if i < trees.len() {
+            i += 1; // `;`
+        }
+        let mut tpl = st.lex_template(
+            "__lust_vis static __lust_name: ::std::thread::LocalKey<__lust_ty> = { fn __lust_init() -> __lust_ty { __lust_initval } unsafe { ::std::thread::LocalKey::new(__lust_init) } };",
+            span,
+        );
+        tpl = splice_placeholders(tpl, "__lust_vis", &vis, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_name", &name_tree, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_ty", &ty, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_initval", &init, st.ctx.interner);
+        out.extend(attrs);
+        out.extend(tpl);
+    }
+    Ok(out)
+}
