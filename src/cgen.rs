@@ -985,7 +985,11 @@ impl FnGen<'_, '_, '_> {
         match c_layout(self.p, t) {
             None => match t {
                 CTy::Option(_) => {
-                    if vals.is_empty() { format!("(({ct}){{ .tag = 0 }})") } else { format!("(({ct}){{ .tag = 1, .v = {} }})", vals[0]) }
+                    if vals.is_empty() {
+                        format!("(({ct}){{ .tag = 0 }})")
+                    } else {
+                        format!("(({ct}){{ .tag = 1, .v = {} }})", vals[0])
+                    }
                 }
                 _ => {
                     if fields.is_empty() {
@@ -1537,8 +1541,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {} {t} = {};", ctype(&tys[0]), vals[0]);
                 let disc = disc_call(self.p, &tys[0], &format!("(&{t})"));
                 if b == B::OptUnwrap {
-                    let _ =
-                        writeln!(self.out, "    if (!{disc}) lust_panic_cstr(\"called `Option::unwrap()` on a `None` value\", {loc});");
+                    let _ = writeln!(self.out, "    if (!{disc}) lust_panic_cstr(\"called `Option::unwrap()` on a `None` value\", {loc});");
                 } else {
                     let _ = writeln!(self.out, "    if (!{disc}) lust_panic_str({}, {loc});", vals[1]);
                 }
@@ -1665,7 +1668,8 @@ impl FnGen<'_, '_, '_> {
                 let some = disc_set(self.p, &opt, &t, 1);
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
-                let _ = writeln!(self.out, "    if ({it}->pos < {it}->s.len) {{ {field} = lust_utf8_next({it}->s.ptr, &{it}->pos);{some} }}");
+                let _ =
+                    writeln!(self.out, "    if ({it}->pos < {it}->s.len) {{ {field} = lust_utf8_next({it}->s.ptr, &{it}->pos);{some} }}");
                 t
             }
             B::CharsCount => format!("lust_chars_count({})", vals[0]),
@@ -2369,11 +2373,8 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
         if let Some((size, signed)) = explicit {
             fields.push((format!("{} _tag", tag_c_type(size, signed)), plain_layout(size, size), 0));
         }
-        fields.extend(
-            v.iter()
-                .enumerate()
-                .map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi])),
-        );
+        fields
+            .extend(v.iter().enumerate().map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi])));
         let _ = write!(out, "struct {{ {}}} v{vi}; ", layout_members(&fields, None, 1));
     }
     match l.enum_tag {
@@ -2571,8 +2572,12 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                             layout_assert(out, &format!("A{an}"), &l);
                         }
                         None => {
-                            let f: String =
-                                adt.variants[0].fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect();
+                            let f: String = adt.variants[0]
+                                .fields
+                                .iter()
+                                .enumerate()
+                                .map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty))))
+                                .collect();
                             let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
                             let _ = writeln!(out, "struct A{an} {{ {f}}};");
                         }

@@ -55,7 +55,6 @@ pub fn is_token_builtin(name: &str) -> bool {
             | "unimplemented"
             | "thread_local"
             | "pin"
-            | "offset_of"
     )
 }
 
@@ -533,12 +532,6 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             tpl = splice_placeholders(tpl, "__lust_e", &call.inner, st.ctx.interner);
             Ok(tpl)
         }
-        "offset_of" => Err(err(
-            C_UNSUPPORTED,
-            span,
-            "`offset_of!` is not supported yet",
-            "Compute the offset another way until offsets have a const path.",
-        )),
         _ => Err(err(C_UNSUPPORTED, span, format!("`{name}!` is not supported yet"), "Rewrite this part with the supported subset.")),
     }
 }

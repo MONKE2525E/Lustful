@@ -1427,10 +1427,12 @@ fn main() {}
     /// instance is added, while the table unit's key does.
     #[test]
     fn instance_manifest_round_trips_and_unit_keys_follow_4_2() {
-        let key = |h: u64| InstanceKeyHash::of_disk_def(
-            DiskDefId { krate: StableCrateHash(1), hash: DefPathHash(h) },
-            InstanceKeyHash::empty_args_fingerprint(),
-        );
+        let key = |h: u64| {
+            InstanceKeyHash::of_disk_def(
+                DiskDefId { krate: StableCrateHash(1), hash: DefPathHash(h) },
+                InstanceKeyHash::empty_args_fingerprint(),
+            )
+        };
         let mut m = SlotManifest::new();
         // Discovery order 30, 10, 20 in the first daemon.
         assert_eq!(m.assign(key(30)), 0);

@@ -452,10 +452,7 @@ pub fn serve(sock: &Path) -> ! {
                 // replace it before serving, never after.
                 let rk = refresh_key(&req.session);
                 if entry.refresh_key != rk {
-                    eprintln!(
-                        "lust daemon: graph or build script changed for crate {}; starting a fresh session",
-                        req.session.describe()
-                    );
+                    eprintln!("lust daemon: graph or build script changed for crate {}; starting a fresh session", req.session.describe());
                     let dir = entry.fresh_dir();
                     entry.session = Session::new(dir, true, req.session.clone());
                     entry.refresh_key = rk;

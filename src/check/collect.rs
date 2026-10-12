@@ -1140,7 +1140,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
                 if let Some(name) = item.name {
                     let idx = p.consts.len() as u32;
                     p.const_names.insert(name, idx);
-                    let disamb = p.const_defs.len() as u32;
+                    let disamb = 0;
                     let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Const, p.interner.get(name), disamb);
                     let def = DefId { krate: p.krate, hash };
                     p.defs.insert(def, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, item.span));

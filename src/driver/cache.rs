@@ -212,10 +212,8 @@ impl Cache {
     /// as for the runtime and main units), and the C text. See the
     /// module docs for why the text is in the key.
     fn unit_key(&self, unit: UnitKey, c_text: &str, debug: bool) -> String {
-        let (a, b) = hash128(
-            &[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), c_text.as_bytes()],
-            29,
-        );
+        let (a, b) =
+            hash128(&[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), c_text.as_bytes()], 29);
         format!("{a:016x}{b:016x}")
     }
 
