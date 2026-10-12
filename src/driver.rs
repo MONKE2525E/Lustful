@@ -198,28 +198,43 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
 /// content-defined: the chunk is cut before an item when a hash of the item's header line hits a
 /// mask. So editing or inserting an item only changes the chunk it is in, and every other chunk
 /// keeps its exact text (and can be reused). A chunk only starts at a line that begins an item at
-/// column 0, and never between an attribute and its item.
-fn split_items(src: &str, region: std::ops::Range<usize>, mask: u64) -> Vec<(usize, usize)> {
+/// column 0, and never between an attribute and its item. `headers`, when given, are the
+/// `item_headers` of the whole source (used on a session's first compile, where the region is
+/// the whole source and the mask needed the same table).
+fn split_items(src: &str, region: std::ops::Range<usize>, mask: u64, headers: Option<&[(usize, u64)]>) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut chunk_start = region.start;
-    for (at, h) in item_headers(&src[region.clone()]).into_iter().skip(1) {
+    let cut = |at: usize, h: u64, ranges: &mut Vec<(usize, usize)>, chunk_start: &mut usize| {
         // The multiply spreads FxHash's low bits.
         if (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) & mask == 0 {
-            ranges.push((chunk_start, region.start + at));
-            chunk_start = region.start + at;
+            ranges.push((*chunk_start, region.start + at));
+            *chunk_start = region.start + at;
+        }
+    };
+    match headers {
+        Some(headers) => {
+            for &(at, h) in headers.iter().skip(1) {
+                cut(at, h, &mut ranges, &mut chunk_start);
+            }
+        }
+        None => {
+            for (at, h) in item_headers(&src[region.clone()]).into_iter().skip(1) {
+                cut(at, h, &mut ranges, &mut chunk_start);
+            }
         }
     }
     ranges.push((chunk_start, region.end));
     ranges
 }
 
-/// The mask that makes `split_items` produce about `2 * cores` chunks for this source.
-fn split_mask(src: &str, cores: usize) -> u64 {
-    if src.len() < 64 * 1024 {
+/// The mask that makes `split_items` produce about `2 * cores` chunks for a source with
+/// `item_count` top-level items.
+fn split_mask(src_len: usize, item_count: usize, cores: usize) -> u64 {
+    if src_len < 64 * 1024 {
         // Small files: one chunk (no item hash has all 24 masked bits zero in practice).
         return (1 << 24) - 1;
     }
-    ((item_headers(src).len() / (cores * 2)).max(1).next_power_of_two() - 1) as u64
+    ((item_count / (cores * 2)).max(1).next_power_of_two() - 1) as u64
 }
 
 /// (offset of each top-level item's first line, hash of its header line), skipping attributes.
@@ -426,7 +441,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // split and lexed again: chunks entirely before it are kept as they are, and chunks entirely
     // after it are kept with shifted offsets.
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let mask = *front.split_mask.get_or_insert_with(|| split_mask(&src, cores));
+    // On the first compile the mask needs the item header table, and so does the split below
+    // (the region is then the whole source). Compute it once. It cost a full serial source
+    // scan, about 2 ms on a 48k-line file (front-end probe, milestone 2).
+    let mut fresh_headers: Option<Vec<(usize, u64)>> = None;
+    let mask = match front.split_mask {
+        Some(m) => m,
+        None => {
+            let headers = item_headers(&src);
+            let m = split_mask(src.len(), headers.len(), cores);
+            fresh_headers = Some(headers);
+            front.split_mask = Some(m);
+            m
+        }
+    };
     let old_len = front.src.len();
     let (prefix, suffix) = common_ends(front.src.as_bytes(), src.as_bytes());
     let delta = src.len() as i64 - old_len as i64;
@@ -444,7 +472,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let region_end = (region_end_old as i64 + delta) as usize;
     let lines = if old_len == 0 { LineIndex::new(&src) } else { front.lines.splice(&src, region_start, region_end_old, region_end) };
     let mut ranges: Vec<(usize, usize)> = kept_front.iter().map(|c| (c.start, c.start + c.text.len())).collect();
-    let middle = if region_start < region_end { split_items(&src, region_start..region_end, mask) } else { Vec::new() };
+    let headers = if region_start == 0 && region_end == src.len() { fresh_headers.as_deref() } else { None };
+    let middle = if region_start < region_end { split_items(&src, region_start..region_end, mask, headers) } else { Vec::new() };
     ranges.extend(middle.iter().copied());
     ranges.extend(kept_back.iter().map(|c| ((c.start as i64 + delta) as usize, (c.start as i64 + delta) as usize + c.text.len())));
     let mut reused: Vec<Option<Chunk>> =
@@ -773,7 +802,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             resp.stdout = run.stdout;
             if req.timings {
                 let kb = mem_units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
-                let _ = writeln!(resp.stderr, "lust run {path}: exit {} ({} functions, {kb} KB of C, in memory)", run.code, program.fns.len());
+                let _ =
+                    writeln!(resp.stderr, "lust run {path}: exit {} ({} functions, {kb} KB of C, in memory)", run.code, program.fns.len());
                 t.render(&mut resp.stderr);
             }
             resp.stderr.push_str(&run.stderr);
