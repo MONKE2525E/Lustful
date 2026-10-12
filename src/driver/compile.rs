@@ -302,11 +302,15 @@ fn chunk_end_ok(c: &Chunk) -> bool {
     c.scan.ends_at_boundary && (c.text.ends_with('\n') || chunk_ends_clean(&c.text))
 }
 
-/// Shifts every AST span in file `file` at or after old offset `lo` by `delta` bytes. After an
-/// edit, the kept suffix chunks keep their text at a new offset; their items in `front.ast`
-/// still carry old spans. Spans the parser stored for an item lie within that item's chunk,
-/// so shifting by range moves exactly the suffix items' spans. Runs before anything new is
-/// parsed in this compile, so every span in the AST is still in old coordinates.
+/// Shifts every AST span in file `file` at or after old offset `lo` by `delta` bytes.
+/// The caller passes the old start of the common suffix: every byte from there on is the
+/// same text at a new offset, so every span there moves by `delta`. This threshold matters
+/// inside the changed region too: in bodies-only mode an unchanged function after the edit
+/// point in the same chunk keeps its old AST, and its spans must move or its diagnostic
+/// and panic columns are off by the edit size. Spans in changed text belong to bodies or
+/// items that this compile re-parses before use, so shifting their dead nodes is harmless.
+/// Runs before anything new is parsed in this compile, so every span in the AST is still
+/// in old coordinates.
 fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
     if delta == 0 {
         return;
@@ -721,10 +725,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             front.chunks.push(chunk);
         }
     }
-    // The kept suffix moved by `delta`: put its AST spans (still in old coordinates, nothing new
-    // parsed yet) at their new positions.
+    // The common suffix moved by `delta`: put its AST spans (still in old coordinates, nothing
+    // new parsed yet) at their new positions. The threshold is the suffix start, not the first
+    // kept chunk: unchanged items between the edit and that chunk keep their old AST.
     if old_len > 0 {
-        shift_ast_spans(front, ROOT_FILE, region_end_old, delta);
+        shift_ast_spans(front, ROOT_FILE, old_len - suffix, delta);
     }
     let item_scans: Vec<scan::ItemScan> = front.chunks.iter().flat_map(|c| c.scan.items.iter().copied()).collect();
     let env = scan::env_hash(item_scans.iter());

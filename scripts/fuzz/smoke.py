@@ -3,7 +3,7 @@
 # does not reach: odd file names, odd run arguments, and old binaries staying valid
 # after the daemon rebuilds its base library.
 # Usage: python3 scripts/fuzz/smoke.py   (exit 0 = pass)
-import glob, os, shutil, subprocess, sys, tempfile, time
+import glob, os, re, shutil, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LUST = os.path.join(ROOT, "target/release/lust")
@@ -101,7 +101,26 @@ def main():
         check("line-comment chunk reuse", rc1 == 0 and rc2 == 1 and "L0001" in err2,
               f"rc1={rc1} rc2={rc2}")
 
-        # 6. The daemon is still alive and correct after all of it.
+        # 6. Regression: a body-only edit that deletes a byte must move the spans of
+        # unchanged functions later in the same chunk. Warm and cold panic locations
+        # must match; the warm column used to be one too high (fuzz seed 21, iter 774).
+        pc = os.path.join(work, "panic_col.rs")
+        open(pc, "w").write("fn price(c: i64) -> i64 { c / 100 }\nfn main() {\n    assert_eq!(price(500), 5);\n}\n")
+        rc1, _, _ = run_lust(["check", pc])
+        open(pc, "w").write("fn price(c: i64) -> i64 { c / 20 }\nfn main() {\n    assert_eq!(price(500), 5);\n}\n")
+        rc, out, err = run_lust(["run", pc, "-o", os.path.join(work, "pc.bin")])
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        r = subprocess.run([LUST, "run", pc, "-o", os.path.join(work, "pc2.bin")], cwd=work,
+                           env=cold_env, capture_output=True, text=True, timeout=20)
+        warm_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", err)
+        cold_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", r.stderr)
+        check("panic column after body edit",
+              rc1 == 0 and warm_loc is not None and cold_loc is not None
+              and warm_loc.groups() == cold_loc.groups() == ("3", "5"),
+              f"rc1={rc1} warm={warm_loc.groups() if warm_loc else None} "
+              f"cold={cold_loc.groups() if cold_loc else None}")
+
+        # 7. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
     finally:
         daemon.terminate()
