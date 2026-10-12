@@ -72,6 +72,13 @@ impl Timer {
         self.stages.push((name, (now - self.last).as_secs_f64() * 1e3));
         self.last = now;
     }
+    /// Records sub-stage times measured inside a stage that just
+    /// finished (the worklist phases), in place of one `lap` for the
+    /// whole stage.
+    fn lap_parts(&mut self, parts: Vec<(&'static str, f64)>) {
+        self.stages.extend(parts);
+        self.last = Instant::now();
+    }
     fn render(&self, out: &mut String) {
         for (name, ms) in &self.stages {
             let _ = writeln!(out, "  {name:<24} {ms:>9.2} ms");
@@ -1120,8 +1127,9 @@ fn resolved_setup(
             }
         }
     };
-    t.lap("resolve (worklist)");
-    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, .. } = resolved;
+    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, .. } =
+        resolved;
+    t.lap_parts(resolve_timings);
     let fn_count = fn_lines.len();
     front.ast = ast;
     front.map = map.clone();

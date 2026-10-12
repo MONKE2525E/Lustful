@@ -460,6 +460,24 @@ impl ResolvedTables {
         })
     }
 
+    /// Every name some module defines locally, as a set (see
+    /// `any_local_named`). The rewrite pass builds this once over the
+    /// frozen tables instead of rescanning every module map per
+    /// unresolved path, which was quadratic in the module count.
+    pub fn local_named_set(&self) -> FxMap<Sym, ()> {
+        let mut out = FxMap::default();
+        for (mi, maps) in self.maps.iter().enumerate() {
+            for m in maps {
+                for (name, state) in m {
+                    if matches!(state, BindState::One(b) if b.rank == 2 && b.def_module.0 as usize == mi) {
+                        out.insert(*name, ());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The answer for the S7 query fns: the module table first, then the
     /// flat-name index (the merged AST's rewritten names, which the
     /// checker asks about in the root module). None means "no answer

@@ -1011,6 +1011,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     generics::collect_trait_defs(&mut p, &mut errs);
 
     // Pass 1: type names, so fields can refer to types defined later.
+    let mut adt_name_counts: HashMap<Sym, u32> = HashMap::default();
     for item in &ast.items {
         let (name, span, is_enum) = match &item.kind {
             ItemKind::Struct(s) => (s.name, s.name_span, false),
@@ -1032,7 +1033,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         // The Adt's stable identity (ARCH 1.7): same name earlier in the file is a
         // duplicate definition (the error above), and the disambiguator keeps the
         // two records apart in the def table, as the old dense ids did.
-        let disamb = p.adts.iter().filter(|a| a.name == name).count() as u32;
+        let disamb = *adt_name_counts.entry(name).and_modify(|c| *c += 1).or_insert(0);
         let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
         let def = DefId { krate: p.krate, hash };
         p.adts.push(AdtDef {

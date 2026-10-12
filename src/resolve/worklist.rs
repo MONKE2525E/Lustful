@@ -89,6 +89,9 @@ pub struct ResolvedCrate {
     /// Outside inputs expansion read across the crate's files (added
     /// for W-MACRO; see `expand::Dep`).
     pub expand_deps: Vec<crate::expand::Dep>,
+    /// Wall time per worklist phase in milliseconds, summed over the
+    /// workspace's crates, for the driver's `--timings` output.
+    pub timings: Vec<(&'static str, f64)>,
 }
 
 /// A failed resolution: the source map and combined text for rendering,
@@ -549,6 +552,7 @@ struct CrateOut {
     exported_macros: Vec<OwnedMacroSource>,
     /// The outside inputs this crate's last expansion round read.
     expand_deps: Vec<crate::expand::Dep>,
+    timings: Vec<(&'static str, f64)>,
 }
 
 /// One crate's failed resolution inside a session.
@@ -728,6 +732,7 @@ pub fn resolve_crate_cached(
     let mut structure_hash = 0u64;
     let mut exported_of: FxMap<usize, Vec<OwnedMacroSource>> = FxMap::default();
     let mut expand_deps: Vec<crate::expand::Dep> = Vec::new();
+    let mut timings: Vec<(&'static str, f64)> = Vec::new();
     for &j in &order {
         let dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
             .deps
@@ -753,6 +758,12 @@ pub fn resolve_crate_cached(
                 tables.fn_module.extend(out.fn_module);
                 expand_deps.extend(out.expand_deps);
                 exported_of.insert(j, out.exported_macros);
+                for (name, ms) in out.timings {
+                    match timings.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, total)) => *total += ms,
+                        None => timings.push((name, ms)),
+                    }
+                }
                 chunks.push(out.ast);
             }
             Err(e) => {
@@ -768,7 +779,7 @@ pub fn resolve_crate_cached(
     tables.fn_module.extend(nested_modules);
     let (map, all_text) = make_map(&all_seen);
     let ast = Ast::concat(chunks);
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps })
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps, timings })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -1758,6 +1769,15 @@ fn resolve_one(
     known: &Known,
 ) -> Result<CrateOut, OneError> {
     let input = &job.input;
+    let mut timings: Vec<(&'static str, f64)> = Vec::new();
+    let mut last = std::time::Instant::now();
+    macro_rules! lap {
+        ($n:expr) => {{
+            let now = std::time::Instant::now();
+            timings.push(($n, (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }};
+    }
     let mut needs_std = false;
     let mut diags: Vec<Diag> = Vec::new();
     let root_file_id = shared.file_id(&input.root_path, job.root_module);
@@ -1778,6 +1798,7 @@ fn resolve_one(
     if !diags.is_empty() {
         return Err(OneError { diags, seen: seen_of(&discs), needs_std });
     }
+    lap!("resolve: discovery");
     // Unknown cfg names (L0520) are checked on the original tokens of
     // every file before expansion can strip the item that carries one.
     for disc in &discs {
@@ -1905,6 +1926,7 @@ fn resolve_one(
             Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
         }
     }
+    lap!("resolve: expand+parse");
     // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
     for (fi, w) in works.iter().enumerate() {
@@ -1916,9 +1938,39 @@ fn resolve_one(
     // Strip, register, and run the import worklist.
     let mut inner_diags: Vec<Diag> = Vec::new();
     let mut imports: Vec<Import> = Vec::new();
+    // Adt disambiguator counts over every Adt the shared tables
+    // already hold (earlier crates of this workspace included),
+    // counted in one pass here instead of per Adt in register.
+    let mut adt_counts: FxMap<Sym, u32> = FxMap::default();
+    for info in tables.def_info.values() {
+        if info.kind == ResKind::Adt {
+            *adt_counts.entry(info.flat).or_insert(0) += 1;
+        }
+    }
+    // Counts store "seen so far"; the register entry call turns the
+    // first sighting into disambiguator 0, so seed with count-1 by
+    // storing the next disambiguator minus one... see the entry use:
+    // entry().and_modify(+1).or_insert(0) yields the stored value,
+    // so a name seen k times must start at k-1 (absent when k == 0).
+    adt_counts.retain(|_, c| {
+        *c -= 1;
+        true
+    });
     for (fi, w) in works.iter_mut().enumerate() {
         strip_file(w, fi, input, interner, &list_module, tables, &mut inner_diags);
-        register_items(&mut w.ast.items, w.module, fi, &[], input, &job.flat_prefix, interner, tables, &list_module, &mut imports);
+        register_items(
+            &mut w.ast.items,
+            w.module,
+            fi,
+            &[],
+            input,
+            &job.flat_prefix,
+            interner,
+            tables,
+            &list_module,
+            &mut imports,
+            &mut adt_counts,
+        );
     }
     match run_imports(tables, &imports, interner) {
         Ok(ds) => inner_diags.extend(ds),
@@ -1930,6 +1982,7 @@ fn resolve_one(
     for w in works.iter() {
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
     }
+    lap!("resolve: strip+register");
     // Rewrite paths to flat names, checking visibility. The tables
     // are frozen at this point and each file's Ast is its own, so
     // the pass runs in parallel across files; diagnostics merge
@@ -1942,9 +1995,10 @@ fn resolve_one(
             tables: &ResolvedTables,
             interner: &Interner,
             list_module: &FxMap<ItemListKey, ModuleId>,
+            local_names: &FxMap<Sym, ()>,
         ) -> Vec<Diag> {
             if works.len() <= 1 || depth == 0 {
-                let mut rw = Rewrite { tables, interner, list_module, diags: Vec::new() };
+                let mut rw = Rewrite { tables, interner, list_module, local_names, diags: Vec::new() };
                 for (i, w) in works.iter_mut().enumerate() {
                     let module = w.module;
                     rw.file_items(&mut w.ast, base + i, module, &[]);
@@ -1954,8 +2008,8 @@ fn resolve_one(
             let mid = works.len() / 2;
             let (left, right) = works.split_at_mut(mid);
             std::thread::scope(|s| {
-                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module));
-                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module);
+                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module, local_names));
+                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module, local_names);
                 let mut diags = handle.join().unwrap();
                 diags.append(&mut right_diags);
                 diags
@@ -1963,11 +2017,13 @@ fn resolve_one(
         }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let depth = (usize::BITS - cores.leading_zeros()).min(5);
-        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module)
+        let local_names = tables.local_named_set();
+        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module, &local_names)
     };
     if !rw_diags.is_empty() {
         return Err(OneError { diags: rw_diags, seen, needs_std });
     }
+    lap!("resolve: rewrite");
     // ---- Flatten: inline module bodies splice into top-level items;
     // mod, use, and extern crate items drop. Each fn's module is
     // recorded here from its origin (file plus inline module path):
@@ -2034,6 +2090,7 @@ fn resolve_one(
         use std::hash::Hasher;
         structure.finish()
     };
+    lap!("resolve: flatten+concat");
     Ok(CrateOut {
         ast,
         fn_lines,
@@ -2047,6 +2104,7 @@ fn resolve_one(
         needs_std,
         exported_macros: menv.exported_sources(),
         expand_deps: file_deps.into_iter().flatten().collect(),
+        timings,
     })
 }
 
@@ -2655,6 +2713,10 @@ fn register_items(
     tables: &mut ResolvedTables,
     list_module: &FxMap<ItemListKey, ModuleId>,
     imports: &mut Vec<Import>,
+    // Same-flat-name Adt counts so far, across the workspace tables
+    // in registration order: the disambiguator source, without
+    // rescanning every recorded def per Adt (quadratic at scale).
+    adt_counts: &mut FxMap<Sym, u32>,
 ) {
     // Adt disambiguators count same-flat-name Adts in one pass order,
     // matching collect (which counts by name over the whole crate).
@@ -2680,7 +2742,7 @@ fn register_items(
                     };
                     bind(tables, Namespace::Type, m.name, Target::Module(child), vis());
                     if let Some(body) = &mut m.body {
-                        register_items(body, child, fi, &key, input, flat_prefix, interner, tables, list_module, imports);
+                        register_items(body, child, fi, &key, input, flat_prefix, interner, tables, list_module, imports, adt_counts);
                     }
                 }
             }
@@ -2694,7 +2756,7 @@ fn register_items(
             }
             ItemKind::Struct(s) => {
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
-                let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Adt && i.flat == flat).count() as u32;
+                let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Adt, interner.get(flat), disamb),
@@ -2706,7 +2768,7 @@ fn register_items(
             }
             ItemKind::Enum(e) => {
                 let flat = flat_name(tables, flat_prefix, module, e.name, interner);
-                let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Adt && i.flat == flat).count() as u32;
+                let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Adt, interner.get(flat), disamb),
@@ -2880,6 +2942,9 @@ struct Rewrite<'a> {
     tables: &'a ResolvedTables,
     interner: &'a Interner,
     list_module: &'a FxMap<ItemListKey, ModuleId>,
+    /// Every name some module defines locally, built once over the
+    /// frozen tables (`ResolvedTables::local_named_set`).
+    local_names: &'a FxMap<Sym, ()>,
     diags: Vec<Diag>,
 }
 
@@ -3164,7 +3229,7 @@ impl Rewrite<'_> {
             // another module defines is not found here, even though the
             // merged flat tables could answer it. Names no module
             // defines (primitives, builtins) fall through as before.
-            if res == PathRes::Absent && names.first().is_some_and(|n| self.tables.any_local_named(*n)) {
+            if res == PathRes::Absent && names.first().is_some_and(|n| self.local_names.contains_key(n)) {
                 let first = self.interner.get(names[0]).to_string();
                 self.diags.push(if ns == Namespace::Type {
                     Diag::new(
