@@ -1,0 +1,63 @@
+# The lust system shim: one rustc-built cdylib for the platform and data
+# crates that ts-rust uses on Linux (ARCH 3.7, package W-SHIM).
+#
+# This crate is NOT a member of the root package. The empty [workspace]
+# table keeps it independent, with its own lockfile. `lust port prepare`
+# will build it once per (lockfile, features, target, toolchain, ABI).
+#
+# Dependency versions are exact copies of ts-rust's Cargo.lock (checked
+# 2026-10-12): rustix 1.1.5, nix 0.31.3, signal-hook 0.4.4,
+# name-to-handle-at 0.1.0, flate2 1.1.10, jiff 0.2.37, xxhash-rust 0.8.15,
+# num-bigint 0.4.6, num-traits 0.2.19, tikv-jemallocator/-ctl 0.7.0.
+# Feature sets are the union of what ts_goport and goport_util enable on
+# Linux, nothing more.
+[workspace]
+
+[package]
+name = "lust-shim"
+version = "0.1.0"
+edition = "2024"
+description = "Rust cdylib shim for ts-rust system dependencies (lust W-SHIM)"
+publish = false
+
+# Never a staticlib through tcc: spikes/RESULTS.md K6 shows a Rust
+# staticlib final-linked by tcc aborts on caught panics and thread spawn.
+# A cdylib linked by tcc or libtcc passes every semantic test.
+[lib]
+name = "lust_shim"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# Small Rust program that does the same operations directly and prints
+# the expected results. tests/test_shim.c prints the same keys through
+# the C ABI. test.sh diffs them.
+[[bin]]
+name = "lust-shim-oracle"
+path = "src/bin/oracle.rs"
+
+[dependencies]
+rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "stdio", "termios"] }
+nix = { version = "=0.31.3", default-features = false, features = ["process", "signal", "fanotify"] }
+signal-hook = "=0.4.4"
+name-to-handle-at = "=0.1.0"
+flate2 = "=1.1.10"
+jiff = { version = "=0.2.37", default-features = false, features = ["std"] }
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
+num-bigint = "=0.4.6"
+num-traits = "=0.2.19"
+
+# The jemalloc pair is optional. Without the feature the shim uses the
+# system allocator and the jemalloc exports return UNSUPPORTED.
+tikv-jemallocator = { version = "=0.7.0", optional = true }
+tikv-jemalloc-ctl = { version = "=0.7.0", optional = true }
+
+[features]
+# Build with jemalloc as the global allocator of this cdylib, plus the
+# thread-arena controls. See README.md "Allocator selection".
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
+[profile.release]
+opt-level = 3
+# Panics must unwind inside the shim so catch_unwind can turn them into
+# a status code. Never set panic=abort here.
+panic = "unwind"
