@@ -1,4 +1,3 @@
-// expect: L0614
 fn get(x: i64) -> i64
 where
     i64: Copy,

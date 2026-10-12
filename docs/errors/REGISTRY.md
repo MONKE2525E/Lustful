@@ -53,9 +53,11 @@ prints "reserved, not yet emitted".
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603-L0609 | Types and aliases | W-CORELANG | reserved | |
-| L0610-L0613 | Traits and inference | W-TRAITS-CORE | reserved | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known |
+| L0610-L0613 | Traits and inference | W-TRAITS-CORE | in use | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known |
 | L0614 | Traits and inference | W-TRAITS-CORE | in use | Trait, generic, or where-clause form is not supported yet (S3b parser reject) |
-| L0615-L0619 | Traits and inference | W-TRAITS-CORE | reserved | L0615 overlapping impls |
+| L0615 | Traits and inference | W-TRAITS-CORE | in use | Overlapping impls (coherence) |
+| L0616 | Traits and inference | W-TRAITS-CORE | in use | Orphan-rule violation |
+| L0617-L0619 | Traits and inference | W-TRAITS-CORE | reserved | |
 | L0620 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
 | L0621 | Associated items | W-TRAITS-CORE | in use | Associated item, binding, or qualified path is not supported yet (S3b parser reject) |
 | L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |
@@ -71,7 +73,7 @@ prints "reserved, not yet emitted".
 | L0653-L0659 | Layout | W-CORELANG | reserved | |
 | L0701-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | L0701 not dyn compatible (name the offending item) |
 | L0710-L0719 | Binders | W-TRAITS-CORE | reserved | L0710 nested higher-ranked binder |
-| L0720 | Methods and receivers | W-TRAITS-CORE | reserved | L0720 ambiguous method; plain "no such method" stays L0104 |
+| L0720 | Methods and receivers | W-TRAITS-CORE | in use | L0720 ambiguous method; plain "no such method" stays L0104 |
 | L0721 | Methods and receivers | W-TRAITS-CORE | in use | Method turbofish or typed receiver form is not supported yet (S3b) |
 | L0722-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0722 unsupported receiver type |
 | L0730-L0739 | Regions and drop check | W-BORROW | reserved | L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes |

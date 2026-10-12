@@ -1,4 +1,3 @@
-// expect: L0614
 struct Wrapper<T> {
     v: T,
 }

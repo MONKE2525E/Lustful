@@ -1,4 +1,3 @@
-// expect: L0614
 impl Iterator for Counter {
     type Item = i64;
 

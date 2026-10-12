@@ -1258,6 +1258,13 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         &method_ids,
                         &mut errs,
                     );
+                } else {
+                    // Inherent associated consts need the const
+                    // evaluator's value path, which is not in this
+                    // wave; they keep the old reject.
+                    for ac in &imp.consts {
+                        errs.push(not_yet("L0621", ac.name_span, "associated consts and types"));
+                    }
                 }
             }
             _ => {}

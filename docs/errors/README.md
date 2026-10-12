@@ -63,8 +63,16 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0522](L0522.md) | this attribute is not supported yet |
 | [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
+| [L0610](L0610.md) | type annotations needed |
+| [L0611](L0611.md) | trait selection overflow |
+| [L0612](L0612.md) | no impl of the trait for this type |
+| [L0613](L0613.md) | an impl parameter is not known from the trait inputs |
 | [L0614](L0614.md) | traits and generics are not supported yet |
+| [L0614](L0614.md) | this trait or generic form is not supported yet |
+| [L0615](L0615.md) | overlapping impls |
+| [L0616](L0616.md) | an impl that the orphan rule forbids |
 | [L0621](L0621.md) | associated items are not supported yet |
+| [L0621](L0621.md) | associated consts are not supported yet |
 | [L0630](L0630.md) | outside the bounded const evaluator |
 | [L0631](L0631.md) | non-const call in a const context |
 | [L0632](L0632.md) | const and static items are not supported yet |
@@ -74,7 +82,9 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0650](L0650.md) | `offset_of!` on a default-repr type |
 | [L0651](L0651.md) | reference to a packed field |
 | [L0652](L0652.md) | unsupported layout form |
+| [L0720](L0720.md) | ambiguous method |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
+| [L0721](L0721.md) | this method form is not supported yet |
 | [L0801](L0801.md) | macro expansion hit a limit |
 | [L0802](L0802.md) | no macro with this name is in scope |
 | [L0803](L0803.md) | include file not found |

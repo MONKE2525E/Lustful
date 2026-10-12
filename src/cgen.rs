@@ -3227,7 +3227,7 @@ mod tests {
             outs.push(gen_fn(&program, &body, &map, 1, &slots));
         }
         let mut glue = GlueSet::default();
-        glue.add(&program, outs.iter().flat_map(|o| o.glue.iter()));
+        glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
         let units = [
             main_unit(slots[main.0 as usize], "test.rs", &vec![1; n], &[]),
             glue_unit(&program, &glue),

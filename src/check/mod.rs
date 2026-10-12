@@ -13,7 +13,7 @@ use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
 use crate::traits::solve::{Selection, SolveCx, Solver};
-use crate::ty::defs::{DefKind as DefsKind, ROOT_MODULE};
+use crate::ty::defs::DefKind as DefsKind;
 use crate::ty::lang;
 use crate::ty::*;
 
@@ -146,6 +146,9 @@ pub enum Res {
     /// A numeric `From::from` call, lowered as a cast to the
     /// call's type. Widening conversions only (checked).
     FromCast,
+    /// A scalar `Default::default()` call, lowered as the zero
+    /// value of the call's type.
+    DefaultVal,
     /// A `for` loop through `IntoIterator`: the `into_iter` and
     /// `next` methods to call (templates until mono rewrites
     /// them through `Checked::generic_args`).
@@ -287,7 +290,6 @@ struct Ctx<'p, 'a> {
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
-    self_ty: Option<Ty>,
     /// The trait obligation queue (ARCH 2.4), run at the fixed
     /// points in `run_obligations`.
     obl: obligations::Obligations,
@@ -305,6 +307,10 @@ struct Ctx<'p, 'a> {
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
+    /// Const inference variables (from `generics::INFER_MARKER_BASE`)
+    /// to the consts they bound to.
+    const_bindings: std::collections::HashMap<u32, ConstId>,
+    next_const_id: u32,
 }
 
 /// Type-checks one function body.
@@ -340,7 +346,6 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
-        self_ty: f.owner.map(|a| p.tys.get_adt_ty(a).expect("ADT types are interned during collection")),
         obl: obligations::Obligations::new(),
         fid,
         solver: Solver::new(),
@@ -355,6 +360,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         },
         generic_sites: Vec::new(),
         in_norm: false,
+        const_bindings: std::collections::HashMap::new(),
+        next_const_id: generics::INFER_MARKER_BASE,
     };
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
@@ -572,6 +579,54 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Drops obligations queued since an `obl_len` snapshot.
     fn obl_truncate(&mut self, len: usize) {
         self.obl.truncate(len);
+    }
+
+    /// A fresh const inference variable.
+    fn fresh_const_var(&mut self) -> ConstId {
+        let id = self.next_const_id;
+        self.next_const_id += 1;
+        self.tys.intern_const(ConstKind::Infer(id))
+    }
+
+    /// The const a const inference variable bound to, if any.
+    fn resolve_const(&self, c: ConstId) -> ConstId {
+        match self.tys.const_kind(c) {
+            ConstKind::Infer(id) if id >= generics::INFER_MARKER_BASE => self.const_bindings.get(&id).copied().unwrap_or(c),
+            _ => c,
+        }
+    }
+
+    /// Unifies two consts, binding a const inference variable.
+    fn unify_const(&mut self, a: ConstId, b: ConstId) -> bool {
+        let (a, b) = (self.resolve_const(a), self.resolve_const(b));
+        if a == b {
+            return true;
+        }
+        match (self.tys.const_kind(a), self.tys.const_kind(b)) {
+            (ConstKind::Infer(x), _) if x >= generics::INFER_MARKER_BASE => {
+                self.const_bindings.insert(x, b);
+                true
+            }
+            (_, ConstKind::Infer(x)) if x >= generics::INFER_MARKER_BASE => {
+                self.const_bindings.insert(x, a);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fresh instantiation arguments for one generics list, by
+    /// parameter kind (used for Adt applications at literals).
+    fn fresh_args(&mut self, generics: &Generics) -> Vec<GenericArg> {
+        generics
+            .params
+            .iter()
+            .map(|param| match param.kind {
+                ParamKind::Type => GenericArg::Ty(self.new_var(false)),
+                ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+            })
+            .collect()
     }
 
     /// This body's elaborated param env.
@@ -796,11 +851,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(true)
             }
         }
-    }
-
-    /// Pushes one bound obligation for the next run point.
-    fn push_obligation(&mut self, tr: TraitRef, span: Span) {
-        self.obl.push_trait(tr, span);
     }
 
     /// Pushes the predicates of one instantiated item bound set:
@@ -1106,6 +1156,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.bind_var(v.index(), d);
                 d
             }
+            TyKind::Array(e, n) if matches!(self.tys.const_kind(n), ConstKind::Infer(id) if id >= generics::INFER_MARKER_BASE) => {
+                let e = self.rebuild(e, zonk);
+                let n = self.resolve_const(n);
+                self.tys.intern(TyKind::Array(e, n))
+            }
             _ if !self.tys.flags(t).contains_infer() => t,
             TyKind::Ref(r, m, e) => {
                 let e = self.rebuild(e, zonk);
@@ -1117,6 +1172,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             TyKind::Array(e, n) => {
                 let e = self.rebuild(e, zonk);
+                let n = self.resolve_const(n);
                 self.tys.intern(TyKind::Array(e, n))
             }
             TyKind::Tuple(ts) => {
@@ -1134,6 +1190,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let g = self.tys.args(a)[i];
                     let g2 = match g {
                         GenericArg::Ty(e) => GenericArg::Ty(self.rebuild(e, zonk)),
+                        GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
                         other => other,
                     };
                     if g2 != g {
@@ -1181,6 +1238,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             .iter()
             .map(|&g| match g {
                 GenericArg::Ty(e) => GenericArg::Ty(self.rebuild(e, zonk)),
+                GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
                 other => other,
             })
             .collect();
@@ -1196,17 +1254,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // normal form (section 2.5). Only when its args hold no
         // inference variable: selection inside probes already
         // handles the open case, and normalizing there would loop.
-        if !self.in_norm
-            && (matches!(self.tys.kind(a), TyKind::Projection(..)) || matches!(self.tys.kind(b), TyKind::Projection(..)))
-            && !self.tys.flags(a).contains_infer()
-            && !self.tys.flags(b).contains_infer()
-        {
-            self.in_norm = true;
-            let (na, nb) = (self.normalize_here(a), self.normalize_here(b));
-            let out = (na != a || nb != b) && self.unify(na, nb);
-            self.in_norm = false;
-            if out || na != a || nb != b {
-                return out;
+        if !self.in_norm {
+            let na = if matches!(self.tys.kind(a), TyKind::Projection(..)) && !self.tys.flags(a).contains_infer() {
+                self.in_norm = true;
+                let n = self.normalize_here(a);
+                self.in_norm = false;
+                n
+            } else {
+                a
+            };
+            let nb = if matches!(self.tys.kind(b), TyKind::Projection(..)) && !self.tys.flags(b).contains_infer() {
+                self.in_norm = true;
+                let n = self.normalize_here(b);
+                self.in_norm = false;
+                n
+            } else {
+                b
+            };
+            if na != a || nb != b {
+                return self.unify(na, nb);
             }
         }
         match (self.tys.kind(a), self.tys.kind(b)) {
@@ -1243,7 +1309,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     })
             }
             (TyKind::Slice(x), TyKind::Slice(y)) => self.unify(x, y),
-            (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && self.unify(x, y),
+            (TyKind::Array(x, n), TyKind::Array(y, m)) => self.unify_const(n, m) && self.unify(x, y),
             (TyKind::RawPtr(m, x), TyKind::RawPtr(n, y)) => m == n && self.unify(x, y),
             (TyKind::Projection(d, x), TyKind::Projection(e, y)) => d == e && self.unify_args(x, y),
             (TyKind::FnDef(d, x), TyKind::FnDef(e, y)) => d == e && self.unify_args(x, y),
@@ -1263,6 +1329,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for i in 0..n {
             let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {
                 (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                (GenericArg::Const(x), GenericArg::Const(y)) => self.unify_const(x, y),
                 (x, y) => x == y,
             };
             if !ok {
@@ -1506,7 +1573,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
-            Ok(t) => self.instantiate_infers(t),
+            Ok(t) => {
+                let t = self.instantiate_infers(t);
+                self.normalize_here(t)
+            }
             Err(d) => {
                 self.errs.push(d);
                 ERROR
@@ -1536,10 +1606,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (Some(g), _) => g,
                 (None, ParamKind::Type) => GenericArg::Ty(self.new_var(false)),
                 (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
-                (None, ParamKind::Const(_)) => {
-                    let c = self.tys.intern_const(ConstKind::Infer(i as u32));
-                    GenericArg::Const(c)
-                }
+                (None, ParamKind::Const(_)) => GenericArg::Const(self.fresh_const_var()),
             });
         }
         let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &args)).collect();
@@ -1565,9 +1632,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
                 ast::GenericArg::Lifetime(_) => None,
                 ast::GenericArg::Const(e) => {
-                    let cx = p.gx.resolve_cx(&p.type_names);
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                     let _ = cx;
-                    crate::check::collect::eval_array_len(p.ast, *e).map(|v| {
+                    crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e).map(|v| {
                         let c = self.tys.intern_const(ConstKind::Int(v));
                         GenericArg::Const(c)
                     })
@@ -1777,6 +1844,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let bt = self.expr(*base, None);
                 // ARCH 2.12 run point: a field access must know the base type.
                 self.run_obligations(false);
+                let bt = self.deep(bt);
                 let (derefs, inner) = self.autoderef(bt);
                 if let Some(a) = self.tys.local_adt(inner) {
                     let adt = p.adt(a);
@@ -1785,7 +1853,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     {
                         self.check_field_vis(a, *name, span);
                         self.set_res(e, Res::Field { derefs, index: i as u32 });
-                        return adt.variants[0].fields[i].ty;
+                        // A generic Adt's fields are the template's,
+                        // substituted with this value's args (the
+                        // instance AdtDef already has them concrete).
+                        let fty = adt.variants[0].fields[i].ty;
+                        return match self.tys.adt_parts(inner) {
+                            Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(fty).contains_param() => {
+                                let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
+                                subst(&mut self.tys, fty, &gargs)
+                            }
+                            _ => fty,
+                        };
                     }
                 }
                 if !matches!(self.kind(inner), TyKind::Error) {
@@ -2692,6 +2770,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "Use a type inside the supported layout grammar.",
                 );
                 Res::ConstUsize(0)
+            }
+        }
+    }
+
     /// True for the scalar widening conversions `From` provides in
     /// std (identity is the blanket's job and also answers true).
     fn numeric_from_ok(src: TyKind, dst: TyKind) -> bool {
@@ -2742,13 +2824,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::FromCast);
                 return Some(base);
             }
-            if Self::numeric_from_ok(self.kind(base), self.kind(src))
-                || matches!(self.kind(src), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
-            {
-                // A scalar `from` that does not widen is an error
-                // here, not a missing method.
+            if matches!(self.kind(src), TyKind::Int(_) | TyKind::Char | TyKind::Bool) {
+                // With the input type known from the argument,
+                // selection can pick between input-specific impls
+                // (the abstract synthetics for each From bound).
+                let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(src)]);
+                let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
+                if let Selection::Impl { id, args: impl_args, .. } = self.select_obligation_at(tr, span, 0)
+                    && let Some((local, params, ret)) = self.method_instance_for_impl(e, id, tr, impl_args, "from", span)
+                {
+                    self.set_res(e, Res::Fn(local));
+                    self.check_args(&params, args, span);
+                    return Some(self.normalize_here(ret));
+                }
                 return None;
             }
+        }
+        if self.name(name) == "default"
+            && args.is_empty()
+            && matches!(self.kind(base), TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit)
+        {
+            self.set_res(callee, Res::DefaultVal);
+            self.set_res(e, Res::DefaultVal);
+            return Some(base);
         }
         let traits: Vec<DefId> = match hint {
             Some(tr) => vec![tr.def],
@@ -2860,7 +2958,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let hint = if trait_path.is_empty() {
                         None
                     } else {
-                        let cx = p.gx.resolve_cx(&p.type_names);
+                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                         let tref = ast::TraitRefExpr { path: trait_path.clone() };
                         generics::resolve_trait_ref(
                             p.ast,
@@ -2956,7 +3054,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.check_args(&params, args, span);
                     self.tys.adt_ty(a)
                 } else {
-                    let gen_args: Vec<GenericArg> = (0..n).map(|_| GenericArg::Ty(self.new_var(false))).collect();
+                    let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
                     let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
                     self.check_args(&params, args, span);
                     self.tys.mk_adt(adef, &gen_args)
@@ -3036,7 +3134,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             .iter()
             .map(|a| match a {
                 ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
-                ast::GenericArg::Const(e2) => crate::check::collect::eval_array_len(p.ast, *e2).map(|v| {
+                ast::GenericArg::Const(e2) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e2).map(|v| {
                     let c = self.tys.intern_const(ConstKind::Int(v));
                     GenericArg::Const(c)
                 }),
@@ -3068,6 +3166,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(c) = user {
             let f = p.local_def(c.def.hash).expect("a method candidate names a local fn");
+            if !turbofish.is_empty() && p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
+                self.errs.push(not_yet("L0721", name_span, "turbofish on method calls"));
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return ERROR;
+            }
             // A generic inherent method: instantiate it like a
             // generic call, with the receiver unifying the impl
             // and method parameters.
@@ -3535,10 +3640,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // A generic Adt literal instantiates its parameters from
         // the written fields (and any turbofish): field types are
         // the template's, substituted with fresh variables.
-        let gen_args: Vec<GenericArg> = {
-            let n = p.gx.adt_generics[a.0 as usize].params.len();
-            (0..n).map(|_| GenericArg::Ty(self.new_var(false))).collect()
-        };
+        let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
         let variant = &p.adt(a).variants[v as usize];
         if variant.shape != VariantShape::Named && !(variant.fields.is_empty() && fields.is_empty()) {
             self.err("L0110", span, "this is not a struct with named fields", "Use the tuple or unit form.");
@@ -4047,7 +4149,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0102", span, "unknown struct or variant in pattern", "Check the name.");
                     return;
                 };
-                let adt_ty = self.tys.adt_ty(a);
+                // A generic Adt pattern matches the scrutinee's
+                // own instance when mono has made it; before that
+                // (and in templates) it matches the template with
+                // the scrutinee's args substituted into its fields.
+                let dt = self.deep(t);
+                let scrut_args: Vec<GenericArg> = match self.tys.adt_parts(dt) {
+                    Some((d, aa)) if d == p.def_of_adt(a) => self.tys.args(aa).to_vec(),
+                    _ => Vec::new(),
+                };
+                let (a, adt_ty) = match self.tys.local_adt(dt) {
+                    Some(inst) if inst != a && p.def_of_adt(inst) == p.def_of_adt(a) => (inst, dt),
+                    _ if !scrut_args.is_empty() => (a, dt),
+                    _ => (a, self.tys.adt_ty(a)),
+                };
                 if !self.unify(adt_ty, t) {
                     self.mismatch(span, t, adt_ty);
                     return;
@@ -4081,6 +4196,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         };
                         for (i, sub) in mapped {
                             let ft = variant.fields[i].ty;
+                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
                             self.pattern_mode(sub, ft, mode, in_match);
                         }
                     }
@@ -4094,6 +4210,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 Some(i) => {
                                     self.check_field_vis(a, fname, p.ast.pat_span(sub));
                                     let ft = variant.fields[i].ty;
+                                    let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
                                     self.pattern_mode(sub, ft, mode, in_match);
                                 }
                                 None => {
@@ -4512,6 +4629,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 .iter()
                 .map(|&g| match g {
                     GenericArg::Ty(t) => GenericArg::Ty(self.zonk(t)),
+                    GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
                     other => other,
                 })
                 .collect();
@@ -4529,6 +4647,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && inst != a
             {
                 self.out.expr_res[i] = Res::Variant(inst, v);
+            }
+        }
+        for i in 0..self.out.pat_res.len() {
+            if let PatRes::Variant(a, v) = self.out.pat_res[i]
+                && let Some(inst) = self.tys.local_adt(self.out.pat_ty[i])
+                && inst != a
+            {
+                self.out.pat_res[i] = PatRes::Variant(inst, v);
             }
         }
         // Literal range checks.

@@ -1,4 +1,4 @@
-// expect: L0602
+// expect: L0112
 fn show(x: impl std::fmt::Display) {
     println!("{}", x);
 }

@@ -1,4 +1,4 @@
-// expect: L0614
+// expect: L0401
 struct S;
 
 impl std::fmt::Display for S {

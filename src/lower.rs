@@ -605,6 +605,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
                     Res::FromCast => self.set_or_temp(dest, Rvalue::Cast(ops.into_iter().next().unwrap(), ty), ty, span),
+                    Res::DefaultVal => {
+                        let zero = match self.kind(ty) {
+                            TyKind::Int(it) => Const::Int(0, it),
+                            TyKind::Bool => Const::Bool(false),
+                            TyKind::Char => Const::Char('\0'),
+                            _ => Const::Unit,
+                        };
+                        self.set_or_temp(dest, Rvalue::Use(Operand::Const(zero)), ty, span)
+                    }
                     Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
                     _ => return,
                 }
@@ -1222,7 +1231,16 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Loops ----------
 
-    fn for_loop(&mut self, for_e: ExprId, _label: Option<ast::Label>, pat: PatId, iter: ExprId, body: ast::BlockId, span: Span, dest: Option<&Place>) {
+    fn for_loop(
+        &mut self,
+        for_e: ExprId,
+        label: Option<ast::Label>,
+        pat: PatId,
+        iter: ExprId,
+        body: ast::BlockId,
+        span: Span,
+        dest: Option<&Place>,
+    ) {
         let p = self.p;
         self.scopes.push(Vec::new());
         let item_ty = self.ck.pat_ty(pat);

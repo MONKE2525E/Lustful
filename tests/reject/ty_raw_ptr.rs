@@ -1,4 +1,4 @@
-// expect: L0602
+// expect: L0104
 fn is_null(p: *const i64) -> bool {
     p.is_null()
 }

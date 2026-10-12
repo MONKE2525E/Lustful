@@ -946,7 +946,7 @@ impl<'a> Parser<'a> {
     fn type_alias_def(&mut self) -> PResult<TypeAliasDef> {
         let start = self.expect(Tok::Type, "`type`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("type aliases", false)?;
+        let generics = self.generics(false)?;
         // For an alias the where clause follows the target type.
         self.expect(Tok::Eq, "`=`")?;
         let ty = self.ty()?;
@@ -1433,14 +1433,9 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Type => types.push(self.assoc_type()?),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
-                Tok::Const if self.peek_at(1) == Tok::Fn => {
-                    self.bump();
-                    let mut def = self.fn_def_inner(true)?;
-                    def.vis = vis;
-                    def.attrs = parsed.attrs;
-                    def.qual.is_const = true;
-                    fns.push(def);
-                }
+                // Const fns in traits are unstable in Rust
+                // (E0379) and unsupported here.
+                Tok::Const if self.peek_at(1) == Tok::Fn => return Err(self.reject(C_CONST, "const functions in traits")),
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),

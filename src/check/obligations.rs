@@ -22,15 +22,6 @@ pub enum Obligation {
     AssocEq { eq: AssocEqData, span: Span },
 }
 
-impl Obligation {
-    /// The span to blame when this obligation cannot be proved.
-    pub fn span(self) -> Span {
-        match self {
-            Obligation::Trait { span, .. } | Obligation::AssocEq { span, .. } => span,
-        }
-    }
-}
-
 /// The per-body work queue. Runs happen in `check/mod.rs`; see
 /// the file header.
 #[derive(Default)]
@@ -47,11 +38,6 @@ impl Obligations {
     /// Records one obligation for a later run point.
     pub fn push(&mut self, obligation: Obligation) {
         self.queue.push(obligation);
-    }
-
-    /// Records one trait obligation.
-    pub fn push_trait(&mut self, trait_ref: TraitRef, span: Span) {
-        self.queue.push(Obligation::Trait { trait_ref, span, depth: 0 });
     }
 
     /// Records one trait obligation at a nested depth.

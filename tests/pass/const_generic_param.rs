@@ -1,4 +1,3 @@
-// expect: L0614
 struct Arr<const N: usize> {
     data: [i64; N],
 }

@@ -1,4 +1,3 @@
-// expect: L0614
 trait Greeter {
     fn greet(&self) -> i64;
 }

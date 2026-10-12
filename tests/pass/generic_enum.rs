@@ -1,4 +1,3 @@
-// expect: L0614
 enum Maybe<T> {
     Some(T),
     None,

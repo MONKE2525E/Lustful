@@ -1,4 +1,4 @@
-// expect: L0721
+// expect: L0641
 struct S;
 
 impl S {

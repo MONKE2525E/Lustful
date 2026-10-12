@@ -761,10 +761,16 @@ pub trait TyIntern {
 /// interned, so their cached bits are read, never recomputed by walking terms.
 fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
     let of_ty = |t: Ty| s.flags(t);
+    let of_const = |c: ConstId| match s.const_kind(c) {
+        ConstKind::Param(_) => TyFlags(TyFlags::PARAM),
+        ConstKind::Infer(_) => TyFlags(TyFlags::INFER),
+        _ => TyFlags::default(),
+    };
     let of_args = |a: ArgsId| {
-        s.args(a).iter().fold(TyFlags::default(), |f, g| match g.as_ty() {
-            Some(t) => f.union(of_ty(t)),
-            None => f,
+        s.args(a).iter().fold(TyFlags::default(), |f, g| match g {
+            GenericArg::Ty(t) => f.union(of_ty(*t)),
+            GenericArg::Const(c) => f.union(of_const(*c)),
+            GenericArg::Lifetime(_) => f,
         })
     };
     let of_trait_ref = |tr: &TraitRef| {
@@ -778,7 +784,8 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
         TyKind::Param(_) => TyFlags(TyFlags::PARAM),
         TyKind::Infer(_) => TyFlags(TyFlags::INFER),
         TyKind::Projection(_, a) => TyFlags(TyFlags::PROJECTION).union(of_args(a)),
-        TyKind::Ref(_, _, t) | TyKind::RawPtr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => of_ty(t),
+        TyKind::Ref(_, _, t) | TyKind::RawPtr(_, t) | TyKind::Slice(t) => of_ty(t),
+        TyKind::Array(t, c) => of_ty(t).union(of_const(c)),
         TyKind::Tuple(ts) => s.tys_of(ts).iter().fold(TyFlags::default(), |f, &t| f.union(of_ty(t))),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => of_args(a),
         TyKind::FnPtr(sig) => {

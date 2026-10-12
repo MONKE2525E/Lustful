@@ -173,20 +173,23 @@ pub(super) fn trait_method_probe(
     let Some(traits) = p.gx.traits_by_method.get(&name).cloned() else { return Probe::Miss };
     // First pass: probe every in-scope trait by selection, with
     // rollback, and count the hits at this form.
-    let mut hits: Vec<(DefId, TraitMethodTemplate, LocalDefId, Vec<GenericArg>)> = Vec::new();
+    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>)> = Vec::new();
     for trait_def in traits {
         if !trait_in_scope(cx, trait_def) {
             continue;
         }
         let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
         let Some(method_def) = rec.method_by_name(name) else { continue };
-        let Some(tmpl) = p.gx.trait_methods.get(&method_def).cloned() else { continue };
-        if tmpl.self_kind.is_none() {
+        // Lang traits have no method templates: the receiver
+        // form and signature come from the impl method itself
+        // once selection picks it (below).
+        let tmpl = p.gx.trait_methods.get(&method_def).cloned();
+        if tmpl.as_ref().is_some_and(|t| t.self_kind.is_none()) {
             continue;
         }
         // Receiver-form pre-filter for plain receivers; typed
         // receivers are decided by unification in confirm.
-        match tmpl.self_kind {
+        match tmpl.as_ref().and_then(|t| t.self_kind) {
             Some(SelfKind::Value) if form != ReceiverForm::Value => continue,
             Some(SelfKind::Ref) if form != ReceiverForm::Ref => continue,
             Some(SelfKind::RefMut) if form != ReceiverForm::RefMut => continue,

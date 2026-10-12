@@ -65,6 +65,9 @@ pub enum Synthetic {
     /// A `#[derive]` expansion (section 2.2). The payload is the
     /// derive name (`Clone`, `Debug`, ...).
     Derive(Sym),
+    /// An abstract-check fact for an opaque type (mono's
+    /// template check): the bound made true by construction.
+    Abstract,
     /// A lang-trait fact for a builtin type (for example the
     /// `IntoIterator` blanket, `From<T> for T`, slice `Index`).
     /// These records exist so selection and coherence see one impl
@@ -252,6 +255,11 @@ impl ImplIndex {
     /// The trait an associated item belongs to.
     pub fn trait_of_assoc(&self, assoc: DefId) -> Option<DefId> {
         self.assoc_trait.get(&assoc).copied()
+    }
+
+    /// The trait a method belongs to, by its def.
+    pub fn trait_of_method(&self, method: DefId) -> Option<DefId> {
+        self.traits.values().find(|r| r.methods.iter().any(|(d, _)| *d == method)).map(|r| r.def)
     }
 
     /// Records one impl and returns its id. The record's head and
