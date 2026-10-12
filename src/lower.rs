@@ -29,7 +29,9 @@ struct Lower<'p, 'a> {
 /// Lowers one checked function body to IR.
 pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
     let f = p.fn_info(fid);
-    let tys = std::mem::replace(&mut ck.tys, Tys::new(&p.tys));
+    // The owned type store lift (ARCH 2.1): the checked body's types move into the
+    // lowered body through this boundary. Identity today; see `ty::lift_to_owned`.
+    let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
     let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len() };
     let mut lw = Lower { p, ck, body, cur: Bb(0), scopes: vec![Vec::new()], loops: Vec::new(), local_map: Vec::new(), mut_index: 0 };
@@ -124,11 +126,11 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.body.tys.kind(t)
     }
     fn ref_ty(&mut self, m: bool, t: Ty) -> Ty {
-        self.body.tys.intern(TyKind::Ref(m, t))
+        self.body.tys.mk_ref(m, t)
     }
     fn peel(&self, mut t: Ty, n: u8) -> Ty {
         for _ in 0..n {
-            if let TyKind::Ref(_, inner) = self.kind(t) {
+            if let TyKind::Ref(_, _, inner) = self.kind(t) {
                 t = inner;
             }
         }
@@ -223,8 +225,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 // `&String` (possibly `&&String`) to `&str`.
                 let mut place = self.op_place(op, ty, span);
                 let mut t = ty;
-                while let TyKind::Ref(_, inner) = self.kind(t) {
-                    if self.kind(inner) == TyKind::String {
+                while let TyKind::Ref(_, _, inner) = self.kind(t) {
+                    if self.body.tys.is_string_ty(inner) {
                         break;
                     }
                     place = place.deref();
@@ -463,7 +465,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 let lt = self.ty(*lhs);
-                if self.kind(lt) == TyKind::String {
+                if self.body.tys.is_string_ty(lt) {
                     let pl = self.place_for_mut(*lhs);
                     let r = self.operand(*rhs);
                     let mt = self.ref_ty(true, STRING);
@@ -569,10 +571,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     fn peel_vec(&self, t: Ty) -> Ty {
-        match self.kind(t) {
-            TyKind::Vec(e) => e,
-            _ => ERROR,
-        }
+        self.body.tys.vec_elem(t).unwrap_or(ERROR)
     }
 
     // ---------- Blocks ----------
@@ -806,7 +805,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let b = self.operand_derefs(rhs, rd);
                     Rvalue::Bin(op, a, b)
                 }
-                TyKind::String | TyKind::Str => {
+                TyKind::Str => {
+                    let a = self.str_view(lhs, ld);
+                    let b = self.str_view(rhs, rd);
+                    Rvalue::StrCmp(op, a, b)
+                }
+                _ if self.body.tys.is_string_ty(base) => {
                     let a = self.str_view(lhs, ld);
                     let b = self.str_view(rhs, rd);
                     Rvalue::StrCmp(op, a, b)
@@ -817,7 +821,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     Rvalue::Eq { a, b, ty: t, ne: op == BinOp::Ne }
                 }
             }
-        } else if self.kind(lt) == TyKind::String {
+        } else if self.body.tys.is_string_ty(lt) {
             let a = self.operand(lhs);
             let b = self.operand(rhs);
             Rvalue::StringAdd(a, b)
@@ -894,7 +898,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             };
             self.assign(Place::local(cur), Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(cur)), Operand::Const(one)), span);
             self.goto(after, span);
-        } else if self.kind(self.ty(iter)) == TyKind::Chars {
+        } else if self.body.tys.is_chars_ty(self.ty(iter)) {
             // `for c in s.chars()`: call `next` until it returns None.
             let it = self.temp(self.ty(iter));
             self.expr_into(iter, Some(&Place::local(it)));
@@ -902,7 +906,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             let mt = self.ref_ty(true, self.ty(iter));
             let r = self.temp(mt);
             self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
-            let ot = self.body.tys.intern(TyKind::Option(CHAR));
+            let ot = self.body.tys.mk_option(CHAR);
             let nx = self.temp(ot);
             self.assign(Place::local(nx), Rvalue::Builtin(Builtin::CharsNext, vec![Operand::Move(Place::local(r))]), span);
             let d = self.temp(int(IntTy::U32));
@@ -915,7 +919,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         } else {
             // `for x in &v` / `&mut v`: index loop over a reference held for the whole loop.
             let it_ty = self.ty(iter);
-            let m = matches!(self.kind(it_ty), TyKind::Ref(true, _));
+            let m = matches!(self.kind(it_ty), TyKind::Ref(_, Mut::Mut, _));
             let vref = self.temp(it_ty);
             self.expr_into(iter, Some(&Place::local(vref)));
             let shared = self.ref_ty(false, self.peel(it_ty, 1));

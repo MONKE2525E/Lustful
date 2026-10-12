@@ -34,20 +34,28 @@ pub enum Glue {
     Debug,
 }
 
+/// Maps a semantic type to its body-independent C form. Builtin Adts reach this
+/// through the v2 compat helpers; kinds the subset cannot form yet map to `Unit`,
+/// as inference leftovers did before. They gain real C forms with their features.
 pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
     match tys.kind(t) {
-        TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Var(..) => CTy::Unit,
         TyKind::Bool => CTy::Bool,
         TyKind::Char => CTy::Char,
         TyKind::Int(i) => CTy::Int(i),
         TyKind::Str => CTy::Str,
-        TyKind::String => CTy::String,
-        TyKind::Vec(e) => CTy::Vec(Box::new(cty(tys, e))),
-        TyKind::Option(e) => CTy::Option(Box::new(cty(tys, e))),
-        TyKind::Chars => CTy::Chars,
-        TyKind::Ref(_, e) => CTy::Ref(Box::new(cty(tys, e))),
-        TyKind::Adt(a) => CTy::Adt(a),
-        TyKind::Args => CTy::Args,
+        TyKind::Ref(_, _, e) => CTy::Ref(Box::new(cty(tys, e))),
+        TyKind::Adt(..) => match tys.builtin_of(t) {
+            Some(BuiltinTy::String) => CTy::String,
+            Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Option) => CTy::Option(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Chars) => CTy::Chars,
+            Some(BuiltinTy::Args) => CTy::Args,
+            None => match tys.local_adt(t) {
+                Some(a) => CTy::Adt(a),
+                None => CTy::Unit,
+            },
+        },
+        _ => CTy::Unit,
     }
 }
 
@@ -61,6 +69,9 @@ fn int_c(i: IntTy) -> &'static str {
         IntTy::U16 => "uint16_t",
         IntTy::U32 => "uint32_t",
         IntTy::U64 | IntTy::Usize => "uint64_t",
+        // Unreachable today: no source type can name these yet (see `IntTy`).
+        IntTy::I128 => "__int128",
+        IntTy::U128 => "unsigned __int128",
     }
 }
 
@@ -75,6 +86,9 @@ fn int_fn(i: IntTy) -> &'static str {
         IntTy::U16 => "u16",
         IntTy::U32 => "u32",
         IntTy::U64 | IntTy::Usize => "u64",
+        // Unreachable today; the runtime helpers land with 128-bit support.
+        IntTy::I128 => "i128",
+        IntTy::U128 => "u128",
     }
 }
 

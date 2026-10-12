@@ -6,6 +6,7 @@ use crate::def::{CrateIds, DiskDefId};
 use crate::diag::{Diag, Span, not_yet, unsupported};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
+use crate::ty::defs::{DefKind as DefsKind, Vis};
 use crate::ty::*;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,6 +67,9 @@ pub struct Program<'a> {
     pub interner: &'a Interner,
     pub known: &'a Known,
     pub tys: GlobalTys,
+    /// The definition table (ARCH 2.2): kinds, parents, generics, and param envs by
+    /// `DefId`, plus the bridge to the session-local `AdtId` compat tables below.
+    pub defs: Defs,
     pub adts: Vec<AdtDef>,
     pub fns: Vec<FnInfo<'a>>,
     pub type_names: HashMap<Sym, AdtId>,
@@ -76,8 +80,8 @@ pub struct Program<'a> {
     pub krate: CrateId,
     pub stable_crate: StableCrateHash,
     /// Each function's stable identity, in `fns` order (the `Vec<DefId>` side
-    /// table of docs/ARCH.md section 1.7). Today functions are the only defs
-    /// with `DefId`s; `AdtId` joins them in S3a, when `TyKind::Adt` takes a `DefId`.
+    /// table of docs/ARCH.md section 1.7). User Adts carry their `DefId` in
+    /// `defs` and in the type store, where `TyKind::Adt(DefId, ArgsId)` reads it.
     pub fn_defs: Vec<DefId>,
     /// The `LocalDefId` of a function by its stable hash (section 1.7).
     pub def_by_hash: HashMap<DefPathHash, LocalDefId>,
@@ -110,9 +114,21 @@ impl<'a> Program<'a> {
     pub fn local_def(&self, hash: DefPathHash) -> Option<LocalDefId> {
         self.def_by_hash.get(&hash).copied()
     }
+    /// A user Adt's stable identity, as carried by `TyKind::Adt(DefId, ArgsId)`.
+    #[allow(dead_code)] // First production readers are generic collect and mono; the store form is used now.
+    pub fn def_of_adt(&self, id: AdtId) -> DefId {
+        self.defs.def_of_adt(id).expect("ADT defs are recorded during collection")
+    }
+    /// The session-local index of the user Adt with this def, if this crate defines it.
+    #[allow(dead_code)] // See `def_of_adt`.
+    pub fn adt_by_def(&self, def: DefId) -> Option<AdtId> {
+        self.defs.local_adt(def)
+    }
 }
 
-/// Human-readable type name, for error messages.
+/// Human-readable type name, for error messages. Builtin Adts keep their std names
+/// through the compat helpers; kinds the subset cannot form yet print their Rust
+/// shape so later waves inherit a total printer.
 pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
     match tys.kind(t) {
         TyKind::Error => "{error}".into(),
@@ -120,17 +136,38 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         TyKind::Bool => "bool".into(),
         TyKind::Char => "char".into(),
         TyKind::Str => "str".into(),
-        TyKind::String => "String".into(),
         TyKind::Never => "!".into(),
         TyKind::Int(i) => i.name().into(),
-        TyKind::Vec(e) => format!("Vec<{}>", ty_name(p, tys, e)),
-        TyKind::Option(e) => format!("Option<{}>", ty_name(p, tys, e)),
-        TyKind::Chars => "std::str::Chars".into(),
-        TyKind::Ref(m, e) => format!("&{}{}", if m { "mut " } else { "" }, ty_name(p, tys, e)),
-        TyKind::Adt(a) => p.name(p.adt(a).name).into(),
-        TyKind::Args => "std::env::Args".into(),
-        TyKind::Var(_, true) => "{integer}".into(),
-        TyKind::Var(..) => "_".into(),
+        TyKind::Float(f) => f.name().into(),
+        TyKind::Ref(_, m, e) => format!("&{}{}", if m.is_mut() { "mut " } else { "" }, ty_name(p, tys, e)),
+        TyKind::RawPtr(m, e) => format!("*{}{}", if m.is_mut() { "mut " } else { "const " }, ty_name(p, tys, e)),
+        TyKind::Slice(e) => format!("[{}]", ty_name(p, tys, e)),
+        TyKind::Array(e, _) => format!("[{}; _]", ty_name(p, tys, e)),
+        TyKind::Tuple(ts) => {
+            let parts: Vec<String> = tys.tys_of(ts).iter().map(|&e| ty_name(p, tys, e)).collect();
+            format!("({})", parts.join(", "))
+        }
+        TyKind::Adt(..) => match tys.builtin_of(t) {
+            Some(BuiltinTy::String) => "String".into(),
+            Some(BuiltinTy::Vec) => format!("Vec<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::Option) => {
+                format!("Option<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e)))
+            }
+            Some(BuiltinTy::Chars) => "std::str::Chars".into(),
+            Some(BuiltinTy::Args) => "std::env::Args".into(),
+            None => match tys.local_adt(t) {
+                Some(a) => p.name(p.adt(a).name).into(),
+                None => "{unknown}".into(),
+            },
+        },
+        TyKind::FnPtr(_) | TyKind::FnDef(..) => "fn(..)".into(),
+        TyKind::Closure(..) => "{closure}".into(),
+        TyKind::Dyn(..) => "dyn ..".into(),
+        TyKind::Opaque(..) => "impl ..".into(),
+        TyKind::Param(param) => format!("T{}", param.0),
+        TyKind::Projection(..) => "{projection}".into(),
+        TyKind::Infer(v) if v.is_int() => "{integer}".into(),
+        TyKind::Infer(_) => "_".into(),
     }
 }
 
@@ -149,7 +186,7 @@ pub fn resolve_ty(
         TyExpr::Unit => Ok(UNIT),
         TyExpr::Ref { mutable, inner, .. } => {
             let inner = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
-            Ok(tys.intern(TyKind::Ref(*mutable, inner)))
+            Ok(tys.mk_ref(*mutable, inner))
         }
         TyExpr::Path(segs) => {
             // Accept `std::...::Name` by looking only at the last segment of std paths.
@@ -192,7 +229,7 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, "Vec takes one type argument", "Write `Vec<T>`."));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
-                return Ok(tys.intern(TyKind::Vec(e)));
+                return Ok(tys.mk_vec(e));
             }
             if name == known.Option {
                 let args = seg.type_args();
@@ -200,10 +237,10 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, "Option takes one type argument", "Write `Option<T>`."));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
-                return Ok(tys.intern(TyKind::Option(e)));
+                return Ok(tys.mk_option(e));
             }
             if let Some(&adt) = type_names.get(&name) {
-                return no_generics(tys.intern(TyKind::Adt(adt)));
+                return no_generics(tys.adt_ty(adt));
             }
             let n = interner.get(name);
             if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell", "f32", "f64", "i128", "u128"]
@@ -237,6 +274,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         interner,
         known,
         tys: GlobalTys::new(),
+        defs: Defs::new(),
         adts: Vec::new(),
         fns: Vec::new(),
         type_names: HashMap::default(),
@@ -248,6 +286,28 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         fn_defs: Vec::new(),
         def_by_hash: HashMap::default(),
     };
+    // The builtin Adt defs join the table with their one type param where they take
+    // one, so `Generics` queries answer for builtins and user types alike. Their
+    // code paths stay builtin until source std lands (ARCH 2.1, 9.3).
+    {
+        let b = p.tys.builtins();
+        let dummy = Span::default();
+        let one_ty_param = || Generics {
+            parent: None,
+            params: vec![ParamDef { name: interner.intern("T"), kind: ParamKind::Type, span: dummy }],
+            predicates: Vec::new(),
+        };
+        let insert_builtin = |p: &mut Program<'a>, def: DefId, kind: DefsKind, name: Sym, generics: Generics| {
+            let mut data = DefData::skeleton(kind, None, name, Vis::Pub, dummy);
+            data.generics = generics;
+            p.defs.insert(def, data);
+        };
+        insert_builtin(&mut p, b.string, DefsKind::Struct, known.String, Generics::default());
+        insert_builtin(&mut p, b.vec, DefsKind::Struct, known.Vec, one_ty_param());
+        insert_builtin(&mut p, b.option, DefsKind::Enum, known.Option, one_ty_param());
+        insert_builtin(&mut p, b.chars, DefsKind::Struct, interner.intern("Chars"), Generics::default());
+        insert_builtin(&mut p, b.args, DefsKind::Struct, interner.intern("Args"), Generics::default());
+    }
     let mut errs = Vec::new();
     let dup = |span: Span, n: &str| Diag::new("L0106", span, format!("`{n}` is defined more than once"), "Rename one of the definitions.");
 
@@ -262,8 +322,17 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         if p.type_names.insert(name, id).is_some() {
             errs.push(dup(span, interner.get(name)));
         }
+        // The Adt's stable identity (ARCH 1.7): same name earlier in the file is a
+        // duplicate definition (the error above), and the disambiguator keeps the
+        // two records apart in the def table, as the old dense ids did.
+        let disamb = p.adts.iter().filter(|a| a.name == name).count() as u32;
+        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
+        let def = DefId { krate: p.krate, hash };
         p.adts.push(AdtDef { name, is_enum, variants: Vec::new(), derives: Derives::default(), span });
-        p.tys.intern(TyKind::Adt(id));
+        p.tys.register_adt(def, id);
+        let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
+        p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
+        p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
     }
 
     // Pass 2: fields, variants, derives.
@@ -393,14 +462,20 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     // slots from the same hashes, before `collect` runs on any new def set;
     // here the maps only record the hashes. A duplicate definition keeps the
     // first local id in `def_by_hash`; the dup errors below report it.
-    let add_fn = |p: &mut Program<'a>, def: &'a ast::FnDef, owner: Option<AdtId>, hash: DefPathHash, errs: &mut Vec<Diag>| -> LocalDefId {
-        let self_ty = owner.map(|a| p.tys.intern(TyKind::Adt(a)));
+    let add_fn = |p: &mut Program<'a>,
+                  def: &'a ast::FnDef,
+                  owner: Option<AdtId>,
+                  parent: Option<DefId>,
+                  hash: DefPathHash,
+                  errs: &mut Vec<Diag>|
+     -> LocalDefId {
+        let self_ty = owner.map(|a| p.tys.adt_ty(a));
         let mut params = Vec::new();
         if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
             params.push(match sp.kind {
                 SelfKind::Value => st,
-                SelfKind::Ref => p.tys.intern(TyKind::Ref(false, st)),
-                SelfKind::RefMut => p.tys.intern(TyKind::Ref(true, st)),
+                SelfKind::Ref => p.tys.mk_ref(false, st),
+                SelfKind::RefMut => p.tys.mk_ref(true, st),
                 // Typed receivers are rejected by the parser today; treat as by-value.
                 SelfKind::Typed => st,
             });
@@ -443,8 +518,18 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
         }
         let id = LocalDefId(p.fns.len() as u32);
-        p.fn_defs.push(DefId { krate: p.krate, hash });
+        let def_id = DefId { krate: p.krate, hash };
+        p.fn_defs.push(def_id);
         p.def_by_hash.entry(hash).or_insert(id);
+        // The def table record mirrors `FnInfo` for identity, kind, and generics;
+        // body checking still reads `FnInfo` through the compat path.
+        let mut generics = Generics::default();
+        generics.parent = parent;
+        let mut data =
+            DefData::skeleton(if owner.is_some() { DefsKind::Method } else { DefsKind::Fn }, parent, def.name, Vis::Priv, def.name_span);
+        data.generics = generics;
+        data.sig = SigData::Fn { params: params.clone(), ret };
+        p.defs.insert(def_id, data);
         p.fns.push(FnInfo {
             name: def.name,
             def,
@@ -461,7 +546,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
-                let id = add_fn(&mut p, def, None, hash, &mut errs);
+                let id = add_fn(&mut p, def, None, None, hash, &mut errs);
                 if p.fn_names.insert(def.name, id).is_some() {
                     errs.push(dup(def.name_span, interner.get(def.name)));
                 }
@@ -487,9 +572,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
                 impl_ordinals.insert(header.clone(), ordinal + 1);
                 let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
+                let impl_def = DefId { krate: p.krate, hash: parent };
+                let owner_name = p.adts[owner.0 as usize].name;
+                p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, owner_name, Vis::Priv, ast.ty_span(imp.self_ty)));
                 for def in &imp.fns {
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
-                    let id = add_fn(&mut p, def, Some(owner), hash, &mut errs);
+                    let id = add_fn(&mut p, def, Some(owner), Some(impl_def), hash, &mut errs);
                     if p.methods.insert((owner, def.name), id).is_some() {
                         errs.push(dup(def.name_span, interner.get(def.name)));
                     }
@@ -510,9 +598,11 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
 pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Ref(..) => true,
-        TyKind::Vec(e) | TyKind::Option(e) => contains_ref(tys, e),
-        TyKind::Chars => true,
-        _ => false,
+        _ if tys.is_chars_ty(t) => true,
+        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+            Some(e) => contains_ref(tys, e),
+            None => false,
+        },
     }
 }
 
@@ -525,10 +615,10 @@ fn contains_adt_by_value(p: &Program, root: AdtId, cur: AdtId, seen: &mut Vec<bo
         for f in &v.fields {
             // Option<T> holds T by value.
             let mut t = f.ty;
-            while let TyKind::Option(inner) = p.tys.kind(t) {
+            while let Some(inner) = p.tys.option_elem(t) {
                 t = inner;
             }
-            if let TyKind::Adt(a) = p.tys.kind(t)
+            if let Some(a) = p.tys.local_adt(t)
                 && (a == root || contains_adt_by_value(p, root, a, seen))
             {
                 return true;
@@ -540,61 +630,98 @@ fn contains_adt_by_value(p: &Program, root: AdtId, cur: AdtId, seen: &mut Vec<bo
 
 // Trait queries. Lust has no user traits yet, so these follow fixed rules plus derives.
 
+// The queries below follow the old fixed rules, now read through the v2 compat
+// helpers: builtin Adts answer through `BuiltinTy`, user Adts through their derives.
+
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Var(_, true) => true,
-        TyKind::Ref(m, _) => !m,
-        TyKind::Option(e) => is_copy(p, tys, e),
-        TyKind::Adt(a) => p.adt(a).derives.copy,
-        _ => false,
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, m, _) => !m.is_mut(),
+        _ => {
+            if let Some(e) = tys.option_elem(t) {
+                return is_copy(p, tys, e);
+            }
+            match tys.local_adt(t) {
+                Some(a) => p.adt(a).derives.copy,
+                None => false,
+            }
+        }
     }
 }
 
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    match tys.kind(t) {
-        TyKind::String => true,
-        TyKind::Vec(e) | TyKind::Option(e) => has_clone(p, tys, e),
-        TyKind::Adt(a) => p.adt(a).derives.clone,
-        _ => is_copy(p, tys, t),
+    if tys.is_string_ty(t) {
+        return true;
+    }
+    if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+        return has_clone(p, tys, e);
+    }
+    match tys.local_adt(t) {
+        Some(a) => p.adt(a).derives.clone,
+        None => is_copy(p, tys, t),
     }
 }
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::String | TyKind::Str | TyKind::Error => true,
-        TyKind::Var(_, true) => true,
-        TyKind::Ref(_, e) | TyKind::Vec(e) | TyKind::Option(e) => has_eq(p, tys, e),
-        TyKind::Adt(a) => p.adt(a).derives.partial_eq,
-        _ => false,
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, _, e) => has_eq(p, tys, e),
+        _ => {
+            if tys.is_string_ty(t) {
+                return true;
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+                return has_eq(p, tys, e);
+            }
+            match tys.local_adt(t) {
+                Some(a) => p.adt(a).derives.partial_eq,
+                None => false,
+            }
+        }
     }
 }
 
 pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::String | TyKind::Str | TyKind::Error => true,
-        TyKind::Var(_, true) => true,
-        TyKind::Ref(_, e) | TyKind::Vec(e) | TyKind::Option(e) => has_debug(p, tys, e),
-        TyKind::Adt(a) => p.adt(a).derives.debug,
-        TyKind::Args => true,
-        _ => false,
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, _, e) => has_debug(p, tys, e),
+        _ => {
+            if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::Args) {
+                return true;
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+                return has_debug(p, tys, e);
+            }
+            match tys.local_adt(t) {
+                Some(a) => p.adt(a).derives.debug,
+                None => false,
+            }
+        }
     }
 }
 
 pub fn has_display(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::String | TyKind::Str | TyKind::Error => true,
-        TyKind::Var(_, true) => true,
-        TyKind::Ref(_, e) => has_display(tys, e),
-        _ => false,
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, _, e) => has_display(tys, e),
+        _ => tys.is_string_ty(t),
     }
 }
 
 /// True if values of this type own heap memory and need a drop call.
 pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    match tys.kind(t) {
-        TyKind::String | TyKind::Vec(_) => true,
-        TyKind::Option(e) => needs_drop(p, tys, e),
-        TyKind::Adt(a) => p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty))),
-        _ => false,
+    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() {
+        return true;
+    }
+    if let Some(e) = tys.option_elem(t) {
+        return needs_drop(p, tys, e);
+    }
+    match tys.local_adt(t) {
+        Some(a) => p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty))),
+        None => false,
     }
 }

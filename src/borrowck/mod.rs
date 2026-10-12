@@ -747,8 +747,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let mut t = self.body.locals[dest.local as usize].ty;
         for pr in &dest.proj {
             t = match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(_, i), Proj::Deref) => i,
-                (TyKind::Vec(e), Proj::Index(_)) => e,
+                (TyKind::Ref(_, _, i), Proj::Deref) => i,
+                (_, Proj::Index(_)) => match self.body.tys.vec_elem(t) {
+                    Some(e) => e,
+                    None => return ERROR,
+                },
                 _ => return ERROR,
             };
         }
@@ -862,7 +865,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for (i, a) in args.iter().enumerate() {
             let (Operand::Move(p) | Operand::Copy(p)) = a else { continue };
             let ty = self.place_ty(p);
-            let TyKind::Ref(true, target) = self.body.tys.kind(ty) else { continue };
+            let TyKind::Ref(_, Mut::Mut, target) = self.body.tys.kind(ty) else { continue };
             if !contains_ref(&self.body.tys, target) {
                 continue;
             }
@@ -1040,8 +1043,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let mut variant = 0;
         for pr in &p.proj {
             match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(m, inner), Proj::Deref) => {
-                    if !m {
+                (TyKind::Ref(_, m, inner), Proj::Deref) => {
+                    if !m.is_mut() {
                         let fix = "Take a `&mut` reference instead of `&`.";
                         if borrow {
                             self.err("L0308", span, "cannot borrow data behind a `&` reference as mutable".into(), fix);
@@ -1053,13 +1056,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     through_ref = true;
                     t = inner;
                 }
-                (TyKind::Vec(e), Proj::Index(_)) => t = e,
-                (TyKind::Adt(a), Proj::Field(i)) => {
+                (_, Proj::Index(_)) if self.body.tys.vec_elem(t).is_some() => t = self.body.tys.vec_elem(t).unwrap(),
+                (TyKind::Adt(..), Proj::Field(i)) if self.body.tys.local_adt(t).is_some() => {
+                    let a = self.body.tys.local_adt(t).unwrap();
                     t = self.p.adt(a).variants[variant as usize].fields[*i as usize].ty;
                     variant = 0;
                 }
-                (TyKind::Adt(_), Proj::Downcast(v)) => variant = *v,
-                (TyKind::Option(e), Proj::Field(_)) => t = e,
+                (TyKind::Adt(..), Proj::Downcast(v)) => variant = *v,
+                (_, Proj::Field(_)) if self.body.tys.option_elem(t).is_some() => t = self.body.tys.option_elem(t).unwrap(),
                 _ => {}
             }
         }
