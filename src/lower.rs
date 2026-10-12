@@ -195,6 +195,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                 b.project(Proj::Index(i))
             }
             (Expr::Deref(inner), _) => self.place(*inner).deref(),
+            // A field, index, or deref the checker could not resolve (its base
+            // type is an error type, so no `Res` was recorded): evaluating it
+            // through `expr_into` would call `place` on this same expression
+            // forever. The checker or borrow checker already reports the real
+            // error; give lowering a dummy place and move on.
+            (Expr::Field { .. } | Expr::Index { .. }, _) => {
+                let t = self.temp(self.ty(e));
+                Place::local(t)
+            }
             _ => {
                 let t = self.temp(self.ty(e));
                 self.expr_into(e, Some(&Place::local(t)));
