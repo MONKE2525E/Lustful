@@ -2153,9 +2153,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let registered: Vec<usize> = caches.overlays.iter().copied().filter(|&u| u >= FIRST_FN_UNIT).collect();
     todo.push((0, false));
     let main_slot = front.fn_slot[program.main.unwrap().0 as usize];
+    // Instance slots take their template's line: cgen stores an
+    // instance's panic lines relative to it (see `line_base_of`).
     let mut slot_lines = vec![0u32; n_slots];
-    for i in 0..fn_count {
-        slot_lines[slot(i)] = scan_of(front, i).1;
+    for i in 0..front.fn_slot.len().min(program.fns.len()) {
+        slot_lines[slot(i)] = line_base_of(front, i);
     }
     // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
     // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
