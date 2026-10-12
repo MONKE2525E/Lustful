@@ -369,6 +369,23 @@ fn chunk_end_ok(c: &Chunk) -> bool {
     c.scan.ends_at_boundary && (c.text.ends_with('\n') || chunk_ends_clean(&c.text))
 }
 
+/// True when a chunk's expansion reads token positions (`line!`,
+/// `column!`, `file!`, `stringify!`, `dbg!`): its expanded tokens are
+/// only valid at the position they were expanded at, so a kept chunk
+/// that moved must be lexed and expanded again. The text scan is
+/// deliberately loose (a name inside a longer identifier also hits);
+/// a false hit costs one relex, a miss would serve a stale `line!`.
+fn chunk_pos_sensitive(c: &Chunk) -> bool {
+    ["line!", "column!", "file!", "stringify!", "dbg!"].iter().any(|n| c.text.contains(n))
+}
+
+/// True when a chunk's expansion reads files outside the source
+/// (`include!` and kin): such a chunk is never reused, because the
+/// included file can change while the source text stays the same.
+fn chunk_reads_files(c: &Chunk) -> bool {
+    c.text.contains("include")
+}
+
 /// Shifts every AST span in file `file` at or after old offset `lo` by `delta` bytes.
 /// The caller passes the old start of the common suffix: every byte from there on is the
 /// same text at a new offset, so every span there moves by `delta`. This threshold matters
@@ -1059,6 +1076,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else if c.start >= old_len - suffix && suffix > 0 {
             kept_back.push(c);
         }
+    }
+    // A kept chunk holds expanded tokens, and expansion can read more
+    // than the chunk text: token positions and included files. A chunk
+    // that reads included files is never kept. A position-sensitive
+    // back chunk that moved is not kept either; front chunks sit at
+    // their old offsets, where their positions still hold. Keep the
+    // lists a prefix and a suffix, as the boundary proof below needs.
+    if let Some(i) = kept_front.iter().position(chunk_reads_files) {
+        kept_front.truncate(i);
+    }
+    if let Some(i) = kept_back.iter().rposition(|c| chunk_reads_files(c) || (delta != 0 && chunk_pos_sensitive(c))) {
+        kept_back.drain(..=i);
     }
     // A chunk may be reused only if its edges are still top-level item boundaries in the new
     // text: `chunk_end_ok` proves the end edge (complete items, clean lex state). A chunk that

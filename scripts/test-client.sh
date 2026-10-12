@@ -81,6 +81,28 @@ d=$(fresh nodaemon)
 sleep 0.5
 if [ -S "$(sock "$d")" ]; then bad "LUST_NO_DAEMON: no daemon starts" "socket exists"; else ok "LUST_NO_DAEMON: no daemon starts"; fi
 
+# A warm daemon must re-expand what positions and included files feed:
+# adding blank lines moves `line!`, and editing only the included file
+# changes `include_str!`. LUST_NO_DAEMON must also skip the live daemon.
+d=$(fresh warmedit); daemon_dirs+=("$d")
+printf 'fn main() { println!("{} {}", line!(), include_str!("data.txt")); }\n' >"$d/hello.rs"
+printf one >"$d/data.txt"
+(cd "$d" && "$lust" run hello.rs) >/dev/null 2>&1
+check "warmedit: daemon socket appears" wait_socket "$d"
+out1=$(cd "$d" && "$lust" run hello.rs 2>&1)
+check "warmedit: warm v1 output" test "$out1" = "1 one"
+printf '\n\nfn main() { println!("{} {}", line!(), include_str!("data.txt")); }\n' >"$d/hello.rs"
+printf two >"$d/data.txt"
+out2=$(cd "$d" && "$lust" run hello.rs 2>&1)
+check "warmedit: warm v2 sees new line and included file" test "$out2" = "3 two"
+(cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o hnd) >/dev/null 2>&1
+if ldd "$d/hnd" 2>/dev/null | grep -q libbase; then
+  bad "LUST_NO_DAEMON: live daemon not used" "loads libbase.so, so the daemon built it"
+else
+  ok "LUST_NO_DAEMON: live daemon not used"
+fi
+stop_daemon "$d"; sleep 0.3
+
 d=$(fresh race); daemon_dirs+=("$d")
 pids=()
 for i in 1 2 3 4; do (cd "$d" && "$lust" check hello.rs) >/dev/null 2>&1 & pids+=($!); done
