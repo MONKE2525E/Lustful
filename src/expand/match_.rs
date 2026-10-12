@@ -1073,6 +1073,8 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
                         | Fn
                         | Unsafe
                         | Extern
+                        // A qualified path type (`<T as P>`).
+                        | Lt
                 ),
                 FragKind::Pat | FragKind::PatParam => {
                     matches!(
@@ -1102,9 +1104,11 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
                             | Mut
                             | Ref
                             | PathSep
+                            // A qualified path pattern.
+                            | Lt
                     ) || (kind == FragKind::Pat && t.tok == Pipe)
                 }
-                FragKind::Path => is_seg_tok(t.tok) || t.tok == PathSep,
+                FragKind::Path => is_seg_tok(t.tok) || t.tok == PathSep || t.tok == Lt,
                 FragKind::Block => false,
                 _ => false,
             }
@@ -1122,6 +1126,10 @@ fn can_continue(kind: FragKind, tree: Option<&Tt>) -> bool {
         Tt::Delim(_, _, _) => {
             matches!(kind, FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt)
                 || kind == FragKind::Path && matches!(tree, Tt::Delim(Delim::Paren, _, _))
+                // A struct or tuple-struct pattern body continues
+                // a pattern (`S { .. }`, `S(..)`).
+                || matches!(kind, FragKind::Pat | FragKind::PatParam)
+                    && matches!(tree, Tt::Delim(Delim::Brace | Delim::Paren, _, _))
         }
         Tt::Frag(_, _, _) => false,
         Tt::Tok(t) => match kind {
@@ -1186,6 +1194,27 @@ fn note_hard_fail(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize, end
         }
         Some(&g) => {
             if can_continue(kind, input.get(g)) {
+                m.hard_fail = true;
+                return;
+            }
+            // Continuations only some heads take: a `+` after a
+            // `dyn`/`impl` type (more bounds), a `->` after a type
+            // that ended in a parenthesized argument list (a fn
+            // type's return), and `:`/`=`/`else` after a leading
+            // `let` in a statement. A plain type or expression
+            // statement stops before the same tokens, so the head
+            // of the greedy slice decides.
+            let head = tok_at(input, pos).map(|t| t.tok);
+            let next = tok_at(input, g).map(|t| t.tok);
+            let continues = match (kind, head, next) {
+                (FragKind::Ty, Some(Tok::Dyn | Tok::Impl), Some(Tok::Plus)) => true,
+                (FragKind::Stmt, Some(Tok::Let), Some(Tok::Colon | Tok::Eq | Tok::Else)) => true,
+                (FragKind::Ty, _, Some(Tok::Arrow)) => {
+                    g >= pos + 2 && matches!(input.get(g - 1), Some(Tt::Delim(Delim::Paren, _, _)))
+                }
+                _ => false,
+            };
+            if continues {
                 m.hard_fail = true;
             }
         }
@@ -1385,6 +1414,12 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             ends
         }
     };
+    // A fragment that ends in `..=` has no range end and does not
+    // parse in rustc. The subset parser's range form accepts it,
+    // so refuse those ends here for every parsed kind.
+    if parsed_kind(kind) {
+        ends.retain(|&end| !matches!(input.get(end.wrapping_sub(1)), Some(Tt::Tok(t)) if t.tok == Tok::DotDotEq));
+    }
     if parsed_kind(kind) {
         note_hard_fail(m, kind, input, pos, &ends);
         // Parsed fragments are greedy (see the fn comment). Item and

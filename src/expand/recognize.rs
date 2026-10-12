@@ -135,6 +135,15 @@ fn pieces(ts: &[Tt]) -> Vec<&[Tt]> {
     out
 }
 
+/// True when every comma piece passes `f`. An empty piece is
+/// allowed only as the last one: a trailing comma, or the whole
+/// empty list. A `,,` anywhere else does not parse in rustc.
+fn pieces_all(ts: &[Tt], f: impl Fn(&[Tt]) -> bool) -> bool {
+    let ps = pieces(ts);
+    let n = ps.len();
+    ps.into_iter().enumerate().all(|(i, p)| if p.is_empty() { i + 1 == n } else { f(p) })
+}
+
 /// True for tokens that name one path segment in the shapes here.
 fn is_seg(t: Tok) -> bool {
     is_seg_tok(t)
@@ -309,7 +318,7 @@ fn parse_path_ty(c: &mut Cur) -> bool {
         // `Fn(A, B) -> C` sugar ends the path.
         if matches!(c.tree(), Some(Tt::Delim(Delim::Paren, _, _))) {
             let Some(inner) = c.group(Delim::Paren) else { return false };
-            if !pieces(inner).iter().all(|p| p.is_empty() || is_ty(p, c.interner)) {
+            if !pieces_all(inner, |p| is_ty(p, c.interner)) {
                 return false;
             }
             if c.eat(Tok::Arrow) && !parse_ty(c) {
@@ -376,8 +385,9 @@ fn parse_bound(c: &mut Cur) -> bool {
         return true;
     }
     if c.at(Tok::For) {
+        // A binder: `for<...>`. A bare `for` is not a bound.
         c.bump();
-        if !generic_params(c) {
+        if !c.at(Tok::Lt) || !generic_params(c) {
             return false;
         }
     }
@@ -412,7 +422,7 @@ fn parse_ty(c: &mut Cur) -> bool {
         }
         Some(Tt::Delim(Delim::Paren, _, _)) => {
             let Some(inner) = c.group(Delim::Paren) else { return false };
-            return pieces(inner).iter().all(|p| p.is_empty() || is_ty(p, c.interner));
+            return pieces_all(inner, |p| is_ty(p, c.interner));
         }
         Some(Tt::Delim(Delim::Bracket, _, _)) => {
             let Some(inner) = c.group(Delim::Bracket) else { return false };
@@ -450,10 +460,11 @@ fn parse_ty(c: &mut Cur) -> bool {
             c.eat(Tok::Mut);
             parse_ty(c)
         }
-        Some(Tok::Dyn) => {
+        Some(Tok::Dyn | Tok::Impl) => {
             c.bump();
-            // A bare `dyn` parses as a type in rustc's fragment
-            // parser (the missing bound is judged only if used).
+            // A bare `dyn` or `impl` parses as a type in rustc's
+            // fragment parser (the missing bound is judged only
+            // if the fragment is ever used as a type).
             if parse_bound(c) {
                 while c.eat(Tok::Plus) {
                     if !parse_bound(c) {
@@ -463,13 +474,9 @@ fn parse_ty(c: &mut Cur) -> bool {
             }
             true
         }
-        Some(Tok::Impl) => {
-            c.bump();
-            parse_bounds(c)
-        }
         Some(Tok::For) => {
             c.bump();
-            generic_params(c) && parse_ty(c)
+            c.at(Tok::Lt) && generic_params(c) && parse_ty(c)
         }
         Some(Tok::Fn | Tok::Unsafe | Tok::Extern) if is_fn_ty_start(c) => parse_fn_ty(c),
         Some(Tok::Lt) => parse_qualified(c, true),
@@ -503,9 +510,14 @@ fn parse_fn_ty(c: &mut Cur) -> bool {
         return false;
     }
     let Some(inner) = c.group(Delim::Paren) else { return false };
-    for p in pieces(inner) {
-        if p.is_empty() || matches!(p, [Tt::Tok(t)] if t.tok == Tok::Ellipsis) {
+    let ps = pieces(inner);
+    let last = ps.len() - 1;
+    for (idx, p) in ps.into_iter().enumerate() {
+        if matches!(p, [Tt::Tok(t)] if t.tok == Tok::Ellipsis) || (p.is_empty() && idx == last) {
             continue;
+        }
+        if p.is_empty() {
+            return false;
         }
         // An optional argument name precedes the type.
         let ty_at = if p.len() > 2 && tok_at(p, 1).map(|t| t.tok) == Some(Tok::Colon) { 2 } else { 0 };
@@ -578,11 +590,13 @@ fn parse_pat_bound(c: &mut Cur) -> bool {
 }
 
 /// A range tail after a first bound: `..b`, `..=b`, or `..`.
+/// The end may be absent only after `..`.
 fn pat_range_tail(c: &mut Cur) -> bool {
-    if c.eat(Tok::DotDot) || c.eat(Tok::DotDotEq) {
-        if range_bound_start(c) {
-            return parse_pat_bound(c);
-        }
+    if c.eat(Tok::DotDotEq) {
+        return range_bound_start(c) && parse_pat_bound(c);
+    }
+    if c.eat(Tok::DotDot) && range_bound_start(c) {
+        return parse_pat_bound(c);
     }
     true
 }
@@ -653,7 +667,7 @@ fn parse_pat_one(c: &mut Cur) -> bool {
                 _ => unreachable!(),
             };
             let Some(inner) = c.group(d) else { return false };
-            return pieces(inner).iter().all(|p| p.is_empty() || is_pat(p, c.interner, true) || is_rest(p));
+            return pieces_all(inner, |p| is_pat(p, c.interner, true) || is_rest(p));
         }
         _ => {}
     }
@@ -746,8 +760,8 @@ fn parse_pat_path_pat(c: &mut Cur) -> bool {
     }
     // A struct pattern: `Path { field: pat, .. }`.
     if let Some(inner) = c.group(Delim::Brace) {
-        return pieces(inner).iter().all(|p| {
-            if p.is_empty() || is_rest(p) {
+        return pieces_all(inner, |p| {
+            if is_rest(p) {
                 return true;
             }
             match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
@@ -758,7 +772,7 @@ fn parse_pat_path_pat(c: &mut Cur) -> bool {
     }
     // A tuple struct pattern: `Path(pat, ..)`.
     if let Some(inner) = c.group(Delim::Paren) {
-        return pieces(inner).iter().all(|p| p.is_empty() || is_pat(p, c.interner, true) || is_rest(p));
+        return pieces_all(inner, |p| is_pat(p, c.interner, true) || is_rest(p));
     }
     if c.eat(Tok::At) {
         return parse_pat_one(c);
@@ -881,8 +895,13 @@ fn parse_expr_bp(c: &mut Cur, min_bp: u8) -> bool {
                 }
             }
             Tok::DotDot | Tok::DotDotEq => {
-                // The end of a range may be absent (`a..`).
-                if operand_start(c) && !parse_expr_bp(c, bp) {
+                // The end of a range may be absent after `..`
+                // only; `a..=` without an end does not parse.
+                if operand_start(c) {
+                    if !parse_expr_bp(c, bp) {
+                        return false;
+                    }
+                } else if t == Tok::DotDotEq {
                     return false;
                 }
             }
@@ -957,9 +976,15 @@ fn parse_unary(c: &mut Cur) -> bool {
             c.depth -= 1;
             ok
         }
-        Some(Tok::DotDot | Tok::DotDotEq) => {
+        Some(Tok::DotDot) => {
             c.bump();
             !operand_start(c) || parse_expr_bp(c, 4)
+        }
+        Some(Tok::DotDotEq) => {
+            // A leading `..=` needs its end (`..` alone is a
+            // complete range, `..=` alone is not).
+            c.bump();
+            operand_start(c) && parse_expr_bp(c, 4)
         }
         Some(Tok::Move) => {
             c.bump();
@@ -1010,8 +1035,13 @@ fn parse_closure(c: &mut Cur) -> bool {
             return false;
         };
         let params = &c.ts[c.i + 1..close];
-        for p in pieces(params) {
+        let ps = pieces(params);
+        let last = ps.len() - 1;
+        for (idx, p) in ps.into_iter().enumerate() {
             if p.is_empty() {
+                if idx != last {
+                    return false;
+                }
                 continue;
             }
             match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
@@ -1131,7 +1161,7 @@ fn parse_primary(c: &mut Cur) -> bool {
         }
         Some(Tt::Delim(Delim::Paren, _, _)) => {
             let Some(inner) = c.group(Delim::Paren) else { return false };
-            if !pieces(inner).iter().all(|p| p.is_empty() || is_expr(p, c.interner, c.ed2024)) {
+            if !pieces_all(inner, |p| is_expr(p, c.interner, c.ed2024)) {
                 return false;
             }
             return parse_postfix(c);
@@ -1140,7 +1170,7 @@ fn parse_primary(c: &mut Cur) -> bool {
             let Some(inner) = c.group(Delim::Bracket) else { return false };
             let ok = match inner.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Semi)) {
                 Some(s) => is_expr(&inner[..s], c.interner, c.ed2024) && is_expr(&inner[s + 1..], c.interner, c.ed2024),
-                None => pieces(inner).iter().all(|p| p.is_empty() || is_expr(p, c.interner, c.ed2024)),
+                None => pieces_all(inner, |p| is_expr(p, c.interner, c.ed2024)),
             };
             return ok && parse_postfix(c);
         }
@@ -1279,7 +1309,7 @@ fn parse_postfix(c: &mut Cur) -> bool {
         match c.tree() {
             Some(Tt::Delim(Delim::Paren, _, _)) => {
                 let Some(inner) = c.group(Delim::Paren) else { return false };
-                if !pieces(inner).iter().all(|p| p.is_empty() || is_expr(p, c.interner, c.ed2024)) {
+                if !pieces_all(inner, |p| is_expr(p, c.interner, c.ed2024)) {
                     return false;
                 }
                 c.block_like = false;
@@ -1372,10 +1402,7 @@ fn parse_path_tail(c: &mut Cur) -> bool {
 /// True when a `{ }` body reads as struct literal fields:
 /// `name`, `name: expr`, or `..expr` pieces.
 fn struct_fields(inner: &[Tt], interner: &Interner, ed2024: bool) -> bool {
-    pieces(inner).iter().all(|p| {
-        if p.is_empty() {
-            return true;
-        }
+    pieces_all(inner, |p| {
         if matches!(p.first(), Some(Tt::Tok(t)) if t.tok == Tok::DotDot) {
             return p.len() > 1 && is_expr(&p[1..], interner, ed2024);
         }
@@ -1525,9 +1552,11 @@ fn skip_to_semi(c: &mut Cur) -> bool {
 }
 
 /// Validates fn parameters: `self` forms, `pat: ty`, and `...`.
-fn fn_params(inner: &[Tt], interner: &Interner) -> bool {
-    pieces(inner).iter().all(|p| {
-        if p.is_empty() || matches!(p, [Tt::Tok(t)] if t.tok == Tok::Ellipsis) {
+/// A bare type with no pattern stands only in a body-less
+/// signature (`allow_bare`), never in a definition.
+fn fn_params(inner: &[Tt], interner: &Interner, allow_bare: bool) -> bool {
+    pieces_all(inner, |p| {
+        if matches!(p, [Tt::Tok(t)] if t.tok == Tok::Ellipsis) {
             return true;
         }
         // A `self` form: `self`, `mut self`, `&self`, `&mut self`,
@@ -1549,17 +1578,14 @@ fn fn_params(inner: &[Tt], interner: &Interner) -> bool {
                 (is_pat(&p[..k], interner, false) || matches!(&p[..k], [Tt::Tok(t)] if t.tok == Tok::Underscore))
                     && is_ty(&p[k + 1..], interner)
             }
-            _ => is_ty(p, interner),
+            _ => allow_bare && is_ty(p, interner),
         }
     })
 }
 
 /// Validates struct-like named fields.
 fn named_fields(inner: &[Tt], interner: &Interner) -> bool {
-    pieces(inner).iter().all(|p| {
-        if p.is_empty() {
-            return true;
-        }
+    pieces_all(inner, |p| {
         let mut s = 0;
         // Attributes and visibility before the field name.
         while matches!(p.get(s), Some(Tt::Tok(t)) if t.tok == Tok::Pound) && matches!(p.get(s + 1), Some(Tt::Delim(Delim::Bracket, _, _))) {
@@ -1579,10 +1605,7 @@ fn named_fields(inner: &[Tt], interner: &Interner) -> bool {
 
 /// Validates the types in a tuple field or variant list.
 fn ty_pieces(inner: &[Tt], interner: &Interner) -> bool {
-    pieces(inner).iter().all(|p| {
-        if p.is_empty() {
-            return true;
-        }
+    pieces_all(inner, |p| {
         let mut s = 0;
         while matches!(p.get(s), Some(Tt::Tok(t)) if t.tok == Tok::Pound) && matches!(p.get(s + 1), Some(Tt::Delim(Delim::Bracket, _, _))) {
             s += 2;
@@ -1667,7 +1690,9 @@ fn parse_item(c: &mut Cur) -> bool {
                 return false;
             }
             let Some(inner) = c.group(Delim::Paren) else { return false };
-            if !fn_params(inner, c.interner) {
+            let definition_params = fn_params(inner, c.interner, false);
+            let signature_params = definition_params || fn_params(inner, c.interner, true);
+            if !signature_params {
                 return false;
             }
             if c.eat(Tok::Arrow) && !parse_ty(c) {
@@ -1677,7 +1702,8 @@ fn parse_item(c: &mut Cur) -> bool {
                 return false;
             }
             if matches!(c.tree(), Some(Tt::Delim(Delim::Brace, _, _))) {
-                parse_block(c)
+                // A definition's parameters need patterns.
+                definition_params && parse_block(c)
             } else {
                 c.eat(Tok::Semi)
             }
@@ -1705,10 +1731,7 @@ fn parse_item(c: &mut Cur) -> bool {
                 return false;
             }
             let Some(inner) = c.group(Delim::Brace) else { return false };
-            pieces(inner).iter().all(|p| {
-                if p.is_empty() {
-                    return true;
-                }
+            pieces_all(inner, |p| {
                 let mut s = 0;
                 while matches!(p.get(s), Some(Tt::Tok(t)) if t.tok == Tok::Pound)
                     && matches!(p.get(s + 1), Some(Tt::Delim(Delim::Bracket, _, _)))
