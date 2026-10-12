@@ -15,11 +15,17 @@ pub struct Parser<'a> {
     known: &'a Known,
     /// Added to string-literal token indexes: where this token list's strings start in the AST.
     str_base: u32,
+    /// Current nesting depth, capped so pathological input cannot overflow the stack.
+    depth: u32,
 }
+
+/// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
+/// patterns, and operator or method chains). Real code stays far below this.
+const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0 };
+    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0 };
     p.ast.strings = lexed.strings.clone();
     while p.peek() != Tok::Eof {
         let before = p.pos;
@@ -46,7 +52,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     toks.push(Token { tok: Tok::Eof, span: Span::new(end.end, end.end) });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
-    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base };
+    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0 };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
@@ -130,6 +136,21 @@ impl<'a> Parser<'a> {
         self.peek() == Tok::Gt && self.peek_at(1) == Tok::Ge && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
     }
 
+    /// Runs `f` one nesting level deeper, or errors past `MAX_DEPTH`.
+    fn nest<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Diag::new(
+                "L9001",
+                self.span(),
+                format!("nesting deeper than {MAX_DEPTH} levels is not supported"),
+                "Split the expression into smaller pieces with `let`.",
+            ));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
     fn push_expr(&mut self, e: Expr, span: Span) -> ExprId {
         self.ast.exprs.push(e);
         self.ast.expr_spans.push(span);
@@ -403,6 +424,10 @@ impl<'a> Parser<'a> {
     // ---------- Types ----------
 
     fn ty(&mut self) -> PResult<TyId> {
+        self.nest(|p| p.ty_inner())
+    }
+
+    fn ty_inner(&mut self) -> PResult<TyId> {
         let start = self.span();
         match self.peek() {
             Tok::Amp | Tok::AndAnd => {
@@ -472,6 +497,10 @@ impl<'a> Parser<'a> {
     // ---------- Blocks and statements ----------
 
     fn block(&mut self) -> PResult<BlockId> {
+        self.nest(|p| p.block_inner())
+    }
+
+    fn block_inner(&mut self) -> PResult<BlockId> {
         let start = self.expect(Tok::LBrace, "`{`")?;
         let mut stmts = Vec::new();
         let mut tail = None;
@@ -527,6 +556,10 @@ impl<'a> Parser<'a> {
     // ---------- Patterns ----------
 
     fn pattern(&mut self) -> PResult<PatId> {
+        self.nest(|p| p.pattern_inner())
+    }
+
+    fn pattern_inner(&mut self) -> PResult<PatId> {
         let start = self.span();
         self.eat(Tok::Pipe);
         let first = self.pattern_one()?;
@@ -732,7 +765,19 @@ impl<'a> Parser<'a> {
     }
 
     fn binary_rest(&mut self, mut lhs: ExprId, min_prec: u8, no_struct: bool) -> PResult<ExprId> {
+        // A long flat chain (`a + a + ...`) makes a deep tree without any recursion
+        // here, so count the operators to keep later passes off the stack limit.
+        let mut chain = 0u32;
         while let Some((op, prec, n)) = self.binop() {
+            chain += 1;
+            if chain > MAX_DEPTH {
+                return Err(Diag::new(
+                    "L9001",
+                    self.span(),
+                    format!("operator chains longer than {MAX_DEPTH} are not supported"),
+                    "Split the expression into smaller pieces with `let`.",
+                ));
+            }
             if prec <= min_prec {
                 break;
             }
@@ -761,6 +806,10 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self, no_struct: bool) -> PResult<ExprId> {
+        self.nest(|p| p.prefix_inner(no_struct))
+    }
+
+    fn prefix_inner(&mut self, no_struct: bool) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
             Tok::Minus => {
@@ -807,7 +856,18 @@ impl<'a> Parser<'a> {
     }
 
     fn postfix(&mut self, mut e: ExprId) -> PResult<ExprId> {
+        // Like `binary_rest`, a long postfix chain makes a deep tree iteratively.
+        let mut chain = 0u32;
         loop {
+            chain += 1;
+            if chain > MAX_DEPTH {
+                return Err(Diag::new(
+                    "L9001",
+                    self.span(),
+                    format!("method and field chains longer than {MAX_DEPTH} are not supported"),
+                    "Split the expression into smaller pieces with `let`.",
+                ));
+            }
             let start = self.ast.expr_span(e);
             match self.peek() {
                 Tok::LParen => {

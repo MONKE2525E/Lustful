@@ -29,7 +29,10 @@ tokens = [b"fn", b"let", b"mut", b"struct", b"enum", b"impl", b"match", b"if", b
           b"18446744073709551616u64", "🧀".encode()]
 known = [b"(", b"", b"pub(", b"fn", b"{", b"'", b'"', b"/*", b"r#", b"r#self",
          b"fn main() { let x = ", b"####", b"<<<<", b"fn f(&mut self,,,,",
-         b"struct S {", b"match x {", b"#["]
+         b"struct S {", b"match x {", b"#[",
+         b"fn main() { let x = " + b"(" * 5000 + b"1",
+         b"fn main() { let x: i64 = 1" + b" + 1" * 5000 + b"; }",
+         b"fn main() { let x: i64 = " + b"-" * 5000 + b"1; }"]
 
 def write(i, data):
     with open(os.path.join(work, "case-%05d.rs" % i), "wb") as f:
