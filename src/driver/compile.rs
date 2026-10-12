@@ -539,13 +539,23 @@ fn slot_update(
     front.env_hash = Some(env);
     front.items = item_scans;
     if changed_names.is_none() {
-        // Full rebuild: fresh slots in def order, and empty caches.
-        front.slot_of.clear();
-        front.slot_paths.clear();
+        // Full rebuild: fresh caches, but slots stay append-only (section
+        // 4.2): existing fns keep the slots the manifest gave them, a
+        // seeded manifest from a previous daemon included, so slot
+        // numbers are stable across restarts and load orders. Only when
+        // dead slots outnumber live fns by a wide margin does a full
+        // rebuild compact: it renumbers in def order and the stored
+        // manifest is rewritten (the base rebuild of 4.2, in slot form).
+        if front.slot_of.len() > fn_count * 2 + 64 {
+            front.slot_of.clear();
+            front.slot_paths.clear();
+            front.slot_manifest_stored = 0;
+        }
         caches.ok.clear();
         caches.out.clear();
         caches.has_out.clear();
         caches.slot_reads.clear();
+        caches.slot_used.clear();
         front.slot_hash.clear();
         caches.glue = GlueSet::default();
         caches.objects = None;
@@ -587,12 +597,14 @@ fn slot_update(
     caches.has_out.resize(n_slots, false);
     caches.out.resize_with(n_slots, FnOut::default);
     caches.slot_reads.resize_with(n_slots, || None);
+    caches.slot_used.resize_with(n_slots, Vec::new);
     front.slot_hash.resize(n_slots, 0);
     for slot in (0..n_slots).filter(|&s| !live[s]) {
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
         caches.ok[slot] = true;
         caches.slot_reads[slot] = None;
+        caches.slot_used[slot].clear();
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
     // function's name (only possible in the "signatures" case). A function in the last
@@ -744,7 +756,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // package and target identity, `Session::crate_ids`). For a single-file
     // program that is the synthetic one-file bin crate, as before.
     let crate_ids = session.crate_ids();
-    let Session { front, caches, std_cache, .. } = session;
+    // Open the disk cache once per session and seed slot assignment from
+    // the stored manifest, so a restarted daemon gives every fn the slot
+    // it had before, in any load or discovery order (sections 4.2, 8.4).
+    if !session.cache_tried {
+        session.cache_tried = true;
+        session.disk_cache = crate::driver::cache::Cache::open(&req.file);
+        if session.front.slot_of.is_empty()
+            && let Some(cache) = &session.disk_cache
+            && let Some(manifest) = cache.load_slot_manifest(&session.key)
+        {
+            session.front.slot_manifest_stored = manifest.len();
+            session.front.slot_of = manifest;
+        }
+    }
+    let session_key = session.key.clone();
+    let Session { front, caches, std_cache, disk_cache, .. } = session;
     t.lap("read");
 
     // Source std (S5): if this file can mention a source std fn, load the
@@ -1046,6 +1073,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
 
+    // Persist slot assignment when it grew (or was compacted): the next
+    // daemon seeds from this file even if this compile later fails,
+    // because the assignment itself is already in use by cached C.
+    if front.slot_of.len() != front.slot_manifest_stored {
+        if let Some(cache) = disk_cache {
+            cache.store_slot_manifest(&session_key, &front.slot_of);
+        }
+        front.slot_manifest_stored = front.slot_of.len();
+    }
+
     let mut program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
         Ok(p) => p,
         Err(mut ds) => {
@@ -1207,10 +1244,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
-    for ((i, _), out) in bodies.iter().zip(outs) {
+    for ((i, body), out) in bodies.iter().zip(outs) {
         caches.out[slot(*i)] = out;
         caches.has_out[slot(*i)] = true;
         dirty_groups[slot(*i) / caches.per_unit] = true;
+        // The slots this fn's C references: itself (its register store)
+        // plus every `Fn` call target (printed as `lust_fns[slot]`).
+        // The unit's used-slots hash is built from these (section 4.2).
+        if let Some(used) = caches.slot_used.get_mut(slot(*i)) {
+            used.clear();
+            used.push(slot(*i) as u32);
+            for block in &body.blocks {
+                if let ir::Terminator::Call { target: ir::CallTarget::Fn(f), .. } = &block.term {
+                    used.push(front.fn_slot[f.0 as usize]);
+                }
+            }
+        }
     }
     let glue_changed = caches.glue.add(&program, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()));
     t.lap("codegen (par)");
@@ -1223,14 +1272,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     const MAX_OVERLAYS: usize = 32;
     let fn_units: Vec<usize> = (0..groups.len()).map(|g| g + FIRST_FN_UNIT).collect();
     let dirty_fn_units: Vec<usize> = (0..groups.len()).filter(|&g| dirty_groups[g]).map(|g| g + FIRST_FN_UNIT).collect();
-    // A fresh base: no base yet, or new slots outgrew its table or unit list.
-    let fresh_base =
-        caches.objects != Some(req.debug) || !caches.persistent || n_slots > caches.table_cap || groups.len() != caches.base_units;
-    if fresh_base {
+    // A fresh base: no base yet under this debug setting, or a one-shot
+    // (static) build. Growth no longer forces one (section 4.2): when
+    // slots outgrow the table capacity or a new fn unit appears, only
+    // the table unit (whose C is the capacity plus the unit list; its
+    // identity is `graph::table_unit_key`) rebuilds and the base
+    // relinks over the existing unit objects. Unrelated units keep
+    // their objects, in the session and in the disk unit cache.
+    let fresh_base = caches.objects != Some(req.debug) || !caches.persistent;
+    let cap_grown = n_slots > caches.table_cap;
+    if fresh_base || cap_grown {
         caches.table_cap = n_slots * 2 + 64;
+    }
+    if fresh_base {
         caches.base_units = groups.len();
     }
-    let rebuild_base = fresh_base || caches.overlays.len() + dirty_fn_units.len() > MAX_OVERLAYS;
+    let table_dirty = cap_grown || groups.len() != caches.base_units;
+    let rebuild_base = fresh_base || table_dirty || caches.overlays.len() + dirty_fn_units.len() > MAX_OVERLAYS;
     let dir = caches.obj_dir.clone();
     let base_obj = |u: usize| dir.join(format!("u{u}.o"));
     let overlay_obj = |u: usize| dir.join(format!("o{u}.o"));
@@ -1249,6 +1307,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if glue_changed && !todo.contains(&(1, false)) {
                 todo.push((1, false));
             }
+            if table_dirty && !todo.contains(&(3, false)) {
+                todo.push((3, false));
+            }
+            // The relinked base now registers every current unit.
+            caches.base_units = groups.len();
         }
         caches.overlays.clear();
     } else {
@@ -1328,9 +1391,59 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return resp;
         }
     }
-    if let Err(e) = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| crate::tcc::compile_units(&units, req.debug)) {
+    // Per-unit object identity (section 4.2): each fn unit keys on its
+    // instances' fingerprints (today: body hashes, one instance per fn)
+    // plus its used-slots hash; the table unit keys on the full slot
+    // manifest. The disk object cache folds the C text in as well (see
+    // cache.rs), so a hit is exactly as sound as recompiling. Adding one
+    // reachable fn changes no unrelated unit's key: its object is copied
+    // from disk and tcc never sees it.
+    let manifest = crate::driver::graph::SlotManifest::from_disk_slots(&front.slot_of);
+    let unit_key_of = |u: usize| -> crate::driver::graph::UnitKey {
+        use crate::driver::graph::{Fingerprint, used_slots_hash};
+        match u {
+            3 => crate::driver::graph::table_unit_key(&manifest),
+            g if g >= FIRST_FN_UNIT => {
+                let range = &groups[g - FIRST_FN_UNIT];
+                let instances: Vec<Fingerprint> = range.clone().map(|s| Fingerprint(front.slot_hash[s])).collect();
+                let mut pairs: Vec<(crate::driver::graph::InstanceKeyHash, u32)> = Vec::new();
+                for s in range.clone() {
+                    if let Some(used) = caches.slot_used.get(s) {
+                        for &used_slot in used {
+                            if let Some(k) = manifest.key_at(used_slot) {
+                                pairs.push((k, used_slot));
+                            }
+                        }
+                    }
+                }
+                crate::driver::graph::unit_key(&instances, used_slots_hash(&pairs))
+            }
+            _ => crate::driver::graph::UnitKey(0),
+        }
+    };
+    let mut unit_hits = 0usize;
+    let mut misses: Vec<(PathBuf, String, crate::driver::graph::UnitKey)> = Vec::new();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
+    for ((obj, c), &(u, _)) in units.iter().zip(todo.iter()) {
+        let key = unit_key_of(u);
+        if disk_cache.as_ref().is_some_and(|cache| cache.unit_object(key, c, req.debug, obj)) {
+            unit_hits += 1;
+        } else {
+            misses.push((obj.clone(), c.clone(), key));
+        }
+    }
+    let miss_units: Vec<(PathBuf, String)> = misses.iter().map(|(o, c, _)| (o.clone(), c.clone())).collect();
+    if let Err(e) = crate::tcc::compile_units(&miss_units, req.debug) {
+        caches.objects = None;
+        return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
+    if let Some(cache) = disk_cache {
+        for (obj, c, key) in &misses {
+            cache.store_unit_object(*key, c, req.debug, obj);
+        }
     }
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
@@ -1383,8 +1496,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             invalidated: reads_invalidated,
             c_bytes: units.iter().map(|u| u.1.len()).sum(),
             dirty_units: dirty_fn_units.len(),
-            units_compiled: units.len(),
-            unit_cache_hits: 0,
+            units_compiled: miss_units.len(),
+            unit_cache_hits: unit_hits,
             table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
             instances: front.fn_slot.len(),
         }

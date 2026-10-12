@@ -39,6 +39,10 @@ pub(crate) struct Front {
     /// (src/def.rs). A key keeps the path that first claimed it; a different
     /// path under the same key is a collision.
     pub(crate) slot_paths: FxMap<DiskDefId, Box<str>>,
+    /// How many `slot_of` entries the disk slot manifest already holds
+    /// (loaded at session start, then every store). The manifest is
+    /// rewritten only when assignment grows past this count.
+    pub(crate) slot_manifest_stored: usize,
     /// Body hash per slot, at the last parse.
     pub(crate) slot_hash: Vec<u64>,
     /// Lexed and scanned chunks from the last request, reused when their text is unchanged.
@@ -78,6 +82,10 @@ pub(crate) struct Caches {
     /// without a recheck. Session-local only (`Sym` and `DefId` keys are
     /// stable inside one session, never written to disk in this form).
     pub(crate) slot_reads: Vec<Option<crate::driver::graph::Reads>>,
+    /// Slots each slot's generated C references (itself plus its `Fn` call
+    /// targets), collected from the IR at codegen. A unit's used-slots
+    /// hash (section 4.2) is computed over the union for its slots.
+    pub(crate) slot_used: Vec<Vec<u32>>,
     pub(crate) glue: GlueSet,
     /// Slots per function unit. Fixed until the next full rebuild, so units stay stable.
     pub(crate) per_unit: usize,
@@ -113,6 +121,12 @@ pub struct Session {
     /// `None` until a request can mention a source std fn, so a session
     /// that never routes one never pays for the load.
     pub(crate) std_cache: Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
+    /// The disk cache (unit objects and the slot manifest), opened on the
+    /// first compile. Opening hashes the tcc tree for the compiler id, so
+    /// a session pays it once, not per request. `cache_tried` separates
+    /// "not opened yet" from "cache is off".
+    pub(crate) disk_cache: Option<crate::driver::cache::Cache>,
+    pub(crate) cache_tried: bool,
 }
 
 impl Session {
@@ -131,6 +145,7 @@ impl Session {
                 fn_slot: Vec::new(),
                 slot_of: FxMap::default(),
                 slot_paths: FxMap::default(),
+                slot_manifest_stored: 0,
                 slot_hash: Vec::new(),
                 chunks: Vec::new(),
                 src: String::new(),
@@ -142,6 +157,7 @@ impl Session {
                 out: Vec::new(),
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
+                slot_used: Vec::new(),
                 glue: GlueSet::default(),
                 per_unit: 16,
                 table_cap: 0,
@@ -155,6 +171,8 @@ impl Session {
                 overlays: Default::default(),
             },
             std_cache: None,
+            disk_cache: None,
+            cache_tried: false,
         }
     }
     pub fn obj_dir(&self) -> &Path {
@@ -178,12 +196,11 @@ impl Session {
 /// pairs are stored, so a restarted daemon that loads these bytes recovers the
 /// same slot assignment in any crate load or discovery order (docs/ARCH.md
 /// sections 4.2 and 8.4). The in-memory manifest type is
-/// `driver::graph::SlotManifest`; where these bytes are stored is W-DRIVER's
-/// cache-file work, so this pair still has no caller.
+/// `driver::graph::SlotManifest`; the bytes live in the disk cache
+/// (`driver::cache::Cache::load_slot_manifest`).
 const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS1";
 
 /// Serializes a slot map. See `SLOT_MANIFEST_MAGIC`.
-#[allow(dead_code)] // First caller is the slot manifest store (W-DRIVER cache work).
 pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
     let mut entries: Vec<(u32, DiskDefId)> = slot_of.iter().map(|(k, &s)| (s, *k)).collect();
     entries.sort_unstable();
@@ -200,7 +217,6 @@ pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
 /// Reads bytes written by `encode_slot_manifest`. None on any shape error (bad
 /// magic, a truncated or trailing byte, or one slot claimed twice), so a bad
 /// file is a cache miss, never a wrong slot.
-#[allow(dead_code)] // See `encode_slot_manifest`.
 pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<FxMap<DiskDefId, u32>> {
     if b.get(..4)? != SLOT_MANIFEST_MAGIC {
         return None;

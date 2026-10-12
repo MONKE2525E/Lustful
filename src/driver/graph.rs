@@ -976,12 +976,94 @@ impl SlotManifest {
         }
         Some(h.finish())
     }
+
+    /// The instance key at one slot, if the slot was ever assigned.
+    pub fn key_at(&self, slot: u32) -> Option<InstanceKeyHash> {
+        self.by_slot.get(slot as usize).copied()
+    }
+
+    /// Serializes the manifest in slot order (magic, count, then one
+    /// 8-byte instance key hash per slot). Dense by construction
+    /// (`by_slot`), so slot numbers need no bytes. This is the 8.4 disk
+    /// form for generic instances; the disk-def form for today's
+    /// non-generic slots lives in `driver::session`. W-DRIVER owns both
+    /// forms: change one only by bumping its magic.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.by_slot.len() * 8);
+        out.extend_from_slice(SLOT_MANIFEST_INSTANCE_MAGIC);
+        out.extend_from_slice(&(self.by_slot.len() as u32).to_le_bytes());
+        for k in &self.by_slot {
+            out.extend_from_slice(&k.0.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reads bytes written by `encode`. None on any shape error (bad
+    /// magic, wrong length, one instance in two slots), so a bad file is
+    /// a cache miss, never a wrong slot. A decoded manifest assigns the
+    /// same slots in any later discovery order: old keys answer from
+    /// `by_key`, new keys append.
+    pub fn decode(b: &[u8]) -> Option<SlotManifest> {
+        if b.get(..4)? != SLOT_MANIFEST_INSTANCE_MAGIC {
+            return None;
+        }
+        let n = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+        if b.len() != 8 + n.checked_mul(8)? {
+            return None;
+        }
+        let mut m = SlotManifest::default();
+        for i in 0..n {
+            let at = 8 + i * 8;
+            let key = InstanceKeyHash(u64::from_le_bytes(b[at..at + 8].try_into().ok()?));
+            if m.by_key.insert(key, i as u32).is_some() {
+                return None;
+            }
+            m.by_slot.push(key);
+        }
+        Some(m)
+    }
+}
+
+/// Magic of the instance-hash slot manifest form. See `SlotManifest::encode`.
+const SLOT_MANIFEST_INSTANCE_MAGIC: &[u8; 4] = b"LSI1";
+
+/// Object-unit identity (section 4.2): a C unit's object is reused exactly
+/// when this key holds. For an ordinary unit the key covers the unit's
+/// instance fingerprints (sorted; membership, not order) plus its
+/// used-slots hash, never the whole manifest, so one new reachable
+/// instance reuses unrelated units' objects. The table unit alone keys
+/// on the full manifest hash. Today's driver also folds the emitted C
+/// text into its disk object key (the text is a function of these
+/// inputs and is already generated); mono will key on this alone when
+/// it can re-emit C from cached IR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UnitKey(pub u64);
+
+/// The ordinary-unit key. See `UnitKey`.
+pub fn unit_key(instances: &[Fingerprint], used_slots: u64) -> UnitKey {
+    let mut fps: Vec<u64> = instances.iter().map(|f| f.0).collect();
+    fps.sort_unstable();
+    let mut h = FxHasher::default();
+    "cunit-v1".hash(&mut h);
+    (fps.len() as u64).hash(&mut h);
+    for f in fps {
+        f.hash(&mut h);
+    }
+    used_slots.hash(&mut h);
+    UnitKey(h.finish())
+}
+
+/// The table unit's key: the full slot manifest hash. See `UnitKey`.
+pub fn table_unit_key(manifest: &SlotManifest) -> UnitKey {
+    let mut h = FxHasher::default();
+    "cunit-table-v1".hash(&mut h);
+    manifest.manifest_hash().hash(&mut h);
+    UnitKey(h.finish())
 }
 
 /// The used-slots hash of explicit `(instance key, slot)` pairs, for a unit
 /// whose emitter collected the pairs it printed. Input order does not
 /// matter; duplicate pairs count once.
-#[allow(dead_code)] // First caller is the C unit cache key (W-DRIVER); tests use it now.
 pub fn used_slots_hash(pairs: &[(InstanceKeyHash, u32)]) -> u64 {
     let mut sorted: Vec<(u64, u64)> = pairs.iter().map(|(k, s)| (k.0, *s as u64)).collect();
     sorted.sort_unstable();
@@ -1326,5 +1408,50 @@ fn main() {}
         assert_eq!(dirty_in(&interner, &known, "fn main() { println!(\"{}\", nosuch()); }\n", &failing), 0, "still missing");
         let fixed = "fn nosuch() -> i64 { 1 }\nfn main() { println!(\"{}\", nosuch()); }\n";
         assert!(dirty_in(&interner, &known, fixed, &failing) >= 1, "added def dirties the failed lookup");
+    }
+
+    /// The instance slot manifest survives a restart in any discovery
+    /// order (4.2): decode gives every old instance its old slot, new
+    /// instances append after them, and an ordinary unit's key (instance
+    /// fingerprints + used-slots) does not move when an unrelated
+    /// instance is added, while the table unit's key does.
+    #[test]
+    fn instance_manifest_round_trips_and_unit_keys_follow_4_2() {
+        let key = |h: u64| InstanceKeyHash::of_disk_def(
+            DiskDefId { krate: StableCrateHash(1), hash: DefPathHash(h) },
+            InstanceKeyHash::empty_args_fingerprint(),
+        );
+        let mut m = SlotManifest::new();
+        // Discovery order 30, 10, 20 in the first daemon.
+        assert_eq!(m.assign(key(30)), 0);
+        assert_eq!(m.assign(key(10)), 1);
+        assert_eq!(m.assign(key(20)), 2);
+        let mut back = SlotManifest::decode(&m.encode()).unwrap();
+        // A restarted daemon discovers in the opposite order.
+        assert_eq!(back.assign(key(20)), 2, "old instance keeps its slot");
+        assert_eq!(back.assign(key(10)), 1);
+        assert_eq!(back.assign(key(30)), 0);
+        assert_eq!(back.key_at(2), Some(key(20)));
+        // Bad bytes never decode to wrong slots.
+        let bytes = m.encode();
+        assert_eq!(SlotManifest::decode(&bytes[..bytes.len() - 1]).map(|d| d.len()), None, "truncated");
+        let mut dup = bytes.clone();
+        dup[16..24].copy_from_slice(&bytes[8..16]);
+        assert!(SlotManifest::decode(&dup).is_none(), "one instance in two slots");
+        // Unit identity: a unit over instances {30, 20} keeps its key when
+        // instance 99 is added elsewhere; the table unit's key moves.
+        let fps = [Fingerprint(100), Fingerprint(200)];
+        let used_before = back.used_slots_hash(&[key(30), key(20)]).unwrap();
+        let unit_before = unit_key(&fps, used_before);
+        let table_before = table_unit_key(&back);
+        assert_eq!(back.assign(key(99)), 3);
+        assert_eq!(back.used_slots_hash(&[key(30), key(20)]), Some(used_before), "used slots unchanged");
+        assert_eq!(unit_key(&fps, used_before), unit_before, "unrelated unit object is reused");
+        assert_ne!(table_unit_key(&back), table_before, "only the table unit rebuilds");
+        // A used-slot change (the same instance at a different slot, as a
+        // compacting renumber would do) moves the unit key even with the
+        // same instance fingerprints: C re-emit, no front-end redo.
+        let renumbered = used_slots_hash(&[(key(30), 7), (key(20), 2)]);
+        assert_ne!(unit_key(&fps, renumbered), unit_before, "used-slot change rekeys the unit");
     }
 }

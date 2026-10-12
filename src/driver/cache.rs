@@ -1,8 +1,15 @@
-// Whole-request disk cache for cold (no-daemon) `lust check` and `lust build` runs.
-// An unchanged file with the same flags replays the stored response in a few milliseconds:
-// about 4 ms for check and 8 ms for build on the dev box.
-// Only the whole-request layer lives here. A per-function layer needs stable IDs (milestone 1)
-// and the fine keys the exp-a check showed unsound; it is not ported.
+// Disk cache, three layers in one directory:
+//   - Whole-request entries for cold (no-daemon) `lust check` and `lust build` runs.
+//     An unchanged file with the same flags replays the stored response in a few
+//     milliseconds: about 4 ms for check and 8 ms for build on the dev box.
+//   - Per-C-unit objects (`unit-*`): a unit's compiled object keyed by compiler id,
+//     debug flag, the section 4.2 unit key (instance fingerprints + used-slots hash),
+//     and the emitted C text. The C text is a function of the unit-key inputs and is
+//     already generated, so folding it in refines the 4.2 key and stays sound while
+//     there is no cached mono IR to re-emit from. A restarted daemon reuses objects
+//     for every unit whose key held; only changed units go through tcc.
+//   - The slot manifest per final bin (`slots-*`): DiskDefId to slot, so a restarted
+//     daemon recovers the same slot assignment in any crate load order (8.4).
 //
 // Location: `.lust-cache/` next to the source file. `LUST_CACHE_DIR` overrides it.
 // `LUST_NO_CACHE=1` turns it off. Size cap: `LUST_CACHE_MAX_BYTES` (default 512 MiB).
@@ -17,7 +24,10 @@
 // build time; see build.rs) mixed with a run-time hash of the tcc binary and its runtime
 // files, so an in-place tcc upgrade misses too. `LUST_CACHE_COMPILER_ID` mixes an extra
 // string into the id (tests use it to stand in for a rebuilt compiler).
-use crate::protocol::{Cmd, Request, Response};
+use crate::def::DiskDefId;
+use crate::driver::graph::UnitKey;
+use crate::intern::FxMap;
+use crate::protocol::{Cmd, Request, Response, SessionKey};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -161,6 +171,61 @@ impl Cache {
         self.dir.join(format!("req-{key}{ext}"))
     }
 
+    /// The disk key of one C unit's object: compiler id, debug flag, the
+    /// 4.2 unit key (0 when the caller has no instance key for the unit,
+    /// as for the runtime and main units), and the C text. See the
+    /// module docs for why the text is in the key.
+    fn unit_key(&self, unit: UnitKey, c_text: &str, debug: bool) -> String {
+        let (a, b) = hash128(
+            &[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), c_text.as_bytes()],
+            29,
+        );
+        format!("{a:016x}{b:016x}")
+    }
+
+    /// Copies a cached unit object to `dest`. False on a miss (no entry,
+    /// or the copy failed): the caller compiles the unit with tcc.
+    pub fn unit_object(&self, unit: UnitKey, c_text: &str, debug: bool, dest: &Path) -> bool {
+        let src = self.dir.join(format!("unit-{}.o", self.unit_key(unit, c_text, debug)));
+        std::fs::copy(&src, dest).is_ok()
+    }
+
+    /// Stores a freshly compiled unit object under its key. Runs the same
+    /// size-cap eviction as whole-request stores.
+    pub fn store_unit_object(&self, unit: UnitKey, c_text: &str, debug: bool, obj: &Path) {
+        let key = format!("unit-{}.o", self.unit_key(unit, c_text, debug));
+        self.copy_in(obj, &self.dir.join(&key));
+        self.evict(&key);
+    }
+
+    /// The manifest file for one session selection. The session text
+    /// (`describe`) names every routing field, so two selections of one
+    /// bin never share a manifest.
+    fn slot_manifest_path(&self, session: &SessionKey) -> PathBuf {
+        let (a, _) = hash128(&[session.describe().as_bytes()], 31);
+        self.dir.join(format!("slots-{a:016x}.bin"))
+    }
+
+    /// The stored slot manifest for `session`, if a previous daemon or
+    /// build left a valid one. A sparse map (a slot above the entry
+    /// count) is rejected here even though the codec allows it as
+    /// bytes: slot assignment appends at the entry count and would
+    /// collide with the sparse slot later.
+    pub fn load_slot_manifest(&self, session: &SessionKey) -> Option<FxMap<DiskDefId, u32>> {
+        let bytes = std::fs::read(self.slot_manifest_path(session)).ok()?;
+        let map = super::session::decode_slot_manifest(&bytes)?;
+        if map.values().copied().max().is_some_and(|m| m as usize >= map.len()) {
+            return None;
+        }
+        Some(map)
+    }
+
+    /// Stores the slot manifest for `session` (atomic, as every write here).
+    pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>) {
+        let bytes = super::session::encode_slot_manifest(slot_of);
+        self.write(&self.slot_manifest_path(session), &bytes);
+    }
+
     /// Looks up `req`. On a build hit, copies the stored executable to `req.out`.
     /// The caller gives the source bytes it read, so the file is read once per process.
     /// A stored `--timings` text never exists; a hit with timings gets one fresh line.
@@ -198,11 +263,15 @@ impl Cache {
             ran: false,
         };
         self.write(&self.entry_path(&key, ""), &encode_response(&clean));
-        self.evict(&key);
+        self.evict(&format!("req-{key}"));
     }
 
     /// Deletes oldest entries (by store time) until the cache fits the size cap.
-    /// The entry named `keep` is never deleted by the call that wrote it.
+    /// The entry file named `keep` is never deleted by the call that wrote it.
+    /// Whole-request entries (`req-*`, plus their `.exe`) and unit objects
+    /// (`unit-*.o`, one file each) are evictable; slot manifests are small
+    /// and pinned (deleting one only costs a renumber, but the cap is about
+    /// object bulk, not manifests).
     fn evict(&self, keep: &str) {
         let cap = std::env::var("LUST_CACHE_MAX_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_MAX_BYTES);
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
@@ -216,7 +285,9 @@ impl Cache {
             }
             total += meta.len();
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("req-") && !name.ends_with(".exe") {
+            if name.starts_with("unit-") && name.ends_with(".o") {
+                entries.push((meta.modified().unwrap_or(std::time::UNIX_EPOCH), e.path(), meta.len()));
+            } else if name.starts_with("req-") && !name.ends_with(".exe") {
                 let mut size = meta.len();
                 if let Ok(exe) = std::fs::metadata(self.dir.join(format!("{name}.exe"))) {
                     size += exe.len();
@@ -232,7 +303,7 @@ impl Cache {
             if total <= cap {
                 break;
             }
-            if path.file_name().is_some_and(|n| n.to_string_lossy() == format!("req-{keep}")) {
+            if path.file_name().is_some_and(|n| n.to_string_lossy() == keep) {
                 continue;
             }
             let mut exe = path.as_os_str().to_owned();
@@ -329,6 +400,56 @@ mod tests {
         other.session.target_triple = "x86_64-unknown-linux-gnu".into();
         assert_ne!(base, request_key(id, &other, b"fn main() {}"), "target triple");
         assert_eq!(base, request_key(id, &req(Cmd::Check, false, false), b"fn main() {}"), "stable");
+    }
+
+    /// Each unit-object key input must change the key on its own, and a
+    /// stored unit object copies back out byte for byte.
+    #[test]
+    fn unit_objects_round_trip_and_key_on_every_input() {
+        use crate::driver::graph::UnitKey;
+        let dir = std::env::temp_dir().join(format!("lust-unit-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache { dir: dir.clone(), id: (3, 4) };
+        let base = cache.unit_key(UnitKey(9), "int f(void);", false);
+        assert_ne!(base, cache.unit_key(UnitKey(10), "int f(void);", false), "unit key (used slots / instances)");
+        assert_ne!(base, cache.unit_key(UnitKey(9), "int g(void);", false), "C text");
+        assert_ne!(base, cache.unit_key(UnitKey(9), "int f(void);", true), "debug flag");
+        assert_ne!(base, Cache { dir: dir.clone(), id: (5, 4) }.unit_key(UnitKey(9), "int f(void);", false), "compiler id");
+        let obj = dir.join("made.o");
+        std::fs::write(&obj, b"fake-object").unwrap();
+        let dest = dir.join("dest.o");
+        assert!(!cache.unit_object(UnitKey(9), "int f(void);", false, &dest), "miss before store");
+        cache.store_unit_object(UnitKey(9), "int f(void);", false, &obj);
+        assert!(cache.unit_object(UnitKey(9), "int f(void);", false, &dest), "hit after store");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"fake-object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored slot manifest loads back for the same session key and not
+    /// for another selection; a sparse map is rejected at load.
+    #[test]
+    fn slot_manifest_round_trips_per_session() {
+        use crate::def::{DefPathHash, StableCrateHash};
+        let dir = std::env::temp_dir().join(format!("lust-slots-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache { dir: dir.clone(), id: (3, 4) };
+        let key = SessionKey::synthetic(Path::new("/tmp/x/main.rs"), false);
+        let disk = |h: u64| DiskDefId { krate: StableCrateHash(1), hash: DefPathHash(h) };
+        let mut slots = FxMap::default();
+        slots.insert(disk(10), 0);
+        slots.insert(disk(20), 1);
+        assert_eq!(cache.load_slot_manifest(&key), None, "miss before store");
+        cache.store_slot_manifest(&key, &slots);
+        assert_eq!(cache.load_slot_manifest(&key), Some(slots.clone()));
+        let other = SessionKey::synthetic(Path::new("/tmp/x/other.rs"), false);
+        assert_eq!(cache.load_slot_manifest(&other), None, "another selection has its own manifest");
+        let mut sparse = FxMap::default();
+        sparse.insert(disk(10), 5);
+        cache.store_slot_manifest(&other, &sparse);
+        assert_eq!(cache.load_slot_manifest(&other), None, "sparse manifests are rejected");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
