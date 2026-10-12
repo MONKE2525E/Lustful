@@ -262,23 +262,82 @@ fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
     SNAP.get_or_init(|| std::env::vars().collect())
 }
 
-/// Renders trees the way `stringify!` does: token text with a single
-/// space wherever the source had a gap between tokens.
+/// The text of one token for `stringify!`. Written tokens print as
+/// written: raw identifiers keep `r#`, raw and byte strings keep their
+/// prefixes, integer literals keep their radix and suffix. The source
+/// slice at the token's span holds that text; the guards keep a slice
+/// from a different file (an included file's tokens after the swap
+/// back) from leaking in, by checking it against the token's value.
+fn stringify_tok_text(st: &Expander, t: &Token) -> String {
+    let plain = tok_text(&t.tok, &st.strings, st.ctx.interner);
+    let span = t.span;
+    let slice = st.cur_src.get(span.lo as usize..span.hi as usize);
+    match t.tok {
+        // `$crate` from a macro body transcribes to one `crate` token
+        // whose span starts at the `$`; the text at its span names it.
+        Tok::Crate if span.ctxt != crate::diag::CtxtId::ROOT => {
+            if st.cur_src.get(span.lo as usize..span.lo as usize + 6) == Some("$crate") {
+                return "$crate".to_string();
+            }
+            plain
+        }
+        Tok::Ident(_) | Tok::Reserved(_) => match slice {
+            Some(s) if s == plain || s.strip_prefix("r#") == Some(plain.as_str()) => s.to_string(),
+            _ => plain,
+        },
+        Tok::Str(_) => match slice {
+            Some(s) if s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#") => s.to_string(),
+            _ => plain,
+        },
+        Tok::ByteStr | Tok::ByteChar => match slice {
+            Some(s) if s.starts_with(['b', 'c']) => s.to_string(),
+            _ => plain,
+        },
+        Tok::Char(_) => match slice {
+            Some(s) if s.starts_with('\'') => s.to_string(),
+            _ => plain,
+        },
+        Tok::Int(..) => match slice {
+            Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => s.to_string(),
+            _ => plain,
+        },
+        _ => plain,
+    }
+}
+
+/// Renders trees the way `stringify!` does. Spacing follows rustc's
+/// token stream printer: a space where the source had a gap, except
+/// never before `,` `;` `)` `]`, never after `(` `[`, never around
+/// `.`, and never before a call or index group. Braces keep their
+/// source gaps (`{ a; b }` but `{b}`). A token a macro body produced
+/// (non-root context) prints alone, with a space on each side the
+/// rules above do not already close: its source gaps were in the
+/// definition, not at the call site (`$crate :: x`, `a - b - c`).
 pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Tok(Tok),
+        Open(Delim),
+        Close(Delim),
+    }
     struct Piece {
         text: String,
         lo: u32,
         hi: u32,
         file: crate::diag::FileId,
+        ctxt: crate::diag::CtxtId,
+        kind: Kind,
     }
     fn go(st: &Expander, trees: &[Tt], out: &mut Vec<Piece>) {
         for tree in trees {
             match tree {
                 Tt::Tok(t) => out.push(Piece {
-                    text: tok_text(&t.tok, &st.strings, st.ctx.interner),
+                    text: stringify_tok_text(st, t),
                     lo: t.span.lo,
                     hi: t.span.hi,
                     file: t.span.file,
+                    ctxt: t.span.ctxt,
+                    kind: Kind::Tok(t.tok),
                 }),
                 Tt::Delim(d, inner, span) => {
                     let (open, close) = match d {
@@ -286,16 +345,69 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
                         Delim::Bracket => ("[", "]"),
                         Delim::Brace => ("{", "}"),
                     };
-                    out.push(Piece { text: open.to_string(), lo: span.lo, hi: span.hi, file: span.file });
+                    out.push(Piece {
+                        text: open.to_string(),
+                        lo: span.lo,
+                        hi: span.lo + 1,
+                        file: span.file,
+                        ctxt: span.ctxt,
+                        kind: Kind::Open(*d),
+                    });
                     go(st, inner, out);
-                    // The closing delimiter has no span of its own in a
-                    // token tree; count it as right after what it closes.
-                    let lo = out.last().map_or(span.hi, |p| p.hi);
-                    out.push(Piece { text: close.to_string(), lo, hi: lo + 1, file: span.file });
+                    // A group's span covers both delimiters; a span
+                    // that only names the opener (a synthetic group)
+                    // counts the closer as right after the last piece.
+                    let (lo, hi) = if span.hi > span.lo + 1 {
+                        (span.hi - 1, span.hi)
+                    } else {
+                        let lo = out.last().map_or(span.hi, |p| p.hi);
+                        (lo, lo + 1)
+                    };
+                    out.push(Piece { text: close.to_string(), lo, hi, file: span.file, ctxt: span.ctxt, kind: Kind::Close(*d) });
                 }
                 Tt::Frag(_, inner, _) => go(st, inner, out),
             }
         }
+    }
+    fn space_between(prev: &Piece, cur: &Piece) -> bool {
+        match cur.kind {
+            Kind::Tok(Tok::Comma | Tok::Semi | Tok::Dot) => return false,
+            Kind::Close(Delim::Paren | Delim::Bracket) => return false,
+            Kind::Open(Delim::Paren | Delim::Bracket) => {
+                // A call, index, or macro group hugs its head.
+                let hugs = matches!(
+                    prev.kind,
+                    Kind::Close(_)
+                        | Kind::Tok(
+                            Tok::Ident(_)
+                                | Tok::Reserved(_)
+                                | Tok::SelfUpper
+                                | Tok::SelfLower
+                                | Tok::Int(..)
+                                | Tok::Float(_)
+                                | Tok::Str(_)
+                                | Tok::DocStr(_)
+                                | Tok::Char(_)
+                                | Tok::PathSep
+                                | Tok::Bang
+                                | Tok::Gt
+                        )
+                );
+                if hugs {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        match prev.kind {
+            Kind::Tok(Tok::Dot) => return false,
+            Kind::Open(Delim::Paren | Delim::Bracket) => return false,
+            _ => {}
+        }
+        if prev.ctxt != crate::diag::CtxtId::ROOT || cur.ctxt != crate::diag::CtxtId::ROOT {
+            return true;
+        }
+        cur.file != prev.file || cur.lo > prev.hi
     }
     let mut pieces = Vec::new();
     go(st, trees, &mut pieces);
@@ -303,7 +415,7 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
     let mut prev: Option<&Piece> = None;
     for piece in &pieces {
         if let Some(prev) = prev
-            && (piece.file != prev.file || piece.lo > prev.hi)
+            && space_between(prev, piece)
         {
             text.push(' ');
         }
