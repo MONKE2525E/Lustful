@@ -94,11 +94,12 @@ def main():
         # of new text. The `/*` below is inside the line comment, so `b` is real code and
         # both cold and daemon must reject the second state.
         lc = os.path.join(work, "lc.rs")
-        open(lc, "w").write("// note")
+        open(lc, "w").write("fn main() {}\n// note")
         rc1, _, _ = run_lust(["check", lc])
-        open(lc, "w").write("// note/* a\nb\nfn fake() {}\n*/\n")
+        open(lc, "w").write("fn main() {}\n// note/* a\nb\nfn fake() {}\n*/\n")
         rc2, _, err2 = run_lust(["check", lc])
-        check("line-comment chunk reuse", rc1 == 0 and rc2 == 1, f"rc1={rc1} rc2={rc2}")
+        check("line-comment chunk reuse", rc1 == 0 and rc2 == 1 and "L0001" in err2,
+              f"rc1={rc1} rc2={rc2}")
 
         # 6. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
