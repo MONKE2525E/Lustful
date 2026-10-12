@@ -101,8 +101,8 @@ pub struct ResolveError {
 }
 
 /// True when a crate root file needs the resolver: any `mod`, `use`,
-/// `const`/`static`/`type` item keyword, `#[cfg`, `#[path`, or
-/// `macro_rules` in its token stream. Token-exact (strings and comments
+/// `const`/`static`/`type` item keyword, `#[cfg`, `#[path`, `macro_rules`,
+/// or an `include!` call in its token stream. Token-exact (strings and comments
 /// never count); a `use` of `std` alone also routes here, which costs a
 /// full rebuild but keeps one code path for imports and cfg.
 pub fn needs_resolve(root_text: &str, interner: &Interner) -> bool {
@@ -144,6 +144,9 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                 }
             }
             Tok::Ident(s) if interner.get(s) == "macro_rules" => return true,
+            // An `include!` can introduce items and macro definitions
+            // other chunks would not see (added for W-MACRO).
+            Tok::Ident(s) if interner.get(s) == "include" && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Bang)) => return true,
             _ => {}
         }
     }
