@@ -525,6 +525,12 @@ struct CrateOut {
     fn_lines: Vec<u32>,
     body_hashes: Vec<u64>,
     fn_module: Vec<ModuleId>,
+    /// Nested (body-local) fns ride after every crate's top-level
+    /// fns in the merged order, as collect and the Ast scan order
+    /// them; the workspace wrapper appends these last.
+    nested_lines: Vec<u32>,
+    nested_hashes: Vec<u64>,
+    nested_modules: Vec<ModuleId>,
     structure_hash: u64,
     seen: Vec<(PathBuf, String, FileId)>,
     needs_std: bool,
@@ -702,6 +708,9 @@ pub fn resolve_crate_cached(
     let mut chunks: Vec<Ast> = Vec::new();
     let mut fn_lines: Vec<u32> = Vec::new();
     let mut body_hashes: Vec<u64> = Vec::new();
+    let mut nested_lines: Vec<u32> = Vec::new();
+    let mut nested_hashes: Vec<u64> = Vec::new();
+    let mut nested_modules: Vec<ModuleId> = Vec::new();
     let mut structure_hash = 0u64;
     let mut exported_of: FxMap<usize, Vec<OwnedMacroSource>> = FxMap::default();
     for &j in &order {
@@ -716,6 +725,9 @@ pub fn resolve_crate_cached(
                 all_seen.extend(out.seen);
                 fn_lines.extend(out.fn_lines);
                 body_hashes.extend(out.body_hashes);
+                nested_lines.extend(out.nested_lines);
+                nested_hashes.extend(out.nested_hashes);
+                nested_modules.extend(out.nested_modules);
                 {
                     use std::hash::{Hash, Hasher};
                     let mut h = crate::intern::FxHasher::default();
@@ -735,6 +747,9 @@ pub fn resolve_crate_cached(
             }
         }
     }
+    fn_lines.extend(nested_lines);
+    body_hashes.extend(nested_hashes);
+    tables.fn_module.extend(nested_modules);
     let (map, all_text) = make_map(&all_seen);
     let ast = Ast::concat(chunks);
     Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std })
@@ -1902,6 +1917,10 @@ fn resolve_one(
     let mut chunks = Vec::new();
     let mut fn_lines = Vec::new();
     let mut body_hashes = Vec::new();
+    // Nested fns ride after every file's top-level fns (collect's order).
+    let mut nested_lines: Vec<u32> = Vec::new();
+    let mut nested_hashes: Vec<u64> = Vec::new();
+    let mut nested_modules: Vec<ModuleId> = Vec::new();
     let mut fn_module = Vec::new();
     let mut structure = crate::intern::FxHasher::default();
     for (fi, mut w) in works.into_iter().enumerate() {
@@ -1933,6 +1952,18 @@ fn resolve_one(
                 _ => {}
             }
         }
+        // Nested fns (W-CORELANG body items) ride after the file's
+        // top-level fns, in stmt item order, matching collect.
+        for item in &w.ast.stmt_items {
+            if let crate::ast::ItemKind::Fn(d) = &item.kind {
+                nested_lines.push(map.line_col(d.name_span).0);
+                let text = map.text(d.name_span.file).unwrap_or("");
+                let body_span = d.body.map(|b| w.ast.block(b).span).unwrap_or(d.name_span);
+                let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
+                nested_hashes.push(hash_str(slice));
+                nested_modules.push(w.module);
+            }
+        }
         w.ast.items = flat_items;
         chunks.push(w.ast);
     }
@@ -1941,7 +1972,7 @@ fn resolve_one(
         use std::hash::Hasher;
         structure.finish()
     };
-    Ok(CrateOut { ast, fn_lines, body_hashes, fn_module, structure_hash, seen, needs_std, exported_macros: menv.exported_sources() })
+    Ok(CrateOut { ast, fn_lines, body_hashes, fn_module, nested_lines, nested_hashes, nested_modules, structure_hash, seen, needs_std, exported_macros: menv.exported_sources() })
 }
 
 /// Hashes one item list's module and import structure for
