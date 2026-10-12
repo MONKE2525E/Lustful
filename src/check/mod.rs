@@ -1159,6 +1159,62 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Tuple-field visibility, like `check_field_vis` for `t.1` forms.
+    fn check_tuple_field_vis(&mut self, a: AdtId, index: u32, span: Span) {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return };
+        let def = p.def_of_adt(a);
+        if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
+            && let Some(vis) = fields.get(index as usize)
+            && !tables.visible(vis, *def_mod, self.module, p.interner)
+        {
+            self.err(
+                "L0510",
+                span,
+                format!("field `{index}` is private"),
+                "Make the field `pub(crate)` (the smallest widening that works).",
+            );
+        }
+    }
+
+    /// A tuple struct constructor is private when any of its fields is
+    /// (rustc E0603), for calls and patterns alike.
+    fn check_ctor_vis(&mut self, a: AdtId, span: Span) {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return };
+        let def = p.def_of_adt(a);
+        if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
+            && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, p.interner))
+        {
+            let name = self.name(p.adt(a).name).to_string();
+            self.err(
+                "L0510",
+                span,
+                format!("tuple struct constructor `{name}` is private"),
+                "Make every field `pub(crate)`, or add a public constructor function.",
+            );
+        }
+    }
+
+    /// Inherent method visibility for a method call on a user type.
+    fn check_method_vis(&mut self, base: Ty, name: Sym, span: Span) {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return };
+        let Some(a) = self.tys.local_adt(base) else { return };
+        let def = p.def_of_adt(a);
+        if let Some(methods) = tables.assoc_vis.get(&def)
+            && let Some((vis, def_mod)) = methods.get(&name)
+            && !tables.visible(vis, *def_mod, self.module, p.interner)
+        {
+            self.err(
+                "L0510",
+                span,
+                format!("method `{}` is private", self.name(name)),
+                "Make the method `pub(crate)` (the smallest widening that works).",
+            );
+        }
+    }
+
     /// The tuple struct a value binding names as a constructor, if it names one.
     fn tuple_struct_ctor(&mut self, name: Sym) -> Option<AdtId> {
         match self.binding(Namespace::Value, name) {
@@ -3184,6 +3240,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 match field_ty {
                     Some(t) => {
+                        if let Some(a) = self.tys.local_adt(inner) {
+                            self.check_tuple_field_vis(a, *index, span);
+                        }
                         self.set_res(e, Res::Field { derefs, index: *index });
                         t
                     }
@@ -3261,6 +3320,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         bad = true;
                         break;
                     };
+                    match ffield {
+                        crate::ast::OffsetField::Name(fname) => self.check_field_vis(a, fname, span),
+                        crate::ast::OffsetField::Index(idx) => self.check_tuple_field_vis(a, idx, span),
+                    }
                     match crate::ty::layout::layout_of_ty(&self.tys, p, cur) {
                         Ok(l) => off += l.field_offsets.get(i).copied().unwrap_or(0),
                         Err(()) => {
@@ -4236,6 +4299,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ret
             }
             Res::Variant(a, v) => {
+                if !p.adt(a).is_enum {
+                    self.check_ctor_vis(a, span);
+                }
                 let adef = p.def_of_adt(a);
                 let _ = p.sig_of(&mut self.out.reads, adef);
                 let variant = &p.adt(a).variants[v as usize];
@@ -4320,6 +4386,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // obligation queue runs just before that head is required (ARCH 2.4).
         self.run_obligations(false);
         let (derefs, base) = self.autoderef(rt);
+        self.check_method_vis(base, name, name_span);
         let bk = self.tys.kind(base);
         if matches!(bk, TyKind::Infer(_)) && !self.closure_arg_stack.is_empty() {
             self.head_unknown_flag = true;
@@ -5209,6 +5276,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0110", span, "functional record update syntax requires a struct", "Set every field of the variant.");
                 return ERROR;
             }
+            // A field filled from the base must be visible here too
+            // (rustc E0451): building a value with a private field from
+            // another module is not allowed even by moving it through.
+            for (i, f) in variant.fields.iter().enumerate() {
+                if !seen[i] {
+                    if variant.shape == VariantShape::Tuple {
+                        self.check_tuple_field_vis(a, i as u32, span);
+                    } else {
+                        self.check_field_vis(a, f.name, span);
+                    }
+                }
+            }
             let at = self.tys.adt_ty(a);
             self.expect_expr(u, at);
             return at;
@@ -6007,6 +6086,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 "Match every field, or use `_` for the ones you do not need.",
                             );
                             return;
+                        }
+                        if !p.adt(a).is_enum {
+                            self.check_ctor_vis(a, span);
                         }
                         let Some(mapped) = map_tuple_elems(p.ast, elems, variant.fields.len()) else {
                             self.err(
