@@ -672,11 +672,24 @@ def cmd_run_multi(a):
                 snapshots.append(dict(files))
             if it % 25 == 24 and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
+                if ok and why == "program hang":
+                    # Same as single-file mode: matching program hang, but
+                    # the daemon may still wait on its forked copy.
+                    print(f"note: program hang at iter {it} op {op} (both sides); daemon restarted",
+                          flush=True)
+                    h.kill_daemon()
+                    h.start_daemon()
                 if not ok:
                     failures += 1
                     bad_ops[f"run {why}"] += 1
                     save_bundle(f"runbad-{it}", prev, files)
                     print(f"FAIL[run {why}] iter {it} op {op}", flush=True)
+                    if why in ("daemon hang", "daemon died"):
+                        h.kill_daemon()
+                        h.start_daemon()
+                        files = dict(MULTI_SEED)
+                        write_all(files)
+                        h.run_cmd("check", True)
                     if a.stop_first:
                         break
             if (it + 1) % 250 == 0:
