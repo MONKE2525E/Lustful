@@ -5,10 +5,17 @@
 // a stale socket file can always be removed safely by the lock holder.
 // The daemon exits on its own after an idle span (`LUST_DAEMON_IDLE`, default 30 minutes;
 // see protocol::daemon_idle) and removes its socket on the way out.
-use crate::driver::{self, Session};
+// Two safety nets make a warm answer as trustworthy as a cold compile:
+//   - A panic in one request is caught. That file's session is dropped, the request is answered
+//     by a fresh session, and the daemon keeps serving.
+//   - The fresh-session guard: when the incremental answer is an error, the request is redone in
+//     a fresh session. If the answers differ, the fresh session and its answer are adopted and
+//     the event is logged (lines starting with "guard:"). If they match, the warm session (and
+//     its caches) is kept. Success answers are trusted as they are.
+use crate::driver::{self, Request, Session};
 use crate::protocol::{self, Response};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufReader, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -36,6 +43,66 @@ fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) 
     let ms = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
     // SAFETY: one valid pollfd over a live listener fd, for the duration of the call.
     unsafe { poll(&mut pfd, 1, ms) > 0 && pfd.revents & POLLIN != 0 }
+}
+
+struct Entry {
+    session: Session,
+    /// Directory stem for this file's sessions; fresh sessions get "<dir>r<n>".
+    dir: PathBuf,
+    resets: u64,
+}
+
+impl Entry {
+    fn fresh_dir(&mut self) -> PathBuf {
+        self.resets += 1;
+        let mut d = self.dir.as_os_str().to_owned();
+        d.push(format!("r{}", self.resets));
+        PathBuf::from(d)
+    }
+}
+
+/// Compiles with the entry's warm session, with the panic net and the fresh-session guard.
+fn compile_guarded(entry: &mut Entry, req: &Request) -> Response {
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session)));
+    match first {
+        Ok(r) if r.code == 0 || r.code == 2 => r,
+        first => {
+            // An error answer, or a panic: redo in a fresh session and trust that instead.
+            let dir = entry.fresh_dir();
+            let mut fresh = Session::new(dir.clone(), true);
+            let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut fresh)));
+            match second {
+                Ok(r) => {
+                    let same = matches!(&first, Ok(f) if f.code == r.code && f.stdout == r.stdout && f.stderr == r.stderr);
+                    if same {
+                        // The warm session was right; keep its caches. The fresh build failed
+                        // the same way, so nothing links its base files: remove them.
+                        let _ = std::fs::remove_dir_all(&dir);
+                    } else {
+                        let first_line = |s: &str| s.lines().next().unwrap_or("").chars().take(120).collect::<String>();
+                        eprintln!(
+                            "guard: fresh session disagreed for {} (warm {}, fresh {}); adopting fresh; warm: {}; fresh: {}",
+                            req.file.display(),
+                            first.as_ref().map_or("panic".to_string(), |f| f.code.to_string()),
+                            r.code,
+                            first.as_ref().map_or("<panic>".to_string(), |f| first_line(&f.stderr)),
+                            first_line(&r.stderr)
+                        );
+                        entry.session = fresh;
+                    }
+                    r
+                }
+                Err(_) => {
+                    // Even a fresh compile panicked. Drop the session so the next request starts
+                    // clean, and say so plainly instead of dying.
+                    eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
+                    let dir = entry.fresh_dir();
+                    entry.session = Session::new(dir, true);
+                    Response { stderr: "error: internal: compile failed in a fresh session\n".into(), code: 3, ..Default::default() }
+                }
+            }
+        }
+    }
 }
 
 /// Serves requests until idle. Each file has its own session.
@@ -70,7 +137,7 @@ pub fn serve(sock: &Path) -> ! {
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
     let base = std::env::temp_dir().join(format!("lust-daemon-{}", std::process::id()));
-    let mut sessions: HashMap<PathBuf, Session> = HashMap::new();
+    let mut sessions: HashMap<PathBuf, Entry> = HashMap::new();
     // Autostart pre-warm: the client that started us names the file it is compiling
     // cold. Checking it here fills a session, so the next command is truly warm. It
     // waits for that cold process to exit first, so it never competes with it. A
@@ -98,8 +165,11 @@ pub fn serve(sock: &Path) -> ! {
             harness: false,
             file: file.clone(),
         };
-        let session = sessions.entry(file).or_insert_with(|| Session::new(base.join("0"), true));
-        let _ = driver::compile(&req, session);
+        let entry = sessions.entry(file).or_insert_with(|| {
+            let dir = base.join("0");
+            Entry { session: Session::new(dir.clone(), true), dir, resets: 0 }
+        });
+        let _ = compile_guarded(entry, &req);
         last = std::time::Instant::now();
     }
     loop {
@@ -119,15 +189,18 @@ pub fn serve(sock: &Path) -> ! {
         };
         last = std::time::Instant::now();
         let _ = conn.set_nonblocking(false);
-        let mut line = String::new();
-        if BufReader::new(&conn).read_line(&mut line).is_err() {
-            continue;
-        }
-        let resp = match protocol::decode(&line) {
+        let req = {
+            let mut reader = BufReader::new(&conn);
+            protocol::read_request(&mut reader)
+        };
+        let resp = match req {
             Some(req) => {
                 let n = sessions.len();
-                let session = sessions.entry(req.file.clone()).or_insert_with(|| Session::new(base.join(n.to_string()), true));
-                driver::compile(&req, session)
+                let entry = sessions.entry(req.file.clone()).or_insert_with(|| {
+                    let dir = base.join(n.to_string());
+                    Entry { session: Session::new(dir.clone(), true), dir, resets: 0 }
+                });
+                compile_guarded(entry, &req)
             }
             None => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
         };

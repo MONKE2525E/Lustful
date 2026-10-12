@@ -35,7 +35,7 @@ pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> 
         }
         // No parse loop may spin in place on bad input: each round must consume a token.
         if p.pos == before {
-            return Err(syntax(p.span(), format!("expected an item, found {:?}", p.peek())));
+            return Err(syntax(p.span(), format!("expected an item, found {}", tok_name(p.peek()))));
         }
     }
     Ok(p.ast)
@@ -62,6 +62,103 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
 
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
+}
+
+/// A token's name for error messages. Never shows the payload, so internal ids (interned
+/// symbol numbers, string indexes) cannot leak into diagnostics.
+fn tok_name(t: Tok) -> &'static str {
+    use Tok::*;
+    match t {
+        Ident(_) => "identifier",
+        Reserved(_) => "reserved keyword",
+        Int(..) => "integer literal",
+        Float => "float literal",
+        Str(_) => "string literal",
+        Char(_) => "char literal",
+        Lifetime => "lifetime",
+        As => "`as`",
+        Break => "`break`",
+        Const => "`const`",
+        Continue => "`continue`",
+        Else => "`else`",
+        Enum => "`enum`",
+        False => "`false`",
+        Fn => "`fn`",
+        For => "`for`",
+        If => "`if`",
+        Impl => "`impl`",
+        In => "`in`",
+        Let => "`let`",
+        Loop => "`loop`",
+        Match => "`match`",
+        Mod => "`mod`",
+        Mut => "`mut`",
+        Pub => "`pub`",
+        Ref => "`ref`",
+        Return => "`return`",
+        SelfLower => "`self`",
+        SelfUpper => "`Self`",
+        Static => "`static`",
+        Struct => "`struct`",
+        Trait => "`trait`",
+        True => "`true`",
+        Type => "`type`",
+        Unsafe => "`unsafe`",
+        Use => "`use`",
+        Where => "`where`",
+        While => "`while`",
+        Async => "`async`",
+        Dyn => "`dyn`",
+        Move => "`move`",
+        LParen => "`(`",
+        RParen => "`)`",
+        LBrace => "`{`",
+        RBrace => "`}`",
+        LBracket => "`[`",
+        RBracket => "`]`",
+        Comma => "`,`",
+        Semi => "`;`",
+        Colon => "`:`",
+        PathSep => "`::`",
+        Dot => "`.`",
+        DotDot => "`..`",
+        DotDotEq => "`..=`",
+        Arrow => "`->`",
+        FatArrow => "`=>`",
+        Eq => "`=`",
+        EqEq => "`==`",
+        Ne => "`!=`",
+        Lt => "`<`",
+        Le => "`<=`",
+        Gt => "`>`",
+        Ge => "`>=`",
+        Plus => "`+`",
+        Minus => "`-`",
+        Star => "`*`",
+        Slash => "`/`",
+        Percent => "`%`",
+        PlusEq => "`+=`",
+        MinusEq => "`-=`",
+        StarEq => "`*=`",
+        SlashEq => "`/=`",
+        PercentEq => "`%=`",
+        AmpEq => "`&=`",
+        PipeEq => "`|=`",
+        CaretEq => "`^=`",
+        ShlEq => "`<<=`",
+        Amp => "`&`",
+        AndAnd => "`&&`",
+        Pipe => "`|`",
+        OrOr => "`||`",
+        Caret => "`^`",
+        Bang => "`!`",
+        Pound => "`#`",
+        Question => "`?`",
+        Underscore => "`_`",
+        Shl => "`<<`",
+        Dollar => "`$`",
+        Eof => "end of file",
+    }
 }
 
 fn lifetime_error(span: Span) -> Diag {
@@ -102,7 +199,11 @@ impl<'a> Parser<'a> {
         }
     }
     fn expect(&mut self, t: Tok, what: &str) -> PResult<Span> {
-        if self.peek() == t { Ok(self.bump().span) } else { Err(syntax(self.span(), format!("expected {what}, found {:?}", self.peek()))) }
+        if self.peek() == t {
+            Ok(self.bump().span)
+        } else {
+            Err(syntax(self.span(), format!("expected {what}, found {}", tok_name(self.peek()))))
+        }
     }
     fn ident(&mut self) -> PResult<(Sym, Span)> {
         match self.peek() {
@@ -110,7 +211,7 @@ impl<'a> Parser<'a> {
             Tok::SelfUpper => Ok((self.known.self_type, self.bump().span)),
             Tok::Reserved(_) => Err(self.reserved_error(self.span())),
             Tok::Lifetime => Err(lifetime_error(self.span())),
-            t => Err(syntax(self.span(), format!("expected identifier, found {t:?}"))),
+            t => Err(syntax(self.span(), format!("expected identifier, found {}", tok_name(t)))),
         }
     }
     /// The error for a reserved keyword (`gen`, `try`, ...) used where an identifier belongs.
@@ -261,7 +362,7 @@ impl<'a> Parser<'a> {
             Tok::Async => return Err(Diag::new("L0405", start, "`async` is not supported", "Use std::thread and channels.")),
             Tok::Ident(_) if self.peek_at(1) == Tok::Bang => return Err(macro_error(start)),
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
-            t => return Err(syntax(start, format!("expected an item, found {t:?}"))),
+            t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
         Ok(Some(Item { kind }))
     }
@@ -546,7 +647,7 @@ impl<'a> Parser<'a> {
             } else if block_like {
                 stmts.push(Stmt::Expr { expr, semi: false });
             } else {
-                return Err(syntax(self.span(), format!("expected `;` or `}}`, found {:?}", self.peek())));
+                return Err(syntax(self.span(), format!("expected `;` or `}}`, found {}", tok_name(self.peek()))));
             }
         }
         let end = self.expect(Tok::RBrace, "`}`")?;
@@ -650,7 +751,7 @@ impl<'a> Parser<'a> {
             Tok::LBracket => return Err(unsupported(start, "slice patterns")),
             Tok::Amp => return Err(unsupported(start, "reference patterns")),
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
-            t => return Err(syntax(start, format!("expected a pattern, found {t:?}"))),
+            t => return Err(syntax(start, format!("expected a pattern, found {}", tok_name(t)))),
         };
         Ok(self.push_pat(pat, start.to(self.prev_span())))
     }
@@ -664,7 +765,7 @@ impl<'a> Parser<'a> {
             Tok::Char(c) if !neg => Expr::Char(c),
             Tok::True if !neg => Expr::Bool(true),
             Tok::False if !neg => Expr::Bool(false),
-            t => return Err(syntax(start, format!("expected a literal, found {t:?}"))),
+            t => return Err(syntax(start, format!("expected a literal, found {}", tok_name(t)))),
         };
         let span = start.to(self.prev_span());
         let id = self.push_expr(e, span);
@@ -1110,7 +1211,7 @@ impl<'a> Parser<'a> {
                 Expr::Path(path)
             }
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
-            t => return Err(syntax(start, format!("expected an expression, found {t:?}"))),
+            t => return Err(syntax(start, format!("expected an expression, found {}", tok_name(t)))),
         };
         Ok(self.push_expr(e, start.to(self.prev_span())))
     }

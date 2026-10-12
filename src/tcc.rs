@@ -180,11 +180,13 @@ pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), Stri
     link_objects(&tcc, objs, out)
 }
 
-/// Links an executable from `objs` plus `<dir>/libbase.so`, which it loads at run time.
-pub fn link_with_base(objs: &[PathBuf], dir: &Path, out: &Path, debug: bool) -> Result<(), String> {
+/// Links an executable from `objs` plus `<dir>/lib<base>.so`, which it loads at run time.
+/// The base name is versioned (for example `base-3`), so a rebuilt base never changes what an
+/// executable built earlier loads.
+pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_EXE, debug)?;
     let rpath = CString::new(format!("-Wl,-rpath={}", dir.display())).unwrap();
-    let base = CString::new("base").unwrap();
+    let base = CString::new(base).unwrap();
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
         tcc_set_options(tcc.s, rpath.as_ptr());
