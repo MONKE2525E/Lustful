@@ -457,39 +457,243 @@ pub fn float_literal_overflows(text: &str, f: FloatTy) -> bool {
 /// evaluator lives in `ty::consteval` (ARCH 2.13); this is its scalar subset
 /// for discriminants and array lengths, which collect needs before bodies run.
 pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<i128> {
-    eval_const_int_depth(ast, interner, known, e, 0)
+    let mut env = Vec::new();
+    let mut steps = 0u64;
+    match eval_scalar(ast, interner, known, e, 0, &mut env, &mut steps) {
+        SFlow::V(v) => v,
+        _ => None,
+    }
 }
 
-fn eval_const_int_depth(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, depth: u32) -> Option<i128> {
-    if depth > 32 {
-        return None;
+/// Control flow of the scalar interpreter below.
+enum SFlow {
+    /// A plain value (None is unit, or not a scalar).
+    V(Option<i128>),
+    Break(Option<i128>),
+    Continue,
+    Return(Option<i128>),
+}
+
+/// One block of the scalar interpreter: plain binding lets and
+/// expression statements, then the tail value.
+fn eval_scalar_block(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    b: ast::BlockId,
+    depth: u32,
+    env: &mut Vec<(Sym, i128)>,
+    steps: &mut u64,
+) -> SFlow {
+    use crate::ast::{Pat, Stmt};
+    let saved = env.len();
+    let block = ast.block(b);
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let { pat, init, .. } => {
+                let (Some(init), Pat::Binding { name, .. }) = (init, ast.pat(*pat)) else {
+                    env.truncate(saved);
+                    return SFlow::V(None);
+                };
+                let v = match eval_scalar(ast, interner, known, *init, depth, env, steps) {
+                    SFlow::V(Some(v)) => v,
+                    _ => {
+                        env.truncate(saved);
+                        return SFlow::V(None);
+                    }
+                };
+                env.push((*name, v));
+            }
+            Stmt::Expr { expr, .. } => match eval_scalar(ast, interner, known, *expr, depth, env, steps) {
+                SFlow::V(_) => {}
+                other => {
+                    env.truncate(saved);
+                    return other;
+                }
+            },
+            _ => {
+                env.truncate(saved);
+                return SFlow::V(None);
+            }
+        }
     }
-    let _ = interner;
+    let out = match block.tail {
+        Some(tail) => eval_scalar(ast, interner, known, tail, depth, env, steps),
+        None => SFlow::V(None),
+    };
+    env.truncate(saved);
+    out
+}
+
+/// The scalar interpreter behind `eval_const_int`: plain integer
+/// arithmetic and comparisons over literals, env-bound names, const
+/// items found by scanning the crate's items, and calls to const fns
+/// whose bodies stay in this scalar subset (lets, assignments, if,
+/// while, and loop). It answers at collection time, before function
+/// signatures exist, so it cannot use the full evaluator. Anything
+/// outside the subset is None, never a wrong value.
+fn eval_scalar(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    e: ast::ExprId,
+    depth: u32,
+    env: &mut Vec<(Sym, i128)>,
+    steps: &mut u64,
+) -> SFlow {
+    *steps += 1;
+    if depth > 32 || *steps > 100_000 {
+        return SFlow::V(None);
+    }
     use crate::ast::{BinOp, Expr, UnOp};
+    let val = |ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, depth: u32, env: &mut Vec<(Sym, i128)>, steps: &mut u64| {
+        match eval_scalar(ast, interner, known, e, depth, env, steps) {
+            SFlow::V(v) => v,
+            _ => None,
+        }
+    };
     match ast.expr(e) {
-        Expr::Int(v, _) => Some(*v as u128 as i128),
-        Expr::Char(c) => Some(*c as i128),
-        Expr::Bool(b) => Some(*b as i128),
+        Expr::Int(v, _) => SFlow::V(Some(*v as u128 as i128)),
+        Expr::Char(c) => SFlow::V(Some(*c as i128)),
+        Expr::Bool(b) => SFlow::V(Some(*b as i128)),
+        Expr::Unit => SFlow::V(None),
         Expr::Unary { op, expr } => {
             // A negated literal names its magnitude first: 170141183460469231731687303715884105728
             // does not fit i128 alone, but its negation is i128::MIN.
             if *op == UnOp::Neg
                 && let Expr::Int(mag, _) = ast.expr(*expr)
             {
-                return if *mag <= (1u128 << 127) { Some((*mag as i128).wrapping_neg()) } else { None };
+                return SFlow::V(if *mag <= (1u128 << 127) { Some((*mag as i128).wrapping_neg()) } else { None });
             }
-            let v = eval_const_int_depth(ast, interner, known, *expr, depth + 1)?;
-            match op {
+            let Some(v) = val(ast, interner, known, *expr, depth + 1, env, steps) else { return SFlow::V(None) };
+            SFlow::V(match op {
                 UnOp::Neg => v.checked_neg(),
                 UnOp::Not => Some(!v),
-            }
+            })
         }
         Expr::Binary { op, lhs, rhs } => {
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let Some(a) = val(ast, interner, known, *lhs, depth + 1, env, steps) else { return SFlow::V(None) };
+                if (*op == BinOp::And && a == 0) || (*op == BinOp::Or && a != 0) {
+                    return SFlow::V(Some((a != 0) as i128));
+                }
+                let b = val(ast, interner, known, *rhs, depth + 1, env, steps);
+                return SFlow::V(b.map(|b| (b != 0) as i128));
+            }
             let (a, b) = (
-                eval_const_int_depth(ast, interner, known, *lhs, depth + 1)?,
-                eval_const_int_depth(ast, interner, known, *rhs, depth + 1)?,
+                val(ast, interner, known, *lhs, depth + 1, env, steps),
+                val(ast, interner, known, *rhs, depth + 1, env, steps),
             );
-            match op {
+            let (Some(a), Some(b)) = (a, b) else { return SFlow::V(None) };
+            SFlow::V(match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div => a.checked_div(b),
+                BinOp::Rem => a.checked_rem(b),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
+                BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
+                BinOp::Eq => Some((a == b) as i128),
+                BinOp::Ne => Some((a != b) as i128),
+                BinOp::Lt => Some((a < b) as i128),
+                BinOp::Le => Some((a <= b) as i128),
+                BinOp::Gt => Some((a > b) as i128),
+                BinOp::Ge => Some((a >= b) as i128),
+                _ => None,
+            })
+        }
+        Expr::Cast { expr, ty } => {
+            let Some(v) = val(ast, interner, known, *expr, depth + 1, env, steps) else { return SFlow::V(None) };
+            let target = match ast.ty(*ty) {
+                TyExpr::Path(segs) if segs.len() == 1 => known.int_ty(segs[0].name),
+                _ => None,
+            };
+            SFlow::V(match target {
+                Some(it) => Some(truncate_to_int(v, it)),
+                None if matches!(ast.ty(*ty), TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char) => Some(v),
+                _ => None,
+            })
+        }
+        Expr::Block(b) | Expr::ConstBlock(b) => eval_scalar_block(ast, interner, known, *b, depth + 1, env, steps),
+        Expr::If { cond, then, els } => {
+            let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
+            if c != 0 {
+                let b = *then;
+                eval_scalar_block(ast, interner, known, b, depth + 1, env, steps)
+            } else {
+                match els {
+                    Some(els) => eval_scalar(ast, interner, known, *els, depth + 1, env, steps),
+                    None => SFlow::V(None),
+                }
+            }
+        }
+        Expr::While { cond, body, .. } => {
+            loop {
+                let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
+                if c == 0 {
+                    return SFlow::V(None);
+                }
+                let b = *body;
+                match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
+                    SFlow::V(_) | SFlow::Continue => {}
+                    SFlow::Break(_) => return SFlow::V(None),
+                    other => return other,
+                }
+                if *steps > 100_000 {
+                    return SFlow::V(None);
+                }
+            }
+        }
+        Expr::Loop { body, .. } => {
+            loop {
+                let b = *body;
+                match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
+                    SFlow::V(_) | SFlow::Continue => {}
+                    SFlow::Break(v) => return SFlow::V(v),
+                    other => return other,
+                }
+                if *steps > 100_000 {
+                    return SFlow::V(None);
+                }
+            }
+        }
+        Expr::Break { value, .. } => {
+            let v = match value {
+                Some(v) => val(ast, interner, known, *v, depth + 1, env, steps),
+                None => None,
+            };
+            SFlow::Break(v)
+        }
+        Expr::Continue(_) => SFlow::Continue,
+        Expr::Return(v) => {
+            let v = match v {
+                Some(v) => val(ast, interner, known, *v, depth + 1, env, steps),
+                None => None,
+            };
+            SFlow::Return(v)
+        }
+        Expr::Assign { lhs, rhs } => {
+            let Some(v) = val(ast, interner, known, *rhs, depth + 1, env, steps) else { return SFlow::V(None) };
+            let Expr::Path(segs) = ast.expr(*lhs) else { return SFlow::V(None) };
+            if segs.len() != 1 {
+                return SFlow::V(None);
+            }
+            match env.iter_mut().rev().find(|(n, _)| *n == segs[0].name) {
+                Some(slot) => {
+                    slot.1 = v;
+                    SFlow::V(None)
+                }
+                None => SFlow::V(None),
+            }
+        }
+        Expr::AssignOp { op, lhs, rhs } => {
+            let cur = val(ast, interner, known, *lhs, depth + 1, env, steps);
+            let rv = val(ast, interner, known, *rhs, depth + 1, env, steps);
+            let (Some(a), Some(b)) = (cur, rv) else { return SFlow::V(None) };
+            let r = match op {
                 BinOp::Add => a.checked_add(b),
                 BinOp::Sub => a.checked_sub(b),
                 BinOp::Mul => a.checked_mul(b),
@@ -501,41 +705,93 @@ fn eval_const_int_depth(ast: &Ast, interner: &Interner, known: &Known, e: ast::E
                 BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
                 BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
                 _ => None,
-            }
-        }
-        Expr::Cast { expr, ty } => {
-            let v = eval_const_int_depth(ast, interner, known, *expr, depth + 1)?;
-            let target = match ast.ty(*ty) {
-                TyExpr::Path(segs) if segs.len() == 1 => known.int_ty(segs[0].name),
-                _ => None,
             };
-            match target {
-                Some(it) => Some(truncate_to_int(v, it)),
-                None if matches!(ast.ty(*ty), TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char) => Some(v),
-                _ => None,
+            let Some(r) = r else { return SFlow::V(None) };
+            let Expr::Path(segs) = ast.expr(*lhs) else { return SFlow::V(None) };
+            if segs.len() != 1 {
+                return SFlow::V(None);
+            }
+            match env.iter_mut().rev().find(|(n, _)| *n == segs[0].name) {
+                Some(slot) => {
+                    slot.1 = r;
+                    SFlow::V(None)
+                }
+                None => SFlow::V(None),
             }
         }
-        Expr::Block(b) => match ast.block(*b).tail {
-            Some(tail) if ast.block(*b).stmts.is_empty() => eval_const_int_depth(ast, interner, known, tail, depth + 1),
-            _ => None,
-        },
+        Expr::Call { callee, args } => {
+            // A call to a const fn found by scanning the crate's items.
+            let Expr::Path(segs) = ast.expr(*callee) else { return SFlow::V(None) };
+            if segs.len() != 1 {
+                return SFlow::V(None);
+            }
+            let name = segs[0].name;
+            let mut argv = Vec::new();
+            for &a in args {
+                match val(ast, interner, known, a, depth + 1, env, steps) {
+                    Some(v) => argv.push(v),
+                    None => return SFlow::V(None),
+                }
+            }
+            for item in &ast.items {
+                let ItemKind::Fn(def) = &item.kind else { continue };
+                if def.name != name || !def.qual.is_const || def.self_param.is_some() || def.params.len() != argv.len() {
+                    continue;
+                }
+                let Some(body) = def.body else { return SFlow::V(None) };
+                let mut fenv: Vec<(Sym, i128)> = Vec::new();
+                for (param, v) in def.params.iter().zip(argv) {
+                    if param.pat.is_some() {
+                        return SFlow::V(None);
+                    }
+                    fenv.push((param.name, v));
+                }
+                return match eval_scalar_block(ast, interner, known, body, depth + 1, &mut fenv, steps) {
+                    SFlow::V(v) | SFlow::Return(v) => SFlow::V(v),
+                    _ => SFlow::V(None),
+                };
+            }
+            SFlow::V(None)
+        }
         Expr::Path(segs) if segs.len() == 1 => {
+            let name = segs[0].name;
+            if let Some((_, v)) = env.iter().rev().find(|(n, _)| *n == name) {
+                return SFlow::V(Some(*v));
+            }
             // A reference to another const item, found by scanning the
             // crate's items (collect evaluates all of them later anyway).
-            let name = segs[0].name;
             let mut out = None;
             for item in &ast.items {
                 if let ItemKind::Const(c) = &item.kind
                     && c.name == Some(name)
                     && let Some(v) = c.value
                 {
-                    out = eval_const_int_depth(ast, interner, known, v, depth + 1);
+                    let mut empty = Vec::new();
+                    out = val(ast, interner, known, v, depth + 1, &mut empty, steps);
                     break;
                 }
             }
-            out
+            SFlow::V(out)
         }
-        _ => None,
+        Expr::Path(segs) if segs.len() == 2 => {
+            // `i64::MAX` and friends by written name.
+            let out = known.int_ty(segs[0].name).and_then(|it| {
+                let item = interner.get(segs[1].name);
+                let bits = it.bits();
+                match item {
+                    "MAX" => Some(truncate_to_int(it.max128() as i128, it)),
+                    "MIN" => Some(if it.signed() {
+                        if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) }
+                    } else {
+                        0
+                    }),
+                    "BITS" => Some(bits as i128),
+                    _ => None,
+                }
+            });
+            SFlow::V(out)
+        }
+        _ => SFlow::V(None),
     }
 }
 

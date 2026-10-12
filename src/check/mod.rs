@@ -185,7 +185,7 @@ pub enum BindMode {
 /// What a lone pattern identifier resolves to (see `Ctx::pat_ident`).
 enum PatIdent {
     Const(u32),
-    Static(u32),
+    Static,
     Variant(AdtId, u32),
     Other,
 }
@@ -404,7 +404,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
                         "Rename the parameter: this name is a const item, so it would be a pattern, not a binding.",
                     );
                 }
-                PatIdent::Static(_) => {
+                PatIdent::Static => {
                     cx.err(
                         "L0110",
                         param.span,
@@ -621,8 +621,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
                 Some(DefsKind::Static) => {
-                    if let Some(i) = p.static_by_def(def).or_else(|| flat.and_then(|f| p.static_names.get(&f).copied())) {
-                        return PatIdent::Static(i);
+                    if p.static_by_def(def).or_else(|| flat.and_then(|f| p.static_names.get(&f).copied())).is_some() {
+                        return PatIdent::Static;
                     }
                 }
                 _ => {}
@@ -648,8 +648,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(&i) = p.const_names.get(&name) {
             return PatIdent::Const(i);
         }
-        if let Some(&i) = p.static_names.get(&name) {
-            return PatIdent::Static(i);
+        if p.static_names.contains_key(&name) {
+            return PatIdent::Static;
         }
         if let Some(&a) = p.type_names.get(&name)
             && !p.adt(a).is_enum
@@ -1272,10 +1272,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.vars.push(Var { bound: None });
         let id = self.vars.len() as u32 - 1;
         self.tys.intern(TyKind::Infer(InferId(id, InferKind::Float)))
-    }
-    /// True when `t` resolves to a float type or an unbound float variable.
-    fn float_like(&self, t: Ty) -> bool {
-        matches!(self.kind(t), TyKind::Float(_)) || self.kind(t).is_float_infer()
     }
     /// Follows variable bindings at the top level only.
     fn resolve(&self, mut t: Ty) -> Ty {
@@ -2458,8 +2454,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => None,
                 });
                 let elem = self.expr(*value, exp_elem);
+                let errs_before = self.errs.len();
                 self.expect_expr(*len, USIZE);
-                let n = crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *len);
+                // The scalar subset first; then the full bounded
+                // evaluator, so size_of calls, const items, and const
+                // fn calls all give lengths in expression position.
+                let n = crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *len).or_else(|| {
+                    if self.errs.len() != errs_before {
+                        return None;
+                    }
+                    let mut ccx = CheckCx { cx: self };
+                    match crate::ty::consteval::eval(&mut ccx, *len, Some(USIZE)) {
+                        Ok((crate::ty::consteval::ConstValue::Int(n), _)) if n >= 0 => Some(n as u128),
+                        _ => None,
+                    }
+                });
                 match n {
                     Some(n) => {
                         let const_val = self.out.const_exprs[self.ei(*value)].is_some();
@@ -2720,11 +2729,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
     /// The value of a literal expression (an integer, possibly negated, or a char), if it is one.
     fn const_scalar(&self, e: ExprId) -> Option<i128> {
+        // A const item or associated const the checker evaluated.
+        if let Some(cv) = &self.out.const_exprs[self.ei(e)] {
+            return match cv {
+                crate::ty::consteval::ConstValue::Int(v) => Some(*v),
+                crate::ty::consteval::ConstValue::Char(c) => Some(*c as i128),
+                crate::ty::consteval::ConstValue::Bool(b) => Some(*b as i128),
+                _ => None,
+            };
+        }
         match self.p.ast.expr(e) {
-            Expr::Int(v, _) => Some(*v as i128),
+            Expr::Int(v, _) => Some(*v as u128 as i128),
             Expr::Char(c) => Some(*c as i128),
             Expr::Unary { op: UnOp::Neg, expr } => match self.p.ast.expr(*expr) {
-                Expr::Int(v, _) => Some(-(*v as i128)),
+                Expr::Int(v, _) => {
+                    if *v == (1u128 << 127) {
+                        Some(i128::MIN)
+                    } else {
+                        Some(-(*v as i128))
+                    }
+                }
                 _ => None,
             },
             _ => None,
@@ -4475,7 +4499,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // an inclusive one needs lo <= hi (rustc E0030).
                 if let [(lo_e, _), (hi_e, _)] = bound_tys[..]
                     && let (Some(lo_v), Some(hi_v)) = (self.const_scalar(lo_e), self.const_scalar(hi_e))
-                    && (lo_v > hi_v || (!inclusive && lo_v == hi_v))
+                    && match (self.scalar_key(lo_v, t), self.scalar_key(hi_v, t)) {
+                        (Some(a), Some(b)) => a > b || (!inclusive && a == b),
+                        _ => lo_v > hi_v || (!inclusive && lo_v == hi_v),
+                    }
                 {
                     self.err(
                         "L0119",
@@ -4514,7 +4541,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 self.out.pat_res[pi] = PatRes::ConstItem(idx);
                                 return;
                             }
-                            PatIdent::Static(_) => {
+                            PatIdent::Static => {
                                 self.err(
                                     "L0110",
                                     span,
@@ -4892,6 +4919,120 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// An order-preserving key for an integer or char scalar at type
+    /// `t`: raw bits, with the sign bit flipped for signed types.
+    fn scalar_key(&self, v: i128, t: Ty) -> Option<u128> {
+        match self.kind(t) {
+            TyKind::Int(it) => {
+                let bits = if it.bits() >= 128 { v as u128 } else { (v as u128) & ((1u128 << it.bits()) - 1) };
+                Some(if it.signed() { bits ^ (1u128 << (it.bits() - 1)) } else { bits })
+            }
+            TyKind::Char => Some(v as u32 as u128),
+            _ => None,
+        }
+    }
+
+    /// The scalar value a pattern matches as a single point, if it is one.
+    fn pat_scalar(&self, pat: PatId) -> Option<i128> {
+        let pi = (pat.0 - self.out.pat_base) as usize;
+        if let Some(cv) = &self.out.pat_const[pi] {
+            return match cv {
+                crate::ty::consteval::ConstValue::Int(v) => Some(*v),
+                crate::ty::consteval::ConstValue::Char(c) => Some(*c as i128),
+                _ => None,
+            };
+        }
+        if let PatRes::ConstItem(idx) = self.out.pat_res[pi] {
+            return match &self.p.consts[idx as usize].value {
+                crate::ty::consteval::ConstValue::Int(v) => Some(*v),
+                crate::ty::consteval::ConstValue::Char(c) => Some(*c as i128),
+                _ => None,
+            };
+        }
+        match self.p.ast.pat(self.pat_unwrap(pat)) {
+            Pat::Lit(l) => self.const_scalar(*l),
+            _ => None,
+        }
+    }
+
+    /// True when integer or char literal, const, and range patterns
+    /// together cover the whole domain of their type. This is the
+    /// const-point and u128 companion to `covers_scalar_domain`:
+    /// it runs only when that one declines (a const item or
+    /// associated const as a point pattern, or a u128 domain).
+    fn covers_scalar_ranges(&self, flat: &[PatId]) -> bool {
+        if flat.is_empty() {
+            return false;
+        }
+        let t = self.out.pat_ty[(flat[0].0 - self.out.pat_base) as usize];
+        let domain: Vec<(u128, u128)> = match self.kind(t) {
+            TyKind::Int(it) => vec![(0, if it.bits() >= 128 { u128::MAX } else { (1u128 << it.bits()) - 1 })],
+            // The char domain skips the surrogate range.
+            TyKind::Char => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
+            _ => return false,
+        };
+        let mut ivs: Vec<(u128, u128)> = Vec::new();
+        for &x in flat {
+            let x = self.pat_unwrap(x);
+            match self.p.ast.pat(x) {
+                Pat::Range { lo, hi, inclusive } => {
+                    let lo_k = match lo {
+                        Some(lo) => match self.const_scalar(*lo).and_then(|v| self.scalar_key(v, t)) {
+                            Some(k) => k,
+                            None => return false,
+                        },
+                        None => 0,
+                    };
+                    let hi_k = match hi {
+                        Some(hi) => match self.const_scalar(*hi).and_then(|v| self.scalar_key(v, t)) {
+                            Some(k) => {
+                                if *inclusive {
+                                    k
+                                } else {
+                                    if k == 0 {
+                                        continue;
+                                    }
+                                    k - 1
+                                }
+                            }
+                            None => return false,
+                        },
+                        None => u128::MAX,
+                    };
+                    if lo_k <= hi_k {
+                        ivs.push((lo_k, hi_k));
+                    }
+                }
+                _ => match self.pat_scalar(x).and_then(|v| self.scalar_key(v, t)) {
+                    Some(k) => ivs.push((k, k)),
+                    None => return false,
+                },
+            }
+        }
+        ivs.sort();
+        for (dlo, dhi) in domain {
+            let mut next = dlo;
+            let mut done = false;
+            for &(lo, hi) in &ivs {
+                if hi < next {
+                    continue;
+                }
+                if lo > next {
+                    break;
+                }
+                if hi >= dhi {
+                    done = true;
+                    break;
+                }
+                next = hi + 1;
+            }
+            if !done {
+                return false;
+            }
+        }
+        true
+    }
+
     /// True if `pats`, all matching values of one type, together match every value.
     fn covers(&self, pats: &[PatId]) -> bool {
         let p = self.p;
@@ -4902,6 +5043,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(res) = self.covers_scalar_domain(&flat) {
             return res;
+        }
+        if self.covers_scalar_ranges(&flat) {
+            return true;
         }
         if !flat.is_empty() && flat.iter().all(|&x| matches!(p.ast.pat(self.pat_unwrap(x)), Pat::Slice { .. })) {
             return self.covers_slice(&flat);

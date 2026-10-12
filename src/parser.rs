@@ -1876,6 +1876,25 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False)
     }
 
+    /// True when the next token can start a range pattern bound: a
+    /// literal, or a path to a const (`u8::MAX`, `m::LO`, `LO`).
+    fn at_bound_start(&self) -> bool {
+        self.at_literal_start() || matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper)
+    }
+
+    /// Parses one range pattern bound: a literal (possibly negated) or
+    /// a path. The checker evaluates it as a const expression.
+    fn pattern_bound(&mut self) -> PResult<ExprId> {
+        let start = self.span();
+        if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper) {
+            let path = self.path(false)?;
+            let span = start.to(self.prev_span());
+            Ok(self.push_expr(Expr::Path(path), span))
+        } else {
+            self.literal_expr()
+        }
+    }
+
     fn pattern_one(&mut self) -> PResult<PatId> {
         let start = self.span();
         let pat = match self.peek() {
@@ -1897,11 +1916,11 @@ impl<'a> Parser<'a> {
             Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
-                    let hi = self.literal_expr()?;
+                    let hi = self.pattern_bound()?;
                     Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: true }
                 } else if self.eat(Tok::DotDot) {
-                    if self.at_literal_start() {
-                        let hi = self.literal_expr()?;
+                    if self.at_bound_start() {
+                        let hi = self.pattern_bound()?;
                         Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: false }
                     } else {
                         Pat::Range { lo: Some(lo), hi: None, inclusive: false }
@@ -1912,8 +1931,8 @@ impl<'a> Parser<'a> {
             }
             Tok::DotDot => {
                 self.bump();
-                if self.at_literal_start() {
-                    let hi = self.literal_expr()?;
+                if self.at_bound_start() {
+                    let hi = self.pattern_bound()?;
                     Pat::Range { lo: None, hi: Some(hi), inclusive: false }
                 } else {
                     Pat::Rest
@@ -1921,7 +1940,7 @@ impl<'a> Parser<'a> {
             }
             Tok::DotDotEq => {
                 self.bump();
-                let hi = self.literal_expr()?;
+                let hi = self.pattern_bound()?;
                 Pat::Range { lo: None, hi: Some(hi), inclusive: true }
             }
             Tok::Float(_) | Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "float and byte literals")),
@@ -1932,7 +1951,23 @@ impl<'a> Parser<'a> {
             Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(start)),
             Tok::Ident(_) | Tok::SelfUpper => {
                 let path = self.path(false)?;
-                if self.peek() == Tok::At {
+                if self.peek() == Tok::DotDotEq || self.peek() == Tok::DotDot {
+                    // A path as a range lower bound (`LO..=HI`, `u8::MIN..`).
+                    let lo_span = start.to(self.prev_span());
+                    let lo = self.push_expr(Expr::Path(path), lo_span);
+                    if self.eat(Tok::DotDotEq) {
+                        let hi = self.pattern_bound()?;
+                        Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: true }
+                    } else {
+                        self.bump();
+                        if self.at_bound_start() {
+                            let hi = self.pattern_bound()?;
+                            Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: false }
+                        } else {
+                            Pat::Range { lo: Some(lo), hi: None, inclusive: false }
+                        }
+                    }
+                } else if self.peek() == Tok::At {
                     if path.len() != 1 || path[0].has_args() {
                         return Err(syntax(start, "expected a binding name before `@`"));
                     }
