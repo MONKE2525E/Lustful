@@ -189,7 +189,11 @@ pub(super) fn inherent_template_probe(
 /// Probes trait methods for one receiver-type probe group (the
 /// variants of one autoderef step that share a receiver type).
 /// Hits are counted across the whole group, as rustc counts
-/// candidates in one probe.
+/// candidates in one probe. `expected` is the call's expected
+/// result type, when the context gives one: it fixes the input
+/// of `Into` (whose method returns that input) and breaks
+/// selection ties the way a return-type annotation does in
+/// rustc.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn trait_method_probe(
     cx: &mut Ctx,
@@ -200,16 +204,21 @@ pub(super) fn trait_method_probe(
     name_span: Span,
     args: &[ExprId],
     explicit: &[Option<GenericArg>],
+    expected: Option<Ty>,
 ) -> Probe {
     let p = cx.p;
     let Some(traits) = p.gx.traits_by_method.get(&name).cloned() else { return Probe::Miss };
     // First pass: probe every in-scope trait by selection, with
     // rollback, and count the hits at this form.
     // A hit: trait, its method template, the impl method (or
-    // default) local, the instantiation prefix, and the trait
-    // input types a trial argument check inferred (when plain
-    // selection with fresh inputs was ambiguous).
-    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>, RcvProbe)> = Vec::new();
+    // default) local, the instantiation prefix, the trait
+    // input types selection fixed, the probe variant, and a
+    // bridge pair when the selected impl is core's blanket
+    // `Into` (the real method is the `From` impl's `from`; the
+    // pair is that trait ref's Self and input types).
+    #[allow(clippy::type_complexity)]
+    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>, RcvProbe, Option<(Ty, Ty)>)> =
+        Vec::new();
     for trait_def in traits {
         if !trait_in_scope(cx, trait_def) {
             continue;
@@ -237,43 +246,90 @@ pub(super) fn trait_method_probe(
             let n_inputs = rec.generics.params.len().saturating_sub(1);
             let snap = cx.snapshot_vars();
             let obl_len = cx.obl_len();
+            let mut input_vars: Vec<Ty> = Vec::new();
             let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
-            for _ in 0..n_inputs {
-                tr_args.push(GenericArg::Ty(cx.new_var(false)));
+            for i in 0..n_inputs {
+                // `Into::into` returns the trait input itself,
+                // so an expected result type is that input.
+                let t = if trait_def == p.gx.lang.into && i == 0 {
+                    expected.unwrap_or_else(|| cx.new_var(false))
+                } else {
+                    cx.new_var(false)
+                };
+                input_vars.push(t);
+                tr_args.push(GenericArg::Ty(t));
             }
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
             let sel = cx.select_obligation(tr);
             let ambiguous = matches!(sel, Selection::Ambiguous);
-            let found: Option<(LocalDefId, Vec<GenericArg>)> = match sel {
+            let found: Option<(LocalDefId, Vec<GenericArg>, Option<(Ty, Ty)>)> = match sel {
                 Selection::Impl { id, args: impl_args, .. } => {
                     let rec_impl = p.gx.index.get(id);
                     let by_name = rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
                     match by_name {
-                        Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
+                        Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone(), None)),
                         None => {
-                            // The trait default body, as a template.
-                            p.local_def(method_def.hash).map(|l| {
-                                let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
-                                let deep_args: Vec<GenericArg> = raw
-                                    .iter()
-                                    .map(|&g| match g {
-                                        GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
-                                        other => other,
-                                    })
-                                    .collect();
-                                (l, deep_args)
+                            // Core's blanket `Into` has no method
+                            // of its own: the call is the selected
+                            // `From` impl's `from`, with the
+                            // receiver as its argument.
+                            let bridged = if trait_def == p.gx.lang.into && input_vars.len() == 1 {
+                                let u = cx.deep(input_vars[0]);
+                                let fargs = cx.tys.intern_args(&[GenericArg::Ty(u), GenericArg::Ty(step)]);
+                                let ftr = TraitRef { def: p.gx.lang.from, args: fargs, bindings: EMPTY_BINDINGS };
+                                match cx.select_obligation(ftr) {
+                                    Selection::Impl { id: id2, args: args2, .. } => {
+                                        let rec2 = p.gx.index.get(id2);
+                                        let fname = p
+                                            .gx
+                                            .index
+                                            .trait_record(p.gx.lang.from)
+                                            .and_then(|r| r.methods.first().map(|m| m.1));
+                                        fname
+                                            .and_then(|fname| {
+                                                rec2.items
+                                                    .iter()
+                                                    .copied()
+                                                    .find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == fname))
+                                            })
+                                            .and_then(|d| p.local_def(d.hash))
+                                            .map(|l| (l, args2.clone(), Some((u, cx.deep(step)))))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            bridged.or_else(|| {
+                                // The trait default body, as a template.
+                                p.local_def(method_def.hash).map(|l| {
+                                    let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+                                    let deep_args: Vec<GenericArg> = raw
+                                        .iter()
+                                        .map(|&g| match g {
+                                            GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
+                                            other => other,
+                                        })
+                                        .collect();
+                                    (l, deep_args, None)
+                                })
                             })
                         }
                     }
                 }
                 _ => None,
             };
+            let zonked_inputs: Option<Vec<Ty>> = if found.is_some() && !input_vars.is_empty() {
+                Some(input_vars.iter().map(|&v| cx.deep(v)).collect())
+            } else {
+                None
+            };
             // Roll the probe back either way; the winner re-selects.
             cx.rollback_vars(snap);
             cx.obl_truncate(obl_len);
-            if let Some((local, prefix)) = found {
-                hits.push((trait_def, tmpl.clone(), local, prefix, None, probe));
+            if let Some((local, prefix, bridge)) = found {
+                hits.push((trait_def, tmpl.clone(), local, prefix, zonked_inputs, probe, bridge));
                 continue;
             }
             // Ambiguous selection with fresh trait inputs is common
@@ -310,7 +366,24 @@ pub(super) fn trait_method_probe(
                 let want_form = probe.recv_ty;
                 let zonked: Option<Vec<Ty>> = if !params.is_empty() && cx.unify(params[0], want_form) {
                     cx.check_args(&params[1..], args, name_span);
-                    Some(input_vars.iter().map(|&v| cx.deep(v)).collect())
+                    // A known expected type fixes inputs that
+                    // only the return type mentions. A return
+                    // type that is still a projection cannot be
+                    // unified yet and does not count against
+                    // the trial.
+                    let ret_ok = match expected {
+                        Some(exp) => {
+                            let r = subst(&mut cx.tys, t.ret, &full);
+                            let r = cx.normalize_here(r);
+                            let is_proj = {
+                                let d = cx.deep(r);
+                                cx.tys.flags(d).contains_projection()
+                            };
+                            is_proj || cx.unify(r, exp)
+                        }
+                        None => true,
+                    };
+                    if ret_ok { Some(input_vars.iter().map(|&v| cx.deep(v)).collect()) } else { None }
                 } else {
                     None
                 };
@@ -341,7 +414,7 @@ pub(super) fn trait_method_probe(
                     cx.rollback_vars(snap);
                     cx.obl_truncate(obl_len);
                     if let Some((local, prefix)) = found {
-                        hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs), probe));
+                        hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs), probe, None));
                     }
                 }
             }
@@ -350,7 +423,23 @@ pub(super) fn trait_method_probe(
     match hits.len() {
         0 => Probe::Miss,
         1 => {
-            let (trait_def, _tmpl, local, prefix, zonked, probe) = hits.into_iter().next().unwrap();
+            let (trait_def, _tmpl, local, prefix, zonked, probe, bridge) = hits.into_iter().next().unwrap();
+            // `Drop::drop` may not be called by hand (rustc
+            // E0040); the drop glue calls it, never a method
+            // call. A user trait method also named `drop` is a
+            // different trait and stays callable.
+            if trait_def == p.gx.lang.drop {
+                cx.err(
+                    "L0110",
+                    name_span,
+                    "the `drop` method cannot be called directly",
+                    "Let the value go out of scope instead.",
+                );
+                for &a in args {
+                    cx.expr(a, None);
+                }
+                return Probe::Failed;
+            }
             let step = probe.self_ty;
             // Re-select to commit the selection bindings and get
             // the confirmed instantiation prefix.
@@ -366,23 +455,36 @@ pub(super) fn trait_method_probe(
             }
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
-            let prefix: Vec<GenericArg> = match cx.select_obligation(tr) {
-                Selection::Impl { args: impl_args, .. } => {
-                    // Impl methods take impl args; trait defaults
-                    // take the trait ref args.
-                    if p.gx.index.impls_of_trait(trait_def).iter().any(|_| true) && local_is_impl_method(p, local, name) {
-                        impl_args
-                    } else {
-                        let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
-                        raw.iter()
-                            .map(|&g| match g {
-                                GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
-                                other => other,
-                            })
-                            .collect()
-                    }
+            let prefix: Vec<GenericArg> = if let Some((u, from_step)) = bridge {
+                // Bookkeep the `Into` obligation, then take the
+                // instantiation prefix from the `From` impl whose
+                // `from` method this call really is.
+                let _ = cx.select_obligation(tr);
+                let fargs = cx.tys.intern_args(&[GenericArg::Ty(u), GenericArg::Ty(from_step)]);
+                let ftr = TraitRef { def: p.gx.lang.from, args: fargs, bindings: EMPTY_BINDINGS };
+                match cx.select_obligation(ftr) {
+                    Selection::Impl { args: args2, .. } => args2,
+                    _ => prefix,
                 }
-                _ => prefix,
+            } else {
+                match cx.select_obligation(tr) {
+                    Selection::Impl { args: impl_args, .. } => {
+                        // Impl methods take impl args; trait defaults
+                        // take the trait ref args.
+                        if p.gx.index.impls_of_trait(trait_def).iter().any(|_| true) && local_is_impl_method(p, local, name) {
+                            impl_args
+                        } else {
+                            let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+                            raw.iter()
+                                .map(|&g| match g {
+                                    GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
+                                    other => other,
+                                })
+                                .collect()
+                        }
+                    }
+                    _ => prefix,
+                }
             };
             let generics = match p.gx.fn_templates.get(local.0 as usize).cloned() {
                 Some(Some(t)) => t.generics.clone(),
@@ -487,6 +589,7 @@ pub(super) fn plain_inherent_probe(
 /// The full generic method search over autoderef steps, in
 /// rustc's receiver-type probe order. Returns Hit/Miss/Failed
 /// like a single probe.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn generic_method_search(
     cx: &mut Ctx,
     e: ExprId,
@@ -495,6 +598,7 @@ pub(super) fn generic_method_search(
     name_span: Span,
     args: &[ExprId],
     explicit: &[Option<GenericArg>],
+    expected: Option<Ty>,
 ) -> Probe {
     // Autoderef steps through references (the builtin derefs of
     // this wave), each with its deref count for lowering.
@@ -535,7 +639,7 @@ pub(super) fn generic_method_search(
                     hit => return hit,
                 }
             }
-            match trait_method_probe(cx, e, group, derefs, name, name_span, args, explicit) {
+            match trait_method_probe(cx, e, group, derefs, name, name_span, args, explicit, expected) {
                 Probe::Miss => {}
                 hit => return hit,
             }

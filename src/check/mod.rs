@@ -3003,7 +3003,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Call { callee, args } => self.call(e, *callee, args, span),
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
-                self.method_call(e, *recv, *name, *name_span, args, generic_args)
+                self.method_call(e, *recv, *name, *name_span, args, generic_args, expected)
             }
             Expr::Field { base, name } => {
                 let bt = self.expr(*base, None);
@@ -4758,7 +4758,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    fn method_call(&mut self, e: ExprId, recv: ExprId, name: Sym, name_span: Span, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Ty {
+    fn method_call(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Ty {
         let p = self.p;
         let k = p.known;
         let rt = self.expr(recv, None);
@@ -4798,7 +4807,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             && (self.tys.local_adt(base).is_some()
                 || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..)))
         {
-            match method::generic_method_search(self, e, rt, name, name_span, args, &explicit) {
+            match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                 method::Probe::Hit(ret) => return ret,
                 method::Probe::Failed => return ERROR,
                 method::Probe::Miss => {}
@@ -5071,7 +5080,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // Generic and trait methods over the full autoderef
                 // chain (check/method.rs).
                 if p.gx.has_generics {
-                    match method::generic_method_search(self, e, rt, name, name_span, args, &explicit) {
+                    match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                         method::Probe::Hit(ret) => return ret,
                         method::Probe::Failed => return ERROR,
                         method::Probe::Miss => {}
