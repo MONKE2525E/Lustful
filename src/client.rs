@@ -8,6 +8,7 @@
 //   lust build <file.rs> --release | --profile <name> [-o <out>]  (Cargo or rustc)
 //   lust run   <file.rs> [-- <args>...]
 //   lust daemon            serve warm, incremental compiles for this directory
+//   lust port scan ...     gap report for a Rust crate (execs `lust-port`)
 //
 // Autostart: `LUST_NO_DAEMON=1` turns it off. The daemon detaches into its own session,
 // logs to `daemon.log` in the cache dir, and exits after `LUST_DAEMON_IDLE` (default 30m).
@@ -121,6 +122,14 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `lust port scan ...` runs the standalone `lust-port` binary
+    // (tools/lust-port), found next to this executable like `lust-core`.
+    if args.first().map(String::as_str) == Some("port") {
+        let tool = std::env::current_exe().map(|p| p.with_file_name("lust-port")).unwrap_or_else(|_| "lust-port".into());
+        let err = std::process::Command::new(&tool).args(&args[1..]).exec();
+        eprintln!("error: cannot run {}: {err}", tool.display());
+        std::process::exit(2);
+    }
     let core = std::env::current_exe().map(|p| p.with_file_name("lust-core")).unwrap_or_else(|_| "lust-core".into());
     match protocol::parse_args(&args) {
         // Release builds and the rustc oracle run right here, streaming output.
