@@ -866,9 +866,13 @@ fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
             }
         }
     }
-    (items.len() as u64).hash(h);
     for item in items {
-        match &item.vis {
+        // Only structure items hash, visibility included (flipping a
+        // `use` or `mod` to `pub` changes re-export bindings). Other
+        // items hash nothing: adding a fn must not look like a
+        // structure edit to the driver's mode split. Their effects
+        // are in the driver's own Ast item hashes.
+        let vis = |h: &mut crate::intern::FxHasher| match &item.vis {
             Vis::Private => 0u8.hash(h),
             Vis::Public => 1u8.hash(h),
             Vis::Restricted { path, .. } => {
@@ -877,9 +881,10 @@ fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
                     s.name.hash(h);
                 }
             }
-        }
+        };
         match &item.kind {
             ItemKind::Mod(m) => {
+                vis(h);
                 0u8.hash(h);
                 m.name.hash(h);
                 match &m.body {
@@ -888,18 +893,17 @@ fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
                 }
             }
             ItemKind::Use(u) => {
+                vis(h);
                 1u8.hash(h);
                 tree(&u.tree, h);
             }
             ItemKind::ExternCrate(e) => {
+                vis(h);
                 2u8.hash(h);
                 e.name.hash(h);
                 e.rename.hash(h);
             }
-            // Non-structure items matter only by their position between
-            // structure items (textual macro and shadowing order is in
-            // the driver's own Ast hashes).
-            _ => 3u8.hash(h),
+            _ => {}
         }
     }
 }

@@ -2252,8 +2252,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
-    for ((obj, c), &(u, _)) in units.iter().zip(todo.iter()) {
-        let key = unit_key_of(u);
+    for ((obj, c), &(u, overlay)) in units.iter().zip(todo.iter()) {
+        // An overlay copy of a unit differs from its base copy only
+        // in the register symbol name, which no fingerprint above
+        // sees: key the two forms apart, or a base object could serve
+        // an overlay link (unresolved `lust_overlay_u<N>`).
+        let key = if overlay {
+            let mut h = crate::intern::FxHasher::default();
+            std::hash::Hash::hash(&"cunit-overlay-v1", &mut h);
+            std::hash::Hash::hash(&unit_key_of(u).0, &mut h);
+            crate::driver::graph::UnitKey(std::hash::Hasher::finish(&h))
+        } else {
+            unit_key_of(u)
+        };
         if disk_cache.as_ref().is_some_and(|cache| cache.unit_object(key, c, req.debug, obj)) {
             unit_hits += 1;
         } else {
