@@ -25,7 +25,12 @@
 # time, the lust check time, and lust's first diagnostic instead of
 # edit counters.
 #
-# Usage: python3 scripts/scale-gate.py [--modules 40] [--json out.json]
+# Usage: python3 scripts/scale-gate.py [--modules 40] [--json out.json] [--multi]
+# --multi measures the same crate split into one module file per
+# warehouse copy (bench/realish/make_multi.py, the resolver path)
+# with per-edit scenarios: body edit, new fn, signature edit, type
+# edit, import edit, new file. Run both forms to compare against
+# the single-file path.
 # Line count reported is physical source lines of the generated crate.
 import json, os, signal, subprocess, sys, tempfile, time
 
@@ -33,6 +38,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.path.join(ROOT, "target/release/lust")
 MODULES = 40
 JSON_OUT = None
+MULTI = False
 args = sys.argv[1:]
 while args:
     a = args.pop(0)
@@ -40,6 +46,8 @@ while args:
         MODULES = int(args.pop(0))
     elif a == "--json":
         JSON_OUT = args.pop(0)
+    elif a == "--multi":
+        MULTI = True
     else:
         sys.exit(f"unknown argument: {a}")
 
@@ -66,7 +74,22 @@ def link_ms(stderr):
     return total
 
 
+def print_rows(rows, rss, lines, work, label):
+    print(f"scale gate ({label}): {MODULES} warehouse modules, {lines} physical lines, work dir {work}")
+    print(f"daemon memory after cold build: RSS {rss} kB")
+    print()
+    hdr = ("scenario", "check", "build", "link", "bodies", "reused", "inval", "inst", "C KB", "dirtyU", "tccU", "diskU", "tbl")
+    print(" ".join(f"{h:>7}" if i else f"{h:<46}" for i, h in enumerate(hdr)))
+    for r in rows:
+        print(f"{r['scenario']:<46} {r['check_ms']:>6.0f} {r['build_ms']:>6.0f} {r['link_ms']:>6.0f} "
+              f"{r['changed_bodies']:>7} {r['reused_bodies']:>7} {r['invalidated_queries']:>7} {r['instances']:>7} "
+              f"{(r['c_bytes'] or 0) // 1024:>7} {r['dirty_units']:>7} {r['units_compiled']:>7} {r['units_from_disk']:>7} {r['table_rebuilt']:>7}"
+              f"  [{r['mode']}] {r['checksum']}")
+
+
 def main():
+    if MULTI:
+        return main_multi()
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
     work = tempfile.mkdtemp(prefix="lust-scale-")
@@ -221,6 +244,135 @@ def main():
         with open(JSON_OUT, "w") as f:
             json.dump({"crate_lines": lines, "modules": MODULES, "daemon_rss_kb": rss,
                        "rows": rows, "ts_slice": slice_rows}, f, indent=1)
+        print(f"json: {JSON_OUT}")
+    kill_daemon()
+
+
+
+def main_multi():
+    if not os.path.exists(LUST):
+        sys.exit(f"{LUST} not built; run cargo build --release first")
+    work = tempfile.mkdtemp(prefix="lust-scale-multi-")
+    crate_dir = os.path.join(work, "crate")
+    subprocess.run([sys.executable, os.path.join(ROOT, "bench/realish/make_multi.py"), str(MODULES), crate_dir], check=True)
+    crate = os.path.join(crate_dir, "main.rs")
+    lines = sum(1 for f in os.listdir(crate_dir) if f.endswith(".rs") for _ in open(os.path.join(crate_dir, f)))
+    env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "s.sock"),
+               LUST_CACHE_DIR=os.path.join(work, "cache"), LUST_STATS="1",
+               LUST_DAEMON_IDLE="120s")
+    prog = os.path.join(work, "prog")
+    rows = []
+
+    def run(cmd, use_env=None):
+        start = time.perf_counter()
+        r = subprocess.run(cmd, cwd=work, env=use_env or env, capture_output=True, text=True)
+        return (time.perf_counter() - start) * 1000, r
+
+    def build_row(name, row_env=None):
+        ct, cr = run([LUST, "check", "--timings", crate], row_env)
+        bt, br = run([LUST, "build", "--timings", crate, "-o", prog], row_env)
+        assert cr.returncode == 0, f"{name}: check failed\n{cr.stderr[-800:]}"
+        assert br.returncode == 0, f"{name}: build failed\n{br.stderr[-800:]}"
+        run_r = subprocess.run([prog], capture_output=True, text=True)
+        assert run_r.returncode == 0, f"{name}: program failed"
+        front, back = parse_stats(cr.stderr), parse_stats(br.stderr)
+        row = {
+            "scenario": name,
+            "check_ms": round(ct, 1), "build_ms": round(bt, 1),
+            "link_ms": round(link_ms(br.stderr), 1),
+            "changed_bodies": front.get("rechecked"), "reused_bodies": front.get("reused"),
+            "invalidated_queries": front.get("invalidated"), "instances": back.get("instances"),
+            "c_bytes": back.get("c_bytes"), "dirty_units": back.get("dirty_units"),
+            "units_compiled": back.get("units_compiled"), "units_from_disk": back.get("unit_cache_hits"),
+            "table_rebuilt": back.get("table_rebuilt"), "mode": front.get("mode"),
+            "reemitted": back.get("reemitted"),
+            "checksum": run_r.stdout.strip().splitlines()[-1] if run_r.stdout.strip() else "",
+        }
+        rows.append(row)
+        return row
+
+    def edit(rel, old, new):
+        path = os.path.join(crate_dir, rel)
+        text = open(path).read()
+        assert old in text, f"edit not found in {rel}: {old!r}"
+        open(path, "w").write(text.replace(old, new, 1))
+
+    daemon = None
+
+    def start_daemon():
+        nonlocal daemon
+        daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):
+            if os.path.exists(os.path.join(work, "s.sock")):
+                return
+            time.sleep(0.05)
+        sys.exit("daemon did not start")
+
+    def daemon_rss_kb():
+        if not daemon:
+            return None
+        try:
+            for line in open(f"/proc/{daemon.pid}/status"):
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        except OSError:
+            return None
+
+    def kill_daemon():
+        nonlocal daemon
+        if daemon:
+            daemon.kill()
+            daemon.wait()
+            daemon = None
+        for f in ("s.sock", "s.sock.lock"):
+            try:
+                os.remove(os.path.join(work, f))
+            except FileNotFoundError:
+                pass
+
+    cold_env = dict(env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold-cache"))
+    build_row("fresh cold (one-shot, empty caches)", row_env=cold_env)
+    start_daemon()
+    build_row("fresh cold (new daemon session)")
+    build_row("warm no-op (daemon)")
+    rss = daemon_rss_kb()
+
+    edit("m21.rs", "if qty >= 10 { subtotal / 20 } else { 0 }", "if qty >= 8 { subtotal / 25 } else { 0 }")
+    build_row("body edit (one file)")
+    edit("m21.rs", "if qty >= 8 { subtotal / 25 } else { 0 }", "if qty >= 10 { subtotal / 20 } else { 0 }")
+    build_row("body edit back (disk unit reuse)")
+
+    edit("m21.rs", "fn validate_m21(order: &Order_m21) -> Option<OrderError_m21> {",
+         "fn qty_ok_m21(q: i64) -> bool {\n    q > 0 && q <= 50\n}\n\nfn validate_m21(order: &Order_m21) -> Option<OrderError_m21> {")
+    build_row("new fn (one file)")
+
+    edit("m11.rs", "fn validate_m11(order: &Order_m11)", "pub fn validate_m11(order: &Order_m11)")
+    build_row("signature edit (visibility flip)")
+
+    edit("m7.rs", "    price_cents: i64,\n    weight_grams: i64,", "    weight_grams: i64,\n    price_cents: i64,")
+    build_row("type edit that changes a layout (field offsets)")
+
+    edit("main.rs", "use crate::m3::run_module_m3 as run3;", "use crate::m4::run_module_m4 as run3;")
+    build_row("import edit (alias retarget, output must move)")
+
+    # New file: one more warehouse copy as m40 plus its mod line and call.
+    subprocess.run([sys.executable, os.path.join(ROOT, "bench/realish/make_multi.py"), str(MODULES + 1), os.path.join(work, "gen41")], check=True)
+    import shutil
+    shutil.copy(os.path.join(work, "gen41", f"m{MODULES}.rs"), os.path.join(crate_dir, f"m{MODULES}.rs"))
+    edit("main.rs", f"mod m{MODULES - 1};", f"mod m{MODULES - 1};\nmod m{MODULES};")
+    edit("main.rs", "    println!", f"    total += crate::m{MODULES}::run_module_m{MODULES}();\n    println!")
+    build_row("new file (module 41)")
+
+    kill_daemon()
+    start_daemon()
+    build_row("cached cold after restart (manifest + disk objects)")
+    build_row("restart warm no-op")
+
+    print_rows(rows, rss, lines, work, "multi-file resolver path")
+    if JSON_OUT:
+        with open(JSON_OUT, "w") as f:
+            json.dump({"crate_lines": lines, "modules": MODULES, "daemon_rss_kb": rss, "multi": True, "rows": rows}, f, indent=1)
         print(f"json: {JSON_OUT}")
     kill_daemon()
 
