@@ -458,6 +458,17 @@ impl<'a> Parser<'a> {
     /// lust does not handle yet (cfg, repr, path, inline, and kin) rejects with
     /// L0522; a name lust does not know at all rejects with L0402.
     fn attributes(&mut self) -> PResult<ParsedAttrs> {
+        self.attributes_at(true)
+    }
+
+    /// Attributes on a part of an item (a field, parameter, variant, arm, or
+    /// statement). `derive` and `test` are not valid there (rustc rejects
+    /// them), so they get the unsupported-attribute error, not a free pass.
+    fn part_attributes(&mut self) -> PResult<ParsedAttrs> {
+        self.attributes_at(false)
+    }
+
+    fn attributes_at(&mut self, item_level: bool) -> PResult<ParsedAttrs> {
         let mut out = ParsedAttrs::default();
         while self.peek() == Tok::Pound {
             let start = self.bump().span;
@@ -545,6 +556,14 @@ impl<'a> Parser<'a> {
                     name_span,
                     format!("unsupported attribute `{name_text}`"),
                     "Lust supports #[derive(...)], #[test], and lint attributes such as #[allow(...)].",
+                ));
+            }
+            if !item_level && (first == k.derive || first == k.test) {
+                return Err(Diag::new(
+                    "L0402",
+                    name_span,
+                    format!("unsupported attribute `{name_text}`"),
+                    "Lust supports #[derive(...)] on structs and enums, #[test] on functions, and lint attributes such as #[allow(...)].",
                 ));
             }
             match first {
@@ -800,7 +819,7 @@ impl<'a> Parser<'a> {
             }
         }
         while self.peek() != Tok::RParen {
-            let pattrs = self.attributes()?;
+            let pattrs = self.part_attributes()?;
             let start = self.span();
             if self.peek() == Tok::DotDot {
                 return Err(self.reject(C_CORE, "variadic parameters"));
@@ -850,7 +869,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while self.peek() != Tok::RBrace {
-            let fattrs = self.attributes()?;
+            let fattrs = self.part_attributes()?;
             let vis = self.vis()?;
             let (name, span) = self.ident()?;
             self.expect(Tok::Colon, "`:`")?;
@@ -869,7 +888,7 @@ impl<'a> Parser<'a> {
     fn tuple_fields(&mut self) -> PResult<Vec<FieldDef>> {
         let mut fields = Vec::new();
         while self.peek() != Tok::RParen {
-            let fattrs = self.attributes()?;
+            let fattrs = self.part_attributes()?;
             let span = self.span();
             let ty = self.ty()?;
             fields.push(FieldDef { name: Sym(0), vis: Vis::Private, attrs: fattrs.attrs, ty, span });
@@ -909,7 +928,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
         while self.peek() != Tok::RBrace {
-            let vattrs = self.attributes()?;
+            let vattrs = self.part_attributes()?;
             let (vname, span) = self.ident()?;
             let fields = match self.peek() {
                 Tok::LParen => {
@@ -1112,7 +1131,7 @@ impl<'a> Parser<'a> {
             }
             // Statement attributes: parsed here so a `#[cfg]` on a statement
             // gets the attribute code; lint attributes are kept on `let`s.
-            let stmt_attrs = self.attributes()?;
+            let stmt_attrs = self.part_attributes()?;
             if matches!(
                 self.peek(),
                 Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Mod | Tok::Trait | Tok::Const | Tok::Static | Tok::Type
@@ -1244,7 +1263,7 @@ impl<'a> Parser<'a> {
                             if matches!(self.peek(), Tok::Int(..)) {
                                 return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
                             }
-                            let _fattrs = self.attributes()?;
+                            let _fattrs = self.part_attributes()?;
                             let by_ref = self.eat(Tok::Ref);
                             let mutable = self.eat(Tok::Mut);
                             let (fname, fspan) = self.ident()?;
@@ -1580,7 +1599,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::LBrace, "`{`")?;
                 let mut arms = Vec::new();
                 while self.peek() != Tok::RBrace {
-                    let aattrs = self.attributes()?;
+                    let aattrs = self.part_attributes()?;
                     let pat = self.pattern()?;
                     let guard = if self.eat(Tok::If) { Some(self.expr()?) } else { None };
                     self.expect(Tok::FatArrow, "`=>`")?;
