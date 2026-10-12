@@ -288,6 +288,10 @@ pub enum PatRes {
     Variant(AdtId, u32),
     /// `Some(..)` (true) or `None` (false).
     Opt(bool),
+    /// An associated const pattern (`Self::A`, `Type::A`): compare
+    /// the scrutinee against the scalar value in
+    /// `Program::assoc_consts` (W-RESOLVE phase 2).
+    AssocConst(AdtId, Sym),
 }
 
 pub struct LocalInfo {
@@ -5437,6 +5441,110 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.out.pat_res[pi] = PatRes::Binding { local: l, mode };
     }
 
+    /// Checks one const pattern value against the scrutinee type:
+    /// structural-match (a constant whose Adt type has no derived
+    /// `PartialEq` is L0633, as in Rust; a structural value lust
+    /// cannot compare yet is the non-scalar unsupported error), then
+    /// type equality and refutability outside `match`. Returns true
+    /// when the pattern may use the value.
+    fn check_const_value(&mut self, cty: Ty, val: &crate::ty::consteval::ConstValue, t: Ty, span: Span, in_match: bool) -> bool {
+        use crate::ty::consteval::ConstValue as CV;
+        let ct = self.resolve(cty);
+        match val {
+            CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_) => {}
+            _ => {
+                let nonstructural =
+                    matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
+                if nonstructural {
+                    let tn = self.tn(ct);
+                    self.err(
+                        "L0633",
+                        span,
+                        format!("constant of non-structural type `{tn}` cannot be used in a pattern"),
+                        "Derive `PartialEq` on the type, match a field, or compare in a guard instead.",
+                    );
+                } else {
+                    self.errs.push(unsupported(span, "non-scalar const patterns"));
+                }
+                return false;
+            }
+        }
+        let eff = if matches!(val, CV::Str(_)) && self.kind(t) == TyKind::Str { t } else { ct };
+        if !self.unify(eff, t) {
+            self.mismatch(span, t, eff);
+            return false;
+        }
+        if !in_match {
+            self.errs.push(unsupported(span, "refutable patterns here"));
+        }
+        true
+    }
+
+    /// A free const item used as a pattern, by const index.
+    fn const_item_pat(&mut self, pi: usize, idx: u32, t: Ty, span: Span, in_match: bool) {
+        // The pattern consumes the const's value: record its `Sig`
+        // read so a value edit rechecks this body (ARCH 8.2).
+        if let Some(&def) = self.p.const_defs.get(idx as usize) {
+            let p = self.p;
+            let _ = p.sig_of(&mut self.out.reads, def);
+        }
+        let c = &self.p.consts[idx as usize];
+        let (ct, val) = (c.ty, c.value.clone());
+        if self.check_const_value(ct, &val, t, span, in_match) {
+            self.out.pat_res[pi] = PatRes::ConstItem(idx);
+        }
+    }
+
+
+    /// Tries to read a path pattern as a const pattern. Returns true
+    /// when the path named a const (or a static, which errors), so
+    /// the caller skips variant handling.
+    fn try_const_path_pat(&mut self, pi: usize, segs: &[ast::PathSeg], t: Ty, span: Span, in_match: bool) -> bool {
+        let p = self.p;
+        if segs.len() == 1 {
+            // Free consts and statics in one segment are handled by
+            // the pattern-identifier resolution in the Path arm.
+            return false;
+        }
+        if let Some((adt, item)) = self.assoc_const_key(segs) {
+            let (cty, val) = match p.assoc_consts.get(&(adt, item)) {
+                Some(&(cty, ref val)) => (cty, val.clone()),
+                None => return false,
+            };
+            if self.check_const_value(cty, &val, t, span, in_match) {
+                self.out.pat_res[pi] = PatRes::AssocConst(adt, item);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// The (Adt, name) key an associated const path (`Self::A`,
+    /// `Type::A`) names, when the owning type is a local Adt.
+    fn assoc_const_key(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, Sym)> {
+        if segs.len() != 2 {
+            return None;
+        }
+        let p = self.p;
+        let (ty_name, item) = (segs[0].name, segs[1].name);
+        let adt = if ty_name == p.known.self_type {
+            self.f.owner
+        } else {
+            match self.binding(Namespace::Type, ty_name) {
+                BindingRes::Def(def) => p.adt_by_def(def),
+                _ => None,
+            }
+        }?;
+        Some((adt, item))
+    }
+
+    /// The (type, value) of an associated const named by a two-segment
+    /// path, for expression reads.
+    fn assoc_const(&mut self, segs: &[ast::PathSeg], _span: Span) -> Option<(Ty, crate::ty::consteval::ConstValue)> {
+        let (adt, item) = self.assoc_const_key(segs)?;
+        self.p.assoc_consts.get(&(adt, item)).map(|&(ty, ref v)| (ty, v.clone()))
+    }
+
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
         self.pattern_mode(pat, t, BindMode::Move, in_match);
     }
@@ -5463,8 +5571,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if structural {
             let mut derefs = 0;
             while let TyKind::Ref(_, m, inner) = self.tys.kind(t) {
-                // A string literal pattern matches `&str` directly.
-                if matches!(p.ast.pat(pat), Pat::Lit(l) if matches!(p.ast.expr(*l), Expr::Str(_))) && self.kind(inner) == TyKind::Str {
+                // A string literal or &str const pattern matches `&str` directly.
+                let str_pat = matches!(p.ast.pat(pat), Pat::Lit(l) if matches!(p.ast.expr(*l), Expr::Str(_)))
+                    || matches!(p.ast.pat(pat), Pat::Path(segs) if segs.len() == 1 && p.const_names.get(&segs[0].name).is_some_and(|&i| matches!(p.consts[i as usize].value, crate::ty::consteval::ConstValue::Str(_))));
+                if str_pat && self.kind(inner) == TyKind::Str {
                     break;
                 }
                 derefs += 1;
@@ -5503,25 +5613,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         {
             match self.pat_ident(*name) {
                 PatIdent::Const(idx) => {
-                    if let Some(&def) = p.const_defs.get(idx as usize) {
-                        let _ = p.sig_of(&mut self.out.reads, def);
-                    }
-                    let c = &p.consts[idx as usize];
-                    if !matches!(
-                        c.value,
-                        crate::ty::consteval::ConstValue::Int(_)
-                            | crate::ty::consteval::ConstValue::Bool(_)
-                            | crate::ty::consteval::ConstValue::Char(_)
-                    ) {
-                        self.errs.push(unsupported(span, "non-scalar const patterns"));
-                        return;
-                    }
-                    let ct = c.ty;
-                    if !self.unify(ct, t) {
-                        self.mismatch(span, t, ct);
-                        return;
-                    }
-                    self.out.pat_res[pi] = PatRes::ConstItem(idx);
+                    self.const_item_pat(pi, idx, t, span, in_match);
                     return;
                 }
                 PatIdent::Static => {
@@ -5547,6 +5639,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return;
                 }
                 PatIdent::Other => {}
+            }
+        }
+        // A const path pattern (`MAX`, `Self::A`, `Type::A`, `m::S`)
+        // is not a variant: it compares against the const's value.
+        if let Pat::Path(segs) = p.ast.pat(pat) {
+            let segs = segs.clone();
+            if self.try_const_path_pat(pi, &segs, t, span, in_match) {
+                return;
             }
         }
         match p.ast.pat(pat) {
@@ -5669,15 +5769,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if segs.len() == 1 {
                         match self.pat_ident(segs[0].name) {
                             PatIdent::Const(idx) => {
-                                if let Some(&def) = p.const_defs.get(idx as usize) {
-                                    let _ = p.sig_of(&mut self.out.reads, def);
-                                }
-                                let ct = p.consts[idx as usize].ty;
-                                if !self.unify(ct, t) {
-                                    self.mismatch(span, t, ct);
-                                    return;
-                                }
-                                self.out.pat_res[pi] = PatRes::ConstItem(idx);
+                                self.const_item_pat(pi, idx, t, span, in_match);
                                 return;
                             }
                             PatIdent::Static => {
@@ -6205,7 +6297,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (PatRes::Variant(a, _), _) if p.adt(a).is_enum => {
                     return (0..p.adt(a).variants.len()).all(|v| self.covers_variant(&flat, a, v as u32));
                 }
-                (_, Pat::Lit(_)) if matches!(self.kind(self.out.pat_ty[(x.0 - self.out.pat_base) as usize]), TyKind::Bool) => {
+                (_, Pat::Lit(_)) | (PatRes::ConstItem(_), _) | (PatRes::AssocConst(..), _)
+                    if matches!(self.kind(self.out.pat_ty[(x.0 - self.out.pat_base) as usize]), TyKind::Bool) =>
+                {
                     let (mut t, mut f) = (false, false);
                     for &y in &flat {
                         self.cover_bools(y, &mut t, &mut f);
@@ -6463,6 +6557,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     fn cover_bools(&self, pat: PatId, t: &mut bool, f: &mut bool) {
+        match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+            PatRes::ConstItem(idx) => match self.p.consts[idx as usize].value {
+                crate::ty::consteval::ConstValue::Bool(true) => *t = true,
+                crate::ty::consteval::ConstValue::Bool(false) => *f = true,
+                _ => {}
+            },
+            PatRes::AssocConst(adt, item) => match self.p.assoc_consts.get(&(adt, item)) {
+                Some((_, crate::ty::consteval::ConstValue::Bool(true))) => *t = true,
+                Some((_, crate::ty::consteval::ConstValue::Bool(false))) => *f = true,
+                _ => {}
+            },
+            _ => {}
+        }
         match self.p.ast.pat(pat) {
             Pat::Or(alts) => {
                 for &a in alts {

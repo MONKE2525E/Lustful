@@ -1521,7 +1521,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             let cv = p.consts[idx as usize].value.clone();
             let op = self.const_operand(&cv, ty, span);
             let c = self.temp(BOOL);
-            self.assign(Place::local(c), Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op), span);
+            let cond = if matches!(cv, crate::ty::consteval::ConstValue::Str(_)) {
+                Rvalue::StrCmp(BinOp::Eq, Operand::Copy(place), op)
+            } else {
+                Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op)
+            };
+            self.assign(Place::local(c), cond, span);
             let ok = self.new_block();
             let b = &mut self.body.blocks[self.cur.0 as usize];
             b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
@@ -1559,6 +1564,16 @@ impl<'p, 'a> Lower<'p, 'a> {
             b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
             this.cur = ok;
         };
+        if let PatRes::AssocConst(adt, item) = self.ck.pat_res(pat) {
+            let v = p.assoc_consts[&(adt, item)].1.clone();
+            let op = self.const_operand(&v, ty, span);
+            if matches!(v, crate::ty::consteval::ConstValue::Str(_)) {
+                branch(self, Rvalue::StrCmp(BinOp::Eq, Operand::Copy(place), op));
+            } else {
+                branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op));
+            }
+            return;
+        }
         match p.ast.pat(pat) {
             Pat::Wild | Pat::Binding { .. } => {}
             Pat::Lit(l) => {

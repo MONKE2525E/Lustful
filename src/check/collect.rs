@@ -102,6 +102,9 @@ pub struct Program<'a> {
     pub const_defs: Vec<DefId>,
     /// Each static item's stable identity, in `statics` order.
     pub static_defs: Vec<DefId>,
+    /// Scalar associated consts of inherent impls, by (Adt, name).
+    /// Filled by the assoc const pass in `collect` (W-RESOLVE phase 2).
+    pub assoc_consts: HashMap<(AdtId, Sym), (Ty, crate::ty::consteval::ConstValue)>,
     /// Evaluated static items, and name to index. Codegen emits these as
     /// static data in the glue unit.
     pub statics: Vec<StaticItem>,
@@ -913,6 +916,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         adts: Vec::new(),
         fns: Vec::new(),
         consts: Vec::new(),
+        assoc_consts: HashMap::default(),
         const_names: HashMap::default(),
         const_defs: Vec::new(),
         static_defs: Vec::new(),

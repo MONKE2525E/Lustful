@@ -78,6 +78,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0630](L0630.md) | outside the bounded const evaluator |
 | [L0631](L0631.md) | non-const call in a const context |
 | [L0632](L0632.md) | const and static items are not supported yet |
+| [L0633](L0633.md) | this constant cannot be used in a pattern |
 | [L0640](L0640.md) | this std item is declared but not yet implemented |
 | [L0641](L0641.md) | this literal or std form is not supported yet |
 | [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |

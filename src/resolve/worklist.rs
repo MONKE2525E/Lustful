@@ -3200,10 +3200,44 @@ impl Rewrite<'_> {
         }
     }
 
+    /// A pattern binding name that resolves to a const, a unit
+    /// struct, or an imported variant is a path pattern in Rust, not
+    /// a fresh binding; one that resolves to a static is an error
+    /// (L0633). Returns the replacement path pattern when it applies.
+    fn binding_pat(&mut self, name: Sym, span: Span, module: ModuleId, scopes: &[Frame]) -> Option<Pat> {
+        let (res, local) = self.resolve(&[name], Namespace::Value, module, scopes);
+        if local {
+            return None;
+        }
+        match res {
+            PathRes::Done(Target::Def(def)) => match self.tables.def_info.get(&def) {
+                Some(info) if info.kind == ResKind::Static => None,
+                Some(info) if matches!(info.kind, ResKind::Const | ResKind::Adt) => Some(Pat::Path(vec![PathSeg::plain(info.flat)])),
+                _ => None,
+            },
+            PathRes::Done(Target::Variant(def, variant)) => {
+                self.tables.def_info.get(&def).map(|info| Pat::Path(vec![PathSeg::plain(info.flat), PathSeg::plain(variant)]))
+            }
+            PathRes::Ambiguous => {
+                self.diags.push(ambiguous_diag(self.interner.get(name), span));
+                None
+            }
+            PathRes::Private => {
+                self.diags.push(private_diag(self.interner.get(name), span));
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Rewrites one pattern's paths.
     fn pat(&mut self, ast: &mut Ast, id: PatId, module: ModuleId, scopes: &[Frame]) {
         let span = ast.pat_span(id);
         match std::mem::replace(&mut ast.pats[id.0 as usize], Pat::Wild) {
+            Pat::Binding { name, mutable, by_ref } => {
+                let replacement = if !mutable && !by_ref { self.binding_pat(name, span, module, scopes) } else { None };
+                ast.pats[id.0 as usize] = replacement.unwrap_or(Pat::Binding { name, mutable, by_ref });
+            }
             Pat::Path(mut segs) => {
                 self.rewrite_path(&mut segs, Namespace::Value, span, module, scopes, ast);
                 ast.pats[id.0 as usize] = Pat::Path(segs);
@@ -3577,7 +3611,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:cachetest", "bin", "cachetest", false) },
             crate_name: "cachetest".into(),
-            externs: Vec::new(),
+            deps: Vec::new(),
         };
         let mut cache = ResolveCache::new();
         let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");

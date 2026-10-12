@@ -66,7 +66,8 @@ prints "reserved, not yet emitted".
 | L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |
 | L0630-L0631 | Const eval | W-CORELANG | in use | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
 | L0632 | Const eval | W-CORELANG | in use | Const or static item, const fn, or const generic form is not supported yet (S3b parser reject) |
-| L0633-L0639 | Const eval | W-CORELANG | reserved | |
+| L0633 | Const eval | W-CORELANG | in use | Static or non-structural constant used in a pattern |
+| L0634-L0639 | Const eval | W-CORELANG | reserved | |
 | L0640 | Std surface | W-STD | in use | Std item is declared but not yet implemented (S5) |
 | L0641 | Std surface | W-STD | in use | Float or byte literal, known std type, or format form is not supported yet (S3b) |
 | L0642 | Std surface | W-STD | in use | Intrinsic called from a crate that may not use intrinsics (S5) |
