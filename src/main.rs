@@ -22,12 +22,16 @@ mod intern;
 mod ir;
 mod lexer;
 mod lower;
+#[allow(dead_code)] // Instance discovery is called from collect and the driver as W-TRAITS-CORE lands in increments.
+mod mono;
 mod parser;
 mod protocol;
 mod scan;
 mod stdload;
 mod tcc;
 mod testrun;
+#[allow(dead_code)] // See `mod mono`.
+mod traits;
 mod ty;
 
 use protocol::Invocation;
