@@ -302,6 +302,14 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session))) {
         Ok(r) if r.code == 0 || r.code == 2 => r,
+        Ok(r) if r.code == 3 && r.stderr.contains("function count mismatch") => {
+            // The warm session's scan and Ast disagree on the fn list
+            // (unusual shapes: items moved into bodies). The session
+            // state is not a sound basis for an answer, like after a
+            // panic: redo in a fresh session at once and hand that out.
+            eprintln!("lust daemon: session fn count mismatch for {}; recomputed in a fresh session", req.file.display());
+            compile_fresh(entry, req).0
+        }
         Ok(r) => {
             // An error answer: hand it out now, verify it in the background.
             // Without the current source bytes no honest comparison is
