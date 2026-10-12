@@ -64,10 +64,19 @@ pub fn is_token_builtin(name: &str) -> bool {
 pub struct CfgEnv {
     pub test: bool,
     pub debug_assertions: bool,
+    /// Full resolver facts (W-RESOLVE): flags as (name, None) and pairs
+    /// as (name, Some(value)), including `feature` pairs. Consulted
+    /// before the host facts below, so a crate session's real cfg
+    /// environment (section 1.6) wins where the two disagree. Empty on
+    /// the single-file path, which keeps the host facts.
+    pub facts: Vec<(String, Option<String>)>,
 }
 
 impl CfgEnv {
     fn name_is(&self, name: &str, value: Option<&str>) -> bool {
+        if !self.facts.is_empty() {
+            return self.facts.iter().any(|(n, v)| n == name && v.as_deref() == value);
+        }
         match (name, value) {
             ("test", None) => self.test,
             ("debug_assertions", None) => self.debug_assertions,
@@ -92,6 +101,10 @@ impl CfgEnv {
         self.test.hash(&mut h);
         self.debug_assertions.hash(&mut h);
         "host-unix-linux".hash(&mut h);
+        for (n, v) in &self.facts {
+            n.hash(&mut h);
+            v.hash(&mut h);
+        }
         std::hash::Hasher::finish(&h)
     }
 }

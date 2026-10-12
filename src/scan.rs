@@ -235,8 +235,9 @@ struct PendingAttrs {
 }
 
 /// Builds token trees from a flat token slice (same nesting rule as the
-/// parser's attribute storage). Used only for `#[cfg(...)]` contents.
-fn outline_trees(toks: &[crate::lexer::Token]) -> Vec<crate::lexer::TokenTree> {
+/// parser's attribute storage). Used for `#[cfg(...)]` contents, here
+/// and in the resolver's pre-expansion cfg check.
+pub fn outline_trees(toks: &[crate::lexer::Token]) -> Vec<crate::lexer::TokenTree> {
     use crate::lexer::{Delim, TokenTree};
     fn delim_of(t: Tok) -> Option<Delim> {
         match t {

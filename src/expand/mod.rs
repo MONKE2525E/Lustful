@@ -536,7 +536,7 @@ impl<'a> ExpandCtx<'a> {
             known,
             file_path: file_path.to_string_lossy().to_string(),
             src,
-            cfg: builtin::CfgEnv { test, debug_assertions: true },
+            cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new() },
         }
     }
     /// The crate name `module_path!` starts with: the file stem, with

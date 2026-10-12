@@ -1,0 +1,10 @@
+# User macros in module files, expanded by the worklist through
+# expand_lexed (the W-MACRO interface). Cross-file macro visibility
+# (a macro used in a file other than its definition file) is not
+# wired yet; each file here defines and uses its own macro.
+[package]
+name = "macro-mods"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

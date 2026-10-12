@@ -795,7 +795,7 @@ fn resolved_setup(
 ) -> Result<(SourceMap, Vec<usize>, Vec<usize>, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
     use crate::resolve::cargo::{self, GraphRequest};
     use crate::resolve::cfg::CfgEnv;
-    use crate::resolve::worklist::{self, CrateInput, NoExpand};
+    use crate::resolve::worklist::{self, CrateInput};
     front.resolved_crate = true;
     let key = &req.session;
     let code2 = |msg: String| Response { stderr: format!("error: {msg}\n"), code: 2, ..Default::default() };
@@ -858,7 +858,7 @@ fn resolved_setup(
             crate_name: crate_name.clone(),
             externs: externs.clone(),
         };
-        match worklist::resolve_crate(&input, &front.interner, &front.known, &NoExpand) {
+        match worklist::resolve_crate(&input, &front.interner, &front.known) {
             Ok(r) => {
                 if r.needs_std && !spliced {
                     let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
