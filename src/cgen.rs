@@ -304,6 +304,24 @@ fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
                 let align = ea.max(4);
                 (align_up(align_up(4, ea) + es, align), align)
             }
+            CTy::Tuple(es) => {
+                if es.is_empty() {
+                    (1, 1) // the emitted `uint8_t unused`
+                } else {
+                    let (mut size, mut align) = (0u64, 1u64);
+                    for e in es {
+                        let (fs, fa) = go(p, e, seen);
+                        size = align_up(size, fa) + fs;
+                        align = align.max(fa);
+                    }
+                    (align_up(size, align), align)
+                }
+            }
+            CTy::Array(e, n) => {
+                let (es, ea) = go(p, e, seen);
+                (es * (*n).max(1), ea)
+            }
+            CTy::Slice(_) => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -356,11 +374,7 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     }
     params.extend(info.params.iter().map(|&t| ctype(&cty(&p.tys, t))));
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    if ret_is_large(p, f) {
-        format!("(void (*)({params}))")
-    } else {
-        format!("({ret} (*)({params}))")
-    }
+    if ret_is_large(p, f) { format!("(void (*)({params}))") } else { format!("({ret} (*)({params}))") }
 }
 
 /// The C signature of function `f`, defined under the C name `f<slot>`.
@@ -373,11 +387,7 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
     }
     params.extend(info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)));
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    if ret_is_large(p, f) {
-        format!("void f{slot}({params})")
-    } else {
-        format!("{ret} f{slot}({params})")
-    }
+    if ret_is_large(p, f) { format!("void f{slot}({params})") } else { format!("{ret} f{slot}({params})") }
 }
 
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
@@ -752,7 +762,8 @@ impl FnGen<'_, '_, '_> {
                     let t = self.tmp();
                     let ret = ctype(&cty(&self.p.tys, info.ret));
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
-                    let _ = writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
+                    let _ =
+                        writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
                     t
                 } else {
                     format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
@@ -819,7 +830,11 @@ impl FnGen<'_, '_, '_> {
                 // Casts to or from a 128-bit struct value are not C casts.
                 match (&from, &to) {
                     (CTy::Int(fi), CTy::Int(ti)) if is128(*fi) && is128(*ti) => {
-                        if fi == ti { a } else { format!("lust_{}_from_{}({a})", int_fn(*ti), int_fn(*fi)) }
+                        if fi == ti {
+                            a
+                        } else {
+                            format!("lust_{}_from_{}({a})", int_fn(*ti), int_fn(*fi))
+                        }
                     }
                     (CTy::Int(fi), _) if is128(*fi) => format!("(({})(({a}).lo))", ctype(&to)),
                     (_, CTy::Int(ti)) if is128(*ti) => {
@@ -1290,7 +1305,10 @@ impl FnGen<'_, '_, '_> {
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
                 let (vv, i, x) = (&vals[0], &vals[1], &vals[2]);
-                let _ = writeln!(self.out, "    lust_vec_insert_at({vv}, {i}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};");
+                let _ = writeln!(
+                    self.out,
+                    "    lust_vec_insert_at({vv}, {i}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};"
+                );
                 "0".into()
             }
             B::VecRemove => {

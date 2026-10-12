@@ -91,7 +91,8 @@ impl Tcc {
         // No asynchronous unwind tables: tcc writes overlapping .eh_frame
         // FDEs (spike K6), which makes the system linker reject its
         // objects. Lust frames never unwind, so the tables are pure cost.
-        let opts = CString::new(if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }).unwrap();
+        let opts =
+            CString::new(if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }).unwrap();
         // SAFETY: a fresh libtcc state; the error vector is boxed so its address is stable.
         unsafe {
             let s = tcc_new();
