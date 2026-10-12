@@ -12,6 +12,13 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Always compile cold: a warm daemon in this directory (or one autostarted by the first
+# test) would serve later tests, and a warm `--emit-c` writes only the changed units, so
+# the SANITIZE build would miss the runtime unit. Cache and daemon behaviour have their
+# own gate (scripts/test-client.sh).
+export LUST_NO_DAEMON=1
+export LUST_DAEMON_SOCKET="$work/no-daemon.sock"
+export LUST_CACHE_DIR="$work/cache"
 rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A unconditional_panic -A warnings)
 filter=${1:-}
 pass=0
