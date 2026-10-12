@@ -219,10 +219,14 @@ impl Reads {
         }
     }
 
-    /// Records a mono call edge to a checked body. `fingerprint` is the body
-    /// fingerprint mono computed; there is no mono stage yet, so no
-    /// production caller records these in S7.
-    #[allow(dead_code)] // First caller is mono (W-MONO, wave B).
+    /// Records a call edge to a checked body whose *body* (not only its
+    /// signature) the reader's result depends on: today, a const fn body
+    /// evaluated while checking a body (a const block, an array length).
+    /// The fingerprint value does not matter yet: `read_fingerprint`
+    /// cannot recompute a body fingerprint, so it reports a sentinel
+    /// that never matches and the reader always rechecks when it is a
+    /// walk candidate. Mono records the same key with a real body
+    /// fingerprint when it lands (W-MONO, wave B).
     pub fn record_checked(&mut self, def: DefId, fingerprint: Fingerprint) {
         self.record(ReadKey::Checked(def), fingerprint, false);
     }
@@ -968,7 +972,6 @@ impl<'a> Program<'a> {
     /// recorded as a `Layout` read. It is separate from the Adt's `Sig`
     /// fingerprint: a method or visibility edit on the type does not
     /// move it, and a field, repr, derive, or discriminant edit does.
-    #[allow(dead_code)] // First callers are mono instance keys and the layout engine (wave A/B).
     pub fn layout_of(&self, reads: &mut Reads, adt: DefId) -> Option<Fingerprint> {
         let known = self.adt_by_def(adt).is_some() || self.defs.get(adt).is_some();
         if !known {
@@ -981,6 +984,20 @@ impl<'a> Program<'a> {
         let fp = layout_fingerprint(self, adt);
         reads.record(ReadKey::Layout(adt), fp, false);
         Some(fp)
+    }
+
+    /// Records a `Layout` read for every Adt named inside one type.
+    /// Body checking uses this where it consumes a layout answer
+    /// directly (`size_of`/`align_of` on a compound written type,
+    /// `offset_of!`, layout queries inside body const evaluation): a
+    /// written-type `Binding` read only names the outermost path, so
+    /// `[S; 2]` or `(S, u8)` would otherwise record nothing for `S`.
+    pub fn record_layout_reads(&self, reads: &mut Reads, tys: &impl TyIntern, t: Ty) {
+        let mut defs = Vec::new();
+        collect_adt_defs(self, tys, t, &mut defs);
+        for def in defs {
+            let _ = self.layout_of(reads, def);
+        }
     }
 
     /// The kind of a def a binding resolved to, through the `Defs` table.
