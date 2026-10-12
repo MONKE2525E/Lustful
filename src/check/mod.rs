@@ -1924,7 +1924,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         "Swap the bounds, or fix the values. An empty range pattern never matches.",
                     );
                 }
-                if bound_tys.iter().any(|&(_, bt)| !self.unify(bt, t)) || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true)) {
+                if bound_tys.iter().any(|&(_, bt)| !self.unify(bt, t))
+                    || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true))
+                {
                     self.err(
                         "L0110",
                         span,

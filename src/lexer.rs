@@ -207,8 +207,20 @@ fn keyword(s: &str) -> Option<Tok> {
 fn reserved(s: &str) -> bool {
     matches!(
         s,
-        "abstract" | "become" | "box" | "do" | "final" | "gen" | "macro" | "override" | "priv" | "try" | "typeof" | "unsized"
-            | "virtual" | "yield"
+        "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "gen"
+            | "macro"
+            | "override"
+            | "priv"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
     )
 }
 
@@ -345,7 +357,10 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::ByteChar
             }
             // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
-            else if s == "r" && b.get(i) == Some(&b'#') && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80) {
+            else if s == "r"
+                && b.get(i) == Some(&b'#')
+                && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80)
+            {
                 i += 1;
                 let name_start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {

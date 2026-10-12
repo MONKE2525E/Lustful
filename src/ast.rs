@@ -96,7 +96,10 @@ pub enum Vis {
     #[default]
     Private,
     Public,
-    Restricted { path: Vec<PathSeg>, span: Span },
+    Restricted {
+        path: Vec<PathSeg>,
+        span: Span,
+    },
 }
 
 /// A lifetime as written, without the leading `'`: `'a`, `'static`, or `'_`.
@@ -337,7 +340,9 @@ pub struct UseTree {
 pub enum UseKind {
     /// Imports the prefix's last segment, renamed with `as` when present.
     /// `self` in a group is a prefix segment naming the module itself.
-    Simple { rename: Option<Sym> },
+    Simple {
+        rename: Option<Sym>,
+    },
     Glob,
     Group(Vec<UseTree>),
 }
@@ -468,7 +473,15 @@ pub enum ForeignItem {
     Fn(FnDef),
     Static(StaticDef),
     /// An opaque foreign type: `type Opaque;`.
-    Type { name: Sym, name_span: Span, vis: Vis, attrs: Vec<Attr>, generics: Generics, where_clause: WhereClause, span: Span },
+    Type {
+        name: Sym,
+        name_span: Span,
+        vis: Vis,
+        attrs: Vec<Attr>,
+        generics: Generics,
+        where_clause: WhereClause,
+        span: Span,
+    },
     MacroCall(MacroCall),
 }
 
@@ -502,7 +515,11 @@ pub enum GenericArg {
     Lifetime(Lifetime),
     Const(ExprId),
     /// An associated binding: `Item = u8`, `Item: Clone`, or `Output = C`.
-    Binding { name: Sym, span: Span, kind: BindingKind },
+    Binding {
+        name: Sym,
+        span: Span,
+        kind: BindingKind,
+    },
 }
 
 /// The right side of an associated binding in generic arguments.
@@ -529,7 +546,13 @@ impl PathSeg {
     /// reject those instead of skipping check `args` themselves.
     pub fn type_args(&self) -> Vec<TyId> {
         match &self.args {
-            GenericArgs::Angle(args) => args.iter().filter_map(|a| match a { GenericArg::Type(t) => Some(*t), _ => None }).collect(),
+            GenericArgs::Angle(args) => args
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArg::Type(t) => Some(*t),
+                    _ => None,
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -541,25 +564,51 @@ impl PathSeg {
 
 pub enum TyExpr {
     Path(Vec<PathSeg>),
-    Ref { lifetime: Option<Lifetime>, mutable: bool, inner: TyId },
+    Ref {
+        lifetime: Option<Lifetime>,
+        mutable: bool,
+        inner: TyId,
+    },
     Unit,
     // ---- AST v2 types: shapes only for now; the parser rejects each form. ----
     /// A tuple type with one or more elements. The empty tuple stays `Unit`.
     Tuple(Vec<TyId>),
     /// `[T; N]`: the element type and the length expression.
-    Array { inner: TyId, len: ExprId },
+    Array {
+        inner: TyId,
+        len: ExprId,
+    },
     /// `[T]`.
     Slice(TyId),
     /// A raw pointer: `*const T` when `mutable` is false, `*mut T` when true.
-    Ptr { mutable: bool, inner: TyId },
+    Ptr {
+        mutable: bool,
+        inner: TyId,
+    },
     /// A function pointer type, with a leading `for<'a, ..>` binder when written.
-    FnPtr { binder: Vec<Lifetime>, qual: FnQual, inputs: Vec<FtyParam>, variadic: bool, ret: Option<TyId> },
+    FnPtr {
+        binder: Vec<Lifetime>,
+        qual: FnQual,
+        inputs: Vec<FtyParam>,
+        variadic: bool,
+        ret: Option<TyId>,
+    },
     /// `dyn Bounds + 'a`: trait bounds plus a written lifetime bound.
-    Dyn { binder: Vec<Lifetime>, bounds: Vec<TraitBound>, lifetime: Option<Lifetime> },
+    Dyn {
+        binder: Vec<Lifetime>,
+        bounds: Vec<TraitBound>,
+        lifetime: Option<Lifetime>,
+    },
     /// `impl Bounds` in argument, return, or associated position.
-    ImplTrait { bounds: Vec<TraitBound> },
+    ImplTrait {
+        bounds: Vec<TraitBound>,
+    },
     /// A qualified path: `<SelfTy as Trait>::Segs`.
-    QPath { self_ty: TyId, trait_path: Vec<PathSeg>, segs: Vec<PathSeg> },
+    QPath {
+        self_ty: TyId,
+        trait_path: Vec<PathSeg>,
+        segs: Vec<PathSeg>,
+    },
     /// The never type `!`.
     Never,
     /// A parenthesized type `(T)`.
@@ -588,13 +637,26 @@ pub struct Block {
 
 pub enum Stmt {
     /// A `let` statement. `els` is the block of a `let .. else { .. }` form.
-    Let { pat: PatId, ty: Option<TyId>, init: Option<ExprId>, els: Option<BlockId>, attrs: Vec<Attr>, span: Span },
-    Expr { expr: ExprId, semi: bool },
+    Let {
+        pat: PatId,
+        ty: Option<TyId>,
+        init: Option<ExprId>,
+        els: Option<BlockId>,
+        attrs: Vec<Attr>,
+        span: Span,
+    },
+    Expr {
+        expr: ExprId,
+        semi: bool,
+    },
     /// An item inside a function body: an index into `Ast::stmt_items`.
     Item(u32),
     /// A macro call in statement position (`m!(..);`). `semi` records whether
     /// a `;` followed a `()` or `[]` call, which changes its type to unit.
-    Macro { call: MacroCall, semi: bool },
+    Macro {
+        call: MacroCall,
+        semi: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -701,33 +763,104 @@ pub enum Expr {
     Path(Vec<PathSeg>),
     SelfValue,
     Block(BlockId),
-    If { cond: ExprId, then: BlockId, els: Option<ExprId> },
-    While { label: Option<Label>, cond: ExprId, body: BlockId },
-    Loop { label: Option<Label>, body: BlockId },
-    For { label: Option<Label>, pat: PatId, iter: ExprId, body: BlockId },
-    Match { scrut: ExprId, arms: Vec<Arm> },
-    Call { callee: ExprId, args: Vec<ExprId> },
+    If {
+        cond: ExprId,
+        then: BlockId,
+        els: Option<ExprId>,
+    },
+    While {
+        label: Option<Label>,
+        cond: ExprId,
+        body: BlockId,
+    },
+    Loop {
+        label: Option<Label>,
+        body: BlockId,
+    },
+    For {
+        label: Option<Label>,
+        pat: PatId,
+        iter: ExprId,
+        body: BlockId,
+    },
+    Match {
+        scrut: ExprId,
+        arms: Vec<Arm>,
+    },
+    Call {
+        callee: ExprId,
+        args: Vec<ExprId>,
+    },
     /// A method call. `generic_args` is the turbofish (`recv.m::<T>(..)`),
     /// with lifetime, const, and binding arguments in written order.
-    MethodCall { recv: ExprId, name: Sym, name_span: Span, generic_args: Vec<GenericArg>, args: Vec<ExprId> },
-    Field { base: ExprId, name: Sym },
-    Index { base: ExprId, index: ExprId },
-    Binary { op: BinOp, lhs: ExprId, rhs: ExprId },
-    Unary { op: UnOp, expr: ExprId },
-    Cast { expr: ExprId, ty: TyId },
+    MethodCall {
+        recv: ExprId,
+        name: Sym,
+        name_span: Span,
+        generic_args: Vec<GenericArg>,
+        args: Vec<ExprId>,
+    },
+    Field {
+        base: ExprId,
+        name: Sym,
+    },
+    Index {
+        base: ExprId,
+        index: ExprId,
+    },
+    Binary {
+        op: BinOp,
+        lhs: ExprId,
+        rhs: ExprId,
+    },
+    Unary {
+        op: UnOp,
+        expr: ExprId,
+    },
+    Cast {
+        expr: ExprId,
+        ty: TyId,
+    },
     /// A borrow. `raw` marks `&raw const` and `&raw mut`, where `mutable`
     /// says which of the two was written.
-    Ref { mutable: bool, raw: bool, expr: ExprId },
+    Ref {
+        mutable: bool,
+        raw: bool,
+        expr: ExprId,
+    },
     Deref(ExprId),
-    Assign { lhs: ExprId, rhs: ExprId },
-    AssignOp { op: BinOp, lhs: ExprId, rhs: ExprId },
+    Assign {
+        lhs: ExprId,
+        rhs: ExprId,
+    },
+    AssignOp {
+        op: BinOp,
+        lhs: ExprId,
+        rhs: ExprId,
+    },
     /// A struct literal. `update` is the base in `S { a: 1, ..base }`.
-    StructLit { path: Vec<PathSeg>, fields: Vec<(Sym, Span, ExprId)>, update: Option<ExprId> },
-    Range { lo: Option<ExprId>, hi: Option<ExprId>, inclusive: bool },
-    Break { label: Option<Label>, value: Option<ExprId> },
+    StructLit {
+        path: Vec<PathSeg>,
+        fields: Vec<(Sym, Span, ExprId)>,
+        update: Option<ExprId>,
+    },
+    Range {
+        lo: Option<ExprId>,
+        hi: Option<ExprId>,
+        inclusive: bool,
+    },
+    Break {
+        label: Option<Label>,
+        value: Option<ExprId>,
+    },
     Continue(Option<Label>),
     Return(Option<ExprId>),
-    Macro { kind: MacroKind, args: Vec<ExprId>, fmt: Vec<FmtPiece>, repeat: bool },
+    Macro {
+        kind: MacroKind,
+        args: Vec<ExprId>,
+        fmt: Vec<FmtPiece>,
+        repeat: bool,
+    },
     // ---- AST v2 expressions: shapes only for now; the parser rejects each form. ----
     /// A float literal: an index into the AST string table holding its text.
     Float(u32),
@@ -736,27 +869,52 @@ pub enum Expr {
     /// An array literal `[a, b, c]`.
     Array(Vec<ExprId>),
     /// An array repeat literal `[value; len]`.
-    ArrayRepeat { value: ExprId, len: ExprId },
+    ArrayRepeat {
+        value: ExprId,
+        len: ExprId,
+    },
     /// A closure: `move |params| -> Ret body`, with `async` when written.
     /// The body is an expression (a block body is `Expr::Block`).
-    Closure { is_move: bool, is_async: bool, params: Vec<ClosureParam>, ret: Option<TyId>, body: ExprId },
+    Closure {
+        is_move: bool,
+        is_async: bool,
+        params: Vec<ClosureParam>,
+        ret: Option<TyId>,
+        body: ExprId,
+    },
     /// The `?` operator.
     Try(ExprId),
     /// An `.await` postfix.
     Await(ExprId),
     /// An `async` block: `async move { .. }`.
-    AsyncBlock { is_move: bool, body: BlockId },
+    AsyncBlock {
+        is_move: bool,
+        body: BlockId,
+    },
     /// An `unsafe { .. }` block.
     UnsafeBlock(BlockId),
     /// A labeled block: `'a: { .. }`.
-    LabeledBlock { label: Label, body: BlockId },
+    LabeledBlock {
+        label: Label,
+        body: BlockId,
+    },
     /// A `let` in an `if` or `while` condition, including let chains joined
     /// by `&&`. Only valid as (part of) a condition.
-    Let { pat: PatId, scrut: ExprId },
+    Let {
+        pat: PatId,
+        scrut: ExprId,
+    },
     /// A tuple field access: `value.0`.
-    TupleField { base: ExprId, index: u32 },
+    TupleField {
+        base: ExprId,
+        index: u32,
+    },
     /// A qualified path: `<SelfTy as Trait>::Segs`.
-    QPath { self_ty: TyId, trait_path: Vec<PathSeg>, segs: Vec<PathSeg> },
+    QPath {
+        self_ty: TyId,
+        trait_path: Vec<PathSeg>,
+        segs: Vec<PathSeg>,
+    },
     /// An inline const block: `const { .. }`.
     ConstBlock(BlockId),
     /// The inferred expression `_` (const generic arguments and the like).
@@ -797,17 +955,33 @@ pub enum Pat {
     Tuple(Vec<PatId>),
     /// A slice pattern: `[first, rest @ .., last]`. `middle`, when present,
     /// is the pattern bound to the middle slice (a binding or `_`).
-    Slice { prefix: Vec<PatId>, middle: Option<PatId>, suffix: Vec<PatId> },
+    Slice {
+        prefix: Vec<PatId>,
+        middle: Option<PatId>,
+        suffix: Vec<PatId>,
+    },
     /// A reference pattern: `&pat` or `&mut pat`.
-    Ref { mutable: bool, inner: PatId },
+    Ref {
+        mutable: bool,
+        inner: PatId,
+    },
     /// An `@` binding: `name @ pat`, with `ref` and `mut` as written.
-    At { name: Sym, mutable: bool, by_ref: bool, inner: PatId },
+    At {
+        name: Sym,
+        mutable: bool,
+        by_ref: bool,
+        inner: PatId,
+    },
     /// A rest pattern `..` inside a tuple, tuple-struct, or slice pattern.
     Rest,
     /// A parenthesized pattern `(pat)`.
     Paren(PatId),
     /// A qualified path pattern: `<SelfTy as Trait>::CONST`.
-    QPath { self_ty: TyId, trait_path: Vec<PathSeg>, segs: Vec<PathSeg> },
+    QPath {
+        self_ty: TyId,
+        trait_path: Vec<PathSeg>,
+        segs: Vec<PathSeg>,
+    },
     /// A macro call in pattern position, as raw token trees.
     MacroCall(MacroCall),
 }

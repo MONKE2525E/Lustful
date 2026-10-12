@@ -543,7 +543,12 @@ impl<'a> Parser<'a> {
             } else {
                 AttrInput::None
             };
-            let attr = Attr { style: if inner { AttrStyle::Inner } else { AttrStyle::Outer }, path: path.clone(), input, span: start.to(name_span) };
+            let attr = Attr {
+                style: if inner { AttrStyle::Inner } else { AttrStyle::Outer },
+                path: path.clone(),
+                input,
+                span: start.to(name_span),
+            };
             let k = self.known;
             if path.len() > 1 {
                 // Tool attributes under a known tool namespace are ignored.
@@ -718,7 +723,12 @@ impl<'a> Parser<'a> {
         let start = self.span();
         let leading_colon = self.eat(Tok::PathSep);
         if self.eat(Tok::LBrace) {
-            return Ok(UseTree { leading_colon, prefix: Vec::new(), kind: UseKind::Group(self.use_group()?), span: start.to(self.prev_span()) });
+            return Ok(UseTree {
+                leading_colon,
+                prefix: Vec::new(),
+                kind: UseKind::Group(self.use_group()?),
+                span: start.to(self.prev_span()),
+            });
         }
         if self.eat(Tok::Star) {
             return Ok(UseTree { leading_colon, prefix: Vec::new(), kind: UseKind::Glob, span: start.to(self.prev_span()) });
@@ -1134,7 +1144,16 @@ impl<'a> Parser<'a> {
             let stmt_attrs = self.part_attributes()?;
             if matches!(
                 self.peek(),
-                Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Mod | Tok::Trait | Tok::Const | Tok::Static | Tok::Type
+                Tok::Fn
+                    | Tok::Struct
+                    | Tok::Enum
+                    | Tok::Impl
+                    | Tok::Use
+                    | Tok::Mod
+                    | Tok::Trait
+                    | Tok::Const
+                    | Tok::Static
+                    | Tok::Type
                     | Tok::Extern
             ) {
                 return Err(self.reject(C_CORE, "items inside function bodies"));
@@ -1660,7 +1679,8 @@ impl<'a> Parser<'a> {
         };
         let span = start.to(self.prev_span());
         let wild = self.push_pat(Pat::Wild, span);
-        let arms = vec![Arm { attrs: Vec::new(), pat, guard: None, body: then_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: els }];
+        let arms =
+            vec![Arm { attrs: Vec::new(), pat, guard: None, body: then_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: els }];
         Ok(self.push_expr(Expr::Match { scrut, arms }, span))
     }
 
@@ -1674,7 +1694,8 @@ impl<'a> Parser<'a> {
         let body_e = self.push_expr(Expr::Block(body), span);
         let brk = self.push_expr(Expr::Break { label: None, value: None }, span);
         let wild = self.push_pat(Pat::Wild, span);
-        let arms = vec![Arm { attrs: Vec::new(), pat, guard: None, body: body_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: brk }];
+        let arms =
+            vec![Arm { attrs: Vec::new(), pat, guard: None, body: body_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: brk }];
         let m = self.push_expr(Expr::Match { scrut, arms }, span);
         let block = self.push_block(Block { stmts: vec![Stmt::Expr { expr: m, semi: true }], tail: None, span });
         Ok(self.push_expr(Expr::Loop { label: None, body: block }, span))
