@@ -893,6 +893,10 @@ pub(super) fn plain_inherent_probe(
 pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
     use crate::check::object::{self, DynRecv};
     let p = cx.p;
+    // At step `&dyn P` the by-value group's pointee variant probes
+    // `dyn P` for `&self` methods, ahead of any trait method that needs
+    // an autoref there (a blanket `impl<T: ?Sized> Tr for &T`), as in
+    // rustc; the call reborrows through the step.
     let (step, form, derefs) = (probe.self_ty, probe.filter, derefs + probe.extra_derefs);
     let Some(principal) = object::principal_of(&cx.tys, step) else { return Probe::Miss };
     let form_of = |k: Option<SelfKind>| match k {

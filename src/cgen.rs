@@ -1630,10 +1630,23 @@ impl FnGen<'_, '_, '_> {
                 // A slice place (a deref of a fat value, or a bare-slice
                 // temporary from a range index) is already the fat value;
                 // a place holding a slice reference takes an address as usual.
+                // The C form cannot tell a `&[T]`/`&dyn` value from the
+                // unsized place behind it, so ask the place's own type:
+                // `&*r` for `r: &&dyn Tr` borrows the `&dyn` value.
+                let sem = self.place_sem_ty(pl).map(|ty| self.body.tys.kind(ty));
                 let slice_place = matches!(t, CTy::Slice(_))
-                    && (matches!(pl.proj.last(), Some(Proj::Deref))
-                        || matches!(self.body.tys.kind(self.body.locals[pl.local as usize].ty), TyKind::Slice(_)));
-                let dyn_place = t == CTy::Dyn && matches!(pl.proj.last(), Some(Proj::Deref));
+                    && match sem {
+                        Some(k) => matches!(k, TyKind::Slice(_)),
+                        None => {
+                            matches!(pl.proj.last(), Some(Proj::Deref))
+                                || matches!(self.body.tys.kind(self.body.locals[pl.local as usize].ty), TyKind::Slice(_))
+                        }
+                    };
+                let dyn_place = t == CTy::Dyn
+                    && match sem {
+                        Some(k) => matches!(k, TyKind::Dyn(..)),
+                        None => matches!(pl.proj.last(), Some(Proj::Deref)),
+                    };
                 if t == CTy::Str || slice_place || dyn_place { e } else { format!("(&{e})") }
             }
             Rvalue::SliceOf(pl) => {
@@ -1965,6 +1978,33 @@ impl FnGen<'_, '_, '_> {
                 t
             }
         }
+    }
+
+    /// The semantic type of a place, through derefs, fields, variants,
+    /// and indexes. None for a projection this walk does not follow.
+    fn place_sem_ty(&self, pl: &Place) -> Option<Ty> {
+        let tys = &self.body.tys;
+        let mut t = self.body.locals[pl.local as usize].ty;
+        let mut variant = 0usize;
+        for pr in &pl.proj {
+            t = match (tys.kind(t), pr) {
+                (TyKind::Ref(_, _, inner), Proj::Deref) => inner,
+                (_, Proj::Downcast(v)) => {
+                    variant = *v as usize;
+                    continue;
+                }
+                (TyKind::Tuple(ts), Proj::Field(i)) => *tys.tys_of(ts).get(*i as usize)?,
+                (TyKind::Adt(..), Proj::Field(i)) => match tys.local_adt(t) {
+                    Some(a) => self.p.adt(a).variants.get(variant)?.fields.get(*i as usize)?.ty,
+                    None => tys.option_elem(t)?,
+                },
+                (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => e,
+                (_, Proj::Index(_)) => tys.vec_elem(t)?,
+                _ => return None,
+            };
+            variant = 0;
+        }
+        Some(t)
     }
 
     /// The C name of vtable `vid` in this function, emitting it (and the

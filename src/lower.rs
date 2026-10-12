@@ -873,6 +873,28 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let op = ops.into_iter().next().unwrap_or(Operand::Const(crate::ir::Const::Unit));
                         self.set_or_temp(dest, Rvalue::Res(ty, false, op), ty, span)
                     }
+                    // `<dyn P as Tr>::m(d, ..)`: the receiver is the first
+                    // argument, already a dyn reference.
+                    Res::DynMethod { owner, slot, .. } => {
+                        let Expr::Call { callee, .. } = p.ast.expr(e) else { return };
+                        let Expr::QPath { segs, .. } = p.ast.expr(*callee) else { return };
+                        let name = segs[0].name;
+                        let mut ops = ops;
+                        let recv_ty = self.coerced_ty(args[0]);
+                        let (m, recv_dyn) = match self.kind(recv_ty) {
+                            TyKind::Ref(_, m, inner) => (m.is_mut(), inner),
+                            _ => return,
+                        };
+                        let r = ops.remove(0);
+                        let r = self.dyn_receiver(r, recv_dyn, m, owner, name, span);
+                        ops.insert(0, r);
+                        let t = self.temp(ty);
+                        self.call_into(CallTarget::Dyn(slot), ops, Place::local(t), span);
+                        if let Some(d) = dest {
+                            let o = self.operand_from(Place::local(t), ty);
+                            self.assign(d.clone(), Rvalue::Use(o), span);
+                        }
+                    }
                     _ => return,
                 }
             }

@@ -345,9 +345,35 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
             }
             info.unsupported.as_ref().map(|u| crate::check::generics::dyn_not_yet(span, u))
         }
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => dyn_type_diag(p, tys, e, span),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().find_map(|&e| dyn_type_diag(p, tys, e, span)),
-        TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => {
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) => dyn_type_diag(p, tys, e, span),
+        // A dyn value has no size, so it cannot be an element (rustc E0277).
+        TyKind::Slice(e) | TyKind::Array(e, _) => unsized_dyn_diag(p, tys, e, span).or_else(|| dyn_type_diag(p, tys, e, span)),
+        TyKind::Tuple(ts) => {
+            let elems = tys.tys_of(ts);
+            let n = elems.len();
+            elems.iter().enumerate().find_map(|(i, &e)| {
+                let unsized_here = if i + 1 < n { unsized_dyn_diag(p, tys, e, span) } else { None };
+                unsized_here.or_else(|| dyn_type_diag(p, tys, e, span))
+            })
+        }
+        TyKind::Adt(d, a) => {
+            // A dyn arg for a param that needs `Sized` (`Vec<dyn Tr>`).
+            let sized_param = |i: usize| match p.adt_by_def(d) {
+                Some(adt) => p.gx.adt_generics.get(adt.0 as usize).is_none_or(|g| {
+                    g.predicates.iter().any(|pred| {
+                        matches!(pred, Predicate::Trait(b) if b.value.def == p.gx.lang.sized
+                            && matches!(p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|t| p.tys.kind(t)), Some(TyKind::Param(q)) if q.0 as usize == i))
+                    })
+                }),
+                None => true,
+            };
+            tys.args(a).iter().enumerate().find_map(|(i, g)| {
+                let e = g.as_ty()?;
+                let unsized_here = if sized_param(i) { unsized_dyn_diag(p, tys, e, span) } else { None };
+                unsized_here.or_else(|| dyn_type_diag(p, tys, e, span))
+            })
+        }
+        TyKind::Projection(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => {
             tys.args(a).iter().find_map(|g| g.as_ty().and_then(|e| dyn_type_diag(p, tys, e, span)))
         }
         TyKind::FnPtr(sig) => {
@@ -356,6 +382,20 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
         }
         _ => None,
     }
+}
+
+/// The size error for a bare dyn type in a position that needs a
+/// sized type.
+fn unsized_dyn_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Option<Diag> {
+    if !matches!(tys.kind(t), TyKind::Dyn(..)) {
+        return None;
+    }
+    Some(Diag::new(
+        "L0110",
+        span,
+        format!("the size for values of type `{}` cannot be known here", crate::check::collect::ty_name(p, tys, t)),
+        "Put the dyn value behind a reference: `&dyn Trait`.",
+    ))
 }
 
 /// True when trait `want` is `principal` or one of its supertraits
@@ -547,6 +587,17 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
     match tys.kind(t) {
         TyKind::Dyn(b, Region::Static) => tys.intern(TyKind::Dyn(b, Region::Erased)),
         _ => t,
+    }
+}
+
+/// True when a dyn type occurs anywhere in `t`.
+pub fn mentions_dyn(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Dyn(..) => true,
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => mentions_dyn(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| mentions_dyn(tys, e)),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| mentions_dyn(tys, e))),
+        _ => false,
     }
 }
 

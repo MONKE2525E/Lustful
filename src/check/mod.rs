@@ -3275,7 +3275,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.exhaustive(st, arms, span);
                 result.unwrap_or(NEVER)
             }
-            Expr::Call { callee, args } => self.call(e, *callee, args, span),
+            Expr::Call { callee, args } => self.call(e, *callee, args, span, expected),
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
                 self.method_call(e, *recv, *name, *name_span, args, generic_args, expected)
             }
@@ -3584,7 +3584,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld: 0, rd });
                 UNIT
             }
-            Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span),
+            Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span, expected),
             Expr::Range { .. } => {
                 self.errs.push(unsupported(span, "ranges outside `for` loops"));
                 ERROR
@@ -5095,6 +5095,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.set_res(e, Res::DefaultVal);
             return Some(base);
         }
+        // `<dyn P as Tr>::m(d)` and `<dyn P>::m(d)` (ARCH 2.8): an
+        // `impl dyn P` method, or an object candidate through the vtable.
+        if let Some(t) = self.dyn_assoc_call(e, base, hint, name, args, span) {
+            return Some(t);
+        }
         // The trait: written, or the template check's pick, or the
         // where clauses of a type parameter (rustc probes those as
         // inherent candidates first), or every trait in scope.
@@ -5256,7 +5261,55 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
+    /// A path call on a dyn Self type: the `impl dyn P` method of that
+    /// name, else the one object candidate (of the hinted trait, when
+    /// written), called through the vtable with the receiver as the
+    /// first argument. None when `base` is not a dyn type or nothing
+    /// matches (the caller reports).
+    fn dyn_assoc_call(&mut self, e: ExprId, base: Ty, hint: Option<TraitRef>, name: Sym, args: &[ExprId], span: Span) -> Option<Ty> {
+        let p = self.p;
+        let base = self.resolve(base);
+        let principal = object::principal_of(&self.tys, base)?;
+        let key = object::erase_dyn_region(&mut self.tys, base);
+        if hint.is_none()
+            && let Some(&f) = p.gx.dyn_inherent.get(&(key, name))
+        {
+            let (params, ret) = {
+                let info = p.fn_info(f);
+                (info.params.clone(), info.ret)
+            };
+            self.set_res(e, Res::Fn(f));
+            self.check_args(&params, args, span);
+            return Some(ret);
+        }
+        let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut self.tys, principal, name)
+            .into_iter()
+            .filter(|c| hint.is_none_or(|h| h.def == c.owner.def))
+            .collect();
+        if cands.len() != 1 {
+            return None;
+        }
+        let c = cands.into_iter().next().unwrap();
+        let slot = match c.call {
+            Ok((slot, _)) => slot,
+            Err(why) => {
+                let tn = self.tn(base);
+                self.err("L0703", span, format!("the method `{}` cannot be called on `{tn}`: {why}", self.name(name)), "Call it on a concrete type.");
+                return Some(ERROR);
+            }
+        };
+        let tm = p.gx.trait_methods.get(&c.def)?;
+        let (tparams, tret) = (tm.params.clone(), tm.ret);
+        let mut sargs: Vec<GenericArg> = self.tys.args(c.owner.args).to_vec();
+        sargs[0] = GenericArg::Ty(base);
+        let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut self.tys, t, &sargs)).collect();
+        let ret = subst(&mut self.tys, tret, &sargs);
+        self.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs: 0, autoref: Autoref::None });
+        self.check_args(&params, args, span);
+        Some(self.normalize_here(ret))
+    }
+
+    fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span, expected: Option<Ty>) -> Ty {
         let p = self.p;
         // A callee that names a local (or is not a path at all)
         // is a value call: closures and Fn-bound parameters.
@@ -5525,6 +5578,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if args.len() != 1 {
                 self.err("L0105", span, "`Some` takes one argument", "Write `Some(value)`.");
                 return ERROR;
+            }
+            // Under an `Option<&dyn Tr>` expectation the argument is a
+            // coercion site for `&dyn Tr`, as rustc's expected inputs make it.
+            let want = expected.and_then(|t| self.tys.option_elem(self.resolve(t))).filter(|&t| self.dyn_ref_expectation(Some(t)).is_some());
+            if let Some(want) = want {
+                self.expect_expr(args[0], want);
+                return self.tys.mk_option(want);
             }
             let t = self.expr(args[0], None);
             return self.tys.mk_option(t);
@@ -7271,7 +7331,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         result
     }
 
-    fn struct_lit(&mut self, e: ExprId, path: &[ast::PathSeg], fields: &[(Sym, Span, ExprId)], update: Option<ExprId>, span: Span) -> Ty {
+    fn struct_lit(
+        &mut self,
+        e: ExprId,
+        path: &[ast::PathSeg],
+        fields: &[(Sym, Span, ExprId)],
+        update: Option<ExprId>,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Ty {
         let p = self.p;
         let target = if path.len() == 1 {
             let n = path[0].name;
@@ -7310,6 +7378,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // the written fields (and any turbofish): field types are
         // the template's, substituted with fresh variables.
         let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
+        // An expectation that names dyn types (`W<&dyn Tr>`) fixes the
+        // params first, so the fields become coercion sites for them,
+        // as rustc's expected inputs make them (ARCH 2.8).
+        if !gen_args.is_empty()
+            && let Some(want) = expected.map(|t| self.deep(t))
+            && let Some((def, eargs)) = self.tys.adt_parts(want)
+            && def == p.gx.adt_info[a.0 as usize].0
+            && object::mentions_dyn(&self.tys, want)
+        {
+            let eargs: Vec<GenericArg> = self.tys.args(eargs).to_vec();
+            for (g, w) in gen_args.iter().zip(eargs) {
+                if let (GenericArg::Ty(x), GenericArg::Ty(y)) = (*g, w) {
+                    self.unify(x, y);
+                }
+            }
+        }
         let variant = &p.adt(a).variants[v as usize];
         // Tuple structs take index fields here (`T { 0: 5, ..a }`); their
         // field names are the index as a synthetic Sym, so the matching
