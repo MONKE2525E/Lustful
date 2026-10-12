@@ -411,16 +411,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.tys.intern(TyKind::Tuple(ts))
             }
             TyKind::Adt(d, a) => {
-                let old: Vec<GenericArg> = self.tys.args(a).to_vec();
-                let new: Vec<GenericArg> = old
-                    .iter()
-                    .map(|&g| match g {
+                // Rebuild each type arg in place: the new list is allocated only
+                // when some arg actually changes (the common deep() case does not).
+                let n = self.tys.args(a).len();
+                let mut new: Option<Vec<GenericArg>> = None;
+                for i in 0..n {
+                    let g = self.tys.args(a)[i];
+                    let g2 = match g {
                         GenericArg::Ty(e) => GenericArg::Ty(self.rebuild(e, zonk)),
                         other => other,
-                    })
-                    .collect();
-                let a = self.tys.intern_args(&new);
-                self.tys.intern(TyKind::Adt(d, a))
+                    };
+                    if g2 != g {
+                        let v = new.get_or_insert_with(|| self.tys.args(a).to_vec());
+                        v[i] = g2;
+                    } else if let Some(v) = &mut new {
+                        v[i] = g2;
+                    }
+                }
+                match new {
+                    None => t,
+                    Some(v) => {
+                        let a = self.tys.intern_args(&v);
+                        self.tys.intern(TyKind::Adt(d, a))
+                    }
+                }
             }
             _ => t,
         }
@@ -473,10 +487,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Type args unify; lifetime and const args must already be equal. Indexed
     /// reads only, so the common one-element `Vec<T>` case allocates nothing.
     fn unify_args(&mut self, a: ArgsId, b: ArgsId) -> bool {
-        if self.tys.args(a).len() != self.tys.args(b).len() {
+        let n = self.tys.args(a).len();
+        if n != self.tys.args(b).len() {
             return false;
         }
-        for i in 0..self.tys.args(a).len() {
+        for i in 0..n {
             let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {
                 (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
                 (x, y) => x == y,
@@ -1426,11 +1441,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (Some(BuiltinTy::Vec), _) => {
                 let elem = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
-                let opt_ref = {
-                    let r = self.tys.mk_ref(false, elem);
-                    self.tys.mk_option(r)
-                };
-                let opt = self.tys.mk_option(elem);
+                // Return types are built only in the arms that return them:
+                // interning has no visible effect, so the common arms skip it.
                 if name == k.len {
                     Some((B::VecLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
@@ -1438,12 +1450,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if name == k.push {
                     Some((B::VecPush, Autoref::RefMut, vec![elem], UNIT))
                 } else if name == k.pop {
+                    let opt = self.tys.mk_option(elem);
                     Some((B::VecPop, Autoref::RefMut, vec![], opt))
                 } else if name == k.get {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecGet, Autoref::Ref, vec![USIZE], opt_ref))
                 } else if name == k.first {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecFirst, Autoref::Ref, vec![], opt_ref))
                 } else if name == k.last {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecLast, Autoref::Ref, vec![], opt_ref))
                 } else if name == k.contains {
                     let r = self.tys.mk_ref(false, elem);
@@ -1588,7 +1607,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn str_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
         let k = self.p.known;
-        let chars = self.tys.mk_chars();
+        let chars = CHARS;
         let table = [
             (k.contains, B::StrContains, vec![REF_STR], BOOL),
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),

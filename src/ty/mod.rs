@@ -648,11 +648,6 @@ pub trait TyIntern {
         let def = self.builtins().option;
         self.mk_adt(def, &[GenericArg::Ty(elem)])
     }
-    /// `str::Chars`, pre-interned in the global store.
-    fn mk_chars(&mut self) -> Ty {
-        let def = self.builtins().chars;
-        self.intern(TyKind::Adt(def, EMPTY_ARGS))
-    }
     /// The `(def, args)` of an Adt type, builtin or user.
     fn adt_parts(&self, t: Ty) -> Option<(DefId, ArgsId)> {
         match self.kind(t) {
@@ -687,8 +682,14 @@ pub trait TyIntern {
     }
     /// The session-local index of a user Adt type. None for builtin Adts and
     /// non-Adt types; builtin checks must run first where both can appear.
+    /// The builtin sentinel crate answers without a table lookup, which keeps
+    /// this at the old closed-kind match cost on builtin receivers.
     fn local_adt(&self, t: Ty) -> Option<AdtId> {
-        self.local_adt_of(self.adt_parts(t)?.0)
+        let (def, _) = self.adt_parts(t)?;
+        if def.krate == BUILTIN_CRATE {
+            return None;
+        }
+        self.local_adt_of(def)
     }
 }
 
