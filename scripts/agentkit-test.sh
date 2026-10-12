@@ -98,7 +98,7 @@ grep -q '"kind":"truncated"' <<<"$out"; check daemon-max-errors $? "daemon must 
 diff -q "$work/explain.txt" "$root/docs/errors/L0301.md" >/dev/null; check explain-text $? "output must be the doc file"
 "$lust" explain l0301 >/dev/null 2>&1; [ $? -eq 0 ]; check explain-lower $? "lowercase code must work"
 "$lust" explain L9999 >/dev/null 2>&1; [ $? -eq 2 ]; check explain-unknown $? "unknown code must exit 2"
-"$lust" explain 2>/dev/null | grep -q "L0301: use of moved value"; check explain-list $? "no argument must list codes"
+"$lust" explain > "$work/explain-list.txt" 2>/dev/null; grep -q "L0301: use of moved value" "$work/explain-list.txt"; check explain-list $? "no argument must list codes"
 
 # --- 4. capabilities ---
 "$lust" capabilities --json > "$work/cap.json" 2>/dev/null; [ $? -eq 0 ]; check cap-exit $? "must exit 0"
