@@ -196,10 +196,31 @@ struct Ck<'b, 'p, 'a> {
     reach: Vec<BitSet>,
     /// True in the pass that only collects `escaped` loans.
     collecting: bool,
+    /// Defs of Adts with a user `Drop` impl (any impl of the lang `Drop`
+    /// trait whose Self head is that Adt). Computed once per body from
+    /// the impl index; the partial-move checks below read it.
+    drop_heads: HashSet<crate::def::DefId>,
+}
+
+/// The Adt defs that have a user `Drop` impl: every impl of the lang
+/// `Drop` trait whose Self type head is an Adt. Conditional impls
+/// count (the partial-move checks are conservative).
+fn drop_heads(p: &Program) -> HashSet<crate::def::DefId> {
+    let mut out = HashSet::new();
+    for &id in p.gx.index.impls_of_trait(p.gx.lang.drop) {
+        let rec = p.gx.index.get(id);
+        if let Some(self_ty) = p.tys.args(rec.trait_ref.args).first().and_then(|g| g.as_ty()) {
+            if let TyKind::Adt(def, _) = p.tys.kind(self_ty) {
+                out.insert(def);
+            }
+        }
+    }
+    out
 }
 
 /// Borrow-checks one function body.
 pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
+    let drop_heads = drop_heads(p);
     let mut ck = Ck {
         p,
         body,
@@ -217,6 +238,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         loan_stmt: Vec::new(),
         reach: Vec::new(),
         collecting: false,
+        drop_heads,
     };
     ck.collect_loans();
     ck.escaped = BitSet::new(ck.loans.len());
@@ -1114,11 +1136,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 // A move out of a local, or out of one of its fields. Moving one field is a
                 // partial move: sibling fields stay usable, but the moved field and every
                 // value that contains it do not, until the field is assigned again. Rust
-                // also forbids partial moves out of a type with a `Drop` impl (E0509).
-                // Lust rejects trait impls, so no lust type has a user `Drop` impl yet and
-                // every struct, enum, and `Option` here may be moved out of by field. When
-                // `Drop` impls land, reject a non-empty path for such a root type here.
+                // also forbids partial moves out of a type with a `Drop` impl (E0509);
+                // `check_partial_move` enforces that, plus one lust limit: codegen
+                // zeroes a moved-out field and drops the husk later, which is exact
+                // for `String`/`Vec` fields but would run a user `Drop` impl on the
+                // zeroed value, so such moves reject until drop elaboration lands.
                 let (path, exact) = field_prefix(p);
+                if exact && !path.is_empty() {
+                    self.check_partial_move(p, span);
+                }
                 if exact {
                     let l = p.local as usize;
                     if path.is_empty() {
@@ -1135,6 +1161,147 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
             Operand::Const(_) => {}
+        }
+    }
+
+    /// Follows a `Param(i)` head through `env` (the type arguments of
+    /// the Adt application the type was read from). An unresolvable
+    /// param stays a param: it is a generic of the enclosing fn, whose
+    /// drop behavior is unknown here.
+    fn head_resolve(&self, mut t: Ty, env: &[Ty]) -> Ty {
+        while let TyKind::Param(p) = self.body.tys.kind(t) {
+            match env.get(p.0 as usize) {
+                Some(&next) if next != t => t = next,
+                _ => break,
+            }
+        }
+        t
+    }
+
+    /// The type arguments of an Adt application, head-resolved through
+    /// `env`, as the env for reading that Adt's field types.
+    fn adt_env(&self, t: Ty, env: &[Ty]) -> Vec<Ty> {
+        match self.body.tys.adt_parts(t) {
+            Some((_, args)) => self.body.tys.args(args).iter().map(|g| self.head_resolve(g.as_ty().unwrap_or(ERROR), env)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// True if dropping a zeroed value of type `t` (in `env` terms) can
+    /// run a user `Drop` impl. Codegen zeroes a moved-out field so the
+    /// husk drop skips it; that is exact for `String` and `Vec` (a zero
+    /// length drops nothing) but a user `Drop` impl runs on the zero
+    /// value, which rustc never does. Unknown params count as yes.
+    fn zero_drop_observable(&self, t: Ty, env: &[Ty], depth: u32) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let t = self.head_resolve(t, env);
+        match self.body.tys.kind(t) {
+            TyKind::Param(_) => true,
+            TyKind::Tuple(ts) => self.body.tys.tys_of(ts).iter().any(|&e| self.zero_drop_observable(e, env, depth + 1)),
+            TyKind::Array(e, _) => self.zero_drop_observable(e, env, depth + 1),
+            TyKind::Adt(..) => {
+                if self.body.tys.is_string_ty(t) || self.body.tys.vec_elem(t).is_some() {
+                    return false;
+                }
+                if let Some(e) = self.body.tys.option_elem(t) {
+                    return self.zero_drop_observable(e, env, depth + 1);
+                }
+                match self.body.tys.local_adt(t) {
+                    Some(a) => {
+                        if let Some((def, _)) = self.body.tys.adt_parts(t) {
+                            if self.drop_heads.contains(&def) {
+                                return true;
+                            }
+                        }
+                        let inner = self.adt_env(t, env);
+                        self.p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| self.zero_drop_observable(f.ty, &inner, depth + 1)))
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The two partial-move gates on an exact field path: Rust's E0509
+    /// (no field move out of a type with a `Drop` impl, at any step of
+    /// the path) and the lust zeroed-husk limit (`zero_drop_observable`
+    /// on the moved type). Copy fields are exempt: copying out is legal
+    /// in Rust even from a `Drop` type, and has no husk drop.
+    fn check_partial_move(&mut self, p: &Place, span: Span) {
+        if !self.report {
+            return;
+        }
+        let mut cur = self.body.locals[p.local as usize].ty;
+        let mut env: Vec<Ty> = Vec::new();
+        let mut variant = 0u32;
+        let mut drop_container: Option<Ty> = None;
+        for pr in &p.proj {
+            match pr {
+                Proj::Downcast(v) => variant = *v,
+                Proj::Field(i) => {
+                    let container = self.head_resolve(cur, &env);
+                    if let Some((def, _)) = self.body.tys.adt_parts(container) {
+                        if self.drop_heads.contains(&def) && self.body.tys.local_adt(container).is_some() {
+                            drop_container = Some(container);
+                        }
+                    }
+                    let next = match self.body.tys.kind(container) {
+                        TyKind::Tuple(ts) => self.body.tys.tys_of(ts).get(*i as usize).copied().unwrap_or(ERROR),
+                        TyKind::Adt(..) if self.body.tys.option_elem(container).is_some() => {
+                            self.body.tys.option_elem(container).unwrap_or(ERROR)
+                        }
+                        TyKind::Adt(..) => match self.body.tys.local_adt(container) {
+                            Some(a) => {
+                                let f = self.p.adt(a).variants.get(variant as usize).and_then(|v| v.fields.get(*i as usize));
+                                match f {
+                                    Some(f) => {
+                                        let ty = f.ty;
+                                        env = self.adt_env(container, &env);
+                                        ty
+                                    }
+                                    None => ERROR,
+                                }
+                            }
+                            None => ERROR,
+                        },
+                        _ => ERROR,
+                    };
+                    if next == ERROR {
+                        return;
+                    }
+                    cur = next;
+                    variant = 0;
+                }
+                _ => return,
+            }
+        }
+        let moved = self.head_resolve(cur, &env);
+        if is_copy(self.p, &self.body.tys, moved) {
+            return;
+        }
+        if let Some(container) = drop_container {
+            if matches!(self.body.tys.kind(moved), TyKind::Param(_)) {
+                // The moved type is a generic of this fn: whether the
+                // move is a legal copy out depends on bounds this pass
+                // does not read, so it stays an unsupported form.
+                if self.seen.insert(("L9001", span)) {
+                    self.errs.push(unsupported(span, "moving a generic field out of a type that implements `Drop`"));
+                }
+            } else {
+                self.err(
+                    "L0305",
+                    span,
+                    format!("cannot move out of {}, because it implements `Drop`", ty_name(self.p, &self.body.tys, container)),
+                    "Borrow the field with `&`, clone it, or use `std::mem::replace` (not yet supported) style code.",
+                );
+            }
+            return;
+        }
+        if self.zero_drop_observable(cur, &env, 0) && self.seen.insert(("L9001", span)) {
+            self.errs.push(unsupported(span, "moving a field whose type contains a `Drop` impl out of a struct, enum, tuple, or `Option`"));
         }
     }
 
