@@ -945,14 +945,7 @@ impl<'a> Parser<'a> {
         let ty = self.ty()?;
         let where_clause = self.where_clause()?;
         self.expect(Tok::Semi, "`;`")?;
-        Ok(TypeAliasDef {
-            name,
-            name_span,
-            generics,
-            where_clause,
-            ty,
-            span: start.to(self.prev_span()),
-        })
+        Ok(TypeAliasDef { name, name_span, generics, where_clause, ty, span: start.to(self.prev_span()) })
     }
 
     /// An `extern crate` item, after the qualifier loop ate `extern`:

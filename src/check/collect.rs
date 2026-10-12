@@ -1087,7 +1087,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             _ => continue,
         };
         let Some(value) = value else { continue };
-        let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &mut p.tys, ty_id, None) {
+        let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, ty_id, None) {
             Ok(t) => t,
             Err(d) => {
                 errs.push(d);
@@ -1306,8 +1306,17 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             if ok_path {
                 let args = segs[segs.len() - 1].type_args();
                 if args.len() == 1 {
-                    let t = resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &mut self.p.tys, args[0], None)
-                        .unwrap_or(ERROR);
+                    let t = resolve_ty(
+                        self.p.ast,
+                        self.p.interner,
+                        self.p.known,
+                        &self.p.type_names,
+                        &self.p.aliases,
+                        &mut self.p.tys,
+                        args[0],
+                        None,
+                    )
+                    .unwrap_or(ERROR);
                     return if ltext == "size_of" { CallTarget::SizeOf(t) } else { CallTarget::AlignOf(t) };
                 }
             }
@@ -1375,7 +1384,8 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
     }
     fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
-        resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &mut self.p.tys, t, None).unwrap_or(ERROR)
+        resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &self.p.aliases, &mut self.p.tys, t, None)
+            .unwrap_or(ERROR)
     }
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
         let p: &Program<'_> = self.p;

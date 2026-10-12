@@ -31,7 +31,6 @@ use crate::ty::defs::{ModuleId, ROOT_MODULE};
 use crate::{lexer, parser, scan};
 use std::path::PathBuf;
 
-
 /// One crate to resolve: its root file and text (with any std splice
 /// already appended by the driver), its cfg environment, its stable
 /// identity, and its extern prelude from the Cargo graph.
@@ -148,11 +147,7 @@ fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
     for f in &env.features {
         facts.push(("feature".to_string(), Some(f.clone())));
     }
-    crate::expand::builtin::CfgEnv {
-        test: env.flags.contains("test"),
-        debug_assertions: env.flags.contains("debug_assertions"),
-        facts,
-    }
+    crate::expand::builtin::CfgEnv { test: env.flags.contains("test"), debug_assertions: env.flags.contains("debug_assertions"), facts }
 }
 
 /// Evaluates every `#[cfg]`/`#[cfg_attr]` predicate and `cfg!` call in
@@ -168,9 +163,7 @@ fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Interner) -> R
     let mut i = 0;
     while i < toks.len() {
         // Skip a macro_rules body (one delimited group after the name).
-        if matches!(toks[i].tok, Tok::Ident(s) if interner.get(s) == "macro_rules")
-            && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang)
-        {
+        if matches!(toks[i].tok, Tok::Ident(s) if interner.get(s) == "macro_rules") && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) {
             i += 2;
             // Optional macro name, then the delimited body.
             if matches!(toks.get(i).map(|t| t.tok), Some(Tok::Ident(_))) {
@@ -1695,6 +1688,7 @@ impl KindChildren for Expr {
             | Expr::Float(_)
             | Expr::Underscore => {}
             Expr::Path(_) | Expr::StructLit { .. } => {}
+            Expr::OffsetOf { ty, .. } => k.ty = Some(*ty),
             Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => k.blocks.push(*b),
             Expr::LabeledBlock { body, .. } | Expr::AsyncBlock { body, .. } => k.blocks.push(*body),
             Expr::If { cond, then, els } => {
@@ -1831,10 +1825,7 @@ mod tests {
     /// and defs are per (crate, module), never shared by file.
     #[test]
     fn shared_file_two_crates_two_def_ids() {
-        let files: &[(&str, &str)] = &[
-            ("main.rs", "mod s;\nfn main() { println!(\"{}\", s::v()); }"),
-            ("s.rs", "pub fn v() -> i64 { 1 }"),
-        ];
+        let files: &[(&str, &str)] = &[("main.rs", "mod s;\nfn main() { println!(\"{}\", s::v()); }"), ("s.rs", "pub fn v() -> i64 { 1 }")];
         let a = resolve(files, "crate_a").ok().expect("crate a resolves");
         let b = resolve(files, "crate_b").ok().expect("crate b resolves");
         let defs = |r: &ResolvedCrate| {
@@ -1873,11 +1864,8 @@ mod tests {
         // Sym values differ across interners, so ask through the flat
         // index state instead: the root map holds the ambiguity.
         let _ = name;
-        let ambiguous = r
-            .tables
-            .maps
-            .first()
-            .is_some_and(|maps| maps.iter().any(|m| m.values().any(|s| matches!(s, BindState::Ambiguous))));
+        let ambiguous =
+            r.tables.maps.first().is_some_and(|maps| maps.iter().any(|m| m.values().any(|s| matches!(s, BindState::Ambiguous))));
         assert!(ambiguous, "glob collision stored ambiguous, no error while unused");
         let _reads = Reads::new();
     }
