@@ -374,11 +374,15 @@ impl Solver {
         // Step 6's other half, checked before any candidate can
         // confirm: with no known head, selection always defers.
         // A blanket probe binding here would pick the blanket
-        // before inference can name the concrete impl.
+        // before inference can name the concrete impl. An integer
+        // or float literal variable is the exception: it can only
+        // become a numeric type, so the impls for those are its
+        // candidates, and exactly one match selects it (as rustc).
         {
             let self_ty = self_ty_of(cx.tys(), &obl);
             let deep = cx.deep_resolve(self_ty);
-            if head_of(cx.tys(), deep, &|t| t).is_none() {
+            let numeric_var = matches!(cx.tys().kind(deep), TyKind::Infer(v) if v.is_int() || v.is_float());
+            if head_of(cx.tys(), deep, &|t| t).is_none() && !numeric_var {
                 return Selection::Ambiguous;
             }
         }

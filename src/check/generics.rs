@@ -2724,6 +2724,22 @@ pub fn add_synthetic_impls(p: &mut Program) {
             }
         }
     }
+    // Floats have the scalar facts except Eq, Ord, Hash, and the
+    // bit operators (std has no impls of those for f32 and f64).
+    for f in [FloatTy::F32, FloatTy::F64] {
+        let t = p.tys.float_ty(f);
+        for tr in [lang.copy, lang.clone, lang.debug, lang.default] {
+            insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.partial_ord, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        for (tr, two) in [(lang.add, true), (lang.sub, true), (lang.mul, true), (lang.div, true), (lang.rem, true), (lang.neg, false)] {
+            if let Some(out) = lang.output_of(tr) {
+                let rest: &[Ty] = if two { &[t] } else { &[] };
+                insert_synthetic(p, &mut ordinal, tr, t, rest, g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+            }
+        }
+    }
     let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
     let p1 = p.tys.intern(TyKind::Param(ParamId(1)));
     let one = Generics {

@@ -306,11 +306,27 @@ impl ImplIndex {
     /// step 2): the bucket for the Self head, plus the blanket impls
     /// whose wrapper shape matches. A record appears at most once.
     /// With no known head, only bare-parameter blankets can be probed
-    /// (the probe itself can still bind the head).
+    /// (the probe itself can still bind the head). An integer or float
+    /// literal variable probes the buckets of every integer or float
+    /// type: it can only become one of those (rustc selects the one
+    /// impl that matches, or defers until the literal fallback).
     pub fn candidates(&self, tys: &impl TyIntern, trait_def: DefId, self_ty: Ty, resolve: &dyn Fn(Ty) -> Ty) -> Vec<ImplId> {
         let mut out: Vec<ImplId> = Vec::new();
         if let Some(head) = head_of(tys, self_ty, resolve) {
             out.extend_from_slice(self.bucket(trait_def, head));
+        }
+        match tys.kind(resolve(self_ty)) {
+            TyKind::Infer(v) if v.is_int() => {
+                for i in IntTy::ALL {
+                    out.extend_from_slice(self.bucket(trait_def, SelfHead::Int(i)));
+                }
+            }
+            TyKind::Infer(v) if v.is_float() => {
+                for f in [FloatTy::F32, FloatTy::F64] {
+                    out.extend_from_slice(self.bucket(trait_def, SelfHead::Float(f)));
+                }
+            }
+            _ => {}
         }
         if let Some(blankets) = self.blankets.get(&trait_def) {
             for &id in blankets {

@@ -1809,6 +1809,58 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Binds the integer and float variables still free in a pending
+    /// obligation to i32 and f64 (see `finish`).
+    fn literal_fallback_in_obligations(&mut self) {
+        let pending = self.obl.take();
+        for ob in &pending {
+            let mut tys: Vec<Ty> = Vec::new();
+            let args = match ob {
+                obligations::Obligation::Trait { trait_ref, .. } => trait_ref.args,
+                obligations::Obligation::AssocEq { eq, .. } => {
+                    tys.push(eq.ty);
+                    eq.trait_args
+                }
+            };
+            tys.extend(self.tys.args(args).iter().filter_map(|g| g.as_ty()));
+            for t in tys {
+                self.default_literal_vars(t);
+            }
+        }
+        for ob in pending {
+            self.obl.push(ob);
+        }
+    }
+
+    /// `literal_fallback_in_obligations` for one type.
+    fn default_literal_vars(&mut self, t: Ty) {
+        let t = self.resolve(t);
+        if !self.tys.flags(t).contains_infer() {
+            return;
+        }
+        match self.tys.kind(t) {
+            TyKind::Infer(v) if v.is_int() => self.bind_var(v.index(), I32),
+            TyKind::Infer(v) if v.is_float() => {
+                let f = self.tys.float_ty(FloatTy::F64);
+                self.bind_var(v.index(), f);
+            }
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.default_literal_vars(e),
+            TyKind::Tuple(ts) => {
+                for e in self.tys.tys_of(ts).to_vec() {
+                    self.default_literal_vars(e);
+                }
+            }
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => {
+                for g in self.tys.args(a).to_vec() {
+                    if let Some(e) = g.as_ty() {
+                        self.default_literal_vars(e);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// True while any of `unbound` still names a free variable in
     /// the confirmed selection (checked through the obligation,
     /// whose args the probe bound).
@@ -5261,6 +5313,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (None, k2) if k2.is_int_infer() && name == k.max => Some((B::Max, Autoref::None, vec![base], base)),
             (None, k2) if k2.is_int_infer() && name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
             (None, k2) if k2.is_int_infer() => {
+                // A trait method still applies: selection fixes the
+                // integer type when exactly one impl matches, as in
+                // rustc. Inherent integer methods need the type.
+                if p.gx.has_generics && !builtin_only {
+                    match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
+                        method::Probe::Hit(ret) => return ret,
+                        method::Probe::Failed => return ERROR,
+                        method::Probe::Miss => {}
+                    }
+                }
                 self.err(
                     "L0111",
                     name_span,
@@ -8480,6 +8542,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.infer_closure_body(&d.names, &d.sig, d.body, d.ret, &d.args);
             }
         }
+        // rustc's literal fallback runs between the last soft run and
+        // the hard one: an obligation that is only ambiguous over a
+        // literal's type (`{float}: Tr` with impls for f32 and f64)
+        // selects with i32 or f64, the types body end defaults to.
+        self.run_obligations(false);
+        self.literal_fallback_in_obligations();
         self.uninferred_site_args();
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
