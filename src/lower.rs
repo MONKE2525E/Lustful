@@ -32,8 +32,9 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     // The owned type store lift (ARCH 2.1): the checked body's types move into the
     // lowered body through this boundary. Identity today; see `ty::lift_to_owned`.
     let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
+    let reads = std::mem::take(&mut ck.reads);
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
-    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len() };
+    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads };
     let mut lw = Lower { p, ck, body, cur: Bb(0), scopes: vec![Vec::new()], loops: Vec::new(), local_map: Vec::new(), mut_index: 0 };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];

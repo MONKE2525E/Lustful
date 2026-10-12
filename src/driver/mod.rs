@@ -4,6 +4,7 @@
 // stable when items move between these files.
 pub mod cache;
 mod compile;
+pub mod graph;
 mod session;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};

@@ -7,7 +7,9 @@ pub mod obligations;
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, not_yet, unsupported};
+use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
+use crate::ty::defs::{DefKind as DefsKind, ROOT_MODULE};
 use crate::ty::lang;
 use crate::ty::*;
 
@@ -175,6 +177,10 @@ pub struct Checked<'g> {
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
+    /// Every cross-item node this body read through a query function
+    /// (docs/ARCH.md section 8.2). Stored with the result; nothing consumes
+    /// it for invalidation yet (S7 is record-only).
+    pub reads: Reads,
 }
 
 impl Checked<'_> {
@@ -246,6 +252,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             pat_derefs: vec![0; n_pats],
             locals: Vec::new(),
             param_locals: Vec::new(),
+            reads: Reads::new(),
         },
         scopes: Vec::new(),
         loops: Vec::new(),
@@ -350,6 +357,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
     fn lookup(&self, name: Sym) -> Option<u32> {
         self.scopes.iter().rev().find(|(n, _)| *n == name).map(|&(_, l)| l)
+    }
+
+    // Cross-item reads go through the section 8.2 query functions on
+    // `Program`, which record into this body's read set. Bodies today live
+    // in the root module (one module per crate until W-RESOLVE).
+    fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
+        let p = self.p;
+        p.binding(&mut self.out.reads, ROOT_MODULE, ns, name)
+    }
+
+    /// The free fn a value binding names, if it names one.
+    fn binding_fn(&mut self, name: Sym) -> Option<LocalDefId> {
+        match self.binding(Namespace::Value, name) {
+            BindingRes::Def(def) if self.p.binding_kind(def) == Some(DefsKind::Fn) => self.p.local_def(def.hash),
+            _ => None,
+        }
     }
 
     // ---------- Inference ----------
@@ -677,6 +700,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn resolve_written(&mut self, t: ast::TyId) -> Ty {
         let p = self.p;
+        // A written type name in a body is a type-namespace binding read.
+        // Primitive names and `Self` are scope layers, not bindings.
+        if let ast::TyExpr::Path(segs) = p.ast.ty(t) {
+            let seg = if segs.len() > 1 && segs[0].name == p.known.std {
+                segs.last()
+            } else if segs.len() == 1 {
+                segs.first()
+            } else {
+                None
+            };
+            if let Some(seg) = seg {
+                let name = seg.name;
+                if p.known.int_ty(name).is_none() && name != p.known.bool && name != p.known.char && name != p.known.str && name != p.known.self_type {
+                    self.binding(Namespace::Type, name);
+                }
+            }
+        }
         match resolve_ty(p.ast, p.interner, p.known, &p.type_names, &mut self.tys, t, self.self_ty) {
             Ok(t) => t,
             Err(d) => {
@@ -1133,7 +1173,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }
-            if let Some(&f) = p.fn_names.get(&name) {
+            // One value-namespace binding read covers the fn and constructor
+            // cases below. The prelude `None` keeps its place between them,
+            // as before: it is a prelude name, not a module binding.
+            let bound = self.binding(Namespace::Value, name);
+            if let BindingRes::Def(def) = bound
+                && p.binding_kind(def) == Some(DefsKind::Fn)
+                && let Some(f) = p.local_def(def.hash)
+            {
                 self.set_res(e, Res::Fn(f));
                 return ERROR;
             }
@@ -1142,9 +1189,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let v = self.new_var(false);
                 return self.tys.mk_option(v);
             }
-            if let Some(&a) = p.type_names.get(&name) {
-                let adt = p.adt(a);
-                if !adt.is_enum && adt.variants[0].shape == VariantShape::Unit {
+            if let BindingRes::Def(def) = bound
+                && let Some(a) = p.adt_by_def(def)
+            {
+                let unit = match p.sig_of(&mut self.out.reads, def) {
+                    SigOf::Adt(adt) => !adt.is_enum && adt.variants[0].shape == VariantShape::Unit,
+                    _ => false,
+                };
+                if unit {
                     self.set_res(e, Res::Variant(a, 0));
                     return self.tys.adt_ty(a);
                 }
@@ -1248,6 +1300,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let (ty_name, item) = (names[0], names[1]);
+        // The first segment is a type-namespace binding read (`Self` is a
+        // scope name, not a binding, and records nothing).
+        let ty_bound = if ty_name == k.self_type { BindingRes::Absent } else { self.binding(Namespace::Type, ty_name) };
         if ty_name == k.String {
             let b = if item == k.new {
                 Builtin::StringNew
@@ -1282,15 +1337,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
             };
             return Some(Res::Builtin(b));
         }
-        let adt = if ty_name == p.known.self_type { self.f.owner } else { p.type_names.get(&ty_name).copied() };
+        let adt = if ty_name == p.known.self_type {
+            self.f.owner
+        } else {
+            match ty_bound {
+                BindingRes::Def(def) => p.adt_by_def(def),
+                _ => None,
+            }
+        };
         let Some(a) = adt else {
             self.err("L0101", span, format!("cannot find type `{}`", self.name(ty_name)), "Check the spelling.");
             return None;
         };
-        let def = p.adt(a);
-        if def.is_enum
-            && let Some(v) = def.variants.iter().position(|v| v.name == item)
-        {
+        // The variant and associated-item tables of the Adt are part of its
+        // signature read. Associated fns get their own index query when the
+        // trait index lands (W-TRAITS-CORE); the method map stays behind
+        // this `Sig` read until then.
+        let adef = p.def_of_adt(a);
+        let is_variant = match p.sig_of(&mut self.out.reads, adef) {
+            SigOf::Adt(def) if def.is_enum => def.variants.iter().position(|v| v.name == item),
+            _ => None,
+        };
+        if let Some(v) = is_variant {
             return Some(Res::Variant(a, v as u32));
         }
         if let Some(&f) = p.methods.get(&(a, item)) {
@@ -1310,8 +1378,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0114", span, "this value is not a function", "Closures are not supported yet. Call a named function.");
                     return ERROR;
                 }
-                match p.fn_names.get(&name) {
-                    Some(&f) => Res::Fn(f),
+                match self.binding_fn(name) {
+                    Some(f) => Res::Fn(f),
                     None if name == p.known.Some => Res::OptSome,
                     None => {
                         let cs = self.span(callee);
@@ -1358,11 +1426,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match res {
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
-                let info = p.fn_info(f);
-                self.check_args(&info.params.clone(), args, span);
-                info.ret
+                let (params, ret) = match p.sig_of(&mut self.out.reads, p.def_id(f)) {
+                    SigOf::Fn(info) => (info.params.clone(), info.ret),
+                    _ => return ERROR,
+                };
+                self.check_args(&params, args, span);
+                ret
             }
             Res::Variant(a, v) => {
+                let adef = p.def_of_adt(a);
+                let _ = p.sig_of(&mut self.out.reads, adef);
                 let variant = &p.adt(a).variants[v as usize];
                 if variant.shape != VariantShape::Tuple {
                     self.err("L0114", span, "this variant is not a tuple variant", "Use `Type::Variant` or `Type::Variant { .. }`.");
@@ -1436,12 +1509,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.obl.run_before_structural();
         let (derefs, base) = self.autoderef(rt);
         let bk = self.tys.kind(base);
-        // User methods.
-        if let Some(a) = self.tys.local_adt(base)
-            && let Some(&f) = p.methods.get(&(a, name))
-        {
-            let info = p.fn_info(f);
-            let Some(sk) = info.self_kind else {
+        // User methods, through the method-set probes of section 2.10: every
+        // form is probed in order and recorded, hit or miss, before the
+        // builtin compat dispatch below runs.
+        let head = Head::of(&self.tys, base);
+        let mut user = None;
+        for form in ReceiverForm::PROBE_ORDER {
+            let set = p.method_set(&mut self.out.reads, head, name, form);
+            if let Some(c) = set.first() {
+                user = Some(c);
+                break;
+            }
+        }
+        if let Some(c) = user {
+            let f = p.local_def(c.def.hash).expect("a method candidate names a local fn");
+            let Some(form) = c.receiver else {
                 self.err(
                     "L0104",
                     name_span,
@@ -1450,17 +1532,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
                 return ERROR;
             };
-            let autoref = match sk {
-                ast::SelfKind::Value => Autoref::None,
-                ast::SelfKind::Ref => Autoref::Ref,
-                ast::SelfKind::RefMut => Autoref::RefMut,
-                // Typed receivers are rejected by the parser today.
-                ast::SelfKind::Typed => Autoref::None,
+            let autoref = match form {
+                ReceiverForm::Value => Autoref::None,
+                ReceiverForm::Ref => Autoref::Ref,
+                ReceiverForm::RefMut => Autoref::RefMut,
+            };
+            let (params, ret) = match p.sig_of(&mut self.out.reads, c.def) {
+                SigOf::Fn(info) => (info.params[1..].to_vec(), info.ret),
+                _ => return ERROR,
             };
             self.set_res(e, Res::Method { f, derefs, autoref });
-            let params = info.params[1..].to_vec();
             self.check_args(&params, args, name_span);
-            return info.ret;
+            return ret;
         }
         // `clone` on a reference to a non-Clone type clones the reference.
         if name == k.clone {

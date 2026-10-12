@@ -4,6 +4,7 @@ use crate::ast::{BinOp, UnOp};
 use crate::check::Builtin;
 use crate::def::LocalDefId;
 use crate::diag::Span;
+use crate::driver::graph::Reads;
 use crate::ty::{AdtId, IntTy, Ty, Tys};
 
 pub type Local = u32;
@@ -154,6 +155,11 @@ pub struct Body<'g> {
     pub locals: Vec<LocalDecl>,
     pub blocks: Vec<BlockData>,
     pub arg_count: usize,
+    #[allow(dead_code)] // Read by invalidation when it lands (W-DRIVER).
+    /// The cross-item reads recorded while this body was checked
+    /// (docs/ARCH.md section 8.2). Carried with the body result so the
+    /// driver can store it with the checked body; record-only today.
+    pub reads: Reads,
 }
 
 impl Body<'_> {
