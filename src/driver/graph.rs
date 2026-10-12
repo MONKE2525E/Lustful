@@ -607,9 +607,7 @@ impl<'a> Program<'a> {
                 Namespace::Macro => BindingRes::Absent,
             }
         };
-        reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || {
-            binding_fingerprint(self, res)
-        });
+        reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || binding_fingerprint(self, res));
         res
     }
 
