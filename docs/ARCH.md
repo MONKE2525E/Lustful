@@ -1,6 +1,9 @@
 # lust compiler architecture: milestones 4 to 9
 
-Status: decision document. It is ready for review. It is not implemented.
+Status: decision document, revision 2. Revision 1 got two
+adversarial reviews that both said "request changes" (sol and
+Opus). This revision fixes those findings. Section 11 lists
+each finding and what changed. It is not implemented.
 Scope: milestones 4 to 9 in `docs/PLAN.md`. The north star is ts-rust.
 Rule zero does not change. Every program lust accepts is valid Rust
 (rustc 1.99, edition 2024) with the same output. Release builds go
@@ -74,13 +77,26 @@ Design rules for all sections:
 
 ### 1.1 Packages, crates, targets
 
-Lust does not write a Cargo resolver. The driver runs
-`cargo metadata --format-version 1` once per workspace session and
-caches the result by the hash of all `Cargo.toml` files plus
-`Cargo.lock`. Cargo owns version solving. Lust reads: packages
-(name, version, manifest path, features, dependencies with rename
-and target cfg), targets (kind, name, `src_path`, edition,
-`crate_types`), and the resolve graph (which features are on).
+Lust does not write a Cargo resolver. Cargo owns version solving.
+The graph key is the full resolver input, not only file hashes:
+the hash of all `Cargo.toml` files plus `Cargo.lock`, the
+requested packages and targets, the requested features and the
+default-feature policy, the target triple, and the Cargo config
+files that apply (`.cargo/config.toml` chain). The driver runs
+`cargo metadata --format-version 1` with those inputs once per
+graph key. `cargo metadata` alone unifies features over the whole
+workspace, which can differ from a `-p ts_goport --bin tsgo`
+build. So the feature set of each selected unit comes from one
+cached `cargo check --message-format=json` dry run for the same
+request. Lust reads: packages (name, version, manifest path,
+features, dependencies with kind, rename, and target cfg),
+targets (kind, name, `src_path`, edition, `crate_types`), and
+per-unit features. Dependency kinds and target cfgs filter edges:
+a dev-dependency or a `cfg(windows)` dependency of a Linux build
+is in the graph data but is not a selected unit. The profile
+values that change output (panic strategy, overflow checks,
+debug assertions) come from the same request and enter every
+cache key. They must match the rustc parity build in tests.
 
 Terms:
 
@@ -91,10 +107,33 @@ Terms:
   sessions.
 - `build.rs` is not compiled by lust in milestones 4 to 7. The
   driver runs it through Cargo during `lust port prepare`, or
-  reads a recorded build-script output. Its `OUT_DIR`,
-  `cargo::rustc-cfg`, and env outputs enter cache keys. Ts-rust
-  needs this: `goport_util/build.rs` returns early on native
-  builds but packs wasm data (DESIGN-TS section 4).
+  reads a recorded build-script output. Recorded output is valid
+  only while its recorded inputs hold: the build script source,
+  every `rerun-if-changed` file, and every
+  `rerun-if-env-changed` value. The driver re-checks those
+  inputs per session and re-runs the script through Cargo when
+  one changes. Its `OUT_DIR`, `cargo::rustc-cfg`, env outputs,
+  and the contents of `OUT_DIR` files that source code includes
+  enter cache keys by content hash. Ordinary source and const
+  initializers see the same Cargo env values (`CARGO_PKG_*`,
+  `OUT_DIR`) as the rustc build. Ts-rust needs this:
+  `goport_util/build.rs` returns early on native builds but
+  packs wasm data (DESIGN-TS section 4).
+- Edition: lust source crates must be edition 2024. Apply the
+  check only to selected units, after dependency
+  classification (1.1 table below) and target filtering. An
+  unselected workspace tool or the upstream package behind an
+  adapter keeps its own edition and does not fail the session.
+- Lints: `cargo metadata` does not report them. The driver
+  reads `[lints]` and `[workspace.lints]` from the manifests of
+  selected units. It enforces `unsafe_code` at forbid or deny
+  level (ts-rust sets `unsafe_code = "forbid"` in
+  `/home/theo/.t3/projects/ts-rust/Cargo.toml:18-19`). Any
+  other rust lint at deny or forbid level rejects the session
+  with `L0531` naming the lint, because rustc would reject
+  code that triggers it and lust does not check it. Warn and
+  allow levels need no action. Clippy lints do not run in a
+  rustc build, so they are out of scope.
 - Test crates: `lust test` builds the lib or bin crate again with
   `cfg(test)` on and `#[test]` fns as extra roots. Integration
   tests in `tests/` are normal bin-like crates that depend on the
@@ -124,10 +163,22 @@ and shims exist only in dev builds.
 
 ### 1.2 Module tree
 
-A crate starts at its root file. `mod foo;` loads, in edition 2024
-order: `foo.rs`, then `foo/mod.rs`, relative to the current
-file's directory (or the current inline module's directory).
-`#[path = "..."]` overrides the file. Ts-rust has 6 `#[path]`
+A crate starts at its root file. The search directory for
+`mod foo;` follows Rust: if the current file is a crate root,
+`mod.rs`, `lib.rs`, or `main.rs`, submodules live in the same
+directory. In any other file `a.rs`, submodules live in the
+directory `a/` next to it. Example: `mod go_frontend;` at
+`/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/program.rs:28`
+loads `program/go_frontend.rs`, not `go_frontend.rs`. An inline
+module keeps the search directory of the file that holds it,
+plus one path segment per inline module name. In the search
+directory, `mod foo;` loads `foo.rs` or `foo/mod.rs`. If both
+exist, that is error `L0502` (Rust reports ambiguity; there is
+no preference order). If neither exists, `L0503`.
+`#[path = "..."]` overrides the file. Its path is relative to
+the directory of the file that holds the `mod` item. For an
+inline module it is relative to that directory plus the inline
+module path segments, as in Rust. Ts-rust has 6 `#[path]`
 modules in 3 files (INVENTORY items table), so support it in
 milestone 4, not later. Inline `mod foo { ... }` needs no file.
 A file belongs to exactly one (crate, module) pair, with one
@@ -166,51 +217,86 @@ exactly this split. One name can hold a struct (type) and a fn
 (value) at once. A tuple struct fills both: the type and its
 constructor in value space. A unit struct does the same.
 
-Resolution runs after macro expansion (section 6) and `cfg`
-stripping (section 1.6), per crate, in four steps:
+Resolution does not run after expansion as a separate phase.
+Cfg stripping, module loading, macro expansion, and import
+resolution form one outline worklist per crate (section 6.1).
+The worklist produces, per crate:
 
-1. Build the module tree. Create one `ModuleId` per module.
-   Record parent, file, visibility, and the inline/file kind.
-2. Collect defined names per module: items, impl blocks (no name),
+1. The module tree. One `ModuleId` per module. Record parent,
+   file, visibility, and the inline/file kind.
+2. Defined names per module: items, impl blocks (no name),
    trait items, enum variants (namespaced by the enum, plus
-   prelude-style value access through the enum path), fields (not
-   module names), and macro defs visible by textual scope.
-3. Resolve imports to a fixpoint. See below.
-4. Resolve every path in signatures, then in bodies, to a `Res`:
-   a `DefId`, a local, a primitive, a self type, or an error.
-   Bodies resolve in parallel after signatures, as collect and
-   check split today (`src/collect.rs:1-2`).
+   prelude-style value access through the enum path), fields
+   (not module names), and macro defs visible by textual scope.
+3. Resolved imports, by the fixpoint below.
+4. Then every path in signatures, then in bodies, resolves to a
+   `Res`: a `DefId`, a local, a primitive, a self type, or an
+   error. Bodies resolve in parallel after signatures, as
+   collect and check split today (`src/collect.rs:1-2`).
 
 Import fixpoint. Imports form a graph. Globs and re-exports make
-it cyclic (`prelude` modules re-export whole subtrees). Algorithm:
+it cyclic (`prelude` modules re-export whole subtrees). An
+explicit import can depend on a glob binding, so one worklist
+handles both. There is no "explicit first, globs later" split:
 
 - State per module: for each namespace, a map `name -> Binding`.
-  A binding is `Def(DefId, Vis)`, `Glob(ModuleId)`, or
-  `Ambiguous` marked on use.
-- Pass 1: insert all local definitions and all explicit imports
-  whose target path resolves without a glob. Explicit imports
-  include groups `use a::{b, c as d}`, `self`, and `super`.
-- Pass 2, repeat until no change, at most `modules + 2` rounds:
-  for each glob `use m::*`, copy each public-enough binding of
-  `m` that the local module does not already have from a local
-  def or explicit import. If two globs bring the same name with
-  different defs, store `Ambiguous`. It is an error only if code
-  uses the name (Rust rule; ts-rust's `prelude.rs` relies on
-  explicit disambiguation, see section 1.4).
+  A binding is `Def(DefId, Vis)` or `Ambiguous`, plus its
+  source: local def, explicit import, or glob. The source sets
+  priority: local def and explicit import beat glob at all
+  times, even when the glob binding arrives first.
+- Work items are unresolved explicit imports and unpropagated
+  globs. Start with all local defs inserted and all imports as
+  work items. Repeat until the worklist is empty: resolve one
+  explicit import if its target path resolves now (groups
+  `use a::{b, c as d}`, `self`, `super` included); propagate
+  one glob by copying each public-enough binding of its target
+  module that loses to no local or explicit binding. Each new
+  binding can unblock other work items, so loop over both
+  kinds. Example that must work:
+  `pub use crate::checker::TypeMapperKind` at
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/prelude.rs:29`,
+  where `checker/mod.rs:133` has `pub use mapper::*` and the
+  enum is defined at `checker/mapper.rs:14`.
+- If two globs bring the same name with different defs, store
+  `Ambiguous`. It is an error only if code uses the name (Rust
+  rule; ts-rust's `prelude.rs` relies on explicit
+  disambiguation, see section 1.4).
+- An explicit import that still does not resolve when the
+  worklist empties is an error, not a silent miss.
 - `pub use` re-exports: the binding in the re-exporting module
-  carries the re-export's visibility. The target `DefId` does not
-  change. There is no alias def. Effective visibility of a name
-  through a path is the minimum visibility along the chain.
-- A failed import records a failed-lookup node (section 8):
-  `(module, namespace, name, scope_fingerprint)`. Adding a def
-  or an import later must re-run the bodies that recorded it.
+  carries the re-export's own visibility. The target `DefId`
+  does not change. There is no alias def. The visibility of the
+  binding is separate from the privacy check on the path used
+  to find it: `mod hidden { pub struct S; } pub use hidden::S;`
+  is valid, and `S` is public through the alias. Do not take a
+  minimum over the lookup chain. The chain rule applies only
+  when a use names the original path segment by segment.
+- A failed import records a failed lookup (section 8) keyed by
+  `(module, namespace, name)`. Adding a def or an import later
+  must re-run the bodies that recorded it.
 
-Determinism: iterate modules in `ModuleId` order and names in
-`Sym` order inside each round. The fixpoint result must not
-depend on hash map order. Cap: if the round cap hits, emit
-`L0130 import cycle does not settle` and stop the crate. Rust
-accepts all such graphs; the cap is a compiler bug guard, not a
-language limit. Log any hit as a bug.
+Determinism: process work items in `ModuleId` order and names in
+`Sym` order. The result must not depend on hash map order. Each
+binding changes state at most twice (absent, glob, explicit), so
+the worklist ends. Keep a round cap of `modules + 2` full sweeps
+as a bug guard: if it hits, emit `L0501 import cycle does not
+settle` and stop the crate. Rust accepts all such graphs; log
+any hit as a bug.
+
+Scope priority for the first segment of a path, highest first:
+lexical scopes (locals, then items and explicit imports of the
+enclosing modules), glob imports, the `#[macro_use]` macro
+prelude (macro namespace), the extern prelude, the std prelude,
+then builtin type names. In a `use` path, the first segment must
+be `crate`, `self`, `super`, an extern prelude name, or an item
+or import of an enclosing module (the 2018 uniform path rule,
+which edition 2024 keeps). A local module can shadow an extern
+name: ts-rust has a local module named `core` at
+`goport_util_root.rs:26`. A generated item that would change a
+macro resolution that already ran is an error, as in Rust
+(E0659, "time travel"): the worklist records which bindings each
+expansion used, and a later binding that wins over a used one
+fails with `L0504`.
 
 Path forms to support in milestone 4: `crate::`, `self::`,
 `super::` (repeated), `::dep::` absolute extern, bare extern
@@ -224,8 +310,15 @@ module tables plus the local scope chain.
 Preludes:
 
 - *Std prelude*: the names in `library/std/src/prelude.rs`
-  (section 3). Imported into every module as the lowest-priority
-  glob. A local def or explicit import with the same name wins.
+  (section 3). It is its own lowest scope layer, below globs.
+  It is not a glob import: it applies only to the first segment
+  of a relative path, it never becomes a module binding, a glob
+  never re-exports it (`pub use m::*` does not carry it), and
+  it is never ambiguous with a glob. A local def, an explicit
+  import, or a glob with the same name wins. Ts-rust depends on
+  this: it defines its own `Box` at
+  `project/dirty/box_.rs:9` and its own `Result` at
+  `contentmapper/host.rs:316`, both glob re-exported.
   `#[no_implicit_prelude]` on a module or crate turns it off.
 - *Extern prelude*: each direct dependency's lib crate root is a
   name in the type namespace of every module's first path
@@ -267,10 +360,12 @@ Forms: private (default), `pub`, `pub(crate)`, `pub(super)`,
 descendants. Fields, variants, trait items, and impl methods
 follow Rust rules: a trait item is as visible as its trait; an
 inherent impl item carries its own visibility; enum variants
-take the enum's visibility. `pub` on a non-`pub` re-export chain
-does not widen access. Check visibility at path resolution time
+take the enum's visibility. A re-export binding carries the
+visibility written on the `use` (section 1.3): a `pub use` of a
+`pub` item in a private module makes a public binding. Check
+visibility at path resolution time
 for each segment, and again for field and method access in
-check. Errors: one code family `L014x`, with a fix hint that
+check. Errors: one code family `L051x`, with a fix hint that
 names the smallest widening (`pub(crate)`) that would work.
 Do not auto-apply the fix. PLAN.md milestone 3 limits `--fix`
 to narrow safe edits; visibility widening changes API surface.
@@ -280,49 +375,63 @@ correctness. Unused names must not change ambiguity behavior.
 
 ### 1.6 cfg
 
-Evaluate `#[cfg(...)]` and `#[cfg_attr(...)]` during collect,
-before resolution, per item, per field, per variant, per match
-arm where Rust allows it, and on `mod` declarations before file
-loading. `cfg!` expands to a `bool` literal in the expander.
+Evaluate `#[cfg(...)]` and `#[cfg_attr(...)]` in the outline
+worklist (section 6.1): strip cfg on each item and attribute
+before expanding or resolving it, per item, per field, per
+variant, per match arm where Rust allows it, and on `mod`
+declarations before file loading. A disabled `compile_error!`
+or `include!` must not run. `cfg!` expands to a `bool` literal
+in the expander.
 
-The cfg environment is a fixed set per crate session:
-`target_arch`, `target_os`, `target_family`, `target_endian`,
-`target_pointer_width`, `target_env`, `target_abi`, `unix`,
-`windows`, `debug_assertions` (dev on), `test` (only in test
-crates), `feature = "..."` from the resolve graph, and
-build-script cfgs recorded by `lust port prepare`. The target
+The cfg environment is a fixed set per crate session. Known
+names are the full rustc well-known list: `target_arch`,
+`target_os`, `target_vendor`, `target_family`, `target_env`,
+`target_abi`, `target_endian`, `target_pointer_width`,
+`target_has_atomic` and its width forms, `target_feature`,
+`target_thread_local`, `unix`, `windows`, `panic`,
+`overflow_checks`, `debug_assertions` (dev on), `test` (only
+in test crates), `docsrs`, `feature = "..."` from the per-unit
+feature set (section 1.1), and build-script cfgs recorded by
+`lust port prepare`. `target_vendor` is required: ts-rust uses
+it 8 times in `fswatch/`. The target
 values come from a small built-in table for tier 1 targets
 (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`) plus
 `wasm32-wasip1` for classification only. Do not shell out to
 rustc per request.
 
 Rules for unknown cfgs: an unknown *name* (say `cfg(frobnicate)`)
-is error `L0150` in lust, listing the known names. Rust treats
+is error `L0520` in lust, listing the known names. Rust treats
 it as false with a warning (or an error under `check-cfg`).
 Rejecting is safer: silently dropping a module changes the
 program. The fix hint says to declare it via build script
-output or remove it. Ts-rust cfg counts: 341 `#[cfg]` plus 35
-`cfg!`, mostly `wasm` (101), `linux` (51), `windows` (31),
-`unix` (26) target families. All are in the known set. One
+output or remove it. One
 lust-only cfg name exists: `lust_dev`. It is true in lust dev
-builds and false in Cargo release. Adapters may use it.
-Application code may use it only for implementation swaps with
-equal behavior; `lust port scan` flags other uses. Never fake a
-target cfg (say, pretend wasm) to delete threads.
+builds and false in Cargo release. Only std and adapter crates
+may use it: lust cannot prove "equal behavior" in user code, so
+user use is `L0520`. The shipped manifests declare it in
+`check-cfg`, so Cargo builds stay free of warnings. Never fake
+a target cfg (say, pretend wasm) to delete threads.
 
 Stripped items leave no def. Diagnostics in stripped code do
 not fire. The scan stage still hashes stripped text so edits
 there invalidate nothing but the file node.
 
-Attributes other than cfg: parse all. Honor: `derive`, `repr`,
+Attributes other than cfg: parse all. Honor: `derive` (with
+`default` on one enum variant, 32 uses in ts-rust; without it
+`derive(Default)` on enums cannot work), `repr`,
 `path`, `macro_use`, `macro_export`, `no_implicit_prelude`,
 `inline` (ignored in dev codegen), `cold` (ignored),
 `must_use` (ignored in v1, no warning infra), `track_caller`
-(real semantics, section 3.5), `allow`/`warn`/`deny` (parsed,
-only `dead_code` family ignored), `non_exhaustive` (real check
+(real semantics, section 3.5), `allow`/`warn`/`deny` (parsed;
+`deny` follows the lint rule in section 1.1),
+`non_exhaustive` (real check
 across crates), `deprecated` (ignored), `doc` (ignored),
-`test`, `bench`, `global_allocator` (recorded; dev link picks
-the allocator, section 3.7). Unknown attributes: `L0151`
+`rustfmt::skip` (ignored, 23 uses),
+`test`, `bench`, `ignore` and `should_panic` (test attributes,
+honored by `lust test`), `global_allocator` (recorded; dev
+link picks the allocator, section 3.7). Tool attributes under
+known tool namespaces (`rustfmt`, `clippy`) are ignored.
+Unknown attributes: `L0521`
 error with the supported list. Ts-rust uses `must_use` 1,215,
 `inline` 713, `cold` 93, `track_caller` 16, `allow` 106.
 
@@ -344,12 +453,17 @@ pub struct DefId { pub krate: CrateId, pub hash: DefPathHash }
 pub struct LocalDefId(pub u32);   // dense index inside one crate, per session
 ```
 
-A `DefId` answers "which item is this" across edits and across
-daemon restarts. A `LocalDefId` is the fast array index inside
-one crate session. The crate session keeps
+A `DefId` answers "which item is this" across edits. Its
+`krate` field is session-local, so a `DefId` as a whole must
+never enter a disk key. The disk form is the pair
+`(StableCrateHash, DefPathHash)`, where `StableCrateHash` is
+the crate disambiguator hash from step 1 below. Only that pair
+may enter disk keys, slot keys, or fuzzer transcripts. Never
+`LocalDefId`, `FileId`, `Sym`, `Ty`, `ArgsId`, or `CtxtId`:
+section 8.4 defines the disk form of each, by translation at
+the write boundary. A `LocalDefId` is the fast array index
+inside one crate session. The crate session keeps
 `FxMap<DefPathHash, LocalDefId>` and `Vec<DefId>` side tables.
-Only `DefId` (never `LocalDefId`, `FileId`, or `Sym`) may enter
-disk keys, slot keys, or fuzzer transcripts.
 
 `DefPathHash` inputs, hashed with the existing FxHash
 (`src/intern.rs:9-41`):
@@ -387,8 +501,11 @@ internal error and stop. Do not add a collision-resolution
 scheme. At 786k lines the birthday risk is negligible, and the
 check makes it safe.
 
-Slots generalize directly: `slot_of: FxMap<DefPathHash, u32>`
-per crate for fn-like defs, and per instance in section 4. The
+Slots live in one space per final binary, not per crate:
+generated code calls `lust_fns[slot]` from one table, so two
+crates must never assign the same slot to different functions.
+`slot_of: FxMap<InstanceKeyHash, u32>` is owned by the driver
+for the final bin (section 4.2). The
 panic line table keys by slot as today. The fuzzer compares
 diagnostics by (crate, module path, name), never by `FnId`.
 
@@ -414,9 +531,12 @@ Daemon
     File index: canonical path -> set of (CrateId, ModuleId)
 ```
 
-`SessionKey` = (crate disambiguator, feature set hash, cfg
-environment hash, profile, lust version, adapter/shim versions
-for its deps). One shared `Interner` per workspace matters:
+`SessionKey` = (graph key from section 1.1, crate
+disambiguator, per-unit feature set hash, cfg
+environment hash, profile including panic and overflow
+settings, lust version, adapter/shim versions for its deps).
+Two feature selections or two targets in one daemon give two
+sessions. A test in section 9 proves it. One shared `Interner` per workspace matters:
 `Sym` values must mean the same string in every crate, or
 cross-crate signature exchange needs translation tables. The
 interner is already sharded and thread-safe
@@ -477,7 +597,7 @@ pub enum TyKind {
     RawPtr(Mut, Ty),     // std and shim code only at first
     Slice(Ty),
     Array(Ty, ConstId),
-    Tuple(ArgsId),       // ArgsId indexes interned &[Ty]
+    Tuple(TysId),        // TysId indexes interned &[Ty]
     Adt(DefId, ArgsId),  // user and std structs/enums/unions(none)
     FnPtr(SigId),        // SigId: interned (inputs, output, safety, abi)
     FnDef(DefId, ArgsId),// fn item used as a value, before coercion
@@ -494,9 +614,14 @@ Supporting interned data, all in `src/ty/`:
 
 - `GenericArg = Ty(Ty) | Lifetime(Region) | Const(ConstId)`.
   `ArgsId` interns `&[GenericArg]` in declared parameter
-  order: lifetimes, types, consts interleaved as written.
-  Store the slice once; hashing a `Ty` stays O(1).
-- `Region = Static | Param(u32) | Infer(u32) | Erased`.
+  order: lifetimes, types, consts interleaved as written. One
+  schema everywhere. A tuple's element list is a different
+  type, `TysId` (interned `&[Ty]`), named differently so no
+  code confuses the two. Store each slice once; hashing a `Ty`
+  stays O(1).
+- `Region = Static | Param(u32) | Bound(u32) | Infer(u32) |
+  Erased`. `Bound(i)` is a de Bruijn index into the nearest
+  enclosing `Binder` (below).
   `Param` indexes the lifetime params of the item whose
   signature the type sits in. `Erased` appears only after
   borrow checking, at mono and codegen. Section 5 owns the
@@ -505,28 +630,35 @@ Supporting interned data, all in `src/ty/`:
   `ret_borrows_from` (`src/collect.rs:52-53`), which the
   region work replaces in milestone 6.
 - `ConstId` interns const generic values and const item
-  values: ints, bools, chars, and const param references.
-  A tiny const evaluator handles literals, arithmetic on
-  literals, `size_of`/`align_of` of sized types (section
-  4.4), and assoc const lookup. Anything else in const
-  position is `L0240` reject. Ts-rust needs const generics
-  in only 3 functions (INVENTORY), so keep the evaluator
-  small and reject the rest.
+  values: ints, bools, chars, aggregate const values (2.13),
+  and const param references. The bounded const evaluator is
+  section 2.13. Anything outside it in const position is
+  `L0630` reject.
+- `Binder<T> { count: u32, value: T }` wraps a type, a
+  signature, or a predicate that contains `Bound` regions.
+  `for<'a, 'b> X` is `Binder` with count 2. Only rank-1
+  binders: a `Binder` inside a `Binder` value is `L0710`.
+  Instantiating a binder replaces each `Bound(i)` with a fresh
+  region (check) or a placeholder region (proof, section 5.5).
 - `BoundsId` interns a `dyn` bound list: one principal trait
-  ref, plus auto traits (`Send`, `Sync`, `Unpin`) as bits.
-- `SigId` interns fn pointer signatures, including
-  higher-ranked binders: `for<'a> fn(&'a T) -> U` stores a
-  binder count; regions inside use de Bruijn indices in a
-  `BoundRegion` form. Only rank-1 binders. See 2.9.
+  ref with its associated-type bindings, the supertrait trait
+  refs in declaration order, plus auto traits (`Send`, `Sync`,
+  `Unpin`) as bits. Auto traits that a supertrait requires are
+  part of the bounds: `dyn AnyValue` is `Send` because
+  `AnyValue: Send` (section 2.8).
+- `SigId` interns fn pointer signatures as `Binder<FnSig>`:
+  `for<'a> fn(&'a T) -> U` is a binder of count 1 over a sig
+  whose regions use `Bound(0)`. See 2.9.
 
 `String`, `Vec<T>`, `Option<T>`, `Chars`, `Args` stop being
 `TyKind` cases. They become `Adt` defs in the std crates
 (section 3). This is the single biggest representation
 change. It deletes special paths in `collect.rs`,
 `check.rs`, `ir.rs`, and `cgen.rs` and replaces them with
-the general Adt path. Do it in serial refactor S3 with the
-std skeleton (S5) so the general path has real users from
-day one.
+the general Adt path. S3 adds the representation behind
+compat helpers. The `Builtin` paths stay until the minimal
+generic pipeline passes its gate (section 9.3). Only then
+does std delete compat cases, in staged API groups.
 
 Every def that can be generic owns a `Generics`:
 
@@ -537,25 +669,66 @@ pub struct Generics {
     pub predicates: Vec<Predicate>,  // bounds, in source order
 }
 pub enum Predicate {
-    Trait(TraitRef),                 // T: Clone, T: Iterator<Item = u8>
+    Trait(Binder<TraitRef>),         // binder count 0 when not higher-ranked
+    AssocEq { assoc: DefId, trait_args: ArgsId, ty: Ty },
     Outlives(Region, Region),
     TypeOutlives(Ty, Region),
 }
-pub struct TraitRef { pub def: DefId, pub args: ArgsId } // Self is args[0]
+// Self is args[0]. `bindings` is an interned list of
+// (assoc DefId, GenericArg) pairs: the `Item = u8` part of
+// `Iterator<Item = u8>`, the `Output = C` part of `Fn(A) -> C`,
+// and dyn associated bindings. No trait ref exists without a
+// place for its bindings, even when the list is empty.
+pub struct TraitRef { pub def: DefId, pub args: ArgsId, pub bindings: BindingsId }
 ```
 
 Bounds written as `T: A + B`, in `where` clauses, and on
-assoc types all become predicates in source order. Source
-order is observable in error messages only. Keep it anyway;
-it costs nothing.
+assoc types all become predicates in source order. An
+associated binding in a bound (`T: Iterator<Item = u8>`)
+becomes two facts at elaboration: the trait predicate and an
+`AssocEq`. Source order is observable in error messages only.
+Keep it anyway; it costs nothing.
 
-Substitution is one function: `subst(ty, args, tys) -> Ty`.
-It replaces `Param` by args, normalizes projections when
-the impl is known (2.5), and erases nothing. Mono calls it
-on every type in a generic body. It must be allocation-light:
+The *param environment* of a generic item is its predicates
+plus their elaboration, computed once at collect and interned
+as `ParamEnvId`:
+
+1. Start with the written predicates, after substitution at
+   each use.
+2. For each trait predicate, add its supertrait predicates
+   (the trait def's own bounds, with Self substituted).
+3. For each associated binding, add the `AssocEq`.
+4. Repeat to a fixpoint. The set is finite: supertrait graphs
+   in scope are small, and a cycle adds nothing new.
+5. Deduplicate. Keep first occurrence order for errors.
+
+Selection and normalization read the param env through one
+query (section 8). No other code walks raw predicate lists to
+find supertraits.
+
+Substitution and normalization are two different functions.
+`subst(ty, args) -> Ty` is pure: it replaces `Param` by args
+and erases nothing. It takes no solver and records no reads.
+`normalize(ty, param_env, reads) -> Ty` rewrites projections
+through impls and `AssocEq` facts (2.5); it can fail to make
+progress and then returns the projection. Mono calls `subst`
+on every type in a generic body, then `normalize` where a
+concrete type is required. Both must be allocation-light:
 return the input `Ty` unchanged when the type contains no
-params. Track "contains param/projection/infer" as flag bits
-cached per `Ty` in the interner, computed at intern time.
+params or projections. Track "contains param/projection/infer"
+as flag bits cached per `Ty` in the interner, computed at
+intern time.
+
+Owned type store. Today a body-local `Ty` is an offset into
+the body's private table (`src/types.rs:168-197` in revision 1
+line terms). Such ids die with the body, so no checked result
+can be cached, shared with another crate, or written to disk.
+Rule: when check finishes a body, lowering lifts its local
+types into the crate session's append-only type store and
+rewrites every `Ty` in the result. After the lift, the body
+result owns stable session ids. Cross-crate readers translate
+by structural fingerprint (section 8.4), never by raw id. The
+lift is part of the `Checked` contract, not an optional step.
 
 ### 2.2 Definitions and signatures
 
@@ -592,7 +765,7 @@ in a side table for error messages ("type `Foo` is
 `Bar<T>`"). Associated-type aliases in traits are defs, not
 expansions. Generic aliases: 44 in ts-rust. Alias cycles
 through non-Adt positions (`type A = B; type B = A;`) are
-`L0210`. Recursive types through `Box`, `Vec`, `Rc`, refs,
+`L0601`. Recursive types through `Box`, `Vec`, `Rc`, refs,
 and fn ptrs are fine. The infinite-size check at
 `src/collect.rs:332` generalizes: a cycle in the
 by-value field graph of Adts is an error.
@@ -657,53 +830,92 @@ in 2.10.
 
 Per body, check keeps a work queue, extending the current
 unification context (`src/check.rs:196-215`). An obligation
-is `TraitRef` plus the span that needs it plus an optional
-assoc binding to prove. Selection algorithm:
+is a `TraitRef` (with its bindings) plus the span that needs
+it. Selection matches the *whole* trait reference: Self and
+every input argument. Matching Self alone is wrong. Rust
+accepts `impl Tr<u8> for S` and `impl Tr<u16> for S` at once,
+and `From`, `PartialEq<Rhs>`, `Add<Rhs>`, `Index<I>`,
+`FromIterator<A>` all need their inputs to pick an impl.
 
-1. If Self or any trait input arg contains an unresolved
-   `Infer`, defer the obligation. (Assoc outputs may stay
-   unknown; they are outputs, not inputs. This is DESIGN's
-   one-candidate rule, kept.)
-2. If the obligation matches a predicate in the current
-   *param env* (the bounds of the enclosing generic item,
-   after substitution), select `ParamEvidence`. No impl
-   lookup runs. Mono re-solves with concrete types.
-3. Else look up `(trait, head_of(Self))` in the impl index.
-   For each impl in the bucket (coherence, 2.6, proves at
-   most one can match a concrete Self), try first-order
-   *matching*: unify the impl's Self pattern against the
-   known Self type. Pattern params bind once. There is no
-   backtracking across impls and no guessing of impl
-   params from predicates. If matching leaves an impl
-   type param unbound, defer; if still unbound at body
-   end, error `L0220 type annotations needed` with the
-   fix naming the param.
-4. On a match, push the impl's predicates (substituted) as
-   new obligations. Memoize by `(TraitRef)` in the body.
-   Depth cap 64 and a cycle set: re-entering the same
-   `TraitRef` on the stack is `L0221` (overflow), matching
-   rustc's overflow class.
-5. If the bucket is empty or no pattern matches, record a
-   failed lookup (section 8) and error `L0222 no impl of
-   Trait for Type`, listing the bucket's impls when the
-   bucket is non-empty.
+A type has a *known head* when its outer form is fixed after
+following inference links: an Adt, a scalar, a ref, a tuple,
+and so on. A bare unresolved `Infer`, or a generic `Param`
+with no structure, has no known head. Section 2.12 lists the
+points where a known head is required.
 
-Queue processing: run after each expr that binds an
-`Infer`. At body end, run to fixpoint. Anything left is an
-annotation error, never a silent default, except integer
-and float literal fallback (`i32`, `f64`, as today).
+Selection algorithm. A *probe* is a tentative unification
+that records every binding it makes and can roll them back.
+A probe unifies headers only. It never runs predicates of a
+candidate that is not selected.
+
+1. If the obligation matches a predicate in the current
+   param env (2.1, after substitution, supertraits and
+   `AssocEq` facts included), select `ParamEvidence`. Param
+   env candidates win over impls, as in rustc. Mono re-solves
+   with concrete types.
+2. Else collect candidates. Look up `(trait, head_of(Self))`
+   in the impl index, plus the blanket bucket for the Self
+   wrapper shape (2.6). For each impl, probe-unify its full
+   trait ref pattern (Self, all input args, and bindings)
+   against the obligation. Keep the impls whose probe
+   succeeds. Roll back every probe that is not confirmed.
+3. If exactly one candidate remains, confirm it: keep its
+   probe bindings. This binds inference vars, integer vars,
+   and float vars. Two cases that must work:
+   `let v: Vec<_> = it.collect()` selects the one
+   `FromIterator` impl and binds the element type (ts-rust
+   has 62 `Vec<_>` sites), and `s[x]` with an integer var
+   `x` selects `Index<usize>`, so `x.wrapping_sub(1)` is a
+   `usize` op. Push the impl's predicates (substituted) as
+   new obligations. If a predicate of the selected impl
+   fails, that is an error. Never fall back to another
+   candidate.
+4. If an impl param is still unbound after the header match,
+   bind it from facts already present, in this order, with
+   no search: (a) an associated binding on the obligation;
+   (b) an `AssocEq` in the impl's own predicates whose
+   projection normalizes now, for example
+   `impl<I: Iterator<Item = T>, T> Tr for I`, where a use site
+   cannot name `T`. One pass over the impl predicates. If a
+   param stays unbound, defer while inference can still
+   change the candidate set; at the end, error `L0613`
+   ("impl parameter is not known from the trait inputs").
+   Do not hint at a turbofish: a use site has no slot for an
+   impl parameter. The fix hint names the impl and suggests
+   a rewrite of that impl.
+5. If no candidate remains and the trait ref has a known
+   head with no inference var that can change the set,
+   record a failed lookup (section 8) and error `L0612 no
+   impl of Trait for Type`, listing the bucket's impls when
+   the bucket is non-empty.
+6. If two or more candidates remain, or Self has no known
+   head, defer the obligation. Deferral ends at a point
+   where the type must be known (2.12): there, an unresolved
+   obligation is `L0610 type annotations needed`, matching
+   rustc E0282 or E0283 as the case fits. Never pick one of
+   several candidates to make progress.
+7. Memoize by `TraitRef` in the body. Depth cap 64 and a
+   cycle set: re-entering the same `TraitRef` on the stack
+   is `L0611` (overflow), matching rustc's overflow class.
+
+Queue processing runs at fixed points only: before a
+structural resolution (2.12), at coercion sites, and at body
+end to a fixpoint. Running the queue after every expression
+that binds an inference var can go quadratic in large
+bodies. At body end, anything left is an annotation error,
+never a silent default, except integer and float literal
+fallback (`i32`, `f64`, as today).
 
 What this rejects that rustc accepts: obligations where an
-impl param is determined only by the impl's predicates or
-by an assoc output used as an input elsewhere. The fix
-hint tells the agent to add a turbofish or annotation.
-`lust port scan` reports sites; a checked codemod adds the
-annotation (it does not change machine code). This is the
-price for no search. Ts-rust is Go-shaped and mostly
-concrete (3% generic fns), so the count should be small.
-Measure in the milestone 5 spike. If it is large, widen
-step 3 to bind impl params from assoc bindings on the
-obligation itself. Do not add backtracking.
+impl param follows only from a chain of predicates, beyond
+step 4. `lust port scan` reports sites as `L0613`, a class of
+its own, separate from ordinary annotation sites (`L0610`).
+Spike K7 counts both classes after this algorithm lands, not
+before: with a Self-only or defer-on-infer rule the count
+measured the algorithm, not the code. Do not add backtracking
+or speculative predicate search. Probes over disjoint header
+patterns are not search: each probe is one first-order
+unification, and at most one probe is confirmed.
 
 Auto traits and `Sized` do not use the queue. They compute
 structurally (2.7). `Drop` is not an obligation; drop glue
@@ -719,9 +931,10 @@ where args are the trait ref (Self first). Normalization:
 - If the trait ref selects a concrete impl (2.4 step 3),
   the projection rewrites to the impl's binding, then
   normalization recurses.
-- If it selects `ParamEvidence` and the param-env predicate
-  carries an assoc binding (`T: Iterator<Item = u8>`),
-  rewrite to that binding.
+- If it selects `ParamEvidence` and the param env carries an
+  `AssocEq` for it (`T: Iterator<Item = u8>`), rewrite to
+  that type. The same holds for supertrait assoc types
+  through the elaborated param env.
 - Else it stays a `Projection` type inside the generic
   body. It unifies only with the identical projection or
   through a binding that appears later. Mono normalizes
@@ -737,7 +950,7 @@ for `&SharedList<T>` at
 binds `Item = &'a T` and `IntoIter = slice::Iter<'a, T>`.
 Assoc const example: `ExpectedJsonKind::JSON_TYPE`
 (DESIGN-TS section 3). GATs (assoc types with their own
-params): reject `L0230`. Ts-rust has none.
+params): reject `L0620`. Ts-rust has none.
 
 `?` desugars through `Try` in Rust, but lust implements
 `?` as a direct match on `Result` and `Option` plus
@@ -757,34 +970,53 @@ so assoc `Output` must normalize in operator result types.
 
 ### 2.6 Coherence and blanket impls
 
-At collect, for each `(trait, head)` bucket, check every
-pair of impls for possible overlap: unify their Self
-patterns and trait input args. If unification can succeed,
-the pair is an overlap. Then:
+At collect, for each trait, check every pair of impls whose
+*full trait refs* can unify: Self pattern, every input arg,
+and bindings. Unifying Self alone is wrong twice over.
+`impl<T> From<T> for T` would seem to overlap every user
+`From` impl, and std's `impl<I: Iterator> IntoIterator for
+I` would seem to overlap `IntoIterator for Vec<T>` and six
+impls in ts-rust (`ast/node.rs:1585`, `ast/node.rs:1594`,
+`checker/types.rs:289`, `checker/types.rs:298`,
+`core.rs:1134`, `core.rs:1145`). Rust accepts all of those,
+so lust must too.
 
-- Two concrete impls overlap: `L0225`, as in Rust.
-- A blanket impl and any impl whose Self pattern can unify
-  with the blanket's Self form: `L0225`. So a blanket
-  `impl<T: A> Tr for T` forbids every other `Tr` impl
-  whose Self is not disjoint by head wrapper. In
-  practice: one bare-param blanket per trait, or blankets
-  partitioned by wrapper head.
+When the full trait refs unify, try to disprove the overlap
+exactly where rustc can. A where clause of either impl,
+after unification, "cannot hold" when all of these hold:
 
-This is stricter than rustc in one way: rustc also rejects
-overlaps it cannot disprove, so the practical difference
-is small. It is looser in no way. Do not try to prove
-disjointness from predicates (`impl<T: A> Tr for T` vs
-`impl<T: B> Tr for T`): reject. Rust rejects these too.
+- the clause is a trait predicate;
+- its Self type is local to the crate that checks coherence,
+  or a fundamental wrapper (`&`, `&mut`, `Box`, `Pin`) of a
+  local type, or the trait itself is local;
+- no impl in the index matches that trait ref.
+
+That is a table lookup, not a search. If nothing disproves
+the pair, it overlaps: `L0615`, as in Rust. Worked cases:
+
+- `IntoIterator for Vec<T>` vs the blanket: unify with
+  `I = Vec<T>`. The clause `Vec<T>: Iterator` cannot hold:
+  `Vec` is local to `alloc`, and no such impl exists. No
+  overlap.
+- `IntoIterator for &'a SharedList<T>` vs the blanket:
+  clause `&SharedList<T>: Iterator`. Self is a fundamental
+  wrapper of a local type, and no impl matches. No overlap.
+- `impl<T: A> Tr for T` vs `impl<T: B> Tr for T`, with `A`
+  and `B` foreign traits on a bare param Self: nothing can
+  disprove either clause. Overlap. Rust rejects these too.
+
+Selection still checks the predicates of the chosen
+candidate (2.4 step 3). Coherence never lets two candidates
+both pass for one concrete trait ref, but a probe can match
+two headers while inference is open; 2.4 step 6 handles that
+by deferral, not by choice.
 
 Accepted blanket Self forms, stored with a wrapper tag:
-`T`, `&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`. The head
-is `Param` plus the wrapper; at lookup, after the concrete
-bucket misses, check checks the blanket bucket for the
-trait whose wrapper matches the Self type's outer shape,
-binds `T`, and pushes the blanket's predicates. Order is
-deterministic: concrete bucket first, then exactly one
-applicable blanket bucket by wrapper shape. Coherence
-above guarantees the two never both apply to one Self.
+`T`, `&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`. A blanket
+with wrapper `&T` sits in the `Ref` bucket as a param
+pattern. Bare `T` sits in a per-trait `Param` bucket. At
+lookup, check probes the concrete bucket and the blanket
+bucket for the Self wrapper shape together (2.4 step 2).
 
 Ts-rust's 6 blanket impls fit this subset:
 
@@ -794,39 +1026,53 @@ Ts-rust's 6 blanket impls fit this subset:
 - `impl<T: MarshalerTo + ?Sized> MarshalerTo for &T` at
   `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/frontend/json.rs:1660-1664`.
   `&T` wrapper. Concrete `MarshalerTo` impls are on Adt
-  heads, disjoint from `Ref`. This is why the head split
-  by wrapper is the key point: bucket it under `Ref`, not
-  under a global blanket bucket, and both this rule and
-  the solver stay simple. Refine the index: a blanket
-  with wrapper `&T` sits in the `Ref` bucket as a param
-  pattern. Bare `T` sits in a per-trait `Param` bucket
-  checked after all head buckets.
+  heads, disjoint from `Ref` by head alone.
 
 Generic impls on named containers (178 in ts-rust), impls
 for `&T` (6), and impls for `dyn Trait` (6) are normal
-index entries. Negative impls, specialization, and
-overlapping marker traits: reject. None exist in ts-rust.
+index entries. Negative impls and overlapping marker traits
+in user code: reject. Specialization in user code: reject.
+Std gets its observable specialization through the closed
+predicate list in section 3.4, not through impl overlap.
 
-### 2.7 Auto traits: Send, Sync, Unpin, and Sized
+### 2.7 Auto traits: Send, Sync, Unpin, unwind safety, Sized
 
-`Send`, `Sync`, `Unpin` compute structurally per type:
+`Send`, `Sync`, `Unpin`, `UnwindSafe`, and `RefUnwindSafe`
+compute structurally per type. The two unwind traits are
+real bounds on `catch_unwind` (7.2): rustc rejects a closure
+that mutates a captured `&mut` across `catch_unwind` without
+`AssertUnwindSafe` (E0277). An unchecked `catch_unwind` API
+would accept that program, so the traits are not optional.
+Each auto trait has its own fixed table. No table borrows
+facts from another. In particular, a negative `UnwindSafe`
+fact does not follow from the `Send` table.
 
-- Scalars, `&T`, fn ptrs: by fixed table (`&T: Send` iff
-  `T: Sync`; `&mut T: Send` iff `T: Send`; `*const T`:
-  neither, as in Rust).
+- Scalars, refs, raw pointers, fn ptrs: by fixed table,
+  pinned in one file. The table must state, at least:
+  `&T: Send` iff `T: Sync`; `&T: Sync` iff `T: Sync`;
+  `&mut T: Send` iff `T: Send`; `&mut T: Sync` iff
+  `T: Sync`; `*const T` and `*mut T` are neither `Send` nor
+  `Sync`; `*const T` and `*mut T` are `UnwindSafe` but the
+  types that hold them still get their own facts below;
+  `&mut T` is not `UnwindSafe` (it is `RefUnwindSafe` only
+  under the rules in std); `PhantomPinned` is not `Unpin`,
+  which makes any Adt that holds it not `Unpin`.
 - `Adt`: all field types (with args substituted) must
   hold the trait, combined with the Adt's own marker
   fields. `PhantomData<T>` contributes `T`'s auto traits,
   including the raw-pointer marker idiom ts-rust uses
   (DESIGN-TS section 6 cites `core.rs:4467`).
-- Std overrides live in the std source as explicit
-  negative facts through private marker fields
-  (`Rc` holds a `*mut` plus a non-atomic count cell, so
-  the structural rule already yields neither `Send` nor
-  `Sync`; `RefCell` is `Send` if `T: Send`, never `Sync`,
-  via its borrow flag cell). Where structure alone gives
-  the wrong answer (`Mutex<T>: Sync` if `T: Send`), std
-  uses the privileged `unsafe impl` form. User code may
+- Std types whose fields contain raw pointers (`Vec`,
+  `Box`, `Rc`, `Arc`, guards) do not get correct facts from
+  structure alone. Their facts live in one checked registry
+  in the shipped std source: explicit `unsafe impl` and
+  negative impl lines, in the same place, diffed against
+  real std by the surface parity gate (3.1). Examples that
+  must be right: `MutexGuard` is not `Send`; `Rc<T>` is
+  neither `Send` nor `Sync`; `Mutex<T>: Sync` if `T: Send`;
+  `RefCell<T>` is `Send` if `T: Send` and never `Sync`.
+  A structural guess that makes a guard `Send` accepts a
+  program rustc rejects. User code may
   write `unsafe impl Send/Sync` only under the opt-in
   `unsafe` support (PLAN.md decision 3). Ts-rust has no
   `unsafe impl` in its own code.
@@ -851,19 +1097,44 @@ this is core, not polish.
 Where checks fire: `thread::spawn` and `scope` (7.3),
 shared statics (`Sync`), `Arc`/`Mutex` bounds in std
 signatures (they are normal predicates that the
-structural solver answers), and `dyn` bounds that name
-auto traits.
+structural solver answers), `dyn` bounds that name
+auto traits, and `catch_unwind` (`UnwindSafe` on the
+closure). `AssertUnwindSafe<T>` reports `UnwindSafe` for
+any `T`, only where the source writes it.
 
 ### 2.8 dyn Trait and vtables
 
-`Dyn(BoundsId, Region)`. Object safety, checked at the
-`dyn` type's span: no `Self: Sized` methods callable, no
-generic methods, no assoc consts, assoc types must be
-bound (`dyn Iterator<Item = u8>`) or the method using
-them must be excluded by `where Self: Sized`. Non-object
--safe use is `L0250` with the method named. Supertraits
-are allowed if object-safe. `dyn` with two non-auto
-principal traits: reject (Rust rejects too).
+`Dyn(BoundsId, Region)`. Dyn compatibility (object
+safety), checked in full at the `dyn` type's span. A trait
+is dyn compatible only when all of these hold:
+
+- The trait does not require `Self: Sized`.
+- Every supertrait is dyn compatible.
+- No associated consts.
+- Every method is dispatchable: its receiver is one of the
+  receiver forms in 2.9 with a known vtable call shape, it
+  has no generic type params of its own, and `Self` occurs
+  only as the receiver (behind the receiver form) and in
+  positions that erase soundly (`&Self`, `Box<dyn ...>`
+  style bounds). A method that returns bare `Self`, takes
+  `Self` by value as a plain argument, or mentions `Self`
+  in a generic argument that stays concrete is not
+  dispatchable. `trait Bad { fn copy(&self) -> Self; }`
+  with `&dyn Bad` fails in rustc with E0038 and must fail
+  here. A method excluded by `where Self: Sized` is simply
+  not in the vtable.
+- Associated types are bound in the `dyn` bounds
+  (`dyn Iterator<Item = u8>`), or every method that uses
+  them is excluded as above.
+
+Failure is `L0701` with the trait and the offending item
+named. `dyn` with two non-auto principal traits: reject
+(Rust rejects too). The `BoundsId` stores the principal
+trait ref, its bindings, the supertrait refs, and the auto
+trait bits, including auto traits that come only from a
+supertrait (section 2.1). Method calls on a trait object
+can use the principal trait and its supertraits with no
+import (2.10).
 
 Dev representation: a fat pointer `{ data: *mut (), vtable:
 *const VTable }` (section 4.4 for the C form).
@@ -889,13 +1160,20 @@ Rules:
 - Upcasting `dyn Sub` to `dyn Super` uses the `super_N`
   slots. Multi-level upcasts chain at check time to a
   fixed slot path; no runtime search.
-- `Any`: `type_id` is the low 64 bits of the concrete
-  type's fingerprint: `DefPathHash` of the Adt plus a
-  hash of its args with regions erased. `TypeId::of::<T>`
-  in lust std computes the same value at mono time.
-  `downcast_ref`/`downcast` compare ids, then reinterpret
-  data. A hash collision here is the same accepted risk
-  as 1.7, and dev-only: release uses real Rust `Any`.
+- `Any`: identity is the full structural key of the
+  concrete type: kind tag, def disk pair (1.7) for Adts,
+  and the full argument structure with regions erased.
+  Primitives, tuples, arrays, slices, refs, fn pointers,
+  closures, and dyn types all have keys. Mono keeps a
+  checked table from key to a small integer id per final
+  binary. Two different keys that hash to the same 64-bit
+  fingerprint stop the build with an internal error, as in
+  1.7. An unchecked hash is not enough: a collision would
+  turn a downcast into an unsound reinterpretation.
+  `TypeId::of::<T>` in lust std reads the same table at
+  mono time. `downcast_ref`/`downcast` compare ids, then
+  reinterpret data. `Any` impls keep the `T: 'static`
+  bound; a type with a non-static region has no `TypeId`.
 - Unsizing coercions supported: `T -> dyn`, and inside
   `&`, `&mut`, `Box`, `Rc`, `Arc`, plus `Rc<RefCell<dyn>>`
   style nesting through one smart pointer whose pointee
@@ -945,19 +1223,28 @@ is a `TraitRef` with args `(Self, (A, B))` plus assoc
 the ref regions in the args. Represent `for<'a> Fn(&'a
 T)` by a binder on the `TraitRef` in predicates and
 `dyn` bounds. At call sites, instantiate the binder with
-fresh region vars. No other higher-ranked forms:
-binders on fn *items* are just their lifetime params;
-binders nested under another binder are `L0260`.
+fresh region vars. To prove that a value meets a
+higher-ranked bound, use a placeholder region and a leak
+check (5.5). No other higher-ranked forms:
+binders on fn *items* are their late-bound lifetime params
+(5.5); binders nested under another binder are `L0710`.
 
 Closure signature inference: from the expected type when
 it is an `Fn` bound, a `dyn Fn`, or a fn ptr; else from
-annotations on params; else params get fresh `Infer`s
-resolved by body use. If a param `Infer` survives, error
-`L0220` asking for an annotation on that param. Stored
+annotations on params; else params get fresh `Infer`s. The
+body checks at the definition point, in source order. A
+structural use inside the body (a method call, a field
+access, an index on a param) needs a known head at that
+point (2.12). `let f = |x| x.len(); f(vec![1u8])` is an
+error, as in rustc (E0282): the later call does not rescue
+the body. Plain unification inside the body can still bind
+a param: passing it to a fn with a known signature, or
+returning it where the return type is known. If a param
+`Infer` survives to the end of the closure body, error
+`L0610` asking for an annotation on that param. Stored
 closures with no expected type are the common failure;
-ts-rust stores 349 in `let`s. Most get types from use
-sites in the same body through unification. The rest
-need one annotation each. That is an accepted codemod
+ts-rust stores 349 in `let`s. Each one that stays unknown
+needs one annotation. That is an accepted codemod
 class (it does not change machine code).
 
 `FnOnce` call consumes the closure value (or the box
@@ -968,17 +1255,37 @@ fat pointer's data. Check enforces these receiver rules.
 
 Function items as values: type `FnDef(def, args)`,
 zero-sized, implements the `Fn` traits its signature
-matches, coerces to the fn ptr `FnPtr(sig)`. Typed
-receivers (`self: &Rc<Self>`, 168 uses in ts-rust):
-support receiver types `Self`, `&Self`, `&mut Self`,
-`Box<Self>`, `Rc<Self>`, `Arc<Self>`, `Pin<&mut Self>`
-(std only at first). Method resolution handles them by
-receiver type matching, not by autoderef alone (2.10).
+matches, coerces to the fn ptr `FnPtr(sig)`. Early-bound
+lifetime params are part of the `FnDef` args; late-bound
+ones become the binder of the `FnPtr` it coerces to (5.5).
+
+Typed receivers. The receiver type grammar is recursive:
+
+```text
+Recv ::= Self
+       | &Recv | &mut Recv
+       | Box<Self> | Rc<Self> | Arc<Self>
+       | Pin<&Self> | Pin<&mut Self> | Pin<Box<Self>>
+```
+
+So `self: &Rc<Self>` and `self: &Arc<Self>` are in the
+grammar, not only `Rc<Self>`. Ts-rust uses `&Rc<Self>` in
+159 places, for example
+`/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/frontend/packagejson.rs:1092`.
+Any other arbitrary self type is `L0722`. Method
+resolution matches these forms by receiver type (2.10 step
+3): for `&Rc<Self>`, the place must have type `Rc<T>` (or
+autoderef to it) and the call takes a reference to that
+smart pointer value, without dereferencing to `T` first.
+The same rule covers a plain smart-pointer receiver and a
+`Pin` receiver (std only at first for `Pin`).
 
 ### 2.10 Method resolution
 
 Input: receiver type `R`, method name, arg types,
-expected result. Algorithm (Rust's, restricted):
+expected result. The receiver must have a known head at
+this point (2.12); if not, `L0610`. Algorithm (Rust's,
+restricted):
 
 1. Build the autoderef chain: `R`, then `*R` via `Deref`
    (or `DerefMut` when a `&mut` receiver or a unique
@@ -991,31 +1298,46 @@ expected result. Algorithm (Rust's, restricted):
    in Rust's order: by value `S`, then `&S`, then `&mut
    S`. For each form, look up inherent methods first
    (exact receiver type match up to the form), then
-   trait methods whose trait is in scope (imported or
-   prelude) and whose Self pattern matches. First hit
+   trait methods whose trait is in scope and whose Self
+   pattern matches. A trait is in scope when it is
+   imported, in the std prelude, named by a bound in the
+   current param env, or the principal trait (or a
+   supertrait) of a `dyn` receiver. The last two need no
+   import. First hit
    wins. Two trait hits in the same probe with different
-   traits: `L0270 ambiguous method`, fix hint gives the
+   traits: `L0720 ambiguous method`, fix hint gives the
    fully qualified form. Inherent and trait in the same
    probe: inherent wins, as in Rust.
-3. Typed receivers (`self: Rc<Self>`) match when any
-   chain step equals the pointee and the actual receiver
-   place has the smart-pointer type. No autoderef runs
-   for that candidate.
+3. Typed receivers (2.9 grammar) match by receiver type.
+   For `Rc<Self>`, any chain step can equal the pointee
+   while the place holds the smart pointer. For
+   `&Rc<Self>`, the place must hold an `Rc<T>` and the call
+   passes a reference to it; no autoderef to `T` runs for
+   that candidate. The same shape holds for `&Box<Self>`,
+   `&Arc<Self>`, and the `Pin` forms.
 4. On a hit, create obligations for the method's bounds
    and unify args. Generic method params come from args
    and the expected type. `?Sized` Self types (`str`
    methods on `&String`) work through the deref chain.
-5. No hit: record a failed method lookup keyed by
-   `(head_of(R), name)` for invalidation, then error
-   `L0271` listing same-name methods on other types.
+5. Every probe records a candidate-set read (section 8):
+   `(Self head, name, receiver form)` for the inherent set
+   and for each trait bucket probed, hit or miss. A body
+   that picked a trait method must recheck when a new
+   inherent method with the same name appears, because
+   Rust then picks the inherent one. No hit at all:
+   record the same reads, then error `L0104` (the existing
+   "no such method" code) listing same-name methods on
+   other types.
 
-Field access: autoderef to the first Adt or tuple with
+Field access: the base type must have a known head.
+Autoderef to the first Adt or tuple with
 the field, checking field visibility. `dyn` has no
-fields. Index syntax goes through `Index`/`IndexMut`
-obligations after the builtin slice/array/Vec paths,
-which are std impls once std is source, so there is one
-path: obligations. Keep a fast path only if profiles
-demand it.
+fields. Index syntax needs a known head on the indexed
+value, then goes through one path: `Index`/`IndexMut`
+obligations (2.4). The slice, array, and `Vec` cases are
+std impls once std is source. Keep a fast path only if
+profiles demand it, and only if it binds inference the
+same way (the `s[x]` case in 2.4 step 3).
 
 Current code hardcodes all of this per `Builtin`
 (`src/check.rs:1002-1227`). The method index plus this
@@ -1036,7 +1358,12 @@ receiver_coerce }`.
   all in-scope type and lifetime params unless `use<>`
   restricts. Support `use<>` syntax; ts-rust uses it once
   (DESIGN-TS section 3, `impl Send + use<>`). Callers see
-  only the bounds. Mono substitutes the hidden type.
+  only the bounds, with one exception: auto traits leak,
+  as in rustc. If the hidden type is `Send`, the opaque is
+  `Send` even when the bounds do not say so (same for
+  `Sync`, `Unpin`, and the unwind traits). A test with
+  `thread::spawn` on an opaque return value gates this.
+  Mono substitutes the hidden type.
   Returning different closure types per branch: reject
   unless they unify, as in Rust.
 - `impl Trait` in assoc type position and in `let` type
@@ -1062,15 +1389,102 @@ explicitly in only part of its 804 collects, the rest
 come from ascriptions and field types, which the expected
 type flow covers.
 
+When a type must be known. At these points, in check order,
+the type in question must have a known head (2.4). If it
+does not, error `L0610` at that point (rustc E0282 or
+E0689). Never defer these to body end:
+
+- a method call (the receiver type);
+- a field access (the base type);
+- an index (the indexed type; the index type then follows
+  from the selected `Index` impl);
+- a deref (the pointee source type);
+- the `?` operator (the operand type);
+- an operator on a non-scalar (the left operand type);
+- a match or `if let` that must know the scrutinee enum;
+- a closure body use of any of the above on a param.
+
+Running the obligation queue happens just before each such
+point (2.4). If the queue binds the head, checking goes on.
+That is how `Vec<_>` collect and `s[x]` infer without any
+search, and how `|x| x.len()` still fails.
+
 Not inferred, by design: types across fn boundaries
 (signatures stay explicit in source, as in Rust), impl
-params from predicates alone (2.4), closure param types
+params beyond 2.4 step 4 (`L0613`), closure param types
 with no expected `Fn` and no body constraint, and numeric
-types beyond literal fallback. Each gap errors with the
-specific missing annotation. This is the "how far beyond
-local" answer: no further. The deterministic solver is
-what keeps check near-linear and independently
-re-runnable per body, which the daemon depends on.
+types beyond literal fallback and one-candidate selection.
+Each gap errors with the specific missing annotation. This
+is the "how far beyond local" answer: no further. The
+deterministic solver is what keeps check near-linear and
+independently re-runnable per body, which the daemon
+depends on.
+
+### 2.13 Bounded const evaluation
+
+Const contexts are: `const` and `static` initializers,
+array lengths and repeat counts, enum discriminants, const
+generic args, inline `const { ... }` blocks, and
+`const _: () = assert!(...)` items. One evaluator owns all
+of them. It is bounded, and anything outside the bound is
+`L0630`. A general const interpreter stays out of scope.
+
+Supported forms, which are the forms ts-rust uses:
+
+- Literals, arithmetic and comparisons on ints, bools, and
+  chars, with rustc overflow rules in const (overflow is a
+  const error, not a wrap).
+- Layout queries: `size_of`, `align_of`, `offset_of!` on
+  types the layout contract supports (4.4).
+- Struct, enum, tuple, and array construction from const
+  parts. Array repeat `[const { E }; N]` evaluates `E`
+  once per element slot. Example:
+  `[const { OnceLock::new() }; CHUNKS]` at
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/core.rs:472`.
+- Const fn calls where the callee body stays inside this
+  list: blocks, `let`, `if` and `match` on const values,
+  bounded loops, field access, and calls to other const
+  fns in the list. Std const fns in scope include
+  `OnceLock::new`, `RefCell::new`, `Mutex::new`,
+  `Vec::new`, `String::new`, and the `new` fns of the
+  adapter types. Example: the `RefCell::new(BuildStores {
+  .. })` initializer at
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/ast/store.rs:1157`.
+- References to other consts and statics, string and byte
+  literals, and promoted temporaries. A const value is
+  `Scalar | Aggregate(fields) | Ref(static or promoted) |
+  Slice(ptr, len)` in the const store.
+- Associated const lookup through the selected impl.
+- `assert!` and `panic!` with a literal message in const
+  position: a false assert is a compile error, as in
+  rustc.
+- Inline const blocks in a generic body, for example the
+  `const { assert!(size_of::<Option<V>>() <= 32) }` at
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/core.rs:4085`.
+  Check the block in generic form (well-formed, const
+  eligible), then evaluate it again per instance at mono
+  after substitution (4.1). A module-level `const _` item
+  captures no generic params of any fn; do not model the
+  inline form as one.
+
+Const eligibility runs before any emission. A `static` or
+`const` initializer that calls a non-const fn is `L0631`,
+matching rustc E0015: `static S: String = String::from("x")`
+must fail. Running a non-const initializer at startup is
+not a substitute. There are no synthetic runtime init fns
+for statics. A static's const value becomes static data in
+the glue unit: scalars inline, aggregates as nested data,
+refs as relocations to the target static or promoted
+block. Mutable statics use the same data path.
+`thread_local!` and `OnceLock` lazy semantics live in std
+source above const initial values (7.3), not in the data
+path. Step cap: 1,000,000 evaluator steps per const item,
+then `L0630` with the item named.
+
+One owner (W-CORELANG, then W-CHECK-G for the generic
+form). Gate: an executable initializer corpus with the
+three ts-rust shapes above, a structured `RefCell` static,
+a discriminated enum const, and the E0015 reject.
 
 ## 3. Std strategy
 
@@ -1111,19 +1525,61 @@ machinery as user generics, which VERIFY G requires:
 almost all real instances come from std, not user
 generics (VERIFY G section P1).
 
-Std source is privileged in exactly two ways:
+Std source is privileged in exactly four ways. This list
+is closed. A fifth privilege needs a change to this
+section:
 
 1. It may use the intrinsic functions in 3.2, through a
    private module `core::intrinsics`. The checker allows
    `intrinsics` calls only in crates whose manifest the
    compiler ships (matched by crate disambiguator of the
    shipped library), never by name matching in user
-   source.
+   source. The shipped crates that may name intrinsics are
+   `core`, `alloc`, `std`, and the adapter crates named in
+   the 3.6 table, each only for the intrinsics its row
+   lists.
 2. It may use `unsafe` blocks, raw pointers, and
    `UnsafeCell`. This is the opt-in `unsafe` from
    PLAN.md decision 3, scoped to shipped crates first.
    User crates get `unsafe` only for shim-facing code
    in milestone 7, behind the same checker support.
+3. It may call the specialization predicates in 3.4. The
+   trait system does not change.
+4. Its `Drop` impls may carry the may-dangle flag (5.4),
+   on the same impls as real std. User impls may not.
+
+Surface parity. Selection, method probing, coherence, and
+auto traits depend on the *set* of std impls and inherent
+methods, not only on behavior. A partial std changes
+results: a missing inherent method lets a user extension
+trait win a probe; a missing impl turns rustc ambiguity
+into a single candidate; a missing impl lets an
+overlapping user impl pass coherence; a structural
+`MutexGuard` can come out `Send`. So lust std must declare
+the same surface as real std for every type and trait it
+exposes:
+
+- Generate a std surface manifest from rustc 1.99 rustdoc
+  JSON (`RUSTC_BOOTSTRAP=1` where the toolchain needs it).
+  It lists every public inherent method name and every
+  impl header for the std types and traits lust exposes.
+- Lust std declares all of them. A body that does not
+  exist yet is a stub that rejects at use with `L0640`
+  naming the item. A missing declaration is a build error
+  in the std build, caught by a manifest diff in CI.
+- An auto-trait parity test generates rustc probes for
+  `Send`, `Sync`, `Unpin`, `UnwindSafe`, `RefUnwindSafe`,
+  and `Copy` over the exposed std type list and compares
+  them with lust answers.
+- W-STD gates include both the manifest diff and the
+  parity test (9.3).
+
+Copy from real std where the code fits. Lust std is Rust
+source, so for exact behaviors (RawVec growth, sort, fmt,
+float text rules) copy the rust-lang/rust 1.99 source and
+adapt it to the supported subset. A copy is more exact
+than a rewrite in C, and the difftest then checks the
+adaptation, not a new algorithm.
 
 Std source must be valid Rust, like all lust programs.
 Where real Rust std uses compiler internals lust lacks
@@ -1149,9 +1605,13 @@ not a user diagnostic.
 
 Intrinsics are the only compiler-known callables left.
 They replace the `Builtin` enum with a small, stable set.
-Target: about 40. Each intrinsic has a normal fn
-signature in `core::intrinsics`, a C symbol, and a
-difftest. Codegen emits the C call directly; there is
+Do not freeze a count: width-specific atomics, sync ops,
+and the hash, memchr, xxh3, ryu-js, and catch helpers pass
+any fixed number. Freeze instead: each intrinsic has a
+normal fn signature in `core::intrinsics`, a C symbol, a
+privilege check (3.1), and a difftest. Most intrinsics are
+plain foreign runtime calls. Codegen emits the C call
+directly; there is
 no IR node per intrinsic family beyond "call this
 runtime symbol with this signature". Sized operations
 take explicit size and align (the erased-core rule).
@@ -1227,27 +1687,48 @@ Rules:
 - Growth must match Rust so `capacity()` matches
   (3.5). Fix `lust_vec_reserve`
   (`src/runtime.c:199-205`): today it starts at 4 for
-  every element size. Rust's rule: minimum capacity is
-  8 for 1-byte elements, 4 for up to 8-byte... in
-  general `max(8 / size, 1)` rounded as `RawVec` does,
-  then double. Copy the exact `RawVec` growth function
-  (amortized and exact paths) into the C core, driven
-  by size, and difftest `capacity()` hard.
+  every element size. Rust 1.99 `RawVec` minimum capacity
+  is: 8 elements when the element size is 1, 4 elements
+  when the size is 2 to 1024, and 1 element above 1024.
+  (`max(8 / size, 1)` is wrong: it gives 2 for 4-byte
+  elements, where Rust gives 4. A probe on rustc 1.99
+  prints capacity 4 for u32, u64, u128, and a 1024-byte
+  element, 8 for u8, and 1 for a 1025-byte element.)
+  Then capacity doubles on the amortized path.
+  `reserve_exact` takes exactly the needed capacity, with
+  no minimum and no doubling. A zero-sized element type
+  never allocates and reports capacity `usize::MAX`.
+  Copy the exact `RawVec` growth functions from the Rust
+  1.99 source (amortized, exact, `reserve`, `shrink_to_fit`,
+  `shrink_to`) into the core, driven by size, and
+  difftest `capacity()` hard: duplicate growth sequences,
+  ZSTs, exact vs amortized reserve, and shrink.
 - `String` is `Vec<u8>` with UTF-8 checks in source.
   Keep the C string core for push bytes and case ops
   where they exist (`src/runtime.c:54-99`) but route
   new methods through the source wrapper. Do not grow
   the C string API method by method.
-- Sorting: one erased C sort (introsort with a
-  comparator fn ptr) is the fallback. Rust sort is
-  stable driftsort with observable comparison order
-  only through the comparator's side effects and panic
-  behavior. `sort` (stable) and `sort_unstable` in
-  source call the erased core with glue compare. If a
-  comparator panics mid-sort, Rust leaves the slice in
-  a valid but unspecified state; the erased core must
-  do the same (never duplicate or lose elements).
-  Difftest with panicking comparators.
+- Sorting: no C introsort. An introsort is not stable, so
+  it cannot implement `sort` or `sort_by` at all, and its
+  comparison sequence differs in every case. Port the
+  Rust 1.99 sort source into lust std: driftsort for the
+  stable `sort`/`sort_by`/`sort_by_key` family and ipnsort
+  for the `sort_unstable` family. Equal elements keep
+  their order under the stable sort; ts-rust depends on
+  stable output (for example
+  `execute/build/orchestrator.rs:286-288` and
+  `checker/nodebuilder_impl_p2.rs:602-603`). Comparator
+  call order, a comparator that is not a total order
+  (Rust panics; ts-rust works around it at
+  `gostd/slices.rs:1480`), and caught panics mid-sort are
+  all observable, so the ported algorithm must match
+  comparison for comparison. If a comparator panics, the
+  slice stays in the same state the Rust algorithm
+  leaves: a permutation, never a duplicate or a loss.
+  Gate: difftests with duplicate keys, a comparator call
+  log, a panicking comparator caught by `catch_unwind`,
+  and a non-total-order comparator, against rustc in
+  unwind mode (9.3 test runners).
 
 ### 3.4 Iterators in source, fusion in the compiler
 
@@ -1265,6 +1746,32 @@ custom `Iterator`, 2 `DoubleEnded`, 4 `ExactSize`, 6
 behavior live in the source impls and must match Rust
 (VERIFY G section P4 gives the failure cases). The
 fusion spec in 4.3 consumes these exact semantics.
+
+Real std also changes output through specialization, which
+plain generic source cannot express. Examples: `zip` with
+two random-access sides pulls the long side only as far as
+the short side; `into_iter().map(f).collect()` reuses the
+allocation and keeps capacity 100; a trusted-length
+`collect` or `extend` reserves a different capacity. The
+unfused path must match rustc on all of these, or
+`LUST_NO_FUSION=1` and the fused path disagree.
+
+Std gets one narrow privilege for this (3.1 item 3): three
+type predicates that mono evaluates as constants after
+substitution, from a closed table of std defs:
+
+- `intrinsics::is_trusted_random_access::<I>() -> bool`
+- `intrinsics::is_trusted_len::<I>() -> bool`
+- `intrinsics::in_place_collect::<Src, T>() -> bool`
+
+Std source branches on them in `Zip::next`, in `collect`,
+and in `extend`. The trait system does not change, and user
+code cannot name the predicates. A new predicate needs a
+difftest that shows observable divergence without it, plus
+a line in this list. Gate: list each std specialization
+that changes output (pull counts, capacity, drop order) in
+the std source README, with one unfused difftest per item
+in `tests/adapters/` (9.3).
 
 `for` loops desugar in check to `IntoIterator::into_iter`
 plus a `next` loop, or to a fused chain when 4.3
@@ -1316,22 +1823,43 @@ where output can observe it:
   hash, and hashbrown's table gives a deterministic
   iteration order for a fixed insertion sequence.
   Where ts-rust output depends on it, lust must match.
-  The only safe way is a hashbrown-compatible table:
-  same bucket count growth (power of two, 87.5% load
-  via growth-left), same quadratic probe sequence,
-  same iteration scan order (bucket index order), same
-  tombstone behavior on remove. Group width (16) does
-  not change order if probing matches. Implement it in
-  the C core (`lust_hashmap`), with the hasher in
-  source: FxHash as `rustc-hash 2.1.2` computes it,
-  SipHash-1-3 for std maps with a fixed seed. Gate:
-  difftest that inserts, removes, rehashes thousands of
-  keys and compares full iteration order against a
-  rustc binary using `rustc-hash =2.1.2` and
-  `hashbrown` as in ts-rust's `Cargo.lock`. Pin those
-  versions in the test. If the gate fails on a case,
-  the fallback is a reviewed list of ts-rust sites that
-  sort before output, not silent divergence.
+  The byte streams that `Hash` writes are part of the
+  contract too: `str` writes a trailing `0xff` byte,
+  slices write a length prefix, and a derived enum writes
+  its discriminant as `isize`. The hasher is source: FxHash
+  as `rustc-hash 2.1.2` computes it, SipHash-1-3 for std
+  maps with a fixed seed.
+  Sequence the work. First, spike K4 audits whether
+  ts-rust output depends on the order at all: build
+  ts-rust with a perturbed FxHasher through `[patch]` and
+  run the baseline tests. Equal bytes mean a deterministic
+  table is enough for the port. Unequal bytes name the
+  sites that need the exact table or a sort at the site.
+  The exact table, when built, must pin: the hashbrown
+  version inside the pinned Rust std (the `FxHashMap`
+  oracle, since `rustc-hash` aliases std `HashMap`; the
+  external `hashbrown` in `Cargo.lock` is the `IndexMap`
+  oracle and can differ), bucket growth (power of two,
+  87.5% load via growth-left), element layout, growth,
+  reserve and shrink, removal and tombstones, rehash, and
+  scan order. Group width is part of the probe sequence,
+  not a free choice: hashbrown adds `Group::WIDTH` to the
+  probe stride, 16 bytes on x86_64 (SSE2) and 8 bytes on
+  aarch64 (NEON), so one fixed-width table cannot match
+  both tier 1 targets. Until the exact gate passes for a
+  target, the adapter README must state that Fx map
+  iteration order is not yet a supported observable on
+  that target, and the port proceeds only under the K4
+  audit result. Never silently diverge.
+- **`type_name`.** `std::any::type_name::<T>()` reaches
+  output: ts-rust parses it into error text at
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/frontend/json_ext.rs:647`.
+  Mono generates the string for each concrete type with
+  real path spelling: crate name, module path, item name,
+  and generic args as rustc prints them, for std types and
+  user types alike. Gate: difftest `type_name` output for
+  the std types ts-rust names plus nested generic user
+  types.
 - **IndexMap order.** Insertion order by definition;
   `shift_remove` vs `swap_remove` differ and both are
   observable. The adapter (3.6) implements entries in a
@@ -1342,12 +1870,13 @@ where output can observe it:
   (cited in DESIGN-TS section 4) is the acceptance
   shape.
 - **Vec capacity.** Copy `RawVec` growth (3.3).
-  `collect` uses `size_hint` lower bounds and
-  `TrustedLen`-equivalent paths only inside std source
-  where the impl proves length. Difftest `capacity()`
+  `collect` uses `size_hint` lower bounds and the trusted
+  length paths only through the predicates in 3.4.
+  Difftest `capacity()`
   after map/filter/collect chains (VERIFY G P4 lists
   the traps: `Vec<u8>` through filter gives 8, 34 kept
-  items give 64).
+  items give 64) and after in-place collect and trusted
+  `extend`.
 - **Panic messages from std.** Copy the Rust 1.99 texts
   verbatim for every std panic lust can raise: unwrap
   on `None`, expect messages, index out of bounds
@@ -1363,6 +1892,15 @@ where output can observe it:
   the `GoThread` spawn path depends on caller location
   for fatal messages
   (`crates/ts_goport/src/gopanic.rs:249`).
+  Two more payload facts are observable: the payload type
+  of `panic!("{}", x)` follows `Arguments::as_str()`, so a
+  literal-only message is a `&'static str` payload and a
+  formatted one is a `String` payload, including rustc's
+  inlining of literal args; ts-rust downcasts payloads.
+  And `Location::file()` is the path Cargo gives rustc:
+  workspace-relative for members, never an absolute lust
+  path. The line numbers in cached code follow the
+  remapping rule in 4.2.
 - **Drop order.** Already a rule-zero requirement and
   tested today with printing `Drop` impls. Std source
   must not reorder drops: `Vec` drops elements front
@@ -1370,7 +1908,12 @@ where output can observe it:
   order, temporaries drop at Rust's points. Early-exit
   paths (`?`, `collect::<Result>` short-circuit) drop
   in Rust order (VERIFY G P4: closure captures drop
-  before partial Vec elements).
+  before partial Vec elements). Edition 2024 has three
+  drop-related rules that change output and need tests of
+  their own: the `if let` scrutinee drop scope, the
+  tail-expression temporary scope, and never-type
+  fallback to `!`. Lowering implements the 2024 forms
+  only; a 2021 crate fails at session start (1.1).
 
 ### 3.6 Adapter crates (dependency layer)
 
@@ -1387,7 +1930,7 @@ clear error, not a silent mismatch.
 |---|---|---|
 | `rustc-hash` | Type aliases over lust `HashMap` with the Fx hasher in source. The upstream crate is already only aliases plus the hasher. | Hash values vs 2.1.2 on byte slices, ints, strings. Table order gate from 3.5. |
 | `indexmap` | `Vec<(K, V)>` plus `lust_hashmap` side index. `IndexSet` likewise. Entry API, `shift_*`/`swap_*`, `sort_by`, slicing. | Order and capacity difftests vs 2.14.0. |
-| `smallvec` | Generic struct with inline array `[MaybeUninit<T>; N]` plus spill to the Vec core. Observable: `capacity`, spill point, `inline` size in `size_of`. | Capacity and drop difftests vs 1.15.1. |
+| `smallvec` | Keep the real public shape: `SmallVec<A>` where `A: Array`, so callers write `SmallVec<[TypeId; 16]>` (ts-rust `checker/types.rs:273`), not `SmallVec<T, N>`. The adapter defines the `Array` trait with its associated `Item` and storage, as upstream does. Inline storage is `[MaybeUninit<A::Item>; N]` plus spill to the Vec core. `MaybeUninit<T>` is the one union-shaped type the layout engine supports (4.4); general unions stay rejected. An alias to `Vec` is not equivalent: `capacity`, the spill point, `size_of`, and drop behavior on spill all differ. | Layout, capacity, spill, and drop difftests vs 1.15.1. |
 | `memchr` | Source wrappers over libc `memchr`/`memrchr`/`memmem` via one intrinsic each. Finder types in source. | Byte-search difftests on random buffers. |
 | `bumpalo` (subset) | Leak arena over `arena_alloc`. Only the API `leak_arena.rs` uses: `Bump::new`, fixed chunk limit, `try_alloc_with`, slice copy. | Alignment, failure-on-full, no-drop semantics vs the ts-rust usage at `crates/ts_goport/src/leak_arena.rs:40-80`. |
 | `xxhash-rust` (xxh3) | C xxhash in the runtime, thin source API. 128-bit results as `u128`. | Digests vs upstream test vectors. |
@@ -1405,11 +1948,29 @@ Shims cover coarse OS and data services: `rustix`,
 `nix`, `signal-hook`, `flate2` (zlib), `jiff` (local
 time), `name-to-handle-at`, jemalloc control. One Rust
 crate in `shims/` in the lust repo builds all of them
-into one `staticlib` (or `cdylib` for the first spike)
+into one `cdylib` (a dylib on macOS)
 with `extern "C"` exports. Cargo builds it once during
 `lust port prepare`, keyed by lockfile, features,
 target, toolchain, and shim ABI version (DESIGN-TS
-section 4). Lust-side, each shim has a lust source
+section 4).
+
+Link rule, from a probe on the pinned tcc: a Rust
+staticlib whose export catches its own panic with
+`catch_unwind` links through tcc (after adding
+`-lgcc_s`) but aborts at run time with "thread panicked
+while processing panic". The same objects linked with
+the system `cc` run and print the caught result. So the
+tcc linker is not a supported final link for Rust shims.
+The first supported path is: build the shim as a cdylib
+with Cargo, and link or load it with the system linker
+or loader, as lust already loads `libbase.so`. A daemon
+build that uses a shim either links the final binary
+with the system linker or loads the cdylib at startup.
+Staticlib linking through libtcc becomes an option only
+after spike K6 passes the semantic test (a recovered
+panic inside the shim, TLS, threads, callbacks, and
+allocator ownership) through the libtcc API itself, on
+both tier 1 targets. Link success alone does not count. Lust-side, each shim has a lust source
 crate with the public API whose bodies call the C
 exports through `extern "C"` foreign fns (checker
 support for foreign fns under opt-in `unsafe`).
@@ -1427,9 +1988,11 @@ concrete):
   buffer: shim-allocated memory is freed only by the
   shim.
 - Callbacks: fn ptr plus env handle plus a status
-  return. A panic in a lust callback sets the thread
-  panic flag and returns the status at once (7.2); the
-  shim must not call back again after a panic status.
+  return. A panic in a lust callback stores an in-flight
+  exception in thread state (7.2) and returns the panic
+  status at once; the shim must not call back again
+  after a panic status, and the lust side resumes the
+  unwind when control returns to lust code.
 - The shim catches its own Rust panics and returns a
   status plus message. A panic must never unwind
   through lust C frames.
@@ -1450,16 +2013,33 @@ the dev allocator or ts-rust's layout guard aborts.
 
 ### 3.8 How std gets built and cached
 
-On first use of a (lust version, target, profile)
-tuple, the driver compiles `core`, `alloc`, `std`, and
-any requested `library/deps/*` adapters with the normal
-pipeline, as crates with no `main`, roots being all
-`pub` items. Output goes to the disk cache (section
-8): per-instance C and objects, plus a serialized
-signature surface (defs, generics, impl index) so a
-cold session loads std defs without rechecking std
-bodies. The signature surface is versioned with the
-compiler; a mismatch rebuilds.
+A signature-only cache cannot serve a new generic use:
+after a restart, `Vec<MyType>` needs the generic body of
+each method it calls, not only a signature and a
+prebuilt object. So the std cache stores three things
+per (lust version, target, profile) tuple:
+
+1. The signature surface: defs, generics, param envs, and
+   the impl and method indexes, in disk form (8.4).
+2. Generic templates: the checked generic IR of every
+   generic fn, method, and impl in `core`, `alloc`,
+   `std`, and the requested adapters, in a std-only
+   versioned format with owned type stores (2.1). Std
+   cannot change inside one lust version, so this format
+   does not freeze the user `Checked` format.
+3. Prebuilt instances for the non-generic items: C and
+   objects, as section 8 defines.
+
+"Compile std once" means: run the normal pipeline over
+the shipped crates with no `main`, with every `pub` item
+as a signature root (not as a codegen root; a pub generic
+fn has no single instance to build). A cold session loads
+items 1 and 2. A user-specific std instance then goes
+through the ordinary mono and instance cache. The
+fallback is to parse and check the shipped templates on
+load; W-DRIVER measures both paths at its gate and keeps
+the serialized path only if it wins. The artifacts are
+versioned with the compiler; a mismatch rebuilds.
 
 Std is immutable inside a daemon session. Editing
 `library/` source requires a new lust version string
@@ -1496,10 +2076,23 @@ bounds, proven at the call site, keep every call and
 loan in the body valid. Two instance-dependent checks
 still run at mono and can error, matching rustc's
 post-mono errors: the recursion limit (VERIFY G P3)
-and layout-dependent const asserts (`const _:
-assert!(size_of::<T>() ...)`) after substitution.
-Mono must walk all instances even where codegen could
-skip one, or those errors diverge from rustc.
+and inline const evaluation after substitution (2.13).
+A build must walk all reachable instances even where
+codegen could skip one, or those errors diverge from
+`rustc build`.
+
+`lust check` does not walk instances. It stops after
+generic check and borrowck, like `rustc check`, which
+accepts a recursive instantiation that `rustc build`
+later rejects. Tests must state which mode they pin: a
+recursion case is a build reject, not a check reject.
+Do not pay the instance walk in the edit loop only to
+mimic a build error.
+
+Between check and mono, lowering lifts body-local types
+into the crate owned store (2.1). Mono, caching, and
+cross-crate reads only ever see lifted results. Static
+initializers are data, not instances (2.13).
 
 Generic IR keeps trait method calls as
 `CallTrait { trait_def, method, self_ty, args,
@@ -1533,36 +2126,41 @@ that names the worst template. These caps stop hangs;
 they are not language limits.
 
 Roots: `main`, `#[test]` fns in test crates, exported
-`extern "C"` fns, statics' initializers (as instances
-of a synthetic init fn), vtable method sets for every
+`extern "C"` fns, vtable method sets for every
 `dyn` coercion site reached, and drop glue for every
-concrete droppable type reached. Non-generic fns are
+concrete droppable type reached. Static initializers
+are data (2.13), not roots. Non-generic fns are
 instances with empty args. Dead generic fns produce
 no instance and no C.
 
-Sharing key (code size), per VERIFY G section 4 item
-3: after substitution, compute a codegen identity:
+No instance sharing in milestones 4 to 8. The key from
+revision 1 (layout class per type arg plus the set of
+trait callees) is not a correctness proof: it ignores
+field offsets, type-dependent constants, `size_of`,
+`TypeId::of`, and `type_name` inside the body, the order
+of calls, and the C calling convention (`f64` and `u64`
+share a layout class and differ in registers). VERIFY G
+also puts the gain under 10%. So v1 emits one C function
+per discovery instance and keeps the erased container
+cores (3.3), which remove the largest instance class by
+a sound route. Milestone 9 may add sharing only with a
+proof per shared group: the normalized concrete IR and
+the C ABI signature must be equal, or the template must
+be in a restricted class with its own proof. Measure
+emitted instance bytes and rebuild bytes first. A 30%
+byte share alone does not prove a compile-time problem.
 
-```text
-share_key = (def,
-             layout_class of each type arg,
-             sorted set of instance keys the body calls trait methods on)
-layout_class(ty) = (size, align, is_copy, needs_drop,
-                    contains fat ptr shape)  computed recursively
-```
-
-If two discovery instances of one template have equal
-share keys, emit C once; the second instance's slot
-points at the first instance's function. Bodies that
-only move `T`, store it, or pass it to shared callees
-share. Bodies that inspect `T` (match on an enum arg,
-call a method on it) differ through the callee set.
-V1 simplification, if the sharing analysis slips:
-share nothing, measure C size on the milestone 5
-spike fixtures, and add sharing in milestone 9 only
-if instance C exceeds 30% of total C after fusion
-(VERIFY G's revisit threshold). Decide at the spike,
-with numbers. Do not block traits on sharing.
+Each instance caches its resolved edge list (callee
+instance keys) with the reads that produced it. On an
+edit, mono recomputes edges only for dirty instances and
+walks from them (8.3). A full walk over a few hundred
+thousand instances and a few million edges would eat the
+edit budget by itself, so the walk is incremental from
+the first version, not a later fix. Record the real
+reachable instance count and the cached-walk time at the
+wave B scale gate (9.3). Density estimates from VERIFY G
+(0.56 to 0.80 instances per line) are a budget check, not
+a prediction.
 
 Glue per concrete type (drop, clone, eq, hash, debug
 where derived or std-known) becomes instances too,
@@ -1573,27 +2171,65 @@ for erased cores (3.3) is a static struct of fn ptrs
 to those instances' slots, emitted once per type that
 reaches a container core.
 
-Daemon instance cache: per crate session (and across
-crates in one workspace session, since instances are
-per final bin but discovery repeats per crate),
-`FxMap<InstanceKeyHash, Slot>` where the hash covers
-def hash plus args fingerprint (type fingerprints use
-DefPathHash and structure, never session-local `Ty`
-ids, so the same map seeds the disk cache). An
-instance is re-emitted only when its fingerprint
-changes (section 8): template body fingerprint, arg
-layout fingerprints, or any selected impl on its call
-edges. This is the milestone 9 instance cache; design
-slots for it now so milestone 5 does not paint over
-it. Slot assignment is append-only per session, as
-today (`src/driver.rs:317-336`). Removed instances
-leave dead slots until the next base rebuild (32
-overlays today; keep the policy).
+Slots and cached code. There is one slot space per final
+binary (1.7), assigned by W-DRIVER when it plans the link.
+Generated C contains numeric slot references, so slot
+assignment is part of code identity:
+
+- Per-instance C text is cached in two layers. The mono
+  IR of an instance is keyed by its instance fingerprint
+  (template body, arg fingerprints, selected impls on its
+  edges). The C text for a unit also depends on the slot
+  manifest (the `InstanceKeyHash -> slot` map for the
+  bin), because call sites print slot numbers. A cached
+  object is reusable only under the same manifest hash.
+  When the manifest changes, re-emit C from cached mono
+  IR; do not reuse the object.
+- C-unit objects and per-instance C are separate cache
+  entries (8.4). The backend compiles groups of instances
+  into units, so the object key names the unit's instance
+  set plus the manifest hash.
+- Slot assignment is append-only per bin session, as
+  today (`src/driver.rs:317-336`). Unreachable instances
+  leave dead slots until the next base rebuild (32
+  overlays today; keep the policy). A restarted daemon
+  loads the stored manifest so slots stay stable across
+  restarts, in any crate load order or instance discovery
+  order. A restart test in 9.3 proves it.
+
+Locations and span remapping. Panic locations,
+`track_caller` locations, and cached diagnostics are
+position-dependent. A token hash that ignores whitespace
+calls a body unchanged after a blank line is added inside
+it, and a function-relative line number only fixes moves
+of the whole function. Rule: stored results keep
+locations as (item def, token ordinal inside the item).
+The line and column are resolved from the current file's
+token spans at print or emit time. C text that embeds
+line numbers also keys on the line-index hash of its
+source file. Expansion tokens carry their `CtxtId`;
+their disk form is the expansion's source hash chain
+(8.4), so a macro edit remaps them, by the same rule.
 
 ### 4.3 Iterator fusion with an unfused fallback
 
-Fusion recognizes a chain at lower time, on the typed
-AST of one body, before mono:
+Start unfused. The first version ships ordinary source
+`next` semantics with fusion off for every adapter. Fusion
+then turns on per adapter chain, under the dual-run gate
+below, in this order: proved single-adapter chains over
+slice and range sources first (`map`, `filter`, `copied`,
+`enumerate`, `take`), then the rest. `zip`, nested
+`flatten`, and reverse pulls (`rev`, `next_back`) stay on
+the source path until their own gates pass.
+
+Recognition has one boundary, stated here so lowering and
+mono do not each invent one. Lowering records a candidate
+chain on the generic IR by std def ids. At mono, with
+concrete types (and after an opaque type is substituted),
+the fusion pass checks eligibility: chain shape, source
+kind, and the specialization predicates of 3.4 for the
+whole chain. If any fact is not proved, the instance uses
+the unfused path. Fusion recognizes, when eligible:
 
 - Source: `.iter()`, `.iter_mut()`, `.into_iter()` on
   `Vec` and slices and arrays, `str::chars` and
@@ -1621,14 +2257,24 @@ simple tests pass. From VERIFY G P4, the spec must
 state:
 
 - Pull order is demand-driven per `next` call. `take(n)`
-  tests its count *before* pulling. `zip` pulls left,
-  then right, once per output, with the known
-  specialization exception: when the right side has an
-  exact remaining length the left side may be pulled
-  only that many times; replicate Rust's
-  `TrustedRandomAccess` behavior for the fused sources
-  by pulling left only up to the right length when the
-  right source is a slice or range iterator. The
+  tests its count *before* pulling. `skip(n)` pulls and
+  drops the skipped items, so `map(f).skip(2).next()`
+  runs `f` 3 times. `step_by(k)` pulls the items it steps
+  over (a 4-item source with `step_by(2).count()` runs a
+  `map` closure 4 times; in general every source item up
+  to the last yielded one is pulled). Never skip a pull
+  because its value is unused.
+- `zip` pulls left, then right, once per output. The one
+  exception is Rust's random-access path, and it needs
+  *both* sides to be trusted random access for the whole
+  adapter chain on each side, by the 3.4 predicate. Then
+  the long side is pulled only as far as the short side.
+  The right side alone proves nothing: with `filter` on
+  the left and a slice on the right, rustc runs the map
+  closure 3 times for a 2-item output, and a
+  minimum-length loop would run it 2 times and change
+  output. The unfused std `Zip` makes the same decision
+  through the same predicate, so both paths agree. The
   side-effect count in user closures is observable.
 - `collect` capacity: pre-size from the chain's
   `size_hint` exactly as the source impls compute it
@@ -1668,72 +2314,138 @@ deep-chain cleverness.
 
 ### 4.4 Layout
 
+Layout is observable in safe Rust. `size_of`, `align_of`,
+and `offset_of!` can print, and a const assert on a size
+is a compile error when the size differs. So layout is a
+strict contract, not a performance choice:
+
+- For every type lust accepts, `size_of` and `align_of`
+  equal rustc 1.99 on the same target. The algorithm
+  below exists to meet that rule. A shape where the
+  algorithm cannot prove a match is rejected, not
+  accepted with a different size.
+- `offset_of!` must also match where it is allowed. Rust
+  does not promise field offsets for default-repr types,
+  but a program can still print them, so lust rejects
+  `offset_of!` on a default-repr type with `L0650`. On
+  `repr(C)`, `repr(packed)`, and `repr(transparent)`
+  types, offsets follow the stated rules and match.
+  Ts-rust uses `offset_of!` only on `repr(C)` types.
+- A scan for size asserts is not permission to diverge.
+  It finds asserts; it cannot find a size printed at run
+  time. No "release-only assert" rewrite changes this,
+  because the assert is also a compile-time check in
+  dev: a wrong size makes the port fail to build.
+  Ts-rust has more than 20 such asserts on default-repr
+  types (`TypeMapper == 16`, `NodeList == 16`,
+  `Symbol == 56`, and more). They are build blockers,
+  not performance guards.
+
 One layout engine in `src/ty/layout.rs`:
 `layout(ty) -> Layout { size, align, field_offsets,
-enum_tag }` for sized types, memoized per `Ty`.
+enum_tag, niche }` for sized types, memoized per `Ty`.
 Pointer width from the target table (1.6). Rules:
 
 - Scalars: C sizes. `bool` 1 byte (values 0 and 1
   only; codegen must never produce other bytes in a
   bool slot). `char` 4 bytes. `u128/i128` 16 bytes,
-  align 16 on x86_64 through tcc's `__int128`? tcc
-  support is thin: represent `u128` as a 2-word struct
-  with runtime helpers for arithmetic beyond add and
-  compare, unless the tcc spike (section 10) proves
-  `__int128` works on both tier 1 targets. Ts-rust
-  needs `u128` only for xxh3_128 values (54 uses):
+  align 16 on both tier 1 targets. The pinned tcc does
+  not parse `__int128` (K3, section 10), so codegen
+  uses a 2-word struct with an explicit 16-byte
+  alignment attribute and runtime helpers for
+  arithmetic beyond add and compare. Ts-rust needs
+  `u128` only for xxh3_128 values (54 uses):
   construction, compare, hash, print. Helpers cover
-  that.
-- `repr(Rust)` (default): fields in declaration order,
-  each aligned to its align, struct align is max field
-  align, size rounded up. Lust does *not* reorder
-  fields like rustc may. Consequence: `size_of` for
-  default-repr types can differ from rustc. Where
-  ts-rust asserts sizes, the types are `repr(C)` (see
-  below) or the assert is a performance guard.
-  `lust port scan` lists every `size_of`/`offset_of`
-  assert on non-`repr(C)` types for human review: if
-  the assert guards safety, the port adds `repr(C)`
-  or the assert moves to the release-only path with a
-  recorded exception (DESIGN-TS section 6). Never
-  silently accept a different size where code
-  *depends* on it (transmute, raw reads): those need
-  `unsafe` and stay rejected in safe lust.
-- `repr(C)`: exact C layout. The C emitter writes
-  explicit padding fields from the layout engine's
-  offsets, so the C struct's layout equals lust layout
-  regardless of the C compiler's choices. Enums with
-  `repr(C)`: tag per C (`int`-sized unless a repr int
-  is given), payload union. Ts-rust: `repr(C)` 6,
-  `repr(u8)` 6, align 3, packed 1, transparent 1.
+  that. Where a C struct field needs align 16, the
+  emitter pads explicitly (the `repr(C)` rule below),
+  so `size_of` and field offsets hold in C too.
+- Niches. Each layout reports at most one niche: a
+  scalar range inside the type that can hold tag values
+  for an outer enum. Sources: a non-null pointer scalar
+  (`&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`, fn ptr,
+  `NonNull`), `NonZero*`, `bool` (values 2 to 255 free),
+  `char` (values above `0x10FFFF` and the surrogate
+  range free), and an enum tag scalar whose discriminant
+  range leaves free values, including a `repr(u64)` enum
+  with few variants. A struct or tuple takes the niche
+  of its first field (in layout order) that has one,
+  with that field's offset. This is the mechanism
+  ts-rust relies on: `TypeData` is a default-repr enum
+  whose tag lives in the free values of a
+  `GenericArgumentsMemo` field, a `repr(u64)` enum (see
+  `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/checker/types.rs:2098-2105`).
+- Enums. Two candidate layouts; take the smaller, then
+  the one rustc takes for the shape (gate below).
+  (a) Niche-filled: if the largest data-carrying variant
+  has a niche with at least as many free values as there
+  are dataless variants plus the other data variants
+  that must share it, store the tag in the niche and add
+  no tag word. `Option<&T>`, `Option<bool>` (1 byte), and
+  the `TypeData` shape all come from this rule. When two
+  fields offer niches, rustc takes the first in layout
+  order; do the same, because which field holds the tag
+  changes offsets inside the enum and the size of
+  nesting types. (b) Tagged: an explicit tag, then the
+  largest variant payload, laid out like a struct. Tag
+  width comes from the discriminant range, not the
+  variant count: the smallest of 1, 2, 4, 8, 16 bytes
+  whose signed or unsigned range holds every explicit
+  discriminant (46 prod plus 351 generated in ts-rust).
+  `enum E { A = 1000, B }` is 2 bytes and `E::A as i32`
+  is 1000; a 1-byte tag cannot hold it. A `repr(int)`
+  attribute fixes the tag type and its width and
+  signedness; discriminants outside its range are an
+  error, as in Rust. Fieldless enums are just the tag.
+- `repr(Rust)` structs and enum payloads: order fields
+  to shrink padding, in a fixed order: by alignment,
+  largest first; among equal alignments, by size,
+  largest first; then by declaration order. Small fields
+  after large ones is what makes an enum with a
+  `(Box<u64>, bool)` variant fit in 16 bytes. Struct
+  align is the max field align, size rounds up. Codegen
+  uses these offsets for every field access, so the
+  order is internal; only `size_of` and `align_of` (and
+  nesting sizes) observe it. `struct S { a: u8, b: u64,
+  c: u8 }` is 16 bytes under this rule, as in rustc;
+  declaration order would give 24.
+- `repr(C)`: exact C layout, declaration order. The C
+  emitter writes explicit padding fields from the
+  layout engine's offsets, so the C struct's layout
+  equals lust layout regardless of the C compiler's
+  choices. Enums with `repr(C)`: tag per C (`int`-sized
+  unless a repr int is given), payload union. A
+  `repr(C)` type that contains a default-repr enum field
+  still needs that field's enum layout from the rules
+  above; `repr(C)` on the outer type does not fix a
+  nested enum. Ts-rust: `repr(C)` 6, `repr(u8)` 6,
+  align 3, packed 1, transparent 1.
 - `repr(transparent)`: layout of the one non-ZST
   field. Check the one-field rule at collect.
 - `repr(align(n))`: raise align. Combined with C as
   in `#[repr(C, align(64))]` on
   `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/checker/types.rs:853-870`,
-  where `size_of::<Type>() <= 128` and
-  `offset_of!(Type, data) == 24` are const-asserted.
-  With declaration order plus C rules, lust computes
-  the same numbers; the milestone 4 fixtures must
-  include this struct shape as a test.
-- `repr(packed)`: align 1, no padding. Field access
-  through unaligned loads in C (memcpy). One use in
-  ts-rust; support it simply.
-- Enums, default repr: tag is the smallest int of
-  1, 2, 4, 8 bytes that holds the variant count,
-  placed first, then the largest payload. Explicit
-  discriminants (46 prod plus 351 generated in
-  ts-rust) set tag values, not sizes.
-- Niches: implement exactly one niche rule, because
-  it is widely observable in `size_of` and in memory
-  use: `Option<T>` where `T` is a non-null single
-  pointer (`&T`, `&mut T`, `Box<T>`, `Rc<T>`,
-  `Arc<T>`, `NonZero*`, fn ptr) has the size of `T`,
-  with null as `None`. No other niches (no bool or
-  char range niches, no enum tag packing into payload
-  padding). `size_of::<Option<T>>()` for other `T`
-  will differ from rustc when rustc finds a niche;
-  port scan flags asserts that depend on it.
+  where `size_of::<Type>() <= 128`,
+  `offset_of!(Type, data) == 24`, and
+  `size_of::<TypeData>() == size_of::<TypeReference>()`
+  are const-asserted. The first two follow from the C
+  rules. The third needs the nested `TypeData` enum to
+  niche-fill its tag; with an 8-byte separate tag,
+  `TypeData` grows and `Type` no longer fits 128 bytes.
+  The layout gate includes this real nested shape, with
+  the real field types, not a simplified stand-in.
+- `repr(packed)`: align 1, no padding. Field access by
+  value goes through unaligned loads in C (memcpy).
+  Taking a reference to a packed field is an error, as
+  in Rust (E0793): `L0651` at the borrow, in check.
+  `repr(packed(N))` for N other than 1: reject until a
+  user appears. One packed use in ts-rust.
+- `MaybeUninit<T>`: size and align of `T`, no niche. It
+  is the one union-shaped type in the contract (std and
+  the smallvec adapter need it). User unions: reject
+  `L0652`. `repr(simd)`: reject. An enum whose niche
+  choice the gate shows diverging from rustc: reject
+  that enum form with `L0652` until the engine matches,
+  rather than ship a wrong size.
 - Unsized: fat pointers are (ptr, len) for slices and
   str (today's `lust_str`, `src/runtime.c:19`), and
   (ptr, vtable) for `dyn`. A struct with an unsized
@@ -1743,6 +2455,17 @@ Pointer width from the target table (1.6). Rules:
   ZST never allocates; the erased core handles
   size 0. `PhantomData` is a ZST field that still
   contributes variance and auto traits.
+
+Gate: a `size_of`/`align_of` difftest over every shape
+ts-rust asserts (the list comes from port scan output at
+gate time, and must include the nested `Type` /
+`TypeData` / `TypeReference` shape and `TypeMapper`)
+plus a shape generator that crosses field kinds (scalars
+of each width, refs, boxes, small enums, bool and char
+fields, repr-int enums) in structs and enum variants,
+against rustc on each tier 1 target. A mismatch is a
+layout bug or a new rejected form; never a waived
+difference.
 
 `size_of`, `align_of`, `offset_of!` evaluate in the
 const evaluator from this engine. `mem::swap`,
@@ -1793,8 +2516,10 @@ Keep today's model and extend it:
   section 7.
 - `#line` directives map C back to the `.rs` file and
   line through the per-build line table, as today
-  (`src/cgen.rs:1059-1095`). Panic locations stay
-  (slot, line-in-fn, col).
+  (`src/cgen.rs:1059-1095`). Panic locations are
+  (slot, token ordinal in the item) in stored form,
+  resolved to line and column by the 4.2 remapping
+  rule at emit time.
 
 Backend swap stays possible: cgen consumes mono IR
 only. The milestone 9 bake-off (tcc, Cranelift,
@@ -1807,8 +2532,10 @@ IR may name C types. Today's `CTy` in cgen
 This section implements DESIGN-TS section 2 option B.
 Read that section with this one. Summary of the deal:
 real region checking, bounded algorithm, stated
-rejects. Ts-rust needs it: 168 user types with
-lifetime params, 111 with non-static ref fields, 27
+rejects. Ts-rust needs it: about 194 user types with
+lifetime params at the last port scan (an older count
+said 168; gates cite scan output, 9.4), 111 with
+non-static ref fields, 27
 with `&mut` fields, 10 with 2 or more lifetimes, one
 with 3 (`transformers/destructuring.rs:93`, cited in
 DESIGN-TS). Do not cap the region count.
@@ -1824,7 +2551,12 @@ step removes the `L0203` blanket reject
 (`src/parser.rs:65-72`) for these two forms and allows
 `&'static T` fields (191 in ts-rust) and std types
 like `Formatter<'_>`, `Cow<'static, str>`,
-`MutexGuard<'_>`. INVENTORY credits this step with
+`MutexGuard<'_>`. Step A still runs well-formedness on
+every lifetime-bearing field: a `&'static` slot accepts
+only a `'static` source, and the region checks in 5.2
+that need no named regions (static outlives, field
+bounds) run from day one. Do not enable ref fields by
+skipping those checks. INVENTORY credits this step with
 moving ts-rust from 16.6% to 32.7% of prod lines for 1k
 to 2k lines. It is the cheapest big win in the plan.
 
@@ -1862,22 +2594,41 @@ Per body, region checking reuses the loan engine in
    This replaces `ret_borrows_from`
    (`src/collect.rs:52-53`, set at
    `src/collect.rs:372`) with the general form.
-3. Solve: live range of each loan comes from the
-   existing NLL liveness (a loan is live where a live
-   local may hold it, `src/borrowck.rs:1-8`). A region
-   var's required live range is the union of points
-   where values typed with it are used, plus outlives
-   closure over the constraint graph. Check: for every
-   loan stored under region `'x`, the loan's place
-   stays valid (not moved, not dropped, not mutably
-   aliased) across `'x`'s whole required range, and if
-   `'x` is a param or outlives the body scope through
-   the return type or a stored field, the loan's place
-   must itself come from a param with a region that
-   outlives `'x` per the signature. Concretely: a
-   reference to a local can never satisfy a region
-   that reaches the return, a `&'static` slot, or a
-   field whose Adt region outlives the body.
+3. Solve with NLL live ranges, exactly. A region is
+   live at a CFG point when any of these holds:
+   (a) a local whose type mentions the region is live
+   there; (b) the region outlives a region live there
+   (close over the outlives graph); (c) the region is
+   *universal*: a fn lifetime param or `'static`.
+   Universal regions contain every CFG point. A loan
+   stored under region `'x` is live at every point where
+   `'x` is live, from the loan's creation point on.
+   Then check: for every loan, the loan's place stays
+   valid (not moved, not dropped, not mutably aliased)
+   across the loan's whole live range.
+   The old rule "a loan is live where a live local may
+   hold it" is not NLL. It is closer to Polonius and it
+   accepts programs rustc rejects. The case that proves
+   it is NLL problem case 3:
+
+   ```rust
+   fn first_or_push(v: &mut Vec<i32>) -> &i32 {
+       if let Some(x) = v.first() { return x; }
+       v.push(1);            // E0502 in rustc
+       &v[0]
+   }
+   ```
+
+   The loan behind `x` sits under the return region, a
+   universal region, so it is live at the `push` even
+   though `x` is dead on that path. Today's lust accepts
+   this program and prints `1`; that is a live rule-zero
+   bug (section 11). Under the rule above, every
+   "Polonius accepts, NLL rejects" shape rejects here
+   too. Concretely, a reference to a local can never
+   satisfy a region that reaches the return, a
+   `&'static` slot, or a field whose Adt region
+   outlives the body.
 
 This is a constraint check, not region *inference* of
 named signatures: signatures are as written (with
@@ -1913,10 +2664,16 @@ fields with variance signs.
 ### 5.3 Variance
 
 Compute each Adt type and lifetime param's variance
-from fields, Rust-style: covariant by default;
-`&mut T`, `Cell`, `RefCell`, `UnsafeCell`, fn ptr
-args, and raw ptr (by kind) flip or freeze to
-invariant per Rust's table. `PhantomData<T>` gives
+from fields, by Rust's table, pinned in full. The rows
+that are easiest to get wrong: `&'a T` is covariant in
+`'a` and in `T`; `&'a mut T` is covariant in `'a` and
+invariant in `T`; `*const T` is covariant in `T`;
+`*mut T` is invariant in `T`; `UnsafeCell<T>`, `Cell`,
+and `RefCell` are invariant in `T`; a fn pointer is
+contravariant in its args and covariant in its return;
+`Box<T>`, `Vec<T>`, and `Rc<T>` are covariant in `T`
+through their `PhantomData` and pointer fields as Rust
+computes them. `PhantomData<T>` gives
 `T`'s variance without storage. Variance feeds step 2
 above: covariant positions produce `'x: 'y`,
 contravariant flip, invariant produce equality (both
@@ -1932,15 +2689,27 @@ With 27 `&mut`-field types, this is not optional.
 
 ### 5.4 Drop check
 
-Structural drop check, conservative: when a value of
-type `Adt<...>` with a `Drop` impl (or a field that
-transitively has one) drops at point P, every region
-arg of the type must still be live at P (its loans
-valid). No `#[may_dangle]`. If the check cannot prove
-liveness, reject with `L0285` naming the type and
-region. Rust's dropck with `may_dangle` accepts some
-of these; ts-rust uses no `may_dangle` (it needs
-`unsafe`). Conservative is sound and sufficient.
+Structural drop check, conservative for user types: when
+a value of type `Adt<...>` with a `Drop` impl (or a
+field that transitively has one) drops at point P, every
+region arg of the type must still be live at P (its
+loans valid). If the check cannot prove liveness, reject
+with `L0730` naming the type and region.
+
+One exception, for std only. Real std marks some `Drop`
+impls `#[may_dangle]`, and safe programs depend on it: a
+`Vec<&String>` declared before the `String` it borrows
+compiles in rustc because `Vec`'s drop does not touch
+the elements' referents. A conservative rule for std
+containers rejects that program. So shipped std (and
+only shipped std, 3.1 item 4) carries a may-dangle flag
+on the same impls as real std: `Vec`, `Box`, `Rc`,
+`Arc`, `VecDeque`, and the iterator and guard impls the
+surface manifest lists. For a flagged impl, drop check
+does not require the type and region args that the flag
+covers to be live at the drop. User impls never get the
+flag; they stay conservative. Ts-rust writes no
+`may_dangle` of its own (it needs `unsafe`).
 
 ### 5.5 What is rejected
 
@@ -1949,22 +2718,43 @@ them before milestone 6 starts, so the list is
 evidence-checked:
 
 - GATs and any assoc type with its own lifetime
-  params (`L0230`, from 2.5).
+  params (`L0620`, from 2.5).
 - Higher-ranked binders beyond rank 1, and binders on
   trait *defs* (`trait Tr<'a>` is fine; `for<'a> Trait`
   as a supertrait bound on a nested binder is not).
   One explicit `for<'a>` exists in ts-rust
   (`ast/synthetic.rs:1447` fn ptr, DESIGN-TS section
   2 table): rank-1 fn ptr, supported.
-- Signatures where early-bound vs late-bound lifetime
-  distinction is observable through turbofish region
-  args at a call. Lust treats all fn lifetime params
-  as late-bound (fresh at each call). A turbofish that
-  names a lifetime arg (`f::<'static>(...)`) is
-  accepted and only checked for well-formedness; if
-  the named region would need to flow *into* the call
-  as an early-bound constraint to typecheck, reject
-  `L0286`. Rare by construction; port scan counts.
+- Explicit lifetime turbofish args. Lust *computes* the
+  early-bound and late-bound split, as rustc does: a
+  lifetime param is early-bound when it appears in a
+  bound on another param or does not appear in the fn
+  inputs where a late-bound param must; else it is
+  late-bound and becomes a binder at each call and in
+  the fn pointer type (2.9). The split is cheap and it
+  decides fn-item coercion: an item with an early-bound
+  lifetime does not coerce to a `for<'a>` fn pointer
+  over that lifetime. But naming a lifetime in a
+  turbofish is rejected in all cases with `L0731`, a
+  stated subset cut. Rust rejects it whenever any
+  late-bound param is present (E0794:
+  `fn f<'a>(x: &'a str) -> &'a str` then
+  `f::<'static>("x")` fails), so the common case already
+  errors in both compilers. Only the all-early-bound
+  case diverges, as a lust reject of valid Rust. Port
+  scan counts those sites.
+- Higher-ranked requirements that the leak check cannot
+  prove. To check `for<'a> P<'a>`, substitute a fresh
+  *placeholder* region for `'a`, check `P` with it, then
+  verify the placeholder did not escape: it must not
+  appear in any inference var, type, or loan that
+  outlives the proof. A fresh existential var alone does
+  not prove a universal claim, it only witnesses one
+  choice. If the placeholder escapes, reject with
+  `L0732`. The negative corpus (5.6) carries both
+  directions: a callback that needs `for<'a> Fn(&'a T)`
+  must accept, and one that stores the borrowed arg
+  past the call must reject.
 - Borrows held across `.await` until the async work
   in milestone 8b. The ATA futures borrow request
   data across suspension (DESIGN-TS section 6); that
@@ -1981,38 +2771,81 @@ evidence-checked:
   2024 capture rules (capture all in scope), reject
   2021-style implicit capture differences by edition.
   Lust only supports edition 2024 crates (1.1); a
-  2021 crate is `L0112` at session start. Ts-rust is
+  selected 2021 crate is `L0530` at session start.
+  Ts-rust is
   edition 2024 workspace-wide
   (`/home/theo/.t3/projects/ts-rust/Cargo.toml:11-15`).
 
 ### 5.6 Negative corpus
 
 Before step B lands, write the reject corpus (each
-checked against rustc): arena reset while borrowed,
+checked against rustc): NLL problem case 3 (5.2) and the
+other "Polonius accepts, NLL rejects" shapes, arena
+reset while borrowed,
 mutable alias through a struct field, nested borrowed
 fields escaping, invariant cell shortening, callback
 (`Rc<dyn Fn + 'a>`) escaping its scope, guard-backed
 borrow outliving its guard (`FileRef` shape), scoped
-thread borrowing past `scope` end, dropck case. The
+thread borrowing past `scope` end, dropck case, and
+both directions of higher-ranked fn-pointer and
+callback coercion (5.5). The
 corpus is the gate. Features follow it (BRIEF test
 rules: `tests/fail` for both-reject, `tests/reject`
-for lust-only rejects).
+for lust-only rejects). Problem case 3 is a bug in
+today's lust, not step B work: it gets a `tests/fail`
+case and a fix as milestone 1 work, before any of this
+lands (section 11).
 
 ## 6. Macros
 
 ### 6.1 Where expansion sits
 
-Pipeline per file:
+Expansion does not run before cfg stripping or before
+import resolution. Rust strips cfg before it expands a
+node, and it resolves macro paths through imports. A
+complete expansion phase followed by a complete
+resolution phase cannot do either: a call under
+`#[cfg(windows)]` to a Windows-only macro would expand
+(or error), and a macro brought in by `use` would not
+resolve. Ts-rust re-imports `go_enum` and `go_flags`
+with `pub(crate) use goport_util::{...}` in an inline
+module (`/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/lib.rs:44-47`).
+
+So per crate, one outline worklist interleaves all of
+it (the same worklist as 1.3):
 
 ```text
-lex to token stream with token trees (delimiters nested)
-  -> parse "outline": items with MacroCall nodes intact,
-     fn bodies as token ranges (as scan does today)
-  -> expand: resolve macro defs visible at each call,
-     expand outermost-first, re-lex nothing (tokens all the way)
-  -> parse expanded token stream to full AST
-  -> cfg strip, resolve, collect, ...
+lex each file to token trees (delimiters nested)
+parse the "outline": items with MacroCall nodes intact,
+  fn bodies as token ranges (as scan does today)
+repeat until nothing changes:
+  1. strip cfg on each known item and attribute (1.6)
+  2. load files for `mod` items now known (1.2)
+  3. resolve imports with the items now known (1.3)
+  4. expand every macro call whose macro path resolves,
+     outermost-first, re-lex nothing (tokens all the way)
+  5. parse the new items an expansion produced; a new
+     `mod` goes back to step 2, a new `use` to step 3
+then: parse bodies to full AST, resolve, collect, ...
 ```
+
+Rules of the loop:
+
+- A disabled `compile_error!` or `include!` never runs:
+  step 1 removes its node before step 4 can see it.
+- A macro call whose path does not resolve yet waits. If
+  the loop ends with calls still waiting, that is the
+  unresolved-macro error (`L0802`).
+- An expansion can emit items, `use` lines, and `mod`
+  items. All go through the same loop. Expansion records
+  the bindings it used; an item generated later that
+  would change an earlier macro resolution is `L0504`
+  (1.3, rustc E0659).
+- One integration owner runs this loop: W-RESOLVE owns
+  the worklist driver and the module, import, and cfg
+  steps; W-MACRO owns step 4 behind a frozen interface
+  (`expand(call, macro_def) -> token trees`). Do not
+  split the loop itself between two packages (9.3).
 
 The lexer grows token trees: `TokenTree = Token |
 Delimited(kind, Vec<TokenTree>, span)`. Today tokens
@@ -2031,7 +2864,7 @@ rustc. A macro can expand to another macro call
 section 5). Expand until no calls remain or a cap
 hits. Caps: expansion depth 128, output tokens per
 call 1,000,000, total expanded tokens per crate
-16,000,000. A cap hit is `L0301` with the macro named,
+16,000,000. A cap hit is `L0801` with the macro named,
 never a hang.
 
 Macro *definitions* are items. `macro_rules!` visibility:
@@ -2050,7 +2883,7 @@ Macro *definitions* are items. `macro_rules!` visibility:
 
 Both layers feed the expander a `(macro DefId)` per
 call site. Unresolved macro name: if it is a builtin
-(6.4), use that; else `L0302`, with the failed lookup
+(6.4), use that; else `L0802`, with the failed lookup
 recorded (section 8).
 
 ### 6.2 Matching and transcription
@@ -2061,17 +2894,57 @@ macro needs: `expr` (2024: `expr_2021` too), `ident`,
 `ty`, `tt`, `literal`, `meta`, `vis`, `pat` (2024:
 `pat_param` distinction: accept `pat` as Rust 2024
 defines it), `block`, `item`, `stmt`, `path`, `lifetime`.
+A fragment means what the edition of its *definition*
+says, not the caller's edition; the def's edition is
+part of the def record and the expansion cache key
+(6.5). All lust source is 2024 today, and adapter macro
+defs are 2024, but the key keeps the rule honest.
+
+Opaque fragments. A matched fragment is not a raw token
+sequence. Store it as `Fragment(kind, node, ctxt)`: the
+parsed node (or its tokens) with a fragment identity.
+When a macro forwards `$x:expr` into another macro
+call, the inner matcher sees one opaque expr unit. It
+must not re-split the tokens: an outer macro that
+forwards the expr `3` to a macro with a `(3)` arm and a
+`($x:expr)` arm picks the expr arm in Rust. Re-parsing
+the forwarded tokens as a literal would pick the other
+arm and change the program. Ts-rust forwards exprs
+between `by_data!` and `match_data!` at
+`/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/ast/node.rs:330-338`,
+so this path is in the port, not only in tests. The
+exceptions that stay transparent are `ident`,
+`lifetime`, and `tt`, as in the Rust reference: an
+inner matcher can match those token by token. Every
+other kind is opaque to an inner matcher and can only
+bind to a metavariable of the same kind (`expr` to
+`expr`, `ty` to `ty`, and so on) or be transcribed
+whole.
+
 Matching: per arm, a token-tree matcher with
-repetition `$( ... ) sep*`, `+`, `?`. Local
-backtracking inside one arm's match is allowed and
-bounded (this is token matching, not trait search);
-arms try in order, first full match wins, as in Rust.
+repetition `$( ... ) sep*`, `+`, `?`. Arms try in
+order; the first full match wins, as in Rust. But a
+match that only succeeds by guessing between two
+fragment parses is an error, not a success. Rust
+reports *local ambiguity* and stops:
+`macro_rules! m { ($($i:ident)* $j:ident) => { () } }`
+then `m!(x)` fails, because `x` can be an `i` or the
+`j`. The matcher therefore tracks, at each input
+position, the set of live partial parses. If two
+different fragment bindings can both consume the same
+next token, the call fails with `L0805` (local
+ambiguity), even if one path would later match the
+whole arm. Bounded guessing inside repetitions of
+plain token trees is fine; guessing between fragment
+kinds or between two metavariables is not. Keep the
+live-set size capped; a cap hit is `L0801`.
 Fragment parsing reuses the real parser on the
 fragment's token slice: an `expr` fragment must parse
 as one expr and consume exactly its slice up to the
 follow set the matcher determines. Implement the follow
 sets Rust requires (for `expr`: `=>`, `,`, `;`).
-Transcription substitutes `$name` and repetitions,
+Transcription substitutes `$name` (whole fragments,
+with kind checks) and repetitions,
 checks repetition depth agreement, and handles
 `$crate`. Nested repetitions to depth 4 cover
 ts-rust (`flags_macros.rs:10` nested repetitions with
@@ -2095,16 +2968,22 @@ pub struct Expansion { pub macro_def: DefId, pub call_span: Span, pub parent: Ct
 ```
 
 Identifiers carry `(Sym, CtxtId)` where hygiene
-matters: local bindings introduced by a macro do not
-capture user locals of the same name, and macro-introduced
-locals with user-passed idents keep the caller's ctxt
-for the passed tokens. Item names from macros resolve
-in the invoking module (plus `$crate` paths are
-absolute). Implement hygiene for locals and labels;
-for items, Rust's `macro_rules` hygiene is mostly
-"$crate and def-site paths", which the path rules
-cover. Lifetimes and generic params introduced by a
-macro are hygienic like locals (edition 2024 rules).
+matters. This is mixed-site hygiene, as in Rust: a
+local binding written in the macro body gets the
+expansion ctxt and does not capture a user local of the
+same name; an ident the caller passes in keeps the
+caller's ctxt, so a macro that uses `$name` as a local
+binds the caller's variable. Labels, lifetimes, and
+generic params introduced by a macro are hygienic the
+same way (edition 2024 rules). Item names from macros
+resolve in the invoking module; paths written in the
+macro body resolve at the def site, with `$crate`
+absolute. Comparing expanded token text does not test
+any of this: two token-equal expansions can bind
+differently. The macro gate is executable tests
+(capture, shadowing, a passed ident used as a local, a
+generated label, def-site vs call-site path) run in
+`tests/macros/` against rustc output (9.3).
 
 Every token from an expansion gets the expansion's
 ctxt and a span that maps back: diagnostics print the
@@ -2126,15 +3005,19 @@ never expanded through the token machinery:
 `unreachable!`, `todo!`, `unimplemented!`, `matches!`,
 `cfg!`, `concat!`, `stringify!`, `include_str!`,
 `include_bytes!`, `include!`, `env!`, `option_env!`,
+`line!`, `file!`, `column!`, `module_path!`,
 `thread_local!`, `pin!`, `offset_of!`, `compile_error!`,
-`dbg!`. Ts-rust call counts are in INVENTORY Q2
+`dbg!`. `line!` and `file!` read the call-site span
+through the remapping rule in 4.2, with `file!` in the
+Cargo path form of 3.5. Ts-rust call counts are in
+INVENTORY Q2
 (`format!` 1,299, `vec!` 975, `panic!` 533, `matches!`
 249). Semantics notes:
 
 - `include_bytes!` (49 uses) and `include_str!` read a
   file relative to the current file at expand time.
   The file's hash enters the expansion cache key and
-  the dep graph. A missing file is `L0303`.
+  the dep graph. A missing file is `L0803`.
 - `env!` (3) and `option_env!` (4) read from a driver
   provided env map: Cargo's build env (`CARGO_PKG_*`,
   `OUT_DIR`) plus the daemon's environment snapshot at
@@ -2149,7 +3032,7 @@ never expanded through the token machinery:
 
 Derives are compiler-generated impls (2.2), not
 macros. Proc macros: out. A `proc-macro` dependency in
-the graph is `L0304` at session start with the crate
+the graph is `L0804` at session start with the crate
 named. Ts-rust has none.
 
 ### 6.5 Caching expansions
@@ -2163,13 +3046,20 @@ trees plus the list of items or the AST fragment it
 parsed to, where position allows. An unchanged call
 reuses output even when surrounding code moves. A def
 edit invalidates its calls through the dep graph, not
-by flushing the cache. Gate from PLAN.md milestone 4:
-all 66 ts-rust macros expand to the same tokens as
-rustc. Test by expanding each call fixture with
-`rustc -Zunpretty=expanded` as oracle on tokens, not
-on printed text (cargo-expand warns printed expansion
-is lossy; token compare on our own fixtures avoids
-that trap).
+by flushing the cache. The cache key also carries the
+macro def's edition (6.2).
+Gate from PLAN.md milestone 4, restated: every macro
+def the port scan lists at gate time expands correctly
+(the scan reports 80 defs under 70 names; an older
+count said 66, so gates cite scan output, not a number
+in this document). Test in three layers in
+`tests/macros/`: token compare against
+`rustc -Zunpretty=expanded` on fixtures (printed
+expansion is lossy, so compare tokens, not text);
+executable hygiene and fragment tests whose output must
+match rustc (6.3); and both-reject cases for local
+ambiguity and caps. Token equality alone proves
+nothing about binding, spans, or forwarded fragments.
 
 ## 7. Panics and threads
 
@@ -2185,109 +3075,177 @@ fallback gate. Rejected alternatives:
 | `setjmp` per fn with a cleanup registry | One `setjmp` per fn with droppable locals, plus registry push/pop per scope | `setjmp` cost lands on every fn, and "which locals are live" at jump time needs the same cleanup metadata as explicit edges, with worse C semantics (volatile rules). |
 | `longjmp` from panic, skip drops | Near 0 | Wrong: skips drops, breaks rule zero wherever a drop prints or releases a lock. |
 | Real unwinding tables for tcc C | 0 until panic | tcc emits no unwind info. Writing it is a backend project. Revisit only if the backend bake-off picks an unwind-capable backend. |
-| Explicit propagation (chosen) | One TLS flag test after each fallible call; duplicate drop code on cleanup edges | Simple C, exact drop order, works with tcc today. |
+| Explicit propagation (chosen) | One global counter load after each call; duplicate drop code on cleanup edges | Simple C, exact drop order, works with tcc today. No C TLS (7.2). |
 
 ### 7.2 Explicit propagation design
 
-Per thread, a panic state in the runtime:
+One boolean cannot do this job. While cleanup runs, the
+original exception is still in flight, and helper calls
+inside a destructor must run normally even though
+`thread::panicking()` is true. A single flag makes every
+helper take its unwind edge at once. So thread state
+keeps two things apart: the *in-flight exception* that
+must propagate, and the *unwind depth* that says cleanup
+is under way.
+
+No C TLS anywhere, in generated code or in the runtime.
+The bundled tcc emits a thread-local access in a shared
+object with no relocation, so a `_Thread_local` in a
+`.so` aliases the executable's variable (a probe reads
+the exe value 3, then sees the exe write 77). Daemon
+builds link `libbase.so` with an overlay, so a C TLS
+panic flag would corrupt state silently. This also
+settles macOS, where the same question is open: the
+design needs no Mach-O TLS answer.
+
+State:
+
+- One global counter `lust_panicking_threads` (a plain
+  atomic load). It is 0 in almost every run. It counts
+  threads with unwind depth above 0.
+- Per thread, through one pthread key:
 
 ```c
 typedef struct {
-    int panicking;
-    void *payload_data;              // Box<dyn Any + Send> parts
+    int unwind_depth;        // > 0 while cleanup or a hook runs
+    int inflight;            // an exception must propagate now
+    uint64_t gen;            // bumped on each new exception
+    void *payload_data;      // Box<dyn Any + Send> parts
     const struct lust_vtable *payload_vtable;
     lust_loc loc;
-    int hook_depth;
-} lust_panic_state;                  // one per OS thread, TLS
+    int in_hook;
+} lust_panic_state;
 ```
 
-IR change: every call terminator gets an optional
-unwind successor block. Lowering builds, per scope,
-cleanup blocks that run the drops for locals live at
-that scope exit, in reverse order, then propagate:
-in a fn, fall through to the caller-visible return
-with the flag set; in a `catch_unwind` closure body,
-land in the catch landing pad. Only fns that *can*
-panic need the check. Compute can-panic by fixpoint
-over the call graph of instances: contains a panic
-op, an intrinsic that can panic (bounds, overflow in
-dev, alloc failure aborts instead, matching Rust),
-a call to a can-panic fn, or a `dyn`/fn-ptr call
-(unknown: can panic). In practice most fns can panic.
-Do not spend effort shrinking the set before profiles.
+IR change: calls are terminators with an optional unwind
+successor (S7 builds the slot; today a call is an
+`Rvalue` inside a statement, `src/ir.rs:81`, and
+`Terminator` has no call case). Lowering builds, per
+scope, cleanup blocks that run the drops for locals live
+at that scope exit, in reverse order, then propagate.
+The same cleanup-edge pass serves scope-exit drops and
+unwind drops; build it once, in wave A with `Drop`.
 
-Codegen shape per fallible call:
+Call protocol. Before a call, the caller reads the
+thread `gen` (only when the global counter is non-zero;
+else the answer is "no exception"). After the call, the
+caller takes its unwind edge only when a *new* exception
+is in flight: the global counter is non-zero and this
+thread has `inflight` set with a `gen` newer than the
+saved one. Code shape in daemon builds:
 
 ```c
 ret = ((SIG)lust_fns[slot])(args);
-if (lust_tls_panic.panicking) goto cleanup_3;
+if (lust_panicking_threads && lust_inflight_new(saved_gen)) goto cleanup_3;
 ```
 
-One TLS load and a predictable branch. Cost estimate:
-C size grows 30 to 60% on drop-heavy code (cleanup
-blocks duplicate drop sequences per scope exit; share
-cleanup blocks per distinct live set to stay near the
-low end). Runtime: tcc code already pays a call per
-operation group; one flag test per call is an
-estimated 5 to 15% on call-dense dev code. That is
-acceptable inside the dev budget because the dev
-binary is already about 1.7x slower than rustc debug
-(DESIGN daemon section), and compile speed is barely
-affected. The spike gate (milestone 7 entry): build
-the `NodeVisitor` plus panic fixtures with propagation
-on, measure C bytes, tcc time, and run time vs
-abort-mode. If C bytes grow over 2x or run time over
-1.5x on the fixtures, stop and evaluate per-fn
-`setjmp` with cleanup registry before building
-threads on top. Keep `panic = "abort"` crates (wasm
-profile in ts-rust's `Cargo.toml:38-47`) on the old
-path: no flag tests, `catch_unwind` rejected there.
+The fast path is one plain load and a predictable
+branch. Every call checks. There is no can-panic
+fixpoint in daemon builds: most fns can panic, and a
+global fixpoint makes a leaf edit that adds a panic
+rewrite the C of every caller up the graph. A later cold
+build may skip the check for calls to fns proved
+panic-free inside one unit, only with profile evidence.
+
+Cleanup protocol. When a frame takes its unwind edge,
+it saves the in-flight exception (payload parts, `gen`,
+location), clears `inflight`, and raises `unwind_depth`.
+Destructors then run as normal code: their own calls
+return normally, and `thread::panicking()` (which reads
+`unwind_depth > 0 || in_hook`) is true throughout. Two
+ends:
+
+- The destructor returns with no new exception: restore
+  the saved exception and keep propagating.
+- The destructor raises a new exception that *escapes*
+  it: that is a double panic. Abort with Rust's
+  double-panic message. But if the destructor catches
+  its own second panic with `catch_unwind` and returns
+  normally, the outer exception resumes. Rust allows
+  this, and a probe prints `after true true` from inside
+  the destructor, then catches the outer panic. The
+  saved-slot design holds both payloads at once: the
+  outer in the frame save area, the inner in thread
+  state.
+
+`catch_unwind` protocol. Enter: raise `unwind_depth`,
+save `gen`, call the closure. On return: if a new
+exception is in flight, move its payload into the
+`Err` return value, clear `inflight`, lower
+`unwind_depth`, and return normally. Nested catches
+nest by depth, each with its own saved `gen`.
+`resume_unwind` installs the given payload as in flight
+*without* running the hook. A panic that starts fresh
+runs the hook first. A panic inside the hook aborts.
 
 Semantics that must match Rust:
 
 - Payload: `Box<dyn Any + Send>`. `panic!("...")`
-  payloads are `&str` or `String` as in Rust
-  (`panic_any` for other types). `catch_unwind`
+  payloads are `&str` or `String` by the `as_str()` rule
+  in 3.5 (`panic_any` for other types). `catch_unwind`
   returns `Result<R, Box<dyn Any + Send>>`.
   `resume_unwind` re-raises the same payload object.
-  Downcasts through the `type_id` in 2.8.
-- Panic during unwinding (a `Drop` panics while the
-  flag is set): abort the process with Rust's
-  double-panic message. No second payload.
+  Downcasts through the checked type id in 2.8.
+- Unwind safety: `catch_unwind` requires its closure to
+  be `UnwindSafe` (2.7). A closure that mutates a
+  captured local through `&mut` fails that bound, as in
+  rustc (E0277), unless the source wraps it in
+  `AssertUnwindSafe`. The wrapper overrides the check
+  only where it is written.
 - Panic hook: `set_hook`/`take_hook` store one fn
   (`dyn Fn(&PanicHookInfo) + Send + Sync`) in a
   global. The hook runs at panic start with payload
   and location, unless a hook is already running.
+  `resume_unwind` skips the hook.
   Ts-rust's bins install hooks that format Go-style
   output and use `in_go_recover` depth to stay quiet
   during recovery
   (`crates/ts_goport/src/gopanic.rs:138-166`). The
   default hook prints Rust's panic line format.
 - Lock poisoning: `MutexGuard` and `RwLock` guards
-  check the flag in their `Drop`: if set, mark the
-  lock poisoned. `lock()` returns `Err(PoisonError)`
-  after. `RefCell` borrow flags reset in guard drops
-  as usual (drop runs on unwind).
+  check `panicking()` in their `Drop`: if true, mark
+  the lock poisoned. They read unwind depth, not the
+  in-flight slot, so a guard that drops during cleanup
+  after its frame saved the exception still poisons.
+  `lock()` returns `Err(PoisonError)` after. `RefCell`
+  borrow flags reset in guard drops as usual.
 - Thread panic: an uncaught panic at a thread root
   ends that thread; `JoinHandle::join` returns
   `Err(payload)`. Other threads continue. Main thread
   uncaught panic: run hook, unwind `main`, exit with
   Rust's code 101.
-- Foreign boundary: a panic flag set when returning
-  into a C or shim frame must not propagate through
-  it. Callback trampolines (3.7) convert flag-set to a
-  status code at the boundary. A panic escaping an
-  `extern "C"` lust fn aborts, as in Rust. Panics in
-  shim Rust code are caught inside the shim.
+- Foreign boundary: an in-flight exception must not
+  propagate through a C or shim frame. Callback
+  trampolines (3.7) turn it into a status code at the
+  boundary and keep it in flight for the lust caller.
+  A panic escaping an `extern "C"` lust fn aborts, as
+  in Rust. Panics in shim Rust code are caught inside
+  the shim (3.7 link rule).
 
 `AssertUnwindSafe`, `catch_unwind`, `resume_unwind`,
-`panic_any` live in `library/std`. `catch_unwind`
-needs one compiler assist: the closure call inside
-it is marked so lowering emits a landing pad that
-clears the flag and moves the payload into the
-return value. Represent it as an intrinsic wrapper
+`panic_any` live in `library/std`. `catch_unwind` needs
+one compiler assist: the closure call inside it is
+marked so lowering emits the landing pad above.
+Represent it as an intrinsic wrapper
 `intrinsics::catch_unwind_call` known to lowering.
 Everything else is source.
+
+Order of work: semantics first, cost second. W-PANIC
+starts with the semantic corpus in `tests/unwind/`
+(helper calls inside a destructor, a locally caught
+second panic in `Drop`, nested catches, poison after a
+caught panic, `resume_unwind` hook silence) against
+rustc in unwind mode. Only then run spike K2 for cost
+on dense-drop code (RefCell guards, Rc captures, sort
+comparators, iterator short-circuits): measure C bytes,
+tcc time, and run time against abort mode. The old
+estimates (30 to 60% C growth, 5 to 15% run time) are
+not data. If C bytes grow over 2x or run time over 1.5x
+on those fixtures, stop and evaluate per-fn `setjmp`
+with a cleanup registry before building threads on top.
+Keep `panic = "abort"` crates (wasm
+profile in ts-rust's `Cargo.toml:38-47`) on the old
+path: no checks, `catch_unwind` rejected there.
 
 ### 7.3 Threads, TLS, atomics, sync
 
@@ -2314,7 +3272,10 @@ Everything else is source.
   removing DESIGN's old "no spawn in generic code"
   limit, which ts-rust violates
   (`GoThread::spawn<F, T>` at gopanic.rs:249).
-- TLS: one pthread key per `thread_local!` static.
+- TLS: pthread keys only. No C `_Thread_local` or
+  `__thread` in generated code or the runtime (7.2: tcc
+  breaks TLS in shared objects). One pthread key per
+  `thread_local!` static, plus one for panic state.
   Lazy init on first `with`, destructor drops the
   value at thread exit in unspecified order (Rust
   makes the same weak promise). `LocalKey::with` and
@@ -2326,7 +3287,18 @@ Everything else is source.
 - Atomics: types in source over C11 `stdatomic.h`
   intrinsics (3.2). Widths: bool, 8 to 64-bit ints,
   ptr, usize. Orderings map to C11 memory orders
-  one-to-one. `fence`, `spin_loop` hint (emit
+  one-to-one, including CAS failure orderings and
+  fences. Linux x86_64 evidence (K3): atomic load and
+  fetch-add work under the pinned tcc, with two pthread
+  workers at 100,000 relaxed increments each ending at
+  200,000. That proves one path, not every width and
+  ordering, and nothing on macOS. The named fallback if
+  the macOS arm64 spike fails: emit the same operations
+  through `__sync_*` builtins where tcc accepts them,
+  and through a per-width spinlock-guarded runtime
+  helper where it does not. The fallback is correct and
+  slow, and it keeps the tier 1 claim honest until the
+  spike runs there. `spin_loop` hint (emit
   `__builtin_ia32_pause` where tcc allows, else a
   compiler barrier; measure in the spike). Ts-rust:
   404 atomic uses in 46 files.
@@ -2369,12 +3341,20 @@ item headers without positions.
 | `Sig(def)` | Items, Sigs it names | resolved signature: types with def hashes, generics, predicates, repr, vis |
 | `LayoutOf(adt)` | Sig of adt and field adts (generic form) | size/align function shape: field order, offsets as functions of params; concrete layouts derive at mono |
 | `ImplSet(trait, head)` | all impl headers in the bucket, across visible crates | set of impl header hashes, sorted |
-| `Scope(module)` | ModTree, imports, defs visible | resolved binding map fingerprint |
+| `Binding(module, ns, name)` | ModTree, the imports and defs that decide this one name | the resolved `Res` (def disk pair, or ambiguous, or absent) for that name only |
+| `MethodSet(head, name, form)` | inherent impls and trait impls that can answer this probe | candidate def list for one (Self head, method name, receiver form), in probe order |
 | `Checked(def)` | Sig(def), body tokens, every node it reads (8.2) | typed side tables exist; key is the read set plus body hash |
 | `BodyIR(def)` | Checked | generic IR fingerprint |
-| `Instance(key)` | BodyIR(template), arg layout fingerprints, selected impl instances on edges | substituted IR fingerprint |
-| `CUnit(slot range)` | Instances in the unit, glue set | C text hash |
-| `FailedLookup(query)` | Scope or ImplSet fingerprint at fail time | query key (module path, name) or (trait, self-type fingerprint) |
+| `Instance(key)` | BodyIR(template), arg layout fingerprints, selected impl instances on edges | substituted IR fingerprint plus its cached edge list |
+| `CUnit(unit)` | Instances in the unit, glue set, slot manifest hash | C text hash |
+| `FailedLookup(query)` | the `Binding`, `ImplSet`, or `MethodSet` fingerprint at fail time | the same key as the query that failed |
+
+There is no whole-module `Scope` node. A scope
+fingerprint over a full binding map makes one new export
+in the central prelude dirty every body in about 698
+files that glob it, used or not. Reads are per name, so
+adding a name dirties only the bodies that read that
+name (or failed to find it).
 
 Const values (`Const` nodes) fold into `Sig` for const
 items and assoc consts: the evaluated value is part of
@@ -2390,10 +3370,14 @@ cross-item query records the node it used:
 - `sig_of(def)`, `layout_of(adt)`, `impl_set(trait,
   head)` at every obligation (success records the
   impl; failure records a `FailedLookup` plus the
-  bucket fingerprint), `scope(module)` at every path
-  resolution, `macro_def` at every expansion,
-  `checked(def)` at every call edge in mono,
-  `layout(arg)` per instance arg.
+  bucket fingerprint), `binding(module, ns, name)` at
+  every path segment resolution (one read per name,
+  never a whole scope), `method_set(head, name, form)`
+  at every method probe in 2.10 step 2 and 3, hit or
+  miss, including the inherent probes that ran before a
+  trait hit, `macro_binding` in the macro namespace at
+  every expansion, `checked(def)` at every call edge in
+  mono, `layout(arg)` per instance arg.
 
 This is a discipline, not a framework. Rules:
 
@@ -2407,14 +3391,22 @@ This is a discipline, not a framework. Rules:
    fingerprint of each read node (cheap hashes, bottom
    up) and reuse the result if all match and the body
    hash matches.
-3. Failed lookups are first-class reads. Adding an
-   impl changes `ImplSet(trait, head)`. Bodies that
-   failed an obligation on that bucket recheck. Adding
-   a def or an import changes `Scope(module)`. Bodies
-   with a failed name there recheck. This is the rule
-   DESIGN-TS section 3 states; without it, "add the
-   missing impl" would keep failing until a full
-   rebuild.
+3. Failed lookups are first-class reads, with the same
+   keys as successes. Adding an impl changes
+   `ImplSet(trait, head)`: bodies that failed an
+   obligation on that bucket recheck. Adding a def or
+   an import changes only the `Binding` nodes for the
+   names it exports: bodies that read or failed those
+   names recheck, and no others. Adding an inherent
+   method changes `MethodSet(head, name, form)`: a body
+   that had picked a trait method of that name
+   rechecks, because Rust now picks the inherent one (a
+   probe pair that prints 1 before the inherent method
+   exists and 2 after). This is distinct from a failed
+   lookup: the first lookup succeeded, and its answer
+   still changed. Without these reads, "add the missing
+   impl" would keep failing until a full rebuild, which
+   is the rule DESIGN-TS section 3 states.
 
 Today's name-based approximation ("bodies that mention
 the name", `src/scan.rs:35-38` body idents) stays as a
@@ -2430,21 +3422,27 @@ Per request, per crate session:
 1. Stat and read changed files (mtime plus size, then
    hash; hash is the truth). Re-run scan on them.
 2. If `ModTree` changed (mod decl edit, file added or
-   removed), rebuild the module tree and `Scope` for
-   affected modules. Files not reachable any more
-   leave the session.
+   removed), rebuild the module tree and the `Binding`
+   nodes of affected modules. Files not reachable any
+   more leave the session.
 3. Re-expand only calls whose inputs changed (6.5).
 4. Re-collect changed items. Compare `Sig`
    fingerprints: unchanged sigs stop propagation even
-   if the item body or formatting changed.
+   if the item body or formatting changed. One limit:
+   an unchanged unexpanded module tree does not stop
+   propagation by itself. A macro def edit can add an
+   item or a whole module under the same tree, so the
+   `Items` and `Expansion` fingerprints are inputs to
+   this step, not the tree alone.
 5. Dirty marking: reverse-walk `Reads` edges from
    changed nodes. Re-run `Checked`, `BodyIR` for
    dirty defs, in parallel.
-6. Re-run mono discovery. It is a graph walk over
-   cached `BodyIR`; only instances whose fingerprint
-   changed re-emit C. Instance discovery itself is
-   fast (hashmap walks). Do not try to incrementalize
-   the walk; incrementalize its outputs.
+6. Mono, for builds only (`lust check` stops at step
+   5): recompute edges for dirty instances from their
+   cached edge lists (4.2), then walk only from dirty
+   instances and roots. Only instances whose
+   fingerprint changed re-emit C. Do not re-walk the
+   whole instance graph per edit.
 7. Recompile dirty C units with tcc, overlay-link as
    today. Base rebuild after 32 overlays or when the
    slot table outgrows capacity, as today.
@@ -2461,27 +3459,51 @@ ts-rust edit benchmark.
 ### 8.4 Disk cache
 
 Content-addressed, local, ignored by git (PLAN.md
-decision 1). Key per entry: (lust version, target,
-profile flags, cfg hash, node fingerprint). Stored:
+decision 1). Disk forms first. Nothing session-local is
+written as-is; each value translates at the write
+boundary:
 
-- Std crates: signature surface plus per-instance C
-  and objects (3.8).
-- Per instance: C text and the compiled object,
-  keyed by `Instance` fingerprint. A cached-cold
-  build re-runs the front end (fast, and it must, to
-  know the instance set) and links cached objects.
+| In memory | On disk |
+|---|---|
+| `DefId` | `(StableCrateHash, DefPathHash)` (1.7) |
+| `Ty`, `ArgsId` | structural fingerprint: kind tag plus child fingerprints, defs in disk form, regions erased or as param indices. Per-crate type tables and body overlays do not align across sessions, so raw ids never cross. Read side rebuilds session ids by interning the structure into the crate owned store (2.1). |
+| `Sym` | the string |
+| `CtxtId` | the chain of (macro def disk pair, call-site file hash, token ordinal) up to the root |
+| `FileId`, `Span` | canonical path hash plus token ordinal in the item (4.2) |
+| `InstanceKey` | def disk pair plus arg fingerprints |
+
+Key per entry: (lust version, target, profile flags,
+cfg hash, graph key of 1.1, node fingerprint). Stored:
+
+- Std crates: signature surface, generic templates, and
+  prebuilt non-generic instances (3.8).
+- Per instance: its mono IR, keyed by the instance
+  fingerprint. Per C unit: C text and the compiled
+  object, keyed by the unit's instance fingerprints
+  *plus the slot manifest hash* (4.2). These are
+  separate entries, because the backend compiles groups
+  of instances, not one object per instance. A
+  cached-cold build re-runs the front end (fast, and it
+  must, to know the instance set), re-emits C from
+  cached IR when only slots moved, and links cached
+  objects when nothing moved.
 - Expansion outputs for the 20 largest macros by
   output size. The rest are cheap to redo and not
   worth disk IO.
-- The slot manifest per crate: `DefPathHash` and
+- The slot manifest per final binary:
   `InstanceKeyHash` to slot, so a restarted daemon
-  reuses `libbase.so` instead of rebuilding it.
+  reuses `libbase.so` instead of rebuilding it, in any
+  crate load order.
 
-Not stored: checked bodies. Serializing `Checked`
+Not stored: user checked bodies. Serializing `Checked`
 plus local tys costs more than rechecking at lust's
-check speed, and it freezes an IR format early.
-Revisit only if cached-cold check profiles say the
-front end dominates after milestone 9's work.
+check speed, and it freezes an IR format early. The one
+exception is the std-only generic template format
+(3.8), which is versioned with the compiler and covers
+shipped crates only.
+Revisit the general case only if cached-cold check
+profiles say the front end dominates after milestone
+9's work.
 
 Soundness rule: a cache hit must be indistinguishable
 from recomputation. Every input that can change an
@@ -2502,7 +3524,12 @@ not a flake.
 
 Split the flat modules into owned directories. The
 split serves ownership. It is not a rewrite: files
-move, contents mostly stay, in serial refactor S4.
+move, contents mostly stay, in serial refactor S4,
+which runs first so later serial diffs land on final
+paths. `runtime.c` also splits in S4, by subsystem,
+behind one `runtime.h`: one file can then have one
+owner per subsystem instead of four packages editing
+one C file.
 
 ```text
 src/
@@ -2511,30 +3538,32 @@ src/
   intern.rs              Sym, FxHash                      (shared, stable)
   lexer.rs               tokens, token trees              [W-MACRO]
   scan.rs                outline scan, hashes             [W-RESOLVE]
-  parser.rs              AST parse                        [W-MACRO + all]
-  ast.rs                 AST nodes                        [shared, frozen by S3]
+  parser.rs              AST parse                        [AST owner, per wave]
+  ast.rs                 AST nodes                        [AST owner, per wave]
   expand/
     mod.rs  match_.rs  transcribe.rs  builtin.rs          [W-MACRO]
   resolve/
     cargo.rs             cargo metadata, crate graph      [W-RESOLVE]
     modules.rs           module tree, mod loading         [W-RESOLVE]
-    imports.rs           fixpoint, globs, visibility      [W-RESOLVE]
+    imports.rs           worklist, globs, visibility      [W-RESOLVE]
     cfg.rs               cfg env and strip                [W-RESOLVE]
+    worklist.rs          outline loop driver (6.1)        [W-RESOLVE]
   ty/
-    mod.rs               TyKind, interning, subst         [S3, then W-TY]
-    defs.rs              Defs, Generics, signatures       [S3, then W-TY]
-    layout.rs            layout engine, const eval        [W-TY]
-    lang.rs              lang item table                  [W-TY + W-STD]
-    print.rs             ty_name for diagnostics          [W-TY]
+    mod.rs               TyKind, interning, subst         [S3; owner per 9.3]
+    defs.rs              Defs, Generics, signatures       [owner per 9.3]
+    layout.rs            layout engine                    [W-CORELANG, then W-CGEN]
+    consteval.rs         bounded const eval (2.13)        [W-CORELANG]
+    lang.rs              lang item table                  [W-STD]
+    print.rs             ty_name, type_name strings       [W-MONO]
   traits/
-    index.rs             impl and method index, coherence [W-TRAITS]
-    solve.rs             obligation queue, selection      [W-TRAITS]
-    auto.rs              Send/Sync/Unpin/Sized            [W-TRAITS]
+    index.rs             impl and method index, coherence [W-TRAITS-CORE, then W-TRAITS]
+    solve.rs             obligation queue, selection      [W-TRAITS-CORE, then W-TRAITS]
+    auto.rs              auto traits (2.7)                [W-TRAITS]
   check/
-    mod.rs               body checking (today check.rs)   [W-CHECK]
-    collect.rs           signature collection (today)     [W-TY + W-CHECK]
-    method.rs            method and field resolution      [W-CHECK]
-    coerce.rs            coercions, unsizing              [W-CHECK]
+    mod.rs               body checking (today check.rs)   [W-CORELANG, then W-CHECK-G]
+    collect.rs           signature collection (today)     [AST owner, per wave]
+    method.rs            method and field resolution      [W-CHECK-G]
+    coerce.rs            coercions, unsizing              [W-CHECK-G]
   borrowck/
     mod.rs               loans, liveness (today)          [W-BORROW]
     regions.rs           region vars, variance feed       [W-BORROW]
@@ -2543,338 +3572,602 @@ src/
     mod.rs               instance walk, substitution      [W-MONO]
     fuse.rs              iterator fusion                  [W-MONO]
   cgen.rs  tcc.rs        C backend (today)                [W-CGEN]
-  runtime.c              C runtime cores                  [W-RUNTIME]
+  runtime/
+    runtime.h            shared C declarations            [W-CGEN]
+    core.c               alloc, vec, string, float text   [W-CGEN]
+    hash.c               hash table core                  [W-STD-B, W-CGEN reviews]
+    panic.c              panic state, hooks               [W-PANIC]
+    thread.c             spawn, TLS keys, sync cores      [W-THREADS]
   driver/
     session.rs           workspace and crate sessions     [W-DRIVER]
-    graph.rs             dep nodes, fingerprints, Reads   [W-DRIVER]
-    cache.rs             disk cache                       [W-DRIVER]
+    graph.rs             dep nodes, fingerprints, Reads   [W-DRIVER; W-PERF from wave B]
+    cache.rs             disk cache, slot manifest        [W-DRIVER]
     compile.rs           pipeline orchestration (today)   [W-DRIVER]
-library/                 lust std source (3.1)            [W-STD]
+library/                 lust std source (3.1)            [W-STD; deps by W-DEPS]
   core/  alloc/  std/  deps/
 shims/                   Rust shim crate (3.7)            [W-SHIM]
-tests/  bench/           as today
+tests/  bench/           as today, plus runners in 9.3
 ```
 
+Every package name used above is defined in 9.3. There
+are no owner names without a package.
+
+Shared files have exactly one owner per wave. Other
+packages send small patches through that owner:
+
+| File | Serial | Wave A | Wave B | Wave C |
+|---|---|---|---|---|
+| `parser.rs`, `ast.rs`, `check/collect.rs` | S3 owner | W-CORELANG | W-CHECK-G | W-BORROW |
+| `ty/defs.rs` | S3 owner | W-TRAITS-CORE | W-TRAITS | W-TRAITS (W-BORROW paired for variance) |
+| `ty/lang.rs` | S5 owner | W-STD | W-STD | W-STD |
+| `ir.rs`, `lower.rs` | S7 owner | W-CORELANG | W-LOWER | W-LOWER |
+| `cgen.rs`, `runtime/runtime.h`, `runtime/core.c` | S4 owner | W-CGEN | W-CGEN | W-CGEN |
+| `runtime/panic.c` | stub by W-CGEN | W-CGEN | W-CGEN | W-PANIC |
+| `runtime/thread.c` | stub by W-CGEN | W-CGEN | W-CGEN | W-THREADS |
+| `driver/*.rs` | S6 owner | W-DRIVER | W-DRIVER | W-DRIVER |
+| one `library/` file | S5 owner | W-STD (ledger names the file) | W-STD | W-STD |
+
+W-LOWER is one owner across waves B and C. W-CHECK-G
+records captures and coercions; W-LOWER emits places,
+calls, field moves, drops, and cleanup edges. W-BORROW
+and W-PANIC consume that contract. They do not edit
+lowering on their own.
 
 ### 9.2 Serial refactors first (keep this list closed)
 
 These land one at a time, each by one agent, each
 small, each with the full test suite green. No
-parallel package starts until S1 to S6 are in. Total
-serial cost target: 2.5k to 4k lines of churn. If a
-serial item grows past its estimate by 2x, stop and
-re-split; do not let it absorb feature work.
+parallel package starts until the serial list is in.
+Execution order: S4, S0, S1, S2, S3, S5, S6, S7. S4
+runs first because it only moves files, so later
+diffs land on final paths. Total serial cost target:
+3k to 5k lines of churn. If a serial item grows past
+its estimate by 2x, stop and re-split; do not let it
+absorb feature work. The serial phase is mechanical.
+It deletes no `Builtin` compat path and proves no
+generic compilation. Each Done line says what its gate
+does and does not test.
 
 | ID | Change | Files | Size | Done when |
 |---|---|---|---|---|
+| S4 | Directory split per 9.1, including `runtime.c` split by subsystem behind `runtime.h`. Moves only, no logic change. `driver.rs` splits into `driver/` with `Session` per crate keyed by a `CrateKey` of one file. | all of `src/` (git mv) | 200-400 churn | `cargo build` and tests green. `git log --follow` works. Gate tests paths only. |
+| S0 | Diagnostic registry: Appendix A ranges become the checked list. `scripts/check-explain.sh` (or its successor) fails on a new code outside the reserved ranges or on a collision with the 43 codes in use today. | `docs/errors/`, `src/explain.rs`, check script | 100-200 | Registry check green on today's codes. No new codes emitted yet. |
 | S1 | `Span { file, lo, hi, ctxt }`, `FileId`, per-file line indexes. One file per crate still. | `diag.rs`, all span users (mechanical) | 400-700 | Difftest green. Diagnostics print file paths. |
-| S2 | `DefId`/`DefPathHash`/`CrateId` types; slots keyed by hash; `FnId` becomes session-local alias of `LocalDefId`. No behavior change. | `collect.rs`, `driver.rs`, `cgen.rs` | 300-500 | Fuzzer green. Slot manifest round-trips. |
-| S3 | `TyKind` v2 with `Adt(DefId, ArgsId)`, arg interning, `Generics`, `Defs` skeletons. `Vec`/`Option`/`String` still special-cased through compat helpers, deleted by W-STD. AST type nodes v2 (tuple, array, slice, fn ptr, dyn, impl trait, qualified path). Parse only; collect rejects the new forms with today's codes where unsupported. | `types.rs` to `ty/`, `ast.rs`, `parser.rs`, `collect.rs` | 800-1,200 | Difftest green. Parser accepts and collect cleanly rejects new type forms. |
-| S4 | Module directory split per 9.1. Moves only, no logic change. `driver.rs` splits into `driver/` with `Session` per crate keyed by a `CrateKey` of one file. | all of `src/` (git mv) | 200-400 churn | `cargo build` and tests green. `git log --follow` works. |
-| S5 | Std skeleton: `library/` crates with `Option`, `Result`, `Vec`, `String`, prelude; intrinsic registry in check and cgen; lang item lookup. Compiler flag to use std-source defs for these four while `Builtin` covers the rest. | `library/`, `ty/lang.rs`, `check/`, `cgen.rs`, `runtime.c` | 600-1,000 | A test program using only those types compiles through the source path. |
-| S6 | Cargo graph loader and protocol v2: request names a crate; daemon routes by `SessionKey`. Single-file programs become a synthetic one-crate package. | `resolve/cargo.rs`, `protocol.rs`, `daemon.rs`, `driver/session.rs` | 400-700 | `lust check file.rs` unchanged for users. A two-file `mod` fixture checks. |
+| S2 | `DefId`/`DefPathHash`/`CrateId` types; slots keyed by hash; `FnId` becomes the session-local `LocalDefId`. No behavior change. | `collect.rs`, `driver/`, `cgen.rs` | 300-500 | Fuzzer green. Slot manifest round-trips. |
+| S3 | AST v2 for all syntax of milestones 4 to 7, not only types: items (`mod`, `trait`, `type`, `const`, `static`, `macro_rules`), patterns, expressions, attributes, generics with lifetimes, `where` clauses, qualified paths. Parser accepts them. `TyKind` v2 with `Adt(DefId, ArgsId)`, arg interning, `Generics`, `Binder`, `AssocEq`, `Defs` skeletons behind compat helpers. Collect rejects new forms it cannot handle yet with stable codes from Appendix A. `Vec`/`Option`/`String` keep their `Builtin` paths. If S3 passes 1.2k lines, split it: S3a types, S3b AST and parser. | `types.rs` to `ty/`, `ast.rs`, `parser.rs`, `collect.rs` | 1,000-1,600 | Difftest green. Parser accepts and collect cleanly rejects new forms. Item and expression counts on ts-rust files match the syn-based `lust-port` count for a sampled file set. Gate tests syntax only; it proves no type checking. |
+| S5 | Lang item table, intrinsic registry (signatures and privilege checks in check and cgen), the `library/` loader, and a source path for *non-generic* std fns only. Generic std waits for the minimal generic pipeline (9.3). | `library/` skeleton, `ty/lang.rs`, `check/`, `cgen.rs` | 400-700 | A test program that calls one non-generic source std fn compiles through the loader. Gate tests loading and the registry. It does not test generic source std, and no `Builtin` case is deleted. |
+| S6 | Protocol and routing schema only: a request names a crate; the daemon routes by `SessionKey` (1.8). Single-file programs become a synthetic one-crate package. Add the multi-file test runner `scripts/test-crates.sh` and `tests/crates/` with fixtures that work under today's language. Cargo graph loading itself is W-RESOLVE work. | `protocol.rs`, `daemon.rs`, `driver/session.rs`, `tests/crates/` | 400-700 | `lust check file.rs` is unchanged for users. Two feature selections in one daemon stay in separate sessions (routing test). The two-file `mod` fixture is *not* part of this gate; it belongs to W-RESOLVE, which builds module loading. |
+| S7 | Frozen-interface plumbing, record-only where noted: the `Reads` sink and the query fns of 8.2 with per-binding and method-set keys (recorded, not yet used for invalidation); IR calls become terminators `Call { target, args, dest, unwind }` with `unwind: None` everywhere today; `InstanceKey` and the disk forms of 8.4 as types; the owned type store lift of 2.1, which is the identity until generics land; the final-bin slot manifest type. | `ir.rs`, `lower.rs`, `driver/graph.rs`, `ty/` | 500-800 | Difftest green. A grep shows no call left as an `Rvalue`. Query fns exist and tests assert that a sample body records binding and method-set reads. Gate tests recording, not invalidation speed. |
 
 Interface freeze at the end of the serial phase.
-These types change only through their owner, with a
-note to all package owners: `Span`, `DefId`, `Ty`,
-`TyKind`, `Generics`, `TraitRef`, `Defs` queries, AST
-node shapes, IR `Rvalue` and `Terminator`, the
-`Reads` query fns, intrinsic signatures, slot and
-`InstanceKey` definitions. Everyone else codes against
-them. Add new variants at the end of enums only.
-Never renumber.
+These change only through their owner, with a note to
+all package owners: `Span`, `DefId` and its disk pair,
+`Ty`, `TyKind`, `ArgsId`/`TysId`, `Binder`,
+`TraitRef` with bindings, `Predicate` with `AssocEq`,
+param-env elaboration (2.1), the owned type store lift,
+`Generics`, `Defs` queries, AST node shapes, IR
+`Rvalue`, the `Call` terminator and its unwind slot,
+field drop-flag shape, the runtime status values at
+the FFI and shim boundary, the `Reads` query fns and
+their keys (`Binding`, `MethodSet`, `ImplSet`),
+intrinsic signatures, the 3.4 predicate signatures,
+the receiver grammar (2.9), `layout()` output
+including `niche`, the const value form (2.13),
+`InstanceKey`, final-bin slots and the slot manifest,
+and every disk key form in 8.4. Everyone else codes
+against them. Add new variants at the end of enums
+only. Never renumber.
 
 ### 9.3 Parallel work packages
 
 Packages run in waves. Sizes are implementation lines
 (compiler plus runtime plus std source in the package),
-not tests. Each package lists its tests and gate.
-"Difftest green" always means `scripts/difftest.sh`
-plus `SANITIZE=1` where codegen changes, per the
-brief. Test dirs: `tests/pass`, `tests/fail`,
-`tests/reject`, plus per-package fixture dirs named
-below. Focused tests only; no bulk-generated slop.
+not tests. "Difftest green" means the commands in the
+runner table below that the package lists, plus
+`SANITIZE=1` where codegen changes, per the brief.
+Focused tests only; no bulk-generated slop.
 
-#### Wave A (milestone 4): modules, macros, core language
+Test runners. W-DRIVER builds each runner before the
+first gate that needs it. A gate that names a fixture
+dir no runner can execute is not a gate.
 
-Run 4 packages in parallel after S1-S6.
+| Runner | Runs | Oracle |
+|---|---|---|
+| `scripts/difftest.sh` | `tests/pass`, `tests/fail`, `tests/reject` in abort mode, as today (`-C panic=abort`) | rustc, same flags |
+| `PANIC=unwind scripts/difftest.sh` | `tests/unwind/` plus panic cases in `tests/pass` | rustc with `-C panic=unwind`, overflow checks on. Needed because abort mode cannot test recovered panics, poison, or unwind drops. |
+| `scripts/test-crates.sh` | `tests/crates/*`: multi-file Cargo fixtures, each built by Cargo and by lust, stdout and exit compared. Sets target and features per fixture. | Cargo |
+| `scripts/test-macros.sh` | `tests/macros/`: token compare, executable hygiene cases, both-reject cases | `rustc -Zunpretty=expanded` tokens; rustc run output |
+| `scripts/test-traits.sh` | `tests/traits/`: selection, coherence, and inference cases, accept and reject | rustc accept/reject per case, with the rustc error class recorded in the fixture |
+| `scripts/test-adapters.sh` | `tests/adapters/`: std and adapter semantics (specialization pull counts and capacity, sort, hash order, SmallVec spill) | rustc with pinned crate versions from ts-rust `Cargo.lock`, in abort and unwind modes |
 
-**W-RESOLVE: crate graph, modules, imports, cfg.**
-Owns: `src/resolve/*`, `src/scan.rs`, module and `use`
-AST handling in `parser.rs` (coordinate with W-MACRO),
-visibility checks in collect.
-Interfaces out: `CrateGraph`, `ModuleTree`, `Scope`
-queries (`resolve_path`, `binding`), cfg env, file set
-per crate. In: AST, expanded items.
-Depends on: S1, S2, S4, S6. Not on W-MACRO internals:
-it consumes post-expansion AST; until W-MACRO lands, a
-stub expander passes macro-free code through.
-Work: 1.2-1.3 module loading and fixpoint, glob and
-re-export semantics, preludes, visibility, cfg strip,
-`#[path]`, function-local `use`. Non-generic core
-language that needs only resolution and collect:
-`const`, `static`, type aliases (non-generic first),
-tuple and unit structs.
-Tests: `tests/modules/` fixtures: glob collisions from
-1.4, re-export chains, `pub(crate)` edges, cfg on/off
-per target, shared file in two crates, `#[path]`.
-Gate: the ts-rust `prelude.rs` shape resolves in a
-fixture crate; an ambiguous glob name errors only on
-use. Size: 2.5k-3.5k.
+Every runner takes a filter, has a per-case timeout,
+and works with `SANITIZE=1` where it builds C. Fixture
+dirs a runner cannot find fail the run; they do not
+skip in silence.
+
+Minimal generic pipeline (MGP). Wave A has one joint
+gate that breaks the old bootstrap cycle. The MGP is a
+thin end-to-end slice, built by W-TRAITS-CORE,
+W-CORELANG, W-CGEN, and W-DRIVER together: one generic
+Adt, one trait with an input parameter, one associated
+equality used in a signature, one generic method call
+(inherent and trait), and one drop of a generic value,
+through collect, generic check, mono, and cgen, run
+against rustc. Until the MGP gate passes, all `Builtin`
+compat paths stay, and no std package deletes a compat
+case. After it passes, W-STD deletes compat cases one
+API group at a time, each group behind its own
+end-to-end gate. State in every report which path a
+test exercised: a green compat path proves nothing
+about source generics.
+
+This moves a thin slice of PLAN milestone 5 (traits
+and mono) into the milestone 4 window. The alternative
+(std first, traits later) cannot reach its own gate.
+The orchestrator must accept the shift; 9.4 records it.
+
+Scale gate, every wave. At each wave end, W-PERF (or
+W-DRIVER in wave A) reports, on the 31k benchmark crate
+and on a pinned ts-rust slice that grows per wave:
+changed `Checked` bodies, instances visited,
+invalidated binding and method-set queries, C bytes
+emitted, dirty units, link time, and memory. The slice
+report pins target, features, and reachable file set.
+Line counts state which count they use: 571k
+handwritten lines, 672k production-plus-generated, or
+786k physical source. Edit scenarios, each timed on its
+own row (body check/build, structural edit, fresh
+cold, cached cold never merge): a new `pub fn` exported
+through the central prelude; an inherent method added
+where a trait method was in use; a type edit that
+changes a niche; a macro edit that adds a generated
+item; a cross-crate generic body edit; a daemon
+restart that must reuse disk objects and the slot
+manifest under a different crate load order. Do not
+wait for wave D to learn that invalidation or the
+instance walk eats the edit budget.
+
+#### Wave A1 (milestone 4 core): modules, macros, core language, trait core
+
+Six packages in parallel after the serial list.
+
+**W-RESOLVE: crate graph, modules, imports, cfg, worklist.**
+Owns: `src/resolve/*`, `src/scan.rs`, visibility checks
+through the AST owner.
+Interfaces out: `CrateGraph`, `ModuleTree`, per-name
+`Binding` queries, cfg env, file set per crate, the
+outline worklist driver (6.1) with W-MACRO behind the
+`expand` interface. In: AST v2.
+Depends on: S1, S2, S6, S7. Until W-MACRO lands, the
+worklist runs with expansion disabled for macro-free
+fixtures.
+Work: 1.1 graph loading with per-unit features, 1.2
+module loading (file rules, ambiguity, `#[path]`),
+1.3 import worklist and scope priority, 1.5
+visibility, 1.6 cfg strip, function-local `use`,
+`const`/`static` item collection, non-generic aliases.
+Tests: `scripts/test-crates.sh` fixtures (glob
+collisions from 1.4, explicit import through a glob,
+re-export through a private module, `pub(crate)`
+edges, cfg on/off, shared file in two crates,
+`#[path]`, both `x.rs` and `x/mod.rs`, two feature
+selections and two targets in one daemon) plus
+difftest.
+Gate: `lust port scan` module findings for ts_goport
+(`modules.imports`, `modules.path_attr`) each compile
+in a fixture or are listed rejects; the ts-rust
+`prelude.rs` shape resolves in a fixture crate. Size:
+2.5k-3.5k.
 
 **W-MACRO: token trees, expansion, builtin macros.**
 Owns: `src/lexer.rs` (token trees), `src/expand/*`,
-macro call parsing in `parser.rs`, hygiene contexts,
-builtin macro parsing (format specs with W-STD),
-`thread_local!` desugar shape (runtime in wave C).
-Interfaces out: expanded token stream to AST, expansion
-cache, span mapping for diagnostics. In: AST outline,
-macro def items from W-RESOLVE's item scan.
-Depends on: S1, S3 (AST v2). W-RESOLVE depends on its
-output, not on its internals; sequence the stub so
-both proceed.
-Work: 6.1-6.5. Fragments, repetitions, `$crate`,
-textual and path macro scopes, caps, `include` and
-`env` builtins with cache keys.
-Tests: `tests/macros/`: every ts-rust macro *shape*
-(the 4 groups in INVENTORY Q2), hygiene cases
-(capture, shadowing, labels), recursion caps.
-Gate: all 66 ts-rust macro defs from an owned fixture
-corpus expand token-equal to rustc. Size: 2.5k-4k.
+hygiene contexts. Parser changes go through the AST
+owner.
+Interfaces out: `expand(call, macro_def) -> token
+trees` for the worklist, expansion cache, span mapping
+for diagnostics. In: macro defs and bindings from
+W-RESOLVE.
+Depends on: S1, S3.
+Work: 6.2 opaque fragments and local-ambiguity errors,
+6.3 mixed-site hygiene, 6.4 builtin macros (format spec
+parsing with W-STD), 6.5 caching, caps, `$crate`,
+textual and path macro scopes.
+Tests: `scripts/test-macros.sh`: every macro shape the
+port scan lists (80 defs, 70 names at last scan),
+fragment forwarding (`by_data!` shape), local
+ambiguity both-reject, hygiene capture and shadowing
+as executable cases, recursion caps, a disabled
+`compile_error!` under cfg, a `use`-imported macro.
+Gate: all three test layers green. Token compare alone
+does not pass this gate. Size: 2.5k-4k.
 
-**W-CORELANG: milestone 4 language without traits.**
-Owns: `src/check/*` (body check growth), `src/ir.rs`,
-`src/lower.rs` (with W-LOWER in later waves; in wave A
-one owner holds both to avoid a split mid-flight),
-`src/ty/layout.rs` basics, const evaluator basics.
+**W-CORELANG: core language without std types; AST owner for wave A.**
+Owns: `parser.rs`, `ast.rs`, `check/collect.rs` (wave
+A AST owner), `src/check/mod.rs`, `src/ir.rs` and
+`src/lower.rs` (wave A lowering), `ty/layout.rs`,
+`ty/consteval.rs`.
 Interfaces out: checked bodies and IR for the new
-forms. In: `Defs`, `Scope`, layout queries.
-Depends on: S3, S5, W-RESOLVE (scopes), W-STD (below)
-for `Box`/`Result` defs.
-Work: tuples, arrays, slices, range indexing and slice
-patterns, `Box`, `Result`/`?`/let-else, labels and
-break-with-value (exists), struct update, `if let`
-chains, nested fns, reference and tuple patterns, enum
-discriminants, u128/f32/f64 scalar paths (float text
-with W-RUNTIME), format spec checking plumbing, `Drop`
-trait as a real (non-generic) impl lookup ahead of full
-traits, more derives (`Default`, `PartialOrd`, `Ord`),
-`mem` ops. Sized checks for unsized slice/str behind
-refs only; full `?Sized` bounds wait for traits.
-Tests: `tests/pass` bulk per feature, layout assert
-fixture from 4.4 (`repr(C, align(64))` offsets).
-Gate: ts-rust scanner and JSON *kernels* as owned
-fixtures compile with byte-equal output (PLAN.md
-milestone 4 gate). Size: 6k-9k. This is the biggest
-wave A package; split it in two (types/data in check,
-control/patterns in lower) if staffing allows 5
-agents, with `ir.rs` owned by the lower half.
+forms, the layout engine. In: scopes from W-RESOLVE.
+Depends on: S3, S7, W-RESOLVE scopes. Takes no std
+types: `Box`, `Result`, `?`, and let-else are W-STD-A
+work in wave A2.
+Work: tuples, arrays, slices, patterns (slice, ref,
+tuple, struct update), control flow (labels, `if let`
+chains), enum discriminants, the const evaluator of
+2.13 (non-generic form), static data emission, u128
+and f32/f64 scalar paths, the layout contract of 4.4
+with its gate, IR cleanup edges built with `Drop`
+(scope exit and unwind share one pass; wave C adds the
+runtime), derives as checked forms ahead of full trait
+impls, the check half of the MGP.
+Tests: difftest per feature, `tests/adapters/` layout
+cases (the nested `TypeData` shape, `TypeMapper`,
+explicit discriminants, packed-field reference
+reject), the 2.13 initializer corpus, the MGP fixture.
+Gate: MGP (joint) plus the layout gate of 4.4. Size:
+6k-9k. The biggest wave A package; the AST-owner duty
+is part of the size, not extra.
 
-**W-STD-A: core and alloc source, first half.**
+**W-TRAITS-CORE: generics, impl index, selection, mono walk.**
+Owns: `src/traits/*`, `ty/defs.rs` (wave A), the mono
+walk in `src/mono/mod.rs` (basic form).
+Interfaces out: `select(obligation) -> Selection` per
+2.4, coherence per 2.6, method candidate queries,
+instance discovery with cached edges. In: `Defs`,
+`Binding` queries for traits in scope.
+Depends on: S3, S7, W-RESOLVE.
+Work: generic Adts and fns in collect, full trait-ref
+matching with probe unification, param-env elaboration,
+associated equalities and normalization, the narrow
+impl-param binding of 2.4 step 4, derives as synthetic
+impls, `Sized` and `?Sized` basics, the mono half of
+the MGP. No closures, no `dyn`, no fusion.
+Tests: `scripts/test-traits.sh`: same Self with
+different trait inputs, supertrait evidence, associated
+equality binding, `Vec<_>` collect shape (with a local
+`Vec`-like fixture type, since std `Vec` lands in A2),
+integer var through `Index`, must-reject inference
+(E0282 and E0283 classes), std `IntoIterator` blanket
+shape plus the six ts-rust `IntoIterator` impl shapes,
+`L0613` vs `L0610` split.
+Gate: MGP (joint) plus the trait corpus. Size: 3k-4.5k.
+
+**W-CGEN: C backend and runtime cores.**
+Owns: `src/cgen.rs`, `src/tcc.rs`, `runtime/runtime.h`,
+`runtime/core.c`.
+Interfaces out: C per unit from concrete IR; slot
+trampolines; runtime call emission. In: layouts
+(W-CORELANG), instances (W-TRAITS-CORE, then W-MONO),
+slot manifest (W-DRIVER).
+Depends on: S4, S7.
+Work: concrete layout emission (explicit padding,
+niche-filled enums, align-16 i128), scalar helpers,
+aggregate ABI and the large-return out-pointer (4.5),
+fn pointer values, drop glue emission for the MGP,
+the Vec growth fix (3.3), float print and parse with
+the K5 fuzz gate, `alloc(size, align)`.
+Tests: difftest with `SANITIZE=1`, float fuzz in
+`tests/adapters/`, capacity cases, MGP run.
+Gate: MGP (joint); float text byte-equal on the fuzz
+corpus. Size: 2k-3.5k plus 1k-1.5k C.
+
+**W-DRIVER: sessions, graph, slots, runners.**
+Owns: `src/driver/*`, `src/daemon.rs`, `src/protocol.rs`
+(after S6).
+Interfaces out: crate sessions, `Reads` recording (S7)
+turned into reuse for `Binding` nodes first, final-bin
+slot assignment and the slot manifest, object-unit
+identity (4.2), config and graph keys (1.1). In: every
+stage's queries.
+Depends on: S6, S7.
+Work: session routing by graph key, build-script
+refresh checks, std loading path (S5 artifacts), the
+six test runners, restart and load-order tests.
+This package is correctness plumbing from day one.
+W-PERF later measures and improves it; W-PERF does not
+supply missing plumbing.
+Tests: driver tests (restart with disk objects,
+different crate load order, manifest change forces C
+re-emit but not a front-end redo), plus all runners
+green on their starter fixtures.
+Gate: MGP (joint) built and run through the daemon;
+runners land before the gates that cite them. Size:
+2k-3k.
+
+#### Wave A2 (milestone 4 gate): source std, first half
+
+Starts only when the MGP gate passes. One package,
+plus AST-owner support from W-CORELANG.
+
+**W-STD-A: core and alloc source over the generic pipeline.**
 Owns: `library/core/*`, `library/alloc/src/{string,
-vec,boxed,rc,borrow}.rs` (rc bodies can land before
-traits are general by using only concrete impls that
-W-CORELANG's Drop path needs; full generic impls
-finish in wave B), `library/std/src/{prelude,env,
-io basics,path,time}`. Runtime cores it needs go
-through W-RUNTIME interface (wave A slice: Vec growth
-fix, string core freeze, float text).
-Interfaces out: lang item defs, prelude, intrinsic
-list (frozen with S5). In: language support as it
-lands; std source must not use a feature before its
-package lands it. Keep a `library/README` feature
-ledger per file.
-Depends on: S5. Co-evolves with W-CORELANG weekly, not
-daily: freeze the needed std API list for the scanner
-and JSON kernels first, build exactly that.
-Tests: every public method gets a `tests/pass` case;
+vec,boxed,rc,borrow}.rs`, `library/std/src/{prelude,
+env,io basics,path,time}`, `ty/lang.rs`.
+Interfaces out: lang item defs, prelude, the intrinsic
+list in use. In: MGP language support. Std source must
+not use a feature before its package lands it; a
+`library/README` ledger names, per file, the features
+and the surface-manifest state.
+Work: `Option`, `Result`, `?`, let-else support in
+check (with the AST owner), `Vec`, `String`, `Box`,
+then `Rc` basics. Delete `Builtin` compat cases in
+staged API groups, in this order: (1) `Option` and
+`Result`, (2) `Vec` and `String`, (3) `Box`. Each group
+lands only when its end-to-end gate passes: difftest
+green with the compat code for that group removed,
+the surface manifest diff for those types (3.1), and
 capacity and drop-order cases from 3.5.
-Gate: `Builtin` cases for String/Vec/Option deleted;
-difftest green through the source path.
-Size: 4k-6k of lust source.
+Tests: difftest, `tests/adapters/` (capacity,
+in-place collect after 3.4 predicates exist in basic
+form), manifest diff in CI.
+Gate: PLAN.md milestone 4 gate: ts-rust scanner and
+JSON kernels as owned fixtures compile with byte-equal
+output, through the source path, with the three compat
+groups deleted. Size: 4k-6k of lust source.
 
-Wave A also needs a thin W-RUNTIME slice (can be the
-W-STD-A agent or a 5th agent): Vec growth fix (3.3),
-float print/parse C code with the fuzz gate (3.5),
-`alloc(size, align)`. Size: 1k-1.5k C.
+#### Wave B (milestone 5): traits in full, closures, dyn, mono
 
-#### Wave B (milestone 5): traits, closures, dyn, mono
+Entry conditions, in order:
 
-Entry condition: run the compatibility spike first
-(one agent, one week-box): `NodeVisitor` with stored
-`Rc<dyn Fn>` callbacks, `ArenaBox` with `Deref`,
-one blanket impl (`AnyValue` shape), `go_flags!`
-output types. The spike is throwaway code on top of
-wave A stubs where needed. It validates 2.4, 2.8,
-and 4.2 before the wave commits. Then 5 packages:
+1. Spike K1 (compatibility, full list in section 10)
+   for the wave B items: a `NodeVisitor` with stored
+   `Rc<dyn Fn>` callbacks (borrowed, not `'static`
+   only), `ArenaBox` with `Deref`, one blanket impl,
+   `go_flags!` output types, one stored callback. The
+   borrowed-visitor and higher-ranked parts double as
+   spike K8: run them before broad closure work. Spike
+   code is throwaway.
+2. Spike K2 has *not* run yet at this point in its
+   cost form; the wave A cleanup edges let K2 measure
+   early at wave B end (section 10).
+3. W-PERF starts part-time: it owns `Reads` after S7
+   and reviews read granularity of each landed stage.
 
-**W-TRAITS: impl index, solver, auto traits.**
-Owns: `src/traits/*`, coherence in collect, derive
-synthetic impls (from W-CORELANG's derives),
-`Sized`/`?Sized` bound handling.
-Interfaces out: `select(obligation) -> Selection`,
-`auto_trait(ty, trait)`, method candidates query.
-In: `Defs`, `Sig` queries (logs `ImplSet` reads, 8.2).
-Depends on: S3, W-RESOLVE (trait-in-scope sets).
-Tests: `tests/traits/`: blanket partition cases from
-2.6 (both ts-rust shapes), overlap rejects, depth cap,
-assoc type and const normalization, `?` conversion,
-operator traits with `Output`.
-Gate: traced solver test on the DESIGN syntax sample
-plus the spike's blanket case, step-visible. Size:
-3k-4.5k.
+Then six packages.
 
-**W-CHECK-G: generic bodies, closures, method calls.**
-Owns: `src/check/*`, capture analysis, `Fn` bound
-handling, `impl Trait` (arg sugar and opaque
-recording), coercions and unsizing, typed receivers.
-Interfaces out: generic `Checked` bodies with
-`CallTrait` evidence for W-MONO. In: W-TRAITS
-selection, layout for capture structs (sizes only).
-Depends on: W-TRAITS interface (can start against its
-stub: `select` returning `ParamEvidence` always).
-Tests: closure capture matrix (by ref/mut/move,
-disjoint fields), stored closures, higher-ranked
-`Fn(&T)` bounds, method ambiguity and autoderef order
-fixtures, `impl Iterator` returns.
-Gate: 3,733-fn closure problem reduced to fixtures:
-one fixture per INVENTORY closure class passes
-(adapters, std methods, user fns, stored, `dyn Fn`).
-Size: 4k-6k.
+**W-TRAITS: traits in full.**
+Owns: `src/traits/*`, `ty/defs.rs` (wave B).
+Work: auto traits in full (2.7, including the unwind
+traits and the std registry), dyn compatibility checks
+(2.8), the coherence disproof table at full crate
+scale, operator traits, `?` conversion errors, derive
+impls completed.
+Tests: `scripts/test-traits.sh` extended: dyn
+compatibility rejects (bare `Self` return, generic
+method, assoc const, `Self: Sized` trait), auto-trait
+parity probes (3.1), overlap cases from 2.6.
+Gate: trait corpus plus auto-trait parity green.
+Size: 2k-3k.
 
-**W-MONO: instantiation, vtables, fusion.**
-Owns: `src/mono/*`, `src/lower.rs` generic-to-mono
-boundary, glue instances, `TypeId` values, slot
-assignment with W-DRIVER.
-Interfaces out: concrete IR per instance for cgen,
-vtable statics list. In: generic IR, W-TRAITS
-selection for concrete self types, layouts.
-Depends on: W-CHECK-G output shape (frozen in S3 plus
-`CallTrait`), W-TRAITS.
-Work: 4.1-4.3, share keys only if the spike numbers
-demand it, fusion with the 4.3 spec and
-`LUST_NO_FUSION` dual-run gate.
-Tests: recursion limit parity with rustc, instance
-dedup counts on a std-heavy fixture, the 150-case
-fusion corpus.
-Gate: `Rc<dyn Fn>` callback fixture runs byte-equal;
-fusion corpus passes fused and unfused. Size:
-4k-6k (fusion 3k-4k of it, per VERIFY G).
+**W-CHECK-G: generic bodies, closures, method calls; AST owner for wave B.**
+Owns: `parser.rs`, `ast.rs`, `check/collect.rs` (wave
+B AST owner), `src/check/*`.
+Interfaces out: generic `Checked` bodies with closure
+captures and `CallTrait` evidence. In: W-TRAITS
+selection, layout queries.
+Work: capture analysis, `Fn` bounds and binders,
+closure signature rules of 2.9 and 2.12, `impl Trait`
+(arg sugar, opaque recording, auto-trait leak),
+coercions and unsizing, typed receivers in full
+(including `&Rc<Self>`), generic inline const
+(well-formed form; per-instance eval in W-MONO),
+foreign fn signatures (small; W-SHIM needs them in
+wave C).
+Tests: difftest closure matrix, `tests/traits/`
+method ambiguity and autoderef order, one fixture per
+INVENTORY closure class (adapters, std methods, user
+fns, stored, `dyn Fn`), the actual
+`self: &Rc<Self>` method shape from
+`frontend/packagejson.rs:1092`.
+Gate: closure class fixtures byte-equal. Size: 4k-6k.
+
+**W-LOWER: lowering owner for waves B and C.**
+Owns: `src/ir.rs`, `src/lower.rs`.
+Interfaces out: generic IR with places, call
+terminators, field moves, drops, cleanup edges. In:
+`Checked` from W-CHECK-G.
+Work: closure env lowering, coercion and unsizing
+lowering, `dyn` calls, drop trees for fused and
+unfused forms (with W-MONO), the place-holds-loan
+shapes W-BORROW needs (frozen before wave C).
+Tests: difftest; drop-order fixtures in
+`tests/adapters/`.
+Gate: IR place shapes frozen for W-BORROW; drop-order
+corpus green. Size: 2k-3k.
+
+**W-MONO: instantiation, vtables, fusion, predicates.**
+Owns: `src/mono/*`, `ty/print.rs`.
+Interfaces out: concrete IR per instance, vtable
+statics, `TypeId` table, `type_name` strings. In:
+generic IR, W-TRAITS selection on concrete types,
+layouts, slot manifest from W-DRIVER.
+Depends on: W-CHECK-G, W-LOWER, W-TRAITS.
+Work: 4.1-4.3 in full: cached instance edges, inline
+const per instance, glue instances, the 3.4 predicate
+evaluation, fusion in the staged order of 4.3
+(starting unfused), recursion limits in build mode
+(never in check mode).
+Tests: `tests/adapters/` fusion corpus (150 or more
+cases: side-effect counts, drop prints, capacity,
+early exits; zip both-sides rule, skip and step_by
+pull counts) run fused and with `LUST_NO_FUSION=1`;
+recursion build-reject vs check-accept pair.
+Gate: `Rc<dyn Fn>` callback fixture byte-equal;
+fusion corpus dual-run green; reachable instance
+count and cached-walk time recorded (scale gate).
+Size: 4k-6k (fusion 3k-4k of it).
 
 **W-STD-B: traits-heavy std and containers.**
-Owns: `library/alloc` collections (`HashMap` typed
-layer, `BTreeMap`, `VecDeque`), `Rc`/`Weak`/`RefCell`/
-`Cell` completion, `Cow`, iterator adapter source in
-`library/core`, `fmt` full surface, `io::Read/Write`
-traits. With W-RUNTIME: `lust_hashmap` core.
-Interfaces out: iterator adapter defs (fusion pattern
-list for W-MONO, by `DefId`, frozen), glue needs.
-Depends on: W-TRAITS, W-CHECK-G.
-Gate: FxHashMap iteration-order difftest (3.5)
-passes; `Rc<RefCell<T>>` fixture set passes.
-Size: 5k-8k lust source, 0.8k-1.2k C for the table.
+Owns: `library/alloc` collections, iterator adapters
+in `library/core`, `fmt` full surface, `Rc`/`Weak`/
+`RefCell`/`Cell`/`Cow` completion, `runtime/hash.c`
+(W-CGEN reviews).
+Interfaces out: adapter def list for fusion (by
+`DefId`, frozen), the specialization list of 3.4 with
+one unfused difftest each. Depends on: W-TRAITS,
+W-CHECK-G.
+Tests: `tests/adapters/`: sort (stable and unstable,
+comparator log, panicking comparator in unwind mode),
+capacity through collect and extend, specialization
+parity on the unfused path, surface manifest diff and
+auto-trait parity for the new types.
+Gate: manifest and parity green; `Rc<RefCell<T>>`
+fixture set passes. Fx map order gate follows the K4
+audit outcome (3.5), not a blanket claim. Size: 5k-8k
+lust source, 0.8k-1.2k C.
 
 **W-DEPS: adapter crates.**
-Owns: `library/deps/*` (indexmap, smallvec,
-rustc-hash, memchr, bumpalo subset, xxh3 and ryu-js
-C cores with W-RUNTIME review).
-Interfaces out: crates by package id; version pins.
-Depends on: W-STD-B containers.
-Gate: per-crate exactness difftests in 3.6 table.
-Size: 3k-5k.
+Owns: `library/deps/*`.
+Work: 3.6 table, including `SmallVec<[T; N]>` in its
+real shape. Depends on: W-STD-B containers.
+Tests: `scripts/test-adapters.sh` per crate, pinned
+versions.
+Gate: per-crate exactness table green. Size: 3k-5k.
+
+Step A lifetimes (`'static`, `'_`, 5.1) land at wave B
+tail by the W-BORROW agent (1k-2k), with the static
+well-formedness checks of 5.1. Named-region gates stay
+distinct from step A in every report.
 
 #### Wave C (milestones 6 and 7): regions, threads, panics
 
-**W-BORROW: regions over the loan engine.**
-Owns: `src/borrowck/*`, variance in `ty/defs.rs`
-(feed), region syntax in parser and collect (step A
-can land at wave B tail by the same agent).
-Depends on: W-CHECK-G (place-holds-loan needs final
-IR place shapes), negative corpus first (5.6).
+**W-BORROW: regions over the loan engine; AST owner for wave C.**
+Owns: `src/borrowck/*`, `parser.rs`, `ast.rs`,
+`check/collect.rs` (wave C AST owner, for region
+syntax), variance feed paired with W-TRAITS in
+`ty/defs.rs`.
+Depends on: W-LOWER frozen place shapes. Starts from
+the 5.6 corpus, not from features. NLL problem case 3
+is already fixed as milestone 1 work (section 11);
+the corpus keeps it as a regression case.
+Work: 5.2 NLL live ranges with universal regions,
+5.3 variance, 5.4 drop check with the std may-dangle
+flag, 5.5 early/late-bound split, lifetime turbofish
+reject, placeholder leak check.
+Tests: `tests/fail` and `tests/reject` corpus of 5.6,
+difftest positive fixtures.
 Gate: `Parser<'a>`, `JsonDecoder<'a>`,
-`RuleContext<'a, 'c>` shaped fixtures compile; the
-5.6 corpus rejects in both lust and rustc. Size:
-3.5k-6k. Step A alone: 1k-2k, do it in wave B.
+`RuleContext<'a, 'c>`, a borrowed `NodeVisitor`
+callback, and the `FileRef` guard-backed borrow shape
+compile; the full 5.6 corpus rejects in both lust and
+rustc. Size: 3.5k-6k.
 
 **W-PANIC: explicit propagation.**
-Owns: IR unwind edges (with W-LOWER owner), lowering
-cleanup blocks, runtime panic state and hooks in
-`runtime.c`, `catch_unwind` assist, `track_caller`
-already in wave A/B plumbing.
-Entry: the 7.2 spike gate with measurements.
-Depends on: W-MONO instance graph (can-panic fixpoint).
-Gate: nested catch, rethrow, poison, drop-on-unwind
-print order, panic in `FnOnce` env drop, thread join
-payload: all byte-equal vs rustc. Size: 2k-3.5k.
+Owns: `runtime/panic.c`, the unwind terminator use in
+lowering (through W-LOWER), cgen call-site shape
+(through W-CGEN).
+Entry: the semantic corpus first (7.2). The cost
+spike K2 runs after the corpus passes, before
+W-THREADS builds on it.
+Depends on: wave A cleanup edges, W-MONO instances.
+Does not depend on any can-panic fixpoint; there is
+none (7.2).
+Tests: `PANIC=unwind scripts/difftest.sh` over
+`tests/unwind/`: helper calls in a destructor, a
+second panic caught inside `Drop`, nested catches,
+poison, `resume_unwind` hook silence, `UnwindSafe`
+reject (E0277 class), drop-on-unwind print order,
+abort-mode run of the same dir where semantics allow.
+Gate: semantic corpus byte-equal in unwind mode; K2
+numbers recorded. Size: 2k-3.5k.
 
 **W-THREADS: std thread and sync surface.**
-Owns: `library/std/src/{thread,sync}`, thread and
-sync intrinsics in `runtime.c`, TLS keys, `mpsc`,
-atomics wrappers, scope.
+Owns: `library/std/src/{thread,sync}`,
+`runtime/thread.c`.
 Depends on: W-PANIC (join payloads, poisoning),
 W-BORROW (scoped borrows), auto traits.
-Gate: parallel bind-shaped fixture (scoped workers
-over files, mpsc results, shared `Arc<Mutex>`) runs
-with equal sorted output; `Rc` across spawn rejects.
-Size: 3k-5k (mostly lust source).
+Tests: difftest in both panic modes: parallel
+bind-shaped fixture (scoped workers over files, mpsc
+results, shared `Arc<Mutex>`) with equal sorted
+output; `Rc` across `spawn` rejects.
+Gate: as stated in Tests. Size: 3k-5k (mostly lust
+source).
 
 **W-SHIM: rustc shim and platform surface.**
 Owns: `shims/` crate, lust-side foreign fn crates for
 rustix/nix/signal/zlib/time/jemalloc-ctl,
-`lust port prepare` build of the shim, allocator
-selection (3.7).
-Depends on: foreign fn support (small, in W-CHECK-G
-wave B tail), W-PANIC boundary rules.
-Gate: one end-to-end syscall path (file watch event
-or signal) works in a fixture; jemalloc arena assign
-plus 4 MiB align fixture passes. Size: 2.5k-4k plus
-Rust shim code.
+`lust port prepare` shim build, allocator selection
+(3.7).
+Depends on: foreign fns (W-CHECK-G, wave B), W-PANIC
+boundary rules.
+Link rule: system linker or loader with a cdylib,
+first and by default (3.7). W-SHIM does not wait on
+K6. K6 gates only the optional libtcc staticlib path.
+Tests: one end-to-end syscall path (file watch event
+or signal) in a fixture; a recovered panic *inside*
+the shim (the K6 semantic case, through the system
+linker path) in `tests/unwind/`; TLS, callback, and
+allocator-ownership cases; jemalloc arena assign plus
+4 MiB align fixture.
+Gate: all of the above on Linux; macOS rows recorded
+as open until K3 runs there. Size: 2.5k-4k plus Rust
+shim code.
 
 #### Wave D (milestones 8 and 9): port and speed
 
 **W-PORT: ts-rust core CLI port.**
 Owns: no compiler files by default. Owns the port
-tree, `lust port scan/apply` fixes as separate small
-packages when a gap is a compiler bug (filed to the
-owning package, not fixed ad hoc).
+tree. Compiler gaps found here are filed to the owning
+package with a fixture, not fixed ad hoc.
 Depends on: waves A-C gates.
 Gate: PLAN.md 8a, baseline tests byte-equal, release
-through Cargo at equal speed. Size: 3k-6k tool and
-fix lines.
+through Cargo at equal speed. The gate names its exact
+target, features, reachable files, and release recipe.
+Do not replace ts-rust's protected output comparisons
+with a smaller chosen subset in silence; a smaller
+scope is a stated scope cut. Size: 3k-6k tool and fix
+lines.
 
 **W-PERF: invalidation depth and cold speed.**
-Owns: `src/driver/graph.rs`, `cache.rs`, read-set
-coverage in stages it does not own (paired commits
-with owners), instance disk cache, front-end profiles,
-backend bake-off harness.
-Depends on: everything; starts part-time in wave B
-(ImplSet reads) and full-time in wave D.
+Owns: `driver/graph.rs` and `cache.rs` (paired with
+W-DRIVER), read-set coverage reviews, instance disk
+cache depth, front-end profiles, the backend bake-off
+harness. Part-time from wave B (above), full-time in
+wave D.
 Gate: PLAN.md milestone 9 measurements on the ts-rust
-edit loop, cold rows separate. Size: 4k-8k.
+edit loop, cold rows separate, scale gate scenarios of
+9.3 all green. Size: 4k-8k.
+
+**Async (8b): a decision, then maybe a package.**
+No W-ASYNC exists until the port reaches ATA and a
+decision gate picks its form. At that gate, compare
+two costed options on the one real user
+(`project/ata/ata.rs`, about 2.5k lines, with its own
+`block_on` and waker): (a) a state-machine lowering
+(3k-6k lines: executor, wake delivery, borrowed
+suspension, cancellation and drop, pinning, panic
+behavior), (b) a reviewed rewrite of that one IO-bound
+file with no release speed impact. The default is the
+rewrite, unless a second project needs async. A
+borrowed-future spike (K9) runs before either choice.
+If the lowering wins, define W-ASYNC here in full
+before work starts, with its own executable gate in
+`tests/pass` and `tests/unwind/`. Until then, 8b makes
+no async coverage claim. It depends on W-BORROW
+(borrows across suspension) and W-PANIC either way.
 
 ### 9.4 Milestone map
 
 | Milestone (PLAN.md) | Packages | Gate (short) |
 |---|---|---|
-| 4 Rust core (13k-20k) | S1-S6, W-RESOLVE, W-MACRO, W-CORELANG, W-STD-A, runtime slice | Scanner and JSON kernels byte-equal. 66 macros token-equal. |
-| 5 Traits, closures, dyn, Rc (25k-38k) | Spike, W-TRAITS, W-CHECK-G, W-MONO, W-STD-B, W-DEPS, step A lifetimes | Compatibility spike set byte-equal. Fusion corpus dual-run. |
-| 6 Lifetimes (5k-9k) | W-BORROW | Three named fixtures compile. 5.6 corpus rejects. |
-| 7 Threads and panics (9k-15k) | W-PANIC, W-THREADS, W-SHIM | Parallel bind. Recovered panic byte-equal. |
-| 8 Port (3k-6k) | W-PORT plus fixes | Core CLI baselines pass. |
+| 4 Rust core (13k-20k) | Serial, wave A1, wave A2. Includes the MGP: a thin traits and mono slice pulled from milestone 5. | Scanner and JSON kernels byte-equal through source std. Macro gate (scan-listed defs) green. |
+| 5 Traits, closures, dyn, Rc (25k-38k) | K1/K8 spikes, W-TRAITS, W-CHECK-G, W-LOWER, W-MONO, W-STD-B, W-DEPS, step A lifetimes | Compatibility spike set byte-equal. Fusion corpus dual-run. Surface and auto-trait parity. |
+| 6 Lifetimes (5k-9k) | W-BORROW | Three named fixtures compile. 5.6 corpus rejects, NLL case 3 included. |
+| 7 Threads and panics (9k-15k) | W-PANIC, W-THREADS, W-SHIM | Parallel bind. Recovered panic byte-equal in unwind mode. Shim panic recovered through the system linker. |
+| 8 Port (3k-6k) | W-PORT plus filed fixes; async decision at 8b | Core CLI baselines pass. |
 | 9 100x (4k-8k) | W-PERF | Measured 100x edit loop; cold rows stated. |
 
-Package sizes sum inside the PLAN.md ranges. The
-async surface for ATA (8b in PLAN.md; 3k-6k in
-DESIGN-TS) is a wave D package of its own when the
-port reaches it: state machine lowering in
-`src/lower.rs`, `Future`/`Pin`/`Waker` in std. It
-depends on W-BORROW (borrows across suspension) and
-W-PANIC. Do not start it in wave C.
+Package sizes sum inside the PLAN.md ranges, with the
+MGP slice counted in milestone 4. Gates cite port-scan
+output at gate time for feature counts. Numbers in
+this document (66 macros, 168 lifetime types in older
+counts; 80 macro defs and 194 lifetime types in the
+last scan) drift, so no gate hard-codes them.
 
 ### 9.5 Coordination rules
 
 1. One owner per file at a time (brief rule). The
-   layout in 9.1 is the ownership map. Cross-owner
+   table in 9.1 is the ownership map. Cross-owner
    edits go through the owner or land as a paired
    commit with the owner as reviewer.
 2. Frozen interfaces (9.2) change only in a dedicated
@@ -2885,16 +4178,20 @@ W-PANIC. Do not start it in wave C.
    per the std feature ledger (W-STD). A std file
    that needs a feature lists it; the feature package
    adds a fixture from that file.
-4. Every package keeps `tests/pass|fail|reject`
-   green on its branch tip before asking for merge.
-   The orchestrator rebases packages in dependency
-   order at wave end, then runs the full gates.
-5. Perf: each wave B and later package records check
-   and build time on the 31k crate plus its fixtures,
-   before and after. A regression over 10% needs a
-   note or a fix in the same package. Cold numbers
-   use interleaved runs and medians (brief rule for
-   the shared box).
+4. Every package keeps its listed runners green on its
+   branch tip before asking for merge, and says which
+   path (compat or source) each std test exercised
+   until the compat group in question is deleted. The
+   orchestrator rebases packages in dependency order
+   at wave end, then runs the full gates.
+5. Perf: the scale gate of 9.3 runs at every wave end.
+   In addition, each wave B and later package records
+   check and build time on the 31k crate plus its
+   fixtures, before and after. A regression over 10%
+   needs a note or a fix in the same package. Cold
+   numbers use interleaved runs and medians (brief
+   rule for the shared box).
+
 
 ## 10. Spikes, risks, and rejected options
 
@@ -2904,22 +4201,35 @@ trouble.
 
 | # | Spike | When | Question | Fallback |
 |---|---|---|---|---|
-| K1 | Compatibility spike (DESIGN-TS): NodeVisitor, ArenaBox, blanket, go_flags, stored callback | Wave B entry | Do 2.4, 2.8, 4.2 hold on real shapes? | Widen solver only where the spike points. No backtracking. |
-| K2 | Panic propagation cost | Wave C entry | C bytes and run time vs abort (7.2 thresholds) | Per-fn setjmp with cleanup registry. |
-| K3 | tcc platform check: `stdatomic.h`, TLS (`_Thread_local`), `__int128`, on Linux x86_64 and macOS arm64 | Wave A | Can the C backend express 3.2 and 4.4 as written? | Helper structs for u128 (already the default), pthread keys instead of `_Thread_local`. |
-| K4 | Hashbrown order fidelity | W-STD-B | Does the C table match iteration order through rehash and remove storms? | Reviewed sort-before-output list for ts-rust; keep the difftest as a known-fail register, never silent. |
-| K5 | Float printer fuzz | Wave A runtime | Byte-equal on 10M random bit patterns? | Swap Ryu variant; keep fuzz in CI at lower count. |
-| K6 | Staticlib linking through tcc | W-SHIM entry | Does libtcc link the Rust staticlib (relocations, TLS)? | `cdylib` plus system linker for final link in dev. |
-| K7 | Annotation burden count | Wave B, on port scan | How many ts-rust sites hit `L0220`? | Widen 2.4 step 3 (assoc binding inputs) if over ~200 sites. |
+| K1 | Compatibility spike, full PLAN list: a visitor with stored callbacks, `ArenaBox` with `Deref`, a blanket impl, `go_flags!` output, a scoped thread, a recovered panic, one C shim, one borrowed async task | Wave B entry for the trait, dyn, and closure items; thread, panic, shim, and async items as bounded probes at wave C and D entries | Do 2.4, 2.8, and 4.2 hold on real shapes? Each non-B item ends in a written yes/no with probe output, or a stated reason it moved. No item drops in silence. | Widen the solver only where a probe points. No backtracking. |
+| K8 | Borrowed visitor and higher-ranked callback spike (the hard half of K1, split out so it cannot hide) | Before broad closure work in wave B | Does an `Rc<dyn Fn(&T) + 'a>` callback work with a real borrow check, including the leak check of 5.5? A `'static`-only stand-in cannot answer this. | Restrict closure bounds and record the codemod class; do not weaken the region check. |
+| K3 | tcc platform check: `stdatomic.h` widths and orderings, TLS, `__int128` | Linux x86_64: done. Atomics load and fetch-add work (two workers, 200,000 total); `_Thread_local` works in an exe and is broken in a shared object (7.2); `__int128` does not parse. macOS arm64: before any tier 1 claim there, with the exact pinned tcc build. | Can the C backend express 3.2, 4.4, and 7.3 as written, per target? | Already the plan: pthread keys, 2-word i128 with align 16, the named atomic fallback in 7.3. |
+| K6 | Rust shim link semantics | Decided for the default path on Linux: tcc links a Rust staticlib but a panic caught inside it aborts; the system `cc` link runs (3.7). Remaining spike, only if someone wants the libtcc staticlib path: prove a recovered panic, TLS, threads, callbacks, and allocator ownership through the libtcc API itself, on both targets. | Can libtcc ever be a final link for Rust shims? | The system linker with a cdylib is the supported path. W-SHIM does not wait on this spike. |
+| K4 | FxHasher audit (replaces "build an exact table first") | One day, before W-STD-B claims map-order support | Build ts-rust with a perturbed FxHasher through `[patch]`; run the baselines. Equal bytes? | Equal: a deterministic table suffices for the port. Unequal: the diff names the sites; fix those sites or build the exact table per 3.5 (per-target group width). Keep the result in the adapter README either way. |
+| K5 | Float printer fuzz | Wave A (W-CGEN) | Byte-equal on 10M random bit patterns? | Swap Ryu variant; keep fuzz in CI at lower count. |
+| K2 | Panic propagation cost, after semantics | After the `tests/unwind/` corpus passes; at wave B end on wave A cleanup edges if they allow it, else in W-PANIC | C bytes and run time vs abort (7.2 thresholds) on dense-drop code, not only on a visitor fixture | Per-fn setjmp with cleanup registry. |
+| K7 | Annotation burden count | After 2.4 lands, on port scan | How many ts-rust sites hit `L0610` (annotation) vs `L0613` (impl param), counted after macro expansion and dependency classification? | Annotations are codemods. A large `L0613` count (order of 200) reopens only the step 4 binding rules, with the same no-search limit. Counted before 2.4 lands, the number measures the algorithm, not the code. |
+| K9 | Borrowed async task spike | At the 8b decision gate (9.3) | Can one ATA-shaped borrowed future run under the proposed lowering, with suspension, wake, cancel, and panic behavior? | The rewrite option of 9.3. |
+
+Order rules: K3 (Linux) and the K6 default-path
+decision are already evidence, before std and runtime
+ABI work starts. Panic *semantics* (7.2 corpus) come
+before K2 cost. K8 comes before broad closure work.
+K7 comes after 2.4. No spike moves later than the
+package that consumes its answer.
 
 Risks that can change the plan, with first evidence:
 restricted lifetimes growing toward full Rust (the
 5.6 corpus passing but real ts-rust modules still
-needing rewrites); mono C size on real modules (watch
-instance C share vs the 30% threshold in 4.2);
+needing rewrites); mono C size on real modules
+(measured per the scale gate in 9.3; a byte share
+alone proves nothing, 4.2);
 adapter drift on upstream version bumps (pins make it
 loud, not silent); daemon memory at 786k lines (1.8
-eviction note; measure at milestone 8).
+eviction note; measure at milestone 8); the layout
+engine meeting a shape where its size differs from
+rustc (the gate in 4.4 turns that into a reject or a
+fix, never a waiver).
 
 Rejected, with reasons on record:
 
@@ -2935,25 +4245,210 @@ Rejected, with reasons on record:
 - Handle conversion for borrowed fields (DESIGN-TS
   option C: callback and guard shapes do not map; also
   slows the release binary).
-- A metadata (rlib-like) crate format before
-  milestone 9 (in-process signature surfaces cover
-  the port; a format freezes too much too early).
+- A metadata (rlib-like) crate format for user crates
+  before milestone 9 (in-process signature surfaces
+  cover the port; a format freezes too much too
+  early). The std-only generic template format of 3.8
+  is the one exception, because std cannot change
+  inside a lust version.
+- Instance sharing by layout class (4.2: the key is
+  not a correctness proof, and VERIFY G puts the gain
+  under 10%).
 
-## Appendix A: new diagnostic code ranges
+## Appendix A: diagnostic codes
 
-Reserve ranges now so parallel packages do not
-collide. Existing codes keep their meanings.
+Audit first. The compiler emits 43 codes today
+(`grep -rhoE 'L[0-9]{4}' src/` at revision 2, each with
+a doc in `docs/errors/` and a row in
+`src/explain.rs:9-50`). Their meanings do not change.
+Revision 1 of this document reused several of them by
+accident. The used set:
+
+| Codes in use | Area today |
+|---|---|
+| L0001 | syntax error |
+| L0101-L0107 | names, types, fields, methods, arity, duplicates |
+| L0110-L0119 | type mismatch, inference, trait not implemented, operators, callable, match, casts, recursion, literal range, bad range bounds |
+| L0120-L0122 | break/continue, assignment target, `mut` under a ref |
+| L0130 | no `main` function (not an import cycle) |
+| L0201-L0203 | refs in fields, lifetime elision, lifetime syntax not supported |
+| L0301-L0312 | borrow checker: move, assign, borrow conflicts, lifetime of values (not macros) |
+| L0401-L0405 | user macros, attributes, derives, `unsafe`, `async` not supported |
+| L9001 | feature not supported yet |
+
+Free ranges are therefore L05xx up. All new codes in
+this document live there. `tests/fail` files key on
+codes, so a collision silently retargets a test. S0
+(9.2) makes this table a checked registry before any
+new code is emitted.
 
 | Range | Area |
 |---|---|
-| L0110-L0199 | Modules, imports, visibility, cfg, attributes (L0130 import cycle, L014x visibility, L0150 cfg, L0151 attribute) |
-| L0200-L0219 | Types and aliases (L0210 alias cycle) |
-| L0220-L0239 | Traits (L0220 annotation, L0221 overflow, L0222 no impl, L0225 overlap, L0230 GAT) |
-| L0240-L0249 | Const eval |
-| L0250-L0269 | dyn and closures (L0250 object safety, L0260 binder rank) |
-| L0270-L0279 | Method resolution |
-| L0280-L0299 | Regions and drop check (L0285 dropck, L0286 early-bound) |
-| L0300-L0309 | Macros (L0301 caps, L0302 unknown, L0303 include, L0304 proc macro) |
-| L0310-L0319 | Foreign and shim boundary |
+| L0501-L0509 | Modules and imports (L0501 import cycle does not settle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution) |
+| L0510-L0519 | Visibility |
+| L0520-L0529 | cfg and attributes (L0520 unknown cfg name, L0521 unknown attribute) |
+| L0530-L0539 | Crate session (L0530 unsupported edition, L0531 unsupported deny-level lint) |
+| L0601-L0609 | Types and aliases (L0601 alias cycle) |
+| L0610-L0619 | Traits and inference (L0610 type annotations needed or type must be known, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known from trait inputs, L0615 overlapping impls) |
+| L0620-L0629 | Associated items (L0620 GAT) |
+| L0630-L0639 | Const eval (L0630 outside the bounded evaluator or step cap, L0631 non-const call in a const or static initializer) |
+| L0640-L0649 | Std surface (L0640 std item declared but not yet implemented) |
+| L0650-L0659 | Layout (L0650 `offset_of!` on a default-repr type, L0651 reference to a packed field, L0652 unsupported layout form) |
+| L0701-L0709 | dyn compatibility (L0701, with the offending item named) |
+| L0710-L0719 | Binders (L0710 nested higher-ranked binder) |
+| L0720-L0729 | Methods and receivers (L0720 ambiguous method, L0722 unsupported receiver type; plain "no such method" stays L0104) |
+| L0730-L0739 | Regions and drop check (L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes) |
+| L0801-L0809 | Macros (L0801 expansion caps, L0802 unknown macro, L0803 include file not found, L0804 proc-macro dependency, L0805 local ambiguity) |
+| L0810-L0819 | Foreign and shim boundary |
 | L9001 | Unsupported prototype feature (existing). New work must not add L9001 sites for planned features; use the ranges above. |
 
+
+## 11. Review responses
+
+Revision 1 got two reviews, both "request changes":
+sol (`/tmp/lust-wt/reviews/arch-sol.md`, 17 blocking
+items) and Opus (`/tmp/lust-wt/reviews/arch-opus.md`,
+11 blocking items). I re-ran the rustc probes from
+both review dirs with rustc 1.99, edition 2024, and
+re-ran the tcc shim and TLS binaries. Every load
+bearing claim below held as the reviewers stated it,
+except one detail noted at Opus B4. This section is
+the checklist the orchestrator verifies against.
+
+### Live rule-zero bugs in today's lust
+
+These are bugs in the current compiler, not in this
+document. Route them to bug-fix agents; do not wait
+for the milestones that touch the same area.
+
+1. **Lust accepts NLL problem case 3.** The program in
+   5.2 (`first_or_push`) builds with today's lust and
+   prints `1`. Rustc rejects it with E0502 (verified
+   with both compilers in this revision). Fix as
+   milestone 1 work: add the case to `tests/fail`,
+   then fix loan liveness for loans under a universal
+   (return) region. W-BORROW later keeps it as a
+   regression case in the 5.6 corpus.
+
+That is the only live accept-side bug either review
+proved against today's binary. The other probes test
+features lust does not have yet (traits, dyn, macros),
+where lust rejects, which the subset rule allows; or
+they test rustc or tcc behavior the design must match.
+
+### sol: blocking items 1-17
+
+| Item | Action |
+|---|---|
+| 1. Layout observable; missing enum niche; tag width | Fixed in 4.4: strict size/align contract, general niche computation, niche-filled enums, tag width from discriminant range and repr ints, real nested `TypeData` shape in the gate, `offset_of!` on default-repr rejected (L0650), packed-field reference rejected (L0651). The 112/192-byte size estimate is not used as a fact; the gate measures the real shape. |
+| 2. Match the whole trait ref; assoc equalities; binders; param env | Fixed in 2.1 (bindings on `TraitRef`, `AssocEq`, `Binder`, param-env elaboration) and 2.4 (full-ref probe). Probe matches sol's `Tr<u8>`/`Tr<u16>` case (re-ran: prints `1 2`). |
+| 3. Lifetime turbofish accepts E0794 | Fixed in 5.5: early/late-bound split is computed; all explicit lifetime turbofish args reject (L0731), the smaller first step sol proposed. Placeholder leak check added. Probe re-ran: E0794 confirmed. |
+| 4. dyn checks; `&Rc<Self>` receiver | Fixed in 2.8 (full dyn compatibility, bare `Self` return included; probe E0038 re-ran) and 2.9/2.10 (recursive receiver grammar; ts-rust shape at `packagejson.rs:1092` verified, 159 uses). Supertrait auto traits on dyn in 2.1/2.8. |
+| 5. Import fixpoint; re-export visibility; mod ambiguity | Fixed in 1.2 (L0502) and 1.3 (one worklist retries explicit imports through globs, with the `TypeMapperKind` chain verified; binding visibility separate from lookup path; re-ran sol re-export probe). |
+| 6. Macro ambiguity; opaque fragments; expansion order | Fixed in 6.1 (interleaved worklist, cfg first), 6.2 (opaque fragments with `ident`/`lifetime`/`tt` exceptions, L0805 local ambiguity), 6.3 (mixed-site hygiene, executable gate). Both probes re-ran (forward prints 4; ambiguity errors). |
+| 7. Panic flag; nested catch in Drop; UnwindSafe | Fixed in 7.2 (in-flight exception split from unwind depth, saved outer exception, nested catch by `gen`, hook and poison rules) and 2.7 (unwind traits). Probes re-ran: nested Drop catch prints `after true true`; `catch_mut` fails E0277. |
+| 8. Const eval too small; static eligibility | Fixed in 2.13 (bounded evaluator over the three cited ts-rust shapes, static data path, L0631 for the E0015 case; probe re-ran). One owner named. |
+| 9. Stable sort; RawVec formula | Fixed in 3.3 (driftsort/ipnsort port, no introsort; min capacity 8/4/1 by size, exact reserve, ZST capacity; layout probe re-ran and matches). |
+| 10. Zip fusion needs both sides | Fixed in 4.3 (start unfused; both-sides predicate rule; one recognition boundary at mono) and 3.4 (source `Zip` uses the same predicate). Probe re-ran: filter-left runs the closure 3 times, plain map 2. |
+| 11. Dep graph: candidate sets; per-name reads | Fixed in 8.1-8.3 (`Binding` and `MethodSet` nodes, every probe recorded, inherent-method addition rechecks; probe pair prints 1 then 2, re-ran). Macro-edit propagation fixed in 8.3 step 4. |
+| 12. Disk-stable keys; slot space; span remap | Fixed in 1.7 (disk pair), 4.2 (one slot space per bin, manifest in object keys, token-ordinal locations), 8.4 (disk form table, IR vs C-unit keys split). |
+| 13. Std generic templates missing | Fixed in 3.8 (signature surface plus serialized generic templates plus non-generic instances; recheck-on-load as the measured fallback). |
+| 14. Bootstrap cycle; missing owners | Fixed in 9.2-9.3 (serial phase deletes no compat; MGP joint gate before staged deletes; W-CGEN and W-DRIVER explicit; one lowering owner; per-wave shared-file table in 9.1). |
+| 15. Gates unrunnable; diagnostic collisions | Fixed in 9.3 runner table (unwind mode, crates, macros, traits, adapters) and Appendix A (43 current codes audited; new codes in L05xx-L08xx). Recursion check-vs-build split in 4.1. |
+| 16. Cargo config omitted from keys | Fixed in 1.1 (full resolver input as graph key, per-unit features, build-script refresh, edition after classification and target filtering). |
+| 17. tcc-linked shim cannot catch its panic | Fixed in 3.7 and K6: system linker with a cdylib is the first supported path; libtcc staticlib only after the semantic spike. Binaries re-ran: `cc` link prints the caught result, tcc link aborts. |
+
+### sol: non-blocking items
+
+| Item | Action |
+|---|---|
+| Defer instance sharing | Fixed in 4.2: sharing removed for milestones 4-8; a proof bar is stated for milestone 9. |
+| Checked identity for `Any` | Fixed in 2.8: structural key, checked id table, collision stops the build, `'static` kept. |
+| Pin auto-trait exceptions | Fixed in 2.7 (per-trait tables, `PhantomPinned`, std registry) and 5.3 (variance rows for `&mut`, `*const`, `*mut`). |
+| SmallVec real API | Fixed in 3.6: `SmallVec<[T; N]>` with the `Array` trait; `MaybeUninit` as the one supported union shape in 4.4. Caller line verified. |
+| Honest intrinsic list | Fixed in 3.1 item 1 and 3.2: signatures and privilege frozen, no count; permitted shipped crates named. |
+| One schema for type args | Fixed in 2.1: `ArgsId` vs `TysId` split by name; `Bound` region added; `subst` split from `normalize`. |
+| No instance walk in `lust check` | Fixed in 4.1: check stops at generic check; build walks. The policy is stated as rustc parity, so no benchmark is needed to justify it. |
+| Budget discovery at scale | Fixed in 4.2 (cached edges, walk from dirty only) and the 9.3 scale gate (real counts recorded per wave). |
+| Measure panic cost on dense-drop code | Fixed in 7.2: K2 fixture list now names RefCell guards, Rc captures, sort comparators, iterator short-circuits; old percentages marked as estimates, not data. |
+| Pin reachability and counts | Fixed in 9.3 scale gate and 9.4: target, features, file set, and which line count (571k/672k/786k) each report uses. |
+
+### sol: calls on the 7 open items, and 9.2/9.3 suggestions
+
+| Item | Action |
+|---|---|
+| Call 1: no sharing keys yet | Agreed. 4.2. |
+| Call 2: predicate-only impl params | Agreed on the diagnosis, and the narrow fix from Opus call 2 is in 2.4 step 4. Leftovers are `L0613` with no turbofish hint. K7 counts `L0610` and `L0613` apart, after expansion. Probe re-ran (the `Item = U` shape proves). |
+| Call 3: hashbrown fidelity, per-target width | Partly agreed, sequenced with Opus call 3: 3.5 keeps the exactness requirement and the per-target pin list (16-byte x86_64, 8-byte aarch64; std-internal hashbrown is the Fx oracle), but K4 audits first. The port may run on a deterministic table only under a passed audit, stated in the adapter README. |
+| Call 4: tcc facts, Linux only | Agreed and recorded in 7.3 and K3. TLS-by-pthread-keys is the only plan on both targets; an atomic fallback is named for arm64. macOS stays an open spike row. |
+| Call 5: reject tcc staticlib default | Agreed. 3.7 link rule. |
+| Call 6: edition 2024 only | Agreed, with the scope rule (selected units only) and def-edition fragments in 1.1 and 6.2. |
+| Call 7: async thin | Agreed. 9.3 wave D turns it into a decision gate plus K9; no 8b coverage claim before a full W-ASYNC exists. |
+| Suggestion 1: smaller serial phase | Done in 9.2 (S5 non-generic only, S6 routing only, compat kept, module fixture moved to W-RESOLVE). |
+| Suggestion 2: freeze missing interfaces | Done: S7 plus the freeze list in 9.2, including the call-terminator move (`src/ir.rs:81` today). |
+| Suggestion 3: one AST/collect owner | Done: 9.1 table; worklist driver has one owner (W-RESOLVE) with W-MACRO behind one interface. |
+| Suggestion 4: minimal generic pipeline first | Done: the MGP joint gate in 9.3, with the exact contents sol listed. |
+| Suggestion 5: W-CGEN and W-DRIVER explicit | Done in wave A1. |
+| Suggestion 6: one lowering owner; runtime split | Done: W-LOWER across B and C; `runtime/` split in 9.1; `ty/defs.rs` and `ty/lang.rs` owners named per wave. |
+| Suggestion 7: runner commands over fixture names | Done: runner table in 9.3; each Done cites commands. The named fixture shapes (nested `TypeData`, borrowed visitor, `&Rc<Self>`, `FileRef`, predicate-only impls, caught second panic) appear in W-CORELANG, W-CHECK-G, W-BORROW, W-TRAITS-CORE, and W-PANIC gates. |
+| Suggestion 8: spikes earlier | Done in section 10 order rules (K3, K6 decision, K8, panic semantics first). |
+| Suggestion 9: narrow first-pass optimization | Done: unfused and unshared start (4.2, 4.3); fusion staged by adapter. |
+| Suggestion 10: scale gate per wave | Done in 9.3, with sol's six edit scenarios and separate cold rows. |
+
+### Opus: blocking items B1-B11
+
+| Item | Action |
+|---|---|
+| B1. Selection and inference | Fixed in 2.4 (probe the full trait ref, param env first, one candidate confirms and binds, defer rules) and 2.12 (type-must-be-known list). Probes re-ran: `idx` prints `1 18446744073709551615`, `infer2` accepts, `infer1` fails E0282. |
+| B2. Coherence rejects std and ts-rust | Fixed in 2.6: full-ref unification plus the local/fundamental disproof as a table lookup. The six ts-rust `IntoIterator` impls verified at the cited lines. |
+| B3. Std surface parity | Fixed in 3.1: rustdoc-JSON manifest, `L0640` stubs, auto-trait parity probes, W-STD gates in 9.3. |
+| B4. Specialization replacement | Fixed in 3.4 (three closed mono predicates) and 4.3 (zip both-sides rule, skip and step_by pull rules). One correction to the review: `step_by(2).count()` runs the closure 4 times on Opus's 4-item probe, but my re-run at lengths 5 and 6 gives 5 and 6. So 4.3 states the pull rule (every item up to the last yielded one is pulled), not a fixed count. In-place collect keeps capacity 100 (probe re-ran). |
+| B5. Region check accepts more than NLL | Fixed in 5.2 (universal regions, exact live-range rule) and 5.6 (corpus). Live bug listed above; verified with today's lust binary. |
+| B6. Layout vs size asserts | Fixed in 4.4 (field order by alignment, enum niche filling, tag from discriminant range, shape-generator gate, `type_name` in 3.5). Partly rejected: "offsets of default-repr types do not need to match" is not safe, because a program can print `offset_of!` (sol's layout probe prints offsets 0 and 9). Lust instead rejects `offset_of!` on default-repr types (L0650) and matches sizes and alignments everywhere it accepts a type. |
+| B7. Macro order for cfg and imports | Fixed in 6.1 (interleaved worklist, E0659 time-travel rule). |
+| B8. Coarse reads, global mono walk, global can-panic | Fixed in 8.1-8.3 (per-binding reads, method-set reads), 4.2 (cached edges, dirty walk), 7.2 (no can-panic fixpoint in daemon builds; global counter fast path). |
+| B9. tcc TLS in shared objects | Fixed in 7.2 and 7.3: no C TLS; global counter plus pthread keys. Probe re-ran: the `.so` sees the exe's write (3, then 77). Also covers macOS by construction. |
+| B10. Work breakdown | Fixed in 9.1-9.3 and Appendix A: AST v2 covers all syntax in S3, W-TRAITS-CORE in wave A, W-STD after the MGP, every named owner has a package, S7 builds the frozen plumbing, codes moved. |
+| B11. Resolution details | Fixed in 1.2 (non-`mod.rs` search dir, `program.rs:28` verified; both-files error; `#[path]` bases), 1.3 (std prelude layer, scope priority table, local `core` module), 1.6 (`target_vendor`, `default`, `rustfmt::skip`, `ignore`, `should_panic`), 6.4 (`line!`, `file!`), 1.1 (lints read from manifests, `unsafe_code` enforced, other deny lints reject). Counts verified by grep, including 32 `#[default]` uses. |
+
+### Opus: non-blocking items 1-14
+
+| Item | Action |
+|---|---|
+| 1. Dropck too strict for std | Fixed in 5.4: std-only may-dangle flag on the same impls as real std. Probe re-ran (`Vec<&String>` case accepts). |
+| 2. Early-bound lifetimes | Fixed in 5.5 and 2.9: the split is computed; early-bound params are `FnDef` args, late-bound become binders. |
+| 3. Auto traits leak through opaque | Fixed in 2.11, with a `spawn` test in the gate. |
+| 4. Edition 2024 drop scopes | Fixed in 3.5 drop-order item (all three rules named, with tests). |
+| 5. Hash byte streams and group width | Fixed in 3.5 (0xff suffix, length prefix, discriminant as `isize`; width 16 vs 8 by target). |
+| 6. Panic payload type and `Location::file` | Fixed in 3.5 and 4.2 (span remapping); unwind harness mode in 9.3. |
+| 7. Features per unit from Cargo | Fixed in 1.1; cfg-set equality is testable per unit. |
+| 8. Std generic IR on disk | Fixed in 3.8 (serialized templates; recheck fallback measured at the W-DRIVER gate). |
+| 9. `lust_dev` only in shipped crates | Fixed in 1.6, with `check-cfg` declared. |
+| 10. Methods from param env and dyn with no import | Fixed in 2.10 step 2. |
+| 11. Sorting | Fixed in 3.3 (port driftsort and ipnsort; total-order panic; no C introsort). |
+| 12. Copy from real std | Fixed in 3.1 (stated policy for RawVec, sort, fmt, float text). |
+| 13. Numbers drift | Fixed in 6.5, 9.4, and the W-MACRO gate: all counts cite port-scan output at gate time. |
+| 14. Obligation queue timing | Fixed in 2.4 (fixed run points only). |
+
+### Opus: calls on the 7 open items, and 9.2/9.3 suggestions
+
+| Item | Action |
+|---|---|
+| Call 1: no sharing in milestones 5-8 | Agreed. 4.2, including the `f64`/`u64` ABI point. |
+| Call 2: narrow impl-param fix now | Agreed. 2.4 step 4; K7 only after B1 lands. |
+| Call 3: hash audit over exact table in 5 | Agreed as sequence; final exactness kept per sol call 3. 3.5 and K4. |
+| Call 4: tcc facts on Linux | Agreed and recorded. K3; macOS stays open and does not block the no-TLS design. |
+| Call 5: skip libtcc staticlib; use cdylib | Agreed for the default path. Partly differs from sol, who wants the API proved: the spike stays, but it gates only the optional path (K6). W-SHIM does not wait. |
+| Call 6: edition 2024; move the code | Agreed. Edition error is L0530; L0112 keeps its meaning. |
+| Call 7: async defer, prefer the file rewrite | Agreed. 9.3 wave D decision gate with the rewrite as default, K9 before either option. |
+| Serial 1-6 (S4 first, AST v2, S5 cut, S7, free code ranges, crates harness) | All done in 9.2 (execution order S4, S0, S1, S2, S3, S5, S6, S7; S3 splits past 1.2k lines; counts checked against `lust-port`). |
+| Parallel 1 (wave A1 with W-TRAITS-CORE) | Done. W-CORELANG takes no std types and owns the layout engine. |
+| Parallel 2 (W-STD after trait core) | Done as wave A2 behind the MGP. The milestone shift is stated in 9.3 and 9.4 for the orchestrator to accept. |
+| Parallel 3 (one owner for cgen, runtime, driver) | Done, with one change of shape: `runtime.c` splits by subsystem (sol's form), so W-PANIC and W-THREADS own their files in wave C while W-CGEN owns `runtime.h` throughout. Closure lowering sits with W-CHECK-G records and W-LOWER emission (9.1 table), which keeps one lowering owner. |
+| Parallel 4 (cleanup edges in wave A) | Done: W-CORELANG builds them with `Drop`; runtime and hooks stay in wave C; K2 can measure at wave B end. |
+| Parallel 5 (more std gates) | Done: manifest, auto-trait parity, unfused specialization parity in W-STD gates. |
+| Parallel 6 (trait oracle corpus) | Done: W-TRAITS-CORE gate lists the must-reject and `IntoIterator` cases. |
+| Parallel 7 (NLL corpus first; fix the bug now) | Done: corpus in 5.6; the live fix is routed above as milestone 1 work, not held for W-BORROW. |
+| Parallel 8 (spikes: K1 full, K4 audit, K6 drop, K3 done) | K1 full list restored with per-wave probes; K4 is the audit; K6 is not dropped but demoted to an optional-path gate (see call 5); K3 Linux recorded as evidence. |
+| Parallel 9 (W-PERF part-time from wave A/B) | Done: scale gate owner is W-DRIVER in wave A, W-PERF from wave B, owning `Reads` review. |
+| Parallel 10 (gates cite scan counts) | Done: W-RESOLVE and W-MACRO gates cite scan findings; 9.4 states the rule globally. |
