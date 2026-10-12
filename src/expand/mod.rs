@@ -12,6 +12,7 @@
 // frozen `Binding` query fns (S7) without touching callers.
 pub mod builtin;
 pub mod match_;
+pub mod recognize;
 pub mod transcribe;
 
 use crate::ast::{MacroCall, MacroRulesDef};
@@ -455,6 +456,8 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
         Question => "?",
         Underscore => "_",
         Shl => "<<",
+        Shr => ">>",
+        ShrEq => ">>=",
         Dollar => "$",
         At => "@",
         Eof => "",

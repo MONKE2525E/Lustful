@@ -1333,7 +1333,12 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                         Some(k) if k > 0 => vec![pos + k],
                         _ => vec![],
                     },
-                    None => vec![],
+                    // The subset parser refuses some valid forms
+                    // (closures, `?`, `.await`, async and unsafe
+                    // blocks); the recognizer knows their shapes
+                    // and where they greedily end.
+                    None => super::recognize::expr_end(input, pos, m.interner, kind == FragKind::Expr)
+                        .map_or_else(Vec::new, |end| vec![end]),
                 }
             }
         }
@@ -1794,6 +1799,23 @@ fn probe(m: &mut Matcher, kind: FragKind, slice: &[Tt]) -> bool {
         }
         _ => false,
     };
+    // The subset parser cannot yet parse every valid Rust form a
+    // fragment can hold (closures, `?`, float patterns, a bare
+    // `dyn`). rustc's fragment parser can, so a shape the parser
+    // refuses gets one more chance from the token-tree recognizer,
+    // which knows the full grammar but builds no AST.
+    let ok = ok
+        || match kind {
+            FragKind::Expr => super::recognize::is_expr(slice, m.interner, true),
+            FragKind::Expr2021 => super::recognize::is_expr(slice, m.interner, false),
+            FragKind::Ty => super::recognize::is_ty(slice, m.interner),
+            FragKind::Pat => super::recognize::is_pat(slice, m.interner, true),
+            FragKind::PatParam => super::recognize::is_pat(slice, m.interner, false),
+            FragKind::Stmt => super::recognize::is_stmt(slice, m.interner),
+            FragKind::Item => super::recognize::is_item(slice, m.interner),
+            FragKind::Block => matches!(slice, [one] if super::recognize::is_block(one, m.interner)),
+            _ => false,
+        };
     m.probe_cache.insert(key, ok);
     ok
 }

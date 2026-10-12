@@ -362,6 +362,8 @@ fn tok_name(t: Tok) -> &'static str {
         Question => "`?`",
         Underscore => "`_`",
         Shl => "`<<`",
+        Shr => "`>>`",
+        ShrEq => "`>>=`",
         Dollar => "`$`",
         At => "`@`",
         Eof => "end of file",

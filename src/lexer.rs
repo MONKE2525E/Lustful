@@ -135,6 +135,14 @@ pub enum Tok {
     Question,
     Underscore,
     Shl,
+    /// `>>` as one token tree. The lexer never emits this from
+    /// source (it emits two `Gt` so generics parse without
+    /// splitting); the expander merges two touching `Gt` into one
+    /// `Shr` when it builds token trees, because rustc's token
+    /// trees hold `>>` whole, and splits it again before the
+    /// parser. `ShrEq` is the same for `>>=`.
+    Shr,
+    ShrEq,
     Dollar,
     At,
     Eof,
