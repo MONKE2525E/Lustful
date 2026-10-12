@@ -2,6 +2,7 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod collect;
+pub mod obligations;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
@@ -212,6 +213,9 @@ struct Ctx<'p, 'a> {
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
     self_ty: Option<Ty>,
+    /// The trait obligation queue (ARCH 2.4). Empty until W-TRAITS-CORE fills it;
+    /// the hook calls at its fixed run points are already in place below.
+    obl: obligations::Obligations,
 }
 
 /// Type-checks one function body.
@@ -242,7 +246,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
-        self_ty: f.owner.map(|a| p.tys.get(TyKind::Adt(a)).expect("ADT types are interned during collection")),
+        self_ty: f.owner.map(|a| p.tys.get_adt_ty(a).expect("ADT types are interned during collection")),
+        obl: obligations::Obligations::new(),
     };
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
@@ -284,12 +289,12 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
-fn string_eq_ok(ld: u8, lk: TyKind, rd: u8, rk: TyKind) -> bool {
+fn string_eq_ok(ld: u8, lk_is_string: bool, rd: u8, rk_is_string: bool) -> bool {
     let peel = ld.min(rd);
-    let (la, ra) = ((ld - peel, lk), (rd - peel, rk));
-    let string = (0, TyKind::String);
-    let str_ = (0, TyKind::Str);
-    let ref_str = (1, TyKind::Str);
+    let (la, ra) = ((ld - peel, lk_is_string), (rd - peel, rk_is_string));
+    let string = (0, true);
+    let str_ = (0, false);
+    let ref_str = (1, false);
     matches!(
         (la, ra),
         (a, b) if (a == string && (b == string || b == str_ || b == ref_str))
@@ -310,11 +315,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
     /// Type name for messages, with inference variables resolved.
     fn tn(&self, t: Ty) -> String {
-        match self.kind(t) {
-            TyKind::Vec(e) => format!("Vec<{}>", self.tn(e)),
-            TyKind::Option(e) => format!("Option<{}>", self.tn(e)),
-            TyKind::Ref(m, e) => format!("&{}{}", if m { "mut " } else { "" }, self.tn(e)),
-            _ => ty_name(self.p, &self.tys, self.resolve(t)),
+        let t = self.resolve(t);
+        match self.tys.kind(t) {
+            TyKind::Ref(_, m, e) => format!("&{}{}", if m.is_mut() { "mut " } else { "" }, self.tn(e)),
+            _ => match self.tys.builtin_of(t) {
+                Some(BuiltinTy::Vec) => format!("Vec<{}>", self.tn(self.tys.adt_first_ty_arg(t).unwrap_or(ERROR))),
+                Some(BuiltinTy::Option) => format!("Option<{}>", self.tn(self.tys.adt_first_ty_arg(t).unwrap_or(ERROR))),
+                _ => ty_name(self.p, &self.tys, t),
+            },
         }
     }
     fn ei(&self, e: ExprId) -> usize {
@@ -344,12 +352,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn new_var(&mut self, int: bool) -> Ty {
         self.vars.push(Var { bound: None });
         let id = self.vars.len() as u32 - 1;
-        self.tys.intern(TyKind::Var(id, int))
+        self.tys.intern(TyKind::Infer(InferId(id, int)))
     }
     /// Follows variable bindings at the top level only.
     fn resolve(&self, mut t: Ty) -> Ty {
-        while let TyKind::Var(v, _) = self.tys.kind(t) {
-            match self.vars[v as usize].bound {
+        while let TyKind::Infer(v) = self.tys.kind(t) {
+            match self.vars[v.index() as usize].bound {
                 Some(b) => t = b,
                 None => return t,
             }
@@ -362,43 +370,71 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Fully resolves a type, interning new structural types as needed. Unbound integer
     /// variables become i32.
     fn zonk(&mut self, t: Ty) -> Ty {
-        let t = self.resolve(t);
-        match self.tys.kind(t) {
-            TyKind::Var(v, int) => {
-                let d = if int { I32 } else { ERROR };
-                self.vars[v as usize].bound = Some(d);
-                d
-            }
-            TyKind::Vec(e) => {
-                let e = self.zonk(e);
-                self.tys.intern(TyKind::Vec(e))
-            }
-            TyKind::Option(e) => {
-                let e = self.zonk(e);
-                self.tys.intern(TyKind::Option(e))
-            }
-            TyKind::Ref(m, e) => {
-                let e = self.zonk(e);
-                self.tys.intern(TyKind::Ref(m, e))
-            }
-            _ => t,
-        }
+        self.rebuild(t, true)
     }
     /// Resolves variables at every depth, keeping unbound ones. Trait queries need this.
     fn deep(&mut self, t: Ty) -> Ty {
+        self.rebuild(t, false)
+    }
+    /// The shared walk of `zonk` and `deep` over the structural kinds a body can form.
+    /// A type with no inference variable anywhere (the cached flag) is returned as is,
+    /// so the common signature types cost one flag read. With `zonk`, an unbound
+    /// variable is defaulted (integer variables to i32, others to the error type).
+    fn rebuild(&mut self, t: Ty, zonk: bool) -> Ty {
         let t = self.resolve(t);
         match self.tys.kind(t) {
-            TyKind::Vec(e) => {
-                let e = self.deep(e);
-                self.tys.intern(TyKind::Vec(e))
+            TyKind::Infer(v) => {
+                if !zonk {
+                    return t;
+                }
+                let d = if v.is_int() { I32 } else { ERROR };
+                self.vars[v.index() as usize].bound = Some(d);
+                d
             }
-            TyKind::Option(e) => {
-                let e = self.deep(e);
-                self.tys.intern(TyKind::Option(e))
+            _ if !self.tys.flags(t).contains_infer() => t,
+            TyKind::Ref(r, m, e) => {
+                let e = self.rebuild(e, zonk);
+                self.tys.intern(TyKind::Ref(r, m, e))
             }
-            TyKind::Ref(m, e) => {
-                let e = self.deep(e);
-                self.tys.intern(TyKind::Ref(m, e))
+            TyKind::Slice(e) => {
+                let e = self.rebuild(e, zonk);
+                self.tys.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.rebuild(e, zonk);
+                self.tys.intern(TyKind::Array(e, n))
+            }
+            TyKind::Tuple(ts) => {
+                let old: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                let new: Vec<Ty> = old.iter().map(|&e| self.rebuild(e, zonk)).collect();
+                let ts = self.tys.intern_tys(&new);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Adt(d, a) => {
+                // Rebuild each type arg in place: the new list is allocated only
+                // when some arg actually changes (the common deep() case does not).
+                let n = self.tys.args(a).len();
+                let mut new: Option<Vec<GenericArg>> = None;
+                for i in 0..n {
+                    let g = self.tys.args(a)[i];
+                    let g2 = match g {
+                        GenericArg::Ty(e) => GenericArg::Ty(self.rebuild(e, zonk)),
+                        other => other,
+                    };
+                    if g2 != g {
+                        let v = new.get_or_insert_with(|| self.tys.args(a).to_vec());
+                        v[i] = g2;
+                    } else if let Some(v) = &mut new {
+                        v[i] = g2;
+                    }
+                }
+                match new {
+                    None => t,
+                    Some(v) => {
+                        let a = self.tys.intern_args(&v);
+                        self.tys.intern(TyKind::Adt(d, a))
+                    }
+                }
             }
             _ => t,
         }
@@ -411,35 +447,76 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         match (self.tys.kind(a), self.tys.kind(b)) {
             (TyKind::Error, _) | (_, TyKind::Error) => true,
-            (TyKind::Var(v, vi), TyKind::Var(w, wi)) => {
+            (TyKind::Infer(v), TyKind::Infer(w)) => {
                 // Bind the general variable to the integer one, so the integer constraint survives.
-                if vi && !wi {
-                    self.vars[w as usize].bound = Some(a);
+                if v.is_int() && !w.is_int() {
+                    self.vars[w.index() as usize].bound = Some(a);
                 } else {
-                    self.vars[v as usize].bound = Some(b);
+                    self.vars[v.index() as usize].bound = Some(b);
                 }
                 true
             }
-            (TyKind::Var(v, int), k) | (k, TyKind::Var(v, int)) => {
-                if int && !matches!(k, TyKind::Int(_)) {
+            (TyKind::Infer(v), k) | (k, TyKind::Infer(v)) => {
+                if v.is_int() && !matches!(k, TyKind::Int(_)) {
                     return false;
                 }
-                let other = if matches!(self.tys.kind(a), TyKind::Var(..)) { b } else { a };
-                if self.occurs(v, other) {
+                let other = if matches!(self.tys.kind(a), TyKind::Infer(_)) { b } else { a };
+                if self.occurs(v.index(), other) {
                     return false;
                 }
-                self.vars[v as usize].bound = Some(other);
+                self.vars[v.index() as usize].bound = Some(other);
                 true
             }
-            (TyKind::Vec(x), TyKind::Vec(y)) | (TyKind::Option(x), TyKind::Option(y)) => self.unify(x, y),
-            (TyKind::Ref(m, x), TyKind::Ref(n, y)) => m == n && self.unify(x, y),
+            // Regions do not take part in this equality: every region is `Erased`
+            // until milestone 6 gives them their own solver (ARCH 5).
+            (TyKind::Ref(_, m, x), TyKind::Ref(_, n, y)) => m == n && self.unify(x, y),
+            (TyKind::Adt(d, x), TyKind::Adt(e, y)) => d == e && self.unify_args(x, y),
+            (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+                self.tys.tys_of(x).len() == self.tys.tys_of(y).len()
+                    && (0..self.tys.tys_of(x).len()).all(|i| {
+                        let (u, v) = (self.tys.tys_of(x)[i], self.tys.tys_of(y)[i]);
+                        self.unify(u, v)
+                    })
+            }
+            (TyKind::Slice(x), TyKind::Slice(y)) => self.unify(x, y),
+            (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && self.unify(x, y),
             _ => false,
         }
     }
+    /// Two generic argument lists unify element by element, in declared order.
+    /// Type args unify; lifetime and const args must already be equal. Indexed
+    /// reads only, so the common one-element `Vec<T>` case allocates nothing.
+    fn unify_args(&mut self, a: ArgsId, b: ArgsId) -> bool {
+        let n = self.tys.args(a).len();
+        if n != self.tys.args(b).len() {
+            return false;
+        }
+        for i in 0..n {
+            let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {
+                (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                (x, y) => x == y,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
     fn occurs(&self, v: u32, t: Ty) -> bool {
         match self.kind(t) {
-            TyKind::Var(w, _) => w == v,
-            TyKind::Vec(e) | TyKind::Option(e) | TyKind::Ref(_, e) => self.occurs(v, e),
+            TyKind::Infer(w) => w.index() == v,
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.occurs(v, e),
+            TyKind::Adt(_, a) => (0..self.tys.args(a).len()).any(|i| match self.tys.args(a)[i].as_ty() {
+                Some(e) => self.occurs(v, e),
+                None => false,
+            }),
+            TyKind::Tuple(ts) => {
+                let n = self.tys.tys_of(ts).len();
+                (0..n).any(|i| {
+                    let e = self.tys.tys_of(ts)[i];
+                    self.occurs(v, e)
+                })
+            }
             _ => false,
         }
     }
@@ -460,6 +537,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
     /// Checks `found` against `expected` at a coercion site. Records the coercion on `e`.
     fn coerce_at(&mut self, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> bool {
+        // ARCH 2.4 run point: the obligation queue runs at coercion sites.
+        self.obl.run_at_coercion();
         let (fk, ek) = (self.kind(found), self.kind(expected));
         if fk == TyKind::Never {
             return true;
@@ -467,7 +546,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Count reference layers, for deref coercions.
         let depth = |cx: &Self, mut t: Ty| {
             let mut n = 0u8;
-            while let TyKind::Ref(_, inner) = cx.kind(t) {
+            while let TyKind::Ref(_, _, inner) = cx.kind(t) {
                 t = inner;
                 n += 1;
             }
@@ -476,24 +555,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let (fd, fbase) = depth(self, found);
         let (ed, _) = depth(self, expected);
         let c = match (fk, ek) {
-            (TyKind::Ref(..), TyKind::Ref(false, s)) if self.kind(s) == TyKind::Str && self.kind(fbase) == TyKind::String => {
+            (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
+                if self.kind(s) == TyKind::Str && self.tys.is_string_ty(self.resolve(fbase)) =>
+            {
                 Coerce::StrFromString
             }
-            (TyKind::Ref(..), TyKind::Ref(false, _))
+            (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, _))
                 if fd > ed && {
                     let mut t = found;
                     for _ in 0..fd - ed {
-                        if let TyKind::Ref(_, inner) = self.kind(t) {
+                        if let TyKind::Ref(_, _, inner) = self.kind(t) {
                             t = inner;
                         }
                     }
-                    matches!(self.kind(t), TyKind::Ref(false, _)) && self.unify(t, expected)
+                    matches!(self.kind(t), TyKind::Ref(_, Mut::Shared, _)) && self.unify(t, expected)
                 } =>
             {
                 Coerce::Deref(fd - ed)
             }
-            (TyKind::Ref(true, x), TyKind::Ref(false, y)) if self.unify(x, y) => Coerce::MutToShared,
-            (TyKind::Ref(true, x), TyKind::Ref(true, y)) if self.unify(x, y) => Coerce::Reborrow,
+            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Shared, y)) if self.unify(x, y) => Coerce::MutToShared,
+            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Mut, y)) if self.unify(x, y) => Coerce::Reborrow,
             _ => {
                 if !self.unify(found, expected) {
                     self.mismatch(span, expected, found);
@@ -550,7 +631,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     match self.p.ast.pat(*pat) {
                         Pat::Binding { name, mutable, by_ref } => {
                             let (name, mutable, by_ref) = (*name, *mutable, *by_ref);
-                            let lty = if by_ref { self.tys.intern(TyKind::Ref(mutable, ty)) } else { ty };
+                            let lty = if by_ref { self.tys.mk_ref(mutable, ty) } else { ty };
                             let l = self.add_local(name, lty, mutable && !by_ref, *span);
                             let pi = (pat.0 - self.out.pat_base) as usize;
                             self.out.pat_ty[pi] = ty;
@@ -614,7 +695,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Int(_, Some(s)) => int(IntTy::from_suffix(*s)),
             Expr::Int(_, None) => match expected.map(|t| (self.resolve(t), self.kind(t))) {
                 Some((t, TyKind::Int(_))) => t,
-                Some((t, TyKind::Var(_, true))) => t,
+                Some((t, k)) if k.is_int_infer() => t,
                 _ => self.new_var(true),
             },
             Expr::Bool(_) => BOOL,
@@ -681,6 +762,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Match { scrut, arms } => {
                 let st = self.expr(*scrut, None);
+                // ARCH 2.12 run point: a match must know the scrutinee enum.
+                self.obl.run_before_structural();
                 let mut result: Option<Ty> = None;
                 for arm in arms {
                     let scope = self.scopes.len();
@@ -707,8 +790,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Field { base, name } => {
                 let bt = self.expr(*base, None);
+                // ARCH 2.12 run point: a field access must know the base type.
+                self.obl.run_before_structural();
                 let (derefs, inner) = self.autoderef(bt);
-                if let TyKind::Adt(a) = self.kind(inner) {
+                if let Some(a) = self.tys.local_adt(inner) {
                     let adt = p.adt(a);
                     if !adt.is_enum
                         && let Some(i) = adt.variants[0].fields.iter().position(|f| f.name == *name)
@@ -725,15 +810,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Index { base, index } => {
                 let bt = self.expr(*base, None);
+                // ARCH 2.12 run point: an index must know the indexed type; the
+                // index type then follows from the selected `Index` impl.
+                self.obl.run_before_structural();
                 let (derefs, inner) = self.autoderef(bt);
                 self.expect_expr(*index, USIZE);
                 match self.kind(inner) {
-                    TyKind::Vec(elem) => {
+                    _ if self.tys.vec_elem(inner).is_some() => {
                         self.set_res(e, Res::Index { derefs });
-                        elem
+                        self.tys.vec_elem(inner).unwrap()
                     }
                     TyKind::Error => ERROR,
-                    TyKind::String | TyKind::Str => {
+                    _ if self.kind(inner) == TyKind::Str || self.tys.is_string_ty(inner) => {
                         self.err(
                             "L0113",
                             span,
@@ -764,15 +852,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let t = self.expr(*expr, expected);
                 // Rust has `-` and `!` for `&T` (shared references only, not `&mut T`).
                 let (d, inner) = match self.kind(t) {
-                    TyKind::Ref(false, inner) => (1, inner),
+                    TyKind::Ref(_, Mut::Shared, inner) => (1, inner),
                     _ => (0, t),
                 };
                 self.set_res(e, Res::Bin { ld: d, rd: 0 });
                 let k = self.kind(inner);
                 match (op, k) {
                     (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
-                    (UnOp::Neg, TyKind::Var(_, true)) => inner,
-                    (UnOp::Not, TyKind::Bool | TyKind::Int(_) | TyKind::Var(_, true)) => inner,
+                    (UnOp::Neg, k) if k.is_int_infer() => inner,
+                    (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
+                    (UnOp::Not, k) if k.is_int_infer() => inner,
                     (_, TyKind::Error) => ERROR,
                     _ => {
                         let tn = self.tn(t);
@@ -792,7 +881,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let t = self.expr(*expr, None);
                 let ok = match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
-                    (TyKind::Var(_, true), TyKind::Int(_)) => true,
+                    (k, TyKind::Int(_)) if k.is_int_infer() => true,
                     (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
                     (TyKind::Int(IntTy::U8), TyKind::Char) => true,
                     (TyKind::Error, _) | (_, TyKind::Error) => true,
@@ -811,16 +900,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Ref { mutable, expr, .. } => {
                 let inner_expected = expected.and_then(|t| match self.kind(t) {
-                    TyKind::Ref(_, inner) => Some(inner),
+                    TyKind::Ref(_, _, inner) => Some(inner),
                     _ => None,
                 });
                 let t = self.expr(*expr, inner_expected);
-                self.tys.intern(TyKind::Ref(*mutable, t))
+                self.tys.mk_ref(*mutable, t)
             }
             Expr::Deref(inner) => {
                 let t = self.expr(*inner, None);
+                // ARCH 2.12 run point: a deref must know the pointee source type.
+                self.obl.run_before_structural();
                 match self.kind(t) {
-                    TyKind::Ref(_, x) => x,
+                    TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
                     _ => {
                         let tn = self.tn(t);
@@ -845,21 +936,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.place_check(*lhs);
                 let rt = self.expr(*rhs, Some(lt));
                 let lk = self.kind(lt);
-                if lk == TyKind::String && *op == BinOp::Add {
+                if self.tys.is_string_ty(self.resolve(lt)) && *op == BinOp::Add {
                     self.coerce_expr(*rhs, rt, REF_STR);
                     self.set_res(e, Res::Bin { ld: 0, rd: 0 });
                     return UNIT;
                 }
                 let (rd, rinner) = self.peel_one_ref(rt);
                 // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
-                let rmut = matches!(self.kind(rt), TyKind::Ref(true, _));
+                let rmut = matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, _));
+                let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
                 let ok = !rmut
                     && match (*op, lk) {
                         (_, TyKind::Error) => true,
-                        (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
-                            matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
-                        }
-                        (_, TyKind::Int(_) | TyKind::Var(_, true)) => self.unify(lt, rinner),
+                        (BinOp::Shl | BinOp::Shr, k) if int_like(k) => int_like(self.kind(rinner)),
+                        (_, k) if int_like(k) => self.unify(lt, rinner),
                         (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
                         _ => false,
                     };
@@ -995,7 +1085,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn autoderef(&self, t: Ty) -> (u8, Ty) {
         let mut t = self.resolve(t);
         let mut n = 0;
-        while let TyKind::Ref(_, inner) = self.tys.kind(t) {
+        while let TyKind::Ref(_, _, inner) = self.tys.kind(t) {
             t = self.resolve(inner);
             n += 1;
         }
@@ -1003,7 +1093,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
     fn peel_one_ref(&self, t: Ty) -> (u8, Ty) {
         match self.kind(t) {
-            TyKind::Ref(_, inner) => (1, inner),
+            TyKind::Ref(_, _, inner) => (1, inner),
             _ => (0, t),
         }
     }
@@ -1023,8 +1113,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn ref_layers(&self, t: Ty) -> Vec<bool> {
         let mut out = Vec::new();
         let mut t = t;
-        while let TyKind::Ref(m, inner) = self.kind(t) {
-            out.push(m);
+        while let TyKind::Ref(_, m, inner) = self.kind(t) {
+            out.push(m.is_mut());
             t = inner;
         }
         out
@@ -1045,13 +1135,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if name == p.known.None {
                 self.set_res(e, Res::OptNone);
                 let v = self.new_var(false);
-                return self.tys.intern(TyKind::Option(v));
+                return self.tys.mk_option(v);
             }
             if let Some(&a) = p.type_names.get(&name) {
                 let adt = p.adt(a);
                 if !adt.is_enum && adt.variants[0].shape == VariantShape::Unit {
                     self.set_res(e, Res::Variant(a, 0));
-                    return self.tys.intern(TyKind::Adt(a));
+                    return self.tys.adt_ty(a);
                 }
             }
             self.err(
@@ -1067,7 +1157,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Res::Variant(a, v) = r {
                 let variant = &p.adt(a).variants[v as usize];
                 if variant.shape == VariantShape::Unit {
-                    return self.tys.intern(TyKind::Adt(a));
+                    return self.tys.adt_ty(a);
                 }
             }
             return ERROR;
@@ -1193,7 +1283,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ERROR;
             }
             let t = self.expr(args[0], None);
-            return self.tys.intern(TyKind::Option(t));
+            return self.tys.mk_option(t);
         }
         match res {
             Res::Fn(f) => {
@@ -1210,7 +1300,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 let params: Vec<Ty> = variant.fields.iter().map(|f| f.ty).collect();
                 self.check_args(&params, args, span);
-                self.tys.intern(TyKind::Adt(a))
+                self.tys.adt_ty(a)
             }
             Res::Builtin(b) => {
                 let (params, ret): (Vec<Ty>, Ty) = match b {
@@ -1228,7 +1318,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             None => self.new_var(false),
                         };
                         let params = if b == Builtin::VecNew { vec![] } else { vec![USIZE] };
-                        (params, self.tys.intern(TyKind::Vec(elem)))
+                        (params, self.tys.mk_vec(elem))
                     }
                     _ => unreachable!(),
                 };
@@ -1265,10 +1355,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let k = p.known;
         let rt = self.expr(recv, None);
         let rt = self.deep(rt);
+        // ARCH 2.12 run point: a method call must know the receiver type. The
+        // obligation queue runs just before that head is required (ARCH 2.4).
+        self.obl.run_before_structural();
         let (derefs, base) = self.autoderef(rt);
         let bk = self.tys.kind(base);
         // User methods.
-        if let TyKind::Adt(a) = bk
+        if let Some(a) = self.tys.local_adt(base)
             && let Some(&f) = p.methods.get(&(a, name))
         {
             let info = p.fn_info(f);
@@ -1299,7 +1392,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // Peel all but the last reference; the clone copies that reference.
                 let mut cur = self.resolve(rt);
                 for _ in 0..derefs - 1 {
-                    if let TyKind::Ref(_, inner) = self.tys.kind(cur) {
+                    if let TyKind::Ref(_, _, inner) = self.tys.kind(cur) {
                         cur = self.resolve(inner);
                     }
                 }
@@ -1314,8 +1407,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         use Builtin as B;
-        let found: Option<(B, Autoref, Vec<Ty>, Ty)> = match bk {
-            TyKind::String => {
+        // Builtin methods dispatch on the v2 builtin def in the first slot and on
+        // the general kind in the second; user Adts were handled above.
+        let found: Option<(B, Autoref, Vec<Ty>, Ty)> = match (self.tys.builtin_of(base), bk) {
+            (Some(BuiltinTy::String), _) => {
                 if name == k.len {
                     Some((B::StringLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
@@ -1333,7 +1428,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.str_method(name)
                 }
             }
-            TyKind::Str => {
+            (None, TyKind::Str) => {
                 if name == k.len {
                     Some((B::StrLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
@@ -1344,12 +1439,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.str_method(name)
                 }
             }
-            TyKind::Vec(elem) => {
-                let opt_ref = {
-                    let r = self.tys.intern(TyKind::Ref(false, elem));
-                    self.tys.intern(TyKind::Option(r))
-                };
-                let opt = self.tys.intern(TyKind::Option(elem));
+            (Some(BuiltinTy::Vec), _) => {
+                let elem = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
+                // Return types are built only in the arms that return them:
+                // interning has no visible effect, so the common arms skip it.
                 if name == k.len {
                     Some((B::VecLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
@@ -1357,15 +1450,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if name == k.push {
                     Some((B::VecPush, Autoref::RefMut, vec![elem], UNIT))
                 } else if name == k.pop {
+                    let opt = self.tys.mk_option(elem);
                     Some((B::VecPop, Autoref::RefMut, vec![], opt))
                 } else if name == k.get {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecGet, Autoref::Ref, vec![USIZE], opt_ref))
                 } else if name == k.first {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecFirst, Autoref::Ref, vec![], opt_ref))
                 } else if name == k.last {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
                     Some((B::VecLast, Autoref::Ref, vec![], opt_ref))
                 } else if name == k.contains {
-                    let r = self.tys.intern(TyKind::Ref(false, elem));
+                    let r = self.tys.mk_ref(false, elem);
                     Some((B::VecContains, Autoref::Ref, vec![r], BOOL))
                 } else if name == k.swap {
                     Some((B::VecSwap, Autoref::RefMut, vec![USIZE, USIZE], UNIT))
@@ -1381,7 +1481,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
-            TyKind::Option(inner) => {
+            (Some(BuiltinTy::Option), _) => {
+                let inner = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
                 if name == k.is_some {
                     Some((B::OptIsSome, Autoref::Ref, vec![], BOOL))
                 } else if name == k.is_none {
@@ -1396,8 +1497,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
-            TyKind::Chars => {
-                let opt = self.tys.intern(TyKind::Option(CHAR));
+            (Some(BuiltinTy::Chars), _) => {
+                let opt = self.tys.mk_option(CHAR);
                 if name == k.next {
                     Some((B::CharsNext, Autoref::RefMut, vec![], opt))
                 } else if name == k.count {
@@ -1406,7 +1507,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
-            TyKind::Char if name != k.to_string => {
+            (None, TyKind::Char) if name != k.to_string => {
                 let b = [
                     (k.is_ascii_digit, B::CharIsDigit),
                     (k.is_ascii_alphabetic, B::CharIsAlphabetic),
@@ -1422,13 +1523,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if name == k.to_ascii_lowercase {
                     Some((B::CharToLowercase, Autoref::Ref, vec![], CHAR))
                 } else if name == k.to_digit {
-                    let o = self.tys.intern(TyKind::Option(int(IntTy::U32)));
+                    let o = self.tys.mk_option(int(IntTy::U32));
                     Some((B::CharToDigit, Autoref::None, vec![int(IntTy::U32)], o))
                 } else {
                     None
                 }
             }
-            TyKind::Int(i) => {
+            (None, TyKind::Int(i)) => {
                 let t = base;
                 if name == k.wrapping_add {
                     Some((B::WrappingAdd, Autoref::None, vec![t], t))
@@ -1450,13 +1551,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
-            TyKind::Bool | TyKind::Char if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
-            TyKind::Args if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),
+            (None, TyKind::Bool | TyKind::Char) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
+            (Some(BuiltinTy::Args), _) if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),
             // Trait methods work on an integer of unknown type; inherent ones (pow, abs) do not.
-            TyKind::Var(_, true) if name == k.min => Some((B::Min, Autoref::None, vec![base], base)),
-            TyKind::Var(_, true) if name == k.max => Some((B::Max, Autoref::None, vec![base], base)),
-            TyKind::Var(_, true) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
-            TyKind::Var(_, true) => {
+            (None, k2) if k2.is_int_infer() && name == k.min => Some((B::Min, Autoref::None, vec![base], base)),
+            (None, k2) if k2.is_int_infer() && name == k.max => Some((B::Max, Autoref::None, vec![base], base)),
+            (None, k2) if k2.is_int_infer() && name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
+            (None, k2) if k2.is_int_infer() => {
                 self.err(
                     "L0111",
                     name_span,
@@ -1465,7 +1566,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
                 return ERROR;
             }
-            TyKind::Error => return ERROR,
+            (_, TyKind::Error) => return ERROR,
             _ => None,
         };
         match found {
@@ -1495,18 +1596,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn mixed_string_eq(&self, a: Ty, b: Ty) -> Option<(u8, u8)> {
         let (ld, lb) = self.autoderef(a);
         let (rd, rb) = self.autoderef(b);
-        let (lk, rk) = (self.tys.kind(lb), self.tys.kind(rb));
-        if lk == rk || !matches!(lk, TyKind::String | TyKind::Str) || !matches!(rk, TyKind::String | TyKind::Str) {
+        let stringy = |t: Ty| self.tys.kind(t) == TyKind::Str || self.tys.is_string_ty(t);
+        if lb == rb || !stringy(lb) || !stringy(rb) {
             return None;
         }
-        string_eq_ok(ld, lk, rd, rk).then_some((ld, rd))
+        string_eq_ok(ld, self.tys.is_string_ty(lb), rd, self.tys.is_string_ty(rb)).then_some((ld, rd))
     }
 
     /// Methods shared by `str` and `String` (through Deref). The receiver is always `&self`.
     fn str_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
         let k = self.p.known;
-        let chars = self.tys.intern(TyKind::Chars);
+        let chars = CHARS;
         let table = [
             (k.contains, B::StrContains, vec![REF_STR], BOOL),
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),
@@ -1528,6 +1629,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let lt = self.expr(lhs, None);
         let rt = self.expr(rhs, Some(lt));
+        // ARCH 2.12 run point: an operator on a non-scalar must know the left
+        // operand type. The scalar path above and below needs no trait search.
+        self.obl.run_before_structural();
         let (lk, rk) = (self.kind(lt), self.kind(rt));
         if lk == TyKind::Error || rk == TyKind::Error {
             return if op.is_cmp() { BOOL } else { ERROR };
@@ -1546,10 +1650,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // String equality across String and &str.
             let (ld, lb) = self.autoderef(lt);
             let (rd, rb) = self.autoderef(rt);
-            let (lbk, rbk) = (self.tys.kind(lb), self.tys.kind(rb));
-            let stringy = |k: TyKind| matches!(k, TyKind::String | TyKind::Str);
-            if stringy(lbk) && stringy(rbk) && matches!(op, Eq | Ne) {
-                if !string_eq_ok(ld, lbk, rd, rbk) {
+            let stringy = |t: Ty| self.tys.kind(t) == TyKind::Str || self.tys.is_string_ty(t);
+            if stringy(lb) && stringy(rb) && matches!(op, Eq | Ne) {
+                if !string_eq_ok(ld, self.tys.is_string_ty(lb), rd, self.tys.is_string_ty(rb)) {
                     return bad(self);
                 }
                 self.set_res(e, Res::Bin { ld, rd });
@@ -1564,8 +1667,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             let lb = self.deep(lb);
             let ok = match self.tys.kind(lb) {
-                TyKind::Int(_) | TyKind::Var(_, true) | TyKind::Bool | TyKind::Char => true,
-                TyKind::String | TyKind::Str => true,
+                TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
+                k if k.is_int_infer() || self.tys.is_string_ty(lb) => true,
                 _ if matches!(op, Eq | Ne) => has_eq(self.p, &self.tys, lb),
                 _ => false,
             };
@@ -1582,19 +1685,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return BOOL;
         }
         // String + &str.
-        if op == Add && lk == TyKind::String {
+        if op == Add && self.tys.is_string_ty(self.resolve(lt)) {
             self.coerce_expr(rhs, rt, REF_STR);
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
             return STRING;
         }
         // Arithmetic and bit operations exist for `&T` operands, but not for `&mut T`.
-        if matches!(lk, TyKind::Ref(true, _)) || matches!(rk, TyKind::Ref(true, _)) {
+        if matches!(lk, TyKind::Ref(_, Mut::Mut, _)) || matches!(rk, TyKind::Ref(_, Mut::Mut, _)) {
             return bad(self);
         }
         let (ld, li) = self.peel_one_ref(lt);
         let (rd, ri) = self.peel_one_ref(rt);
         let (lik, rik) = (self.kind(li), self.kind(ri));
-        let int_like = |k: TyKind| matches!(k, TyKind::Int(_) | TyKind::Var(_, true));
+        let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
         let result = match op {
             Shl | Shr if int_like(lik) && int_like(rik) => li,
             BitAnd | BitOr | BitXor if lik == TyKind::Bool && rik == TyKind::Bool => BOOL,
@@ -1661,7 +1764,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Set every field. Struct update syntax is not supported yet.",
             );
         }
-        self.tys.intern(TyKind::Adt(a))
+        self.tys.adt_ty(a)
     }
 
     fn for_iter(&mut self, iter: ExprId) -> Ty {
@@ -1674,7 +1777,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             };
             let lt = self.expr(lo, None);
             let ht = self.expr(hi, Some(lt));
-            let ok = matches!(self.kind(lt), TyKind::Int(_) | TyKind::Var(_, true)) && self.unify(lt, ht);
+            let ok = (matches!(self.kind(lt), TyKind::Int(_)) || self.kind(lt).is_int_infer()) && self.unify(lt, ht);
             if !ok {
                 let s = self.span(iter);
                 let (a, b) = (self.tn(lt), self.tn(ht));
@@ -1690,17 +1793,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let t = self.expr(iter, None);
         match self.kind(t) {
-            TyKind::Chars => CHAR,
-            TyKind::Ref(m, inner) => match self.kind(inner) {
-                TyKind::Vec(elem) => self.tys.intern(TyKind::Ref(m, elem)),
-                _ => {
+            _ if self.tys.is_chars_ty(self.resolve(t)) => CHAR,
+            TyKind::Ref(r, m, inner) => match self.tys.vec_elem(self.resolve(inner)) {
+                Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),
+                None => {
                     let s = self.span(iter);
                     let tn = self.tn(t);
                     self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
                     ERROR
                 }
             },
-            TyKind::Vec(_) => {
+            _ if self.tys.vec_elem(self.resolve(t)).is_some() => {
                 let s = self.span(iter);
                 self.errs.push(unsupported(s, "iterating a Vec by value"));
                 ERROR
@@ -1734,16 +1837,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let result = match kind {
             MacroKind::Vec => {
-                let elem_expected = expected.and_then(|t| match self.kind(t) {
-                    TyKind::Vec(e) => Some(e),
-                    _ => None,
-                });
+                let elem_expected = expected.and_then(|t| self.tys.vec_elem(self.resolve(t)));
                 let elem = elem_expected.unwrap_or_else(|| self.new_var(false));
                 if repeat {
                     self.expect_expr(args[0], elem);
                     self.expect_expr(args[1], USIZE);
                     let elem = self.deep(elem);
-                    if !has_clone(self.p, &self.tys, elem) && !matches!(self.kind(elem), TyKind::Var(..)) {
+                    if !has_clone(self.p, &self.tys, elem) && !matches!(self.kind(elem), TyKind::Infer(_)) {
                         let tn = self.tn(elem);
                         self.err(
                             "L0112",
@@ -1757,7 +1857,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.expect_expr(a, elem);
                     }
                 }
-                return self.tys.intern(TyKind::Vec(elem));
+                return self.tys.mk_vec(elem);
             }
             MacroKind::Assert => {
                 if let Some(&c) = args.first() {
@@ -1801,11 +1901,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let a = args[*index];
                 let t = self.expr(a, None);
                 let t = self.deep(t);
-                let ok = if *debug {
-                    has_debug(self.p, &self.tys, t)
-                } else {
-                    has_display(&self.tys, t) || matches!(self.kind(t), TyKind::Var(_, true))
-                };
+                let ok = if *debug { has_debug(self.p, &self.tys, t) } else { has_display(&self.tys, t) || self.kind(t).is_int_infer() };
                 if !ok {
                     let tn = self.tn(t);
                     let (what, fix) = if *debug {
@@ -1846,7 +1942,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             || matches!(p.ast.pat(pat), Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(_) | Pat::Lit(_) | Pat::Range { .. });
         if structural {
             let mut derefs = 0;
-            while let TyKind::Ref(m, inner) = self.tys.kind(t) {
+            while let TyKind::Ref(_, m, inner) = self.tys.kind(t) {
                 // A string literal pattern matches `&str` directly.
                 if matches!(p.ast.pat(pat), Pat::Lit(l) if matches!(p.ast.expr(*l), Expr::Str(_))) && self.kind(inner) == TyKind::Str {
                     break;
@@ -1854,7 +1950,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 derefs += 1;
                 mode = match mode {
                     BindMode::Ref(false) => BindMode::Ref(false),
-                    _ => BindMode::Ref(m),
+                    _ => BindMode::Ref(m.is_mut()),
                 };
                 t = self.resolve(inner);
             }
@@ -1863,7 +1959,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.out.pat_ty[pi] = t;
         if let Some(is_some) = opt {
             let inner = self.new_var(false);
-            let ot = self.tys.intern(TyKind::Option(inner));
+            let ot = self.tys.mk_option(inner);
             if !self.unify(ot, t) {
                 self.mismatch(span, t, ot);
                 return;
@@ -1880,7 +1976,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let mode = if *by_ref { BindMode::Ref(*mutable) } else { mode };
                 let lty = match mode {
                     BindMode::Move => t,
-                    BindMode::Ref(m) => self.tys.intern(TyKind::Ref(m, t)),
+                    BindMode::Ref(m) => self.tys.mk_ref(m, t),
                 };
                 let mutable_local = *mutable && !*by_ref;
                 if mutable_local && mode != BindMode::Move {
@@ -1925,7 +2021,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     );
                 }
                 if bound_tys.iter().any(|&(_, bt)| !self.unify(bt, t))
-                    || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true))
+                    || !(matches!(self.kind(t), TyKind::Int(_) | TyKind::Char) || self.kind(t).is_int_infer())
                 {
                     self.err(
                         "L0110",
@@ -1954,7 +2050,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0102", span, "unknown struct or variant in pattern", "Check the name.");
                     return;
                 };
-                let adt_ty = self.tys.intern(TyKind::Adt(a));
+                let adt_ty = self.tys.adt_ty(a);
                 if !self.unify(adt_ty, t) {
                     self.mismatch(span, t, adt_ty);
                     return;
@@ -2058,8 +2154,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         let (_, base) = self.autoderef(scrut_ty);
-        let msg = match self.kind(base) {
-            TyKind::Adt(a) if p.adt(a).is_enum => {
+        let msg = match self.tys.local_adt(base) {
+            Some(a) if p.adt(a).is_enum => {
                 let mut flat = Vec::new();
                 pats.iter().for_each(|&x| self.flatten_or(x, &mut flat));
                 let missing: Vec<String> = (0..p.adt(a).variants.len())
@@ -2072,7 +2168,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     format!("non-exhaustive match: missing {}", missing.join(", "))
                 }
             }
-            TyKind::Error => return,
+            _ if self.kind(base) == TyKind::Error => return,
             _ => "non-exhaustive match".to_string(),
         };
         self.err("L0115", span, msg, "Add arms for the missing cases, or add a `_ => ...` arm.");
@@ -2206,6 +2302,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     fn finish(&mut self) {
+        // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
+        // Anything left there is an annotation error, never a silent default.
+        self.obl.run_at_body_end();
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
@@ -2254,7 +2353,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn has_error_kind(&self, t: Ty) -> bool {
         match self.kind(t) {
             TyKind::Error => true,
-            TyKind::Vec(e) | TyKind::Option(e) | TyKind::Ref(_, e) => self.has_error_kind(e),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_error_kind(e),
+            TyKind::Adt(_, a) => (0..self.tys.args(a).len()).any(|i| match self.tys.args(a)[i].as_ty() {
+                Some(e) => self.has_error_kind(e),
+                None => false,
+            }),
+            TyKind::Tuple(ts) => {
+                let n = self.tys.tys_of(ts).len();
+                (0..n).any(|i| {
+                    let e = self.tys.tys_of(ts)[i];
+                    self.has_error_kind(e)
+                })
+            }
             _ => false,
         }
     }

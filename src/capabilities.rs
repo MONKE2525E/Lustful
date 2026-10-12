@@ -213,22 +213,31 @@ fn item_kind_label(k: &ItemKind) -> &'static str {
 
 #[allow(dead_code)]
 fn ty_kind_label(k: &TyKind) -> &'static str {
+    // String, Vec<T>, Option<T>, std::env::Args, and str::Chars are Adt types with
+    // builtin defs since S3a; the capability lists below still name them on their own.
     match k {
         TyKind::Error => "error placeholder",
         TyKind::Unit => "()",
         TyKind::Bool => "bool",
         TyKind::Char => "char",
         TyKind::Str => "str",
-        TyKind::String => "String",
         TyKind::Never => "!",
         TyKind::Int(_) => "integers",
-        TyKind::Vec(_) => "Vec<T>",
-        TyKind::Option(_) => "Option<T>",
+        TyKind::Float(_) => "floats (representation only)",
         TyKind::Ref(..) => "&T and &mut T",
-        TyKind::Adt(_) => "user structs and enums",
-        TyKind::Args => "std::env::Args",
-        TyKind::Chars => "str::Chars",
-        TyKind::Var(..) => "inference variable",
+        TyKind::RawPtr(..) => "raw pointers (representation only)",
+        TyKind::Slice(_) => "slices (representation only)",
+        TyKind::Array(..) => "arrays (representation only)",
+        TyKind::Tuple(_) => "tuples (representation only)",
+        TyKind::Adt(..) => "String, Vec<T>, Option<T>, std::env::Args, str::Chars, user structs and enums",
+        TyKind::FnPtr(_) => "fn pointers (representation only)",
+        TyKind::FnDef(..) => "fn items (representation only)",
+        TyKind::Closure(..) => "closures (representation only)",
+        TyKind::Dyn(..) => "dyn Trait (representation only)",
+        TyKind::Opaque(..) => "impl Trait (representation only)",
+        TyKind::Param(_) => "generic parameters (representation only)",
+        TyKind::Projection(..) => "associated types (representation only)",
+        TyKind::Infer(_) => "inference variable",
     }
 }
 
@@ -476,7 +485,8 @@ pub fn run(args: &[String]) -> i32 {
     };
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let int_types: Vec<String> = IntTy::ALL.iter().map(|t| t.name().to_string()).collect();
+    // Supported types only: `IntTy::ALL` also carries the representation-only 128-bit forms.
+    let int_types: Vec<String> = IntTy::ALL_SUPPORTED.iter().map(|t| t.name().to_string()).collect();
     let macros: Vec<String> = ALL_MACROS.iter().map(|&m| format!("{}!", interner.get(macro_name(m, &known)))).collect();
     let attributes: Vec<String> =
         [known.derive, known.test, known.allow, known.warn, known.deny].iter().map(|&s| interner.get(s).to_string()).collect();
