@@ -6,7 +6,7 @@ pub mod obligations;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
-use crate::diag::{Diag, Span, not_yet, unsupported};
+use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
 use crate::ty::defs::{DefKind as DefsKind, ROOT_MODULE};
@@ -233,7 +233,10 @@ struct Ctx<'p, 'a> {
     tys: Tys<'p>,
     vars: Vec<Var>,
     out: Checked<'p>,
-    scopes: Vec<(Sym, u32)>,
+    /// Locals by (name, hygiene context): a local a macro introduces does
+    /// not bind a caller ident of the same name, and an ident the caller
+    /// passes in keeps the caller's context (ARCH 6.3).
+    scopes: Vec<((Sym, CtxtId), u32)>,
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
@@ -400,11 +403,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn add_local(&mut self, name: Sym, ty: Ty, mutable: bool, span: Span) -> u32 {
         let l = self.out.locals.len() as u32;
         self.out.locals.push(LocalInfo { name, ty, mutable, span });
-        self.scopes.push((name, l));
+        // `span` must be the binding name's own span: its context is the
+        // hygiene key. Callers pass the pattern or parameter name span.
+        self.scopes.push(((name, span.ctxt), l));
         l
     }
-    fn lookup(&self, name: Sym) -> Option<u32> {
-        self.scopes.iter().rev().find(|(n, _)| *n == name).map(|&(_, l)| l)
+    fn lookup(&self, name: Sym, ctxt: CtxtId) -> Option<u32> {
+        self.scopes.iter().rev().find(|(n, _)| *n == (name, ctxt)).map(|&(_, l)| l)
     }
 
     // Cross-item reads go through the section 8.2 query functions on
@@ -720,7 +725,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut diverges = false;
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { pat, ty, init, span, .. } => {
+                Stmt::Let { pat, ty, init, .. } => {
                     let declared = ty.map(|t| self.resolve_written(t));
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {
@@ -745,7 +750,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         Pat::Binding { name, mutable, by_ref } => {
                             let (name, mutable, by_ref) = (*name, *mutable, *by_ref);
                             let lty = if by_ref { self.tys.mk_ref(mutable, ty) } else { ty };
-                            let l = self.add_local(name, lty, mutable && !by_ref, *span);
+                            // The binding's hygiene key is the pattern name's
+                            // own context, not the `let` keyword's (ARCH 6.3).
+                            let l = self.add_local(name, lty, mutable && !by_ref, self.p.ast.pat_span(*pat));
                             let pi = (pat.0 - self.out.pat_base) as usize;
                             self.out.pat_ty[pi] = ty;
                             let mode = if by_ref { BindMode::Ref(mutable) } else { BindMode::Move };
@@ -850,7 +857,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Char(_) => CHAR,
             Expr::Str(_) => REF_STR,
             Expr::Unit => UNIT,
-            Expr::SelfValue => match self.lookup(p.known.self_value) {
+            Expr::SelfValue => match self.lookup(p.known.self_value, span.ctxt) {
                 Some(l) => {
                     self.set_res(e, Res::Local(l));
                     self.out.locals[l as usize].ty
@@ -1439,7 +1446,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         if segs.len() == 1 {
             let name = segs[0].name;
-            if let Some(l) = self.lookup(name) {
+            if let Some(l) = self.lookup(name, span.ctxt) {
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }
@@ -1644,7 +1651,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
-                if self.lookup(name).is_some() {
+                if self.lookup(name, self.span(callee).ctxt).is_some() {
                     self.err("L0114", span, "this value is not a function", "Closures are not supported yet. Call a named function.");
                     return ERROR;
                 }
