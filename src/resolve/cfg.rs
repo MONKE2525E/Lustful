@@ -65,6 +65,15 @@ pub struct CfgEnv {
 }
 
 impl CfgEnv {
+    /// This environment with another unit's feature set: the target,
+    /// profile, and test facts of a workspace session are shared by all
+    /// its crates (ARCH 1.8); only per-unit features differ.
+    pub fn with_features(&self, features: &[String]) -> CfgEnv {
+        let mut env = self.clone();
+        env.features = features.iter().cloned().collect();
+        env
+    }
+
     /// The environment for one target triple (empty means the host), one
     /// per-unit feature set, the test-crate flag, and the profile. Tier 1
     /// targets and `wasm32-wasip1` (classification only) are in the table;

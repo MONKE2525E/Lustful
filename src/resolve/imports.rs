@@ -113,21 +113,30 @@ pub struct DefInfo {
     pub vis: VisKind,
 }
 
-/// One module of the crate's module tree.
+/// One module of a crate's module tree. One `ResolvedTables` holds the
+/// trees of every crate in the workspace session (ARCH 1.8): each crate
+/// is a detached subtree whose root has no parent, and `path` is the
+/// name path inside that crate.
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
     pub parent: Option<ModuleId>,
-    /// The module's own name (the crate name for the root).
+    /// The module's own name (the crate name for a crate root).
     pub name: Sym,
-    /// Names from the crate root to this module (empty for the root).
+    /// Names from the crate root to this module (empty for a root).
     pub path: Vec<Sym>,
     pub vis: VisKind,
     pub span: Span,
     /// `#[no_implicit_prelude]` applies (inherited from the parent too).
     pub no_prelude: bool,
+    /// The crate root module of the crate this module belongs to.
+    pub krate_root: ModuleId,
+    /// True when the `mod` declaration carried `#[macro_use]`.
+    pub macro_use: bool,
 }
 
-/// One extern crate in the extern prelude.
+/// One extern crate in one crate's extern prelude. The prelude is per
+/// crate: two crates in one session can name different dependency
+/// crates with the same extern name, so every entry carries its owner.
 #[derive(Clone, Debug)]
 pub struct ExternInfo {
     /// The name paths use (`std`, `core`, a renamed dependency).
@@ -136,6 +145,17 @@ pub struct ExternInfo {
     /// True for `std`, `core`, and `alloc`: paths rooted there keep the
     /// std compat handling in collect and check.
     pub is_std_lib: bool,
+    /// The crate root module this entry belongs to (the dependent crate).
+    pub owner: ModuleId,
+    /// For a dependency lust compiles from source in this session: the
+    /// dependency crate's root module in these tables. Paths then walk
+    /// its real bindings with normal visibility. None for std libs and
+    /// for unsupported dependencies.
+    pub root_module: Option<ModuleId>,
+    /// For a dependency with no lust source, adapter, or shim crate
+    /// yet: the reason (it names the crate), reported as L0508 where
+    /// the dependency is used. None when the crate is usable.
+    pub unsupported: Option<String>,
 }
 
 /// The resolved binding tables of one crate: the swap-in implementation
@@ -162,10 +182,19 @@ pub struct ResolvedTables {
     pub flat: [FxMap<Sym, DefId>; 3],
     /// The defining module of each flattened fn, in LocalDefId order.
     pub fn_module: Vec<ModuleId>,
+    /// Crate roots by their `$crate` magic segment name. A macro defined
+    /// in one crate and expanded in another has its `$crate` rewritten
+    /// to a magic first segment (`$lust$crate$<hex>`, not a legal Rust
+    /// identifier, so source text can never write it) that resolves to
+    /// the defining crate's root even when it is not a direct dependency
+    /// of the expanding crate.
+    pub crate_magic: FxMap<Sym, ModuleId>,
 }
 
 impl ResolvedTables {
-    /// An empty table set with only the root module.
+    /// An empty table set with only the first crate's root module (id
+    /// 0, the selected crate; dependency crates join with
+    /// `add_crate_root`).
     pub fn new(crate_name: Sym) -> ResolvedTables {
         ResolvedTables {
             modules: vec![ModuleInfo {
@@ -175,6 +204,8 @@ impl ResolvedTables {
                 vis: VisKind::Pub,
                 span: Span::default(),
                 no_prelude: false,
+                krate_root: ModuleId(0),
+                macro_use: false,
             }],
             maps: vec![Default::default()],
             externs: Vec::new(),
@@ -185,7 +216,32 @@ impl ResolvedTables {
             module_defs: vec![DefId::PLACEHOLDER],
             flat: Default::default(),
             fn_module: Vec::new(),
+            crate_magic: FxMap::default(),
         }
+    }
+
+    /// Adds a detached crate root module for one more crate in the
+    /// workspace session and returns its id.
+    pub fn add_crate_root(&mut self, name: Sym) -> ModuleId {
+        let id = ModuleId(self.modules.len() as u32);
+        self.modules.push(ModuleInfo {
+            parent: None,
+            name,
+            path: Vec::new(),
+            vis: VisKind::Pub,
+            span: Span::default(),
+            no_prelude: false,
+            krate_root: id,
+            macro_use: false,
+        });
+        self.maps.push(Default::default());
+        self.module_defs.push(DefId::PLACEHOLDER);
+        id
+    }
+
+    /// The crate root module of the crate `m` belongs to.
+    pub fn root_of(&self, m: ModuleId) -> ModuleId {
+        self.modules[m.0 as usize].krate_root
     }
 
     /// Adds a module under a parent and returns its id.
@@ -193,16 +249,23 @@ impl ResolvedTables {
         let mut path = self.modules[parent.0 as usize].path.clone();
         path.push(name);
         let no_prelude = self.modules[parent.0 as usize].no_prelude;
+        let krate_root = self.modules[parent.0 as usize].krate_root;
         let id = ModuleId(self.modules.len() as u32);
-        self.modules.push(ModuleInfo { parent: Some(parent), name, path, vis, span, no_prelude });
+        self.modules.push(ModuleInfo { parent: Some(parent), name, path, vis, span, no_prelude, krate_root, macro_use: false });
         self.maps.push(Default::default());
         self.module_defs.push(DefId::PLACEHOLDER);
         id
     }
 
-    /// The module at a name path from the crate root, if it exists.
+    /// The module at a name path from a crate root, if it exists.
+    pub fn module_by_path_in(&self, root: ModuleId, path: &[Sym]) -> Option<ModuleId> {
+        self.modules.iter().position(|m| m.krate_root == root && m.path == path).map(|i| ModuleId(i as u32))
+    }
+
+    /// The module at a name path from the first crate's root, if it
+    /// exists. Kept for single-crate callers.
     pub fn module_by_path(&self, path: &[Sym]) -> Option<ModuleId> {
-        self.modules.iter().position(|m| m.path == path).map(|i| ModuleId(i as u32))
+        self.module_by_path_in(ModuleId(0), path)
     }
 
     /// True when `m` is `anc` or a descendant of it.
@@ -221,7 +284,8 @@ impl ResolvedTables {
     /// a binding with visibility `vis` defined in `def_module`?
     pub fn visible(&self, vis: &VisKind, def_module: ModuleId, from: ModuleId, interner: &Interner) -> bool {
         match vis {
-            VisKind::Pub | VisKind::Crate => true,
+            VisKind::Pub => true,
+            VisKind::Crate => self.root_of(from) == self.root_of(def_module),
             VisKind::Priv => self.is_within(from, def_module),
             VisKind::Super => match self.modules[def_module.0 as usize].parent {
                 Some(p) => self.is_within(from, p),
@@ -261,7 +325,7 @@ impl ResolvedTables {
             _ => (self.modules[def_module.0 as usize].path.clone(), path),
         };
         base_path.extend_from_slice(rest);
-        self.module_by_path(&base_path)
+        self.module_by_path_in(self.root_of(def_module), &base_path)
     }
 
     /// Inserts a binding, applying the priority rules. Returns `Changed`
@@ -440,9 +504,21 @@ pub fn in_std_prelude(name: &str, ns: Namespace) -> bool {
 }
 
 impl ResolvedTables {
-    /// The extern prelude index of a crate name, if it is one.
-    pub fn extern_by_name(&self, name: &str) -> Option<u32> {
-        self.externs.iter().position(|e| e.name == name).map(|i| i as u32)
+    /// The extern prelude index of a crate name in the prelude of the
+    /// crate `from` belongs to, if it is one there.
+    pub fn extern_by_name(&self, from: ModuleId, name: &str) -> Option<u32> {
+        let owner = self.root_of(from);
+        self.externs.iter().position(|e| e.owner == owner && e.name == name).map(|i| i as u32)
+    }
+
+    /// The path target an extern prelude entry resolves to: the
+    /// dependency crate's root module when lust compiles it from
+    /// source in this session, else the extern root itself.
+    pub fn extern_target(&self, i: u32) -> Target {
+        match self.externs[i as usize].root_module {
+            Some(m) => Target::Module(m),
+            None => Target::Extern(i),
+        }
     }
 
     /// Looks up one first segment and checks visibility from `from`.
@@ -467,8 +543,8 @@ impl ResolvedTables {
             }
         }
         let name_str = interner.get(name);
-        if let Some(i) = self.extern_by_name(name_str) {
-            return PathRes::Done(Target::Extern(i));
+        if let Some(i) = self.extern_by_name(from, name_str) {
+            return PathRes::Done(self.extern_target(i));
         }
         if !self.modules[from.0 as usize].no_prelude && in_std_prelude(name_str, ns) {
             return PathRes::Prelude;
@@ -519,15 +595,20 @@ impl ResolvedTables {
         }
         let mut idx = 0usize;
         let cur: Target;
-        if leading_colon {
+        if let Some(&root) = self.crate_magic.get(&segs[0]) {
+            // A `$crate` magic segment from a cross-crate macro
+            // expansion: the defining crate's root, direct dep or not.
+            cur = Target::Module(root);
+            idx = 1;
+        } else if leading_colon {
             // `::dep::...`: extern prelude only.
-            match self.extern_by_name(interner.get(segs[0])) {
-                Some(i) => cur = Target::Extern(i),
+            match self.extern_by_name(from, interner.get(segs[0])) {
+                Some(i) => cur = self.extern_target(i),
                 None => return PathRes::Absent,
             }
             idx = 1;
         } else if segs[0] == crate_sym {
-            cur = Target::Module(crate::ty::defs::ROOT_MODULE);
+            cur = Target::Module(self.root_of(from));
             idx = 1;
         } else if segs[0] == self_sym {
             cur = Target::Module(from);
@@ -803,7 +884,12 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         // without error at the end.
                         TryOut::Stay { changed, resolved: true }
                     }
-                    PathRes::Done(Target::Extern(_)) => TryOut::Done(false),
+                    PathRes::Done(Target::Extern(i)) => {
+                        if let Some(why) = &tables.externs[i as usize].unsupported {
+                            diags.push(unsupported_diag(why, imp.span));
+                        }
+                        TryOut::Done(false)
+                    }
                     PathRes::Private => {
                         diags.push(private_diag("that module", imp.span));
                         TryOut::Done(false)
@@ -895,14 +981,17 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     TryOut::Done(changed)
                 }
                 PathRes::Done(Target::Extern(i)) => {
-                    // `use dep::Name`: no cross-crate item table exists
-                    // yet. The only answer that keeps rule zero is to
-                    // bind nothing and let the path stay written: a
-                    // `std` path goes through std compat, a real dep
-                    // item path rejects at its use site (L0505 from the
-                    // rewrite pass). A bare renamed import with no use
-                    // is accepted by rustc, so no error here.
-                    let _ = i;
+                    // `use dep::Name` where the path did not enter a
+                    // source dependency's module tree: a `std` path goes
+                    // through std compat and binds nothing here. An
+                    // unsupported dependency (adapter, shim, or other
+                    // crate with no lust form yet) rejects at the import
+                    // with L0508 naming the crate, since its item names
+                    // are unknown and a later plain use could not be
+                    // told from a typo.
+                    if let Some(why) = &tables.externs[i as usize].unsupported {
+                        diags.push(unsupported_diag(why, imp.span));
+                    }
                     TryOut::Done(false)
                 }
                 PathRes::Done(_) => TryOut::Wait,
@@ -939,6 +1028,12 @@ fn report_dup(out: InsertOut, imp: &Import, name: Sym, interner: &Interner, diag
             "Rename one of the imports with `as`, or remove one.",
         ));
     }
+}
+
+/// The L0508 diagnostic for a use of a dependency crate that has no
+/// lust source, adapter, or shim form yet. `why` names the crate.
+pub fn unsupported_diag(why: &str, span: Span) -> Diag {
+    Diag::new("L0508", span, why.to_string(), "Build this crate with Cargo, or remove the dependency from the lust dev build.")
 }
 
 /// The L0510 diagnostic for a name that exists but is not visible. The

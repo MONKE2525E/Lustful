@@ -1039,7 +1039,7 @@ fn resolved_setup(
             local: def::LOCAL_CRATE,
             stable: def::stable_crate_hash(&unit.package_id, &key.krate.target_kind, &unit.target.name, key.krate.test),
         };
-        (unit.target.src_path.clone(), root_text, ids, env, unit.externs.clone(), unit.package.name.replace('-', "_"))
+        (unit.target.src_path.clone(), root_text, ids, env, unit.deps.clone(), unit.package.name.replace('-', "_"))
     } else {
         let stem = key.krate.root.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string();
         let env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
@@ -1063,7 +1063,7 @@ fn resolved_setup(
             env: env.clone(),
             crate_ids,
             crate_name: crate_name.clone(),
-            externs: externs.clone(),
+            deps: externs.clone(),
         };
         match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {

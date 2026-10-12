@@ -1,0 +1,5 @@
+# Both reject: a private and a pub(crate) item of a dependency crate
+# are not visible in the dependent crate (ARCH 1.5 across crates).
+[workspace]
+members = ["base", "app"]
+resolver = "2"

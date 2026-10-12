@@ -1,0 +1,5 @@
+# Valid Rust lust rejects: a path dependency lust would compile
+# from source must be edition 2024 (ARCH 1.1).
+[workspace]
+members = ["base", "app"]
+resolver = "2"

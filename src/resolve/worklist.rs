@@ -31,17 +31,37 @@ use crate::ty::defs::{ModuleId, ROOT_MODULE};
 use crate::{lexer, parser, scan};
 use std::path::PathBuf;
 
-/// One crate to resolve: its root file and text (with any std splice
-/// already appended by the driver), its cfg environment, its stable
-/// identity, and its extern prelude from the Cargo graph.
+/// The selected crate to resolve: its root file and text (with any std
+/// splice already appended by the driver), its cfg environment, its
+/// stable identity, and its dependency tree from the Cargo graph.
+/// Dependency crates lust compiles from source resolve in the same
+/// workspace session (ARCH 1.8): one shared interner and one shared
+/// binding table set, one detached module subtree per crate, so
+/// `dep::Item` paths and cross-crate visibility use the same code as
+/// same-crate paths.
 pub struct CrateInput {
     pub root_path: PathBuf,
     pub root_text: String,
     pub env: CfgEnv,
     pub crate_ids: CrateIds,
     pub crate_name: String,
-    /// (extern name, package id string, lib root file) per dependency.
-    pub externs: Vec<(String, String, PathBuf)>,
+    /// The selected crate's direct dependency lib units, recursively.
+    pub deps: Vec<super::cargo::DepUnit>,
+}
+
+/// One crate's own resolve inputs inside a workspace session (the
+/// selected crate or one source dependency).
+struct OneInput {
+    root_path: PathBuf,
+    root_text: String,
+    env: CfgEnv,
+    /// The merged program's ids: every crate in the session computes
+    /// def hashes with the selected crate's stable hash over flat
+    /// names that carry a per-crate prefix, which is what collect
+    /// recomputes on the merged AST. Slots are per final bin (1.7),
+    /// so one identity space per merged program is consistent.
+    crate_ids: CrateIds,
+    crate_name: String,
 }
 
 /// The resolved crate the driver compiles: the merged Ast, the source
@@ -453,13 +473,155 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     all.into_iter().map(|r| r.unwrap()).collect()
 }
 
+/// Workspace-session shared state: session-global file ids and the
+/// file text cache (one file text per canonical path, as section 1.2
+/// requires; defs stay per (crate, module)).
+#[derive(Default)]
+struct SharedFiles {
+    next_file: u32,
+    file_ids: FxMap<String, FileId>,
+    text_by_path: FxMap<String, String>,
+}
+
+impl SharedFiles {
+    /// The session-global FileId of one (file, module) pair.
+    fn file_id(&mut self, path: &std::path::Path, module: ModuleId) -> FileId {
+        let canon = modules::canonical_string(path);
+        let next = &mut self.next_file;
+        *self.file_ids.entry(format!("{canon}#{}", module.0)).or_insert_with(|| {
+            let id = FileId(*next);
+            *next += 1;
+            id
+        })
+    }
+}
+
+/// One `macro_rules!` definition in token form, for cross-file and
+/// cross-crate macro visibility: the definition's flat tokens and the
+/// string table they index into, plus the defining crate's `$crate`
+/// magic segment so expansion in another crate can rewrite it.
+#[derive(Clone)]
+struct OwnedMacroSource {
+    name: Sym,
+    tokens: Vec<crate::lexer::Token>,
+    strings: Vec<String>,
+    magic: Sym,
+}
+
+/// One crate of a workspace session, ready to resolve.
+struct CrateJob {
+    input: OneInput,
+    root_module: ModuleId,
+    flat_prefix: String,
+    magic: Sym,
+    /// Direct dependencies: (extern name, source job index or the
+    /// L0508 reason when the dependency has no lust form yet).
+    deps: Vec<(String, Result<usize, String>)>,
+}
+
+/// What one resolved crate contributes to the merged program.
+struct CrateOut {
+    ast: Ast,
+    fn_lines: Vec<u32>,
+    body_hashes: Vec<u64>,
+    fn_module: Vec<ModuleId>,
+    structure_hash: u64,
+    seen: Vec<(PathBuf, String, FileId)>,
+    needs_std: bool,
+    exported_macros: Vec<OwnedMacroSource>,
+}
+
+/// One crate's failed resolution inside a session.
+struct OneError {
+    diags: Vec<Diag>,
+    seen: Vec<(PathBuf, String, FileId)>,
+    needs_std: bool,
+}
+
+/// Adapter crates and the upstream version each lust adapter matches
+/// (ARCH 3.6). An empty version means the table pins none yet.
+const ADAPTER_VERSIONS: &[(&str, &str)] = &[
+    ("indexmap", "2.14.0"),
+    ("smallvec", "1.15.1"),
+    ("rustc-hash", "2.1.2"),
+    ("memchr", ""),
+    ("bumpalo", ""),
+    ("xxhash-rust", ""),
+    ("ryu-js", ""),
+    ("num-bigint", ""),
+];
+
+/// Shim crates (ARCH 3.7): rustc-built, with a lust source API crate
+/// in front once one exists.
+const SHIM_CRATES: &[&str] = &["rustix", "nix", "signal-hook", "flate2", "jiff", "name-to-handle-at", "tikv-jemallocator"];
+
+/// The lib root of the lust-side crate for an adapter or shim, if one
+/// exists in `library/deps/<name>/src/lib.rs` (under `$LUST_LIBRARY`
+/// when set, else the build-time library tree).
+fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
+    let base = match std::env::var_os("LUST_LIBRARY") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library"),
+    };
+    let root = base.join("deps").join(name).join("src/lib.rs");
+    root.is_file().then_some(root)
+}
+
+/// How one resolved dependency classifies (ARCH 1.1): lust source with
+/// this lib root (a path package, or the lust-side adapter/shim crate),
+/// or unsupported with a reason that names the crate (L0508). The
+/// class is a property of the resolved package, never of a source
+/// spelling: a path package that happens to be named `indexmap` is
+/// plain lust source.
+enum DepClass {
+    Source { root: PathBuf, adapter: bool },
+    Unsupported(String),
+}
+
+/// Classifies one dependency unit. See `DepClass`.
+fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
+    if dep.source.is_none() {
+        return DepClass::Source { root: dep.lib_src.clone(), adapter: false };
+    }
+    let name = dep.package_name.as_str();
+    if let Some((_, want)) = ADAPTER_VERSIONS.iter().find(|(n, _)| *n == name) {
+        if let Some(root) = lust_dep_lib_root(name) {
+            if !want.is_empty() && dep.version != *want {
+                return DepClass::Unsupported(format!(
+                    "dependency crate `{name}` {} has no matching lust adapter (the adapter matches {want})",
+                    dep.version
+                ));
+            }
+            return DepClass::Source { root, adapter: true };
+        }
+        return DepClass::Unsupported(format!("dependency crate `{name}` has no lust adapter yet"));
+    }
+    if SHIM_CRATES.contains(&name) {
+        if let Some(root) = lust_dep_lib_root(name) {
+            return DepClass::Source { root, adapter: true };
+        }
+        return DepClass::Unsupported(format!("dependency crate `{name}` has no lust shim yet"));
+    }
+    DepClass::Unsupported(format!("dependency crate `{name}` is not a lust source crate, an adapter, or a shim crate yet"))
+}
+
+/// The `$crate` magic segment name of one crate in a session. Not a
+/// legal Rust identifier, so source text can never write it.
+fn crate_magic_name(stable: crate::def::StableCrateHash) -> String {
+    format!("$lust$crate${:016x}", stable.0)
+}
+
 /// Runs the outline worklist for one crate. See the file header.
 pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> Result<ResolvedCrate, ResolveError> {
     resolve_crate_cached(input, interner, known, &mut ResolveCache::new())
 }
 
-/// `resolve_crate` with a caller-kept per-file cache (the daemon's
-/// crate session holds one across requests). See `ResolveCache`.
+/// Runs the outline worklist for the selected crate and every source
+/// dependency in one workspace session (ARCH 1.8), dependencies first,
+/// with a caller-kept per-file cache (the daemon's crate session
+/// holds one across requests; it serves raw token streams and
+/// outlines here, since expanded streams also depend on the macro
+/// environment). See the file header for the merged-output shape.
 pub fn resolve_crate_cached(
     input: &CrateInput,
     interner: &Interner,
@@ -467,127 +629,338 @@ pub fn resolve_crate_cached(
     cache: &mut ResolveCache,
 ) -> Result<ResolvedCrate, ResolveError> {
     cache.begin(input);
-    let crate_sym = interner.intern(&input.crate_name);
-    let mut tables = ResolvedTables::new(crate_sym);
-    // The extern prelude: std, core, alloc, then the direct dependencies.
-    for name in ["std", "core", "alloc"] {
-        push_extern(&mut tables, input, name, true);
-    }
-    for (name, _, _) in &input.externs {
-        if tables.extern_by_name(name).is_none() {
-            push_extern(&mut tables, input, name, false);
+    let mut tables = ResolvedTables::new(interner.intern(&input.crate_name));
+    let main_magic = interner.intern(&crate_magic_name(input.crate_ids.stable));
+    tables.crate_magic.insert(main_magic, ROOT_MODULE);
+    let mut jobs: Vec<CrateJob> = vec![CrateJob {
+        input: OneInput {
+            root_path: input.root_path.clone(),
+            root_text: input.root_text.clone(),
+            env: input.env.clone(),
+            crate_ids: input.crate_ids,
+            crate_name: input.crate_name.clone(),
+        },
+        root_module: ROOT_MODULE,
+        flat_prefix: String::new(),
+        magic: main_magic,
+        deps: Vec::new(),
+    }];
+    // The session error map for job-build failures (a dependency root
+    // that cannot be read, a non-2024 source dependency): the selected
+    // crate's root file at the span's default file id.
+    let build_err = |d: Diag| -> ResolveError {
+        let (map, all_text) = make_map(&[(input.root_path.clone(), input.root_text.clone(), FileId(0))]);
+        ResolveError { map, all_text, needs_std: false, diags: vec![d] }
+    };
+    let mut by_key: FxMap<String, usize> = FxMap::default();
+    let mut main_deps = Vec::new();
+    for dep in &input.deps {
+        match add_dep_job(dep, input, &mut tables, &mut jobs, &mut by_key, interner) {
+            Ok(link) => main_deps.push(link),
+            Err(d) => return Err(build_err(d)),
         }
     }
-
-    // ---- Discovery: lex, outline, and walk `mod` edges to the file set.
-    // cfg on a `mod` declaration is evaluated here, before its file loads.
-    let mut files: Vec<(PathBuf, String, ModuleId)> = Vec::new();
-    let mut seen: Vec<(PathBuf, String, FileId)> = Vec::new();
+    jobs[0].deps = main_deps;
+    // Extern preludes, per crate: std libs, then direct dependencies.
+    for j in 0..jobs.len() {
+        let (root_module, deps) = (jobs[j].root_module, jobs[j].deps.clone());
+        for name in ["std", "core", "alloc"] {
+            push_extern(&mut tables, input.crate_ids.local, root_module, name, true, None, None);
+        }
+        for (name, target) in &deps {
+            match target {
+                Ok(dj) => {
+                    let dep_root = jobs[*dj].root_module;
+                    push_extern(&mut tables, input.crate_ids.local, root_module, name, false, Some(dep_root), None);
+                }
+                Err(why) => push_extern(&mut tables, input.crate_ids.local, root_module, name, false, None, Some(why.clone())),
+            }
+        }
+    }
+    // Dependencies first (a dev-dependency cycle, legal in Cargo test
+    // crates, breaks at the back edge: that crate then resolves after
+    // its dependent and the dependent's paths into it do not resolve).
+    let mut order: Vec<usize> = Vec::new();
+    let mut state = vec![0u8; jobs.len()];
+    fn visit(j: usize, jobs: &[CrateJob], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[j] != 0 {
+            return;
+        }
+        state[j] = 1;
+        for (_, t) in &jobs[j].deps {
+            if let Ok(d) = t {
+                visit(*d, jobs, state, order);
+            }
+        }
+        state[j] = 2;
+        order.push(j);
+    }
+    visit(0, &jobs, &mut state, &mut order);
+    let mut shared = SharedFiles::default();
+    let mut all_seen: Vec<(PathBuf, String, FileId)> = Vec::new();
     let mut needs_std = false;
-    let mut diags: Vec<Diag> = Vec::new();
-    let mut queue: Vec<(PathBuf, String, ModuleId, bool)> = vec![(input.root_path.clone(), input.root_text.clone(), ROOT_MODULE, true)];
-    let mut text_by_path: FxMap<String, String> = FxMap::default();
-    let mut file_ids: FxMap<String, FileId> = FxMap::default();
-    let mut next_file = 0u32;
-    while let Some((path, text, module, is_root)) = queue.pop() {
-        let canon = modules::canonical_string(&path);
-        let file_key = format!("{}#{}", canon, module.0);
-        let file_id = *file_ids.entry(file_key.clone()).or_insert_with(|| {
-            let id = FileId(next_file);
-            next_file += 1;
-            id
-        });
-        needs_std |= crate::ty::lang::needs_std_load(&text);
-        if !seen.iter().any(|(_, _, f)| *f == file_id) {
-            seen.push((path.clone(), text.clone(), file_id));
+    let mut chunks: Vec<Ast> = Vec::new();
+    let mut fn_lines: Vec<u32> = Vec::new();
+    let mut body_hashes: Vec<u64> = Vec::new();
+    let mut structure_hash = 0u64;
+    let mut exported_of: FxMap<usize, Vec<OwnedMacroSource>> = FxMap::default();
+    for &j in &order {
+        let dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
+            .deps
+            .iter()
+            .filter_map(|(name, t)| t.as_ref().ok().map(|d| (name.clone(), exported_of.get(d).cloned().unwrap_or_default())))
+            .collect();
+        match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, interner, known) {
+            Ok(out) => {
+                needs_std |= out.needs_std;
+                all_seen.extend(out.seen);
+                fn_lines.extend(out.fn_lines);
+                body_hashes.extend(out.body_hashes);
+                {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = crate::intern::FxHasher::default();
+                    structure_hash.hash(&mut h);
+                    out.structure_hash.hash(&mut h);
+                    structure_hash = h.finish();
+                }
+                tables.fn_module.extend(out.fn_module);
+                exported_of.insert(j, out.exported_macros);
+                chunks.push(out.ast);
+            }
+            Err(e) => {
+                needs_std |= e.needs_std;
+                all_seen.extend(e.seen);
+                let (map, all_text) = make_map(&all_seen);
+                return Err(ResolveError { map, all_text, needs_std, diags: e.diags });
+            }
         }
-        // Raw tokens from the per-file cache when the text stands:
-        // an unchanged file is not lexed again for discovery.
-        let text_hash = hash_str(&text);
-        let lexed = match cache.raw(&file_key, text_hash, file_id) {
-            Some(l) => l,
-            None => match lexer::lex(&text, file_id, 0, interner) {
-                Ok(l) => {
-                    cache.put_raw(&file_key, text_hash, file_id, &l);
-                    l
-                }
-                Err(d) => {
-                    diags.push(d);
-                    files.push((path, text, module));
-                    continue;
-                }
-            },
+    }
+    let (map, all_text) = make_map(&all_seen);
+    let ast = Ast::concat(chunks);
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std })
+}
+
+/// Creates (or reuses) the job for one source dependency, recursively.
+/// Returns the dependent's link: the job index, or the L0508 reason.
+fn add_dep_job(
+    dep: &super::cargo::DepUnit,
+    input: &CrateInput,
+    tables: &mut ResolvedTables,
+    jobs: &mut Vec<CrateJob>,
+    by_key: &mut FxMap<String, usize>,
+    interner: &Interner,
+) -> Result<(String, Result<usize, String>), Diag> {
+    let (root, adapter) = match classify_dep(dep) {
+        DepClass::Source { root, adapter } => (root, adapter),
+        DepClass::Unsupported(why) => return Ok((dep.extern_name.clone(), Err(why))),
+    };
+    let key = format!("{}#{}", dep.package_id, dep.lib_name);
+    if let Some(&j) = by_key.get(&key) {
+        return Ok((dep.extern_name.clone(), Ok(j)));
+    }
+    if !adapter && dep.edition != "2024" {
+        return Err(Diag::new(
+            "L0530",
+            Span::default(),
+            format!("dependency crate `{}` is edition {}, but lust source crates must be edition 2024", dep.package_name, dep.edition),
+            "Set `edition = \"2024\"` in the dependency package manifest.",
+        ));
+    }
+    let root_text = std::fs::read_to_string(&root).map_err(|e| {
+        Diag::new(
+            "L0503",
+            Span::default(),
+            format!("cannot read dependency crate `{}` root {}: {e}", dep.package_name, root.display()),
+            "Check the file exists and is readable.",
+        )
+    })?;
+    let crate_name = dep.lib_name.replace('-', "_");
+    let stable = def::stable_crate_hash(&dep.package_id, "lib", &dep.lib_name, false);
+    let magic = interner.intern(&crate_magic_name(stable));
+    let root_module = tables.add_crate_root(interner.intern(&crate_name));
+    tables.crate_magic.insert(magic, root_module);
+    let mut env = input.env.with_features(&dep.features);
+    if adapter {
+        env.allow_lust_dev = true;
+    }
+    let idx = jobs.len();
+    by_key.insert(key, idx);
+    jobs.push(CrateJob {
+        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name },
+        root_module,
+        flat_prefix: format!("k{:016x}$", stable.0),
+        magic,
+        deps: Vec::new(),
+    });
+    let mut sub = Vec::new();
+    for d in &dep.deps {
+        sub.push(add_dep_job(d, input, tables, jobs, by_key, interner)?);
+    }
+    jobs[idx].deps = sub;
+    Ok((dep.extern_name.clone(), Ok(idx)))
+}
+
+/// One discovered file of one crate during resolution.
+struct FileDisc {
+    path: PathBuf,
+    text: String,
+    file_id: FileId,
+    /// The module this file's top-level items belong to.
+    module: ModuleId,
+    is_root: bool,
+    /// The `mod` declaration that loaded this file (none at the root).
+    parent: Option<ParentDecl>,
+    lexed: Option<lexer::Lexed>,
+    outline: scan::Outline,
+}
+
+/// The `mod` declaration that loaded a file: where it sits, which is
+/// the point that fixes textual macro inheritance (ARCH 6.1).
+#[derive(Clone)]
+struct ParentDecl {
+    disc: usize,
+    container: Vec<Sym>,
+    lo: u32,
+    macro_use: bool,
+}
+
+/// The seen list of the discovered files so far, for error maps.
+fn seen_of(discs: &[FileDisc]) -> Vec<(PathBuf, String, FileId)> {
+    discs.iter().map(|d| (d.path.clone(), d.text.clone(), d.file_id)).collect()
+}
+
+/// Creates the modules and file edges of one outline's `mod`
+/// declarations, returning the inline module map of this file. New
+/// file discs are appended to `discs` and queued for outline
+/// processing. A declaration whose module already exists is a no-op,
+/// which is what lets the same code serve the first discovery pass
+/// and the macro-generated edges of later expansion rounds.
+#[allow(clippy::too_many_arguments)]
+fn outline_mods(
+    di: usize,
+    outline: &scan::Outline,
+    strings: &[String],
+    discs: &mut Vec<FileDisc>,
+    queue: &mut Vec<usize>,
+    tables: &mut ResolvedTables,
+    shared: &mut SharedFiles,
+    job: &CrateJob,
+    interner: &Interner,
+    diags: &mut Vec<Diag>,
+) -> FxMap<Vec<Sym>, ModuleId> {
+    let (file_path, file_module, is_root) = (discs[di].path.clone(), discs[di].module, discs[di].is_root);
+    let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
+    inline_modules.insert(Vec::new(), file_module);
+    for decl in &outline.mods {
+        let enabled = match cfg::outline_enabled(&job.input.env, &decl.cfg, strings, interner, decl.span) {
+            Ok(e) => e,
+            Err(d) => {
+                diags.push(d);
+                false
+            }
         };
-        let outline = match cache.outline(&file_key, text_hash, file_id) {
-            Some(o) => o,
+        if !enabled {
+            continue;
+        }
+        let parent = inline_modules.get(&decl.container).copied().unwrap_or(file_module);
+        let mut child_path = tables.modules[parent.0 as usize].path.clone();
+        child_path.push(decl.name);
+        let existing = tables.module_by_path_in(job.root_module, &child_path);
+        let child = match existing {
+            Some(c) => c,
             None => {
-                let o = scan::outline(&lexed, interner);
-                cache.put_outline(&file_key, text_hash, file_id, o.clone());
-                o
+                let vis = match decl.vis {
+                    scan::OutlineVis::Private => VisKind::Priv,
+                    scan::OutlineVis::Pub => VisKind::Pub,
+                    scan::OutlineVis::Restricted => VisKind::Crate,
+                };
+                tables.add_module(parent, decl.name, vis, decl.span)
             }
         };
-        // Inline module skeleton, keyed by name path from this file's module.
-        let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
-        inline_modules.insert(Vec::new(), module);
-        for decl in &outline.mods {
-            let enabled = match cfg::outline_enabled(&input.env, &decl.cfg, &lexed.strings, interner, decl.span) {
-                Ok(e) => e,
-                Err(d) => {
-                    diags.push(d);
-                    false
+        tables.modules[child.0 as usize].macro_use |= decl.macro_use;
+        if decl.inline {
+            let mut key = decl.container.clone();
+            key.push(decl.name);
+            inline_modules.insert(key, child);
+        } else if existing.is_none() {
+            let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
+            match modules::module_file(&file_path, is_root, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
+                Ok(f) => {
+                    let fcanon = modules::canonical_string(&f);
+                    let ftext = match shared.text_by_path.get(&fcanon) {
+                        Some(t) => t.clone(),
+                        None => match std::fs::read_to_string(&f) {
+                            Ok(t) => {
+                                shared.text_by_path.insert(fcanon, t.clone());
+                                t
+                            }
+                            Err(e) => {
+                                diags.push(Diag::new(
+                                    "L0503",
+                                    decl.span,
+                                    format!("cannot read module file {}: {e}", f.display()),
+                                    "Check the file exists and is readable.",
+                                ));
+                                continue;
+                            }
+                        },
+                    };
+                    let file_id = shared.file_id(&f, child);
+                    discs.push(FileDisc {
+                        path: f,
+                        text: ftext,
+                        file_id,
+                        module: child,
+                        is_root: false,
+                        parent: Some(ParentDecl {
+                            disc: di,
+                            container: decl.container.clone(),
+                            lo: decl.span.lo,
+                            macro_use: decl.macro_use,
+                        }),
+                        lexed: None,
+                        outline: scan::Outline::default(),
+                    });
+                    queue.push(discs.len() - 1);
                 }
-            };
-            if !enabled {
-                continue;
-            }
-            let parent = inline_modules.get(&decl.container).copied().unwrap_or(module);
-            let vis = match decl.vis {
-                scan::OutlineVis::Private => VisKind::Priv,
-                scan::OutlineVis::Pub => VisKind::Pub,
-                // The restricted path itself is re-read from the AST at
-                // registration; the outline only needs the module node.
-                scan::OutlineVis::Restricted => VisKind::Crate,
-            };
-            let child = tables.add_module(parent, decl.name, vis, decl.span);
-            if decl.inline {
-                let mut key = decl.container.clone();
-                key.push(decl.name);
-                inline_modules.insert(key, child);
-            } else {
-                let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
-                match modules::module_file(&path, is_root, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
-                    Ok(f) => {
-                        let fcanon = modules::canonical_string(&f);
-                        let ftext = match text_by_path.get(&fcanon) {
-                            Some(t) => t.clone(),
-                            None => match std::fs::read_to_string(&f) {
-                                Ok(t) => {
-                                    text_by_path.insert(fcanon, t.clone());
-                                    t
-                                }
-                                Err(e) => {
-                                    diags.push(Diag::new(
-                                        "L0503",
-                                        decl.span,
-                                        format!("cannot read module file {}: {e}", f.display()),
-                                        "Check the file exists and is readable.",
-                                    ));
-                                    continue;
-                                }
-                            },
-                        };
-                        queue.push((f, ftext, child, false));
-                    }
-                    Err(d) => diags.push(d),
-                }
+                Err(d) => diags.push(d),
             }
         }
-        // Textual macro names from this file (the parser has no
-        // macro_rules items yet): bind them in the macro namespace of
-        // their module now, exported ones also at the crate root.
-        for m in &outline.macros {
-            let hash = macro_hash(input, interner, module, &tables, m.name);
-            let def = DefId { krate: input.crate_ids.local, hash };
+    }
+    inline_modules
+}
+
+/// Binds one outline's textual macro names in the macro namespace:
+/// in their defining module, and `#[macro_export]` ones also at the
+/// crate root. Expansion itself runs in the expander; these bindings
+/// serve import resolution and path queries.
+fn bind_outline_macros(
+    outline: &scan::Outline,
+    disc_module: ModuleId,
+    inline_modules: &FxMap<Vec<Sym>, ModuleId>,
+    job: &CrateJob,
+    tables: &mut ResolvedTables,
+    interner: &Interner,
+) {
+    for m in &outline.macros {
+        let module = inline_modules.get(&m.container_path).copied().unwrap_or(disc_module);
+        let hash = macro_hash(&job.input, &job.flat_prefix, interner, module, tables, m.name);
+        let def = DefId { krate: job.input.crate_ids.local, hash };
+        if tables.def_info.contains_key(&def) {
+            continue;
+        }
+        // An exported macro defined at the crate root has one binding
+        // there, and it is public: inserting the private textual
+        // binding first would keep it (same target reads as no change)
+        // and hide the macro from other crates.
+        if m.exported && module == job.root_module {
+            tables.insert(
+                module,
+                Namespace::Macro,
+                m.name,
+                Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: module },
+            );
+        } else {
             tables.insert(
                 module,
                 Namespace::Macro,
@@ -596,194 +969,751 @@ pub fn resolve_crate_cached(
             );
             if m.exported {
                 tables.insert(
-                    ROOT_MODULE,
+                    job.root_module,
                     Namespace::Macro,
                     m.name,
-                    Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: ROOT_MODULE },
+                    Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: job.root_module },
                 );
             }
-            tables.def_info.insert(def, DefInfo { kind: ResKind::Macro, flat: m.name, module, vis: VisKind::Priv });
+        }
+        tables.def_info.insert(def, DefInfo { kind: ResKind::Macro, flat: m.name, module, vis: VisKind::Priv });
+        if job.flat_prefix.is_empty() {
             tables.flat[ns_index(Namespace::Macro)].insert(m.name, def);
         }
-        files.push((path, text, module));
     }
-    if !diags.is_empty() {
-        let (map, all_text) = make_map(&seen);
-        return Err(ResolveError { map, all_text, needs_std, diags });
-    }
-    // The source map, in FileId order, with every file's text.
-    files.sort_by_key(|(p, _, m)| file_ids[&format!("{}#{}", modules::canonical_string(p), m.0)].0);
-    let (map, all_text) = make_map(&seen);
-    // Lex, expand, and parse every file, in parallel. Token streams
-    // come from the per-file cache when the text stands: an expanded
-    // hit goes straight to the parser, a raw hit skips only the lex.
-    // Cache reads happen before the parallel phase and writes after
-    // it, so the cache itself needs no locking. The first error in
-    // file order is the answer, as in the serial form.
-    struct FileJob {
-        path: PathBuf,
-        text: String,
-        module: ModuleId,
-        file_id: FileId,
-        key: String,
-        text_hash: u64,
-        raw: Option<lexer::Lexed>,
-        expanded: Option<lexer::Lexed>,
-    }
-    let jobs: Vec<FileJob> = files
-        .into_iter()
-        .map(|(path, text, module)| {
-            let canon = modules::canonical_string(&path);
-            let key = format!("{canon}#{}", module.0);
-            let file_id = file_ids[&key];
-            let text_hash = hash_str(&text);
-            let expanded = if reads_outside(&text) { None } else { cache.expanded(&key, text_hash, file_id) };
-            let raw = if expanded.is_some() { None } else { cache.raw(&key, text_hash, file_id) };
-            FileJob { path, text, module, file_id, key, text_hash, raw, expanded }
-        })
-        .collect();
-    // (work, raw to store, expanded to store) per file.
-    let parsed = par_map(&jobs, |job| -> Result<(FileWork, Option<lexer::Lexed>, Option<lexer::Lexed>), Diag> {
-        let (lexed, store_raw, store_expanded) = match &job.expanded {
-            Some(l) => (clone_lexed(l), None, None),
-            None => {
-                let (raw, store_raw) = match &job.raw {
-                    Some(l) => (clone_lexed(l), None),
-                    None => {
-                        let raw = lexer::lex(&job.text, job.file_id, 0, interner)?;
-                        let store = clone_lexed(&raw);
-                        (raw, Some(store))
-                    }
-                };
-                check_cfg_names(&raw, &input.env, interner)?;
-                // Expansion (6.1 step 4), per file at lex time, with
-                // the crate cfg environment as expander facts.
-                let ects = crate::expand::ExpandCtx {
-                    interner,
-                    known,
-                    file_path: job.path.to_string_lossy().to_string(),
-                    src: &job.text,
-                    cfg: expand_cfg(&input.env),
-                    module_path: Vec::new(),
-                };
-                let lexed = crate::expand::expand_lexed(raw, &ects)?;
-                let store = clone_lexed(&lexed);
-                (lexed, store_raw, Some(store))
+}
+
+/// Lexes and outlines one discovered file (the original text), creates
+/// its module edges, and binds its macro names.
+#[allow(clippy::too_many_arguments)]
+fn process_disc_orig(
+    di: usize,
+    discs: &mut Vec<FileDisc>,
+    queue: &mut Vec<usize>,
+    tables: &mut ResolvedTables,
+    shared: &mut SharedFiles,
+    cache: &mut ResolveCache,
+    job: &CrateJob,
+    interner: &Interner,
+    diags: &mut Vec<Diag>,
+    needs_std: &mut bool,
+) {
+    let (text, file_id, module) = (discs[di].text.clone(), discs[di].file_id, discs[di].module);
+    *needs_std |= crate::ty::lang::needs_std_load(&text);
+    // Raw tokens and outline from the per-file cache when the text
+    // stands (keyed by canonical path plus module, as in discovery).
+    let file_key = format!("{}#{}", modules::canonical_string(&discs[di].path), module.0);
+    let text_hash = hash_str(&text);
+    let lexed = match cache.raw(&file_key, text_hash, file_id) {
+        Some(l) => l,
+        None => match lexer::lex(&text, file_id, 0, interner) {
+            Ok(l) => {
+                cache.put_raw(&file_key, text_hash, file_id, &l);
+                l
             }
-        };
-        let ast = parser::parse(&lexed, interner, known)?;
-        Ok((
-            FileWork { path: job.path.clone(), text: job.text.clone(), file_id: job.file_id, ast, module: job.module },
-            store_raw,
-            store_expanded,
-        ))
-    });
-    let mut works: Vec<FileWork> = Vec::with_capacity(jobs.len());
-    for (job, r) in jobs.iter().zip(parsed) {
-        match r {
-            Ok((w, store_raw, store_expanded)) => {
-                if let Some(l) = &store_raw {
-                    cache.put_raw(&job.key, job.text_hash, job.file_id, l);
-                }
-                if let Some(l) = &store_expanded
-                    && !reads_outside(&job.text)
-                {
-                    cache.put_expanded(&job.key, job.text_hash, job.file_id, l);
-                }
-                works.push(w);
+            Err(d) => {
+                diags.push(d);
+                return;
             }
-            Err(d) => return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] }),
+        },
+    };
+    let outline = match cache.outline(&file_key, text_hash, file_id) {
+        Some(o) => o,
+        None => {
+            let o = scan::outline(&lexed, interner);
+            cache.put_outline(&file_key, text_hash, file_id, o.clone());
+            o
+        }
+    };
+    let inline = outline_mods(di, &outline, &lexed.strings.clone(), discs, queue, tables, shared, job, interner, diags);
+    bind_outline_macros(&outline, module, &inline, job, tables, interner);
+    discs[di].outline = outline;
+    discs[di].lexed = Some(lexed);
+}
+
+/// One macro definition in this crate, located in one file's token
+/// stream (the original tokens, or the expanded tokens for a
+/// macro-generated definition).
+struct MacroSrc {
+    name: Sym,
+    exported: bool,
+    /// Index into `MacroEnv::owned`.
+    owned: usize,
+}
+
+/// The token range of one `macro_rules!` definition in a flat token
+/// list, from its outline token index: through its closing group and
+/// an optional `;`.
+fn macro_tok_range(toks: &[crate::lexer::Token], start: usize) -> (usize, usize) {
+    use crate::lexer::Tok;
+    let mut i = start + 3; // macro_rules ! name
+    let open = toks.get(i).map(|t| t.tok);
+    let close = match open {
+        Some(Tok::LParen) => Tok::RParen,
+        Some(Tok::LBracket) => Tok::RBracket,
+        Some(Tok::LBrace) => Tok::RBrace,
+        _ => return (start, (start + 3).min(toks.len())),
+    };
+    let mut depth = 0usize;
+    while i < toks.len() {
+        match toks[i].tok {
+            t if Some(t) == open => depth += 1,
+            t if t == close => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            Tok::Eof => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    if toks.get(i).map(|t| t.tok) == Some(Tok::Semi) {
+        i += 1;
+    }
+    (start, i)
+}
+
+/// One module-level `use` naming a single name, for the macro
+/// path-binding fixpoint.
+struct UseSite {
+    module: Vec<Sym>,
+    pubish: bool,
+    segs: Vec<Sym>,
+    leading: bool,
+    alias: Sym,
+    /// True for `use a::b::*`: `segs` is the glob target's written
+    /// path and `alias` is unused.
+    glob: bool,
+}
+
+/// The symbol a path-segment token stands for in a `use` tree.
+fn use_seg_sym(tok: crate::lexer::Tok, interner: &Interner) -> Option<Sym> {
+    use crate::lexer::Tok;
+    Some(match tok {
+        Tok::Ident(s) => s,
+        Tok::SelfLower => interner.intern("self"),
+        Tok::Super => interner.intern("super"),
+        Tok::Crate => interner.intern("crate"),
+        Tok::SelfUpper => interner.intern("Self"),
+        _ => return None,
+    })
+}
+
+/// Splits a `use` group `{ a, b::{c, d} }` body into its comma parts
+/// (commas inside subgroups are hidden inside `Delim` trees).
+fn comma_chunks(trees: &[crate::lexer::TokenTree]) -> Vec<Vec<crate::lexer::TokenTree>> {
+    use crate::lexer::{Tok, TokenTree};
+    let mut out: Vec<Vec<TokenTree>> = vec![Vec::new()];
+    for t in trees {
+        if matches!(t, TokenTree::Token(tok) if tok.tok == Tok::Comma) {
+            out.push(Vec::new());
+        } else if let Some(last) = out.last_mut() {
+            last.push(t.clone());
         }
     }
-    // The module of every item list, by (file, inline path).
+    out.into_iter().filter(|c| !c.is_empty()).collect()
+}
+
+/// Parses the body trees of one `use` item (without `use` and `;`)
+/// into single-name and glob sites under `prefix`. The expander does
+/// not track a glob macro import inside one file, but a public glob
+/// re-export must still seed dependent crates and other files.
+fn parse_use_trees(
+    trees: &[crate::lexer::TokenTree],
+    prefix: &[Sym],
+    leading: bool,
+    module: &[Sym],
+    pubish: bool,
+    interner: &Interner,
+    out: &mut Vec<UseSite>,
+) {
+    use crate::lexer::{Delim, Tok, TokenTree};
+    let tok = |i: usize| match trees.get(i) {
+        Some(TokenTree::Token(t)) => Some(t.tok),
+        _ => None,
+    };
+    let mut segs: Vec<Sym> = prefix.to_vec();
+    let mut leading = leading;
+    let mut i = 0;
+    if tok(0) == Some(Tok::PathSep) {
+        leading = true;
+        i = 1;
+    }
+    let mut alias: Option<Sym> = None;
+    let mut underscore = false;
+    loop {
+        let Some(sym) = tok(i).and_then(|t| use_seg_sym(t, interner)) else { return };
+        segs.push(sym);
+        i += 1;
+        match tok(i) {
+            Some(Tok::PathSep) => {
+                i += 1;
+                match trees.get(i) {
+                    Some(TokenTree::Delim(Delim::Brace, inner, _)) => {
+                        for chunk in comma_chunks(inner) {
+                            parse_use_trees(&chunk, &segs, leading, module, pubish, interner, out);
+                        }
+                        return;
+                    }
+                    Some(TokenTree::Token(t)) if t.tok == Tok::Star => {
+                        out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias: Sym(0), glob: true });
+                        return;
+                    }
+                    _ => continue,
+                }
+            }
+            Some(Tok::As) => {
+                match tok(i + 1) {
+                    Some(Tok::Ident(s)) => alias = Some(s),
+                    Some(Tok::Underscore) => underscore = true,
+                    _ => return,
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    if underscore || segs.is_empty() {
+        return;
+    }
+    let self_sym = interner.intern("self");
+    let alias = alias
+        .unwrap_or_else(|| if segs.len() > 1 && *segs.last().unwrap() == self_sym { segs[segs.len() - 2] } else { *segs.last().unwrap() });
+    out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias, glob: false });
+}
+
+/// Scans one file's item-level `use` items (top level and inline
+/// module bodies) from its token trees.
+fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &Interner, out: &mut Vec<UseSite>) {
+    use crate::lexer::{Delim, Tok, TokenTree};
+    let tok = |trees: &[TokenTree], i: usize| match trees.get(i) {
+        Some(TokenTree::Token(t)) => Some(t.tok),
+        _ => None,
+    };
+    let mut i = 0;
+    let mut pubish = false;
+    while i < trees.len() {
+        match tok(trees, i) {
+            Some(Tok::Pub) => {
+                pubish = true;
+                i += 1;
+                if matches!(trees.get(i), Some(TokenTree::Delim(Delim::Paren, _, _))) {
+                    i += 1;
+                }
+            }
+            Some(Tok::Use) => {
+                let start = i + 1;
+                let mut end = start;
+                while end < trees.len() && tok(trees, end) != Some(Tok::Semi) {
+                    end += 1;
+                }
+                parse_use_trees(&trees[start..end], &[], false, module, pubish, interner, out);
+                i = end + 1;
+                pubish = false;
+            }
+            Some(Tok::Mod) => {
+                if let (Some(name), Some(TokenTree::Delim(Delim::Brace, inner, _))) =
+                    (tok(trees, i + 1).and_then(|t| use_seg_sym(t, interner)), trees.get(i + 2))
+                {
+                    let inner = inner.clone();
+                    let mut sub = module.to_vec();
+                    sub.push(name);
+                    scan_use_sites(&inner, &sub, interner, out);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                pubish = false;
+            }
+            Some(_) | None => {
+                // At item level a brace group belongs to an item the
+                // pattern above does not open (fn body, impl, const):
+                // the trees are nested, so skipping one tree skips it.
+                if !matches!(tok(trees, i), Some(Tok::Pound)) {
+                    pubish = false;
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Rewrites `$crate` in the template groups of one macro definition
+/// to the defining crate's magic segment (a plain identifier token,
+/// which transcription copies verbatim). Matcher groups keep their
+/// tokens: `$crate` is illegal there and `compile_macro` rejects it.
+fn rewrite_dollar_crate(tokens: &[crate::lexer::Token], magic: Sym) -> Vec<crate::lexer::Token> {
+    use crate::lexer::{Tok, Token, TokenTree};
+    fn rewrite(trees: &[TokenTree], magic: Sym) -> Vec<TokenTree> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < trees.len() {
+            let is_crate = matches!(trees.get(i), Some(TokenTree::Token(t)) if t.tok == Tok::Dollar)
+                && matches!(trees.get(i + 1), Some(TokenTree::Token(t)) if t.tok == Tok::Crate);
+            if is_crate {
+                let span = match trees[i] {
+                    TokenTree::Token(t) => t.span,
+                    _ => unreachable!(),
+                };
+                out.push(TokenTree::Token(Token { tok: Tok::Ident(magic), span }));
+                i += 2;
+                continue;
+            }
+            match &trees[i] {
+                TokenTree::Delim(d, inner, span) => out.push(TokenTree::Delim(*d, rewrite(inner, magic), *span)),
+                t => out.push(t.clone()),
+            }
+            i += 1;
+        }
+        out
+    }
+    let (trees, balanced) = crate::lexer::build_trees(tokens);
+    if !balanced {
+        return tokens.to_vec();
+    }
+    // Arms at the top level of a definition body; the seed slice is
+    // `macro_rules ! name <group>`, so rewrite inside that group per
+    // arm: matcher group, `=>`, template group.
+    let mut top = trees;
+    if let Some(TokenTree::Delim(d, body, span)) = top.get(3).cloned() {
+        let mut arms = Vec::new();
+        let mut j = 0;
+        while j < body.len() {
+            match (body.get(j), body.get(j + 2)) {
+                (Some(matcher @ TokenTree::Delim(..)), Some(TokenTree::Delim(td, template, tspan))) => {
+                    arms.push(matcher.clone());
+                    if let Some(arrow) = body.get(j + 1) {
+                        arms.push(arrow.clone());
+                    }
+                    arms.push(TokenTree::Delim(*td, rewrite(template, magic), *tspan));
+                    j += 3;
+                }
+                _ => {
+                    arms.push(body[j].clone());
+                    j += 1;
+                }
+            }
+        }
+        top[3] = TokenTree::Delim(d, arms, span);
+    }
+    let mut out = Vec::new();
+    crate::lexer::flatten_trees(&top, &mut out);
+    out
+}
+
+/// Renames the macro in one definition token slice (`macro_rules !
+/// name ...`) to a re-export binding's alias, when they differ. The
+/// expander registers a seed under the name its tokens define, so an
+/// aliased re-export must carry the alias in its tokens.
+fn rename_macro_token(tokens: &mut [crate::lexer::Token], alias: Sym) {
+    use crate::lexer::Tok;
+    if let Some(t) = tokens.get_mut(2)
+        && let Tok::Ident(name) = t.tok
+        && name != alias
+    {
+        t.tok = Tok::Ident(alias);
+    }
+}
+
+/// The macro environment of one expansion round: every macro
+/// definition visible by path in this crate, as expander seeds. Seeds
+/// come from this crate's `#[macro_export]` definitions (crate root),
+/// direct dependencies' exported definitions (`dep::` paths), and
+/// public-single-name re-exports settled by a fixpoint over the
+/// crate's `use` items (`crate::m::name` paths). Textual visibility
+/// is the splice step's job (below); seeds never enter textual scope.
+struct MacroEnv {
+    seeds: Vec<crate::expand::MacroSeed>,
+    /// Every macro source of this crate, for the exports other crates
+    /// receive.
+    own: Vec<OwnedMacroSource>,
+    own_exported: Vec<bool>,
+    /// Sources visible at this crate's root by path, under binding
+    /// names (own exports plus root re-exports).
+    root_sources: Vec<OwnedMacroSource>,
+}
+
+impl MacroEnv {
+    /// Builds the environment from the files discovered so far (the
+    /// original outlines, plus macro definitions the previous
+    /// expansion round generated).
+    fn build(
+        job: &CrateJob,
+        discs: &[FileDisc],
+        expanded: &[Option<lexer::Lexed>],
+        dep_exports: &[(String, Vec<OwnedMacroSource>)],
+        tables: &ResolvedTables,
+        interner: &Interner,
+    ) -> MacroEnv {
+        // All sources: this crate's definitions first, then the
+        // exported definitions of direct source dependencies.
+        let mut owned: Vec<OwnedMacroSource> = Vec::new();
+        let mut srcs: Vec<MacroSrc> = Vec::new();
+        // (module path, name) -> owned index, for textual definitions
+        // a same-module re-export names.
+        let mut module_defs: FxMap<(Vec<Sym>, Sym), usize> = FxMap::default();
+        let mut own_exported: Vec<bool> = Vec::new();
+        for (di, disc) in discs.iter().enumerate() {
+            let base_path = tables.modules[disc.module.0 as usize].path.clone();
+            let mut collect = |outline: &scan::Outline, lexed: &lexer::Lexed, owned: &mut Vec<OwnedMacroSource>| {
+                for m in &outline.macros {
+                    let mut mod_path = base_path.clone();
+                    mod_path.extend(m.container_path.iter().copied());
+                    let key = (mod_path, m.name);
+                    if module_defs.contains_key(&key) {
+                        continue;
+                    }
+                    let (lo, hi) = macro_tok_range(&lexed.tokens, m.container.1);
+                    module_defs.insert(key, owned.len());
+                    srcs.push(MacroSrc { name: m.name, exported: m.exported, owned: owned.len() });
+                    own_exported.push(m.exported);
+                    owned.push(OwnedMacroSource {
+                        name: m.name,
+                        tokens: lexed.tokens[lo..hi].to_vec(),
+                        strings: lexed.strings.clone(),
+                        magic: job.magic,
+                    });
+                }
+            };
+            if let Some(orig) = &disc.lexed {
+                collect(&disc.outline, orig, &mut owned);
+            }
+            if let Some(Some(exp)) = expanded.get(di) {
+                let o = scan::outline(exp, interner);
+                collect(&o, exp, &mut owned);
+            }
+        }
+        let own = owned.clone();
+        // Path bindings: (module path, name) -> owned index.
+        let mut bindings: FxMap<(Vec<Sym>, Sym), usize> = FxMap::default();
+        for s in &srcs {
+            if s.exported {
+                bindings.insert((Vec::new(), s.name), s.owned);
+            }
+        }
+        let mut dep_base: Vec<(Sym, usize, usize)> = Vec::new(); // (extern sym, first owned, count)
+        for (extern_name, sources) in dep_exports {
+            let sym = interner.intern(extern_name);
+            let first = owned.len();
+            for src in sources {
+                bindings.insert((vec![sym], src.name), owned.len());
+                owned.push(src.clone());
+            }
+            dep_base.push((sym, first, sources.len()));
+        }
+        let _ = dep_base;
+        // The re-export fixpoint over this crate's use items.
+        let mut sites: Vec<UseSite> = Vec::new();
+        for (di, disc) in discs.iter().enumerate() {
+            let base = tables.modules[disc.module.0 as usize].path.clone();
+            if let Some(orig) = &disc.lexed {
+                let (trees, _) = crate::lexer::build_trees(&orig.tokens);
+                scan_use_sites(&trees, &base, interner, &mut sites);
+            }
+            if let Some(Some(exp)) = expanded.get(di) {
+                let (trees, _) = crate::lexer::build_trees(&exp.tokens);
+                scan_use_sites(&trees, &base, interner, &mut sites);
+            }
+        }
+        let crate_sym = interner.intern("crate");
+        let self_sym = interner.intern("self");
+        let super_sym = interner.intern("super");
+        let resolve_use = |segs: &[Sym], leading: bool, from: &[Sym], bindings: &FxMap<(Vec<Sym>, Sym), usize>| -> Option<usize> {
+            let last = *segs.last()?;
+            let middle = &segs[..segs.len() - 1];
+            let by = |m: &[Sym]| bindings.get(&(m.to_vec(), last)).copied();
+            let md = |m: &[Sym]| module_defs.get(&(m.to_vec(), last)).copied();
+            if segs.len() == 1 && !leading {
+                return md(from).or_else(|| by(from));
+            }
+            if segs[0] == crate_sym {
+                let m = &middle[1.min(middle.len())..];
+                return by(m);
+            }
+            if segs[0] == self_sym {
+                let mut m = from.to_vec();
+                m.extend_from_slice(&middle[1.min(middle.len())..]);
+                return by(&m).or_else(|| md(&m));
+            }
+            if segs[0] == super_sym {
+                let supers = segs.iter().take_while(|&&s| s == super_sym).count();
+                let keep = from.len().saturating_sub(supers);
+                let mut m: Vec<Sym> = from[..keep].to_vec();
+                m.extend_from_slice(&middle[supers.min(middle.len())..]);
+                return by(&m);
+            }
+            if leading {
+                return by(middle);
+            }
+            let mut m = from.to_vec();
+            m.extend_from_slice(middle);
+            by(&m).or_else(|| by(middle)).or_else(|| md(&m))
+        };
+        // The bindings-space module path a glob target names.
+        let resolve_glob_module = |segs: &[Sym], leading: bool, from: &[Sym], bindings: &FxMap<(Vec<Sym>, Sym), usize>| -> Vec<Sym> {
+            if segs.first() == Some(&crate_sym) {
+                return segs[1..].to_vec();
+            }
+            if segs.first() == Some(&self_sym) {
+                let mut m = from.to_vec();
+                m.extend_from_slice(&segs[1..]);
+                return m;
+            }
+            if segs.first() == Some(&super_sym) {
+                let supers = segs.iter().take_while(|&&s| s == super_sym).count();
+                let keep = from.len().saturating_sub(supers);
+                let mut m: Vec<Sym> = from[..keep].to_vec();
+                m.extend_from_slice(&segs[supers..]);
+                return m;
+            }
+            if leading {
+                return segs.to_vec();
+            }
+            let has = |m: &[Sym]| bindings.keys().any(|(bm, _)| bm == m);
+            if has(segs) {
+                return segs.to_vec();
+            }
+            let mut m = from.to_vec();
+            m.extend_from_slice(segs);
+            if has(&m) {
+                return m;
+            }
+            segs.to_vec()
+        };
+        loop {
+            let mut changed = false;
+            for site in &sites {
+                if !site.pubish {
+                    continue;
+                }
+                if site.glob {
+                    let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
+                    let names: Vec<(Sym, usize)> =
+                        bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
+                    for (name, src) in names {
+                        let key = (site.module.clone(), name);
+                        if bindings.get(&key) != Some(&src) {
+                            bindings.insert(key, src);
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, &bindings) {
+                    let key = (site.module.clone(), site.alias);
+                    if bindings.get(&key) != Some(&src) {
+                        bindings.insert(key, src);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut seeds = Vec::with_capacity(bindings.len());
+        let mut keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().collect();
+        keys.sort_by(|a, b| {
+            let pa: Vec<&str> = a.0.iter().map(|s| interner.get(*s)).collect();
+            let pb: Vec<&str> = b.0.iter().map(|s| interner.get(*s)).collect();
+            pa.cmp(&pb).then_with(|| interner.get(a.1).cmp(interner.get(b.1)))
+        });
+        for key in keys {
+            let src = &owned[bindings[key]];
+            let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
+            rename_macro_token(&mut tokens, key.1);
+            seeds.push(crate::expand::MacroSeed { path: key.0.clone(), tokens, strings: src.strings.clone() });
+        }
+        // Macros visible at this crate's root by path (its own
+        // `#[macro_export]` definitions plus root re-exports), under
+        // their binding names: what dependent crates receive.
+        let mut root_sources: Vec<OwnedMacroSource> = Vec::new();
+        let mut root_keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().filter(|(m, _)| m.is_empty()).collect();
+        root_keys.sort_by(|a, b| interner.get(a.1).cmp(interner.get(b.1)));
+        for key in root_keys {
+            let src = owned[bindings[key]].clone();
+            root_sources.push(OwnedMacroSource { name: key.1, ..src });
+        }
+        MacroEnv { seeds, own, own_exported, root_sources }
+    }
+
+    /// The macro sources dependent crates see at this crate's root:
+    /// its `#[macro_export]` definitions plus any macro re-exported
+    /// at the root by a public `use` (glob or single-name).
+    fn exported_sources(&self) -> Vec<OwnedMacroSource> {
+        if !self.root_sources.is_empty() {
+            return self.root_sources.clone();
+        }
+        self.own.iter().zip(&self.own_exported).filter(|(_, e)| **e).map(|(s, _)| s.clone()).collect()
+    }
+}
+
+/// Resolves one crate of a workspace session into the shared tables:
+/// discovery, the expansion rounds of section 6.1 (cfg names, seeded
+/// macro expansion, macro-generated module edges), the import
+/// worklist, the path rewrite, and flattening.
+fn resolve_one(
+    job: &CrateJob,
+    tables: &mut ResolvedTables,
+    shared: &mut SharedFiles,
+    cache: &mut ResolveCache,
+    dep_exports: &[(String, Vec<OwnedMacroSource>)],
+    interner: &Interner,
+    known: &Known,
+) -> Result<CrateOut, OneError> {
+    let input = &job.input;
+    let mut needs_std = false;
+    let mut diags: Vec<Diag> = Vec::new();
+    let root_file_id = shared.file_id(&input.root_path, job.root_module);
+    let mut discs: Vec<FileDisc> = vec![FileDisc {
+        path: input.root_path.clone(),
+        text: input.root_text.clone(),
+        file_id: root_file_id,
+        module: job.root_module,
+        is_root: true,
+        parent: None,
+        lexed: None,
+        outline: scan::Outline::default(),
+    }];
+    let mut queue: Vec<usize> = vec![0];
+    while let Some(di) = queue.pop() {
+        process_disc_orig(di, &mut discs, &mut queue, tables, shared, cache, job, interner, &mut diags, &mut needs_std);
+    }
+    if !diags.is_empty() {
+        return Err(OneError { diags, seen: seen_of(&discs), needs_std });
+    }
+    // Unknown cfg names (L0520) are checked on the original tokens of
+    // every file before expansion can strip the item that carries one.
+    for disc in &discs {
+        if let Some(orig) = &disc.lexed
+            && let Err(d) = check_cfg_names(orig, &input.env, interner)
+        {
+            return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std });
+        }
+    }
+    // Expansion rounds (6.1): expand every file with the macro
+    // environment the outlines now prove, then look for module edges
+    // the expansions generated; repeat until a round adds no file.
+    let mut expanded: Vec<Option<lexer::Lexed>> = Vec::new();
+    let mut menv = MacroEnv { seeds: Vec::new(), own: Vec::new(), own_exported: Vec::new(), root_sources: Vec::new() };
+    for round in 0..8 {
+        expanded.resize_with(discs.len(), || None);
+        menv = MacroEnv::build(job, &discs, &expanded, dep_exports, tables, interner);
+        for di in 0..discs.len() {
+            let (orig, text, path) = match &discs[di].lexed {
+                Some(l) => (l.clone(), discs[di].text.clone(), discs[di].path.clone()),
+                None => continue,
+            };
+            let ects = crate::expand::ExpandCtx {
+                interner,
+                known,
+                file_path: path.to_string_lossy().to_string(),
+                src: &text,
+                cfg: expand_cfg(&input.env),
+                module_path: tables.modules[discs[di].module.0 as usize].path.clone(),
+            };
+            let spliced = splice_textual(di, orig, &discs, tables, job, interner);
+            match crate::expand::expand_lexed_seeded(spliced, &ects, &menv.seeds) {
+                Ok(l) => expanded[di] = Some(l),
+                Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
+            }
+        }
+        // Macro-generated module edges and macro definitions.
+        let before = discs.len();
+        let mut new_queue: Vec<usize> = Vec::new();
+        for di in 0..before {
+            let Some(exp) = expanded[di].clone() else { continue };
+            let outline = scan::outline(&exp, interner);
+            let disc_module = discs[di].module;
+            let inline =
+                outline_mods(di, &outline, &exp.strings.clone(), &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
+            bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
+        }
+        while let Some(di) = new_queue.pop() {
+            process_disc_orig(di, &mut discs, &mut new_queue, tables, shared, cache, job, interner, &mut diags, &mut needs_std);
+        }
+        if !diags.is_empty() {
+            return Err(OneError { diags, seen: seen_of(&discs), needs_std });
+        }
+        // Files the expansions generated need their cfg names checked
+        // and their own expansion in the next round.
+        for disc in &discs[before..] {
+            if let Some(orig) = &disc.lexed
+                && let Err(d) = check_cfg_names(orig, &input.env, interner)
+            {
+                return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std });
+            }
+        }
+        if discs.len() == before {
+            break;
+        }
+        if round == 7 {
+            return Err(OneError {
+                diags: vec![Diag::new(
+                    "L0801",
+                    Span::default(),
+                    "macro-generated module discovery did not settle after 8 rounds".to_string(),
+                    "This is a lust bug; report it.",
+                )],
+                seen: seen_of(&discs),
+                needs_std,
+            });
+        }
+    }
+    let seen = seen_of(&discs);
+    let (map, _all) = make_map(&seen);
+    // Parse the expanded files, in FileId order as before.
+    let mut order: Vec<usize> = (0..discs.len()).collect();
+    order.sort_by_key(|&di| discs[di].file_id.0);
+    let mut works: Vec<FileWork> = Vec::new();
+    for &di in &order {
+        let disc = &discs[di];
+        let lexed = expanded[di]
+            .clone()
+            .unwrap_or_else(|| disc.lexed.clone().unwrap_or_else(|| lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }));
+        let ast = match parser::parse(&lexed, interner, known) {
+            Ok(a) => a,
+            Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
+        };
+        works.push(FileWork { path: disc.path.clone(), text: disc.text.clone(), file_id: disc.file_id, ast, module: disc.module });
+    }
+    // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
     for (fi, w) in works.iter().enumerate() {
         list_module.insert((fi, Vec::new()), w.module);
     }
-    let list_module = &mut list_module;
     for (fi, w) in works.iter().enumerate() {
-        collect_inline_modules(&w.ast.items, fi, &[], &tables, list_module);
+        collect_inline_modules(&w.ast.items, fi, &[], tables, &mut list_module);
     }
-
-    // ---- The worklist loop: strip, register, import, expand.
-    // Registration is idempotent (same target inserts are Same), so the
-    // loop can re-run it after an expansion changed items. With
-    // expansion disabled, round two confirms and stops.
+    // Strip, register, and run the import worklist.
     let mut inner_diags: Vec<Diag> = Vec::new();
     let mut imports: Vec<Import> = Vec::new();
-    let mut stripped = vec![false; works.len()];
-    let mut registered = vec![false; works.len()];
-    for round in 0..4 {
-        for (fi, w) in works.iter_mut().enumerate() {
-            if !stripped[fi] {
-                strip_file(w, fi, input, interner, list_module, &mut tables, &mut inner_diags);
-                stripped[fi] = true;
-            }
-            // Registration renames defs, so it must run once per file
-            // even when the loop sweeps again after an expansion.
-            if !registered[fi] {
-                register_items(&mut w.ast.items, w.module, fi, &[], input, interner, &mut tables, list_module, &mut imports);
-                registered[fi] = true;
-            }
-        }
-        match run_imports(&mut tables, &imports, interner) {
-            Ok(ds) => inner_diags.extend(ds),
-            Err(e) => {
-                inner_diags.push(Diag::new("L0506", Span::default(), e, "This is a lust bug; report it."));
-            }
-        }
-        imports.clear();
-        let _ = round;
-        break;
+    for (fi, w) in works.iter_mut().enumerate() {
+        strip_file(w, fi, input, interner, &list_module, tables, &mut inner_diags);
+        register_items(&mut w.ast.items, w.module, fi, &[], input, &job.flat_prefix, interner, tables, &list_module, &mut imports);
+    }
+    match run_imports(tables, &imports, interner) {
+        Ok(ds) => inner_diags.extend(ds),
+        Err(e) => inner_diags.push(Diag::new("L0506", Span::default(), e, "This is a lust bug; report it.")),
     }
     if !inner_diags.is_empty() {
-        return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: inner_diags });
+        return Err(OneError { diags: inner_diags, seen, needs_std });
     }
-    // Associated fn visibility, keyed by the self type's def now that
-    // imports have settled (an impl may name an imported type).
     for w in works.iter() {
-        collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, &mut tables);
+        collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
     }
-
-    // ---- Rewrite paths to flat names, checking visibility. The
-    // tables are frozen at this point and each file's Ast is its own,
-    // so the pass runs in parallel across files; diagnostics merge
-    // back in file order.
-    let rw_diags = {
-        fn rewrite_chunk(
-            works: &mut [FileWork],
-            base: usize,
-            depth: u32,
-            tables: &ResolvedTables,
-            interner: &Interner,
-            list_module: &FxMap<ItemListKey, ModuleId>,
-        ) -> Vec<Diag> {
-            if works.len() <= 1 || depth == 0 {
-                let mut rw = Rewrite { tables, interner, list_module, diags: Vec::new() };
-                for (i, w) in works.iter_mut().enumerate() {
-                    let module = w.module;
-                    rw.file_items(&mut w.ast, base + i, module, &[]);
-                }
-                return rw.diags;
-            }
-            let mid = works.len() / 2;
-            let (left, right) = works.split_at_mut(mid);
-            std::thread::scope(|s| {
-                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module));
-                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module);
-                let mut diags = handle.join().unwrap();
-                diags.append(&mut right_diags);
-                diags
-            })
-        }
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let depth = (usize::BITS - cores.leading_zeros()).min(5);
-        rewrite_chunk(&mut works, 0, depth, &tables, interner, list_module)
-    };
-    if !rw_diags.is_empty() {
-        return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: rw_diags });
+    // Rewrite paths to flat names, checking visibility.
+    let mut rw = Rewrite { tables: &*tables, interner, list_module: &list_module, diags: Vec::new() };
+    for (fi, w) in works.iter_mut().enumerate() {
+        let module = w.module;
+        rw.file_items(&mut w.ast, fi, module, &[]);
     }
-
+    if !rw.diags.is_empty() {
+        return Err(OneError { diags: rw.diags, seen, needs_std });
+    }
     // ---- Flatten: inline module bodies splice into top-level items;
     // mod, use, and extern crate items drop. Each fn's module is
     // recorded here from its origin (file plus inline module path):
@@ -806,7 +1736,7 @@ pub fn resolve_crate_cached(
         }
         let mut flat_items = Vec::new();
         let mut flat_mods: Vec<ModuleId> = Vec::new();
-        flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], list_module, &mut flat_items, &mut flat_mods);
+        flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], &list_module, &mut flat_items, &mut flat_mods);
         for (item, module) in flat_items.iter().zip(flat_mods.iter()) {
             let mut push = |def: &FnDef| {
                 fn_lines.push(map.line_col(def.name_span).0);
@@ -830,12 +1760,11 @@ pub fn resolve_crate_cached(
         chunks.push(w.ast);
     }
     let ast = Ast::concat(chunks);
-    tables.fn_module = fn_module;
     let structure_hash = {
         use std::hash::Hasher;
         structure.finish()
     };
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std })
+    Ok(CrateOut { ast, fn_lines, body_hashes, fn_module, structure_hash, seen, needs_std, exported_macros: menv.exported_sources() })
 }
 
 /// Hashes one item list's module and import structure for
@@ -909,16 +1838,62 @@ fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
     }
 }
 
-/// Adds one extern crate to the prelude tables.
-fn push_extern(tables: &mut ResolvedTables, input: &CrateInput, name: &str, is_std_lib: bool) {
-    let hash = def::item_hash(crate::def::StableCrateHash(hash_str(name) | 1), &[], def::DefKind::Module, name, 0);
-    tables.externs.push(ExternInfo { name: name.to_string(), def: DefId { krate: input.crate_ids.local, hash }, is_std_lib });
+/// Stage marker for textual macro splicing (cross-file `#[macro_use]`
+/// and inherited textual macros). The worklist calls this on every
+/// file's original tokens before expansion; the implementation lands
+/// with the textual-scope step and is the identity until then.
+fn splice_textual(
+    _di: usize,
+    lexed: lexer::Lexed,
+    _discs: &[FileDisc],
+    _tables: &ResolvedTables,
+    _job: &CrateJob,
+    _interner: &Interner,
+) -> lexer::Lexed {
+    lexed
 }
 
-/// A macro def's stable hash: module path segments plus the name
-/// (section 1.7, the proper form; nothing else computes macro hashes).
-fn macro_hash(input: &CrateInput, interner: &Interner, module: ModuleId, tables: &ResolvedTables, name: Sym) -> DefPathHash {
-    let path: Vec<&str> = tables.modules[module.0 as usize].path.iter().map(|s| interner.get(*s)).collect();
+/// Adds one extern crate to one crate's prelude tables, if that crate
+/// has no entry with this name yet.
+fn push_extern(
+    tables: &mut ResolvedTables,
+    local: crate::def::CrateId,
+    owner: ModuleId,
+    name: &str,
+    is_std_lib: bool,
+    root_module: Option<ModuleId>,
+    unsupported: Option<String>,
+) {
+    if tables.extern_by_name(owner, name).is_some() {
+        return;
+    }
+    let hash = def::item_hash(crate::def::StableCrateHash(hash_str(name) | 1), &[], def::DefKind::Module, name, 0);
+    tables.externs.push(ExternInfo {
+        name: name.to_string(),
+        def: DefId { krate: local, hash },
+        is_std_lib,
+        owner,
+        root_module,
+        unsupported,
+    });
+}
+
+/// A macro def's stable hash: the crate flat prefix, module path
+/// segments, and the name. Nothing else computes macro hashes, and the
+/// prefix keeps two crates' same-named macros apart in one session.
+fn macro_hash(
+    input: &OneInput,
+    flat_prefix: &str,
+    interner: &Interner,
+    module: ModuleId,
+    tables: &ResolvedTables,
+    name: Sym,
+) -> DefPathHash {
+    let mut path: Vec<&str> = Vec::new();
+    if !flat_prefix.is_empty() {
+        path.push(flat_prefix);
+    }
+    path.extend(tables.modules[module.0 as usize].path.iter().map(|s| interner.get(*s)));
     def::item_hash(input.crate_ids.stable, &path, def::DefKind::Macro, interner.get(name), 0)
 }
 
@@ -932,14 +1907,16 @@ fn hash_str(s: &str) -> u64 {
 
 /// Records the module of each inline item list in one file's items.
 fn collect_inline_modules(items: &[Item], fi: usize, prefix: &[Sym], tables: &ResolvedTables, out: &mut FxMap<ItemListKey, ModuleId>) {
-    let parent_path: Vec<Sym> = out.get(&(fi, prefix.to_vec())).map(|m| tables.modules[m.0 as usize].path.clone()).unwrap_or_default();
+    let parent_mod = out.get(&(fi, prefix.to_vec())).copied();
+    let parent_path: Vec<Sym> = parent_mod.map(|m| tables.modules[m.0 as usize].path.clone()).unwrap_or_default();
+    let root = parent_mod.map(|m| tables.root_of(m)).unwrap_or(ROOT_MODULE);
     for item in items {
         if let ItemKind::Mod(m) = &item.kind {
             let mut key = prefix.to_vec();
             key.push(m.name);
             let mut full = parent_path.clone();
             full.push(m.name);
-            if let Some(id) = tables.module_by_path(&full) {
+            if let Some(id) = tables.module_by_path_in(root, &full) {
                 out.insert((fi, key.clone()), id);
                 if let Some(body) = &m.body {
                     collect_inline_modules(body, fi, &key, tables, out);
@@ -990,7 +1967,7 @@ fn path_attr_value(attrs: &[Attr], ast: &Ast, interner: &Interner) -> Option<Str
 fn strip_file(
     w: &mut FileWork,
     fi: usize,
-    input: &CrateInput,
+    input: &OneInput,
     interner: &Interner,
     list_module: &FxMap<ItemListKey, ModuleId>,
     tables: &mut ResolvedTables,
@@ -1024,7 +2001,7 @@ fn strip_items(
     fi: usize,
     prefix: &[Sym],
     w: &FileWork,
-    input: &CrateInput,
+    input: &OneInput,
     interner: &Interner,
     list_module: &FxMap<ItemListKey, ModuleId>,
     tables: &mut ResolvedTables,
@@ -1105,7 +2082,7 @@ fn strip_items(
 }
 
 /// Strips cfg'd-out fields from one field list.
-fn strip_fields(fs: &mut Vec<FieldDef>, input: &CrateInput, strings: &[String], interner: &Interner, diags: &mut Vec<Diag>) {
+fn strip_fields(fs: &mut Vec<FieldDef>, input: &OneInput, strings: &[String], interner: &Interner, diags: &mut Vec<Diag>) {
     fs.retain_mut(|f| {
         if let Err(d) = cfg::expand_cfg_attr(&input.env, &mut f.attrs, strings, interner) {
             diags.push(d);
@@ -1120,14 +2097,16 @@ fn strip_fields(fs: &mut Vec<FieldDef>, input: &CrateInput, strings: &[String], 
     });
 }
 
-/// The flat name of a def in a module: the plain name at the root, the
-/// module path joined with `$` elsewhere.
-fn flat_name(tables: &ResolvedTables, module: ModuleId, name: Sym, interner: &Interner) -> Sym {
-    if module == ROOT_MODULE {
+/// The flat name of a def in a module: the crate's flat prefix (empty
+/// for the selected crate, a stable-hash prefix for a source
+/// dependency), then the module path joined with `$`, then the name.
+/// The selected crate's root keeps plain names, as before.
+fn flat_name(tables: &ResolvedTables, flat_prefix: &str, module: ModuleId, name: Sym, interner: &Interner) -> Sym {
+    let path = &tables.modules[module.0 as usize].path;
+    if flat_prefix.is_empty() && path.is_empty() {
         return name;
     }
-    let path = &tables.modules[module.0 as usize].path;
-    let mut s = String::new();
+    let mut s = String::from(flat_prefix);
     for seg in path {
         s.push_str(interner.get(*seg));
         s.push('$');
@@ -1146,7 +2125,8 @@ fn register_items(
     module: ModuleId,
     fi: usize,
     prefix: &[Sym],
-    input: &CrateInput,
+    input: &OneInput,
+    flat_prefix: &str,
     interner: &Interner,
     tables: &mut ResolvedTables,
     list_module: &FxMap<ItemListKey, ModuleId>,
@@ -1170,18 +2150,18 @@ fn register_items(
                             input.crate_ids.stable,
                             &[],
                             def::DefKind::Module,
-                            interner.get(flat_name(tables, module, m.name, interner)),
+                            interner.get(flat_name(tables, flat_prefix, module, m.name, interner)),
                             0,
                         ),
                     };
                     bind(tables, Namespace::Type, m.name, Target::Module(child), vis());
                     if let Some(body) = &mut m.body {
-                        register_items(body, child, fi, &key, input, interner, tables, list_module, imports);
+                        register_items(body, child, fi, &key, input, flat_prefix, interner, tables, list_module, imports);
                     }
                 }
             }
             ItemKind::Fn(f) => {
-                let flat = flat_name(tables, module, f.name, interner);
+                let flat = flat_name(tables, flat_prefix, module, f.name, interner);
                 let def = DefId { krate: input.crate_ids.local, hash: def::free_fn_hash(input.crate_ids.stable, &[], interner.get(flat)) };
                 bind(tables, Namespace::Value, f.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Fn, flat, module, vis: vis() });
@@ -1189,7 +2169,7 @@ fn register_items(
                 f.name = flat;
             }
             ItemKind::Struct(s) => {
-                let flat = flat_name(tables, module, s.name, interner);
+                let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Adt && i.flat == flat).count() as u32;
                 let def = DefId {
                     krate: input.crate_ids.local,
@@ -1201,7 +2181,7 @@ fn register_items(
                 s.name = flat;
             }
             ItemKind::Enum(e) => {
-                let flat = flat_name(tables, module, e.name, interner);
+                let flat = flat_name(tables, flat_prefix, module, e.name, interner);
                 let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Adt && i.flat == flat).count() as u32;
                 let def = DefId {
                     krate: input.crate_ids.local,
@@ -1223,7 +2203,7 @@ fn register_items(
             }
             ItemKind::Const(c) => {
                 if let Some(name) = c.name {
-                    let flat = flat_name(tables, module, name, interner);
+                    let flat = flat_name(tables, flat_prefix, module, name, interner);
                     let def = DefId {
                         krate: input.crate_ids.local,
                         hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Const, interner.get(flat), 0),
@@ -1235,7 +2215,7 @@ fn register_items(
                 }
             }
             ItemKind::Static(s) => {
-                let flat = flat_name(tables, module, s.name, interner);
+                let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Static, interner.get(flat), 0),
@@ -1246,7 +2226,7 @@ fn register_items(
                 s.name = flat;
             }
             ItemKind::Type(a) => {
-                let flat = flat_name(tables, module, a.name, interner);
+                let flat = flat_name(tables, flat_prefix, module, a.name, interner);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::TypeAlias, interner.get(flat), 0),
@@ -1270,9 +2250,9 @@ fn register_items(
                 let bind_name = e.rename.unwrap_or(e.name);
                 if bind_name != interner.intern("_") {
                     let target = if e.name == interner.intern("self") {
-                        Some(Target::Module(ROOT_MODULE))
+                        Some(Target::Module(tables.root_of(module)))
                     } else {
-                        tables.extern_by_name(interner.get(e.name)).map(Target::Extern)
+                        tables.extern_by_name(module, interner.get(e.name)).map(|i| tables.extern_target(i))
                     };
                     if let Some(target) = target {
                         bind(tables, Namespace::Type, bind_name, target, vis());
@@ -1329,7 +2309,7 @@ fn collect_assoc_vis(ast: &Ast, items: &[Item], module: ModuleId, interner: &Int
                     // the path lookup finds it by name path.
                     let mut full = tables.modules[module.0 as usize].path.clone();
                     full.push(m.name);
-                    if let Some(child) = tables.module_by_path(&full) {
+                    if let Some(child) = tables.module_by_path_in(tables.root_of(module), &full) {
                         collect_assoc_vis(ast, body, child, interner, tables);
                     }
                 }
@@ -1561,7 +2541,10 @@ impl Rewrite<'_> {
                 // reports; leave the path written.
             }
             PathRes::Done(Target::Extern(i)) => {
-                if !self.tables.externs[i as usize].is_std_lib {
+                let e = &self.tables.externs[i as usize];
+                if let Some(why) = &e.unsupported {
+                    self.diags.push(unsupported_diag(why, span));
+                } else if !e.is_std_lib {
                     self.diags.push(crate::diag::not_yet("L0505", span, "items from other crates"));
                 }
             }
@@ -1583,7 +2566,10 @@ impl Rewrite<'_> {
             }
             PathRes::Partial(Target::Variant(..), _) => {}
             PathRes::Partial(Target::Extern(i), _) => {
-                if !self.tables.externs[i as usize].is_std_lib {
+                let e = &self.tables.externs[i as usize];
+                if let Some(why) = &e.unsupported {
+                    self.diags.push(unsupported_diag(why, span));
+                } else if !e.is_std_lib {
                     self.diags.push(crate::diag::not_yet("L0505", span, "items from other crates"));
                 }
             }
@@ -2186,7 +3172,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{crate_name}"), "bin", crate_name, false) },
             crate_name: crate_name.into(),
-            externs: Vec::new(),
+            deps: Vec::new(),
         };
         // The interner must outlive the tables' Syms only for lookups in
         // the test; leak it (tests are short-lived).
@@ -2249,6 +3235,48 @@ mod tests {
         };
         assert!(!defs(&a).is_empty());
         assert_ne!(defs(&a), defs(&b), "same file, different crates, different defs");
+    }
+
+    fn dep_unit(name: &str, version: &str, source: Option<&str>) -> super::super::cargo::DepUnit {
+        super::super::cargo::DepUnit {
+            extern_name: name.replace('-', "_"),
+            package_id: format!("pkg:{name}"),
+            package_name: name.into(),
+            version: version.into(),
+            source: source.map(str::to_string),
+            lib_src: PathBuf::from("/nonexistent/lib.rs"),
+            lib_name: name.into(),
+            edition: "2021".into(),
+            features: Vec::new(),
+            deps: Vec::new(),
+        }
+    }
+
+    /// Dependency classification (ARCH 1.1 table): a path package is
+    /// lust source whatever its name; a registry adapter or shim with
+    /// no lust-side crate rejects with a reason naming the crate.
+    #[test]
+    fn dep_classification_names_unsupported_crates() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        match classify_dep(&dep_unit("indexmap", "2.14.0", registry)) {
+            DepClass::Unsupported(why) => assert!(why.contains("indexmap"), "{why}"),
+            DepClass::Source { .. } => {
+                // A lust adapter may have landed in library/deps since
+                // this test was written; then source is the answer.
+            }
+        }
+        match classify_dep(&dep_unit("indexmap", "0.1.0", None)) {
+            DepClass::Source { adapter, .. } => assert!(!adapter, "a path package named indexmap is plain source"),
+            DepClass::Unsupported(why) => panic!("path package must be source: {why}"),
+        }
+        match classify_dep(&dep_unit("rustix", "1.0.0", registry)) {
+            DepClass::Unsupported(why) => assert!(why.contains("rustix"), "{why}"),
+            DepClass::Source { .. } => {}
+        }
+        match classify_dep(&dep_unit("frobnicator", "1.0.0", registry)) {
+            DepClass::Unsupported(why) => assert!(why.contains("frobnicator"), "{why}"),
+            DepClass::Source { .. } => panic!("an unknown registry crate has no lust form"),
+        }
     }
 
     /// The explicit-through-glob example of section 1.3 resolves, and a

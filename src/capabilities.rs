@@ -509,6 +509,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("generic parameter defaults", "L0614"),
     ("negative impls", "L0614"),
     ("associated consts", "L0621"),
+    ("dependency crates with no lust adapter or shim yet (named in the message)", "L0508"),
     ("patterns in parameters", "L0820"),
     ("`impl Trait` types", "L0602"),
     ("`dyn Trait` types", "L0602"),

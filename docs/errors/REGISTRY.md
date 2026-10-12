@@ -39,9 +39,10 @@ prints "reserved, not yet emitted".
 | L0501 | Modules and imports | W-RESOLVE | reserved | Import cycle does not settle |
 | L0502-L0503 | Modules and imports | W-RESOLVE | in use | L0502 ambiguous module file, L0503 module file not found |
 | L0504 | Modules and imports | W-RESOLVE | reserved | Generated name changes an earlier resolution |
-| L0505 | Modules and imports | W-RESOLVE | in use | Module, import, and module-path forms are not supported yet (S3b parser reject) |
+| L0505 | Modules and imports | W-RESOLVE | in use | Module-path forms lust cannot place yet (source-dependency items work; see L0508) |
 | L0506-L0507 | Modules and imports | W-RESOLVE | in use | L0506 unresolved import, L0507 ambiguous glob name used |
-| L0508-L0509 | Modules and imports | W-RESOLVE | reserved | |
+| L0508 | Modules and imports | W-RESOLVE | in use | Dependency crate has no lust source, adapter, or shim form yet |
+| L0509 | Modules and imports | W-RESOLVE | reserved | |
 | L0510 | Visibility | W-RESOLVE | in use | Item or field is private |
 | L0511-L0519 | Visibility | W-RESOLVE | reserved | |
 | L0520 | cfg and attributes | W-RESOLVE | in use | Unknown cfg name |

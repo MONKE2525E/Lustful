@@ -56,6 +56,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0505](L0505.md) | this module path form is not supported yet |
 | [L0506](L0506.md) | unresolved import |
 | [L0507](L0507.md) | ambiguous name from glob imports |
+| [L0508](L0508.md) | dependency crate has no lust form yet |
 | [L0510](L0510.md) | item is private |
 | [L0520](L0520.md) | unknown cfg name |
 | [L0530](L0530.md) | unsupported edition |

@@ -1,0 +1,13 @@
+# Valid Rust lust rejects: `indexmap` is an adapter crate (ARCH 3.6)
+# and no lust adapter exists yet, so the use rejects with L0508
+# naming the crate. The vendored directory source stands in for the
+# registry so the fixture runs offline.
+[package]
+name = "adapter-missing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+indexmap = "2.14.0"
+
+[workspace]

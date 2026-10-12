@@ -1,0 +1,5 @@
+# A 3-crate workspace with path dependencies (ARCH 1.8): lust
+# compiles base and mid from source in the same session as app.
+[workspace]
+members = ["base", "mid", "app"]
+resolver = "2"

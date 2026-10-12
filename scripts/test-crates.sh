@@ -8,6 +8,9 @@
 # key=value per line (# starts a comment):
 #   bin=<name>        bin target to build (default: the package name)
 #   root=<path>       crate root file for the lust build (default: src/main.rs)
+#   manifest=<path>   manifest for both builds, relative to the fixture
+#                     root (default: Cargo.toml). Workspace fixtures name
+#                     the bin package's manifest here.
 #   features=<a,b>    passed to cargo and to lust as --features
 #   target=<triple>   passed to cargo and to lust as --target; the value
 #                     `host` means the rustc host triple. No line = no flag.
@@ -69,6 +72,7 @@ for dir in "$fixtures"/*/; do
 
   # Fixture selections, with the defaults named in the header.
   bin=$(sed -n 's/^name = "\(.*\)"/\1/p' "$case_dir/proj/Cargo.toml" | head -1)
+  manifest=Cargo.toml
   root_file=src/main.rs
   features=""
   target=""
@@ -80,6 +84,7 @@ for dir in "$fixtures"/*/; do
       case "$k" in
         bin) bin=$v ;;
         root) root_file=$v ;;
+        manifest) manifest=$v ;;
         features) features=$v ;;
         target) target=$v ;;
         expect) expect=$v ;;
@@ -93,9 +98,9 @@ for dir in "$fixtures"/*/; do
   fi
   if [ "$target" = host ]; then target=$host_triple; fi
 
-  cargo_args=(build --manifest-path "$case_dir/proj/Cargo.toml" --bin "$bin")
+  cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
   lust_args=(build "$case_dir/proj/$root_file" -o "$case_dir/lust.bin"
-    --manifest-path "$case_dir/proj/Cargo.toml" --bin "$bin")
+    --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
   if [ -n "$features" ]; then
     cargo_args+=(--features "$features")
     lust_args+=(--features "$features")
@@ -108,7 +113,7 @@ for dir in "$fixtures"/*/; do
   fi
 
   cargo_ok=1
-  if ! timeout 60 cargo "${cargo_args[@]}" --target-dir "$case_dir/cargo-target" >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"; then
+  if ! (cd "$case_dir/proj" && timeout 60 cargo "${cargo_args[@]}" --target-dir "$case_dir/cargo-target") >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"; then
     cargo_ok=0
   fi
   if [ -n "$expect" ]; then

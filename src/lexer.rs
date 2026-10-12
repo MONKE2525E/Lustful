@@ -256,6 +256,7 @@ pub fn flatten_trees(trees: &[TokenTree], out: &mut Vec<Token>) {
     }
 }
 
+#[derive(Clone)]
 pub struct Lexed {
     pub tokens: Vec<Token>,
     pub strings: Vec<String>,

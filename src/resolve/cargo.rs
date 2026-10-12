@@ -233,7 +233,7 @@ pub struct PackageInfo {
 }
 
 /// One selected compilation unit: a package target with its exact
-/// per-unit feature set and its extern prelude (dependency lib crates).
+/// per-unit feature set and its dependency tree (lib crates only).
 #[derive(Clone, Debug)]
 pub struct UnitInfo {
     pub package: PackageInfo,
@@ -243,8 +243,35 @@ pub struct UnitInfo {
     /// name, version, and the workspace-relative manifest path.
     pub package_id: String,
     pub features: Vec<String>,
-    /// (extern name as written in paths, package id repr, lib src path).
-    pub externs: Vec<(String, String, PathBuf)>,
+    /// Direct dependency lib units, each with its own dependencies.
+    pub deps: Vec<DepUnit>,
+}
+
+/// One dependency lib unit of a selected crate, recursively: everything
+/// the resolver needs to classify the dependency (ARCH 1.1 table) and,
+/// for a lust-source dependency, to compile it in the same workspace
+/// session (ARCH 1.8).
+#[derive(Clone, Debug)]
+pub struct DepUnit {
+    /// The name paths in the dependent crate use (rename or the package
+    /// name, with `-` read as `_`).
+    pub extern_name: String,
+    /// The stable package identity string (`package_id_string`).
+    pub package_id: String,
+    /// The Cargo package name as written (may contain `-`).
+    pub package_name: String,
+    pub version: String,
+    /// The package source: None for a path package, else the registry
+    /// or git source string from metadata.
+    pub source: Option<String>,
+    /// The lib target's root file.
+    pub lib_src: PathBuf,
+    /// The lib target's name (the crate name, with `-` as written).
+    pub lib_name: String,
+    pub edition: String,
+    /// The exact feature set of this unit, as for the selected unit.
+    pub features: Vec<String>,
+    pub deps: Vec<DepUnit>,
 }
 
 /// The full graph for one request.
@@ -329,6 +356,12 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
         return Ok(g.clone());
     }
     let mut cmd = Command::new("cargo");
+    // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
+    // from the working directory, and the project's config (source
+    // replacement, aliases) must apply as it does for the user there.
+    if let Some(dir) = req.manifest_path.parent() {
+        cmd.current_dir(dir);
+    }
     cmd.args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&req.manifest_path);
     if !req.features.is_empty() {
         cmd.args(["--features", &req.features.join(",")]);
@@ -355,13 +388,15 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     let members: Vec<String> = root.get("workspace_members").map(|v| v.strings()).unwrap_or_default();
     // Resolve nodes: features per package id, and the exact dep edges.
     let mut node_features: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut node_deps: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
+    // (dependency name as in the manifest, resolved package id, kind, target)
+    let mut node_deps: std::collections::HashMap<String, Vec<(String, String, String, Option<String>)>> = std::collections::HashMap::new();
     if let Some(nodes) = root.get("resolve").and_then(|r| r.get("nodes")) {
         for n in nodes.as_arr() {
             let Some(id) = n.get("id").and_then(|v| v.as_str()) else { continue };
             node_features.insert(id.to_string(), n.get("features").map(|v| v.strings()).unwrap_or_default());
             let mut deps = Vec::new();
             for d in n.get("deps").map(|v| v.as_arr()).unwrap_or(&[]) {
+                let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let pkg = d.get("pkg").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 for k in d.get("dep_kinds").map(|v| v.as_arr()).unwrap_or(&[]) {
                     let kind = match k.get("kind") {
@@ -369,10 +404,10 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
                         _ => "normal".to_string(),
                     };
                     let target = k.get("target").and_then(|v| v.as_str()).map(str::to_string);
-                    deps.push((pkg.clone(), kind, target));
+                    deps.push((name.clone(), pkg.clone(), kind, target));
                 }
                 if d.get("dep_kinds").is_none() {
-                    deps.push((pkg, "normal".into(), None));
+                    deps.push((name, pkg, "normal".into(), None));
                 }
             }
             node_deps.insert(id.to_string(), deps);
@@ -398,16 +433,17 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
             })
             .collect();
         // Fill each dependency's resolved package by matching the resolve
-        // edges of this package (name plus kind plus target).
+        // edges of this package (dependency name plus kind plus target;
+        // the resolve node's name is the dependency lib name, with `-`
+        // read as `_` on both sides).
         if let Some(edges) = node_deps.get(&id_repr) {
             for dep in &mut dependencies {
-                let pkg_name = dep.rename.clone().unwrap_or_else(|| dep.name.clone());
-                let _ = pkg_name;
+                let want = dep.name.replace('-', "_");
                 dep.pkg = edges
                     .iter()
-                    .find(|(_, kind, target)| *kind == dep.kind && *target == dep.target)
-                    .map(|(pkg, _, _)| pkg.clone())
-                    .or_else(|| edges.first().map(|(pkg, _, _)| pkg.clone()));
+                    .find(|(name, _, kind, target)| name.replace('-', "_") == want && *kind == dep.kind && *target == dep.target)
+                    .or_else(|| edges.iter().find(|(name, _, kind, _)| name.replace('-', "_") == want && *kind == dep.kind))
+                    .map(|(_, pkg, _, _)| pkg.clone());
             }
         }
         packages.push(PackageInfo {
@@ -472,6 +508,9 @@ fn unit_features_via_check(req: &GraphRequest) -> Option<std::collections::HashM
         return Some(v.clone());
     }
     let mut cmd = Command::new("cargo");
+    if let Some(dir) = req.manifest_path.parent() {
+        cmd.current_dir(dir);
+    }
     cmd.args(["check", "--message-format=json", "--manifest-path"]).arg(&req.manifest_path);
     if let Some(pkg) = &req.package {
         cmd.args(["-p", pkg]);
@@ -554,16 +593,33 @@ pub fn select_unit(
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
-    let features = if simple_graph {
-        pkg.resolved_features.clone()
-    } else {
-        unit_features_via_check(req)
-            .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
-            .unwrap_or_else(|| pkg.resolved_features.clone())
-    };
-    // Extern prelude: direct dependencies whose kind and target select
-    // them for this unit. Dev-dependencies join only test crates.
-    let mut externs = Vec::new();
+    let check_map = if simple_graph { None } else { unit_features_via_check(req) };
+    let features = check_map
+        .as_ref()
+        .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
+        .unwrap_or_else(|| pkg.resolved_features.clone());
+    // Dependency tree: direct dependencies whose kind and target select
+    // them for this unit, recursively. Dev-dependencies join only the
+    // selected test crate itself, never its dependencies.
+    let mut stack = vec![pkg.id_repr.clone()];
+    let deps = build_deps(graph, pkg, env, interner, test_crate, &check_map, &mut stack);
+    Ok(UnitInfo { package_id: package_id_string(graph, pkg), package: pkg.clone(), target: target.clone(), features, deps })
+}
+
+/// Builds the lib dependency units of one package, recursively. A
+/// package already on the stack (a dev-dependency cycle, the only cycle
+/// Cargo allows) is not entered again; its unit still appears at the
+/// level where it was first reached.
+fn build_deps(
+    graph: &CrateGraph,
+    pkg: &PackageInfo,
+    env: &CfgEnv,
+    interner: &crate::intern::Interner,
+    test_crate: bool,
+    check_map: &Option<std::collections::HashMap<(String, String), Vec<String>>>,
+    stack: &mut Vec<String>,
+) -> Vec<DepUnit> {
+    let mut out = Vec::new();
     for dep in &pkg.dependencies {
         let kind_ok = dep.kind == "normal" || (test_crate && dep.kind == "dev");
         if !kind_ok || !dep_target_matches(env, dep.target.as_deref(), interner) {
@@ -573,9 +629,32 @@ pub fn select_unit(
         let Some(dep_pkg) = graph.packages.iter().find(|p| &p.id_repr == dep_pkg_id) else { continue };
         let Some(lib) = dep_pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) else { continue };
         let extern_name = dep.rename.clone().unwrap_or_else(|| dep.name.replace('-', "_"));
-        externs.push((extern_name, dep_pkg.id_repr.clone(), lib.src_path.clone()));
+        let features = check_map
+            .as_ref()
+            .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())
+            .unwrap_or_else(|| dep_pkg.resolved_features.clone());
+        let sub = if stack.contains(&dep_pkg.id_repr) {
+            Vec::new()
+        } else {
+            stack.push(dep_pkg.id_repr.clone());
+            let s = build_deps(graph, dep_pkg, env, interner, false, check_map, stack);
+            stack.pop();
+            s
+        };
+        out.push(DepUnit {
+            extern_name,
+            package_id: package_id_string(graph, dep_pkg),
+            package_name: dep_pkg.name.clone(),
+            version: dep_pkg.version.clone(),
+            source: dep_pkg.source.clone(),
+            lib_src: lib.src_path.clone(),
+            lib_name: lib.name.clone(),
+            edition: lib.edition.clone(),
+            features,
+            deps: sub,
+        });
     }
-    Ok(UnitInfo { package_id: package_id_string(graph, pkg), package: pkg.clone(), target: target.clone(), features, externs })
+    out
 }
 
 /// The edition gate for a selected unit (section 1.1): lust source crates
