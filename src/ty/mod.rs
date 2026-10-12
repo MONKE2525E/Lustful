@@ -13,6 +13,7 @@
 // and kin), never by matching on a builtin `TyKind` case.
 pub mod defs;
 pub mod lang;
+pub mod layout;
 pub use defs::{DefData, Defs, SigData};
 
 use crate::def::{CrateId, DefId, StableCrateHash};
