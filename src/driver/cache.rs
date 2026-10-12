@@ -133,6 +133,17 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     let cmd: &[u8] = if req.cmd == Cmd::Check { b"check" } else { b"build" };
     let flags = [req.json as u8, req.debug as u8];
     let session = req.session.describe();
+    // The graph key and the build script output hash (section 1.1):
+    // editing Cargo.toml, Cargo.lock, a cargo config, or a build script
+    // input must miss a stored whole-request answer instead of
+    // replaying one resolved under the old graph. The build script
+    // check only hashes recorded inputs while they hold; a stale
+    // record re-runs the script through Cargo here.
+    let graph = crate::protocol::graph_key(&req.session);
+    let build_script = match crate::protocol::manifest_dir(&req.session) {
+        Some(dir) => crate::driver::buildscript::refresh(&dir, &cache_dir(&req.file)).hash(),
+        None => 0,
+    };
     let (a, b) = hash128(
         &[
             &id.0.to_le_bytes(),
@@ -143,6 +154,8 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
             &req.max_errors.to_le_bytes(),
             req.file.to_string_lossy().as_bytes(),
             session.as_bytes(),
+            &graph.to_le_bytes(),
+            &build_script.to_le_bytes(),
             src,
         ],
         13,

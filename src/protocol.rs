@@ -132,6 +132,81 @@ fn sort_features(features: &mut Vec<String>) {
     features.dedup();
 }
 
+/// A small self-contained string hash for graph keys. This module is also
+/// compiled into the thin client, which has no other hash helper.
+fn hash_bytes(seed: u64, parts: &[&[u8]]) -> u64 {
+    let mut h = seed ^ 0x51_7C_C1_B7_27_22_0A_95;
+    for part in parts {
+        h = (h.rotate_left(5) ^ part.len() as u64).wrapping_mul(0x51_7C_C1_B7_27_22_0A_95);
+        for &b in *part {
+            h = (h.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7C_C1_B7_27_22_0A_95);
+        }
+    }
+    h ^= h >> 29;
+    h
+}
+
+/// The Cargo graph key for one session selection (docs/ARCH.md section
+/// 1.1): the full resolver input, not only file hashes. Covers the
+/// manifest bytes (the session's manifest, or the nearest one above the
+/// crate root), the nearest `Cargo.lock` at or above the manifest, the
+/// `.cargo/config.toml` (and legacy `.cargo/config`) chain from the
+/// manifest dir to the filesystem root, and the whole session selection
+/// (requested package and target, features with the default-feature
+/// policy, target triple, profile flags) through `describe`. Hashing
+/// every workspace `Cargo.toml` joins when W-RESOLVE reads real graph
+/// data from Cargo; until then the lock file covers workspace member
+/// and version edits in practice. Daemon routing compares this key per
+/// request: an edit to any covered file routes the crate to a fresh
+/// session instead of reusing state resolved under the old graph. The
+/// cold disk cache mixes it into the whole-request key for the same
+/// reason.
+/// The manifest directory of a session selection: its named manifest's
+/// directory, or the nearest manifest above the crate root. Build
+/// script lookup and graph keys both anchor here, so every routing
+/// layer agrees on which package a session belongs to. A synthetic
+/// single-file crate (`file:` package id, no manifest named) has no
+/// manifest anchor: a file that merely sits inside some other package
+/// (a test fixture under a repo root, say) must not inherit that
+/// package's graph or build script.
+pub fn manifest_dir(session: &SessionKey) -> Option<PathBuf> {
+    match &session.krate.manifest_path {
+        Some(p) => p.parent().map(Path::to_path_buf),
+        None if session.krate.package_id.starts_with("file:") => None,
+        None => find_manifest(&session.krate.root).map(|m| m.dir),
+    }
+}
+
+pub fn graph_key(session: &SessionKey) -> u64 {
+    let mut h = hash_bytes(1, &[session.describe().as_bytes()]);
+    let manifest_path = match &session.krate.manifest_path {
+        Some(p) => Some(p.clone()),
+        // Same synthetic-crate rule as `manifest_dir`.
+        None if session.krate.package_id.starts_with("file:") => None,
+        None => find_manifest(&session.krate.root).map(|m| m.path),
+    };
+    if let Some(manifest) = manifest_path {
+        if let Ok(bytes) = std::fs::read(&manifest) {
+            h = hash_bytes(h, &[b"manifest", &bytes]);
+        }
+        let mut dir = manifest.parent();
+        let mut lock_found = false;
+        while let Some(d) = dir {
+            for name in [".cargo/config.toml", ".cargo/config"] {
+                if let Ok(bytes) = std::fs::read(d.join(name)) {
+                    h = hash_bytes(h, &[name.as_bytes(), &bytes]);
+                }
+            }
+            if !lock_found && let Ok(bytes) = std::fs::read(d.join("Cargo.lock")) {
+                h = hash_bytes(h, &[b"lock", &bytes]);
+                lock_found = true;
+            }
+            dir = d.parent();
+        }
+    }
+    h
+}
+
 /// The host target triple, for the tier-1 hosts lust runs on. Empty when the
 /// host is not in the table (an explicit `--target` then never matches it).
 pub fn host_triple() -> &'static str {
@@ -857,6 +932,36 @@ mod tests {
             compile_req(&["check", "/tmp/x/main.rs", "--all-features"]).session.describe(),
             "all features"
         );
+    }
+
+    /// The graph key (1.1) covers every resolver input on disk: manifest
+    /// bytes, lock bytes, the cargo config chain, and the selection. An
+    /// edit to any one must move it, or the daemon would route the crate
+    /// to a session resolved under the old graph.
+    #[test]
+    fn graph_key_covers_resolver_inputs() {
+        let dir = std::env::temp_dir().join(format!("lust-graphkey-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"g\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut key = SessionKey::synthetic(&dir.join("src/main.rs"), false);
+        key.krate.manifest_path = Some(dir.join("Cargo.toml"));
+        let base = graph_key(&key);
+        assert_eq!(graph_key(&key), base, "stable with no edit");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"g\"\nversion = \"0.2.0\"\n").unwrap();
+        let after_manifest = graph_key(&key);
+        assert_ne!(after_manifest, base, "manifest edit");
+        std::fs::write(dir.join("Cargo.lock"), "version = 4\n").unwrap();
+        assert_ne!(graph_key(&key), after_manifest, "lock appears");
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(dir.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+        let after_config = graph_key(&key);
+        assert_ne!(after_config, after_manifest, "cargo config appears");
+        let mut featured = key.clone();
+        featured.features = vec!["alpha".into()];
+        assert_ne!(graph_key(&featured), after_config, "feature selection");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Manifest and package flags name a real crate: package identity from

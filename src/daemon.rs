@@ -54,11 +54,37 @@ fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) 
     unsafe { poll(&mut pfd, 1, ms) > 0 && pfd.revents & POLLIN != 0 }
 }
 
+/// The per-request refresh key of one crate selection: the Cargo graph
+/// key (protocol::graph_key, section 1.1) mixed with the build script
+/// output hash (driver::buildscript). Routing by SessionKey alone would
+/// reuse a session resolved under an old Cargo.toml, lock file, config,
+/// or build script; when this key moves, the entry's session is
+/// replaced before the request is served.
+fn refresh_key(key: &SessionKey) -> u64 {
+    let graph = protocol::graph_key(key);
+    let build_script = match protocol::manifest_dir(key) {
+        Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root)) {
+            r @ crate::driver::buildscript::Refresh::Failed { .. } => {
+                if let crate::driver::buildscript::Refresh::Failed { error, .. } = &r {
+                    eprintln!("lust daemon: build script refresh failed for {}: {error}", dir.display());
+                }
+                r.hash()
+            }
+            r => r.hash(),
+        },
+        None => 0,
+    };
+    graph ^ build_script.rotate_left(17)
+}
+
 struct Entry {
     session: Session,
     /// Directory stem for this crate's sessions; fresh sessions get "<dir>r<n>".
     dir: PathBuf,
     resets: u64,
+    /// The refresh key (graph key + build script hash) the current
+    /// session was resolved under. See `refresh_key`.
+    refresh_key: u64,
     /// Requests served for this key. A background guard carries the count at
     /// its spawn, so a slow older result cannot replace a session that a
     /// newer guard already replaced (`replaced_gen`).
@@ -78,7 +104,16 @@ impl Entry {
     }
 
     fn new(dir: PathBuf, key: SessionKey) -> Entry {
-        Entry { session: Session::new(dir.clone(), true, key), dir, resets: 0, served: 0, replaced_gen: 0, recompute_next: false }
+        let rk = refresh_key(&key);
+        Entry {
+            session: Session::new(dir.clone(), true, key),
+            dir,
+            resets: 0,
+            refresh_key: rk,
+            served: 0,
+            replaced_gen: 0,
+            recompute_next: false,
+        }
     }
 }
 
@@ -410,6 +445,19 @@ pub fn serve(sock: &Path) -> ! {
                 // compile, so a marked recompute takes effect here.
                 jobs.drain(&mut sessions);
                 let entry = entry_for(&mut sessions, &base, &req.session);
+                // Graph and build-script routing (sections 1.1, 1.8): if
+                // a covered file changed since this session was made,
+                // replace it before serving, never after.
+                let rk = refresh_key(&req.session);
+                if entry.refresh_key != rk {
+                    eprintln!(
+                        "lust daemon: graph or build script changed for crate {}; starting a fresh session",
+                        req.session.describe()
+                    );
+                    let dir = entry.fresh_dir();
+                    entry.session = Session::new(dir, true, req.session.clone());
+                    entry.refresh_key = rk;
+                }
                 compile_guarded(entry, &req, &mut jobs)
             }
             None => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
