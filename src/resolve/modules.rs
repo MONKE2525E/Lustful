@@ -48,13 +48,15 @@ pub fn search_dir(file: &Path, is_crate_root: bool, inline_path: &[String]) -> P
 /// `mod` item in a file module (no inline container) this is the file's
 /// own directory even when the file is not a dir owner; that is Rust's
 /// rule for `#[path]` and differs from the default search directory.
-pub fn path_attr_base(file: &Path, inline_path: &[String]) -> PathBuf {
+pub fn path_attr_base(file: &Path, is_crate_root: bool, inline_path: &[String]) -> PathBuf {
     let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
     // A `#[path]` inside inline modules is relative to the *module*
-    // directory: for a non-dir-owner file that includes the file stem,
-    // matching the search directory the inline module itself would use.
+    // directory: the search directory the inline module itself would
+    // use, which adds the file stem only for a non-dir-owner file
+    // that is not the crate root (a crate root named anything, such
+    // as `goport_util_root.rs`, searches its own directory).
     if !inline_path.is_empty() {
-        return search_dir(file, false, inline_path);
+        return search_dir(file, is_crate_root, inline_path);
     }
     dir
 }
@@ -72,7 +74,7 @@ pub fn module_file(
     span: Span,
 ) -> Result<PathBuf, Diag> {
     if let Some(p) = path_attr {
-        let full = path_attr_base(file, inline_path).join(p);
+        let full = path_attr_base(file, is_crate_root, inline_path).join(p);
         if full.is_file() {
             return Ok(full);
         }
@@ -153,6 +155,16 @@ mod tests {
         assert_eq!(module_file(&root, true, &[], "nope", None, span).unwrap_err().code, "L0503");
         // #[path] from the crate root file is relative to its directory.
         assert_eq!(module_file(&root, true, &[], "x", Some("flat.rs"), span).unwrap(), dir.join("flat.rs"));
+        // #[path] in an inline module of a crate root file with a
+        // non-dir-owner name: file directory plus inline segments,
+        // with no file-stem segment.
+        let named_root = dir.join("root_file.rs");
+        fs::create_dir_all(dir.join("frontend")).unwrap();
+        fs::write(dir.join("frontend/util_prelude.rs"), "").unwrap();
+        assert_eq!(
+            module_file(&named_root, true, &["frontend".into()], "prelude", Some("util_prelude.rs"), span).unwrap(),
+            dir.join("frontend/util_prelude.rs")
+        );
         assert_eq!(module_file(&root, true, &[], "x", Some("no.rs"), span).unwrap_err().code, "L0503");
         let _ = fs::remove_dir_all(&dir);
     }

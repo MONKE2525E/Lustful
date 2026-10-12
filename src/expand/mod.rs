@@ -892,10 +892,16 @@ pub fn splice_placeholders(trees: Vec<Tt>, name: &str, replacement: &[Tt], inter
 /// closing group and optional `;`), and `strings` is the string table
 /// those tokens index into; the expander remaps them into its own table
 /// and compiles the definition there, so string values stay exact.
+#[derive(Clone)]
 pub struct MacroSeed {
     pub path: Vec<Sym>,
     pub tokens: Vec<Token>,
     pub strings: Vec<String>,
+    /// When set, this seed also answers plain `name!` calls in this
+    /// module path: it records a glob import (`use a::*;`) of this
+    /// macro into that module, which the worklist resolved. Plain
+    /// seeds leave it None and stay path-only, as before.
+    pub import_into: Option<Vec<Sym>>,
 }
 
 /// Expands every macro in one lexed file or chunk, returning the
@@ -1207,6 +1213,9 @@ impl<'a> Expander<'a> {
                 let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
                 let idx = self.register(Rc::new(compiled), at_root, false);
                 self.by_path.insert((seed.path.clone(), def.name), idx);
+                if let Some(module) = &seed.import_into {
+                    self.module_imports.insert((module.clone(), def.name), idx);
+                }
                 return Ok(());
             }
             i += 1;
@@ -1974,6 +1983,19 @@ impl<'a> Expander<'a> {
                     if !on {
                         if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
                             return Ok(def.end);
+                        }
+                        // A macro call is boundable even though it is
+                        // not a keyword item: path, `!`, its group,
+                        // and an optional `;`. Dropping it here keeps
+                        // a disabled `include!` or `compile_error!`
+                        // from ever expanding (found in ts-rust's
+                        // wasm-only bundled embed).
+                        if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner) {
+                            let mut end = group_idx + 1;
+                            if tok_at(trees, end).map(|t| t.tok) == Some(Tok::Semi) {
+                                end += 1;
+                            }
+                            return Ok(end);
                         }
                         if let Some(end) = item_end(trees, after, self.ctx.interner) {
                             return Ok(end);

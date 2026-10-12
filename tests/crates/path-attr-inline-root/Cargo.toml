@@ -1,0 +1,17 @@
+# A #[path] inside an inline module of a crate root file whose name
+# is not a dir owner (the goport_util_root.rs shape in ts-rust): the
+# path is relative to the file directory plus inline segments, with
+# no file-stem directory in between.
+[package]
+name = "path-attr-inline-root"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/root_file.rs"
+
+[[bin]]
+name = "path-attr-inline-root"
+path = "src/main.rs"
+
+[workspace]

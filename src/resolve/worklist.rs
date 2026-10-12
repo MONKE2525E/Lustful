@@ -1086,6 +1086,7 @@ fn macro_tok_range(toks: &[crate::lexer::Token], start: usize) -> (usize, usize)
 
 /// One module-level `use` naming a single name, for the macro
 /// path-binding fixpoint.
+#[derive(Clone)]
 struct UseSite {
     module: Vec<Sym>,
     pubish: bool,
@@ -1355,6 +1356,9 @@ struct MacroEnv {
     /// `#[macro_use] extern crate` in the original file: the sources
     /// join textual scope right after that item.
     after_mods: Vec<Vec<(u32, Vec<usize>, bool)>>,
+    /// Per disc: extra seeds for macros this file's glob imports
+    /// bring into plain-name scope (`use crate::prelude::*;`).
+    glob_seeds: Vec<Vec<crate::expand::MacroSeed>>,
 }
 
 impl MacroEnv {
@@ -1441,16 +1445,20 @@ impl MacroEnv {
         }
         // The re-export fixpoint over this crate's use items.
         let mut sites: Vec<UseSite> = Vec::new();
+        let mut sites_by_disc: Vec<Vec<UseSite>> = Vec::with_capacity(discs.len());
         for (di, disc) in discs.iter().enumerate() {
             let base = tables.modules[disc.module.0 as usize].path.clone();
+            let mut mine: Vec<UseSite> = Vec::new();
             if let Some(orig) = &disc.lexed {
                 let (trees, _) = crate::lexer::build_trees(&orig.tokens);
-                scan_use_sites(&trees, &base, interner, &mut sites);
+                scan_use_sites(&trees, &base, interner, &mut mine);
             }
             if let Some(Some(exp)) = expanded.get(di) {
                 let (trees, _) = crate::lexer::build_trees(&exp.tokens);
-                scan_use_sites(&trees, &base, interner, &mut sites);
+                scan_use_sites(&trees, &base, interner, &mut mine);
             }
+            sites.extend(mine.iter().cloned());
+            sites_by_disc.push(mine);
         }
         let crate_sym = interner.intern("crate");
         let self_sym = interner.intern("self");
@@ -1559,7 +1567,7 @@ impl MacroEnv {
             let src = &owned[bindings[key]];
             let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
             rename_macro_token(&mut tokens, key.1);
-            seeds.push(crate::expand::MacroSeed { path: key.0.clone(), tokens, strings: src.strings.clone() });
+            seeds.push(crate::expand::MacroSeed { path: key.0.clone(), tokens, strings: src.strings.clone(), import_into: None });
         }
         // Macros visible at this crate's root by path (its own
         // `#[macro_export]` definitions plus root re-exports), under
@@ -1571,8 +1579,37 @@ impl MacroEnv {
             let src = owned[bindings[key]].clone();
             root_sources.push(OwnedMacroSource { name: key.1, ..src });
         }
+        // Glob imports in each file bring the target module's
+        // path-visible macros into plain-name scope in the importing
+        // module (the expander's prescan does not track globs, so the
+        // worklist seeds them per file).
+        let mut glob_seeds: Vec<Vec<crate::expand::MacroSeed>> = Vec::with_capacity(discs.len());
+        for mine in &sites_by_disc {
+            let mut extra: Vec<crate::expand::MacroSeed> = Vec::new();
+            for site in mine {
+                if !site.glob {
+                    continue;
+                }
+                let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
+                let mut names: Vec<(Sym, usize)> =
+                    bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
+                names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
+                for (name, src_idx) in names {
+                    let src = &owned[src_idx];
+                    let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
+                    rename_macro_token(&mut tokens, name);
+                    extra.push(crate::expand::MacroSeed {
+                        path: target.clone(),
+                        tokens,
+                        strings: src.strings.clone(),
+                        import_into: Some(site.module.clone()),
+                    });
+                }
+            }
+            glob_seeds.push(extra);
+        }
         let (inherited, after_mods) = textual_env(job, discs, expanded, &srcs, &dep_owned, tables, interner);
-        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods }
+        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds }
     }
 
     /// The macro sources dependent crates see at this crate's root:
@@ -1733,6 +1770,7 @@ fn resolve_one(
         dep_owned: FxMap::default(),
         inherited: Vec::new(),
         after_mods: Vec::new(),
+        glob_seeds: Vec::new(),
     };
     for round in 0..8 {
         expanded.resize_with(discs.len(), || None);
@@ -1751,7 +1789,11 @@ fn resolve_one(
                 module_path: tables.modules[discs[di].module.0 as usize].path.clone(),
             };
             let spliced = menv.splice(di, orig, job);
-            match crate::expand::expand_lexed_seeded(spliced, &ects, &menv.seeds) {
+            let seeds: Vec<crate::expand::MacroSeed> = match menv.glob_seeds.get(di) {
+                Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
+                _ => menv.seeds.clone(),
+            };
+            match crate::expand::expand_lexed_seeded(spliced, &ects, &seeds) {
                 Ok(l) => expanded[di] = Some(l),
                 Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
             }

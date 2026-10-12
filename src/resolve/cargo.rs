@@ -602,7 +602,36 @@ pub fn select_unit(
     // them for this unit, recursively. Dev-dependencies join only the
     // selected test crate itself, never its dependencies.
     let mut stack = vec![pkg.id_repr.clone()];
-    let deps = build_deps(graph, pkg, env, interner, test_crate, &check_map, &mut stack);
+    let mut deps = build_deps(graph, pkg, env, interner, test_crate, &check_map, &mut stack);
+    // A bin, test, example, or bench target of a package with a lib
+    // target depends on that lib implicitly (Cargo adds it as an
+    // extern named by the lib crate name; it is not in the manifest
+    // dependency list). The same holds in ts-rust (the `tsgo` bin
+    // uses the `ts_goport` lib).
+    let target_is_lib = target.kind.iter().any(|k| k == "lib" || k == "rlib");
+    if !target_is_lib {
+        if let Some(lib) = pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) {
+            let lib_features = check_map
+                .as_ref()
+                .and_then(|m| m.get(&(pkg.id_repr.clone(), lib.name.clone())).cloned())
+                .unwrap_or_else(|| features.clone());
+            deps.insert(
+                0,
+                DepUnit {
+                    extern_name: lib.name.replace('-', "_"),
+                    package_id: package_id_string(graph, pkg),
+                    package_name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    source: pkg.source.clone(),
+                    lib_src: lib.src_path.clone(),
+                    lib_name: lib.name.clone(),
+                    edition: lib.edition.clone(),
+                    features: lib_features,
+                    deps: deps.clone(),
+                },
+            );
+        }
+    }
     Ok(UnitInfo { package_id: package_id_string(graph, pkg), package: pkg.clone(), target: target.clone(), features, deps })
 }
 

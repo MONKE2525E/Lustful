@@ -1,0 +1,8 @@
+# A macro brought into plain-name scope by glob imports through
+# prelude re-exports (the ts-rust prelude shape, ARCH 1.4 and 6.1).
+[package]
+name = "macro-glob"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
