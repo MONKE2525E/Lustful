@@ -442,6 +442,13 @@ fn eval_const_int_depth(ast: &Ast, interner: &Interner, known: &Known, e: ast::E
         Expr::Char(c) => Some(*c as i128),
         Expr::Bool(b) => Some(*b as i128),
         Expr::Unary { op, expr } => {
+            // A negated literal names its magnitude first: 170141183460469231731687303715884105728
+            // does not fit i128 alone, but its negation is i128::MIN.
+            if *op == UnOp::Neg
+                && let Expr::Int(mag, _) = ast.expr(*expr)
+            {
+                return if *mag <= (1u128 << 127) { Some((*mag as i128).wrapping_neg()) } else { None };
+            }
             let v = eval_const_int_depth(ast, interner, known, *expr, depth + 1)?;
             match op {
                 UnOp::Neg => v.checked_neg(),
@@ -596,11 +603,15 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
 }
 
 /// Converts written variant or struct fields to (shape, (name, type, span) list).
-/// Tuple fields get their index as a synthetic name, as they had before AST v2.
-fn variant_fields_src(vf: &VariantFields) -> (VariantShape, Vec<(Sym, ast::TyId, Span)>) {
+/// Tuple fields get their index text as their name, so `T { 0: 5 }` field
+/// matching and field diagnostics work like named fields.
+fn variant_fields_src(interner: &Interner, vf: &VariantFields) -> (VariantShape, Vec<(Sym, ast::TyId, Span)>) {
     match vf {
         VariantFields::Unit => (VariantShape::Unit, Vec::new()),
-        VariantFields::Tuple(fs) => (VariantShape::Tuple, fs.iter().enumerate().map(|(i, f)| (Sym(i as u32), f.ty, f.span)).collect()),
+        VariantFields::Tuple(fs) => (
+            VariantShape::Tuple,
+            fs.iter().enumerate().map(|(i, f)| (interner.intern(&i.to_string()), f.ty, f.span)).collect(),
+        ),
         VariantFields::Struct(fs) => (VariantShape::Named, fs.iter().map(|f| (f.name, f.ty, f.span)).collect()),
     }
 }
@@ -780,7 +791,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
             ItemKind::Struct(s) => {
-                let (shape, fields) = variant_fields_src(&s.fields);
+                let (shape, fields) = variant_fields_src(interner, &s.fields);
                 let shape = if shape == VariantShape::Unit { VariantShape::Named } else { shape };
                 (vec![(s.name, s.name_span, shape, fields, None)], &s.derives)
             }
@@ -789,7 +800,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                     .variants
                     .iter()
                     .map(|v| {
-                        let (shape, fs) = variant_fields_src(&v.fields);
+                        let (shape, fs) = variant_fields_src(interner, &v.fields);
                         (v.name, v.span, shape, fs, v.discriminant)
                     })
                     .collect();
@@ -934,6 +945,22 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         {
             use crate::ty::layout::ReprKind;
             let adt = &p.adts[id.0 as usize];
+            if !adt.is_enum && adt.repr.int.is_some() {
+                errs.push(Diag::new(
+                    "L0110",
+                    adt.span,
+                    "`#[repr(...)]` with an integer type can only be used on an enum",
+                    "Remove the integer from the repr, or make the type an enum.",
+                ));
+            }
+            if adt.repr.kind == ReprKind::Packed && adt.repr.align.is_some() {
+                errs.push(Diag::new(
+                    "L0110",
+                    adt.span,
+                    "`#[repr(packed)]` and `#[repr(align(...))]` conflict",
+                    "Remove one of them: a packed type has alignment 1.",
+                ));
+            }
             if adt.repr.kind == ReprKind::Transparent {
                 let non_unit = adt.variants.first().map(|v| v.fields.iter().filter(|f| f.ty != UNIT && f.ty != ERROR).count()).unwrap_or(0);
                 if adt.is_enum || non_unit != 1 {

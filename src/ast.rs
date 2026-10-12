@@ -746,6 +746,14 @@ pub struct Arm {
     pub body: ExprId,
 }
 
+/// One step of an `offset_of!` field path: a named field, or a tuple
+/// field by index (`offset_of!(W, 1)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OffsetField {
+    Name(Sym),
+    Index(u32),
+}
+
 /// One closure parameter: a pattern and an optional written type.
 pub struct ClosureParam {
     pub pat: PatId,
@@ -924,7 +932,7 @@ pub enum Expr {
     /// An `offset_of!` query: a type and a field path (W-CORELANG, wave A).
     OffsetOf {
         ty: TyId,
-        fields: Vec<Sym>,
+        fields: Vec<OffsetField>,
     },
 }
 

@@ -495,7 +495,7 @@ impl Evaluator {
             Expr::OffsetOf { ty, fields } => {
                 let mut cur = cx.resolve_ty(*ty);
                 let mut off: u64 = 0;
-                for &fname in fields {
+                for &ffield in fields {
                     let Some(adt) = cx.tys_ref().local_adt(cur) else {
                         return Err(outside(span, "this `offset_of!`"));
                     };
@@ -511,7 +511,18 @@ impl Evaluator {
                         ));
                     }
                     let defs = cx.variant_fields(adt, 0);
-                    let Some(i) = defs.iter().position(|(n, _)| *n == fname) else {
+                    // Tuple field defs carry their index text as the name.
+                    let found = match ffield {
+                        crate::ast::OffsetField::Name(fname) => defs.iter().position(|(n, _)| *n == fname),
+                        crate::ast::OffsetField::Index(idx) => {
+                            if (idx as usize) < defs.len() && cx.sym_text(defs[idx as usize].0).parse::<u32>() == Ok(idx) {
+                                Some(idx as usize)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    let Some(i) = found else {
                         return Err(outside(span, "this `offset_of!` field"));
                     };
                     let Some(l) = cx.layout(cur) else {

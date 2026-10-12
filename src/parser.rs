@@ -2697,7 +2697,18 @@ impl<'a> Parser<'a> {
                 update = Some(self.expr()?);
                 break;
             }
-            let (name, span) = self.ident()?;
+            // A tuple struct literal names fields by index: `T { 0: 5, ..a }`.
+            // Tuple field names are the index text (collect).
+            let (name, span) = if let Tok::Int(v, suffix) = self.peek() {
+                if suffix.is_some() || v > u32::MAX as u128 {
+                    return Err(syntax(self.span(), "invalid tuple field index"));
+                }
+                let index = v as u32;
+                let span = self.bump().span;
+                (self.interner.intern(&index.to_string()), span)
+            } else {
+                self.ident()?
+            };
             let value = if self.eat(Tok::Colon) {
                 self.expr()?
             } else {
@@ -2713,17 +2724,30 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(Expr::StructLit { path, fields, update }, start.to(self.prev_span())))
     }
 
+    /// One step of an `offset_of!` field path: a field name, or an
+    /// unsuffixed integer for a tuple field.
+    fn offset_field(&mut self) -> PResult<crate::ast::OffsetField> {
+        if let Tok::Int(v, suffix) = self.peek() {
+            if suffix.is_some() || v > u32::MAX as u128 {
+                return Err(syntax(self.span(), "invalid tuple field index"));
+            }
+            let index = v as u32;
+            self.bump();
+            return Ok(crate::ast::OffsetField::Index(index));
+        }
+        let (name, _) = self.ident()?;
+        Ok(crate::ast::OffsetField::Name(name))
+    }
+
     /// The body of an `offset_of!` call, after the `!`: `(Type, field)`,
     /// with a nested `a.b` field path allowed.
     fn offset_of_body(&mut self, start: Span) -> PResult<ExprId> {
         self.expect(Tok::LParen, "`(`")?;
         let ty = self.ty()?;
         self.expect(Tok::Comma, "`,`")?;
-        let (first, _) = self.ident()?;
-        let mut fields = vec![first];
+        let mut fields = vec![self.offset_field()?];
         while self.eat(Tok::Dot) {
-            let (f, _) = self.ident()?;
-            fields.push(f);
+            fields.push(self.offset_field()?);
         }
         self.eat(Tok::Comma);
         self.expect(Tok::RParen, "`)`")?;

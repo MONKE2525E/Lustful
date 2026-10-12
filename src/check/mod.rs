@@ -2319,7 +2319,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let mut cur = self.deep(t);
                 let mut off: u64 = 0;
                 let mut bad = false;
-                for &fname in fields {
+                for &ffield in fields {
                     let Some(a) = self.tys.local_adt(cur) else {
                         self.err("L0110", span, "`offset_of!` needs a struct type", "Use a struct with named fields.");
                         bad = true;
@@ -2338,8 +2338,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         bad = true;
                         break;
                     }
-                    let Some(i) = p.adt(a).variants[0].fields.iter().position(|f| f.name == fname) else {
-                        self.err("L0103", span, format!("no field `{}` for `offset_of!`", self.name(fname)), "Check the field name.");
+                    let found = match ffield {
+                        crate::ast::OffsetField::Name(fname) => p.adt(a).variants[0].fields.iter().position(|f| f.name == fname),
+                        crate::ast::OffsetField::Index(idx) => {
+                            if p.adt(a).variants[0].shape == VariantShape::Tuple && (idx as usize) < p.adt(a).variants[0].fields.len() {
+                                Some(idx as usize)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    let Some(i) = found else {
+                        let shown = match ffield {
+                            crate::ast::OffsetField::Name(fname) => self.name(fname).to_string(),
+                            crate::ast::OffsetField::Index(idx) => idx.to_string(),
+                        };
+                        self.err("L0103", span, format!("no field `{shown}` for `offset_of!`"), "Check the field name.");
                         bad = true;
                         break;
                     };
@@ -2408,7 +2422,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Requires an assignable place expression on the left of `=`.
     /// A reference to a packed field could be unaligned (ARCH 4.4): any borrow
     /// of a field place whose base is a packed Adt, explicit or implicit
-    /// (method autoref, format arguments), is an error at the borrow.
+    /// (method autoref, format arguments), is an error at the borrow, unless
+    /// the field type has alignment 1, when every address is aligned for it
+    /// and Rust allows the reference.
     fn check_packed_borrow(&mut self, place_e: ExprId, span: Span) {
         let base = match self.p.ast.expr(place_e) {
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => *base,
@@ -2419,6 +2435,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(a) = self.tys.local_adt(inner)
             && self.p.adt(a).repr.kind == crate::ty::layout::ReprKind::Packed
         {
+            let ft = self.deep(self.out.expr_ty[self.ei(place_e)]);
+            if crate::ty::layout::layout_of_ty(&self.tys, self.p, ft).is_ok_and(|l| l.align <= 1) {
+                return;
+            }
             self.err("L0651", span, "reference to a packed field is not allowed", "Copy the field value into a local first.");
         }
     }
@@ -3665,7 +3685,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // the template's, substituted with fresh variables.
         let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
         let variant = &p.adt(a).variants[v as usize];
-        if variant.shape != VariantShape::Named && !(variant.fields.is_empty() && fields.is_empty()) {
+        // Tuple structs take index fields here (`T { 0: 5, ..a }`); their
+        // field names are the index as a synthetic Sym, so the matching
+        // below works for both shapes.
+        if !matches!(variant.shape, VariantShape::Named | VariantShape::Tuple) && !(variant.fields.is_empty() && fields.is_empty()) {
             self.err("L0110", span, "this is not a struct with named fields", "Use the tuple or unit form.");
             return ERROR;
         }

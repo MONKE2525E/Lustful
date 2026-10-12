@@ -753,7 +753,16 @@ impl Walker<'_> {
                 self.ty(h, *ty);
                 (fields.len() as u64).hash(h);
                 for f in fields {
-                    self.sym(h, *f);
+                    match f {
+                        crate::ast::OffsetField::Name(s) => {
+                            0u8.hash(h);
+                            self.sym(h, *s);
+                        }
+                        crate::ast::OffsetField::Index(i) => {
+                            1u8.hash(h);
+                            i.hash(h);
+                        }
+                    }
                 }
             }
         }
