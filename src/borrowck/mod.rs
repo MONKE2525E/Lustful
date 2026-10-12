@@ -91,26 +91,41 @@ struct Loan {
 /// is the whole local. Used to track partial moves per field.
 type Path = Vec<u64>;
 
-fn encode_proj(p: &Proj) -> Option<u64> {
-    match p {
-        Proj::Field(i) => Some((*i as u64) << 1),
-        Proj::Downcast(v) => Some(((*v as u64) << 1) | 1),
-        _ => None,
-    }
-}
-
-/// The leading `Field`/`Downcast` part of a place, and whether that is the whole place.
-/// A place that goes through a dereference or an index is not exact: its field prefix
-/// still identifies the field of the root local that it reaches into.
-fn field_prefix(p: &Place) -> (Path, bool) {
-    let mut path = Vec::new();
-    for pr in &p.proj {
-        match encode_proj(pr) {
-            Some(e) => path.push(e),
-            None => return (path, false),
+/// Locals assigned exactly once, from a constant integer: the index
+/// temporaries pattern and loop lowering make for fixed array slots.
+/// A constant index into an array names one element like a field does,
+/// so moves out of it are partial moves; any other index is not exact.
+fn const_index_locals(body: &Body) -> std::collections::HashMap<Local, u64> {
+    let mut writes: std::collections::HashMap<Local, u32> = Default::default();
+    let mut value: std::collections::HashMap<Local, u64> = Default::default();
+    let mut note_write = |dest: &Place, v: Option<u64>| {
+        if dest.proj.is_empty() {
+            *writes.entry(dest.local).or_default() += 1;
+            match v {
+                Some(v) => {
+                    value.insert(dest.local, v);
+                }
+                None => {
+                    value.remove(&dest.local);
+                }
+            }
+        }
+    };
+    for b in &body.blocks {
+        for s in &b.stmts {
+            if let StmtKind::Assign(dest, rv) = &s.kind {
+                let v = match rv {
+                    Rvalue::Use(Operand::Const(Const::Int(v, _))) if *v <= u64::MAX as u128 => Some(*v as u64),
+                    _ => None,
+                };
+                note_write(dest, v);
+            }
+        }
+        if let Terminator::Call { dest, .. } = &b.term {
+            note_write(dest, None);
         }
     }
-    (path, true)
+    value.into_iter().filter(|(l, _)| writes.get(l) == Some(&1)).collect()
 }
 
 fn is_prefix(a: &[u64], b: &[u64]) -> bool {
@@ -200,6 +215,8 @@ struct Ck<'b, 'p, 'a> {
     /// trait whose Self head is that Adt). Computed once per body from
     /// the impl index; the partial-move checks below read it.
     drop_heads: HashSet<crate::def::DefId>,
+    /// Index locals with a known constant value (see `const_index_locals`).
+    const_index: std::collections::HashMap<Local, u64>,
 }
 
 /// The Adt defs that have a user `Drop` impl: every impl of the lang
@@ -239,6 +256,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         reach: Vec::new(),
         collecting: false,
         drop_heads,
+        const_index: const_index_locals(body),
     };
     ck.collect_loans();
     ck.escaped = BitSet::new(ck.loans.len());
@@ -885,7 +903,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             self.check_store_into_param_ref(dest, new_origins, st, span);
             // Writing a field puts back a field that was moved out, and every
             // field below it. Other moved fields stay moved.
-            let (path, exact) = field_prefix(dest);
+            let (path, exact) = self.prefix_of(dest);
             if exact {
                 st.moved_paths[dest.local as usize].retain(|m| !is_prefix(&path, m));
             }
@@ -1124,6 +1142,63 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         if p.proj.is_empty() { self.body.locals[p.local as usize].ty } else { self.dest_ty(p) }
     }
 
+    /// The type one `Field` projection down from `t` (in the variant a
+    /// preceding `Downcast` selected), or the error type when unknown.
+    fn step_field_ty(&self, t: Ty, variant: u32, i: u32) -> Ty {
+        match self.body.tys.kind(t) {
+            TyKind::Tuple(ts) => self.body.tys.tys_of(ts).get(i as usize).copied().unwrap_or(ERROR),
+            TyKind::Adt(..) => match self.body.tys.local_adt(t) {
+                Some(a) => self
+                    .p
+                    .adt(a)
+                    .variants
+                    .get(variant as usize)
+                    .and_then(|v| v.fields.get(i as usize))
+                    .map(|f| f.ty)
+                    .unwrap_or(ERROR),
+                None => ERROR,
+            },
+            _ if self.body.tys.option_elem(t).is_some() => self.body.tys.option_elem(t).unwrap(),
+            _ => ERROR,
+        }
+    }
+
+    /// The leading exact part of a place as an encoded path, and whether
+    /// that is the whole place. Fields, downcasts, and constant indexes
+    /// into arrays are exact; a dereference or any other index is not,
+    /// and the prefix still identifies the field the place reaches into.
+    /// Encodings sit in the low two bits: 0 field, 1 downcast, 2 index.
+    fn prefix_of(&self, p: &Place) -> (Path, bool) {
+        let mut path = Vec::new();
+        let mut t = self.body.locals[p.local as usize].ty;
+        let mut variant = 0u32;
+        for pr in &p.proj {
+            match pr {
+                Proj::Field(i) => {
+                    path.push((*i as u64) << 2);
+                    t = self.step_field_ty(t, variant, *i);
+                    variant = 0;
+                }
+                Proj::Downcast(v) => {
+                    path.push(((*v as u64) << 2) | 1);
+                    variant = *v;
+                }
+                Proj::Index(l) => match self.body.tys.kind(t) {
+                    TyKind::Array(e, _) => match self.const_index.get(l) {
+                        Some(&c) if c < (1 << 60) => {
+                            path.push((c << 2) | 2);
+                            t = e;
+                        }
+                        _ => return (path, false),
+                    },
+                    _ => return (path, false),
+                },
+                Proj::Deref => return (path, false),
+            }
+        }
+        (path, true)
+    }
+
     fn operand(&mut self, o: &Operand, span: Span, st: &mut State, live: &BitSet) {
         match o {
             Operand::Copy(p) => {
@@ -1141,7 +1216,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 // zeroes a moved-out field and drops the husk later, which is exact
                 // for `String`/`Vec` fields but would run a user `Drop` impl on the
                 // zeroed value, so such moves reject until drop elaboration lands.
-                let (path, exact) = field_prefix(p);
+                let (path, exact) = self.prefix_of(p);
                 if exact && !path.is_empty() {
                     self.check_partial_move(p, span);
                 }
@@ -1275,6 +1350,16 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     cur = next;
                     variant = 0;
                 }
+                Proj::Index(_) => {
+                    // A constant index into an array is a partial move
+                    // like a field: the array container does not carry a
+                    // user Drop of its own, but the husk rule below does.
+                    let container = self.head_resolve(cur, &env);
+                    match self.body.tys.kind(container) {
+                        TyKind::Array(e, _) => cur = e,
+                        _ => return,
+                    }
+                }
                 _ => return,
             }
         }
@@ -1314,10 +1399,31 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 "Clone the value with `.clone()`, or borrow it with `&` instead of moving it.",
             );
         } else if p.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+            // Name the indexed thing: a Vec's elements sit behind its
+            // buffer, an array or slice index with a variable index
+            // cannot name one element either.
+            let mut t = self.body.locals[p.local as usize].ty;
+            let mut variant = 0;
+            for pr in &p.proj {
+                match pr {
+                    Proj::Field(i) => {
+                        t = self.step_field_ty(t, variant, *i);
+                        variant = 0;
+                    }
+                    Proj::Downcast(v) => variant = *v,
+                    Proj::Deref => {
+                        if let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+                            t = inner;
+                        }
+                    }
+                    Proj::Index(_) => break,
+                }
+            }
+            let what = if self.body.tys.vec_elem(t).is_some() { "a Vec index" } else { "an index" };
             self.err(
                 "L0305",
                 span,
-                "cannot move out of a Vec index".into(),
+                format!("cannot move out of {what}"),
                 "Borrow the element with `&v[i]`, or clone it with `v[i].clone()`.",
             );
         } else if self.report && self.seen.insert(("L9001", span)) {
@@ -1332,7 +1438,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             return;
         }
         let l = p.local as usize;
-        let (path, exact) = field_prefix(p);
+        let (path, exact) = self.prefix_of(p);
         // A moved field blocks uses of itself, of fields below it, and of every value
         // that contains it. A sibling field is fine.
         for m in &st.moved_paths[l] {
@@ -1372,7 +1478,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             return;
         }
         let l = p.local as usize;
-        let (path, exact) = field_prefix(p);
+        let (path, exact) = self.prefix_of(p);
         for m in &st.moved_paths[l] {
             let under_moved = is_prefix(m, &path) && !(exact && m.len() == path.len());
             if under_moved {
@@ -1422,6 +1528,10 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     t = inner;
                 }
                 (_, Proj::Index(_)) if self.body.tys.vec_elem(t).is_some() => t = self.body.tys.vec_elem(t).unwrap(),
+                (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => t = e,
+                (TyKind::Tuple(ts), Proj::Field(i)) => {
+                    t = self.body.tys.tys_of(ts).get(*i as usize).copied().unwrap_or(ERROR);
+                }
                 (TyKind::Adt(..), Proj::Field(i)) if self.body.tys.local_adt(t).is_some() => {
                     let a = self.body.tys.local_adt(t).unwrap();
                     t = self.p.adt(a).variants[variant as usize].fields[*i as usize].ty;
