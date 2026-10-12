@@ -17,10 +17,34 @@ use std::collections::BTreeSet;
 /// `feature`). Any other name in a predicate is L0520. `lust_dev` is known
 /// only for shipped crates; in user code it takes the unknown-name error.
 pub const KNOWN_CFG_NAMES: &[&str] = &[
-    "all", "any", "not", "feature", "target_arch", "target_os", "target_vendor", "target_family", "target_env", "target_abi",
-    "target_endian", "target_pointer_width", "target_has_atomic", "target_has_atomic_equal_alignment", "target_feature",
-    "target_thread_local", "unix", "windows", "panic", "overflow_checks", "debug_assertions", "test", "docsrs", "fuzzing",
-    "miri", "target_has_atomic_load_store", "target_os_version", "target_abi_version",
+    "all",
+    "any",
+    "not",
+    "feature",
+    "target_arch",
+    "target_os",
+    "target_vendor",
+    "target_family",
+    "target_env",
+    "target_abi",
+    "target_endian",
+    "target_pointer_width",
+    "target_has_atomic",
+    "target_has_atomic_equal_alignment",
+    "target_feature",
+    "target_thread_local",
+    "unix",
+    "windows",
+    "panic",
+    "overflow_checks",
+    "debug_assertions",
+    "test",
+    "docsrs",
+    "fuzzing",
+    "miri",
+    "target_has_atomic_load_store",
+    "target_os_version",
+    "target_abi_version",
 ];
 
 /// One crate session's cfg environment. Flags are names that are on
@@ -53,7 +77,10 @@ impl CfgEnv {
         let parts: Vec<&str> = triple.split('-').collect();
         let arch = parts.first().copied().unwrap_or("");
         env.pair("target_arch", arch);
-        env.pair("target_endian", if matches!(arch, "s390x" | "powerpc" | "powerpc64" | "sparc64" | "mips" | "mips64") { "big" } else { "little" });
+        env.pair(
+            "target_endian",
+            if matches!(arch, "s390x" | "powerpc" | "powerpc64" | "sparc64" | "mips" | "mips64") { "big" } else { "little" },
+        );
         env.pair("target_pointer_width", if arch.contains("64") || arch == "wasm64" { "64" } else { "32" });
         // vendor-os[-env[-abi]] after the arch, when the triple has them.
         // Two-part triples (`wasm32-wasip1`) carry the os in the vendor
@@ -147,7 +174,12 @@ impl CfgEnv {
         let mut pos = 0;
         let v = self.pred(trees, &mut pos, strings, interner, span)?;
         if pos != trees.len() {
-            return Err(Diag::new("L0001", span, "malformed `#[cfg]` predicate", "Write `#[cfg(name)]`, `#[cfg(name = \"value\")]`, or `all`/`any`/`not` combinations."));
+            return Err(Diag::new(
+                "L0001",
+                span,
+                "malformed `#[cfg]` predicate",
+                "Write `#[cfg(name)]`, `#[cfg(name = \"value\")]`, or `all`/`any`/`not` combinations.",
+            ));
         }
         Ok(v)
     }
@@ -165,13 +197,23 @@ impl CfgEnv {
             }
         };
         let Some((name, name_span)) = name_of(trees, *pos) else {
-            return Err(Diag::new("L0001", span, "malformed `#[cfg]` predicate", "Write `#[cfg(name)]`, `#[cfg(name = \"value\")]`, or `all`/`any`/`not` combinations."));
+            return Err(Diag::new(
+                "L0001",
+                span,
+                "malformed `#[cfg]` predicate",
+                "Write `#[cfg(name)]`, `#[cfg(name = \"value\")]`, or `all`/`any`/`not` combinations.",
+            ));
         };
         *pos += 1;
         // Combinators: `all(...)`, `any(...)`, `not(...)`.
         if matches!(name.as_str(), "all" | "any" | "not") {
             let Some(TokenTree::Delim(_, inner, _)) = trees.get(*pos) else {
-                return Err(Diag::new("L0001", name_span, format!("`{name}` in a cfg predicate needs `(...)`"), "Write `all(a, b)`, `any(a, b)`, or `not(a)`."));
+                return Err(Diag::new(
+                    "L0001",
+                    name_span,
+                    format!("`{name}` in a cfg predicate needs `(...)`"),
+                    "Write `all(a, b)`, `any(a, b)`, or `not(a)`.",
+                ));
             };
             let inner = inner.clone();
             *pos += 1;
@@ -232,7 +274,8 @@ fn unknown_cfg(name: &str, span: Span) -> Diag {
 /// holds. `#[cfg_attr(...)]` does not gate the item; see `expand_cfg_attr`.
 pub fn attrs_enabled(env: &CfgEnv, attrs: &[Attr], strings: &[String], interner: &Interner) -> Result<bool, Diag> {
     for a in attrs {
-        if a.path.len() == 1 && interner.get(a.path[0].name) == "cfg"
+        if a.path.len() == 1
+            && interner.get(a.path[0].name) == "cfg"
             && let AttrInput::List(_, trees) = &a.input
             && !env.eval(trees, strings, interner, a.span)?
         {

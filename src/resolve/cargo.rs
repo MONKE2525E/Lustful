@@ -344,7 +344,10 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     }
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
-        return Err(format!("`cargo metadata` failed: {}", String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" ")));
+        return Err(format!(
+            "`cargo metadata` failed: {}",
+            String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" ")
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let root = parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
@@ -430,10 +433,13 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
                 })
                 .collect(),
             dependencies,
-            features: p.get("features").map(|v| match v {
-                Json::Obj(kvs) => kvs.iter().map(|(k, _)| k.clone()).collect(),
-                _ => Vec::new(),
-            }).unwrap_or_default(),
+            features: p
+                .get("features")
+                .map(|v| match v {
+                    Json::Obj(kvs) => kvs.iter().map(|(k, _)| k.clone()).collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default(),
         });
     }
     let graph = std::sync::Arc::new(CrateGraph { key, workspace_root, packages, workspace_members: members });
@@ -541,7 +547,10 @@ pub fn select_unit(
     let target = pkg
         .targets
         .iter()
-        .find(|t| t.name == target_name && (t.kind.iter().any(|k| k == target_kind) || target_kind == "lib" && t.kind.iter().any(|k| k == "lib" || k == "rlib")))
+        .find(|t| {
+            t.name == target_name
+                && (t.kind.iter().any(|k| k == target_kind) || target_kind == "lib" && t.kind.iter().any(|k| k == "lib" || k == "rlib"))
+        })
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
@@ -688,7 +697,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::copy(src_dir.join("Cargo.toml"), dir.join("Cargo.toml")).unwrap();
         std::fs::copy(src_dir.join("src/main.rs"), dir.join("src/main.rs")).unwrap();
-        let req = GraphRequest { manifest_path: dir.join("Cargo.toml"), package: None, features: vec![], default_features: true, all_features: false, target_triple: String::new() };
+        let req = GraphRequest {
+            manifest_path: dir.join("Cargo.toml"),
+            package: None,
+            features: vec![],
+            default_features: true,
+            all_features: false,
+            target_triple: String::new(),
+        };
         let graph = load_graph(&req).expect("cargo metadata on the hello fixture");
         let interner = crate::intern::Interner::default();
         let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
