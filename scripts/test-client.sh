@@ -27,9 +27,12 @@ bad() { fail=$((fail + 1)); echo "FAIL $1: $2"; }
 # check <name> <test...> : ok when the test command succeeds.
 check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name" "command failed: $*"; fi; }
 
+# sock <dir> : the daemon socket path in <dir> (its name holds the compiler build hash).
+sock() { local f; for f in "$1"/.lust-daemon-*.sock "$1"/.lust-daemon-*.sock.lock; do [ -e "$f" ] && { echo "${f%.lock}"; return; }; done; echo "$1/.lust-daemon-none.sock"; }
+
 stop_daemon() { # stop_daemon <dir>
   local pid
-  pid=$(cat "$1/.lust-daemon.sock.lock" 2>/dev/null) || return 0
+  pid=$(cat "$(sock "$1").lock" 2>/dev/null) || return 0
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
   return 0
 }
@@ -42,7 +45,7 @@ trap cleanup EXIT
 
 wait_socket() { # wait_socket <dir> : true when the daemon socket appears
   local i
-  for i in $(seq 1 100); do [ -S "$1/.lust-daemon.sock" ] && return 0; sleep 0.05; done
+  for i in $(seq 1 100); do [ -S "$(sock "$1")" ] && return 0; sleep 0.05; done
   return 1
 }
 fresh() { # fresh <name> : a new dir with a hello.rs, prints its path
@@ -76,7 +79,7 @@ stop_daemon "$d"; sleep 0.3
 d=$(fresh nodaemon)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" check hello.rs) >/dev/null 2>&1
 sleep 0.5
-if [ -S "$d/.lust-daemon.sock" ]; then bad "LUST_NO_DAEMON: no daemon starts" "socket exists"; else ok "LUST_NO_DAEMON: no daemon starts"; fi
+if [ -S "$(sock "$d")" ]; then bad "LUST_NO_DAEMON: no daemon starts" "socket exists"; else ok "LUST_NO_DAEMON: no daemon starts"; fi
 
 d=$(fresh race); daemon_dirs+=("$d")
 pids=()
@@ -92,14 +95,14 @@ stop_daemon "$d"; sleep 0.3
 d=$(fresh idle); daemon_dirs+=("$d")
 (cd "$d" && LUST_DAEMON_IDLE=1 "$lust" check hello.rs) >/dev/null 2>&1
 check "idle: daemon starts" wait_socket "$d"
-ipid=$(cat "$d/.lust-daemon.sock.lock" 2>/dev/null)
+ipid=$(cat "$(sock "$d").lock" 2>/dev/null)
 gone=0
 for i in $(seq 1 100); do
   if ! kill -0 "$ipid" 2>/dev/null; then gone=1; break; fi
   sleep 0.1
 done
 check "idle: daemon exits after the idle span" test $gone -eq 1
-if [ -S "$d/.lust-daemon.sock" ]; then bad "idle: socket removed on exit" "socket still there"; else ok "idle: socket removed on exit"; fi
+if [ -S "$(sock "$d")" ]; then bad "idle: socket removed on exit" "socket still there"; else ok "idle: socket removed on exit"; fi
 (cd "$d" && LUST_DAEMON_IDLE=0 "$lust" check hello.rs) >/dev/null 2>&1
 check "idle: next command works and restarts a daemon" wait_socket "$d"
 stop_daemon "$d"; sleep 0.3

@@ -126,9 +126,12 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     Some(Invocation::Compile { req, run: cmd == "run", args: run_args })
 }
 
-/// The daemon socket for the current directory.
+/// The daemon socket for the current directory. The name holds the compiler build hash, so a rebuilt
+/// `lust` never talks to a daemon from an older build (that daemon exits on its idle timeout).
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("LUST_DAEMON_SOCKET").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".lust-daemon.sock"))
+    std::env::var_os("LUST_DAEMON_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!(".lust-daemon-{}.sock", &env!("LUST_BUILD_HASH")[..8])))
 }
 
 pub fn encode(r: &Request) -> String {
