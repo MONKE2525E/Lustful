@@ -1,0 +1,8 @@
+# Import tree forms from the port scan taxonomy: groups, renames,
+# underscore imports, super::* in an inline module, and self in a group.
+[package]
+name = "import-forms"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

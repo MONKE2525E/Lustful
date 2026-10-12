@@ -15,7 +15,7 @@
 # also requires the full stderr text to match.
 #
 # Usage:
-#   fuzz.py run --edits 2000 --seed 7 --crate small|realish [--modules 40] [--strict]
+#   fuzz.py run --edits 2000 --seed 7 --crate small|realish|multi [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
 #   fuzz.py shrink --prev A.rs --cur B.rs --out DIR
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
@@ -396,6 +396,8 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
+    if a.crate == "multi":
+        return cmd_run_multi(a)
     rng = random.Random(a.seed)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
@@ -507,6 +509,185 @@ def cmd_run(a):
         print("bad:", dict(bad_ops))
         if a.fail_on_guard and guard > 0:
             print(f"FAIL fresh-session guard fired {guard} time(s)")
+            failures += guard
+        return 1 if failures else 0
+    finally:
+        h.close()
+
+
+MULTI_SEED = {
+    "main.rs": """mod a;
+mod b;
+
+use crate::a::Point;
+
+fn helper() -> i64 {
+    100
+}
+
+fn main() {
+    let p = Point { x: a::value(), y: b::value() };
+    println!("multi {} {} {}", p.sum(), a::inner::deep(), helper());
+}
+""",
+    "a.rs": """pub mod inner;
+
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+
+impl Point {
+    pub fn sum(&self) -> i64 {
+        self.x + self.y
+    }
+}
+
+pub fn value() -> i64 {
+    3
+}
+""",
+    "a/inner.rs": """pub fn deep() -> i64 {
+    super::value() + 10
+}
+""",
+    "b/mod.rs": """pub fn value() -> i64 {
+    4
+}
+""",
+}
+
+
+def cmd_run_multi(a):
+    """Multi-file mode (W-RESOLVE): the seed crate is a small module tree.
+    Each edit applies the single-file edit ops to one random file, or a
+    structural op (add/remove a module file, toggle its `mod` line).
+    The equivalence rule is the same: daemon answer == cold answer, and
+    the fresh-session guard must never fire. Failure pairs are saved as
+    one bundle of files per side (replay/shrink stay single-file tools).
+    """
+    rng = random.Random(a.seed)
+    Harness.keep_work = a.keep_work
+    h = Harness(a.timeout)
+    base = os.path.join(h.work, "multi")
+    h.crate = os.path.join(base, "main.rs")
+    files = dict(MULTI_SEED)
+    snapshots = [dict(files)]
+    failures = 0
+    ops, bad_ops = Counter(), Counter()
+    t0 = time.time()
+
+    def write_all(fs):
+        if os.path.isdir(base):
+            shutil.rmtree(base)
+        for rel, text in fs.items():
+            p = os.path.join(base, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(text)
+
+    def save_bundle(tag, prev_fs, cur_fs):
+        for side, fs in (("prev", prev_fs), ("cur", cur_fs)):
+            d = os.path.join(a.out, f"{tag}-{side}")
+            os.makedirs(d, exist_ok=True)
+            for rel, text in fs.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w") as f:
+                    f.write(text)
+
+    def structural(rng, fs):
+        fs = dict(fs)
+        op = rng.choice(["add_mod", "drop_file", "toggle_mod", "restore_files"])
+        if op == "add_mod" and "c.rs" not in fs and "main.rs" in fs:
+            fs["c.rs"] = "pub fn extra() -> i64 { 5 }\n"
+            fs["main.rs"] = "mod c;\n" + fs["main.rs"]
+            return fs, op
+        if op == "drop_file":
+            victims = [k for k in fs if k != "main.rs"]
+            if victims:
+                victim = rng.choice(victims)
+                del fs[victim]
+                return fs, f"{op}:{victim}"
+        if op == "toggle_mod" and "mod b;" in fs["main.rs"]:
+            fs["main.rs"] = fs["main.rs"].replace("mod b;", "//mod b;", 1)
+            return fs, op
+        if op == "toggle_mod" and "//mod b;" in fs["main.rs"]:
+            fs["main.rs"] = fs["main.rs"].replace("//mod b;", "mod b;", 1)
+            return fs, op
+        return dict(rng.choice(snapshots)), "restore_files"
+
+    try:
+        write_all(files)
+        ok, why, da, co = compare(h, "check", a.strict)
+        if not ok:
+            print(f"SEED-CRATE FAILURE ({why}) on the unedited multi-file crate", flush=True)
+            return 1
+        seen_guard = 0
+        for it in range(a.edits):
+            prev = files
+            if rng.random() < 0.2:
+                files, op = structural(rng, files)
+            else:
+                rel = rng.choice(sorted(files))
+                text, op = make_edit(rng, files[rel], [s.get(rel, files[rel]) for s in snapshots])
+                files = dict(files)
+                files[rel] = text
+                op = f"{rel}:{op}"
+            ops[op.split(":")[0]] += 1
+            write_all(files)
+            if not h.daemon_alive():
+                failures += 1
+                save_bundle(f"crash-{it}", prev, files)
+                print(f"FAIL daemon dead before iter {it} op {op}", flush=True)
+                h.start_daemon()
+                files = dict(MULTI_SEED)
+                write_all(files)
+                h.run_cmd("check", True)
+                continue
+            ok, why, da, co = compare(h, "check", a.strict)
+            h.wait_guard_idle()
+            g = h.guard_count()
+            if g > seen_guard:
+                save_bundle(f"guard-{it}", prev, files)
+                print(f"GUARD iter {it} op {op}: warm answer differed; bundle guard-{it} saved", flush=True)
+                seen_guard = g
+            if not ok:
+                failures += 1
+                bad_ops[why] += 1
+                save_bundle(f"bad-{it}", prev, files)
+                print(f"FAIL[{why}] iter {it} op {op}\n"
+                      f"  daemon={da[0]} {da[2][:200]!r}\n"
+                      f"  cold  ={co[0] if co else '-'} {(co[2][:200] if co else '')!r}", flush=True)
+                if why in ("daemon hang", "daemon died"):
+                    h.kill_daemon()
+                    h.start_daemon()
+                files = dict(MULTI_SEED)
+                write_all(files)
+                h.run_cmd("check", True)
+                if a.stop_first:
+                    break
+                continue
+            if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
+                snapshots.append(dict(files))
+            if it % 25 == 24 and da[0] == 0:
+                ok, why, ra, rb = compare(h, "run", a.strict)
+                if not ok:
+                    failures += 1
+                    bad_ops[f"run {why}"] += 1
+                    save_bundle(f"runbad-{it}", prev, files)
+                    print(f"FAIL[run {why}] iter {it} op {op}", flush=True)
+                    if a.stop_first:
+                        break
+            if (it + 1) % 250 == 0:
+                print(f"... {it + 1}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
+        h.wait_guard_idle()
+        guard = h.guard_count()
+        print(f"RESULT seed={a.seed} crate=multi edits={a.edits} failures={failures} "
+              f"guard_fired={guard} wall={time.time() - t0:.0f}s")
+        print("ops:", dict(ops))
+        print("bad:", dict(bad_ops))
+        if a.fail_on_guard and guard > 0:
             failures += guard
         return 1 if failures else 0
     finally:
