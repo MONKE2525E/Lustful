@@ -337,7 +337,7 @@ impl FnGen<'_, '_, '_> {
             {
                 continue;
             }
-            self.term(&block.term, block.term_span);
+            self.term(&block.term, block.term_span, next);
         }
         self.out.push_str("}\n\n");
     }
@@ -420,69 +420,79 @@ impl FnGen<'_, '_, '_> {
 
     // ---------- Statements ----------
 
+    /// Stores a computed value into `dest`, dropping the old value first when
+    /// the local owns one. Shared by `Assign` statements and `Call`
+    /// terminators: `make_value` produces the value text (and may emit helper
+    /// statements into the block this opens), and `mentions` says whether
+    /// producing the value reads `dest` itself.
+    fn emit_assign(&mut self, dest: &Place, mentions: bool, loc: &str, make_value: impl FnOnce(&mut Self, &str, &mut Vec<String>) -> String) {
+        // Value generation may emit helper statements with temporaries, so open a C block lazily.
+        let mark = self.out.len();
+        self.out.push_str("  {\n");
+        let body_start = self.out.len();
+        let mut post = Vec::new();
+        let value = make_value(self, loc, &mut post);
+        let (d, dt) = self.place(dest, loc);
+        let drop = needs_drop_c(self.p, &dt);
+        if drop && dest.proj.is_empty() && !mentions {
+            // The old value is dropped before the new one is written. Safe because the
+            // rvalue does not read the destination.
+            self.want(Glue::Drop, &dt);
+            let (m, l) = (mangle(&dt), dest.local);
+            if self.out.len() == body_start {
+                self.out.truncate(mark);
+                let _ = write!(self.out, "  if (d{l}) drop_{m}(&{d}); {d} = {value}; d{l} = 1;");
+                for p in &post {
+                    let _ = write!(self.out, " {p}");
+                }
+                self.out.push('\n');
+                return;
+            }
+            let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {value};\n    d{l} = 1;");
+            for p in &post {
+                let _ = writeln!(self.out, "    {p}");
+            }
+            self.out.push_str("  }\n");
+            return;
+        }
+        if drop {
+            let t = self.tmp();
+            let _ = writeln!(self.out, "    {} {t} = {value};", ctype(&dt));
+            for p in &post {
+                let _ = writeln!(self.out, "    {p}");
+            }
+            self.want(Glue::Drop, &dt);
+            let m = mangle(&dt);
+            if dest.proj.is_empty() {
+                let l = dest.local;
+                let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {t};\n    d{l} = 1;");
+            } else {
+                let _ = writeln!(self.out, "    drop_{m}(&{d});\n    {d} = {t};");
+            }
+        } else {
+            if dt == CTy::Str {
+                panic!("unsized assignment");
+            }
+            if self.out.len() == body_start && post.is_empty() {
+                // No helper statements: a plain assignment needs no block.
+                self.out.truncate(mark);
+                let _ = writeln!(self.out, "  {d} = {value};");
+                return;
+            }
+            let _ = writeln!(self.out, "    {d} = {value};");
+            for p in &post {
+                let _ = writeln!(self.out, "    {p}");
+            }
+        }
+        self.out.push_str("  }\n");
+    }
+
     fn stmt(&mut self, s: &StmtKind, span: Span) {
         let loc = self.loc(span);
         match s {
             StmtKind::Assign(dest, rv) => {
-                // Rvalues may emit helper statements with temporaries, so open a C block lazily.
-                let mark = self.out.len();
-                self.out.push_str("  {\n");
-                let body_start = self.out.len();
-                let mut post = Vec::new();
-                let value = self.rvalue(rv, &loc, &mut post);
-                let (d, dt) = self.place(dest, &loc);
-                let drop = needs_drop_c(self.p, &dt);
-                if drop && dest.proj.is_empty() && !rvalue_mentions(rv, dest.local) {
-                    // The old value is dropped before the new one is written. Safe because the
-                    // rvalue does not read the destination.
-                    self.want(Glue::Drop, &dt);
-                    let (m, l) = (mangle(&dt), dest.local);
-                    if self.out.len() == body_start {
-                        self.out.truncate(mark);
-                        let _ = write!(self.out, "  if (d{l}) drop_{m}(&{d}); {d} = {value}; d{l} = 1;");
-                        for p in &post {
-                            let _ = write!(self.out, " {p}");
-                        }
-                        self.out.push('\n');
-                        return;
-                    }
-                    let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {value};\n    d{l} = 1;");
-                    for p in &post {
-                        let _ = writeln!(self.out, "    {p}");
-                    }
-                    self.out.push_str("  }\n");
-                    return;
-                }
-                if drop {
-                    let t = self.tmp();
-                    let _ = writeln!(self.out, "    {} {t} = {value};", ctype(&dt));
-                    for p in &post {
-                        let _ = writeln!(self.out, "    {p}");
-                    }
-                    self.want(Glue::Drop, &dt);
-                    let m = mangle(&dt);
-                    if dest.proj.is_empty() {
-                        let l = dest.local;
-                        let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {t};\n    d{l} = 1;");
-                    } else {
-                        let _ = writeln!(self.out, "    drop_{m}(&{d});\n    {d} = {t};");
-                    }
-                } else {
-                    if dt == CTy::Str {
-                        panic!("unsized assignment");
-                    }
-                    if self.out.len() == body_start && post.is_empty() {
-                        // No helper statements: a plain assignment needs no block.
-                        self.out.truncate(mark);
-                        let _ = writeln!(self.out, "  {d} = {value};");
-                        return;
-                    }
-                    let _ = writeln!(self.out, "    {d} = {value};");
-                    for p in &post {
-                        let _ = writeln!(self.out, "    {p}");
-                    }
-                }
-                self.out.push_str("  }\n");
+                let mentions = rvalue_mentions(rv, dest.local);
+                self.emit_assign(dest, mentions, &loc, |s, loc, post| s.rvalue(rv, loc, post));
             }
             StmtKind::Drop(l) => {
                 let t = self.local_cty[*l as usize].clone();
@@ -506,7 +516,7 @@ impl FnGen<'_, '_, '_> {
         }
     }
 
-    fn term(&mut self, t: &Terminator, span: Span) {
+    fn term(&mut self, t: &Terminator, span: Span, next_block: Option<usize>) {
         let loc = self.loc(span);
         let mut post = Vec::new();
         match t {
@@ -525,6 +535,16 @@ impl FnGen<'_, '_, '_> {
                 }
                 let _ = writeln!(self.out, " default: goto bb{}; }}", other.0);
             }
+            Terminator::Call { target, args, dest, next, unwind } => {
+                // No unwind edges exist yet (W-PANIC builds them); the slot
+                // is carried so that work needs no IR change.
+                debug_assert!(unwind.is_none(), "cgen has no unwind edges yet");
+                let mentions = args.iter().any(|o| operand_mentions(o, dest.local));
+                self.emit_assign(dest, mentions, &loc, |s, loc, post| s.call_value(*target, args, loc, post));
+                if Some(next.0 as usize) != next_block {
+                    let _ = writeln!(self.out, "  goto bb{};", next.0);
+                }
+            }
             Terminator::Return => self.out.push_str("  return l0;\n"),
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
             Terminator::Panic(parts) => {
@@ -536,6 +556,25 @@ impl FnGen<'_, '_, '_> {
     }
 
     // ---------- Rvalues ----------
+
+    /// The C text of one call's result value. Every user fn call goes through
+    /// `lust_fns`, so a changed function can be swapped in without relinking
+    /// its callers.
+    fn call_value(&mut self, target: CallTarget, args: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+        match target {
+            CallTarget::Fn(f) => {
+                let info = self.p.fn_info(f);
+                for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
+                    let ct = cty(&self.p.tys, t);
+                    collect_types(&ct, &mut self.sig_types);
+                }
+                let args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
+            }
+            CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
+            CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
+        }
+    }
 
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
         match rv {
@@ -624,19 +663,6 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "\n    {t}.len = {i}_n;");
                 t
             }
-            Rvalue::Call(f, ops) => {
-                // Every call goes through `lust_fns`, so a changed function can be swapped in
-                // without relinking its callers.
-                let info = self.p.fn_info(*f);
-                for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
-                    let ct = cty(&self.p.tys, t);
-                    collect_types(&ct, &mut self.sig_types);
-                }
-                let args: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-                format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, *f), self.slots[f.0 as usize], args.join(", "))
-            }
-            Rvalue::Builtin(b, ops) => self.builtin(*b, ops, loc, post),
-            Rvalue::Intrinsic(id, ops) => self.intrinsic(*id, ops, loc, post),
             Rvalue::Eq { a, b, ty, ne } => {
                 let (a, _) = self.operand(a, loc, post);
                 let (b, _) = self.operand(b, loc, post);
@@ -1665,21 +1691,24 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
     }
 }
 
+fn place_mentions(p: &Place, l: Local) -> bool {
+    p.local == l || p.proj.iter().any(|x| matches!(x, Proj::Index(i) if *i == l))
+}
+
+fn operand_mentions(o: &Operand, l: Local) -> bool {
+    matches!(o, Operand::Copy(p) | Operand::Move(p) if place_mentions(p, l))
+}
+
 fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
-    let place_has = |p: &Place| p.local == l || p.proj.iter().any(|x| matches!(x, Proj::Index(i) if *i == l));
-    let op_has = |o: &Operand| matches!(o, Operand::Copy(p) | Operand::Move(p) if place_has(p));
+    let op_has = |o: &Operand| operand_mentions(o, l);
     let parts_has = |ps: &[FmtPart]| ps.iter().any(|p| matches!(p, FmtPart::Arg { value, .. } if op_has(value)));
     match rv {
         Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) => op_has(o),
-        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) => place_has(p),
+        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) => place_mentions(p, l),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op_has(a) || op_has(b)
         }
-        Rvalue::Aggregate(_, _, ops)
-        | Rvalue::VecLit(_, ops)
-        | Rvalue::Call(_, ops)
-        | Rvalue::Builtin(_, ops)
-        | Rvalue::Intrinsic(_, ops) => ops.iter().any(op_has),
+        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) => ops.iter().any(op_has),
         Rvalue::Opt(_, o) => o.as_ref().is_some_and(op_has),
         Rvalue::Format(parts) => parts_has(parts),
     }
@@ -1690,6 +1719,7 @@ fn succ(t: &Terminator) -> Vec<Bb> {
         Terminator::Goto(b) => vec![*b],
         Terminator::If(_, a, b) => vec![*a, *b],
         Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
+        Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
         _ => Vec::new(),
     }
 }

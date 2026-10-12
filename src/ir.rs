@@ -79,8 +79,6 @@ pub enum Rvalue {
     Opt(Ty, Option<Operand>),
     VecLit(Ty, Vec<Operand>),
     VecRepeat(Ty, Operand, Operand),
-    Call(LocalDefId, Vec<Operand>),
-    Builtin(Builtin, Vec<Operand>),
     /// `a == b` for any PartialEq type. Both operands are references to `ty`.
     Eq {
         a: Operand,
@@ -94,11 +92,6 @@ pub enum Rvalue {
     StringAdd(Operand, Operand),
     Format(Vec<FmtPart>),
     Discriminant(Place),
-    /// A call to a registry intrinsic by id (`ty::lang::INTRINSICS`).
-    /// One node for the whole family: codegen emits the row's C symbol
-    /// with the row's signature. Added by S5; never delete a Builtin
-    /// case in its favor this wave (docs/ARCH.md section 9.2 S5).
-    Intrinsic(u32, Vec<Operand>),
 }
 
 #[derive(Clone, Debug)]
@@ -122,12 +115,31 @@ pub struct Stmt {
     pub span: Span,
 }
 
+/// What a `Call` terminator calls: a user fn or method by local def, or a
+/// builtin operation. Frozen with the `Call` terminator (docs/ARCH.md
+/// section 9.2): new target forms go at the end only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    Fn(LocalDefId),
+    Builtin(Builtin),
+    /// A registry intrinsic by id (`ty::lang::INTRINSICS`, S5): one target
+    /// for the whole family; codegen emits the row's C symbol with the
+    /// row's signature.
+    Intrinsic(u32),
+}
+
 #[derive(Clone, Debug)]
 pub enum Terminator {
     Goto(Bb),
     If(Operand, Bb, Bb),
     /// Jumps on an enum discriminant.
     Switch(Operand, Vec<(u32, Bb)>, Bb),
+    /// A call: writes its result to `dest`, then continues at `next`.
+    /// `unwind` is the cleanup successor for a panic in the callee
+    /// (docs/ARCH.md section 7.2); it is `None` everywhere until W-PANIC
+    /// builds cleanup edges. Calls are terminators, never rvalues, so
+    /// every call already has its unwind slot.
+    Call { target: CallTarget, args: Vec<Operand>, dest: Place, next: Bb, unwind: Option<Bb> },
     Return,
     Unreachable,
     Panic(Vec<FmtPart>),

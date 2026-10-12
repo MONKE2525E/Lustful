@@ -84,6 +84,24 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn assign(&mut self, place: Place, rv: Rvalue, span: Span) {
         self.push(StmtKind::Assign(place, rv), span);
     }
+    /// Emits a call terminator that writes its result to `dest` and continues
+    /// in a fresh block. No cleanup edges exist yet, so `unwind` is `None`
+    /// (docs/ARCH.md section 7.2).
+    fn call_into(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place, span: Span) {
+        let next = self.new_block();
+        let b = &mut self.body.blocks[self.cur.0 as usize];
+        b.term = Terminator::Call { target, args, dest, next, unwind: None };
+        b.term_span = span;
+        self.cur = next;
+    }
+    /// The place a call result goes: the given destination, or a throwaway
+    /// temporary for a call in statement position.
+    fn call_dest(&mut self, dest: Option<&Place>, ty: Ty) -> Place {
+        match dest {
+            Some(d) => d.clone(),
+            None => Place::local(self.temp(ty)),
+        }
+    }
     /// Ends the current block. Later code goes into a fresh block (unreachable if nothing jumps there).
     fn terminate(&mut self, term: Terminator, span: Span) {
         let b = &mut self.body.blocks[self.cur.0 as usize];
@@ -234,7 +252,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     t = inner;
                 }
                 let tmp = self.temp(REF_STR);
-                self.assign(Place::local(tmp), Rvalue::Builtin(Builtin::StringAsStr, vec![Operand::Copy(place)]), span);
+                self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(place)], Place::local(tmp), span);
                 Operand::Copy(Place::local(tmp))
             }
             Coerce::Deref(n) => {
@@ -402,23 +420,25 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Call { args, .. } => {
                 let res = self.ck.res(e);
                 let ops: Vec<Operand> = args.iter().map(|&a| self.operand(a)).collect();
-                let rv = match res {
-                    Res::Fn(f) => Rvalue::Call(f, ops),
-                    Res::Variant(a, v) => Rvalue::Aggregate(a, v, ops),
-                    Res::OptSome => Rvalue::Opt(ty, ops.into_iter().next()),
-                    Res::Builtin(b) => match b {
-                        Builtin::VecNew | Builtin::VecWithCapacity => Rvalue::VecLit(self.peel_vec(ty), Vec::new()),
-                        _ => Rvalue::Builtin(b, ops),
-                    },
-                    Res::Intrinsic(id) => Rvalue::Intrinsic(id, ops),
-                    _ => return,
-                };
-                match dest {
-                    Some(d) => self.assign(d.clone(), rv, span),
-                    None => {
-                        let t = self.temp(ty);
-                        self.assign(Place::local(t), rv, span);
+                match res {
+                    Res::Fn(f) => {
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Fn(f), ops, d, span);
                     }
+                    Res::Intrinsic(id) => {
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Intrinsic(id), ops, d, span);
+                    }
+                    Res::Builtin(Builtin::VecNew) | Res::Builtin(Builtin::VecWithCapacity) => {
+                        self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span)
+                    }
+                    Res::Builtin(b) => {
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Builtin(b), ops, d, span);
+                    }
+                    Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span),
+                    Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
+                    _ => return,
                 }
             }
             Expr::MethodCall { recv, args, .. } => self.method_into(e, *recv, args, dest, span),
@@ -474,7 +494,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let t = self.temp(mt);
                     self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
                     let u = self.temp(UNIT);
-                    self.assign(Place::local(u), Rvalue::Builtin(Builtin::StringPushStr, vec![Operand::Move(Place::local(t)), r]), span);
+                    self.call_into(CallTarget::Builtin(Builtin::StringPushStr), vec![Operand::Move(Place::local(t)), r], Place::local(u), span);
                 } else {
                     let rd = match self.ck.res(e) {
                         Res::Bin { rd, .. } => rd,
@@ -753,17 +773,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
         }
-        let rv = match callee {
-            Ok(f) => Rvalue::Call(f, ops),
-            Err(b) => Rvalue::Builtin(b, ops),
+        let target = match callee {
+            Ok(f) => CallTarget::Fn(f),
+            Err(b) => CallTarget::Builtin(b),
         };
-        match dest {
-            Some(d) => self.assign(d.clone(), rv, span),
-            None => {
-                let t = self.temp(self.ty(e));
-                self.assign(Place::local(t), rv, span);
-            }
-        }
+        let d = self.call_dest(dest, self.ty(e));
+        self.call_into(target, ops, d, span);
     }
 
     fn binary_into(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, dest: Option<&Place>, span: Span) {
@@ -850,7 +865,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         let (r, _) = self.borrow_of(e, n);
         let t = self.temp(REF_STR);
-        self.assign(Place::local(t), Rvalue::Builtin(Builtin::StringAsStr, vec![r]), span);
+        self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![r], Place::local(t), span);
         Operand::Copy(Place::local(t))
     }
 
@@ -910,7 +925,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
             let ot = self.body.tys.mk_option(CHAR);
             let nx = self.temp(ot);
-            self.assign(Place::local(nx), Rvalue::Builtin(Builtin::CharsNext, vec![Operand::Move(Place::local(r))]), span);
+            self.call_into(CallTarget::Builtin(Builtin::CharsNext), vec![Operand::Move(Place::local(r))], Place::local(nx), span);
             let d = self.temp(int(IntTy::U32));
             self.assign(Place::local(d), Rvalue::Discriminant(Place::local(nx)), span);
             let b = &mut self.body.blocks[self.cur.0 as usize];
@@ -928,7 +943,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             let sref = self.temp(shared);
             self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(vref).deref()), span);
             let len = self.temp(USIZE);
-            self.assign(Place::local(len), Rvalue::Builtin(Builtin::VecLen, vec![Operand::Copy(Place::local(sref))]), span);
+            self.call_into(CallTarget::Builtin(Builtin::VecLen), vec![Operand::Copy(Place::local(sref))], Place::local(len), span);
             let idx = self.temp(USIZE);
             self.assign(Place::local(idx), Rvalue::Use(Operand::Const(Const::Int(0, IntTy::Usize))), span);
             self.goto(head, span);

@@ -151,6 +151,9 @@ struct Ck<'b, 'p, 'a> {
     loan_at: std::collections::HashMap<(u32, u32), usize>,
     preds: Vec<Vec<u32>>,
     live_out_stmt: Vec<Vec<BitSet>>,
+    /// Live locals at each block's entry, for the loans live after a block's
+    /// terminating call.
+    live_in_block: Vec<BitSet>,
     errs: Vec<Diag>,
     seen: HashSet<(&'static str, Span)>,
     report: bool,
@@ -177,6 +180,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         loan_at: Default::default(),
         preds: vec![Vec::new(); body.blocks.len()],
         live_out_stmt: Vec::new(),
+        live_in_block: Vec::new(),
         errs: Vec::new(),
         seen: HashSet::new(),
         report: false,
@@ -200,6 +204,7 @@ fn successors(t: &Terminator) -> Vec<Bb> {
         Terminator::Goto(b) => vec![*b],
         Terminator::If(_, a, b) => vec![*a, *b],
         Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
+        Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
         _ => Vec::new(),
     }
 }
@@ -217,11 +222,7 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
             f(a);
             f(b);
         }
-        Rvalue::Aggregate(_, _, ops)
-        | Rvalue::VecLit(_, ops)
-        | Rvalue::Call(_, ops)
-        | Rvalue::Builtin(_, ops)
-        | Rvalue::Intrinsic(_, ops) => ops.iter().for_each(f),
+        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) => ops.iter().for_each(f),
         Rvalue::Format(parts) => parts.iter().for_each(|p| {
             if let FmtPart::Arg { value, .. } = p {
                 f(value)
@@ -356,6 +357,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             };
             match &b.term {
                 Terminator::If(o, ..) | Terminator::Switch(o, ..) => note(o),
+                Terminator::Call { args, .. } => args.iter().for_each(&mut note),
                 Terminator::Panic(parts) => parts_operands(parts, &mut note),
                 _ => {}
             }
@@ -451,15 +453,25 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     fn live_term(t: &Terminator, live: &mut BitSet) {
-        let mut uses = |o: &Operand| {
+        fn uses(live: &mut BitSet, o: &Operand) {
             if let Operand::Copy(p) | Operand::Move(p) = o {
-                Self::uses_place(live, p);
+                Ck::uses_place(live, p);
             }
-        };
+        }
         match t {
-            Terminator::If(o, ..) | Terminator::Switch(o, ..) => uses(o),
+            Terminator::If(o, ..) | Terminator::Switch(o, ..) => uses(live, o),
+            Terminator::Call { args, dest, .. } => {
+                if dest.proj.is_empty() {
+                    live.remove(dest.local as usize);
+                } else {
+                    Self::uses_place(live, dest);
+                }
+                for o in args {
+                    uses(live, o);
+                }
+            }
             Terminator::Return => live.insert(0),
-            Terminator::Panic(parts) => parts_operands(parts, &mut uses),
+            Terminator::Panic(parts) => parts_operands(parts, &mut |o| uses(live, o)),
             _ => {}
         }
     }
@@ -487,6 +499,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
         }
+        self.live_in_block = live_in.clone();
         // Per-statement live-out sets.
         self.live_out_stmt = Vec::with_capacity(nb);
         for bi in 0..nb {
@@ -587,6 +600,10 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let span = block.term_span;
         let mut ops: Vec<&Operand> = Vec::new();
         match &block.term {
+            Terminator::Call { target, args, dest, .. } => {
+                let (target, args, dest) = (*target, args.clone(), dest.clone());
+                self.call_term(b, target, &args, &dest, span, st);
+            }
             Terminator::If(o, ..) | Terminator::Switch(o, ..) => ops.push(o),
             Terminator::Panic(parts) => parts_operands(parts, &mut |o| ops.push(o)),
             Terminator::Return if self.report => {
@@ -670,14 +687,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.check_init(place, span, st);
                         self.access(place, Access::Read, span, &live);
                     }
-                    Rvalue::Call(f, args) => {
-                        let info = self.p.fn_info(*f);
-                        if let Some(i) = info.ret_borrows_from {
-                            self.holds_of(&args[i], st, &mut new_holds);
-                            self.origins_of(&args[i], st, &mut new_origins);
-                        }
-                        self.flow_into_mut_args(args, st, span);
-                    }
                     _ => {
                         let ty = self.dest_ty(dest);
                         if contains_ref(&self.body.tys, ty) {
@@ -686,40 +695,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                                 self.origins_of(o, st, &mut new_origins);
                             }
                         }
-                        if let Rvalue::Builtin(Builtin::VecPush, args) = rv {
-                            self.flow_into_mut_args(args, st, span);
-                        }
                     }
                 }
-                // The write to the destination.
-                if dest.proj.is_empty() {
-                    let l = dest.local as usize;
-                    if !self.body.locals[l].mutable && st.maybe_init.contains(l) {
-                        let name = self.local_name(dest.local);
-                        self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
-                    }
-                    self.access(dest, Access::Write, span, &live);
-                    self.check_store_into_param_ref(dest, &new_origins, st, span);
-                    st.maybe_init.insert(l);
-                    st.maybe_uninit.remove(l);
-                    st.maybe_moved.remove(l);
-                    st.moved_paths[l].clear();
-                    st.holds[l] = new_holds;
-                    st.origins[l].union(&new_origins);
-                } else {
-                    self.check_init_write(dest, span, st);
-                    self.check_mutability(dest, span, st, false);
-                    self.access(dest, Access::Write, span, &live);
-                    self.check_store_into_param_ref(dest, &new_origins, st, span);
-                    // Writing a field puts back a field that was moved out, and every
-                    // field below it. Other moved fields stay moved.
-                    let (path, exact) = field_prefix(dest);
-                    if exact {
-                        st.moved_paths[dest.local as usize].retain(|m| !is_prefix(&path, m));
-                    }
-                    st.holds[dest.local as usize].union(&new_holds);
-                    st.origins[dest.local as usize].union(&new_origins);
-                }
+                self.write_dest(dest, new_holds, &new_origins, span, &live, st);
             }
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
                 let place = Place::local(*l);
@@ -745,6 +723,87 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
         }
+    }
+
+    /// The write side of an assignment or a call's result store: mutability,
+    /// conflicts with live loans, parameter-origin checks, and init state.
+    fn write_dest(&mut self, dest: &Place, new_holds: BitSet, new_origins: &BitSet, span: Span, live: &BitSet, st: &mut State) {
+        if dest.proj.is_empty() {
+            let l = dest.local as usize;
+            if !self.body.locals[l].mutable && st.maybe_init.contains(l) {
+                let name = self.local_name(dest.local);
+                self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
+            }
+            self.access(dest, Access::Write, span, live);
+            self.check_store_into_param_ref(dest, new_origins, st, span);
+            st.maybe_init.insert(l);
+            st.maybe_uninit.remove(l);
+            st.maybe_moved.remove(l);
+            st.moved_paths[l].clear();
+            st.holds[l] = new_holds;
+            st.origins[l].union(new_origins);
+        } else {
+            self.check_init_write(dest, span, st);
+            self.check_mutability(dest, span, st, false);
+            self.access(dest, Access::Write, span, live);
+            self.check_store_into_param_ref(dest, new_origins, st, span);
+            // Writing a field puts back a field that was moved out, and every
+            // field below it. Other moved fields stay moved.
+            let (path, exact) = field_prefix(dest);
+            if exact {
+                st.moved_paths[dest.local as usize].retain(|m| !is_prefix(&path, m));
+            }
+            st.holds[dest.local as usize].union(&new_holds);
+            st.origins[dest.local as usize].union(new_origins);
+        }
+    }
+
+    /// One `Call` terminator, checked like the assignment it ends: argument
+    /// reads first, then loan flow into the result and into `&mut` argument
+    /// targets, then the write to `dest`. The loans live after the call are
+    /// the ones its successors keep live.
+    fn call_term(&mut self, b: u32, target: CallTarget, args: &[Operand], dest: &Place, span: Span, st: &mut State) {
+        let si = self.body.blocks[b as usize].stmts.len() as u32;
+        let skip = if dest.proj.is_empty() { Some(dest.local) } else { None };
+        let live = if self.report {
+            let mut locals = BitSet::new(self.n_locals());
+            for s in successors(&self.body.blocks[b as usize].term) {
+                locals.union(&self.live_in_block[s.0 as usize]);
+            }
+            self.live_loans(st, &locals, skip, b, si)
+        } else {
+            BitSet::new(0)
+        };
+        for o in args {
+            self.operand(o, span, st, &live);
+        }
+        let mut new_holds = BitSet::new(self.loans.len());
+        let mut new_origins = BitSet::new(self.loans.len());
+        match target {
+            CallTarget::Fn(f) => {
+                let info = self.p.fn_info(f);
+                if let Some(i) = info.ret_borrows_from {
+                    self.holds_of(&args[i], st, &mut new_holds);
+                    self.origins_of(&args[i], st, &mut new_origins);
+                }
+                self.flow_into_mut_args(args, st, span);
+            }
+            CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => {
+                // Builtins were plain rvalues before S7: a reference-typed
+                // result may hold any argument's loans.
+                let ty = self.dest_ty(dest);
+                if contains_ref(&self.body.tys, ty) {
+                    for o in args {
+                        self.holds_of(o, st, &mut new_holds);
+                        self.origins_of(o, st, &mut new_origins);
+                    }
+                }
+                if target == CallTarget::Builtin(Builtin::VecPush) {
+                    self.flow_into_mut_args(args, st, span);
+                }
+            }
+        }
+        self.write_dest(dest, new_holds, &new_origins, span, &live, st);
     }
 
     fn dest_ty(&self, dest: &Place) -> Ty {
