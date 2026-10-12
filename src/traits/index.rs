@@ -690,21 +690,44 @@ impl ImplIndex {
         fundamental: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
     ) -> Vec<(ImplId, ImplId)> {
-        let mut out = Vec::new();
-        for ids in self.by_trait.values() {
+        // Pair generation by Self head, not all pairs per trait:
+        // two non-blanket impls whose Self heads differ cannot unify
+        // their Self patterns (see `unify_patterns`: the outer
+        // constructor must agree), so only same-bucket pairs and
+        // pairs that involve a blanket impl can overlap. A blanket
+        // impl pairs against every impl of its trait. Without this,
+        // one derived impl per Adt makes coherence quadratic in the
+        // Adt count of the crate (thousands of Clone/Debug records).
+        let mut pairs: Vec<(ImplId, ImplId)> = Vec::new();
+        for ids in self.buckets.values() {
             for (i, &a) in ids.iter().enumerate() {
                 for &b in &ids[i + 1..] {
-                    let (ra, rb) = (self.get(a), self.get(b));
-                    if !ra.local && !rb.local {
-                        continue;
-                    }
-                    if self.pair_overlaps(tys, ra, rb, fundamental, is_local) {
-                        out.push((a, b));
+                    pairs.push(if a.0 < b.0 { (a, b) } else { (b, a) });
+                }
+            }
+        }
+        for (trait_def, blanket_ids) in &self.blankets {
+            let Some(ids) = self.by_trait.get(trait_def) else { continue };
+            for &b in blanket_ids {
+                for &o in ids {
+                    if o != b {
+                        pairs.push(if b.0 < o.0 { (b, o) } else { (o, b) });
                     }
                 }
             }
         }
-        out.sort_by_key(|(a, b)| (a.0, b.0));
+        pairs.sort_by_key(|(a, b)| (a.0, b.0));
+        pairs.dedup();
+        let mut out = Vec::new();
+        for (a, b) in pairs {
+            let (ra, rb) = (self.get(a), self.get(b));
+            if !ra.local && !rb.local {
+                continue;
+            }
+            if self.pair_overlaps(tys, ra, rb, fundamental, is_local) {
+                out.push((a, b));
+            }
+        }
         out
     }
 
@@ -974,5 +997,56 @@ mod tests {
             })
         };
         assert!(!index.orphan_ok(&g, index.get(id), &[], &local_only));
+    }
+
+    /// Head-bucketed pair generation finds exactly the pairs the
+    /// naive all-pairs loop finds: many distinct Adt heads, one
+    /// duplicate pair, one generic-Adt pair that unifies, ref and
+    /// tuple heads, and a bare-parameter blanket.
+    #[test]
+    fn coherence_matches_naive_all_pairs() {
+        let mut g = GlobalTys::new();
+        let tr = def(10);
+        let mut index = ImplIndex::new();
+        let p0 = g.intern(TyKind::Param(ParamId(0)));
+        // 40 distinct Adt heads, no overlaps among them.
+        for i in 0..40u64 {
+            let t = g.mk_adt(def(100 + i), &[]);
+            add_impl(&mut g, &mut index, 1000 + i, tr, t, &[], 0, vec![]);
+        }
+        // A duplicate of the first Adt impl: one overlap.
+        let dup = g.mk_adt(def(100), &[]);
+        add_impl(&mut g, &mut index, 1100, tr, dup, &[], 0, vec![]);
+        // Generic Adt patterns that unify with each other.
+        let vec_p = g.mk_adt(def(200), &[GenericArg::Ty(p0)]);
+        let vec_u8 = g.mk_adt(def(200), &[GenericArg::Ty(int(IntTy::U8))]);
+        add_impl(&mut g, &mut index, 1101, tr, vec_p, &[], 1, vec![]);
+        add_impl(&mut g, &mut index, 1102, tr, vec_u8, &[], 0, vec![]);
+        // A shared-ref blanket and a concrete shared-ref impl.
+        let ref_p = g.intern(TyKind::Ref(Region::Erased, Mut::Shared, p0));
+        let ref_u8 = g.intern(TyKind::Ref(Region::Erased, Mut::Shared, int(IntTy::U8)));
+        add_impl(&mut g, &mut index, 1103, tr, ref_p, &[], 1, vec![]);
+        add_impl(&mut g, &mut index, 1104, tr, ref_u8, &[], 0, vec![]);
+        // A tuple impl and an int impl: different heads.
+        let tup_tys = g.intern_tys(&[int(IntTy::U8), int(IntTy::U16)]);
+        let tup = g.intern(TyKind::Tuple(tup_tys));
+        add_impl(&mut g, &mut index, 1105, tr, tup, &[], 0, vec![]);
+        add_impl(&mut g, &mut index, 1106, tr, int(IntTy::I32), &[], 0, vec![]);
+        // The naive loop: every pair of the trait, in index order.
+        let mut naive = Vec::new();
+        let ids = index.impls_of_trait(tr).to_vec();
+        for (i, &a) in ids.iter().enumerate() {
+            for &b in &ids[i + 1..] {
+                let (ra, rb) = (index.get(a).clone(), index.get(b).clone());
+                if index.pair_overlaps(&mut g, &ra, &rb, &[], &is_local) {
+                    naive.push((a, b));
+                }
+            }
+        }
+        naive.sort_by_key(|(a, b)| (a.0, b.0));
+        let fast = index.coherence_overlaps(&mut g, &[], &is_local);
+        assert_eq!(fast, naive);
+        // The duplicate, the generic-Adt pair, and the ref pair.
+        assert_eq!(fast.len(), 3);
     }
 }
