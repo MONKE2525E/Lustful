@@ -3391,6 +3391,44 @@ mod tests {
         assert_eq!(String::from_utf8(run.stdout).unwrap(), "42\n3\n1.75\n1267650600228229401496703205381\n");
     }
 
+    /// Derived glue regenerates when a field type changes under the
+    /// same Adt id: `refresh` on the edited program reports the
+    /// regeneration and the glue text moves; on the same program it
+    /// is a no-op. (Review B3/C3: `add` alone kept the old Debug body.)
+    #[test]
+    fn glue_refresh_regenerates_on_field_type_edit() {
+        fn with_program<R>(src: &str, f: impl FnOnce(&Interner, &crate::check::collect::Program) -> R) -> R {
+            let interner = Interner::default();
+            let known = Known::new(&interner);
+            let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            f(&interner, &program)
+        }
+        let v1 = "#[derive(Debug)]\nstruct S { b: u8 }\nfn main() { let s = S { b: 0 }; println!(\"{:?}\", s); }\n";
+        let v2 = "#[derive(Debug)]\nstruct S { b: bool }\nfn main() { let s = S { b: false }; println!(\"{:?}\", s); }\n";
+        let mut glue = GlueSet::default();
+        // The Adt id is collect order; both programs declare S first,
+        // so one key names it in both, as in one daemon session.
+        let (key, text1) = with_program(v1, |interner, p| {
+            let a = p.type_names[&interner.intern("S")];
+            let key = (Glue::Debug, CTy::Adt(a));
+            glue.add(p, [&key].into_iter());
+            (key, glue_unit(p, &glue))
+        });
+        let regen_same = with_program(v1, |_interner, p| glue.refresh(p, [&key].into_iter()).1);
+        assert!(!regen_same, "same program: nothing regenerates");
+        let text1_again = with_program(v1, |_interner, p| glue_unit(p, &glue));
+        assert_eq!(text1_again, text1, "same program: same glue text");
+        let (regen, text2) = with_program(v2, |_interner, p| {
+            let regen = glue.refresh(p, [&key].into_iter()).1;
+            (regen, glue_unit(p, &glue))
+        });
+        assert!(regen, "field type edit regenerates the Debug glue");
+        assert_ne!(text2, text1, "regenerated glue text differs");
+    }
+
     /// Replaces `main` with a hand-built body: an indirect call
     /// through a fn pointer value, float add, remainder and a
     /// saturating float-to-int cast, and a 128-bit literal print.
