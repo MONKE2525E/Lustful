@@ -285,7 +285,17 @@ mod tests {
     use super::*;
 
     fn req(cmd: Cmd, json: bool, debug: bool) -> Request {
-        Request { cmd, file: "/tmp/x/main.rs".into(), out: "/tmp/x/main".into(), json, timings: false, debug, emit_c: None, max_errors: 20, run_args: None }
+        Request {
+            cmd,
+            file: "/tmp/x/main.rs".into(),
+            out: "/tmp/x/main".into(),
+            json,
+            timings: false,
+            debug,
+            emit_c: None,
+            max_errors: 20,
+            run_args: None,
+        }
     }
 
     /// Each key input named in the module docs must change the key on its own.
