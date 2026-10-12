@@ -14,8 +14,61 @@
 //
 // A rename changes an item's hash. That is intended: a rename is a delete plus an
 // insert for caches. Hashes carry no generic arguments, no types, and no span.
-use crate::intern::FxHasher;
 use std::hash::{Hash, Hasher};
+
+/// Hasher for stable def identity only. The FxHasher used for hash maps
+/// and scan hashes keeps too little entropy between similar short
+/// inputs: its rotate-xor-multiply step makes sequential names collide
+/// at high rates (`filler_19` and `filler_92` hash equal for many crate
+/// seeds, measured above 10 percent over random states), which turns
+/// valid crates into internal DefPathHash collision errors. This mixer
+/// folds each word with a 128-bit multiply (wyhash's mum step), so
+/// every input bit reaches every output bit. Values differ from the
+/// old FxHash-based ones for the same inputs: persisted slot manifests
+/// and disk cache keys from older builds simply miss and rebuild.
+struct DefHasher(u64);
+
+#[inline]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+impl DefHasher {
+    fn new() -> DefHasher {
+        DefHasher(0x243f_6a88_85a3_08d3)
+    }
+    fn add(&mut self, w: u64) {
+        self.0 = mum(self.0 ^ 0x9e37_79b9_7f4a_7c15, w ^ self.0);
+    }
+}
+
+impl Hasher for DefHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        for &b in rest {
+            self.add(b as u64);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        mum(self.0 ^ 0xa076_1d64_78bd_642f, self.0)
+    }
+}
 
 /// One crate in this session. Dense, session-local. Today a session holds one
 /// crate, so every def has `LOCAL_CRATE`; multi-crate sessions (S6) assign more.
@@ -129,7 +182,7 @@ impl DefKind {
 /// manifest path in place of the source. `test` marks the same target compiled
 /// as a test crate: test and non-test defs must never share identity.
 pub fn stable_crate_hash(package_id: &str, target_kind: &str, target_name: &str, test: bool) -> StableCrateHash {
-    let mut h = FxHasher::default();
+    let mut h = DefHasher::new();
     "lust-crate-v1".hash(&mut h);
     package_id.hash(&mut h);
     target_kind.hash(&mut h);
@@ -171,7 +224,7 @@ pub fn item_path(krate: StableCrateHash, module: &[&str], kind: DefKind, name: &
 /// The hash half of `item_path`, without building the text. Callers that run
 /// per compile and keep no path table (`collect`) use this form.
 pub fn item_hash(krate: StableCrateHash, module: &[&str], kind: DefKind, name: &str, disamb: u32) -> DefPathHash {
-    let mut h = FxHasher::default();
+    let mut h = DefHasher::new();
     krate.0.hash(&mut h);
     (module.len() as u64).hash(&mut h);
     for seg in module {
@@ -192,7 +245,7 @@ pub fn child_path(parent: DefPathHash, parent_text: &str, kind: DefKind, name: &
 
 /// The hash half of `child_path`. See `item_hash`.
 pub fn child_hash(parent: DefPathHash, kind: DefKind, name: &str, disamb: u32) -> DefPathHash {
-    let mut h = FxHasher::default();
+    let mut h = DefHasher::new();
     parent.0.hash(&mut h);
     (kind as u64).hash(&mut h);
     name.hash(&mut h);
@@ -320,6 +373,22 @@ mod tests {
         assert_eq!(impl_hash(k, &[], "Foo", 2), ih);
         assert_eq!(method_hash(ih, "get"), method_path(ih, &it, "get").0);
         assert_eq!(child_hash(ih, DefKind::Method, "get", 0), child_path(ih, &it, DefKind::Method, "get", 0).0);
+    }
+
+    /// Sequential generated names must not collide: the old FxHash-based
+    /// identity made `filler_19` and `filler_92` hash equal, so a valid
+    /// file of numbered functions failed with an internal collision
+    /// error. A few thousand names from each common generated family
+    /// must all hash apart.
+    #[test]
+    fn sequential_names_do_not_collide() {
+        let k = krate();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..2000 {
+            for name in [format!("filler_{i}"), format!("test_{i}"), format!("a{i}"), format!("fn_{i}"), format!("m{i}_x")] {
+                assert!(seen.insert(free_fn_path(k, &[], &name).0), "collision at {name}");
+            }
+        }
     }
 
     /// A duplicate definition (same path) is not a collision. Two distinct
