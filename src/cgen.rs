@@ -1417,8 +1417,8 @@ impl FnGen<'_, '_, '_> {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
             }
-            Rvalue::StaticLoad(idx) => format!("lust_static_{idx}"),
-            Rvalue::StaticRef(idx) => format!("(&lust_static_{idx})"),
+            Rvalue::StaticLoad(idx) => static_sym(self.p, *idx),
+            Rvalue::StaticRef(idx) => format!("(&{})", static_sym(self.p, *idx)),
             Rvalue::LenOf(pl) => {
                 let (e, t) = self.place(pl, loc);
                 match &t {
@@ -2398,11 +2398,11 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let st = &p.statics[*idx as usize];
             let sct = cty(&p.tys, st.ty);
             match sct {
-                CTy::Array(_, n) => format!("(({}){{ lust_static_{idx}.v, {n} }})", ctype(t)),
+                CTy::Array(_, n) => format!("(({}){{ {}.v, {n} }})", ctype(t), static_sym(p, *idx)),
                 _ => zero_lit(p, t),
             }
         }
-        (CV::StaticRef(idx), _) => format!("(&lust_static_{idx})"),
+        (CV::StaticRef(idx), _) => format!("(&{})", static_sym(p, *idx)),
         (CV::Ref(inner), CTy::Slice(el)) => {
             // A slice over a promoted aggregate.
             match &**inner {
@@ -2488,6 +2488,20 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
     }
 }
 
+/// The C symbol of one static. Named by the static's stable def hash,
+/// never by its collect-order index: cached function code (a daemon
+/// slot's `FnOut`, a disk unit object) names statics by symbol, and an
+/// edit that inserts a static earlier in the file shifts every later
+/// index. A position-based name would then read the wrong static
+/// while every fingerprint still matches (the same reason fn slots
+/// key on def identity, section 4.2).
+fn static_sym(p: &Program, idx: u32) -> String {
+    match p.static_defs.get(idx as usize) {
+        Some(def) => format!("lust_static_{}", def.hash.0),
+        None => format!("lust_static_{idx}"),
+    }
+}
+
 /// Definitions of the program's statics as C globals (ARCH 2.13 static data).
 fn static_defs(p: &Program) -> String {
     let mut pre = String::new();
@@ -2496,7 +2510,7 @@ fn static_defs(p: &Program) -> String {
     for (i, st) in p.statics.iter().enumerate() {
         let ct = cty(&p.tys, st.ty);
         let init = const_init(p, &st.value, &ct, &mut pre, &mut counter);
-        let _ = writeln!(out, "{} lust_static_{i} = {init};", ctype(&ct));
+        let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
     }
     format!("{pre}{out}")
 }
@@ -2505,7 +2519,7 @@ fn static_defs(p: &Program) -> String {
 fn static_decls(p: &Program) -> String {
     let mut out = String::new();
     for (i, st) in p.statics.iter().enumerate() {
-        let _ = writeln!(out, "extern {} lust_static_{i};", ctype(&cty(&p.tys, st.ty)));
+        let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, st.ty)), static_sym(p, i as u32));
     }
     out
 }
