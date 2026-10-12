@@ -386,7 +386,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Slice(_) => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
-                layout::struct_layout(&fields?, layout::Repr::default()).ok()
+                layout::tuple_layout(&fields?).ok()
             }
             CTy::Array(e, 0) => Some(plain_layout(0, go(p, e, seen).map_or(1, |l| l.align))),
             CTy::Array(e, n) => layout::array_layout(&go(p, e, seen)?, *n).ok(),

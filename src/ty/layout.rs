@@ -177,7 +177,116 @@ fn best_niche(fields: &[Layout], offsets: &[u64], order: &[usize]) -> Option<Nic
     best
 }
 
-/// The layout of a struct or tuple with the given field layouts and repr.
+/// Which end of a univariant layout its largest niche is biased toward
+/// (rustc's two-pass field ordering: enums pack other variants into the
+/// larger side of the niche).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NicheBias {
+    Start,
+    End,
+}
+
+/// Whether the last field may be unsized. Tuple types use `MaybeUnsized`:
+/// their last element stays last, outside the field reordering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnivKind {
+    AlwaysSized,
+    MaybeUnsized,
+}
+
+/// rustc's alignment group key for one field: `log2` of an effective
+/// alignment derived from the field's align and size, so a `[u8; 4]`
+/// groups with align-4 fields and a `[u8; 6]` with align-2 fields. The
+/// niche bias caps or drops the size part for niche-carrying fields.
+fn alignment_group_key(f: &Layout, max_field_align: u64, largest_niche_free: u128, bias: NicheBias) -> u64 {
+    let niche_free = f.niche.map_or(0, |n| n.free);
+    let mut key = f.align.max(f.size).trailing_zeros();
+    if largest_niche_free > 0 {
+        match bias {
+            NicheBias::Start => key = key.min(max_field_align.trailing_zeros()),
+            NicheBias::End if niche_free == largest_niche_free => key = f.align.trailing_zeros(),
+            NicheBias::End => {}
+        }
+    }
+    key as u64
+}
+
+/// One biased pass of rustc's univariant (repr(Rust) struct or tuple)
+/// layout: stable-sort the optimizable fields by alignment group
+/// (largest first), then niche placement within the group; place them
+/// in that order with normal padding.
+fn univariant_biased(fields: &[Layout], repr: Repr, kind: UnivKind, bias: NicheBias) -> Result<Layout, ()> {
+    let mut order: Vec<usize> = (0..fields.len()).collect();
+    let end = if kind == UnivKind::MaybeUnsized && !fields.is_empty() { fields.len() - 1 } else { fields.len() };
+    if fields.len() > 1 {
+        let max_field_align = fields[..end].iter().map(|f| f.align).max().unwrap_or(1);
+        let largest_niche_free = fields[..end].iter().filter_map(|f| f.niche).map(|n| n.free).max().unwrap_or(0);
+        order[..end].sort_by_key(|&x| {
+            let f = &fields[x];
+            let niche_free = f.niche.map_or(0, |n| n.free);
+            let niche_key = match bias {
+                NicheBias::Start => !niche_free,
+                NicheBias::End => niche_free,
+            };
+            let inner_key = match bias {
+                NicheBias::Start => f.niche.map_or(0, |n| n.offset),
+                NicheBias::End => f.niche.map_or(0, |n| !(f.size - n.scalar_size - n.offset)),
+            };
+            (std::cmp::Reverse(alignment_group_key(f, max_field_align, largest_niche_free, bias)), niche_key, inner_key)
+        });
+    }
+    let (end_off, offsets) = place_in_order(fields, &order);
+    let align = fields.iter().map(|f| f.align).max().unwrap_or(1);
+    // The largest niche, in placement order; the End bias takes the last
+    // of equally large niches, the Start bias the first.
+    let mut best: Option<Niche> = None;
+    for &i in &order {
+        if let Some(n) = fields[i].niche {
+            let prefer = match bias {
+                NicheBias::Start => best.is_none_or(|b| n.free > b.free),
+                NicheBias::End => best.is_none_or(|b| n.free >= b.free),
+            };
+            if prefer {
+                best = Some(Niche { offset: offsets[i] + n.offset, ..n });
+            }
+        }
+    }
+    let mut out = Layout::simple(align_up(end_off, align), align, best);
+    out.field_offsets = offsets;
+    finish(out, repr)
+}
+
+/// rustc's univariant layout: a start-biased pass, then (for sized
+/// types whose niche sits strictly inside) an end-biased pass, keeping
+/// the layout whose niche is closer to an edge.
+fn univariant_layout(fields: &[Layout], repr: Repr, kind: UnivKind) -> Result<Layout, ()> {
+    let start = univariant_biased(fields, repr, kind, NicheBias::Start)?;
+    if kind != UnivKind::MaybeUnsized && fields.len() > 1 {
+        if let Some(n) = start.niche {
+            let head = n.offset;
+            let tail = start.size.saturating_sub(head + n.scalar_size);
+            if head != 0 && tail > 0 {
+                let alt = univariant_biased(fields, repr, kind, NicheBias::End)?;
+                if let Some(an) = alt.niche
+                    && an.offset > head
+                    && an.offset > tail
+                {
+                    return Ok(alt);
+                }
+            }
+        }
+    }
+    Ok(start)
+}
+
+/// The layout of a tuple type: repr(Rust) with the last element held
+/// last, as rustc lays tuples out as possibly unsized.
+pub fn tuple_layout(fields: &[Layout]) -> Result<Layout, ()> {
+    univariant_layout(fields, Repr::default(), UnivKind::MaybeUnsized)
+}
+
+/// The layout of a struct (or one enum variant's fields) with the given
+/// field layouts and repr. Tuple types use `tuple_layout` instead.
 pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
     match repr.kind {
         ReprKind::Transparent => {
@@ -215,15 +324,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
         }
         ReprKind::Default => {}
     }
-    // repr(Rust): largest alignment first, then largest size, then declaration order.
-    let mut order: Vec<usize> = (0..fields.len()).collect();
-    order.sort_by(|&a, &b| fields[b].align.cmp(&fields[a].align).then(fields[b].size.cmp(&fields[a].size)).then(a.cmp(&b)));
-    let (end, offsets) = place_in_order(fields, &order);
-    let align = fields.iter().map(|f| f.align).max().unwrap_or(1);
-    let niche = best_niche(fields, &offsets, &order);
-    let mut out = Layout::simple(align_up(end, align), align, niche);
-    out.field_offsets = offsets;
-    finish(out, repr)
+    univariant_layout(fields, repr, UnivKind::AlwaysSized)
 }
 
 /// The smallest tag width in bytes (1, 2, 4, 8, 16) whose range holds every
@@ -304,35 +405,6 @@ fn tagged_variant(fields: &[Layout], tag_w: u64) -> (u64, u64, Vec<u64>) {
     (cur, align, offsets)
 }
 
-/// Tries to place `fields` inside `size` bytes without using the niche scalar
-/// bytes. Greedy first-fit in declaration order at each field's alignment.
-fn fits_outside_niche(fields: &[Layout], size: u64, niche: Niche) -> Option<Vec<u64>> {
-    let n_lo = niche.offset;
-    let n_hi = niche.offset + niche.scalar_size;
-    let mut placed: Vec<(u64, u64)> = vec![(n_lo, n_hi)];
-    let mut offsets = Vec::with_capacity(fields.len());
-    for f in fields {
-        if f.size == 0 {
-            offsets.push(0);
-            continue;
-        }
-        let mut at = 0u64;
-        loop {
-            at = align_up(at, f.align);
-            if at + f.size > size {
-                return None;
-            }
-            let clash = placed.iter().find(|&&(lo, hi)| at < hi && lo < at + f.size).map(|&(_, hi)| hi);
-            match clash {
-                Some(hi) => at = hi,
-                None => break,
-            }
-        }
-        placed.push((at, at + f.size));
-        offsets.push(at);
-    }
-    Some(offsets)
-}
 
 /// The layout of an enum. `variants` holds each variant's field layouts in
 /// declaration order; `discs` holds the discriminant of each variant.
@@ -501,54 +573,60 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
     finish(l, repr)
 }
 
-/// The niche-filled candidate layout, when one exists.
+/// The niche-filled candidate layout, when one exists (rustc's rule):
+/// every variant is laid out as a plain univariant under the enum repr,
+/// the largest variant by size (the last on a tie) donates its niche,
+/// and every other variant's whole layout must fit either before the
+/// niche scalar or shifted to just after it. Niche values are reserved
+/// for the whole index span from the first to the last other variant.
 fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Option<Layout> {
     let _ = discs;
-    // The niche variant is the largest data-carrying variant as a plain struct.
-    let mut cand: Option<(usize, Layout)> = None;
-    for (i, v) in variants.iter().enumerate() {
-        if v.is_empty() {
-            continue;
-        }
-        let l = struct_layout(v, Repr::default()).ok()?;
-        if cand.as_ref().is_none_or(|(_, c)| l.size > c.size) {
-            cand = Some((i, l));
+    if variants.len() < 2 {
+        return None;
+    }
+    let vrepr = Repr { kind: ReprKind::Default, int: None, align: repr.align };
+    let mut layouts: Vec<Layout> = Vec::with_capacity(variants.len());
+    for v in variants {
+        layouts.push(univariant_layout(v, vrepr, UnivKind::AlwaysSized).ok()?);
+    }
+    let mut vi = 0;
+    for i in 1..layouts.len() {
+        if layouts[i].size >= layouts[vi].size {
+            vi = i;
         }
     }
-    let (vi, base) = cand?;
+    let base = layouts[vi].clone();
     let niche = base.niche?;
-    let others = (variants.len() - 1) as u128;
-    if niche.free < others {
+    let first = (0..variants.len()).find(|&i| i != vi)?;
+    let last = (0..variants.len()).rev().find(|&i| i != vi)?;
+    let count = (last - first + 1) as u128;
+    if niche.free < count {
         return None;
     }
     // Another variant may need a larger alignment than the niche variant
     // (a u128 payload next to an align-8 niche variant): the enum then
-    // takes that alignment, and its size is rounded up to it. The other
-    // fields must still fit in that size outside the niche scalar bytes.
-    let mut eff_align = base.align;
-    for (i, v) in variants.iter().enumerate() {
-        if i != vi {
-            for f in v {
-                eff_align = eff_align.max(f.align);
-            }
-        }
-    }
+    // takes that alignment, and its size is rounded up to it.
+    let eff_align = layouts.iter().map(|l| l.align).max().unwrap_or(1);
     let eff_size = align_up(base.size, eff_align);
     let mut variant_offsets: Vec<Vec<u64>> = Vec::with_capacity(variants.len());
-    for (i, v) in variants.iter().enumerate() {
-        if i == vi {
-            variant_offsets.push(base.field_offsets.clone());
+    for (i, l) in layouts.iter().enumerate() {
+        if i == vi || l.size <= niche.offset {
+            variant_offsets.push(l.field_offsets.clone());
         } else {
-            variant_offsets.push(fits_outside_niche(v, eff_size, niche)?);
+            let shift = align_up(niche.offset + niche.scalar_size, l.align);
+            if shift + l.size > eff_size {
+                return None;
+            }
+            variant_offsets.push(l.field_offsets.iter().map(|&o| o + shift).collect());
         }
     }
-    let remaining = niche.free - others;
+    let remaining = niche.free - count;
     let niche_mask: u128 = if niche.scalar_size * 8 >= 128 { u128::MAX } else { (1u128 << (niche.scalar_size * 8)) - 1 };
     let mut l = Layout::simple(
         eff_size,
         eff_align,
         if remaining > 0 {
-            Some(Niche { free: remaining, start: niche.start.wrapping_add(others) & niche_mask, ..niche })
+            Some(Niche { free: remaining, start: niche.start.wrapping_add(count) & niche_mask, ..niche })
         } else {
             None
         },
@@ -649,7 +727,7 @@ fn compute(
             for e in elems {
                 fields.push(go(tys, shapes, e, memo, active)?);
             }
-            struct_layout(&fields, Repr::default())
+            tuple_layout(&fields)
         }
         TyKind::Adt(..) => match tys.builtin_of(t) {
             // String and Vec are (ptr, len, cap) words in this order for layout.
@@ -874,6 +952,64 @@ mod tests {
         // byte leaves 199 free values (the small arc is 100..=156).
         let e = enum_layout(&[vec![], vec![]], &[-100, 100], Repr::default()).unwrap();
         assert_eq!(e.niche.map(|n| n.free), Some(199));
+    }
+
+    #[test]
+    fn tuple_last_element_stays_last() {
+        // (usize, Option<()>, usize) as layouts (u64, bool-sized enum, u64):
+        // the middle element is not moved after the last one.
+        let opt_unit = enum_layout(&[vec![], vec![zst_layout(1)]], &[0, 1], Repr::default()).unwrap();
+        let t = tuple_layout(&[int_layout(IntTy::U64), opt_unit, int_layout(IntTy::U64)]).unwrap();
+        assert_eq!(sz(&t), (24, 8));
+        assert_eq!(t.field_offsets, vec![0, 8, 16]);
+        // (u8, u32, u8, u64): the first three reorder, the u64 stays last.
+        let t = tuple_layout(&ints(&[IntTy::U8, IntTy::U32, IntTy::U8, IntTy::U64])).unwrap();
+        assert_eq!(t.field_offsets, vec![4, 0, 5, 8]);
+        // The same fields as a struct reorder fully: u64 first.
+        let s = struct_layout(&ints(&[IntTy::U8, IntTy::U32, IntTy::U8, IntTy::U64]), Repr::default()).unwrap();
+        assert_eq!(s.field_offsets, vec![12, 8, 13, 0]);
+        assert_eq!(sz(&t), sz(&s));
+    }
+
+    #[test]
+    fn niche_fit_is_whole_variant_before_or_after() {
+        // enum { A([bool; 4]), B(u8, u8, u8) } niche-fills by shifting
+        // B's whole layout past the niche byte: offsets 1, 2, 3.
+        let arr = array_layout(&bool_layout(), 4).unwrap();
+        let l = enum_layout(&[vec![arr], ints(&[IntTy::U8, IntTy::U8, IntTy::U8])], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 4);
+        assert_eq!(l.variant_offsets[1], vec![1, 2, 3]);
+        // The largest variant is the last on a size tie: { A((..32..)),
+        // B(i128, char) } with both at 32 picks B, whose char niche
+        // cannot hold A's tuple, so the enum stays tagged at 48.
+        let oo = enum_layout(&[vec![], vec![enum_layout(&[vec![], vec![int_layout(IntTy::U64)]], &[0, 1], Repr::default()).unwrap()]], &[0, 1], Repr::default())
+            .unwrap();
+        let tup = tuple_layout(&[oo, int_layout(IntTy::Usize), array_layout(&int_layout(IntTy::U8), 5).unwrap()]).unwrap();
+        let l = enum_layout(&[vec![tup], vec![int_layout(IntTy::I128), char_layout()]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(sz(&l), (48, 16));
+        assert!(matches!(l.enum_tag, Some(EnumTag::Explicit { .. })));
+    }
+
+    #[test]
+    fn repr_align_applies_to_niche_variant_layouts() {
+        // #[repr(align(4))] enum { V0, V1(u16, [i8; 0]), V2((Option<u16>,)) }
+        // is 8: with the align applied per variant, V1 no longer fits.
+        let opt16 = enum_layout(&[vec![], vec![int_layout(IntTy::U16)]], &[0, 1], Repr::default()).unwrap();
+        let tup = tuple_layout(&[opt16]).unwrap();
+        let arr0 = array_layout(&int_layout(IntTy::I8), 0).unwrap();
+        let l = enum_layout(
+            &[vec![], vec![int_layout(IntTy::U16), arr0], vec![tup]],
+            &[0, 1, 2],
+            Repr { align: Some(4), ..Repr::default() },
+        )
+        .unwrap();
+        assert_eq!(sz(&l), (8, 4));
+        // Without the align repr the same enum niche-fills to 4.
+        let opt16 = enum_layout(&[vec![], vec![int_layout(IntTy::U16)]], &[0, 1], Repr::default()).unwrap();
+        let tup = tuple_layout(&[opt16]).unwrap();
+        let arr0 = array_layout(&int_layout(IntTy::I8), 0).unwrap();
+        let l = enum_layout(&[vec![], vec![int_layout(IntTy::U16), arr0], vec![tup]], &[0, 1, 2], Repr::default()).unwrap();
+        assert_eq!(sz(&l), (4, 2));
     }
 
     #[test]
