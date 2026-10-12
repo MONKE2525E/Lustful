@@ -1295,12 +1295,12 @@ impl CollectCx<'_, '_> {
     }
 }
 
-/// True when static data emission can write this value as a C initializer:
-/// niche-filled enums only in their niche variant (other variants need
-/// statements to store the niche tag, which an initializer cannot do).
+/// True when static data emission can write this value as a C
+/// initializer. Every variant form qualifies today, niche-filled
+/// enums included: the emitter sets the niche scalar through the
+/// variant struct's `_s` member in the same designator (W-CGEN).
 fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> bool {
     use crate::ty::consteval::ConstValue as CV;
-    use crate::ty::layout::EnumTag;
     match v {
         CV::Variant(variant, vals) => {
             let elem_tys: Vec<Ty> = match p.tys.kind(ty) {
@@ -1310,14 +1310,7 @@ fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> boo
                     None => vec![ERROR; vals.len()],
                 },
             };
-            let tag_ok = match crate::ty::layout::layout_of_ty(&p.tys, p, ty) {
-                Ok(l) => match l.enum_tag {
-                    Some(EnumTag::NicheFilled { variant: nv, .. }) => *variant as usize == nv,
-                    _ => true,
-                },
-                Err(()) => true,
-            };
-            tag_ok && vals.iter().enumerate().all(|(i, x)| static_form(p, x, elem_tys.get(i).copied().unwrap_or(ERROR)))
+            vals.iter().enumerate().all(|(i, x)| static_form(p, x, elem_tys.get(i).copied().unwrap_or(ERROR)))
         }
         CV::Aggregate(vals) => {
             let elem_tys: Vec<Ty> = match p.tys.kind(ty) {
