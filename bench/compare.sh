@@ -35,14 +35,22 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/samples"
 base_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
 
+# now_ns: nanoseconds since epoch. GNU date has %N; BSD date (macOS) does not,
+# so fall back to python3 there (adds the same few ms to every competitor).
+if [ "$(date +%N 2>/dev/null | tr -d 0-9)" = "" ]; then
+  now_ns() { date +%s%N; }
+else
+  now_ns() { python3 -c 'import time; print(time.time_ns())'; }
+fi
+
 # time_run <sample-file> <cmd...>: run cmd, append wall seconds to sample-file.
 time_run() {
   local samples=$1
   shift
   local s e
-  s=$(date +%s%N)
+  s=$(now_ns)
   "$@" >/dev/null 2>"$work/last.err"
-  e=$(date +%s%N)
+  e=$(now_ns)
   awk -v s="$s" -v e="$e" 'BEGIN { printf "%.4f\n", (e - s) / 1000000000 }' >>"$samples"
 }
 
