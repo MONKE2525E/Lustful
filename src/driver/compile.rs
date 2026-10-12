@@ -689,10 +689,16 @@ fn slot_update(
         .fn_loc
         .iter()
         .map(|&(item, sub)| {
-            let f = match (&front.ast.items[item].kind, sub) {
-                (ItemKind::Fn(d), None) => d,
-                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
-                _ => unreachable!("fn_loc out of date"),
+            let f = match (item != usize::MAX, sub) {
+                (false, Some(k)) => match &front.ast.stmt_items[k].kind {
+                    ItemKind::Fn(d) => d,
+                    _ => unreachable!("fn_loc out of date"),
+                },
+                _ => match (&front.ast.items[item].kind, sub) {
+                    (ItemKind::Fn(d), None) => d,
+                    (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+                    _ => unreachable!("fn_loc out of date"),
+                },
             };
             super::ast_hash::fn_head_hash(&front.ast, f)
         })
@@ -817,7 +823,17 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
     let key = |hash, path, free, name| FnKey { disk: DiskDefId { krate: stable, hash }, path, free, name };
     fn_loc
         .iter()
-        .map(|&(item, sub)| match (&ast.items[item].kind, sub) {
+        .map(|&(item, sub)| match (item != usize::MAX, sub) {
+            (false, Some(k)) => {
+                let d = match &ast.stmt_items[k].kind {
+                    ItemKind::Fn(d) => d,
+                    _ => unreachable!("fn_loc points at a function"),
+                };
+                let seg = format!("#nested{k}");
+                let (hash, path) = def::free_fn_path(stable, &[seg.as_str()], interner.get(d.name));
+                key(hash, path, true, d.name)
+            }
+            _ => match (&ast.items[item].kind, sub) {
             (ItemKind::Fn(d), None) => {
                 let (hash, path) = def::free_fn_path(stable, &[], interner.get(d.name));
                 key(hash, path, true, d.name)
@@ -828,6 +844,7 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
                 key(hash, path, false, imp.fns[k].name)
             }
             _ => unreachable!("fn_loc points at a function"),
+            },
         })
         .collect()
 }
@@ -840,6 +857,13 @@ fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
             ItemKind::Fn(_) => out.push((i, None)),
             ItemKind::Impl(imp) => out.extend((0..imp.fns.len()).map(|k| (i, Some(k)))),
             _ => {}
+        }
+    }
+    // Nested fns follow, in stmt item order, marked with a usize::MAX item
+    // index and the stmt item index as the sub index (collect's order).
+    for (i, item) in ast.stmt_items.iter().enumerate() {
+        if matches!(item.kind, ItemKind::Fn(_)) {
+            out.push((usize::MAX, Some(i)));
         }
     }
     out
@@ -1025,7 +1049,7 @@ fn resolved_setup(
         lexed,
         lexed_start: 0,
         scan: scan::ChunkScan {
-            fns: body_hashes.iter().map(|&body_hash| scan::FnScan { body_hash, fn_offset: 0, body: 0..0 }).collect(),
+            fns: body_hashes.iter().map(|&body_hash| scan::FnScan { body_hash, nested: false, fn_offset: 0, body: 0..0 }).collect(),
             items: item_scans.clone(),
             body_idents: scans.bodies.into_iter().map(|b| b.1).collect(),
             ends_at_boundary: true,
@@ -1345,8 +1369,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let env = scan::env_hash(item_scans.iter());
     let fn_count = front.chunks.iter().map(|c| c.scan.fns.len()).sum::<usize>();
     // (chunk, index in chunk) for every function, in LocalDefId order.
-    let fn_at: Vec<(usize, usize)> =
-        front.chunks.iter().enumerate().flat_map(|(c, ch)| (0..ch.scan.fns.len()).map(move |k| (c, k))).collect();
+    let fn_at: Vec<(usize, usize)> = {
+        // Collect's LocalDefId order: top-level fns first, then nested.
+        let mut tops: Vec<(usize, usize)> = Vec::new();
+        let mut nested: Vec<(usize, usize)> = Vec::new();
+        for (c, ch) in front.chunks.iter().enumerate() {
+            for k in 0..ch.scan.fns.len() {
+                if ch.scan.fns[k].nested {
+                    nested.push((c, k));
+                } else {
+                    tops.push((c, k));
+                }
+            }
+        }
+        tops.extend(nested);
+        tops
+    };
     let scan_of = |front: &Front, i: usize| -> (u64, u32) {
         let f = &front.chunks[fn_at[i].0].scan.fns[fn_at[i].1];
         (f.body_hash, map.line_col_at(ROOT_FILE, f.fn_offset).0)
@@ -1394,10 +1432,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             match parser::parse_body(toks, &chunk.lexed.strings, &mut front.ast, &front.interner, &front.known) {
                 Ok((body, exprs, pats)) => {
                     let (item, sub) = front.fn_loc[i];
-                    let def = match (&mut front.ast.items[item].kind, sub) {
-                        (ItemKind::Fn(d), None) => d,
-                        (ItemKind::Impl(imp), Some(k)) => &mut imp.fns[k],
-                        _ => unreachable!("fn_loc out of date"),
+                    let def = match (item != usize::MAX, sub) {
+                        (false, Some(k)) => match &mut front.ast.stmt_items[k].kind {
+                            ItemKind::Fn(d) => d,
+                            _ => unreachable!("fn_loc out of date"),
+                        },
+                        _ => match (&mut front.ast.items[item].kind, sub) {
+                            (ItemKind::Fn(d), None) => d,
+                            (ItemKind::Impl(imp), Some(k)) => &mut imp.fns[k],
+                            _ => unreachable!("fn_loc out of date"),
+                        },
                     };
                     def.body = Some(body);
                     def.exprs = exprs;

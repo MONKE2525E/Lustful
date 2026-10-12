@@ -794,6 +794,10 @@ pub fn resolve_crate_cached(
     let mut chunks = Vec::new();
     let mut fn_lines = Vec::new();
     let mut body_hashes = Vec::new();
+    // Nested fns ride after every file's top-level fns (collect's order).
+    let mut nested_lines: Vec<u32> = Vec::new();
+    let mut nested_hashes: Vec<u64> = Vec::new();
+    let mut nested_modules: Vec<ModuleId> = Vec::new();
     let mut fn_module = Vec::new();
     let mut structure = crate::intern::FxHasher::default();
     for (fi, mut w) in works.into_iter().enumerate() {
@@ -825,9 +829,24 @@ pub fn resolve_crate_cached(
                 _ => {}
             }
         }
+        // Nested fns (W-CORELANG body items) ride after the file's
+        // top-level fns, in stmt item order, matching collect.
+        for item in &w.ast.stmt_items {
+            if let crate::ast::ItemKind::Fn(d) = &item.kind {
+                nested_lines.push(map.line_col(d.name_span).0);
+                let text = map.text(d.name_span.file).unwrap_or("");
+                let body_span = d.body.map(|b| w.ast.block(b).span).unwrap_or(d.name_span);
+                let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
+                nested_hashes.push(hash_str(slice));
+                nested_modules.push(w.module);
+            }
+        }
         w.ast.items = flat_items;
         chunks.push(w.ast);
     }
+    fn_lines.extend(nested_lines);
+    body_hashes.extend(nested_hashes);
+    fn_module.extend(nested_modules);
     let ast = Ast::concat(chunks);
     tables.fn_module = fn_module;
     let structure_hash = {

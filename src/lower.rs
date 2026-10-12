@@ -1425,8 +1425,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             return;
         }
-        if let PatRes::ConstItem(idx) = self.ck.pat_res(pat) {
-            let cv = p.consts[idx as usize].value.clone();
+        let const_pat = match self.ck.pat_res(pat) {
+            PatRes::ConstItem(idx) => Some(p.consts[idx as usize].value.clone()),
+            PatRes::BodyConst(idx) => Some(p.body_consts[idx as usize].value.clone()),
+            _ => None,
+        };
+        if let Some(cv) = const_pat {
             let op = self.const_operand(&cv, ty, span);
             let c = self.temp(BOOL);
             self.assign(Place::local(c), Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op), span);
