@@ -712,7 +712,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             };
             if let Some(seg) = seg {
                 let name = seg.name;
-                if p.known.int_ty(name).is_none() && name != p.known.bool && name != p.known.char && name != p.known.str && name != p.known.self_type {
+                if p.known.int_ty(name).is_none()
+                    && name != p.known.bool
+                    && name != p.known.char
+                    && name != p.known.str
+                    && name != p.known.self_type
+                {
                     self.binding(Namespace::Type, name);
                 }
             }

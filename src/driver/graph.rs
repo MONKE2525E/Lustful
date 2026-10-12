@@ -17,7 +17,7 @@
 use crate::ast::SelfKind;
 use crate::check::collect::{AdtDef, FnInfo, Program, VariantShape};
 use crate::def::{DefId, DiskDefId, LocalDefId, StableCrateHash};
-use crate::intern::{FxMap, FxHasher, Sym};
+use crate::intern::{FxHasher, FxMap, Sym};
 use crate::ty::defs::{DefData, DefKind as DefsKind, ModuleId, ROOT_MODULE};
 use crate::ty::*;
 use std::hash::{Hash, Hasher};
@@ -807,8 +807,7 @@ impl SlotManifest {
     #[allow(dead_code)] // See `new`.
     pub fn from_disk_slots(slot_of: &FxMap<DiskDefId, u32>) -> SlotManifest {
         let empty = InstanceKeyHash::empty_args_fingerprint();
-        let mut entries: Vec<(u32, InstanceKeyHash)> =
-            slot_of.iter().map(|(k, &s)| (s, InstanceKeyHash::of_disk_def(*k, empty))).collect();
+        let mut entries: Vec<(u32, InstanceKeyHash)> = slot_of.iter().map(|(k, &s)| (s, InstanceKeyHash::of_disk_def(*k, empty))).collect();
         entries.sort_unstable();
         let mut m = SlotManifest::default();
         for (slot, key) in entries {
@@ -950,7 +949,8 @@ fn main() {
             let (ck, errs) = check_fn(p, p.main.unwrap());
             assert!(errs.is_empty(), "{errs:?}");
             let reads = &ck.reads;
-            let value = |name: &str| ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern(name) });
+            let value =
+                |name: &str| ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern(name) });
             // The `helper()` call reads one value binding, by that name only.
             let helper = reads.get(&value("helper")).expect("helper binding read");
             assert!(!helper.failed);
@@ -1008,7 +1008,13 @@ fn main() {
             let as_ty = p.binding(&mut reads, ROOT_MODULE, Namespace::Type, interner.intern("Foo"));
             let as_val = p.binding(&mut reads, ROOT_MODULE, Namespace::Value, interner.intern("Foo"));
             assert_eq!(as_ty, as_val);
-            assert_eq!(p.binding_kind(match as_ty { BindingRes::Def(d) => d, _ => unreachable!() }), Some(DefsKind::Struct));
+            assert_eq!(
+                p.binding_kind(match as_ty {
+                    BindingRes::Def(d) => d,
+                    _ => unreachable!(),
+                }),
+                Some(DefsKind::Struct)
+            );
             // Builtin types resolve in the type namespace only.
             let b = p.tys.builtins();
             assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Type, interner.intern("String")), BindingRes::Def(b.string));
@@ -1046,7 +1052,8 @@ fn main() {}
             assert_eq!(bump.first().map(|c| (c.receiver, c.trait_)), Some((Some(ReceiverForm::RefMut), None)));
             // A miss on a primitive head still records, as a failed read.
             assert!(p.method_set(&mut reads, Head::Int(IntTy::I64), interner.intern("nope"), ReceiverForm::Value).candidates.is_empty());
-            let key = ReadKey::MethodSet(MethodSetKey { head: Head::Int(IntTy::I64), name: interner.intern("nope"), form: ReceiverForm::Value });
+            let key =
+                ReadKey::MethodSet(MethodSetKey { head: Head::Int(IntTy::I64), name: interner.intern("nope"), form: ReceiverForm::Value });
             assert_eq!(reads.get(&key).map(|r| r.failed), Some(true));
         });
     }
@@ -1134,7 +1141,11 @@ fn main() {}
         let unit = [key(1, 10), key(1, 30)];
         let before = m.used_slots_hash(&unit).unwrap();
         let table_before = m.manifest_hash();
-        assert_eq!(Some(before), Some(used_slots_hash(&[(key(1, 30), 2), (key(1, 10), 0), (key(1, 10), 0)])), "order and duplicates do not matter");
+        assert_eq!(
+            Some(before),
+            Some(used_slots_hash(&[(key(1, 30), 2), (key(1, 10), 0), (key(1, 10), 0)])),
+            "order and duplicates do not matter"
+        );
         // One new reachable instance: append-only, old slots stay put.
         assert_eq!(m.assign(key(1, 99)), 3);
         assert_eq!(m.assign(key(1, 99)), 3, "assign is stable");

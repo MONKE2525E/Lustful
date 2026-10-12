@@ -139,7 +139,13 @@ pub enum Terminator {
     /// (docs/ARCH.md section 7.2); it is `None` everywhere until W-PANIC
     /// builds cleanup edges. Calls are terminators, never rvalues, so
     /// every call already has its unwind slot.
-    Call { target: CallTarget, args: Vec<Operand>, dest: Place, next: Bb, unwind: Option<Bb> },
+    Call {
+        target: CallTarget,
+        args: Vec<Operand>,
+        dest: Place,
+        next: Bb,
+        unwind: Option<Bb>,
+    },
     Return,
     Unreachable,
     Panic(Vec<FmtPart>),

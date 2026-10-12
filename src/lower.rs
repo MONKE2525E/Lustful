@@ -494,7 +494,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let t = self.temp(mt);
                     self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
                     let u = self.temp(UNIT);
-                    self.call_into(CallTarget::Builtin(Builtin::StringPushStr), vec![Operand::Move(Place::local(t)), r], Place::local(u), span);
+                    self.call_into(
+                        CallTarget::Builtin(Builtin::StringPushStr),
+                        vec![Operand::Move(Place::local(t)), r],
+                        Place::local(u),
+                        span,
+                    );
                 } else {
                     let rd = match self.ck.res(e) {
                         Res::Bin { rd, .. } => rd,

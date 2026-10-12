@@ -425,7 +425,13 @@ impl FnGen<'_, '_, '_> {
     /// terminators: `make_value` produces the value text (and may emit helper
     /// statements into the block this opens), and `mentions` says whether
     /// producing the value reads `dest` itself.
-    fn emit_assign(&mut self, dest: &Place, mentions: bool, loc: &str, make_value: impl FnOnce(&mut Self, &str, &mut Vec<String>) -> String) {
+    fn emit_assign(
+        &mut self,
+        dest: &Place,
+        mentions: bool,
+        loc: &str,
+        make_value: impl FnOnce(&mut Self, &str, &mut Vec<String>) -> String,
+    ) {
         // Value generation may emit helper statements with temporaries, so open a C block lazily.
         let mark = self.out.len();
         self.out.push_str("  {\n");
