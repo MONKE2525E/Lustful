@@ -1,0 +1,11 @@
+# Textual macro scope across mod files (ARCH 6.1): a macro defined
+# before a `mod` is visible in that file and its children, a later
+# redefinition shadows for modules declared after it, and
+# #[macro_use] brings a child file's macros into the parent and its
+# later siblings.
+[package]
+name = "macro-textual"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

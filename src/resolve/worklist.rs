@@ -1037,8 +1037,16 @@ fn process_disc_orig(
 struct MacroSrc {
     name: Sym,
     exported: bool,
-    /// Index into `MacroEnv::owned`.
+    /// Index into the environment's owned source list.
     owned: usize,
+    /// The disc (file) the definition was found in.
+    disc: usize,
+    /// The definition's module path from this crate's root.
+    module_path: Vec<Sym>,
+    /// The inline container path inside that file.
+    container: Vec<Sym>,
+    /// Byte offset of `macro_rules` in its file (textual order point).
+    lo: u32,
 }
 
 /// The token range of one `macro_rules!` definition in a flat token
@@ -1334,6 +1342,19 @@ struct MacroEnv {
     /// Sources visible at this crate's root by path, under binding
     /// names (own exports plus root re-exports).
     root_sources: Vec<OwnedMacroSource>,
+    /// Every source by owned index (own sources, then dependency
+    /// exports), for textual splice materialization.
+    owned_all: Vec<OwnedMacroSource>,
+    srcs: Vec<MacroSrc>,
+    /// Dependency exported sources by extern name, as owned indices.
+    dep_owned: FxMap<String, Vec<usize>>,
+    /// Textual macro sources inherited by each disc, in textual order.
+    inherited: Vec<Vec<usize>>,
+    /// Per disc: (declaration byte offset, textual sources, is an
+    /// `extern crate` item) for each `#[macro_use]` file module or
+    /// `#[macro_use] extern crate` in the original file: the sources
+    /// join textual scope right after that item.
+    after_mods: Vec<Vec<(u32, Vec<usize>, bool)>>,
 }
 
 impl MacroEnv {
@@ -1355,6 +1376,11 @@ impl MacroEnv {
         // (module path, name) -> owned index, for textual definitions
         // a same-module re-export names.
         let mut module_defs: FxMap<(Vec<Sym>, Sym), usize> = FxMap::default();
+        // One source per definition occurrence, by (disc, byte
+        // offset): the same definition seen through the original and
+        // the expanded outline is one source, but two definitions of
+        // one name in one module are two (the later shadows).
+        let mut seen_defs: FxMap<(usize, u32), ()> = FxMap::default();
         let mut own_exported: Vec<bool> = Vec::new();
         for (di, disc) in discs.iter().enumerate() {
             let base_path = tables.modules[disc.module.0 as usize].path.clone();
@@ -1362,13 +1388,21 @@ impl MacroEnv {
                 for m in &outline.macros {
                     let mut mod_path = base_path.clone();
                     mod_path.extend(m.container_path.iter().copied());
-                    let key = (mod_path, m.name);
-                    if module_defs.contains_key(&key) {
+                    if seen_defs.insert((di, m.span.lo), ()).is_some() {
                         continue;
                     }
+                    let key = (mod_path, m.name);
                     let (lo, hi) = macro_tok_range(&lexed.tokens, m.container.1);
-                    module_defs.insert(key, owned.len());
-                    srcs.push(MacroSrc { name: m.name, exported: m.exported, owned: owned.len() });
+                    module_defs.insert(key.clone(), owned.len());
+                    srcs.push(MacroSrc {
+                        name: m.name,
+                        exported: m.exported,
+                        owned: owned.len(),
+                        disc: di,
+                        module_path: key.0.clone(),
+                        container: m.container_path.clone(),
+                        lo: m.span.lo,
+                    });
                     own_exported.push(m.exported);
                     owned.push(OwnedMacroSource {
                         name: m.name,
@@ -1394,17 +1428,17 @@ impl MacroEnv {
                 bindings.insert((Vec::new(), s.name), s.owned);
             }
         }
-        let mut dep_base: Vec<(Sym, usize, usize)> = Vec::new(); // (extern sym, first owned, count)
+        let mut dep_owned: FxMap<String, Vec<usize>> = FxMap::default();
         for (extern_name, sources) in dep_exports {
             let sym = interner.intern(extern_name);
-            let first = owned.len();
+            let mut idxs = Vec::new();
             for src in sources {
                 bindings.insert((vec![sym], src.name), owned.len());
+                idxs.push(owned.len());
                 owned.push(src.clone());
             }
-            dep_base.push((sym, first, sources.len()));
+            dep_owned.insert(extern_name.clone(), idxs);
         }
-        let _ = dep_base;
         // The re-export fixpoint over this crate's use items.
         let mut sites: Vec<UseSite> = Vec::new();
         for (di, disc) in discs.iter().enumerate() {
@@ -1537,7 +1571,8 @@ impl MacroEnv {
             let src = owned[bindings[key]].clone();
             root_sources.push(OwnedMacroSource { name: key.1, ..src });
         }
-        MacroEnv { seeds, own, own_exported, root_sources }
+        let (inherited, after_mods) = textual_env(job, discs, expanded, &srcs, &dep_owned, tables, interner);
+        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods }
     }
 
     /// The macro sources dependent crates see at this crate's root:
@@ -1548,6 +1583,96 @@ impl MacroEnv {
             return self.root_sources.clone();
         }
         self.own.iter().zip(&self.own_exported).filter(|(_, e)| **e).map(|(s, _)| s.clone()).collect()
+    }
+
+    /// Splices the textual macro definitions visible in one file into
+    /// its original token stream: inherited definitions just after
+    /// any inner attributes (they are visible to the whole file), and
+    /// each `#[macro_use]` file module's definitions right after its
+    /// `mod` item (visible from that point on, as in Rust). The
+    /// expander registers them in textual order and strips them from
+    /// its output, so the parsed items are unaffected. Source
+    /// strings are remapped into this file's string table.
+    fn splice(&self, di: usize, lexed: lexer::Lexed, job: &CrateJob) -> lexer::Lexed {
+        use crate::lexer::{Tok, Token};
+        let start_srcs: &[usize] = self.inherited.get(di).map(Vec::as_slice).unwrap_or(&[]);
+        let after: &[(u32, Vec<usize>, bool)] = self.after_mods.get(di).map(Vec::as_slice).unwrap_or(&[]);
+        if start_srcs.is_empty() && after.is_empty() {
+            return lexed;
+        }
+        let mut strings = lexed.strings.clone();
+        let mut offsets: FxMap<usize, u32> = FxMap::default();
+        let materialize = |idx: usize, strings: &mut Vec<String>, offsets: &mut FxMap<usize, u32>| -> Vec<Token> {
+            let src = &self.owned_all[idx];
+            let base = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
+            let offset = *offsets.entry(idx).or_insert_with(|| {
+                let at = strings.len() as u32;
+                strings.extend(src.strings.iter().cloned());
+                at
+            });
+            base.iter()
+                .map(|t| {
+                    let tok = match t.tok {
+                        Tok::Str(i) => Tok::Str(i + offset),
+                        Tok::Float(i) => Tok::Float(i + offset),
+                        other => other,
+                    };
+                    Token { tok, span: t.span }
+                })
+                .collect()
+        };
+        // Insertion positions in the original token list.
+        let toks = &lexed.tokens;
+        let mut start_pos = 0usize;
+        while toks.get(start_pos).map(|t| t.tok) == Some(Tok::Pound) && toks.get(start_pos + 1).map(|t| t.tok) == Some(Tok::Bang) {
+            // One inner attribute `#![...]`: skip to its closing bracket.
+            let mut depth = 0usize;
+            let mut i = start_pos + 2;
+            while i < toks.len() {
+                match toks[i].tok {
+                    Tok::LBracket => depth += 1,
+                    Tok::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            start_pos = i;
+        }
+        let mut inserts: Vec<(usize, Vec<Token>)> = Vec::new();
+        if !start_srcs.is_empty() {
+            let mut all = Vec::new();
+            for &idx in start_srcs {
+                all.extend(materialize(idx, &mut strings, &mut offsets));
+            }
+            inserts.push((start_pos, all));
+        }
+        for (lo, srcs, is_extern) in after {
+            let want = if *is_extern { Tok::Extern } else { Tok::Mod };
+            let Some(mod_at) = toks.iter().position(|t| t.tok == want && t.span.lo == *lo) else { continue };
+            let Some(semi) = toks[mod_at..].iter().position(|t| t.tok == Tok::Semi) else { continue };
+            let mut all = Vec::new();
+            for &idx in srcs {
+                all.extend(materialize(idx, &mut strings, &mut offsets));
+            }
+            inserts.push((mod_at + semi + 1, all));
+        }
+        inserts.sort_by_key(|(pos, _)| *pos);
+        let mut out: Vec<Token> = Vec::with_capacity(toks.len());
+        let mut cur = 0usize;
+        for (pos, add) in inserts {
+            out.extend_from_slice(&toks[cur..pos.min(toks.len())]);
+            cur = pos.min(toks.len());
+            out.extend(add);
+        }
+        out.extend_from_slice(&toks[cur..]);
+        lexer::Lexed { tokens: out, strings }
     }
 }
 
@@ -1598,7 +1723,17 @@ fn resolve_one(
     // environment the outlines now prove, then look for module edges
     // the expansions generated; repeat until a round adds no file.
     let mut expanded: Vec<Option<lexer::Lexed>> = Vec::new();
-    let mut menv = MacroEnv { seeds: Vec::new(), own: Vec::new(), own_exported: Vec::new(), root_sources: Vec::new() };
+    let mut menv = MacroEnv {
+        seeds: Vec::new(),
+        own: Vec::new(),
+        own_exported: Vec::new(),
+        root_sources: Vec::new(),
+        owned_all: Vec::new(),
+        srcs: Vec::new(),
+        dep_owned: FxMap::default(),
+        inherited: Vec::new(),
+        after_mods: Vec::new(),
+    };
     for round in 0..8 {
         expanded.resize_with(discs.len(), || None);
         menv = MacroEnv::build(job, &discs, &expanded, dep_exports, tables, interner);
@@ -1615,7 +1750,7 @@ fn resolve_one(
                 cfg: expand_cfg(&input.env),
                 module_path: tables.modules[discs[di].module.0 as usize].path.clone(),
             };
-            let spliced = splice_textual(di, orig, &discs, tables, job, interner);
+            let spliced = menv.splice(di, orig, job);
             match crate::expand::expand_lexed_seeded(spliced, &ects, &menv.seeds) {
                 Ok(l) => expanded[di] = Some(l),
                 Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
@@ -1838,19 +1973,260 @@ fn structure_items(items: &[Item], h: &mut crate::intern::FxHasher) {
     }
 }
 
-/// Stage marker for textual macro splicing (cross-file `#[macro_use]`
-/// and inherited textual macros). The worklist calls this on every
-/// file's original tokens before expansion; the implementation lands
-/// with the textual-scope step and is the identity until then.
-fn splice_textual(
-    _di: usize,
-    lexed: lexer::Lexed,
-    _discs: &[FileDisc],
-    _tables: &ResolvedTables,
-    _job: &CrateJob,
-    _interner: &Interner,
-) -> lexer::Lexed {
-    lexed
+/// True when module path `a` is a prefix of `b` (an ancestor inline
+/// module of it, or the same module).
+fn path_prefix_of(a: &[Sym], b: &[Sym]) -> bool {
+    a.len() <= b.len() && a == &b[..a.len()]
+}
+
+/// The `#[macro_use] extern crate name;` items at the top level of
+/// one file, as (byte offset, extern name). Top level only, like the
+/// expander's own prescan reach for extern crates.
+fn extern_macro_use_events(lexed: &lexer::Lexed, interner: &Interner) -> Vec<(u32, String)> {
+    use crate::lexer::Tok;
+    let toks = &lexed.tokens;
+    let mut out = Vec::new();
+    let mut pending = false;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i].tok {
+            Tok::LBrace => depth += 1,
+            Tok::RBrace => depth = depth.saturating_sub(1),
+            Tok::Semi if depth == 0 => pending = false,
+            Tok::Pound if depth == 0 => {
+                let mut j = i + 1;
+                if toks.get(j).map(|t| t.tok) == Some(Tok::Bang) {
+                    j += 1;
+                }
+                if toks.get(j).map(|t| t.tok) == Some(Tok::LBracket) {
+                    if let Some(Tok::Ident(s)) = toks.get(j + 1).map(|t| t.tok)
+                        && interner.get(s) == "macro_use"
+                    {
+                        pending = true;
+                    }
+                    // Skip the attribute body.
+                    let mut d = 0usize;
+                    while j < toks.len() {
+                        match toks[j].tok {
+                            Tok::LBracket => d += 1,
+                            Tok::RBracket => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            Tok::Eof => break,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+            }
+            Tok::Extern if depth == 0 => {
+                if pending
+                    && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Crate)
+                    && let Some(Tok::Ident(name)) = toks.get(i + 2).map(|t| t.tok)
+                {
+                    out.push((toks[i].span.lo, interner.get(name).to_string()));
+                }
+                pending = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The textual macro environment of one crate (ARCH 6.1): for each
+/// disc, the macro sources its whole file inherits, and the sources
+/// each `#[macro_use]` file module adds after its declaration. A
+/// macro is textually visible in a module after its definition point,
+/// in child modules declared after it, and in the parent (from the
+/// declaration point on) when the child module carries
+/// `#[macro_use]`. Dependency macros enter only through
+/// `#[macro_use] extern crate dep;`, which brings the dependency's
+/// exported macros into textual scope at that point.
+#[allow(clippy::too_many_arguments)]
+fn textual_env(
+    job: &CrateJob,
+    discs: &[FileDisc],
+    expanded: &[Option<lexer::Lexed>],
+    srcs: &[MacroSrc],
+    dep_owned: &FxMap<String, Vec<usize>>,
+    tables: &ResolvedTables,
+    interner: &Interner,
+) -> (Vec<Vec<usize>>, Vec<Vec<(u32, Vec<usize>, bool)>>) {
+    struct Cx<'a> {
+        job: &'a CrateJob,
+        discs: &'a [FileDisc],
+        decls: Vec<Vec<scan::ModDecl>>,
+        extern_events: Vec<Vec<(u32, String)>>,
+        srcs: &'a [MacroSrc],
+        by_path: FxMap<Vec<Sym>, Vec<usize>>,
+        exports_memo: FxMap<ModuleId, Vec<usize>>,
+        inherited_memo: Vec<Option<Vec<usize>>>,
+        dep_owned: &'a FxMap<String, Vec<usize>>,
+        tables: &'a ResolvedTables,
+    }
+    impl Cx<'_> {
+        /// The textual macros a `#[macro_use]` on module `m` exports:
+        /// its own definitions plus, recursively, those of its
+        /// `#[macro_use]` child modules.
+        fn exports_of(&mut self, m: ModuleId) -> Vec<usize> {
+            if let Some(v) = self.exports_memo.get(&m) {
+                return v.clone();
+            }
+            let path = self.tables.modules[m.0 as usize].path.clone();
+            let mut out: Vec<usize> = self.by_path.get(&path).cloned().unwrap_or_default();
+            let children: Vec<ModuleId> = self
+                .tables
+                .modules
+                .iter()
+                .enumerate()
+                .filter(|(_, info)| info.parent == Some(m) && info.macro_use)
+                .map(|(i, _)| ModuleId(i as u32))
+                .collect();
+            for c in children {
+                for idx in self.exports_of(c) {
+                    if !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+            }
+            self.exports_memo.insert(m, out.clone());
+            out
+        }
+
+        /// The child module one `mod` declaration in disc `di` names.
+        fn child_module(&self, di: usize, decl: &scan::ModDecl) -> Option<ModuleId> {
+            let mut path = self.tables.modules[self.discs[di].module.0 as usize].path.clone();
+            path.extend(decl.container.iter().copied());
+            path.push(decl.name);
+            self.tables.module_by_path_in(self.job.root_module, &path)
+        }
+
+        /// Textual macros visible at one point (container, byte
+        /// offset) in one file, in textual order.
+        fn textual_at(&mut self, di: usize, container: &[Sym], lo: u32) -> Vec<usize> {
+            let mut out = self.inherited(di);
+            let mut events: Vec<(u32, Vec<usize>)> = Vec::new();
+            for s in self.srcs {
+                if s.disc == di && s.lo < lo && path_prefix_of(&s.container, container) {
+                    events.push((s.lo, vec![s.owned]));
+                }
+            }
+            let decls = self.decls[di].clone();
+            for decl in &decls {
+                if decl.macro_use && decl.span.lo < lo && path_prefix_of(&decl.container, container) {
+                    if let Some(child) = self.child_module(di, decl) {
+                        events.push((decl.span.lo, self.exports_of(child)));
+                    }
+                }
+            }
+            for (elo, name) in self.extern_events[di].clone() {
+                if elo < lo
+                    && let Some(idxs) = self.dep_owned.get(&name)
+                {
+                    events.push((elo, idxs.clone()));
+                }
+            }
+            events.sort_by_key(|(l, _)| *l);
+            for (_, idxs) in events {
+                for idx in idxs {
+                    if !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+            }
+            out
+        }
+
+        /// The textual macros a whole file inherits from its parent
+        /// module chain at its `mod` declaration point.
+        fn inherited(&mut self, di: usize) -> Vec<usize> {
+            if let Some(v) = &self.inherited_memo[di] {
+                return v.clone();
+            }
+            // Guard against a parent cycle (cannot occur in a module
+            // tree, but a memo placeholder keeps the recursion total).
+            self.inherited_memo[di] = Some(Vec::new());
+            let out = match self.discs[di].parent.clone() {
+                None => Vec::new(),
+                Some(p) => self.textual_at(p.disc, &p.container, p.lo),
+            };
+            self.inherited_memo[di] = Some(out.clone());
+            out
+        }
+    }
+    let mut by_path: FxMap<Vec<Sym>, Vec<(u32, usize)>> = FxMap::default();
+    for s in srcs {
+        by_path.entry(s.module_path.clone()).or_default().push((s.lo, s.owned));
+    }
+    let by_path: FxMap<Vec<Sym>, Vec<usize>> = by_path
+        .into_iter()
+        .map(|(k, mut v)| {
+            v.sort_by_key(|(lo, _)| *lo);
+            (k, v.into_iter().map(|(_, o)| o).collect())
+        })
+        .collect();
+    let mut decls: Vec<Vec<scan::ModDecl>> = Vec::with_capacity(discs.len());
+    let mut extern_events: Vec<Vec<(u32, String)>> = Vec::with_capacity(discs.len());
+    for (di, disc) in discs.iter().enumerate() {
+        let mut ds = disc.outline.mods.clone();
+        if let Some(Some(exp)) = expanded.get(di) {
+            ds.extend(scan::outline(exp, interner).mods);
+        }
+        decls.push(ds);
+        extern_events.push(match &disc.lexed {
+            Some(l) => extern_macro_use_events(l, interner),
+            None => Vec::new(),
+        });
+    }
+    let mut cx = Cx {
+        job,
+        discs,
+        decls,
+        extern_events,
+        srcs,
+        by_path,
+        exports_memo: FxMap::default(),
+        inherited_memo: vec![None; discs.len()],
+        dep_owned,
+        tables,
+    };
+    let mut inherited = Vec::with_capacity(discs.len());
+    for di in 0..discs.len() {
+        inherited.push(cx.inherited(di));
+    }
+    // `#[macro_use]` file modules in the original outline: their
+    // exported textual macros join the parent file after the `mod`.
+    // A macro-generated `#[macro_use] mod` is not in the original
+    // token stream, so it cannot be spliced; uses of its macros in
+    // the same file then fail closed with an unknown-macro error.
+    let mut after_mods: Vec<Vec<(u32, Vec<usize>, bool)>> = vec![Vec::new(); discs.len()];
+    for (di, disc) in discs.iter().enumerate() {
+        for decl in &disc.outline.mods {
+            if decl.macro_use && !decl.inline {
+                if let Some(child) = cx.child_module(di, decl) {
+                    let idxs = cx.exports_of(child);
+                    if !idxs.is_empty() {
+                        after_mods[di].push((decl.span.lo, idxs, false));
+                    }
+                }
+            }
+        }
+        for (elo, name) in &cx.extern_events[di] {
+            if let Some(idxs) = cx.dep_owned.get(name)
+                && !idxs.is_empty()
+            {
+                after_mods[di].push((*elo, idxs.clone(), true));
+            }
+        }
+    }
+    (inherited, after_mods)
 }
 
 /// Adds one extern crate to one crate's prelude tables, if that crate

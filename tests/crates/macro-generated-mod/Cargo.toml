@@ -1,0 +1,9 @@
+# A `mod` item produced by a macro is discovered as a new file
+# edge in the expansion rounds (ARCH 6.1), and the new file
+# inherits the textual macros in scope at the call.
+[package]
+name = "macro-generated-mod"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

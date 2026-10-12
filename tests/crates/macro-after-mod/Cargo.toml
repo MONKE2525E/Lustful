@@ -1,0 +1,8 @@
+# Both reject: a textual macro is not visible in a module file
+# declared before its definition point.
+[package]
+name = "macro-after-mod"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
