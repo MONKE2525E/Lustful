@@ -162,7 +162,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0 };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None };
     f(&mut p)
 }
 
