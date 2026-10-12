@@ -190,7 +190,90 @@ def main():
               settled and "guard:" not in text,
               f"settled={settled} guard_lines={[l for l in text.splitlines() if 'guard:' in l]}")
 
-        # 8. The daemon is still alive and correct after all of it.
+        # 8. Regression (fuzz seed 42, iter 1034): a return-type edit must
+        # recheck the changed fn's own body. The body of `classify` returns
+        # an i64 expression, so `-> i32` makes the program invalid; the
+        # daemon reused the body on its clean read set (its own signature
+        # was not in the set) and accepted it while cold rejected with
+        # L0110. Both sides must now answer the same, byte for byte.
+        sig_prev = '''struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn main() {
+    let mut pts: Vec<Point> = Vec::new();
+    pts.push(Point { x: 1, y: 2 });
+    pts.push(Point { x: 3, y: 4 });
+    pts[0].bump(5);
+    let t = total(&pts);
+    let c = classify(Shape::Pair(2, 3));
+    let nums = vec![2, 20, 30];
+    println!("{} {} {} {}", label(t), c, pick(&nums, 1), pts.len());
+}
+
+enum Shape {
+    Dot,
+    Pair(i64, i64),
+}
+
+impl Point {
+    fn sum(&self) -> i64 {
+        self.x + self.y
+    }
+
+    fn bump(&mut self, d: i64) {
+        self.x += d;
+        self.y += d * 2;
+    }
+}
+
+fn classify(s: Shape) -> i64 {
+    match s {
+        Shape::Dot => 0,
+        Shape::Pair(a, b) => a * 2 + b,
+    }
+}
+
+fn total(pts: &Vec<Point>) -> i64 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < pts.len() {
+        acc += pts[i].sum();
+        i += 1;
+    }
+    acc
+}
+
+fn added_75576() -> i64 { 13 }
+fn label(n: i64) -> String {
+    let mut s = String::from("n=");
+    s.push_str(&n.to_string());
+    s
+}
+
+fn pick(v: &Vec<i64>, i: usize) -> i64 {
+    v[i]
+}
+
+fn grown() -> i64 { 1 }
+'''
+        sig_cur = sig_prev.replace("fn classify(s: Shape) -> i64", "fn classify(s: Shape) -> i32")
+        assert sig_cur != sig_prev
+        sg = os.path.join(work, "sigedit.rs")
+        open(sg, "w").write(sig_prev)
+        rc1, _, _ = run_lust(["check", sg])
+        open(sg, "w").write(sig_cur)
+        rcw, _, errw = run_lust(["check", sg])
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        r = subprocess.run([LUST, "check", sg], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("own return-type edit rechecks the body (seed 42 iter 1034)",
+              rc1 == 0 and rcw == 1 and r.returncode == 1
+              and "L0110" in errw and errw == r.stderr,
+              f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+
+        # 9. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
     finally:
         daemon.terminate()
