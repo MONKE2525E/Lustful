@@ -272,8 +272,9 @@ fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
     (p, q)
 }
 
-fn errors(diags: &mut [Diag], path: &str, src: &str, json: bool) -> Response {
-    let text = diag::render(diags, path, src, json);
+fn errors(diags: &mut [Diag], path: &str, src: &str, req: &Request) -> Response {
+    let json = req.json;
+    let text = diag::render(diags, path, src, json, req.max_errors);
     let mut r = Response { code: 1, ..Default::default() };
     if json {
         r.stdout = text;
@@ -455,7 +456,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if fresh.iter().any(|l| l.is_err()) {
         // Re-lex serially so the error never depends on the split.
         if let Err(d) = lexer::lex(&src, 0, &front.interner) {
-            return errors(&mut [d], &path, &src, req.json);
+            return errors(&mut [d], &path, &src, req);
         }
     }
     let mut fresh = need.iter().zip(fresh).map(|(&i, r)| (i, r.unwrap())).collect::<Vec<_>>().into_iter();
@@ -533,7 +534,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 Err(d) => {
                     caches.ok[slot] = false;
-                    return errors(&mut [d], &path, &src, req.json);
+                    return errors(&mut [d], &path, &src, req);
                 }
             }
         }
@@ -546,7 +547,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let parsed = par_map(&todo, |&i| parser::parse(&front.chunks[i].lexed, &front.interner, &front.known));
         if let Some(Err(d)) = parsed.iter().find(|p| p.is_err()) {
             let d = d.clone();
-            return errors(&mut [d], &path, &src, req.json);
+            return errors(&mut [d], &path, &src, req);
         }
         let mut new_asts: FxMap<usize, Ast> = todo.iter().copied().zip(parsed.into_iter().map(|p| p.unwrap())).collect();
         let mut old_items: Vec<Option<crate::ast::Item>> = std::mem::take(&mut front.ast.items).into_iter().map(Some).collect();
@@ -585,7 +586,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 Ok(a) => a,
                 Err(d) => {
                     front.env_hash = None;
-                    return errors(&mut [d], &path, &src, req.json);
+                    return errors(&mut [d], &path, &src, req);
                 }
             }
         };
@@ -597,7 +598,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
-            return errors(&mut ds, &path, &src, req.json);
+            return errors(&mut ds, &path, &src, req);
         }
     };
     if program.fns.len() != fn_count {
@@ -633,7 +634,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });
     if !diags.is_empty() {
-        return errors(&mut diags, &path, &src, req.json);
+        return errors(&mut diags, &path, &src, req);
     }
     let mut resp = Response::default();
     if req.cmd == Cmd::Check {
