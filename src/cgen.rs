@@ -732,7 +732,11 @@ impl FnGen<'_, '_, '_> {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
-                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et})) = {};", vals[0], vals[1]);
+                // The value must be read before `lust_vec_push_slot` can reallocate the
+                // buffer: `v.push(v[0])` in one C assignment could read the freed buffer.
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
+                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et})) = {t};", vals[0]);
                 "0".into()
             }
             B::Clone => {
