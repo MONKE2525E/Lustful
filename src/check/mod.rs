@@ -4517,6 +4517,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if flat.iter().any(|&x| self.irrefutable(x)) {
             return true;
         }
+        if let Some(res) = self.covers_scalar_domain(&flat) {
+            return res;
+        }
+        if !flat.is_empty() && flat.iter().all(|&x| matches!(p.ast.pat(self.pat_unwrap(x)), Pat::Slice { .. })) {
+            return self.covers_slice(&flat);
+        }
         for &x in &flat {
             match (self.pres(x), p.ast.pat(x)) {
                 (PatRes::Opt(_), _) => {
@@ -4570,19 +4576,157 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 row
             })
             .collect();
+        self.rows_cover(&rows)
+    }
+
+    /// Do the rows (one per pattern, `None` is a skipped or wildcard cell)
+    /// together match every tuple of values? Conservative, like `covers`:
+    /// a fully free row wins, else one column must carry the whole split
+    /// while every other column is free in all rows.
+    fn rows_cover(&self, rows: &[Vec<Option<PatId>>]) -> bool {
         if rows.is_empty() {
             return false;
         }
+        let nf = rows[0].len();
         let free = |c: &Option<PatId>| c.is_none_or(|x| self.irrefutable(x));
         if rows.iter().any(|r| r.iter().all(free)) {
             return true;
         }
-        // One refutable column, with every other column free in all rows: recurse on that column.
         (0..nf).any(|j| {
             rows.iter().all(|r| r.iter().enumerate().all(|(i, c)| i == j || free(c)))
-                && self.covers(&rows.iter().filter_map(|r| r[j]).collect::<Vec<_>>())
                 && rows.iter().all(|r| r[j].is_some())
+                && self.covers(&rows.iter().filter_map(|r| r[j]).collect::<Vec<_>>())
         })
+    }
+
+    /// Slice and array pattern coverage, split by length. An array has the
+    /// one length; a slice needs a `..` pattern, and then every length up
+    /// to one past the longest fixed part is checked (a longer slice only
+    /// adds wildcard middle cells to the rows that matched there, so the
+    /// same row argument keeps holding). With no `..` pattern a slice
+    /// match can never be exhaustive: some length is missed, and accepting
+    /// it would make the missing length abort at run time.
+    fn covers_slice(&self, flat: &[PatId]) -> bool {
+        let p = self.p;
+        let t = self.out.pat_ty[(flat[0].0 - self.out.pat_base) as usize];
+        let arr_len: Option<usize> = match self.kind(t) {
+            TyKind::Slice(_) => None,
+            TyKind::Array(_, c) => match self.tys.const_kind(c) {
+                ConstKind::Int(n) => Some(n as usize),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        // (prefix, suffix, middle is free over any cells it spans)
+        let mut pats: Vec<(Vec<PatId>, Vec<PatId>, Option<bool>)> = Vec::new();
+        for &x in flat {
+            let Pat::Slice { prefix, middle, suffix } = p.ast.pat(self.pat_unwrap(x)) else { return false };
+            let mid = match middle {
+                None => None,
+                Some(mid) => Some(matches!(p.ast.pat(*mid), Pat::Rest) || self.irrefutable(*mid)),
+            };
+            pats.push((prefix.clone(), suffix.clone(), mid));
+        }
+        let lengths: Vec<usize> = match arr_len {
+            Some(n) => vec![n],
+            None => {
+                if pats.iter().all(|(_, _, m)| m.is_none()) {
+                    return false;
+                }
+                let m = pats.iter().map(|(a, b, _)| a.len() + b.len()).max().unwrap_or(0);
+                (0..=m + 1).collect()
+            }
+        };
+        for len in lengths {
+            let mut rows: Vec<Vec<Option<PatId>>> = Vec::new();
+            for (prefix, suffix, mid) in &pats {
+                let fixed = prefix.len() + suffix.len();
+                match mid {
+                    None if len == fixed => {
+                        rows.push(prefix.iter().chain(suffix.iter()).map(|&s| Some(s)).collect());
+                    }
+                    Some(true) if len >= fixed => {
+                        let mut row: Vec<Option<PatId>> = prefix.iter().map(|&s| Some(s)).collect();
+                        row.resize(len - suffix.len(), None);
+                        row.extend(suffix.iter().map(|&s| Some(s)));
+                        rows.push(row);
+                    }
+                    _ => {}
+                }
+            }
+            if !self.rows_cover(&rows) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Integer and char coverage by literal and range patterns: `Some` when
+    /// the patterns are all scalar literals or ranges with known bounds on
+    /// an int or char type, with the result of merging their intervals
+    /// against the type's whole domain (the char domain skips surrogates).
+    fn covers_scalar_domain(&self, flat: &[PatId]) -> Option<bool> {
+        let p = self.p;
+        let first = *flat.first()?;
+        let t = self.out.pat_ty[(first.0 - self.out.pat_base) as usize];
+        let segments: Vec<(i128, i128)> = match self.kind(t) {
+            TyKind::Int(it) => {
+                let bits = it.bits();
+                if bits >= 128 && !it.signed() {
+                    return None; // u128 bounds do not fit the i128 values here.
+                }
+                if bits >= 128 {
+                    vec![(i128::MIN, i128::MAX)]
+                } else if it.signed() {
+                    vec![(-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)]
+                } else {
+                    vec![(0, (1i128 << bits) - 1)]
+                }
+            }
+            TyKind::Char => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
+            _ => return None,
+        };
+        let (dom_lo, dom_hi) = (segments[0].0, segments[segments.len() - 1].1);
+        let mut ivs: Vec<(i128, i128)> = Vec::new();
+        for &x in flat {
+            match p.ast.pat(self.pat_unwrap(x)) {
+                Pat::Lit(l) => {
+                    let v = self.const_scalar(*l)?;
+                    ivs.push((v, v));
+                }
+                Pat::Range { lo, hi, inclusive } => {
+                    let lo_v = match lo {
+                        Some(e) => self.const_scalar(*e)?,
+                        None => dom_lo,
+                    };
+                    let hi_v = match hi {
+                        Some(e) => {
+                            let v = self.const_scalar(*e)?;
+                            if *inclusive { v } else { v.saturating_sub(1) }
+                        }
+                        None => dom_hi,
+                    };
+                    if lo_v <= hi_v {
+                        ivs.push((lo_v, hi_v));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        ivs.sort_unstable();
+        Some(segments.iter().all(|&(slo, shi)| {
+            let mut next = slo;
+            for &(lo, hi) in &ivs {
+                if lo > next {
+                    break;
+                }
+                next = next.max(hi.saturating_add(1));
+                if next > shi {
+                    return true;
+                }
+            }
+            next > shi
+        }))
     }
 
     fn irrefutable(&self, pat: PatId) -> bool {
@@ -4605,16 +4749,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
             Pat::Ref { inner, .. } => self.irrefutable(*inner),
             Pat::At { inner, .. } => self.irrefutable(*inner),
-            Pat::Slice { prefix, suffix, .. } => {
+            Pat::Slice { prefix, middle, suffix } => {
+                // The pattern matches every value only if it matches every
+                // length: an array needs an exact-length pattern, or a `..`
+                // with at most the array's length fixed; a slice always
+                // needs the `..` (`[]` alone matches only the empty slice).
                 let t = self.out.pat_ty[(pat.0 - self.out.pat_base) as usize];
-                let arr_ok = match self.kind(t) {
+                let fixed = (prefix.len() + suffix.len()) as u128;
+                let len_ok = match self.kind(t) {
                     TyKind::Array(_, c) => match self.tys.const_kind(c) {
-                        ConstKind::Int(n) => (prefix.len() + suffix.len()) as u128 <= n,
+                        ConstKind::Int(n) => {
+                            if middle.is_some() {
+                                fixed <= n
+                            } else {
+                                fixed == n
+                            }
+                        }
                         _ => false,
                     },
-                    _ => prefix.is_empty() && suffix.is_empty(),
+                    _ => middle.is_some(),
                 };
-                arr_ok && prefix.iter().chain(suffix.iter()).all(|&s| self.irrefutable(s))
+                len_ok
+                    && middle.is_none_or(|m| matches!(p.ast.pat(m), Pat::Rest) || self.irrefutable(m))
+                    && prefix.iter().chain(suffix.iter()).all(|&s| self.irrefutable(s))
             }
             Pat::Paren(inner) => self.irrefutable(*inner),
             Pat::Rest => true,
@@ -4640,7 +4797,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     // ---------- Finish ----------
 
-    /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     /// True when the type still holds an unbound non-integer inference
     /// variable (an integer variable defaults to i32, as in rustc; any other
     /// one is the E0282 "type annotations needed" case).
@@ -4657,6 +4813,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     fn finish(&mut self) {
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
