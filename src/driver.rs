@@ -933,7 +933,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 Ok(w) => w,
                 Err(mut d) => {
                     front.env_hash = None;
-                    return errors(std::slice::from_mut(&mut d), &path, &src, req.json);
+                    return errors(std::slice::from_mut(&mut d), &path, &src, req);
                 }
             };
             match parser::parse(&whole, &front.interner, &front.known) {

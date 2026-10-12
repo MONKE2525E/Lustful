@@ -15,7 +15,7 @@
 use crate::driver::{self, Request, Session};
 use crate::protocol::{self, Response};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufReader, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,6 @@ fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) 
     // SAFETY: one valid pollfd over a live listener fd, for the duration of the call.
     unsafe { poll(&mut pfd, 1, ms) > 0 && pfd.revents & POLLIN != 0 }
 }
-
 
 struct Entry {
     session: Session,
