@@ -602,7 +602,16 @@ fn resolve_const_arg(
             if let Some(&(_, i)) = scope.const_params.iter().find(|(n, _)| *n == segs[0].name) {
                 return Ok(tys.intern_const(ConstKind::Param(i)));
             }
-            Err(Diag::new("L0110", span, "const argument must be a literal or a const parameter", "Use a literal such as `3`."))
+            // A named const item evaluates like the literal forms below.
+            match crate::check::collect::eval_array_len(ast, interner, known, e) {
+                Some(v) => Ok(tys.intern_const(ConstKind::Int(v))),
+                None => Err(Diag::new(
+                    "L0110",
+                    span,
+                    "const argument must be a literal or a const parameter",
+                    "Use a literal such as `3`.",
+                )),
+            }
         }
         ast::Expr::Bool(b) => Ok(tys.intern_const(ConstKind::Bool(*b))),
         ast::Expr::Char(c) => Ok(tys.intern_const(ConstKind::Char(*c))),
