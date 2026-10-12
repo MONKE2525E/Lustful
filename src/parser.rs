@@ -2282,6 +2282,16 @@ impl<'a> Parser<'a> {
         while self.peek() == Tok::As {
             self.bump();
             let ty = self.ty()?;
+            // In rustc a `<<` right after a cast type starts generic
+            // arguments, it is not a shift: `a as u8 << 2` is an error. A
+            // type that already ends in `>` is complete, so a shift after
+            // it stays a shift.
+            if self.peek() == Tok::Shl && self.toks[self.pos.saturating_sub(1)].tok != Tok::Gt {
+                return Err(syntax(
+                    self.span(),
+                    "`<<` after a cast type is read as generic arguments, not as a shift: parenthesize the cast",
+                ));
+            }
             let span = self.ast.expr_span(e).to(self.prev_span());
             e = self.push_expr(Expr::Cast { expr: e, ty }, span);
         }
@@ -2316,6 +2326,11 @@ impl<'a> Parser<'a> {
                         let parts: Vec<&str> = text.split('.').collect();
                         if parts.len() == 2 && parts.iter().all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
                             self.bump();
+                            // A tuple index has no leading zero: `t.01.2`
+                            // names no field (rustc E0609).
+                            if parts.iter().any(|s| s.len() > 1 && s.starts_with('0')) {
+                                return Err(syntax(self.span(), "tuple index has a leading zero"));
+                            }
                             for part in parts {
                                 let index: u32 = part.parse().map_err(|_| syntax(self.span(), "invalid tuple field index"))?;
                                 e = self.push_expr(Expr::TupleField { base: e, index }, start.to(self.prev_span()));
@@ -2327,6 +2342,13 @@ impl<'a> Parser<'a> {
                     if let Tok::Int(v, suffix) = self.peek() {
                         if suffix.is_some() || v > u32::MAX as u128 {
                             return Err(syntax(self.span(), "invalid tuple field index"));
+                        }
+                        // A tuple index is written with no leading zero and
+                        // no underscores: its text is exactly its decimal
+                        // digits (rustc E0609 for `t.01`).
+                        let sp = self.span();
+                        if v.to_string().len() as u32 != sp.hi - sp.lo {
+                            return Err(syntax(sp, "tuple index has a leading zero"));
                         }
                         let index = v as u32;
                         self.bump();
@@ -2508,16 +2530,38 @@ impl<'a> Parser<'a> {
                 if self.eat(Tok::RParen) {
                     Expr::Unit
                 } else {
-                    let mut elems = vec![self.expr()?];
+                    // A `let` in parentheses is never a let chain, even in a
+                    // condition: rustc rejects `(let ...)` as a syntax error.
+                    if self.peek() == Tok::Let {
+                        return Err(syntax(start, "expected an expression, found `let`: parenthesized let chains are not allowed"));
+                    }
+                    let old_let = self.let_ok;
+                    self.let_ok = false;
+                    let first = self.expr();
+                    let mut elems = match first {
+                        Ok(e) => vec![e],
+                        Err(d) => {
+                            self.let_ok = old_let;
+                            return Err(d);
+                        }
+                    };
                     let mut tuple = false;
                     while self.eat(Tok::Comma) {
                         tuple = true;
                         if self.peek() == Tok::RParen {
                             break;
                         }
-                        elems.push(self.expr()?);
+                        match self.expr() {
+                            Ok(e) => elems.push(e),
+                            Err(d) => {
+                                self.let_ok = old_let;
+                                return Err(d);
+                            }
+                        }
                     }
-                    self.expect(Tok::RParen, "`)`")?;
+                    let end = self.expect(Tok::RParen, "`)`");
+                    self.let_ok = old_let;
+                    end?;
                     if tuple {
                         Expr::Tuple(elems)
                     } else {

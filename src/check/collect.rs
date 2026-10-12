@@ -830,6 +830,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
         let is_enum = p.adts[id.0 as usize].is_enum;
         let mut variants = Vec::new();
+        let mut disc_explicit: Vec<bool> = Vec::new();
         let mut next_disc: i128 = 0;
         for (vname, vspan, shape, field_srcs, disc_src) in variants_src {
             let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
@@ -864,6 +865,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             if is_enum && variants.iter().any(|v: &Variant| v.name == vname) {
                 errs.push(dup(vspan, interner.get(vname)));
             }
+            disc_explicit.push(disc_src.is_some());
             let disc = match disc_src {
                 Some(de) => match eval_const_int(ast, interner, known, de) {
                     Some(v) => v,
@@ -960,6 +962,45 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                             "Change the discriminant or the repr integer type.",
                         ));
                     }
+                }
+            }
+            if adt.is_enum {
+                // With no int repr the discriminant type is `isize`; an
+                // implicit discriminant after `isize::MAX` lands outside it.
+                if adt.repr.int.is_none() {
+                    for v in &adt.variants {
+                        if v.disc < i64::MIN as i128 || v.disc > i64::MAX as i128 {
+                            errs.push(Diag::new(
+                                "L0110",
+                                adt.span,
+                                format!("discriminant value {} overflows `isize`", v.disc),
+                                "Change the discriminant, or add an int repr such as `#[repr(i64)]`.",
+                            ));
+                        }
+                    }
+                }
+                // Duplicate discriminants, explicit or implicit (rustc E0081).
+                for i in 0..adt.variants.len() {
+                    if adt.variants[..i].iter().any(|v| v.disc == adt.variants[i].disc) {
+                        errs.push(Diag::new(
+                            "L0110",
+                            adt.span,
+                            format!("discriminant value {} is used more than once", adt.variants[i].disc),
+                            "Give each variant a different discriminant value.",
+                        ));
+                    }
+                }
+                // Explicit discriminants on an enum with data variants need
+                // an int repr (rustc E0732).
+                let any_explicit = disc_explicit.iter().any(|&x| x);
+                let any_data = adt.variants.iter().any(|v| !v.fields.is_empty());
+                if any_explicit && any_data && adt.repr.int.is_none() {
+                    errs.push(Diag::new(
+                        "L0110",
+                        adt.span,
+                        "enums with explicit discriminants and data variants need an int repr",
+                        "Add a repr such as `#[repr(u8)]`, or remove the discriminants.",
+                    ));
                 }
             }
         }

@@ -1,0 +1,5 @@
+// expect: L0001
+fn main() {
+    let t = (1, 2);
+    println!("{}", t.01);
+}

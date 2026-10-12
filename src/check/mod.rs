@@ -1984,14 +1984,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(a) => p.adt(a).is_enum && p.adt(a).variants.iter().all(|v| v.shape == VariantShape::Unit),
                     None => false,
                 };
+                // The `as` table rustc enforces (E0054, E0604, E0606): bool
+                // and char never cast to a float, only `u8` casts to char,
+                // nothing casts to bool, a fieldless enum casts only to an
+                // integer. A same-kind cast (`bool as bool`) is fine.
                 let ok = match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
                     (_, TyKind::Int(_)) if enum_cast => true,
                     (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
-                    (TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Float(_), TyKind::Float(_)) => true,
-                    (TyKind::Float(_), TyKind::Int(_) | TyKind::Char) => true,
-                    (TyKind::Int(IntTy::U8), TyKind::Char) => true,
+                    (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
+                    (TyKind::Float(_), TyKind::Int(_)) => true,
+                    (TyKind::Int(IntTy::U8) | TyKind::Char, TyKind::Char) => true,
+                    (TyKind::Bool, TyKind::Bool) => true,
                     (TyKind::Error, _) | (_, TyKind::Error) => true,
                     _ => false,
                 };
@@ -2081,6 +2086,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ERROR
             }
             Expr::Break { label, value: val } => {
+                // Edition 2024 (rustc E0695): an unlabeled break may not
+                // target or pass through a labeled block. If the innermost
+                // breakable is a labeled block, the break needs the label.
+                if label.is_none()
+                    && let Some(lp) = self.loops.last()
+                    && lp.is_block
+                {
+                    self.err(
+                        "L0120",
+                        span,
+                        "unlabeled `break` inside of a labeled block",
+                        "Give the break the block's label, such as `break 'a;`.",
+                    );
+                    if let Some(v) = val {
+                        self.expr(*v, None);
+                    }
+                    return NEVER;
+                }
                 let target = match label {
                     None => self.loops.len().checked_sub(1),
                     Some(l) => self
@@ -3960,6 +3983,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Checks a pattern against a value of type `t`. Applies default binding modes.
     /// Records one pattern binding with the local type its mode gives it.
     fn bind_pattern_local(&mut self, pi: usize, name: Sym, mutable: bool, by_ref: bool, t: Ty, mode: BindMode, span: Span) {
+        // Edition 2024: once a pattern is implicitly borrowing (a default
+        // binding mode shift happened above it), an explicit `ref` borrow
+        // in it is an error.
+        if by_ref && mode != BindMode::Move {
+            self.err(
+                "L0122",
+                span,
+                "cannot explicitly borrow within an implicitly-borrowing pattern",
+                "Remove `ref`: the binding already borrows by default. To borrow explicitly, dereference with `&` at the top of the pattern first.",
+            );
+        }
         let mode = if by_ref { BindMode::Ref(mutable) } else { mode };
         let lty = match mode {
             BindMode::Move => t,
@@ -4066,6 +4100,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Pat::Ref { mutable, inner } => match self.kind(t) {
                 TyKind::Ref(_, m, inner_ty) => {
+                    // Edition 2024: an explicit `&` dereference inside an
+                    // implicitly-borrowing pattern is an error.
+                    if mode != BindMode::Move {
+                        self.err(
+                            "L0122",
+                            span,
+                            "cannot explicitly dereference within an implicitly-borrowing pattern",
+                            "Remove the `&`: the pattern already borrows by default, so the binding has the same type without it.",
+                        );
+                    }
                     if *mutable && !m.is_mut() {
                         self.err(
                             "L0110",
@@ -4098,7 +4142,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.errs.push(unsupported(span, "refutable patterns here"));
                 }
             }
-            Pat::Range { lo, hi, .. } => {
+            Pat::Range { lo, hi, inclusive } => {
                 // The parser only builds two-bound ranges today; a half-open
                 // range checks its one bound the same way.
                 let mut bound_tys = Vec::new();
@@ -4108,9 +4152,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(hi) = hi {
                     bound_tys.push((*hi, self.expr(*hi, Some(t))));
                 }
+                // An exclusive range `lo..hi` needs lo < hi (rustc E0579);
+                // an inclusive one needs lo <= hi (rustc E0030).
                 if let [(lo_e, _), (hi_e, _)] = bound_tys[..]
                     && let (Some(lo_v), Some(hi_v)) = (self.const_scalar(lo_e), self.const_scalar(hi_e))
-                    && lo_v > hi_v
+                    && (lo_v > hi_v || (!inclusive && lo_v == hi_v))
                 {
                     self.err(
                         "L0119",
@@ -4595,10 +4641,42 @@ impl<'p, 'a> Ctx<'p, 'a> {
     // ---------- Finish ----------
 
     /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
+    /// True when the type still holds an unbound non-integer inference
+    /// variable (an integer variable defaults to i32, as in rustc; any other
+    /// one is the E0282 "type annotations needed" case).
+    fn has_unbound_var(&self, t: Ty) -> bool {
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Infer(v) => !v.is_int(),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_unbound_var(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_var(e)),
+            TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.has_unbound_var(e))),
+            _ => false,
+        }
+    }
+
     fn finish(&mut self) {
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
+        // A local whose element or item type was never decided (`let a = [];`,
+        // `let v = Vec::new();`) is an annotation error (rustc E0282). This
+        // scan runs before the zonk below defaults those variables away.
+        for i in 0..self.out.locals.len() {
+            let t = self.out.locals[i].ty;
+            if self.has_unbound_var(t) && !self.has_error_kind(t) {
+                let span = self.out.locals[i].span;
+                let name = self.name(self.out.locals[i].name).to_string();
+                self.err(
+                    "L0111",
+                    span,
+                    format!("cannot infer the type of `{name}`"),
+                    "Add a type annotation, such as `let v: Vec<i64> = Vec::new();`.",
+                );
+            }
+        }
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
