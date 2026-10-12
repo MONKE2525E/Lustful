@@ -4280,7 +4280,10 @@ Free ranges are therefore L05xx up. All new codes in
 this document live there. `tests/fail` files key on
 codes, so a collision silently retargets a test. S0
 (9.2) makes this table a checked registry before any
-new code is emitted.
+new code is emitted. The registry is
+`docs/errors/REGISTRY.md`, checked by
+`scripts/check-codes.sh`; this appendix is the
+rationale, the registry is the enforced list.
 
 | Range | Area |
 |---|---|

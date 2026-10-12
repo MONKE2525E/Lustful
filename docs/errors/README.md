@@ -4,6 +4,8 @@ Every error lust prints has a stable `L####` code. Run `lust explain L0301` to p
 the long-form text for one code, or `lust explain` to list all codes. Each page has a
 wrong example that fails with that code and a fixed example that passes.
 `scripts/check-explain.sh` checks every example against lust and rustc.
+[REGISTRY.md](REGISTRY.md) is the checked list of in-use and reserved code
+ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 
 | Code | Meaning |
 |---|---|
