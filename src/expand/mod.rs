@@ -16,7 +16,7 @@ pub mod transcribe;
 
 use crate::ast::{MacroCall, MacroRulesDef};
 use crate::def::DefId;
-use crate::diag::{CtxtId, Diag, HygieneMark, Span, register_expansion, register_hygiene};
+use crate::diag::{CtxtId, Diag, HygieneMark, Span, mark_no_capture, register_expansion, register_hygiene};
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree, build_trees};
 use std::hash::{Hash, Hasher};
@@ -625,9 +625,11 @@ pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
             Tok::Ident(s) if interner.get(s) == "macro_rules" => return true,
             Tok::Bang => {
                 // `name!`: the token before the bang names the macro.
+                // A path-qualified parser macro (`std::println!`) also
+                // needs the expander: it strips the prefix for the parser.
                 if let Some(prev) = i.checked_sub(1).map(|j| tokens[j].tok)
                     && let Some(name) = seg_text(prev, interner)
-                    && !builtin::is_passthrough(&name)
+                    && (!builtin::is_passthrough(&name) || tokens.get(i.wrapping_sub(2)).map(|t| t.tok) == Some(Tok::PathSep))
                 {
                     return true;
                 }
@@ -1455,6 +1457,40 @@ fn item_end(trees: &[Tt], start: usize, interner: &Interner) -> Option<usize> {
     None
 }
 
+/// True when the first call argument in `trees` is written as one string
+/// literal (a fragment that holds one counts, as the literal was written
+/// by the caller and only forwarded).
+fn is_str_lit_arg(trees: &[Tt]) -> bool {
+    let end = trees.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(trees.len());
+    match &trees[..end] {
+        [Tt::Tok(t)] => matches!(t.tok, Tok::Str(_)),
+        [Tt::Frag(_, inner, _)] => is_str_lit_arg(inner),
+        _ => false,
+    }
+}
+
+/// Stamps the first argument of an expanded format-macro call, when it is
+/// one string literal, as macro-produced: the parser then rejects named
+/// captures in it, as rustc does for `println!(concat!("{x}", ""))`.
+fn mark_format_str(expanded: &mut [Tt], span: Span) {
+    fn stamp(t: &mut Token, span: Span) {
+        let ctxt = register_expansion(crate::diag::Expansion { macro_def: DefId::PLACEHOLDER, call_span: span, parent: t.span.ctxt });
+        mark_no_capture(ctxt);
+        t.span.ctxt = ctxt;
+    }
+    fn first_str(trees: &mut [Tt], span: Span) {
+        match trees {
+            [Tt::Tok(t)] if matches!(t.tok, Tok::Str(_)) => stamp(t, span),
+            [Tt::Frag(_, inner, _)] => first_str(inner, span),
+            _ => {}
+        }
+    }
+    let end = expanded.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(expanded.len());
+    if end == 1 {
+        first_str(&mut expanded[..1], span);
+    }
+}
+
 /// Takes `trees[i]` out by value, leaving a placeholder behind.
 fn take(trees: &mut [Tt], i: usize) -> Tt {
     std::mem::replace(&mut trees[i], Tt::Tok(Token { tok: Tok::Eof, span: Span::default() }))
@@ -1544,10 +1580,17 @@ impl<'a> Expander<'a> {
                     Tt::Delim(d, inner, span) => (*d, inner.clone(), *span),
                     _ => unreachable!(),
                 };
-                for k in i..group_idx {
-                    out.push(take(&mut trees, k));
+                // The parser owns only the plain `name!` form, so a
+                // path-qualified call (`std::println!`) keeps just its
+                // last segment and the bang.
+                out.push(take(&mut trees, group_idx - 2));
+                out.push(take(&mut trees, group_idx - 1));
+                let fmt_name = segs.last().map_or("", |s| s.text.as_str());
+                let written_lit = is_str_lit_arg(&inner);
+                let mut expanded_inner = self.expand_list(inner, depth, false, nest + 1)?;
+                if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
+                    mark_format_str(&mut expanded_inner, group_span);
                 }
-                let expanded_inner = self.expand_list(inner, depth, false, nest + 1)?;
                 out.push(Tt::Delim(delim, expanded_inner, group_span));
                 i = group_idx + 1;
                 pending_macro_use = false;
@@ -1781,9 +1824,16 @@ impl<'a> Expander<'a> {
                 return builtin::expand_builtin(self, &name, call, depth);
             }
             if builtin::is_passthrough(&name) {
-                // The head already ends with the call's `!`.
-                let mut out = call.head.clone();
-                let inner = self.expand_list(call.inner.clone(), depth, false, 0)?;
+                // The head already ends with the call's `!`. The parser
+                // owns only the plain `name!` form, so keep just the
+                // last segment and the bang of a qualified path.
+                let head = &call.head[call.head.len().saturating_sub(2)..];
+                let mut out: Vec<Tt> = head.to_vec();
+                let written_lit = is_str_lit_arg(&call.inner);
+                let mut inner = self.expand_list(call.inner.clone(), depth, false, 0)?;
+                if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
+                    mark_format_str(&mut inner, call.span);
+                }
                 out.push(Tt::Delim(call.delim, inner, call.group_span));
                 return Ok(out);
             }

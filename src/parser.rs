@@ -2802,7 +2802,9 @@ impl<'a> Parser<'a> {
                 }
                 let s = self.ast.strings[(si + self.str_base) as usize].clone();
                 let base = args.len();
-                fmt = self.format_string(&s, lit_span, base, &mut extra)?;
+                // A format string a macro produced (concat! and kin) may
+                // not capture variables, as in rustc.
+                fmt = self.format_string(&s, lit_span, base, &mut extra, !crate::diag::is_no_capture(lit_span.ctxt))?;
                 args.extend(extra);
             } else if self.peek() != close {
                 return Err(syntax(self.span(), "expected a format string literal"));
@@ -2813,7 +2815,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Splits a format string into pieces. `{name}` captures become extra path arguments.
-    fn format_string(&mut self, s: &str, span: Span, base: usize, extra: &mut Vec<ExprId>) -> PResult<Vec<FmtPiece>> {
+    /// With `allow_capture` false (a macro-produced format string), a named
+    /// capture is an error, as in rustc.
+    fn format_string(&mut self, s: &str, span: Span, base: usize, extra: &mut Vec<ExprId>, allow_capture: bool) -> PResult<Vec<FmtPiece>> {
         let mut pieces = Vec::new();
         let mut lit = String::new();
         let mut next = 0usize;
@@ -2847,6 +2851,11 @@ impl<'a> Parser<'a> {
                     next - 1
                 } else if let Ok(n) = name.parse::<usize>() {
                     n
+                } else if !allow_capture {
+                    return Err(syntax(
+                        span,
+                        format!("there is no argument named `{name}`: a format string expanded from a macro cannot capture variables"),
+                    ));
                 } else {
                     let sym = self.interner.intern(name);
                     let seg = PathSeg::plain(sym);

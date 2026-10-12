@@ -224,6 +224,32 @@ pub fn register_hygiene(ctxt: CtxtId, mark: HygieneMark) {
     table[idx] = Some(mark);
 }
 
+/// Contexts whose string literals came out of a macro expansion at the
+/// point a format macro reads them (`println!(concat!("{x}", ""))`).
+/// Rust forbids captured variables in such format strings; the expander
+/// stamps the produced literal with a context recorded here and the
+/// parser's format reader checks it. Parallel to `HYGIENE_MARKS`.
+static NO_CAPTURE_MARKS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+/// Records `ctxt` as a no-capture format string context. The expander
+/// calls this right after `register_expansion` for the same context.
+pub fn mark_no_capture(ctxt: CtxtId) {
+    let mut table = NO_CAPTURE_MARKS.lock().unwrap();
+    let idx = (ctxt.0 as usize).saturating_sub(1);
+    if table.len() <= idx {
+        table.resize(idx + 1, false);
+    }
+    table[idx] = true;
+}
+
+/// True when `ctxt` was recorded by `mark_no_capture`.
+pub fn is_no_capture(ctxt: CtxtId) -> bool {
+    if ctxt == CtxtId::ROOT {
+        return false;
+    }
+    NO_CAPTURE_MARKS.lock().unwrap().get((ctxt.0 - 1) as usize).copied().unwrap_or(false)
+}
+
 fn hygiene_mark(ctxt: CtxtId) -> Option<HygieneMark> {
     if ctxt == CtxtId::ROOT {
         return None;
