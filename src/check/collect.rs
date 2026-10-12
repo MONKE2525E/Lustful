@@ -1,6 +1,7 @@
 // Collection: builds the item tables (types, functions, methods) and resolves all signatures.
 // This is the only stage that runs in sequence. Function bodies are checked after it, in parallel.
 use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
+use crate::check::generics::{self, GenTables};
 pub use crate::def::{CrateId, DefId, DefPathHash, LocalDefId, StableCrateHash};
 use crate::def::{CrateIds, DiskDefId};
 use crate::diag::{Diag, Span, not_yet, unsupported};
@@ -135,6 +136,9 @@ pub struct Program<'a> {
     /// through the resolver. Filled by the driver after collection; the
     /// S7 `Binding` query fns in driver/graph.rs read through it.
     pub resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+    /// The generic tables (traits, templates, instances) built by
+    /// `check::generics` during collection and finished by mono.
+    pub gx: GenTables<'a>,
 }
 
 impl<'a> Program<'a> {
@@ -630,6 +634,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         std_fns: Vec::new(),
         shipped_ranges: Vec::new(),
         resolved: None,
+        gx: GenTables::default(),
     };
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their
@@ -656,6 +661,11 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     let mut errs = Vec::new();
     let dup = |span: Span, n: &str| Diag::new("L0106", span, format!("`{n}` is defined more than once"), "Rename one of the definitions.");
 
+    // Generic pass 0: lang traits and user trait defs, so bounds in
+    // every later signature can name them.
+    generics::init_lang(&mut p);
+    generics::collect_trait_defs(&mut p, &mut errs);
+
     // Pass 1: type names, so fields can refer to types defined later.
     for item in &ast.items {
         let (name, span, is_enum) = match &item.kind {
@@ -664,8 +674,16 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             _ => continue,
         };
         let id = AdtId(p.adts.len() as u32);
-        if p.type_names.insert(name, id).is_some() {
+        if p.type_names.insert(name, id).is_some() || p.gx.trait_names.contains_key(&name) {
             errs.push(dup(span, interner.get(name)));
+        }
+        let n_params = match &item.kind {
+            ItemKind::Struct(st) => generics::ast_param_count(&st.generics),
+            ItemKind::Enum(e) => generics::ast_param_count(&e.generics),
+            _ => 0,
+        };
+        if n_params > 0 {
+            p.gx.has_generics = true;
         }
         // The Adt's stable identity (ARCH 1.7): same name earlier in the file is a
         // duplicate definition (the error above), and the disambiguator keeps the
@@ -681,6 +699,11 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             span,
             repr: crate::ty::layout::Repr::default(),
         });
+        p.gx.adt_info.push((def, n_params));
+        p.gx.adt_generics.push(Generics::default());
+        p.gx.adt_envs.push(Vec::new());
+        p.gx.adt_scopes.push(generics::Scope::default());
+        p.gx.adt_instance_of.push(None);
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
         p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
@@ -746,6 +769,10 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
     }
 
+    // Generic pass 1.5: trait generics, method templates. Fields
+    // and fn signatures after this can name traits in bounds.
+    generics::build_trait_tables(&mut p, &mut errs);
+
     // Pass 2: fields, variants, derives.
     let mut adt_index = 0;
     for item in &ast.items {
@@ -772,6 +799,35 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         };
         let id = AdtId(adt_index);
         adt_index += 1;
+        // The Adt's own generics scope its field types.
+        {
+            let (g_ast, w_ast) = match &item.kind {
+                ItemKind::Struct(st) => (st.generics.clone(), st.where_clause.clone()),
+                ItemKind::Enum(e) => (e.generics.clone(), e.where_clause.clone()),
+                _ => unreachable!(),
+            };
+            let (adt_generics, adt_scope) = {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                generics::build_generics(ast, interner, known, &cx, &mut p.tys, &g_ast, &w_ast, &mut errs)
+            };
+            let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &adt_generics.predicates);
+            p.gx.adt_generics[id.0 as usize] = adt_generics;
+            p.gx.adt_envs[id.0 as usize] = env;
+            p.gx.adt_scopes[id.0 as usize] = adt_scope;
+            // Mirror the generics into the def table record.
+            let def = p.defs.def_of_adt(id).expect("ADT defs are recorded in pass 1");
+            let name = p.adts[id.0 as usize].name;
+            let is_enum_now = p.adts[id.0 as usize].is_enum;
+            let mut data = DefData::skeleton(
+                if is_enum_now { DefsKind::Enum } else { DefsKind::Struct },
+                None,
+                name,
+                Vis::Priv,
+                p.adts[id.0 as usize].span,
+            );
+            data.generics = p.gx.adt_generics[id.0 as usize].clone();
+            p.defs.insert(def, data);
+        }
         let is_enum = p.adts[id.0 as usize].is_enum;
         let mut variants = Vec::new();
         let mut next_disc: i128 = 0;
@@ -782,9 +838,14 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 if shape == VariantShape::Named && fields.iter().any(|f: &Field| f.name == fname) {
                     errs.push(dup(fspan, interner.get(fname)));
                 }
-                match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, fty, None) {
+                let resolved = {
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    let scope = p.gx.adt_scopes[id.0 as usize].clone();
+                    generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &scope)
+                };
+                match resolved {
                     Ok(t) => {
-                        if contains_ref(&p.tys, t) {
+                        if contains_ref(&p.tys, t) && !generics::ref_field_ok(ast, interner, fty) {
                             errs.push(Diag::new(
                                 "L0201",
                                 ast.ty_span(fty),
@@ -841,6 +902,25 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         if d.copy && !d.clone {
             errs.push(Diag::new("L0112", p.adts[id.0 as usize].span, "deriving Copy requires Clone", "Add Clone to the derive list."));
         }
+        // A type parameter must occur in a field (rustc E0392's
+        // class): an unused parameter has no layout meaning here.
+        {
+            let agx = &p.gx.adt_generics[id.0 as usize];
+            for (i, param) in agx.params.iter().enumerate() {
+                if param.kind != ParamKind::Type {
+                    continue;
+                }
+                let used = variants.iter().any(|v| v.fields.iter().any(|f| generics::ty_uses_param(&p.tys, f.ty, i as u32)));
+                if !used {
+                    errs.push(Diag::new(
+                        "L0110",
+                        param.span,
+                        format!("type parameter `{}` is never used", interner.get(param.name)),
+                        "Use the parameter in a field type, or remove it.",
+                    ));
+                }
+            }
+        }
         let adt = &mut p.adts[id.0 as usize];
         adt.variants = variants;
         adt.derives = d;
@@ -891,6 +971,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let d = adt.derives;
         for v in &adt.variants {
             for f in &v.fields {
+                if p.tys.flags(f.ty).contains_param() {
+                    // A generic field: the synthetic derive impl
+                    // carries the bound (section 2.2), checked per
+                    // instance, not against the abstract field type.
+                    continue;
+                }
                 // Each query runs only for a derive the type asks for: the queries
                 // are pure, so skipping the others changes no result.
                 let mut checks: [(bool, &str); 4] = [(true, ""); 4];
@@ -959,79 +1045,61 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     // slots from the same hashes, before `collect` runs on any new def set;
     // here the maps only record the hashes. A duplicate definition keeps the
     // first local id in `def_by_hash`; the dup errors below report it.
+    // Functions and methods. Each gets the stable path hash its caller computed
+    // (src/def.rs). Hash collisions are checked by the driver when it assigns
+    // slots from the same hashes, before `collect` runs on any new def set;
+    // here the maps only record the hashes. A duplicate definition keeps the
+    // first local id in `def_by_hash`; the dup errors below report it.
+    //
+    // A fn with generic parameters (its own, or its impl's) is a template:
+    // its FnInfo holds the signature over `Param` tys, and mono appends a
+    // concrete FnInfo per instance after this pass. Plain fns are their
+    // own only instance, exactly as before generics.
+    struct ParentGen {
+        generics: Generics,
+        scope: generics::Scope,
+    }
+    let plain_parent = || ParentGen { generics: Generics::default(), scope: generics::Scope::default() };
     let add_fn = |p: &mut Program<'a>,
                   def: &'a ast::FnDef,
                   owner: Option<AdtId>,
+                  self_ty: Option<Ty>,
                   parent: Option<DefId>,
+                  parent_gen: &ParentGen,
                   hash: DefPathHash,
                   errs: &mut Vec<Diag>|
      -> LocalDefId {
-        let self_ty = owner.map(|a| p.tys.adt_ty(a));
-        let mut params = Vec::new();
-        if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
-            params.push(match sp.kind {
-                SelfKind::Value => st,
-                SelfKind::Ref => p.tys.mk_ref(false, st),
-                SelfKind::RefMut => p.tys.mk_ref(true, st),
-                // Typed receivers are rejected by the parser today; treat as by-value.
-                SelfKind::Typed => st,
-            });
-        }
-        for param in &def.params {
-            match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, param.ty, self_ty) {
-                Ok(t) => {
-                    if !is_sized_ty(&p.tys, t) {
-                        errs.push(Diag::new(
-                            "L0110",
-                            ast.ty_span(param.ty),
-                            format!("the size for values of type `{}` cannot be known", ty_name(p, &p.tys, t)),
-                            "Put the value behind a reference, such as `&[T]` or `&str`.",
-                        ));
-                    }
-                    params.push(t)
-                }
-                Err(d) => {
-                    errs.push(d);
-                    params.push(ERROR);
-                }
-            }
-        }
-        let ret = match def.ret {
-            None => UNIT,
-            Some(t) => resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, t, self_ty).unwrap_or_else(|d| {
-                errs.push(d);
-                ERROR
-            }),
+        let shift = parent_gen.generics.params.len() as u32;
+        let (own_generics, own_scope) = {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &def.generics, &def.where_clause, shift, errs)
         };
-        if !is_sized_ty(&p.tys, ret) {
-            let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
-            errs.push(Diag::new(
-                "L0110",
-                span,
-                format!("the size for values of type `{}` cannot be known", ty_name(p, &p.tys, ret)),
-                "Put the value behind a reference, such as `&[T]` or `&str`.",
-            ));
+        let mut generics = parent_gen.generics.clone();
+        generics.params.extend(own_generics.params.iter().cloned());
+        generics.predicates.extend(own_generics.predicates.iter().copied());
+        generics.parent = parent;
+        let mut scope = parent_gen.scope.clone();
+        scope.type_params.extend(own_scope.type_params.iter().copied());
+        scope.const_params.extend(own_scope.const_params.iter().copied());
+        scope.assoc_srcs.extend(own_scope.assoc_srcs.iter().cloned());
+        // Associated sources from every bound in the combined env,
+        // so `T::Assoc` resolves in this signature.
+        {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
+            scope.assoc_srcs.append(&mut srcs);
         }
-        // Elision: a returned reference borrows from `self`, or from the only reference parameter.
-        let mut ret_borrows_from = None;
-        if contains_ref(&p.tys, ret) {
-            let ref_params: Vec<usize> = (0..params.len()).filter(|&i| contains_ref(&p.tys, params[i])).collect();
-            if def.self_param.as_ref().is_some_and(|s| s.kind != SelfKind::Value) {
-                ret_borrows_from = Some(0);
-            } else if ref_params.len() == 1 {
-                ret_borrows_from = Some(ref_params[0]);
-            } else {
-                let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
-                errs.push(Diag::new(
-                    "L0202",
-                    span,
-                    "this function returns a reference, but elision cannot tell which parameter it borrows from",
-                    "Return an owned value (such as String), or take exactly one reference parameter. Lust has no lifetime names.",
-                ));
-            }
-        }
-        if def.self_param.is_some() && owner.is_none() {
+        let (params, ret, ret_borrows_from, generics, scope) = {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, errs)
+        };
+        if def.self_param.is_some() && self_ty.is_none() {
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
+        }
+        let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
+        let is_template = !generics.params.is_empty();
+        if is_template {
+            p.gx.has_generics = true;
         }
         let id = LocalDefId(p.fns.len() as u32);
         let def_id = DefId { krate: p.krate, hash };
@@ -1039,11 +1107,9 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         p.def_by_hash.entry(hash).or_insert(id);
         // The def table record mirrors `FnInfo` for identity, kind, and generics;
         // body checking still reads `FnInfo` through the compat path.
-        let mut generics = Generics::default();
-        generics.parent = parent;
         let mut data =
             DefData::skeleton(if owner.is_some() { DefsKind::Method } else { DefsKind::Fn }, parent, def.name, Vis::Priv, def.name_span);
-        data.generics = generics;
+        data.generics = generics.clone();
         data.sig = SigData::Fn { params: params.clone(), ret };
         p.defs.insert(def_id, data);
         p.fns.push(FnInfo {
@@ -1056,6 +1122,17 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             ret_borrows_from,
             is_const: def.qual.is_const,
         });
+        p.gx.fn_templates.push(if is_template { Some(generics::FnTemplate { generics, env: env.clone() }) } else { None });
+        // The body scope of a template keeps its parameters (the
+        // abstract-instance check substitutes them); of a plain
+        // fn it is empty but for Self and assoc sources.
+        let mut body_scope = scope;
+        if !is_template {
+            body_scope.type_params.clear();
+            body_scope.const_params.clear();
+        }
+        p.gx.fn_scopes.push(generics::FnScope { env, scope: body_scope });
+        p.gx.fn_class.push(if is_template { generics::FnClass::Template } else { generics::FnClass::Plain });
         id
     };
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
@@ -1063,7 +1140,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
-                let id = add_fn(&mut p, def, None, None, hash, &mut errs);
+                let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
                 if p.fn_names.insert(def.name, id).is_some() {
                     errs.push(dup(def.name_span, interner.get(def.name)));
                 }
@@ -1072,11 +1149,63 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 }
             }
             ItemKind::Impl(imp) => {
-                let owner = match ast.ty(imp.self_ty) {
-                    TyExpr::Path(segs) if segs.len() == 1 && !segs[0].has_args() => p.type_names.get(&segs[0].name).copied(),
+                if imp.is_negative {
+                    errs.push(not_yet("L0614", imp.span, "negative impls"));
+                    continue;
+                }
+                // Impl identity header, computed exactly as the
+                // driver's `fn_keys` computes it (self type's first
+                // segment name, else "<error>"), with one ordinal
+                // sequence per header across all impls.
+                let header = match ast.ty(imp.self_ty) {
+                    TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
+                    _ => "<error>".to_string(),
+                };
+                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
+                impl_ordinals.insert(header.clone(), ordinal + 1);
+                let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
+                let impl_def = DefId { krate: p.krate, hash: parent };
+                p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, known.self_type, Vis::Priv, imp.span));
+
+                let (impl_generics, mut impl_scope) = {
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    generics::build_generics(ast, interner, known, &cx, &mut p.tys, &imp.generics, &imp.where_clause, &mut errs)
+                };
+                if !impl_generics.params.is_empty() {
+                    p.gx.has_generics = true;
+                }
+                let self_pat = {
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    match generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, imp.self_ty, &impl_scope) {
+                        Ok(t) => t,
+                        Err(d) => {
+                            errs.push(d);
+                            continue;
+                        }
+                    }
+                };
+                impl_scope.self_ty = Some(self_pat);
+                // The owner template Adt, when the Self pattern is a
+                // local Adt application (inherent and trait impls).
+                let owner: Option<AdtId> = match p.tys.kind(self_pat) {
+                    TyKind::Adt(def, _) => p.defs.local_adt(def),
                     _ => None,
                 };
-                let Some(owner) = owner else {
+                let trait_ref = match &imp.trait_ref {
+                    None => None,
+                    Some(tref) => {
+                        p.gx.has_generics = true;
+                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        match generics::resolve_trait_ref(ast, interner, known, &cx, &mut p.tys, &impl_scope, self_pat, tref, imp.span) {
+                            Ok(tr) => Some(tr),
+                            Err(d) => {
+                                errs.push(d);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                if trait_ref.is_none() && owner.is_none() {
                     errs.push(Diag::new(
                         "L0102",
                         ast.ty_span(imp.self_ty),
@@ -1084,25 +1213,54 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         "Write `impl MyType { ... }`.",
                     ));
                     continue;
-                };
-                let header = interner.get(p.adts[owner.0 as usize].name).to_string();
-                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
-                impl_ordinals.insert(header.clone(), ordinal + 1);
-                let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
-                let impl_def = DefId { krate: p.krate, hash: parent };
-                let owner_name = p.adts[owner.0 as usize].name;
-                p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, owner_name, Vis::Priv, ast.ty_span(imp.self_ty)));
+                }
+                // The impl's trait is an assoc source on the Self
+                // pattern inside its method signatures.
+                if let Some(tr) = &trait_ref
+                    && let Some(rec) = p.gx.index.trait_record(tr.def).cloned()
+                {
+                    impl_scope.assoc_srcs.push(generics::AssocSrc {
+                        self_ty: self_pat,
+                        trait_def: tr.def,
+                        args: tr.args,
+                        assocs: rec.assoc_items.iter().map(|&(d, n, _)| (n, d)).collect(),
+                    });
+                }
+                let parent_gen = ParentGen { generics: impl_generics.clone(), scope: impl_scope };
+                let mut method_ids: Vec<LocalDefId> = Vec::new();
                 for def in &imp.fns {
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
-                    let id = add_fn(&mut p, def, Some(owner), Some(impl_def), hash, &mut errs);
-                    if p.methods.insert((owner, def.name), id).is_some() {
-                        errs.push(dup(def.name_span, interner.get(def.name)));
+                    let id = add_fn(&mut p, def, owner, Some(self_pat), Some(impl_def), &parent_gen, hash, &mut errs);
+                    method_ids.push(id);
+                    if trait_ref.is_none() {
+                        // Inherent methods join the compat method
+                        // table under the *template* Adt; instances
+                        // get their own entries at materialization.
+                        if let Some(owner) = owner
+                            && p.methods.insert((owner, def.name), id).is_some()
+                        {
+                            errs.push(dup(def.name_span, interner.get(def.name)));
+                        }
                     }
+                }
+                if let Some(tr) = trait_ref {
+                    generics::finish_trait_impl(
+                        &mut p,
+                        imp,
+                        impl_def,
+                        impl_generics,
+                        self_pat,
+                        tr,
+                        &parent_gen.scope,
+                        &method_ids,
+                        &mut errs,
+                    );
                 }
             }
             _ => {}
         }
     }
+    generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
         if !f.params.is_empty() || f.ret != UNIT {

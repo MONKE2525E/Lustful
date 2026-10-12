@@ -44,12 +44,11 @@ pub struct Parser<'a> {
     /// Current nesting depth, capped so pathological input cannot overflow the stack.
     depth: u32,
     /// The first form (by span) that parses into AST v2 shapes but
-    /// later stages do not support yet. The parser builds those
-    /// shapes (generics, traits, and kin, for W-TRAITS-CORE) and
-    /// records the reject the parser used to emit on sight, so the
-    /// error a user sees is still the first one in the file, with
-    /// its old code. `parse` returns it after the parse, or in
-    /// place of a later hard error.
+    /// later stages do not support yet: the parser builds the shape
+    /// and records the reject it used to emit on sight, so the
+    /// error a user sees is still the first one in the file.
+    /// `parse` returns it after the parse, or in place of a later
+    /// hard error.
     deferred: Option<Diag>,
     /// True while parsing an `if` or `while` condition, where `let` may
     /// appear as a chain element.
@@ -429,7 +428,10 @@ impl<'a> Parser<'a> {
 
     /// Records the reject for a form the parser builds but later
     /// stages do not support yet, keeping the earliest by span.
-    /// See the `deferred` field.
+    /// See the `deferred` field. No form defers today (generic and
+    /// trait forms reach collect since W-TRAITS-CORE); the slot
+    /// stays for the next AST form that parses before it checks.
+    #[allow(dead_code)]
     fn defer(&mut self, d: Diag) {
         if self.deferred.as_ref().is_none_or(|old| d.span.lo < old.span.lo) {
             self.deferred = Some(d);
@@ -1001,25 +1003,14 @@ impl<'a> Parser<'a> {
 
     /// Generic parameters as written: `<..>`, or empty when absent.
     /// Additive parser work for W-CORELANG (the AST owner) on behalf
-    /// of W-TRAITS-CORE: the shapes are the frozen AST v2 ones, and
-    /// collect still rejects every generic form until generic
-    /// collect lands, so accepted programs do not change. Lifetime
+    /// of W-TRAITS-CORE: the shapes are the frozen AST v2 ones.
+    /// Lifetime
     /// parameters keep the old L0203 reject where `allow_lifetimes`
     /// is false (fns, structs, enums); impls and traits record them.
-    fn generics(&mut self, what: &str, allow_lifetimes: bool) -> PResult<Generics> {
+    fn generics(&mut self, allow_lifetimes: bool) -> PResult<Generics> {
         let start = self.span();
         if !self.eat(Tok::Lt) {
             return Ok(Generics { params: Vec::new(), span: start });
-        }
-        // The reject this syntax used to get on sight (see the
-        // `deferred` field): a leading lifetime named lifetimes,
-        // anything else named generics.
-        if matches!(self.peek(), Tok::Lifetime(_)) {
-            let d = lifetime_error(self.span());
-            self.defer(d);
-        } else {
-            let d = not_yet(C_TRAIT, start, &format!("generic {what}"));
-            self.defer(d);
         }
         let mut params = Vec::new();
         loop {
@@ -1151,8 +1142,6 @@ impl<'a> Parser<'a> {
         if !self.eat(Tok::Where) {
             return Ok(WhereClause { preds: Vec::new(), span: start });
         }
-        let d = not_yet(C_TRAIT, start, "where clauses");
-        self.defer(d);
         let mut preds = Vec::new();
         loop {
             if matches!(self.peek(), Tok::LBrace | Tok::Semi) {
@@ -1195,7 +1184,7 @@ impl<'a> Parser<'a> {
     fn fn_def_inner(&mut self, sig_only: bool) -> PResult<FnDef> {
         self.expect(Tok::Fn, "`fn`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("functions", false)?;
+        let generics = self.generics(false)?;
         self.expect(Tok::LParen, "`(`")?;
         let mut self_param = None;
         let mut params = Vec::new();
@@ -1205,8 +1194,6 @@ impl<'a> Parser<'a> {
         let typed_self = (self.peek() == Tok::SelfLower && self.peek_at(1) == Tok::Colon)
             || (self.peek() == Tok::Mut && self.peek_at(1) == Tok::SelfLower && self.peek_at(2) == Tok::Colon);
         if typed_self {
-            let d = not_yet(C_METHOD, s, "typed `self` parameters");
-            self.defer(d);
             let mutable = self.eat(Tok::Mut);
             self.bump(); // `self`
             self.bump(); // `:`
@@ -1241,10 +1228,7 @@ impl<'a> Parser<'a> {
             }
         };
         if let Some((kind, mutable, n, lifetime)) = self_form {
-            if let Some(lt) = lifetime {
-                let d = lifetime_error(lt.span);
-                self.defer(d);
-            }
+            if let Some(_lt) = lifetime {}
             for _ in 0..n {
                 self.bump();
             }
@@ -1339,7 +1323,7 @@ impl<'a> Parser<'a> {
     fn struct_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<StructDef> {
         self.expect(Tok::Struct, "`struct`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("structs", false)?;
+        let generics = self.generics(false)?;
         // The where clause sits before the fields (named struct)
         // or before the `;` (unit struct). Tuple structs put it
         // after the fields; they still reject below.
@@ -1363,7 +1347,7 @@ impl<'a> Parser<'a> {
     fn enum_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<EnumDef> {
         self.expect(Tok::Enum, "`enum`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("enums", false)?;
+        let generics = self.generics(false)?;
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
@@ -1393,10 +1377,8 @@ impl<'a> Parser<'a> {
     /// collect checks which parts each context requires).
     fn assoc_type(&mut self) -> PResult<AssocTypeDef> {
         let start = self.expect(Tok::Type, "`type`")?;
-        let d = not_yet(C_ASSOC, start, "associated consts and types");
-        self.defer(d);
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("associated types", true)?;
+        let generics = self.generics(true)?;
         let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
         let where_clause = self.where_clause()?;
         let default = if self.eat(Tok::Eq) { Some(self.ty()?) } else { None };
@@ -1418,8 +1400,6 @@ impl<'a> Parser<'a> {
     /// `const NAME: Ty = value;` (the value is optional in a trait).
     fn assoc_const(&mut self) -> PResult<AssocConstDef> {
         let start = self.expect(Tok::Const, "`const`")?;
-        let d = not_yet(C_ASSOC, start, "associated consts and types");
-        self.defer(d);
         let (name, name_span) = self.ident()?;
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
@@ -1433,10 +1413,8 @@ impl<'a> Parser<'a> {
     /// types, and associated consts.
     fn trait_def(&mut self) -> PResult<TraitDef> {
         let start = self.expect(Tok::Trait, "`trait`")?;
-        let d = not_yet(C_TRAIT, start, "trait definitions");
-        self.defer(d);
         let (name, name_span) = self.ident()?;
-        let generics = self.generics("traits", true)?;
+        let generics = self.generics(true)?;
         let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
@@ -1491,7 +1469,7 @@ impl<'a> Parser<'a> {
     /// parsed once, and a following `for` makes it the trait ref.
     fn impl_def(&mut self, is_unsafe: bool) -> PResult<ImplDef> {
         let start = self.expect(Tok::Impl, "`impl`")?;
-        let generics = self.generics("impls", true)?;
+        let generics = self.generics(true)?;
         let is_negative = self.eat(Tok::Bang);
         let (trait_ref, self_ty) = if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper) {
             let header_start = self.span();
@@ -1512,10 +1490,7 @@ impl<'a> Parser<'a> {
             }
             (None, self_ty)
         };
-        if trait_ref.is_some() || is_negative {
-            let d = not_yet(C_TRAIT, start, "trait impls");
-            self.defer(d);
-        }
+        if trait_ref.is_some() || is_negative {}
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut fns = Vec::new();
@@ -1572,8 +1547,6 @@ impl<'a> Parser<'a> {
                 // written forms the subset accepts.
                 let lifetime = if matches!(self.peek(), Tok::Lifetime(_)) {
                     let lt = self.lifetime_here()?;
-                    let d = lifetime_error(lt.span);
-                    self.defer(d);
                     Some(lt)
                 } else {
                     None
@@ -1618,15 +1591,11 @@ impl<'a> Parser<'a> {
             }
             Tok::Impl => {
                 self.bump();
-                let d = not_yet(C_TY, start, "`impl Trait` types");
-                self.defer(d);
                 let bounds = self.bounds()?;
                 Ok(self.push_ty(TyExpr::ImplTrait { bounds }, start.to(self.prev_span())))
             }
             Tok::Dyn => {
                 self.bump();
-                let d = not_yet(C_TY, start, "`dyn Trait` types");
-                self.defer(d);
                 let binder = self.opt_binder()?;
                 let mut bounds = self.bounds()?;
                 // A trailing lifetime bound is the dyn lifetime.
@@ -1643,8 +1612,6 @@ impl<'a> Parser<'a> {
             Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
             Tok::Star => {
                 self.bump();
-                let d = not_yet(C_TY, start, "raw pointer types");
-                self.defer(d);
                 let mutable = if self.eat(Tok::Mut) {
                     true
                 } else if self.eat(Tok::Const) {
@@ -1664,15 +1631,11 @@ impl<'a> Parser<'a> {
             }
             Tok::Underscore => {
                 self.bump();
-                let d = not_yet(C_TY, start, "inferred types (`_`)");
-                self.defer(d);
                 Ok(self.push_ty(TyExpr::Infer, start.to(self.prev_span())))
             }
             Tok::Unsafe => Err(unsafe_error(start)),
             Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),
             Tok::Lt => {
-                let d = not_yet(C_ASSOC, start, "qualified paths");
-                self.defer(d);
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Ok(self.push_ty(TyExpr::QPath { self_ty, trait_path, segs }, start.to(self.prev_span())))
             }
@@ -1695,8 +1658,6 @@ impl<'a> Parser<'a> {
     /// `<SelfTy as Trait>::Segs`, or `<SelfTy>::Segs` with an empty
     /// trait path. Shared by type and expression position.
     fn qpath_parts(&mut self) -> PResult<(TyId, Vec<PathSeg>, Vec<PathSeg>)> {
-        let d = not_yet(C_ASSOC, self.span(), "qualified paths");
-        self.defer(d);
         self.expect(Tok::Lt, "`<`")?;
         let self_ty = self.ty()?;
         let trait_path = if self.eat(Tok::As) { self.trait_path()? } else { Vec::new() };
@@ -1730,8 +1691,6 @@ impl<'a> Parser<'a> {
                 Tok::Lifetime(_) => return Err(lifetime_error(self.span())),
                 Tok::Ident(name) if self.peek_at(1) == Tok::Eq => {
                     let span = self.span();
-                    let d = not_yet(C_ASSOC, span, "associated bindings in generic arguments");
-                    self.defer(d);
                     self.bump();
                     self.bump();
                     let kind = match self.peek() {
@@ -1744,16 +1703,12 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Ident(name) if self.peek_at(1) == Tok::Colon => {
                     let span = self.span();
-                    let d = not_yet(C_ASSOC, span, "associated bindings in generic arguments");
-                    self.defer(d);
                     self.bump();
                     self.bump();
                     let bounds = self.bounds()?;
                     args.push(GenericArg::Binding { name, span, kind: BindingKind::Constraint(bounds) });
                 }
                 Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
-                    let d = not_yet(C_CONST, self.span(), "const generic arguments");
-                    self.defer(d);
                     args.push(GenericArg::Const(self.const_arg_expr()?));
                 }
                 _ => args.push(GenericArg::Type(self.ty()?)),
