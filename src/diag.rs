@@ -183,6 +183,45 @@ pub struct Expansion {
     pub parent: CtxtId,
 }
 
+/// Process-wide expansion table. Macro expansion runs inside the lexer and
+/// chunk paths, which have no handle on the session's `SourceMap`, so the
+/// expander registers every expansion here and gets a globally unique
+/// `CtxtId`. A `SourceMap`'s own table (built by `add_expansion`) takes
+/// precedence for ids it holds; today only tests build one. Entries are
+/// append-only for the life of the process, so a daemon keeps them across
+/// requests: spans in reused chunks stay valid.
+static GLOBAL_EXPANSIONS: std::sync::Mutex<Vec<Expansion>> = std::sync::Mutex::new(Vec::new());
+
+/// Records one expansion in the process-wide table and returns the context
+/// id for its tokens. The macro expander is the caller.
+pub fn register_expansion(exp: Expansion) -> CtxtId {
+    let mut table = GLOBAL_EXPANSIONS.lock().unwrap();
+    table.push(exp);
+    CtxtId(table.len() as u32)
+}
+
+/// The ordinary-source span an expanded span reports at, through the
+/// process-wide table only. `line!`, `file!`, and `column!` read their
+/// call site through this during expansion (ARCH 6.4).
+pub fn call_site_span(span: Span) -> Span {
+    let mut span = span;
+    while span.ctxt != CtxtId::ROOT {
+        match global_expansion(span.ctxt) {
+            Some(e) => span = e.call_span,
+            None => break,
+        }
+    }
+    span
+}
+
+/// The expansion record for a context id from the process-wide table, if any.
+fn global_expansion(ctxt: CtxtId) -> Option<Expansion> {
+    if ctxt == CtxtId::ROOT {
+        return None;
+    }
+    GLOBAL_EXPANSIONS.lock().unwrap().get((ctxt.0 - 1) as usize).cloned()
+}
+
 /// One file known to a source map: its path (as diagnostics print it) and its line index.
 /// The map does not own source text; the session keeps the text (the driver's `Front::src`).
 #[derive(Clone)]
@@ -240,12 +279,25 @@ impl SourceMap {
     pub fn call_site(&self, span: Span) -> Span {
         let mut span = span;
         while span.ctxt != CtxtId::ROOT {
-            span = self.expansions[(span.ctxt.0 - 1) as usize].call_span;
+            // A record in this map's own table wins; expansion contexts the
+            // expander registered live in the process-wide table instead.
+            let exp = match self.expansions.get((span.ctxt.0 - 1) as usize) {
+                Some(e) => Some(e.clone()),
+                None => global_expansion(span.ctxt),
+            };
+            match exp {
+                Some(e) => span = e.call_span,
+                // An unknown context cannot be followed further; report the
+                // span as written rather than failing the diagnostic.
+                None => break,
+            }
         }
         span
     }
-    /// Records one expansion and returns the context id for its tokens.
-    #[allow(dead_code)] // First caller is macro expansion; the table exists now so ctxt ids have their final meaning.
+    /// Records one expansion in this map's own table and returns the context
+    /// id for its tokens. Do not mix with `register_expansion` in one
+    /// session: both number contexts from 1, and this table wins lookups.
+    #[allow(dead_code)] // The expander uses the process-wide table today; the worklist driver (ARCH 6.1) will own this one.
     pub fn add_expansion(&mut self, exp: Expansion) -> CtxtId {
         self.expansions.push(exp);
         CtxtId(self.expansions.len() as u32)

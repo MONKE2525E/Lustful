@@ -150,6 +150,99 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Groups a flat token slice into nested token trees, skipping a final `Eof`
+/// token. Returns the trees and true when every delimiter was balanced. On
+/// unbalanced input the trees nest on a best-effort basis (an unclosed group
+/// runs to the end) and the flag is false; callers that need balance check it.
+pub fn build_trees(toks: &[Token]) -> (Vec<TokenTree>, bool) {
+    fn open(t: Tok) -> Option<Delim> {
+        match t {
+            Tok::LParen => Some(Delim::Paren),
+            Tok::LBracket => Some(Delim::Bracket),
+            Tok::LBrace => Some(Delim::Brace),
+            _ => None,
+        }
+    }
+    fn closes(d: Delim, t: Tok) -> bool {
+        matches!((d, t), (Delim::Paren, Tok::RParen) | (Delim::Bracket, Tok::RBracket) | (Delim::Brace, Tok::RBrace))
+    }
+    fn is_close(t: Tok) -> bool {
+        matches!(t, Tok::RParen | Tok::RBracket | Tok::RBrace)
+    }
+    // One stack frame per open delimiter: its kind, opening span, and trees so far.
+    let mut stack: Vec<(Delim, Span, Vec<TokenTree>)> = Vec::new();
+    let mut out: Vec<TokenTree> = Vec::new();
+    let mut balanced = true;
+    for t in toks {
+        if t.tok == Tok::Eof {
+            break;
+        }
+        if let Some(d) = open(t.tok) {
+            stack.push((d, t.span, Vec::new()));
+            continue;
+        }
+        if is_close(t.tok) {
+            match stack.last() {
+                Some((d, _, _)) if closes(*d, t.tok) => {
+                    let (d, span, inner) = stack.pop().unwrap();
+                    let tree = TokenTree::Delim(d, inner, span);
+                    match stack.last_mut() {
+                        Some((_, _, parent)) => parent.push(tree),
+                        None => out.push(tree),
+                    }
+                }
+                _ => {
+                    balanced = false;
+                    match stack.last_mut() {
+                        Some((_, _, parent)) => parent.push(TokenTree::Token(*t)),
+                        None => out.push(TokenTree::Token(*t)),
+                    }
+                }
+            }
+            continue;
+        }
+        match stack.last_mut() {
+            Some((_, _, parent)) => parent.push(TokenTree::Token(*t)),
+            None => out.push(TokenTree::Token(*t)),
+        }
+    }
+    if !stack.is_empty() {
+        balanced = false;
+        // Close what is left, innermost first, so no token is dropped.
+        while let Some((d, span, inner)) = stack.pop() {
+            let tree = TokenTree::Delim(d, inner, span);
+            match stack.last_mut() {
+                Some((_, _, parent)) => parent.push(tree),
+                None => out.push(tree),
+            }
+        }
+    }
+    (out, balanced)
+}
+
+/// Flattens token trees back into a flat token list, re-creating the closing
+/// delimiter tokens from each group's kind and span. The worklist path
+/// (ARCH 6.1) reads this when it owns expansion; today's expander
+/// flattens its own tree type.
+#[allow(dead_code)]
+pub fn flatten_trees(trees: &[TokenTree], out: &mut Vec<Token>) {
+    for tree in trees {
+        match tree {
+            TokenTree::Token(t) => out.push(*t),
+            TokenTree::Delim(d, inner, span) => {
+                let (open, close) = match d {
+                    Delim::Paren => (Tok::LParen, Tok::RParen),
+                    Delim::Bracket => (Tok::LBracket, Tok::RBracket),
+                    Delim::Brace => (Tok::LBrace, Tok::RBrace),
+                };
+                out.push(Token { tok: open, span: *span });
+                flatten_trees(inner, out);
+                out.push(Token { tok: close, span: *span });
+            }
+        }
+    }
+}
+
 pub struct Lexed {
     pub tokens: Vec<Token>,
     pub strings: Vec<String>,
