@@ -4521,7 +4521,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         },
                     },
                 }
-                }
             }
             Expr::QPath { self_ty, trait_path, segs } => {
                 if segs.len() == 1 {
