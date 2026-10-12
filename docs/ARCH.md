@@ -284,13 +284,18 @@ settle` and stop the crate. Rust accepts all such graphs; log
 any hit as a bug.
 
 Scope priority for the first segment of a path, highest first:
-lexical scopes (locals, then items and explicit imports of the
-enclosing modules), glob imports, the `#[macro_use]` macro
+lexical scopes, glob imports, the `#[macro_use]` macro
 prelude (macro namespace), the extern prelude, the std prelude,
-then builtin type names. In a `use` path, the first segment must
-be `crate`, `self`, `super`, an extern prelude name, or an item
-or import of an enclosing module (the 2018 uniform path rule,
-which edition 2024 keeps). A local module can shadow an extern
+then builtin type names. Lexical scope means locals, then
+block items up to the enclosing fn, then the items and
+explicit imports of the current module only. It never searches
+outer modules: an unqualified name that only an enclosing
+module defines is not found (rustc E0425). In a `use` path,
+the first segment must be `crate`, `self`, `super`, an extern
+prelude name, or an item or import of an enclosing module
+(the 2018 uniform path rule, which edition 2024 keeps; this
+`use`-path rule is wider than lexical scope and is the only
+place enclosing modules count). A local module can shadow an extern
 name: ts-rust has a local module named `core` at
 `goport_util_root.rs:26`. A generated item that would change a
 macro resolution that already ran is an error, as in Rust
@@ -619,11 +624,16 @@ Supporting interned data, all in `src/ty/`:
   type, `TysId` (interned `&[Ty]`), named differently so no
   code confuses the two. Store each slice once; hashing a `Ty`
   stays O(1).
-- `Region = Static | Param(u32) | Bound(u32) | Infer(u32) |
-  Erased`. `Bound(i)` is a de Bruijn index into the nearest
-  enclosing `Binder` (below).
+- `Region = Static | Param(u32) | Bound(u32) |
+  Placeholder(u32) | Infer(u32) | Erased`. `Bound(i)` is a
+  de Bruijn index into the nearest enclosing `Binder`
+  (below).
   `Param` indexes the lifetime params of the item whose
-  signature the type sits in. `Erased` appears only after
+  signature the type sits in. `Placeholder(n)` is a fresh
+  universal region that exists only during a higher-ranked
+  proof (5.5): it is distinct from every other region, it
+  never unifies with one, and it must not escape the proof.
+  It is not an inference var. `Erased` appears only after
   borrow checking, at mono and codegen. Section 5 owns the
   rules. In milestone 4, all regions are `Erased` except the
   std-internal handling that exists today through
@@ -639,10 +649,13 @@ Supporting interned data, all in `src/ty/`:
   `for<'a, 'b> X` is `Binder` with count 2. Only rank-1
   binders: a `Binder` inside a `Binder` value is `L0710`.
   Instantiating a binder replaces each `Bound(i)` with a fresh
-  region (check) or a placeholder region (proof, section 5.5).
+  region var (at a call site) or with a `Placeholder` region
+  (in a proof, section 5.5). The two are never mixed.
 - `BoundsId` interns a `dyn` bound list: one principal trait
-  ref with its associated-type bindings, the supertrait trait
-  refs in declaration order, plus auto traits (`Send`, `Sync`,
+  ref under its `Binder` (a `dyn for<'a> Fn(&'a T)` principal
+  keeps count 1; 2.9), with its associated-type bindings
+  under the same binder, the supertrait trait refs in
+  declaration order, plus auto traits (`Send`, `Sync`,
   `Unpin`) as bits. Auto traits that a supertrait requires are
   part of the bounds: `dyn AnyValue` is `Send` because
   `AnyValue: Send` (section 2.8).
@@ -655,7 +668,7 @@ Supporting interned data, all in `src/ty/`:
 (section 3). This is the single biggest representation
 change. It deletes special paths in `collect.rs`,
 `check.rs`, `ir.rs`, and `cgen.rs` and replaces them with
-the general Adt path. S3 adds the representation behind
+the general Adt path. S3a adds the representation behind
 compat helpers. The `Builtin` paths stay until the minimal
 generic pipeline passes its gate (section 9.3). Only then
 does std delete compat cases, in staged API groups.
@@ -670,10 +683,15 @@ pub struct Generics {
 }
 pub enum Predicate {
     Trait(Binder<TraitRef>),         // binder count 0 when not higher-ranked
-    AssocEq { assoc: DefId, trait_args: ArgsId, ty: Ty },
+    // The equality stays under the binder of the bound that
+    // wrote it: `for<'a> Fn(&'a T) -> &'a U` binds its
+    // `Output` inside the `for<'a>`. Moving the equality out
+    // of the binder loses the region and is a bug.
+    AssocEq(Binder<AssocEqData>),
     Outlives(Region, Region),
     TypeOutlives(Ty, Region),
 }
+pub struct AssocEqData { pub assoc: DefId, pub trait_args: ArgsId, pub ty: Ty }
 // Self is args[0]. `bindings` is an interned list of
 // (assoc DefId, GenericArg) pairs: the `Item = u8` part of
 // `Iterator<Item = u8>`, the `Output = C` part of `Fn(A) -> C`,
@@ -845,21 +863,67 @@ points where a known head is required.
 
 Selection algorithm. A *probe* is a tentative unification
 that records every binding it makes and can roll them back.
-A probe unifies headers only. It never runs predicates of a
-candidate that is not selected.
+A probe unifies headers only. The one exception is the
+clause filter in step 3, which can only remove candidates,
+never pick one.
+
+A trait ref is *provably false* when this check says so.
+The check binds nothing and commits nothing:
+
+- If the ref matches a predicate in the current param env,
+  it is not provably false. It can hold.
+- Else collect header candidates as in step 2. If there
+  are none, and the ref has a known head with no inference
+  var that can change the set, the ref is provably false.
+- If there are candidates, the ref is provably false only
+  when every candidate has at least one trait-predicate
+  where clause that is itself provably false after
+  substitution with that candidate's own probe bindings.
+  Recurse with the same depth cap and cycle set as
+  selection (step 7). One level is not enough:
+  `Box<[T]>: IntoIterator` must remove the `Iterator`
+  blanket by way of `Box<[T]>: Iterator`, whose only
+  candidate (`Iterator for Box<I>`) needs `[T]: Iterator`,
+  which has no candidate at all.
+- In every other case the ref is unknown, not false: Self
+  has no known head, a clause is not a trait predicate
+  (an outlives clause, an equality), a cap or a cycle
+  stops the check, or a clause can hold. Unknown stays
+  unknown. A candidate is never kept or dropped because
+  its clauses proved *true*.
+- The check records the same `ImplSet` and failed-lookup
+  reads as a failed selection (section 8). A body that
+  dropped a candidate because a bucket was empty must
+  recheck when an impl joins that bucket.
 
 1. If the obligation matches a predicate in the current
    param env (2.1, after substitution, supertraits and
-   `AssocEq` facts included), select `ParamEvidence`. Param
+   `AssocEq` facts included, each fact matched under its
+   own binder), select `ParamEvidence`. Param
    env candidates win over impls, as in rustc. Mono re-solves
-   with concrete types.
+   with concrete types. If two param-env predicates match
+   and unification does not pick one (for example `T:
+   From<u8> + From<u16>` against the obligation `T:
+   From<?X>`), defer as in step 6. Never take the first
+   match: rustc stays ambiguous there too (E0283).
 2. Else collect candidates. Look up `(trait, head_of(Self))`
    in the impl index, plus the blanket bucket for the Self
    wrapper shape (2.6). For each impl, probe-unify its full
    trait ref pattern (Self, all input args, and bindings)
    against the obligation. Keep the impls whose probe
    succeeds. Roll back every probe that is not confirmed.
-3. If exactly one candidate remains, confirm it: keep its
+3. If two or more candidates remain and Self is concrete
+   enough for the provably-false check, run the clause
+   filter: drop each candidate that has a trait-predicate
+   where clause which is provably false after substitution
+   with that candidate's probe bindings. This is what
+   selects `IntoIterator for Vec<T>` over std's blanket
+   `impl<I: Iterator> IntoIterator for I`: both headers
+   match `Vec<u8>`, but `Vec<u8>: Iterator` has no
+   candidate, so the blanket drops. The filter drops
+   candidates only. It never selects one because its
+   clauses held, and it never binds an inference var.
+   If exactly one candidate remains, confirm it: keep its
    probe bindings. This binds inference vars, integer vars,
    and float vars. Two cases that must work:
    `let v: Vec<_> = it.collect()` selects the one
@@ -888,14 +952,17 @@ candidate that is not selected.
    record a failed lookup (section 8) and error `L0612 no
    impl of Trait for Type`, listing the bucket's impls when
    the bucket is non-empty.
-6. If two or more candidates remain, or Self has no known
-   head, defer the obligation. Deferral ends at a point
-   where the type must be known (2.12): there, an unresolved
-   obligation is `L0610 type annotations needed`, matching
+6. If two or more candidates remain after the filter, or
+   Self has no known head, defer the obligation. Deferral
+   ends at a point where the type must be known (2.12):
+   there, an unresolved obligation is
+   `L0610 type annotations needed`, matching
    rustc E0282 or E0283 as the case fits. Never pick one of
    several candidates to make progress.
-7. Memoize by `TraitRef` in the body. Depth cap 64 and a
-   cycle set: re-entering the same `TraitRef` on the stack
+7. Memoize by `TraitRef` in the body; the provably-false
+   check shares the memo table. Depth cap 64 and a
+   cycle set, shared by selection and the filter:
+   re-entering the same `TraitRef` on the stack
    is `L0611` (overflow), matching rustc's overflow class.
 
 Queue processing runs at fixed points only: before a
@@ -908,14 +975,22 @@ fallback (`i32`, `f64`, as today).
 
 What this rejects that rustc accepts: obligations where an
 impl param follows only from a chain of predicates, beyond
-step 4. `lust port scan` reports sites as `L0613`, a class of
-its own, separate from ordinary annotation sites (`L0610`).
+step 4; and obligations where two candidates survive
+because the losing clause is false only for reasons the
+provably-false check cannot see (it depends on a generic
+param's own bounds, say). Those defer and end at `L0610`.
+`lust port scan` reports impl-param sites as `L0613`, a
+class of its own, separate from ordinary annotation sites
+(`L0610`).
 Spike K7 counts both classes after this algorithm lands, not
 before: with a Self-only or defer-on-infer rule the count
 measured the algorithm, not the code. Do not add backtracking
 or speculative predicate search. Probes over disjoint header
 patterns are not search: each probe is one first-order
-unification, and at most one probe is confirmed.
+unification, and at most one probe is confirmed. The clause
+filter is not search either: it evaluates each candidate's
+clauses on its own, removes only definite "no" answers,
+and keeps deferral for everything else.
 
 Auto traits and `Sized` do not use the queue. They compute
 structurally (2.7). `Drop` is not an obligation; drop glue
@@ -933,8 +1008,10 @@ where args are the trait ref (Self first). Normalization:
   normalization recurses.
 - If it selects `ParamEvidence` and the param env carries an
   `AssocEq` for it (`T: Iterator<Item = u8>`), rewrite to
-  that type. The same holds for supertrait assoc types
-  through the elaborated param env.
+  that type. The equality matches under its binder (2.1):
+  instantiate the binder the same way as the trait ref it
+  came with, never outside it. The same holds for
+  supertrait assoc types through the elaborated param env.
 - Else it stays a `Projection` type inside the generic
   body. It unifies only with the identical projection or
   through a binding that appears later. Mono normalizes
@@ -982,34 +1059,60 @@ impls in ts-rust (`ast/node.rs:1585`, `ast/node.rs:1594`,
 so lust must too.
 
 When the full trait refs unify, try to disprove the overlap
-exactly where rustc can. A where clause of either impl,
-after unification, "cannot hold" when all of these hold:
+exactly where rustc can: by the orphan rule. A where clause
+of either impl, after unification, "cannot hold" when all
+of these hold:
 
 - the clause is a trait predicate;
-- its Self type is local to the crate that checks coherence,
-  or a fundamental wrapper (`&`, `&mut`, `Box`, `Pin`) of a
-  local type, or the trait itself is local;
-- no impl in the index matches that trait ref.
+- its Self type is a concrete type that is local to the
+  crate that checks coherence, or a fundamental wrapper
+  (`&`, `&mut`, `Box`, `Pin`) of such a local type. A bare
+  type param is never such a Self: a generic `T` can gain
+  any impl downstream, so no clause on `T` alone is
+  disprovable;
+- no impl in the index matches that trait ref, and the
+  orphan rule says no downstream crate can add one: for a
+  local Self under fundamental wrappers, a downstream impl
+  of a foreign trait would need a local covering type,
+  which this Self does not give it. When the *trait* is
+  local instead, the same test runs with the roles
+  swapped: the impl set for a local trait is closed once
+  this crate and its deps are indexed, but only for Self
+  types that are already concrete here.
 
-That is a table lookup, not a search. If nothing disproves
-the pair, it overlaps: `L0615`, as in Rust. Worked cases:
+An empty impl bucket alone proves nothing. `impl<T: A> Tr
+for T` and `impl<T: B> Tr for T` overlap even when `A`,
+`B`, and `Tr` are all local and `A` and `B` have no impls
+yet: some `T` can implement both. Rust rejects that pair
+with E0119, and so does lust (`L0615`). That is a table
+lookup under the orphan test, not a search. If nothing
+disproves the pair, it overlaps: `L0615`, as in Rust.
+Worked cases:
 
 - `IntoIterator for Vec<T>` vs the blanket: unify with
   `I = Vec<T>`. The clause `Vec<T>: Iterator` cannot hold:
-  `Vec` is local to `alloc`, and no such impl exists. No
-  overlap.
+  `Vec` is local to `alloc`, no such impl exists, and no
+  downstream crate can add one. No overlap.
 - `IntoIterator for &'a SharedList<T>` vs the blanket:
   clause `&SharedList<T>: Iterator`. Self is a fundamental
   wrapper of a local type, and no impl matches. No overlap.
-- `impl<T: A> Tr for T` vs `impl<T: B> Tr for T`, with `A`
-  and `B` foreign traits on a bare param Self: nothing can
-  disprove either clause. Overlap. Rust rejects these too.
+- `impl<T: A> Tr for T` vs `impl Tr for MyType`, with `A`
+  local, `MyType` local, and no `A for MyType` impl: the
+  clause is `MyType: A` after unification. A downstream
+  crate cannot impl the local trait `A` for the local
+  type `MyType`, so the clause cannot hold. No overlap.
+  Rust accepts this pair.
+- `impl<T: A> Tr for T` vs `impl<T: B> Tr for T`, on a bare
+  param Self: nothing can disprove either clause, whatever
+  is local. Overlap. Rust rejects these too.
 
 Selection still checks the predicates of the chosen
 candidate (2.4 step 3). Coherence never lets two candidates
 both pass for one concrete trait ref, but a probe can match
-two headers while inference is open; 2.4 step 6 handles that
-by deferral, not by choice.
+two headers for one concrete Self (a concrete impl and a
+blanket); the 2.4 clause filter removes the one whose
+clauses cannot hold, and 2.4 step 6 defers what stays
+ambiguous while inference is open.
 
 Accepted blanket Self forms, stored with a wrapper tag:
 `T`, `&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`. A blanket
@@ -1114,12 +1217,16 @@ is dyn compatible only when all of these hold:
 - Every method is dispatchable: its receiver is one of the
   receiver forms in 2.9 with a known vtable call shape, it
   has no generic type params of its own, and `Self` occurs
-  only as the receiver (behind the receiver form) and in
-  positions that erase soundly (`&Self`, `Box<dyn ...>`
-  style bounds). A method that returns bare `Self`, takes
-  `Self` by value as a plain argument, or mentions `Self`
-  in a generic argument that stays concrete is not
-  dispatchable. `trait Bad { fn copy(&self) -> Self; }`
+  only as the receiver, behind the receiver form. There is
+  no allowance for `Self` in any other position: not as a
+  return, not as a plain argument by value or by reference
+  (`fn other(&self, value: &Self)` fails in rustc with
+  E0038), and not in a generic argument that stays
+  concrete. The trait's own object type in an argument or
+  return is fine (`fn f(&self, x: &dyn Trait)`, `-> Box<dyn
+  Trait>`): it names the erased trait, not `Self`. `Self`
+  itself, even boxed (`Box<Self>` as an argument), is
+  E0038 there. `trait Bad { fn copy(&self) -> Self; }`
   with `&dyn Bad` fails in rustc with E0038 and must fail
   here. A method excluded by `where Self: Sized` is simply
   not in the vtable.
@@ -1304,7 +1411,11 @@ restricted):
    current param env, or the principal trait (or a
    supertrait) of a `dyn` receiver. The last two need no
    import. First hit
-   wins. Two trait hits in the same probe with different
+   wins. Two impls of the *same* trait that both match the
+   receiver are not an ambiguity here: the obligation for
+   that trait ref goes through 2.4 selection, clause
+   filter included, and picks the impl the method comes
+   from. Two trait hits in the same probe with different
    traits: `L0720 ambiguous method`, fix hint gives the
    fully qualified form. Inherent and trait in the same
    probe: inherent wins, as in Rust.
@@ -1482,9 +1593,23 @@ path. Step cap: 1,000,000 evaluator steps per const item,
 then `L0630` with the item named.
 
 One owner (W-CORELANG, then W-CHECK-G for the generic
-form). Gate: an executable initializer corpus with the
-three ts-rust shapes above, a structured `RefCell` static,
-a discriminated enum const, and the E0015 reject.
+form). Gates split by what exists at each stage; no gate
+may cite a type from a later wave. The wave A1 gate is
+an executable initializer corpus over *locally defined,
+already supported types only*: local stand-ins for the
+three ts-rust shapes above (a local cell-like struct in
+a static, a local once-like const fn in an array
+repeat), a discriminated enum const, and the E0015
+reject. The source-std versions of the same shapes (the
+real `RefCell::new(BuildStores { .. })` static, the real
+`[const { OnceLock::new() }; CHUNKS]`, a `Mutex::new`
+static) gate at the first stage that supports each
+type: `RefCell` with W-STD-B in wave B, `Mutex` and
+`OnceLock` with W-THREADS in wave C. The generic
+inline-const case (the `core.rs:4085` assert shape)
+gates with W-CHECK-G and W-MONO in wave B, where its
+checker and per-instance evaluator live. Each gate
+names its stage in its Done line (9.3).
 
 ## 3. Std strategy
 
@@ -2179,16 +2304,36 @@ assignment is part of code identity:
 - Per-instance C text is cached in two layers. The mono
   IR of an instance is keyed by its instance fingerprint
   (template body, arg fingerprints, selected impls on its
-  edges). The C text for a unit also depends on the slot
-  manifest (the `InstanceKeyHash -> slot` map for the
-  bin), because call sites print slot numbers. A cached
-  object is reusable only under the same manifest hash.
-  When the manifest changes, re-emit C from cached mono
-  IR; do not reuse the object.
+  edges). The C text for a unit also depends on slot
+  numbers, because call sites print them. But it depends
+  only on the slots its own emitted code uses: the
+  unit's key includes a *used-slots hash*, the hash of
+  the `(InstanceKeyHash, slot)` pairs for every slot the
+  unit's C references, its callee slots, its own
+  instances' slots, and any table or trampoline it
+  names. The whole-manifest hash is *not* in the key.
+  Slot assignment is append-only (below), so adding one
+  new reachable instance changes no old pair: every
+  unrelated unit keeps its key and its cached object is
+  reused. Keying on the whole manifest instead would
+  reject every object on each new slot and break the
+  small-edit rule of 8.3 step 6. When a unit's own used
+  pairs change (a base rebuild renumbers, say), re-emit
+  its C from cached mono IR; do not reuse its object.
+- The one unit that does depend on the whole table is
+  the table unit: it emits the `lust_fns` array and the
+  slot trampolines (4.5). Its key is the full manifest
+  hash, and it rebuilds whenever the table grows. It is
+  small and holds no user code.
 - C-unit objects and per-instance C are separate cache
   entries (8.4). The backend compiles groups of instances
   into units, so the object key names the unit's instance
-  set plus the manifest hash.
+  fingerprints plus its used-slots hash.
+- Gate for this rule: add one reachable generic
+  instance to a built fixture and show that the objects
+  of unrelated units are reused (same keys, no
+  recompiles), while the table unit rebuilds. W-DRIVER
+  owns the test (9.3).
 - Slot assignment is append-only per bin session, as
   today (`src/driver.rs:317-336`). Unreachable instances
   leave dead slots until the next base rebuild (32
@@ -2361,53 +2506,96 @@ Pointer width from the target table (1.6). Rules:
   so `size_of` and field offsets hold in C too.
 - Niches. Each layout reports at most one niche: a
   scalar range inside the type that can hold tag values
-  for an outer enum. Sources: a non-null pointer scalar
+  for an outer enum, as (offset, scalar, free value
+  count). Sources: a non-null pointer scalar
   (`&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`, fn ptr,
   `NonNull`), `NonZero*`, `bool` (values 2 to 255 free),
   `char` (values above `0x10FFFF` and the surrogate
   range free), and an enum tag scalar whose discriminant
   range leaves free values, including a `repr(u64)` enum
   with few variants. A struct or tuple takes the niche
-  of its first field (in layout order) that has one,
-  with that field's offset. This is the mechanism
-  ts-rust relies on: `TypeData` is a default-repr enum
-  whose tag lives in the free values of a
-  `GenericArgumentsMemo` field, a `repr(u64)` enum (see
+  with the *most free values* among its fields, at that
+  field's offset; on a tie, the first such field in
+  layout order. First-in-order alone is wrong:
+  `Payload { pointer: &'static u8, flag: bool }` must
+  report the `bool` niche (254 values), not the pointer
+  niche (1 value), or an enum with a `Data(Payload)`
+  variant and two empty variants needs a separate tag
+  and takes 24 bytes where rustc takes 16. This is the
+  mechanism ts-rust relies on: `TypeData` is a
+  default-repr enum whose tag lives in the free values
+  of a `GenericArgumentsMemo` field, a `repr(u64)` enum
+  (see
   `/home/theo/.t3/projects/ts-rust/crates/ts_goport/src/checker/types.rs:2098-2105`).
-- Enums. Two candidate layouts; take the smaller, then
-  the one rustc takes for the shape (gate below).
-  (a) Niche-filled: if the largest data-carrying variant
-  has a niche with at least as many free values as there
-  are dataless variants plus the other data variants
-  that must share it, store the tag in the niche and add
-  no tag word. `Option<&T>`, `Option<bool>` (1 byte), and
-  the `TypeData` shape all come from this rule. When two
-  fields offer niches, rustc takes the first in layout
-  order; do the same, because which field holds the tag
-  changes offsets inside the enum and the size of
-  nesting types. (b) Tagged: an explicit tag, then the
-  largest variant payload, laid out like a struct. Tag
-  width comes from the discriminant range, not the
-  variant count: the smallest of 1, 2, 4, 8, 16 bytes
-  whose signed or unsigned range holds every explicit
-  discriminant (46 prod plus 351 generated in ts-rust).
-  `enum E { A = 1000, B }` is 2 bytes and `E::A as i32`
-  is 1000; a 1-byte tag cannot hold it. A `repr(int)`
-  attribute fixes the tag type and its width and
-  signedness; discriminants outside its range are an
+- Enums. An explicit repr that fixes the tag or the
+  field order (`repr(int)`, `repr(C)`, `repr(packed)`)
+  turns the niche-filled candidate off: the tag is
+  explicit even when a payload has a niche.
+  `#[repr(u8)] enum E { Pointer(&'static u8), Empty }`
+  is 16 bytes in rustc, not 8. `repr(align(n))` alone
+  does not fix the tag and does not turn the candidate
+  off. Without such a repr, two candidate layouts:
+  (a) Niche-filled. Take the largest data-carrying
+  variant, laid out as a plain struct, as the niche
+  variant. The candidate exists only when its niche has
+  at least as many free values as there are other
+  variants, *and* every other variant's fields fit in
+  the niche variant's layout in the bytes outside the
+  niche scalar, at their own alignments, without
+  growing the size. The fit check is not optional:
+  `enum E { Pointer(&'static u8), Byte(u8) }` is 16
+  bytes in rustc, because the `u8` payload has nowhere
+  to sit inside the 8-byte pointer word. The tag values
+  for the other variants come out of the niche; the
+  enum reports the niche values that remain. `Option<&T>`,
+  `Option<bool>` (1 byte), and the `TypeData` shape all
+  come from this rule.
+  (b) Tagged. Lay out *each variant as a struct that
+  starts with the tag*: the tag first, then that
+  variant's other fields, smallest alignment first,
+  ties in declaration order. This is rustc's order, and
+  it is not the plain struct order below: `enum E {
+  A(u8, u32), B }` is 8 bytes (tag, `u8`, padding,
+  `u32`), a `TypeMapper`-like enum with an
+  `Array(Box<_>, bool)` variant is 16 (tag, `bool`,
+  padding, `Box`), and a variant `(u16, [u8; 3])` gives
+  a 6-byte enum. Tag-first with largest alignment first
+  gives 12, 24, and 8 for the same shapes. Enum size
+  is the largest variant struct, rounded up to the
+  enum alignment, which is the largest variant
+  alignment. Tag width comes from the discriminant
+  range, not the variant count: the smallest of 1, 2,
+  4, 8, 16 bytes whose signed or unsigned range holds
+  every explicit discriminant (46 prod plus 351
+  generated in ts-rust). `enum E { A = 1000, B }` is 2
+  bytes and `E::A as i32` is 1000; a 1-byte tag cannot
+  hold it. Then widen the tag into padding: when every
+  variant leaves a gap between the tag and its first
+  field (or has no field), the tag scalar grows to the
+  largest width that fits the smallest such gap. Size
+  does not change; the free values in the enum's own
+  niche do. `enum E { A(u32), B(u32) }` gets a 4-byte
+  tag this way, so nested `Option`s over it stay at 8
+  bytes. A `repr(int)` attribute fixes the tag type,
+  its width, and its signedness, and skips the
+  widening; discriminants outside its range are an
   error, as in Rust. Fieldless enums are just the tag.
-- `repr(Rust)` structs and enum payloads: order fields
-  to shrink padding, in a fixed order: by alignment,
-  largest first; among equal alignments, by size,
-  largest first; then by declaration order. Small fields
-  after large ones is what makes an enum with a
-  `(Box<u64>, bool)` variant fit in 16 bytes. Struct
-  align is the max field align, size rounds up. Codegen
-  uses these offsets for every field access, so the
-  order is internal; only `size_of` and `align_of` (and
-  nesting sizes) observe it. `struct S { a: u8, b: u64,
-  c: u8 }` is 16 bytes under this rule, as in rustc;
-  declaration order would give 24.
+  Choice between the candidates, in order: the smaller
+  size wins; on equal size, the layout whose resulting
+  niche has more free values wins; if still equal,
+  take the tagged layout.
+- `repr(Rust)` structs and tuples (plain structs only;
+  enum variant payloads follow the enum rules above):
+  order fields to shrink padding, in a fixed order: by
+  alignment, largest first; among equal alignments, by
+  size, largest first; then by declaration order.
+  Struct align is the max field align, size rounds up.
+  Codegen uses these offsets for every field access, so
+  the order is internal; only `size_of` and `align_of`
+  (and nesting sizes) observe it. `struct S { a: u8,
+  b: u64, c: u8 }` is 16 bytes under this rule, as in
+  rustc; declaration order would give 24. Closure env
+  structs are plain structs under this rule (4.5).
 - `repr(C)`: exact C layout, declaration order. The C
   emitter writes explicit padding fields from the
   layout engine's offsets, so the C struct's layout
@@ -2442,10 +2630,29 @@ Pointer width from the target table (1.6). Rules:
 - `MaybeUninit<T>`: size and align of `T`, no niche. It
   is the one union-shaped type in the contract (std and
   the smallvec adapter need it). User unions: reject
-  `L0652`. `repr(simd)`: reject. An enum whose niche
-  choice the gate shows diverging from rustc: reject
-  that enum form with `L0652` until the engine matches,
-  rather than ship a wrong size.
+  `L0652`. `repr(simd)`: reject.
+
+Supported shapes, as an enforceable rule. The engine
+computes a layout only for types in this grammar:
+scalars; refs, raw pointers, and fn pointers; tuples;
+arrays; the fat-pointer forms (slice, `str`, `dyn`);
+closure env structs and `MaybeUninit<T>` over a
+supported `T`; and Adts whose repr is one of the forms
+above (default, `C`, `transparent`, `align`, `packed`
+with no `N` or `N` = 1, an int repr, or a combination
+rustc accepts of those) and whose field and variant
+payload types are themselves in the grammar. `layout()`
+returns a result, not a guess: a type outside the
+grammar is `L0652` at the Adt def (collect) or at the
+use, never a best-effort size. The gate below enumerates
+the grammar, so the rule and the test grow together: a
+new type form enters only when the grammar, the
+generator, and the engine all gain it in the same
+change, and the extended gate is green. A shape inside
+the grammar where the gate shows the engine diverging
+from rustc is a layout bug; until it is fixed, that
+grammar production is cut back to `L0652` rather than
+shipped with a wrong size.
 - Unsized: fat pointers are (ptr, len) for slices and
   str (today's `lust_str`, `src/runtime.c:19`), and
   (ptr, vtable) for `dyn`. A struct with an unsized
@@ -2460,12 +2667,39 @@ Gate: a `size_of`/`align_of` difftest over every shape
 ts-rust asserts (the list comes from port scan output at
 gate time, and must include the nested `Type` /
 `TypeData` / `TypeReference` shape and `TypeMapper`)
-plus a shape generator that crosses field kinds (scalars
-of each width, refs, boxes, small enums, bool and char
-fields, repr-int enums) in structs and enum variants,
-against rustc on each tier 1 target. A mismatch is a
-layout bug or a new rejected form; never a waived
-difference.
+plus a generator that enumerates the supported-shape
+grammar above, not random samples: field kinds (scalars
+of each width, refs, boxes, small enums, `bool` and
+`char` fields, repr-int enums, small arrays) crossed in
+structs, tuples, and enum variants, with declared
+bounds (fields per shape, variants per enum, nesting
+depth) stated in the generator, against rustc on each
+tier 1 target. The generated set must include these
+pinned shapes by name, each with its rustc size:
+`enum { A(u8, u32), B }` (8); variants `(u8, u64, u8)`
+and `(u32, u64)` (16 each) and `(u16, [u8; 3])` (6); a
+`TypeMapper`-like enum with an `Array(Box<_>, bool)`
+variant (16); `Option<Option<S>>` for
+`S { a: bool, b: &u8 }` (16); a `Data(Payload)` enum
+with two empty variants for
+`Payload { pointer: &'static u8, flag: bool }` (16); a
+`Pointer(&'static u8)` / `Byte(u8)` enum (16);
+`#[repr(u8)]` and `#[repr(C)]` `Pointer` / `Empty`
+enums (16 each); `enum { A(u32), B(u32) }` under three
+nested `Option`s (8, by tag widening). A mismatch is
+a layout bug or a cut grammar production (`L0652`);
+never a waived difference.
+
+The nested `TypeData` case runs as a standalone
+layout-engine test over the real field-type graph: the
+test builds the `Ty` graph for `Type`, `TypeData`, and
+`TypeReference` with their real field types (`Box`,
+`Rc<[T]>`, `&'static [T]`, and all) directly in the
+engine's own test harness. It needs no `Box` in source
+std and no lifetime support, so it can gate wave A1.
+The same shape re-runs as an end-to-end source program
+at the first stage that supports all of its parts
+(9.3).
 
 `size_of`, `align_of`, `offset_of!` evaluate in the
 const evaluator from this engine. `mem::swap`,
@@ -2504,12 +2738,17 @@ Keep today's model and extend it:
   scalars, raw ptrs, `repr(C)` structs of scalars.
   Check rejects other types at foreign signatures.
 - Fat pointers are two-word C structs passed by value.
-- Closures: env struct (captures in order) plus the
-  trampoline ptr at offset 0 for `dyn Fn` erasure. A
-  direct closure call knows the def and calls its
-  slot with `&env` first. A `dyn Fn` call goes through
-  the vtable (one vtable per closure def per Fn
-  signature).
+- Closures: the closure value is exactly its captures
+  and nothing else. Its layout is the plain struct
+  layout of the capture types (4.4): an empty closure
+  is size 0, a closure that captures one `u8` is size
+  1, as in rustc, because `size_of_val` can print both.
+  No trampoline pointer and no tag word sits in the
+  value. A direct closure call knows the def and calls
+  its slot with `&env` first. For `dyn Fn` erasure, the
+  trampoline lives in the vtable (one vtable per
+  closure def per Fn signature) and in call-site
+  metadata, never in the closure value.
 - Checked arithmetic, bounds, and overflow keep
   today's runtime helpers and inline checks
   (`src/runtime.c:232-300`), with panic behavior from
@@ -2968,26 +3207,43 @@ pub struct Expansion { pub macro_def: DefId, pub call_span: Span, pub parent: Ct
 ```
 
 Identifiers carry `(Sym, CtxtId)` where hygiene
-matters. This is mixed-site hygiene, as in Rust: a
-local binding written in the macro body gets the
-expansion ctxt and does not capture a user local of the
-same name; an ident the caller passes in keeps the
-caller's ctxt, so a macro that uses `$name` as a local
-binds the caller's variable. Labels, lifetimes, and
-generic params introduced by a macro are hygienic the
-same way (edition 2024 rules). Item names from macros
-resolve in the invoking module; paths written in the
-macro body resolve at the def site, with `$crate`
-absolute. Comparing expanded token text does not test
+matters. This is mixed-site hygiene, as in Rust, and
+the split is by what the name refers to:
+
+- *Locals and labels* (and lifetimes and generic params
+  a macro introduces) resolve at the definition site. A
+  local binding written in the macro body gets the
+  expansion ctxt and does not capture a user local of
+  the same name. An ident the caller passes in keeps
+  the caller's ctxt, so a macro that uses `$name` as a
+  local binds the caller's variable.
+- *Item paths* resolve at the call site. An ordinary
+  path written in a macro body, `helper()` say, looks up
+  `helper` in the invoking module, not in the module
+  that defines the macro. A probe with `helper`
+  returning 1 at the def site and 2 at the call site
+  prints 2 in rustc. A macro that must name its own
+  crate's items writes `$crate::...`; `$crate` is
+  absolute and is the only def-site path form. Item
+  names a macro *defines* also land in the invoking
+  module.
+
+Comparing expanded token text does not test
 any of this: two token-equal expansions can bind
 differently. The macro gate is executable tests
 (capture, shadowing, a passed ident used as a local, a
-generated label, def-site vs call-site path) run in
-`tests/macros/` against rustc output (9.3).
+generated label, a call-site item path, a `$crate`
+path) run in `tests/macros/` against rustc output
+(9.3).
 
-Every token from an expansion gets the expansion's
-ctxt and a span that maps back: diagnostics print the
-call site first, then "in expansion of `name!` at
+Tokens a macro body writes get the expansion's ctxt.
+Tokens that come from a metavariable keep the spans
+and ctxts they arrived with (6.2): transcription must
+not restamp a forwarded fragment with the expansion
+ctxt, or the caller's idents would stop binding the
+caller's locals. Every token keeps a span that maps
+back: diagnostics print the call site first, then
+"in expansion of `name!` at
 def:line" chain. The panic line table uses the call
 site's file and line. This span change touches every
 stage; it is serial refactor S1 and lands before
@@ -3107,7 +3363,8 @@ State:
 
 ```c
 typedef struct {
-    int unwind_depth;        // > 0 while cleanup or a hook runs
+    int unwind_depth;        // > 0 only while a panic or its cleanup is active
+    int catch_depth;         // active catch_unwind boundaries; separate count
     int inflight;            // an exception must propagate now
     uint64_t gen;            // bumped on each new exception
     void *payload_data;      // Box<dyn Any + Send> parts
@@ -3116,6 +3373,17 @@ typedef struct {
     int in_hook;
 } lust_panic_state;
 ```
+
+A catch boundary is not an active panic, and the state
+keeps the two apart. `catch_depth` counts boundaries
+only; it never feeds `panicking()`. `unwind_depth`
+rises only when a panic actually starts and while its
+cleanup runs. Ordinary code inside a `catch_unwind`
+closure therefore sees `thread::panicking() == false`,
+as in rustc. Code inside a catch that itself runs
+during an outer panic (a catch inside a destructor)
+still sees true, because the outer `unwind_depth` is
+raised.
 
 IR change: calls are terminators with an optional unwind
 successor (S7 builds the slot; today a call is an
@@ -3168,12 +3436,19 @@ ends:
   outer in the frame save area, the inner in thread
   state.
 
-`catch_unwind` protocol. Enter: raise `unwind_depth`,
-save `gen`, call the closure. On return: if a new
-exception is in flight, move its payload into the
-`Err` return value, clear `inflight`, lower
-`unwind_depth`, and return normally. Nested catches
-nest by depth, each with its own saved `gen`.
+`catch_unwind` protocol. Enter: raise `catch_depth`
+(and nothing else), save `gen`, call the closure. While
+the closure runs normally, `unwind_depth` is whatever
+it was on entry, so `panicking()` keeps its entry
+value. A panic that starts inside the closure raises
+`unwind_depth` at the raise point, like any panic. On
+return: if a new exception is in flight, move its
+payload into the `Err` return value, clear `inflight`,
+lower `unwind_depth` back to its entry value, lower
+`catch_depth`, and return normally. If the closure
+returned normally, only `catch_depth` drops. Nested
+catches nest by `catch_depth`, each with its own saved
+`gen`.
 `resume_unwind` installs the given payload as in flight
 *without* running the hook. A panic that starts fresh
 runs the hook first. A panic inside the hook aborts.
@@ -3202,12 +3477,22 @@ Semantics that must match Rust:
   during recovery
   (`crates/ts_goport/src/gopanic.rs:138-166`). The
   default hook prints Rust's panic line format.
-- Lock poisoning: `MutexGuard` and `RwLock` guards
-  check `panicking()` in their `Drop`: if true, mark
-  the lock poisoned. They read unwind depth, not the
-  in-flight slot, so a guard that drops during cleanup
-  after its frame saved the exception still poisons.
-  `lock()` returns `Err(PoisonError)` after. `RefCell`
+- Lock poisoning: a `MutexGuard` or `RwLock` guard
+  records `panicking()` when it acquires the lock. Its
+  `Drop` poisons the lock only on the transition:
+  `panicking()` is true at drop *and* was false at
+  acquisition. The three cases, all checked against
+  rustc: a guard locked and dropped inside a successful
+  `catch_unwind` does not poison (`panicking()` is
+  false at both points); a guard locked before a panic
+  and dropped by the unwind poisons; a guard locked and
+  dropped inside a destructor while an outer panic is
+  already active does not poison (true at both points).
+  The guard keeps the recorded bit itself, in std
+  source; the runtime only supplies `panicking()`,
+  which reads `unwind_depth` and `in_hook`, never
+  `catch_depth` and never the in-flight slot. `lock()`
+  returns `Err(PoisonError)` after a poison. `RefCell`
   borrow flags reset in guard drops as usual.
 - Thread panic: an uncaught panic at a thread root
   ends that thread; `JoinHandle::join` returns
@@ -3235,7 +3520,12 @@ starts with the semantic corpus in `tests/unwind/`
 (helper calls inside a destructor, a locally caught
 second panic in `Drop`, nested catches, poison after a
 caught panic, `resume_unwind` hook silence) against
-rustc in unwind mode. Only then run spike K2 for cost
+rustc in unwind mode. Its first gate also carries the
+two catch-boundary cases above as executable tests:
+`panicking()` is false and a mutex stays unpoisoned
+inside a successful catch, and a mutex locked and
+released inside a destructor during an outer panic
+stays unpoisoned. Only then run spike K2 for cost
 on dense-drop code (RefCell guards, Rc captures, sort
 comparators, iterator short-circuits): measure C bytes,
 tcc time, and run time against abort mode. The old
@@ -3346,7 +3636,7 @@ item headers without positions.
 | `Checked(def)` | Sig(def), body tokens, every node it reads (8.2) | typed side tables exist; key is the read set plus body hash |
 | `BodyIR(def)` | Checked | generic IR fingerprint |
 | `Instance(key)` | BodyIR(template), arg layout fingerprints, selected impl instances on edges | substituted IR fingerprint plus its cached edge list |
-| `CUnit(unit)` | Instances in the unit, glue set, slot manifest hash | C text hash |
+| `CUnit(unit)` | Instances in the unit, glue set, the unit's used-slots hash (4.2); for the table unit only, the full slot manifest hash | C text hash |
 | `FailedLookup(query)` | the `Binding`, `ImplSet`, or `MethodSet` fingerprint at fail time | the same key as the query that failed |
 
 There is no whole-module `Scope` node. A scope
@@ -3461,12 +3751,19 @@ ts-rust edit benchmark.
 Content-addressed, local, ignored by git (PLAN.md
 decision 1). Disk forms first. Nothing session-local is
 written as-is; each value translates at the write
-boundary:
+boundary. The cache file carries a format version, and
+these forms are *not* frozen interfaces: nothing
+writes them before wave D, so pinning them in the
+serial phase would only freeze a guess. W-DRIVER owns
+the forms and may change any of them by bumping the
+cache version; an old-version cache is dropped, never
+migrated. The table below is the starting shape, not a
+contract other packages code against.
 
 | In memory | On disk |
 |---|---|
 | `DefId` | `(StableCrateHash, DefPathHash)` (1.7) |
-| `Ty`, `ArgsId` | structural fingerprint: kind tag plus child fingerprints, defs in disk form, regions erased or as param indices. Per-crate type tables and body overlays do not align across sessions, so raw ids never cross. Read side rebuilds session ids by interning the structure into the crate owned store (2.1). |
+| `Ty`, `ArgsId` | structural fingerprint: kind tag plus child fingerprints, defs in disk form. Regions in signature types keep their form (`Static`, a `Param` index, or a `Bound` index under its binder count): a stored signature must rebuild the same regions, early-bound and late-bound alike (5.5). `Placeholder` regions never reach disk; they exist only inside a proof. Only mono `InstanceKey` args erase regions (4.2). Per-crate type tables and body overlays do not align across sessions, so raw ids never cross. Read side rebuilds session ids by interning the structure into the crate owned store (2.1). |
 | `Sym` | the string |
 | `CtxtId` | the chain of (macro def disk pair, call-site file hash, token ordinal) up to the root |
 | `FileId`, `Span` | canonical path hash plus token ordinal in the item (4.2) |
@@ -3480,13 +3777,18 @@ cfg hash, graph key of 1.1, node fingerprint). Stored:
 - Per instance: its mono IR, keyed by the instance
   fingerprint. Per C unit: C text and the compiled
   object, keyed by the unit's instance fingerprints
-  *plus the slot manifest hash* (4.2). These are
-  separate entries, because the backend compiles groups
+  plus the unit's *used-slots hash* (4.2); the table
+  unit alone keys on the full slot manifest hash. These
+  are separate entries, because the backend compiles groups
   of instances, not one object per instance. A
   cached-cold build re-runs the front end (fast, and it
   must, to know the instance set), re-emits C from
-  cached IR when only slots moved, and links cached
-  objects when nothing moved.
+  cached IR for a unit whose used slots moved, and
+  links cached objects for every unit whose key held.
+  The complete manifest stays stored (below) so a
+  restarted daemon recovers the same slot assignment;
+  storing it does not put it in any ordinary unit's
+  key.
 - Expansion outputs for the 20 largest macros by
   output size. The rest are cheap to redo and not
   worth disk IO.
@@ -3549,8 +3851,8 @@ src/
     cfg.rs               cfg env and strip                [W-RESOLVE]
     worklist.rs          outline loop driver (6.1)        [W-RESOLVE]
   ty/
-    mod.rs               TyKind, interning, subst         [S3; owner per 9.3]
-    defs.rs              Defs, Generics, signatures       [owner per 9.3]
+    mod.rs               TyKind, interning, subst, normalize [W-TRAITS-CORE in A, then W-TRAITS]
+    defs.rs              Defs, Generics, signatures       [W-TRAITS-CORE in A, then W-TRAITS]
     layout.rs            layout engine                    [W-CORELANG, then W-CGEN]
     consteval.rs         bounded const eval (2.13)        [W-CORELANG]
     lang.rs              lang item table                  [W-STD]
@@ -3562,7 +3864,9 @@ src/
   check/
     mod.rs               body checking (today check.rs)   [W-CORELANG, then W-CHECK-G]
     collect.rs           signature collection (today)     [AST owner, per wave]
-    method.rs            method and field resolution      [W-CHECK-G]
+    obligations.rs       queue run points, 2.12 hooks     [W-TRAITS-CORE in A, then W-TRAITS]
+    generics.rs          generic collect, param env       [W-TRAITS-CORE in A, then W-TRAITS]
+    method.rs            method and field resolution      [W-TRAITS-CORE in A, then W-CHECK-G]
     coerce.rs            coercions, unsizing              [W-CHECK-G]
   borrowck/
     mod.rs               loans, liveness (today)          [W-BORROW]
@@ -3597,8 +3901,10 @@ packages send small patches through that owner:
 
 | File | Serial | Wave A | Wave B | Wave C |
 |---|---|---|---|---|
-| `parser.rs`, `ast.rs`, `check/collect.rs` | S3 owner | W-CORELANG | W-CHECK-G | W-BORROW |
-| `ty/defs.rs` | S3 owner | W-TRAITS-CORE | W-TRAITS | W-TRAITS (W-BORROW paired for variance) |
+| `parser.rs`, `ast.rs`, `check/collect.rs` | S3a/S3b owners | W-CORELANG | W-CHECK-G | W-BORROW |
+| `ty/mod.rs`, `ty/defs.rs` | S3a owner | W-TRAITS-CORE | W-TRAITS | W-TRAITS (W-BORROW paired for variance in `defs.rs`) |
+| `check/obligations.rs`, `check/generics.rs` | new in wave A (S3a hooks) | W-TRAITS-CORE | W-TRAITS | W-TRAITS |
+| `check/method.rs` | new in wave A | W-TRAITS-CORE | W-CHECK-G | W-CHECK-G |
 | `ty/lang.rs` | S5 owner | W-STD | W-STD | W-STD |
 | `ir.rs`, `lower.rs` | S7 owner | W-CORELANG | W-LOWER | W-LOWER |
 | `cgen.rs`, `runtime/runtime.h`, `runtime/core.c` | S4 owner | W-CGEN | W-CGEN | W-CGEN |
@@ -3606,6 +3912,16 @@ packages send small patches through that owner:
 | `runtime/thread.c` | stub by W-CGEN | W-CGEN | W-CGEN | W-THREADS |
 | `driver/*.rs` | S6 owner | W-DRIVER | W-DRIVER | W-DRIVER |
 | one `library/` file | S5 owner | W-STD (ledger names the file) | W-STD | W-STD |
+
+Trait work in body check does not wait for wave B.
+S3a puts empty hook calls at the fixed queue run points
+of 2.4 and 2.12 inside `check/mod.rs`, calling into
+`check/obligations.rs`. In wave A, W-TRAITS-CORE fills
+those hooks and owns `check/obligations.rs`,
+`check/generics.rs` (generic Adt and fn collect, param
+env), and `check/method.rs` (the MGP needs trait
+candidates in method probing). W-CORELANG does not
+become the merge queue for trait changes to check.
 
 W-LOWER is one owner across waves B and C. W-CHECK-G
 records captures and coercions; W-LOWER emits places,
@@ -3618,9 +3934,11 @@ lowering on their own.
 These land one at a time, each by one agent, each
 small, each with the full test suite green. No
 parallel package starts until the serial list is in.
-Execution order: S4, S0, S1, S2, S3, S5, S6, S7. S4
-runs first because it only moves files, so later
-diffs land on final paths. Total serial cost target:
+Execution order: S4, S0, S1, S2, S3a, S3b, S5, S6, S7.
+S4 runs first because it only moves files, so later
+diffs land on final paths. S4 is file moves only: the
+`Session`-per-crate and `CrateKey` behavior change is
+S6 work, not part of the move. Total serial cost target:
 3k to 5k lines of churn. If a serial item grows past
 its estimate by 2x, stop and re-split; do not let it
 absorb feature work. The serial phase is mechanical.
@@ -3630,14 +3948,22 @@ does and does not test.
 
 | ID | Change | Files | Size | Done when |
 |---|---|---|---|---|
-| S4 | Directory split per 9.1, including `runtime.c` split by subsystem behind `runtime.h`. Moves only, no logic change. `driver.rs` splits into `driver/` with `Session` per crate keyed by a `CrateKey` of one file. | all of `src/` (git mv) | 200-400 churn | `cargo build` and tests green. `git log --follow` works. Gate tests paths only. |
+| S4 | Directory split per 9.1, including `runtime.c` split by subsystem behind `runtime.h`. Moves only, no logic change. `driver.rs` splits into `driver/` by file move; session behavior does not change here (S6 owns `Session` per crate and `CrateKey`). | all of `src/` (git mv) | 200-400 churn | `cargo build` and tests green. `git log --follow` works. Gate tests paths only. |
 | S0 | Diagnostic registry: Appendix A ranges become the checked list. `scripts/check-explain.sh` (or its successor) fails on a new code outside the reserved ranges or on a collision with the 43 codes in use today. | `docs/errors/`, `src/explain.rs`, check script | 100-200 | Registry check green on today's codes. No new codes emitted yet. |
 | S1 | `Span { file, lo, hi, ctxt }`, `FileId`, per-file line indexes. One file per crate still. | `diag.rs`, all span users (mechanical) | 400-700 | Difftest green. Diagnostics print file paths. |
 | S2 | `DefId`/`DefPathHash`/`CrateId` types; slots keyed by hash; `FnId` becomes the session-local `LocalDefId`. No behavior change. | `collect.rs`, `driver/`, `cgen.rs` | 300-500 | Fuzzer green. Slot manifest round-trips. |
-| S3 | AST v2 for all syntax of milestones 4 to 7, not only types: items (`mod`, `trait`, `type`, `const`, `static`, `macro_rules`), patterns, expressions, attributes, generics with lifetimes, `where` clauses, qualified paths. Parser accepts them. `TyKind` v2 with `Adt(DefId, ArgsId)`, arg interning, `Generics`, `Binder`, `AssocEq`, `Defs` skeletons behind compat helpers. Collect rejects new forms it cannot handle yet with stable codes from Appendix A. `Vec`/`Option`/`String` keep their `Builtin` paths. If S3 passes 1.2k lines, split it: S3a types, S3b AST and parser. | `types.rs` to `ty/`, `ast.rs`, `parser.rs`, `collect.rs` | 1,000-1,600 | Difftest green. Parser accepts and collect cleanly rejects new forms. Item and expression counts on ts-rust files match the syn-based `lust-port` count for a sampled file set. Gate tests syntax only; it proves no type checking. |
+| S3a | Types first: `TyKind` v2 with `Adt(DefId, ArgsId)`, arg interning, `Generics`, `Binder`, `AssocEq` under its binder and the `Placeholder` region form (2.1), `Defs` skeletons behind compat helpers. Empty hook calls at the fixed 2.4/2.12 run points in `check/mod.rs`, calling stubs in `check/obligations.rs`. `Vec`/`Option`/`String` keep their `Builtin` paths. | `types.rs` to `ty/`, `check/mod.rs` hooks, `check/obligations.rs` stubs | 500-800 | Difftest green. Gate tests the representation and the hook points; it proves no generic type checking. |
+| S3b | AST v2 *shapes* for all syntax of milestones 4 to 7: items (`mod`, `trait`, `type`, `const`, `static`, `macro_rules`), patterns, expressions, attributes, generics with lifetimes, `where` clauses, qualified paths. Shapes freeze here; broad parser work does not land here. Each syntax form's parser lands later with its feature owner (W-CORELANG for core syntax in wave A). Until its parser lands, a new form is a clean reject with a stable code from Appendix A, never a parse panic. | `ast.rs`, `parser.rs` (reject paths only), `collect.rs` | 500-800 | Difftest green. AST shapes compile and are frozen. Unimplemented forms reject cleanly on sampled ts-rust files. The syn-based `lust-port` item and expression count check runs per feature package as its parser lands, starting with W-CORELANG. Gate tests shapes and rejects only; it proves no type checking. |
 | S5 | Lang item table, intrinsic registry (signatures and privilege checks in check and cgen), the `library/` loader, and a source path for *non-generic* std fns only. Generic std waits for the minimal generic pipeline (9.3). | `library/` skeleton, `ty/lang.rs`, `check/`, `cgen.rs` | 400-700 | A test program that calls one non-generic source std fn compiles through the loader. Gate tests loading and the registry. It does not test generic source std, and no `Builtin` case is deleted. |
-| S6 | Protocol and routing schema only: a request names a crate; the daemon routes by `SessionKey` (1.8). Single-file programs become a synthetic one-crate package. Add the multi-file test runner `scripts/test-crates.sh` and `tests/crates/` with fixtures that work under today's language. Cargo graph loading itself is W-RESOLVE work. | `protocol.rs`, `daemon.rs`, `driver/session.rs`, `tests/crates/` | 400-700 | `lust check file.rs` is unchanged for users. Two feature selections in one daemon stay in separate sessions (routing test). The two-file `mod` fixture is *not* part of this gate; it belongs to W-RESOLVE, which builds module loading. |
-| S7 | Frozen-interface plumbing, record-only where noted: the `Reads` sink and the query fns of 8.2 with per-binding and method-set keys (recorded, not yet used for invalidation); IR calls become terminators `Call { target, args, dest, unwind }` with `unwind: None` everywhere today; `InstanceKey` and the disk forms of 8.4 as types; the owned type store lift of 2.1, which is the identity until generics land; the final-bin slot manifest type. | `ir.rs`, `lower.rs`, `driver/graph.rs`, `ty/` | 500-800 | Difftest green. A grep shows no call left as an `Rvalue`. Query fns exist and tests assert that a sample body records binding and method-set reads. Gate tests recording, not invalidation speed. |
+| S6 | Protocol and routing: a request names a crate; the daemon routes by `SessionKey` (1.8). `driver/` gains `Session` per crate keyed by `CrateKey` (the behavior change kept out of S4). Single-file programs become a synthetic one-crate package. Add the multi-file test runner `scripts/test-crates.sh` and `tests/crates/` with fixtures that work under today's language. Cargo graph loading itself is W-RESOLVE work. | `protocol.rs`, `daemon.rs`, `driver/session.rs`, `tests/crates/` | 400-700 | `lust check file.rs` is unchanged for users. Two feature selections in one daemon stay in separate sessions (routing test). The two-file `mod` fixture is *not* part of this gate; it belongs to W-RESOLVE, which builds module loading. |
+| S7 | Frozen-interface plumbing, record-only where noted: the `Reads` sink and the query fns of 8.2 with per-binding and method-set keys (recorded, not yet used for invalidation), including the frozen `Binding` query fns that wave A codes against (9.3); IR calls become terminators `Call { target, args, dest, unwind }` with `unwind: None` everywhere today; `InstanceKey` as a type; the owned type store lift of 2.1, which is the identity until generics land; the final-bin slot manifest type. No 8.4 disk forms: the cache file is versioned and W-DRIVER owns its forms (8.4). | `ir.rs`, `lower.rs`, `driver/graph.rs`, `ty/` | 500-800 | Difftest green. A grep shows no call left as an `Rvalue`. Query fns exist and tests assert that a sample body records binding and method-set reads. Gate tests recording, not invalidation speed. |
+
+One live bug fix runs beside this list, with its own
+owner: today's binary accepts NLL problem case 3
+(section 11). S4 moves `borrowck.rs`, so the fix starts
+right after S4 and runs in parallel with S0 to S7. It
+touches borrow checking only; no serial item edits
+that code, so there is no collision.
 
 Interface freeze at the end of the serial phase.
 These change only through their owner, with a note to
@@ -3653,10 +3979,13 @@ their keys (`Binding`, `MethodSet`, `ImplSet`),
 intrinsic signatures, the 3.4 predicate signatures,
 the receiver grammar (2.9), `layout()` output
 including `niche`, the const value form (2.13),
-`InstanceKey`, final-bin slots and the slot manifest,
-and every disk key form in 8.4. Everyone else codes
-against them. Add new variants at the end of enums
-only. Never renumber.
+final-bin slots and the slot manifest. Two stated
+exceptions: `InstanceKey` is owned by W-TRAITS-CORE
+through wave A, because the MGP may still reshape it;
+and the 8.4 disk forms are not frozen at all (versioned
+cache file, W-DRIVER owns them). Everyone else codes
+against the frozen list. Add new variants at the end
+of enums only. Never renumber.
 
 ### 9.3 Parallel work packages
 
@@ -3688,14 +4017,23 @@ skip in silence.
 Minimal generic pipeline (MGP). Wave A has one joint
 gate that breaks the old bootstrap cycle. The MGP is a
 thin end-to-end slice, built by W-TRAITS-CORE,
-W-CORELANG, W-CGEN, and W-DRIVER together: one generic
-Adt, one trait with an input parameter, one associated
+W-CORELANG, W-CGEN, and W-DRIVER together, over local
+types only (no std types): one generic
+Adt, one trait with an input parameter (whole trait
+ref, not Self alone), one associated
 equality used in a signature, one generic method call
-(inherent and trait), and one drop of a generic value,
-through collect, generic check, mono, and cgen, run
-against rustc. Until the MGP gate passes, all `Builtin`
-compat paths stay, and no std package deletes a compat
-case. After it passes, W-STD deletes compat cases one
+(inherent and trait), one drop of a generic value, and
+one trait that has both a concrete impl and a bounded
+bare-param blanket impl, selected through a `for` loop
+over a local iterator type. That last shape is the 2.4
+clause-filter case (the std `IntoIterator` blanket in
+local form); without it, the filter bug would first
+show in wave A2 against real std. The slice runs
+through collect, generic check, mono, and cgen, built
+and run *through the daemon*, output compared with
+rustc. Until the MGP gate passes that way, all
+`Builtin` compat paths stay, and no std package
+deletes a compat case. After it passes, W-STD deletes compat cases one
 API group at a time, each group behind its own
 end-to-end gate. State in every report which path a
 test exercised: a green compat path proves nothing
@@ -3721,15 +4059,33 @@ cold, cached cold never merge): a new `pub fn` exported
 through the central prelude; an inherent method added
 where a trait method was in use; a type edit that
 changes a niche; a macro edit that adds a generated
-item; a cross-crate generic body edit; a daemon
+item; a cross-crate generic body edit; an edit that
+adds one reachable generic instance (unrelated objects
+must be reused, 4.2); a daemon
 restart that must reuse disk objects and the slot
-manifest under a different crate load order. Do not
-wait for wave D to learn that invalidation or the
-instance walk eats the edit budget.
+manifest under a different crate load order. Wave A
+runs only the scenarios its features can express: the
+new `pub fn` (in single-file form until W-RESOLVE
+lands), the niche-changing type edit, the macro edit,
+and the restart (slot manifest reuse; disk objects
+once the cache exists). The inherent-method scenario,
+the cross-crate generic body edit, and the
+added-instance scenario need the MGP and join at the
+wave A gate at the earliest, in full from wave B. A
+wave A scale report that lists them as run is wrong.
+Do not wait for wave D to learn that invalidation or
+the instance walk eats the edit budget.
 
 #### Wave A1 (milestone 4 core): modules, macros, core language, trait core
 
-Six packages in parallel after the serial list.
+Six packages in parallel after the serial list. No A1
+package waits for W-RESOLVE: S7 freezes the `Binding`
+query fns, and wave A packages code against those fns
+with today's single-file resolver behind them until
+W-RESOLVE lands. W-CORELANG, W-TRAITS-CORE, and
+W-MACRO fixtures stay single-file until then. When
+W-RESOLVE lands, it swaps the implementation behind
+the same fns; no caller changes.
 
 **W-RESOLVE: crate graph, modules, imports, cfg, worklist.**
 Owns: `src/resolve/*`, `src/scan.rs`, visibility checks
@@ -3765,9 +4121,11 @@ hygiene contexts. Parser changes go through the AST
 owner.
 Interfaces out: `expand(call, macro_def) -> token
 trees` for the worklist, expansion cache, span mapping
-for diagnostics. In: macro defs and bindings from
-W-RESOLVE.
-Depends on: S1, S3.
+for diagnostics. In: macro defs and bindings through
+the frozen `Binding` query fns (S7), with today's
+single-file resolver behind them until W-RESOLVE
+lands; macro fixtures stay single-file until then.
+Depends on: S1, S3a, S3b.
 Work: 6.2 opaque fragments and local-ambiguity errors,
 6.3 mixed-site hygiene, 6.4 builtin macros (format spec
 parsing with W-STD), 6.5 caching, caps, `$crate`,
@@ -3787,8 +4145,11 @@ A AST owner), `src/check/mod.rs`, `src/ir.rs` and
 `src/lower.rs` (wave A lowering), `ty/layout.rs`,
 `ty/consteval.rs`.
 Interfaces out: checked bodies and IR for the new
-forms, the layout engine. In: scopes from W-RESOLVE.
-Depends on: S3, S7, W-RESOLVE scopes. Takes no std
+forms, the layout engine. In: scopes through the
+frozen `Binding` query fns (S7), with today's
+single-file resolver behind them until W-RESOLVE
+lands; fixtures stay single-file until then.
+Depends on: S3a, S3b, S7. Takes no std
 types: `Box`, `Result`, `?`, and let-else are W-STD-A
 work in wave A2.
 Work: tuples, arrays, slices, patterns (slice, ref,
@@ -3798,30 +4159,50 @@ chains), enum discriminants, the const evaluator of
 and f32/f64 scalar paths, the layout contract of 4.4
 with its gate, IR cleanup edges built with `Drop`
 (scope exit and unwind share one pass; wave C adds the
-runtime), derives as checked forms ahead of full trait
-impls, the check half of the MGP.
+runtime), the check half of the MGP. Derives are not
+in this package: today's derive path stays as compat,
+untouched, until W-TRAITS-CORE's synthetic impls land
+and replace it. Building a second checked-forms derive
+path here would be throwaway work.
 Tests: difftest per feature, `tests/adapters/` layout
-cases (the nested `TypeData` shape, `TypeMapper`,
+cases (the nested `TypeData` shape as the standalone
+engine test of 4.4 over the real field-type graph,
+`TypeMapper`, the pinned 4.4 generator shapes,
 explicit discriminants, packed-field reference
-reject), the 2.13 initializer corpus, the MGP fixture.
+reject), the wave A1 form of the 2.13 initializer
+corpus (locally supported types only, per 2.13), the
+MGP fixture.
 Gate: MGP (joint) plus the layout gate of 4.4. Size:
 6k-9k. The biggest wave A package; the AST-owner duty
 is part of the size, not extra.
 
 **W-TRAITS-CORE: generics, impl index, selection, mono walk.**
-Owns: `src/traits/*`, `ty/defs.rs` (wave A), the mono
-walk in `src/mono/mod.rs` (basic form).
+Owns: `src/traits/*`, `ty/mod.rs` (`TyKind`, interning,
+`subst`, `normalize`) and `ty/defs.rs` (wave A),
+`check/obligations.rs` (queue run points and the 2.12
+hooks S3a planted), `check/generics.rs` (generic Adt
+and fn collect, param env), `check/method.rs` (wave
+A), `InstanceKey`, and the mono walk in
+`src/mono/mod.rs` (basic form).
 Interfaces out: `select(obligation) -> Selection` per
 2.4, coherence per 2.6, method candidate queries,
 instance discovery with cached edges. In: `Defs`,
-`Binding` queries for traits in scope.
-Depends on: S3, S7, W-RESOLVE.
-Work: generic Adts and fns in collect, full trait-ref
-matching with probe unification, param-env elaboration,
+`Binding` queries for traits in scope, through the
+frozen S7 fns; single-file fixtures until W-RESOLVE
+lands.
+Depends on: S3a, S7.
+Work: generic Adts and fns in collect (in
+`check/generics.rs`), full trait-ref matching with
+probe unification, the 2.4 clause
+filter (provably false where clauses remove
+candidates, multi-level, never selecting on a "yes"),
+orphan-based coherence (2.6), param-env elaboration,
 associated equalities and normalization, the narrow
 impl-param binding of 2.4 step 4, derives as synthetic
-impls, `Sized` and `?Sized` basics, the mono half of
-the MGP. No closures, no `dyn`, no fusion.
+impls (the one derive path; today's checked-forms
+path stays compat until this lands), `Sized` and
+`?Sized` basics, the mono half of the MGP. No
+closures, no `dyn`, no fusion.
 Tests: `scripts/test-traits.sh`: same Self with
 different trait inputs, supertrait evidence, associated
 equality binding, `Vec<_>` collect shape (with a local
@@ -3829,6 +4210,13 @@ equality binding, `Vec<_>` collect shape (with a local
 integer var through `Index`, must-reject inference
 (E0282 and E0283 classes), std `IntoIterator` blanket
 shape plus the six ts-rust `IntoIterator` impl shapes,
+the clause-filter cases (a concrete impl next to a
+bounded blanket through a `for` over a local iterator
+type; the multi-level `Box<[T]>` shape in local form;
+two matching param-env predicates deferring), the
+coherence cases (`impl<T: A> Tr` vs `impl<T: B> Tr`
+with local traits and empty buckets rejects, E0119
+class; the orphan positive case accepts),
 `L0613` vs `L0610` split.
 Gate: MGP (joint) plus the trait corpus. Size: 3k-4.5k.
 
@@ -3867,7 +4255,10 @@ This package is correctness plumbing from day one.
 W-PERF later measures and improves it; W-PERF does not
 supply missing plumbing.
 Tests: driver tests (restart with disk objects,
-different crate load order, manifest change forces C
+different crate load order; one added reachable
+generic instance reuses the objects of unrelated
+units and rebuilds only the table unit, per 4.2;
+a change to a unit's own used slots forces its C
 re-emit but not a front-end redo), plus all runners
 green on their starter fixtures.
 Gate: MGP (joint) built and run through the daemon;
@@ -3991,6 +4382,9 @@ Tests: `tests/adapters/` fusion corpus (150 or more
 cases: side-effect counts, drop prints, capacity,
 early exits; zip both-sides rule, skip and step_by
 pull counts) run fused and with `LUST_NO_FUSION=1`;
+the generic inline-const assert case of 2.13,
+evaluated per instance (its well-formed check gates
+in W-CHECK-G);
 recursion build-reject vs check-accept pair.
 Gate: `Rc<dyn Fn>` callback fixture byte-equal;
 fusion corpus dual-run green; reachable instance
@@ -4007,10 +4401,14 @@ Interfaces out: adapter def list for fusion (by
 one unfused difftest each. Depends on: W-TRAITS,
 W-CHECK-G.
 Tests: `tests/adapters/`: sort (stable and unstable,
-comparator log, panicking comparator in unwind mode),
+comparator log; caught comparator panics are not a
+wave B gate, because W-PANIC lands in wave C: they
+run there, see W-PANIC),
 capacity through collect and extend, specialization
 parity on the unfused path, surface manifest diff and
-auto-trait parity for the new types.
+auto-trait parity for the new types, and the
+source-std `RefCell` static initializer case of 2.13
+(first stage that supports it).
 Gate: manifest and parity green; `Rc<RefCell<T>>`
 fixture set passes. Fx map order gate follows the K4
 audit outcome (3.5), not a blanket claim. Size: 5k-8k
@@ -4067,7 +4465,14 @@ Tests: `PANIC=unwind scripts/difftest.sh` over
 second panic caught inside `Drop`, nested catches,
 poison, `resume_unwind` hook silence, `UnwindSafe`
 reject (E0277 class), drop-on-unwind print order,
+the two catch-boundary cases of 7.2 (`panicking()`
+false and no poison inside a successful catch; a
+mutex locked and released inside a destructor during
+an outer panic stays unpoisoned) in the first gate,
 abort-mode run of the same dir where semantics allow.
+The wave C integration gate also runs the caught
+sort-comparator panic fixtures from W-STD-B here,
+because they need both the sort code and unwind.
 Gate: semantic corpus byte-equal in unwind mode; K2
 numbers recorded. Size: 2k-3.5k.
 
@@ -4079,7 +4484,10 @@ W-BORROW (scoped borrows), auto traits.
 Tests: difftest in both panic modes: parallel
 bind-shaped fixture (scoped workers over files, mpsc
 results, shared `Arc<Mutex>`) with equal sorted
-output; `Rc` across `spawn` rejects.
+output; `Rc` across `spawn` rejects; the source-std
+`Mutex::new` and `OnceLock::new` static initializer
+cases of 2.13, array-repeat form included (first
+stage that supports them).
 Gate: as stated in Tests. Size: 3k-5k (mostly lust
 source).
 
@@ -4318,6 +4726,24 @@ bearing claim below held as the reviewers stated it,
 except one detail noted at Opus B4. This section is
 the checklist the orchestrator verifies against.
 
+Revision 2 (the result of round 1) then got two
+round-2 reviews, both "GO WITH THESE FIXES": Opus
+(`arch-r2-opus.md`, items N1-N4 plus a list for S0-S7
+and A1) and sol (`arch-r2-sol.md`, items A-G plus a
+"changes before work starts" list). The round-2
+tables are at the end of this section. I verified each
+claim with rustc 1.99, edition 2024 before I changed
+the text (probes in `/tmp/arch-r2-probes/`): layout
+sizes, the local `IntoIterator` shape, both coherence
+directions (E0119 for two bounded blankets over a
+generic `T`; accept for the orphan positive case),
+call-site macro path lookup, `panicking()` and poison
+in the three guard cases, E0038 for a non-receiver
+`&Self`, closure sizes 0 and 1, and E0425 for an
+unqualified outer-module name. Every claim held. Where
+a round-2 row and a round-1 row conflict, the round-2
+row wins; the round-1 tables stay as history.
+
 ### Live rule-zero bugs in today's lust
 
 These are bugs in the current compiler, not in this
@@ -4455,3 +4881,38 @@ they test rustc or tcc behavior the design must match.
 | Parallel 8 (spikes: K1 full, K4 audit, K6 drop, K3 done) | K1 full list restored with per-wave probes; K4 is the audit; K6 is not dropped but demoted to an optional-path gate (see call 5); K3 Linux recorded as evidence. |
 | Parallel 9 (W-PERF part-time from wave A/B) | Done: scale gate owner is W-DRIVER in wave A, W-PERF from wave B, owning `Reads` review. |
 | Parallel 10 (gates cite scan counts) | Done: W-RESOLVE and W-MACRO gates cite scan findings; 9.4 states the rule globally. |
+
+### Round 2: Opus items N1-N4 and the S0-S7/A1 list
+
+| Item | Action |
+|---|---|
+| N1. 2.4 cannot select through the std `IntoIterator` blanket | Fixed in 2.4: a *provably false* check (binds nothing, shared depth cap 64 and cycle set, recursive through candidates, so the two-level `Box<[T]>` case works) and a clause filter in step 3 that drops a candidate only when one of its trait-predicate where clauses is provably false for the concrete Self. Never selects because clauses said yes; unknown stays unknown and defers (step 6). The filter records `ImplSet` reads (8), so a later impl rechecks bodies that filtered on an empty bucket. The same selection path serves trait candidates in 2.10 step 2. The shape is in the MGP (9.3) and in W-TRAITS-CORE tests. Probe: a local trait with one concrete impl and one bounded blanket prints 7 under rustc; `for` over `Box<[i32]>` and `Vec<u8>` accept. |
+| N2. Three 4.4 layout rules give wrong sizes | Fixed in 4.4. Variant layout is a struct that starts with the tag, other fields smallest alignment first, ties in declaration order; enum size is the largest variant rounded up to the enum alignment. The false "(Box, bool) fits in 16 by small fields last" sentence is deleted. A struct or tuple takes the niche with the most free values, tie by layout order. Layout choice is now a rule: smaller size, then more free niche values, then tagged. Tag widening into padding is stated (non-blocking item, done too). The three shapes (`A(u8, u32)` = 8, `TypeMapper`-like = 16, `Option<Option<S>>` = 16) are pinned in the 4.4 gate by name. My probes add `(u8, u64, u8)` = 16, `(u32, u64)` = 16, `(u16, [u8; 3])` = 6; all match the new rule and break the old one. |
+| N3. Wave A1 is a chain on W-RESOLVE | Fixed in 9.3: S7 freezes the `Binding` query fns; wave A packages code against them with today's single-file resolver behind them until W-RESOLVE lands; W-CORELANG, W-TRAITS-CORE, and W-MACRO state this in their In/Depends lines and keep fixtures single-file until then. No A1 package lists W-RESOLVE as a dependency. |
+| N4. Wave A ownership gaps and overlaps | Fixed in 9.1 and 9.3. W-TRAITS-CORE owns new files `check/obligations.rs` and `check/generics.rs` plus `check/method.rs` in wave A; S3a plants empty hook calls at the fixed 2.4/2.12 run points in `check/mod.rs`. `ty/mod.rs` (TyKind, interning, `subst`, `normalize`) goes to W-TRAITS-CORE in wave A. The ownership table and the tree in 9.1 name all three files. |
+| N4. Derives built twice | Fixed: W-CORELANG's "derives as checked forms" item is removed. Today's derive path stays as compat, untouched, until W-TRAITS-CORE's synthetic impls land. Stated in both packages. |
+| S0-S7/A1 item 1: split S3 now | Done in 9.2: S3a (TyKind v2, args, `Generics`, `Binder`, `AssocEq`, `Defs` skeletons, hook points) and S3b (AST v2 shapes frozen; parsers land with feature owners; clean rejects until then). See also sol's matching cut below. Execution order is S4, S0, S1, S2, S3a, S3b, S5, S6, S7. |
+| S0-S7/A1 item 2: remove 8.4 disk forms from S7 and the freeze list | Done: S7 no longer defines disk forms; 8.4 carries a cache format version, states the forms are not frozen, and gives them to W-DRIVER; the 9.2 freeze list drops "every disk key form in 8.4". `InstanceKey` is owned by W-TRAITS-CORE through wave A, since the MGP may reshape it. |
+| S0-S7/A1 item 3: give the live NLL bug an owner | Done in 9.2: the fix starts right after S4 (which moves `borrowck.rs`), runs in parallel with S0 to S7, and touches borrow checking only. |
+| S0-S7/A1 item 4: two matching param-env predicates | Done in 2.4 step 1: defer (rustc E0283), with the `T: From<u8> + From<u16>` example. Probe confirms rustc rejects the ambiguous form instead of picking one. |
+| S0-S7/A1 item 5: name the wave A scale-gate scenarios | Done in 9.3: wave A runs the new `pub fn` (single-file form until W-RESOLVE), the niche-changing type edit, the macro edit, and the restart; the inherent-method, cross-crate generic body, and added-instance scenarios join at the MGP at the earliest and run in full from wave B. |
+| S0-S7/A1 item 6: N1 shape in the MGP, N2 shapes in layout fixtures | Done: MGP carries a local concrete-plus-blanket trait selected through a `for` over a local iterator type (9.3); the 4.4 gate pins the three N2 shapes by name. |
+| B11 wording: 1.3 lexical scope searches outer modules | Fixed in 1.3: lexical scope is locals, block items up to the enclosing fn, then the current module only; it never searches outer modules (E0425 probe). The wider enclosing-module rule is stated as the `use`-path rule only. |
+
+### Round 2: sol items A-G and "changes before work starts"
+
+| Item | Action |
+|---|---|
+| A. Header matching is not selection (2.4, 2.6) | Fixed in 2.4 (the provably-false check and clause filter; same row as Opus N1) and 2.6. Coherence now states the orphan rule in full: disproof needs a concrete local Self (or a fundamental wrapper of one, or a local trait with a concrete Self) plus no possible downstream impl. A bare param Self is never disprovable, and an empty impl bucket alone proves nothing for a generic Self. The `impl<T: A> Tr for T` vs `impl<T: B> Tr for T` pair with local traits and no impls is an overlap (`L0615`, rustc E0119, probed). The orphan positive case (`impl Tr for MyType` next to `impl<T: A> Tr for T`, `A` and `MyType` local) is a worked accept case (probed). Both cases are in W-TRAITS-CORE tests. |
+| B. Item paths resolve at the call site (6.3) | Fixed in 6.3: locals, labels, lifetimes, and generic params resolve at the definition site; ordinary item paths resolve at the call site; `$crate` is the only def-site path form; items a macro defines land in the invoking module. The unconditional "every token gets the expansion ctxt" rule is replaced: metavariable tokens keep their spans and ctxts (6.2), only macro-written tokens get the expansion ctxt. Probe: `helper()` returning 1 at the def site and 2 at the call site prints 2. |
+| C. Layout algorithm misses its contract (4.4) | Fixed in 4.4: niches are chosen by free value count with the pinned tie rule (see N2 row); the niche-filled candidate also checks that every other variant's fields fit outside the niche scalar (`Pointer`/`Byte` enum = 16, probed); an explicit repr that fixes the tag or field order (`repr(int)`, `repr(C)`, `repr(packed)`) turns the niche candidate off, `repr(align)` alone does not (probed: `#[repr(u8)]` = 16, `#[repr(align(8))]` = 8). A supported-shape rule is now stated as a grammar: `layout()` returns `L0652` for any type outside it, the generator enumerates the grammar under stated bounds, and a new form enters only when grammar, generator, and engine change together with a green gate. All of sol's probe shapes are pinned in the gate. |
+| D. Gates that need later waves (2.13, 9.3) | Fixed in 2.13, 4.4, and 9.3. Wave A1 gates use only locally supported types: the 2.13 A1 corpus uses local stand-ins, and the nested `TypeData` shape runs as a standalone layout-engine test over the real field-type graph (no source `Box`, no lifetime support). Source-std versions gate at their first supported stage: `RefCell` static with W-STD-B (B), `Mutex`/`OnceLock` statics with W-THREADS (C), the generic inline-const case with W-CHECK-G/W-MONO (B). Caught sort comparator panics move from W-STD-B to the wave C integration gate in W-PANIC. Each moved gate states its stage in its Done line. The MGP stays the A2 entry condition. |
+| E. A catch boundary is not an active panic (7.2) | Fixed in 7.2: `catch_depth` is recorded in thread state apart from `unwind_depth`; catch entry raises only `catch_depth`; `unwind_depth` rises only while a panic or its cleanup is active, so `thread::panicking()` is false inside a successful catch. Guards record `panicking()` at acquisition and poison only on the false-to-true transition, which covers all three probed cases (successful catch: no poison; locked before the panic: poison; locked during an outer panic's destructor: no poison). Both catch-boundary probes are in W-PANIC's first gate (7.2, 9.3). The contract is fixed now; the implementation stays in wave C. |
+| F. One new slot invalidates every cached object (4.2, 8.4) | Fixed in 4.2, 8.1, and 8.4: a unit keys on its *used-slots hash*, the `(InstanceKeyHash, slot)` pairs its own emitted code uses, its own entries included. The table unit alone keys on the full manifest hash and rebuilds when the table grows. The complete manifest stays stored for restart recovery (8.4). Gate, owned by W-DRIVER: add one reachable generic instance and show unrelated objects are reused while only the table unit rebuilds. The same scenario joins the 9.3 scale gate from the MGP on. |
+| G. Interfaces before the S3/S7 freeze (2.1, 2.8, 4.5) | Fixed in 2.1: `Region` gains `Placeholder(u32)` for the 5.5 proof (distinct from every region, never unifies, never stored); `AssocEq` stays under its original `Binder` (`AssocEq(Binder<AssocEqData>)`), matched under the binder in 2.4 step 1 and 2.5; the `dyn` principal trait ref is stored under its `Binder`, bindings included, for higher-ranked `Fn`. Disk forms preserve signature regions (8.4). Fixed in 2.8: the non-receiver `&Self` allowance is removed; `Self` outside the receiver is E0038 (probed, `Box<Self>` argument included), while the trait's own `dyn` type in an argument or return stays legal (probed). Fixed in 4.5: the closure value is exactly its captures under the plain struct layout (sizes 0 and 1 probed); the trampoline lives in the vtable and call metadata. `ty/mod.rs`, interning, and substitution are assigned to W-TRAITS-CORE in A1 (9.1, 9.3). |
+| Before work starts: S4, S0, S1, S2 can start; keep S4 to file moves | Done in 9.2: S4 is moves only; the `Session`-per-crate and `CrateKey` behavior change moves to S6, whose row now states it. |
+| Before work starts: fix G before the freeze; A, B, C, D, F before their owners start | Done in this revision: G is in 2.1/2.8/4.5 ahead of S3a/S7; A, B, C, D, F are contract text in 2.4/2.6, 6.3, 4.4, 2.13/9.3, and 4.2/8.4 ahead of A1. |
+| Before work starts: keep the MGP small; compat paths until it runs through the daemon | Done in 9.3: the MGP is local types only (one generic Adt, whole trait inputs, one equality, inherent and trait method calls, one drop, plus the clause-filter shape), and its gate now reads "built and run through the daemon", with all compat paths kept until it passes that way. |
+| Before work starts: cut broad parser work from S3 | Done in 9.2 (S3b row): AST shapes freeze in S3b; each syntax parser lands with its feature owner; unimplemented syntax is a clean reject with a stable code, never a parse panic. The syn count check moves to the package whose parser lands, starting with W-CORELANG. |
+| Before work starts: fix E in the contract now, probes in W-PANIC's first gate | Done: see row E. Implementation stays in wave C. |
+| Before work starts: keep fusion and instance sharing off | No change. 4.2 (no sharing in milestones 4 to 8) and 4.3 (start unfused) already state both cuts; round 2 changes nothing there. |
