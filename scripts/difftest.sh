@@ -22,6 +22,9 @@
 #     failure in every mode: lust accepted the program.
 # Usage: scripts/difftest.sh [filter]
 #   SANITIZE=1 also builds the generated C with gcc -fsanitize=address,undefined and runs it.
+#              The gcc build uses -Werror=incompatible-pointer-types, so a
+#              miscompile that passes a pointer of the wrong type (which
+#              tcc accepts silently) fails loudly here.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run
 #   (default 10). A missing or empty fixture dir fails the run, as does
 #   a filter that matches no case (ARCH 9.3: no silent skips).
@@ -71,7 +74,7 @@ sanitize_case() {
   # $1 fixture, $2 name, $3 expected-stdout file. Returns 0 on match.
   local f=$1 name=$2 expected=$3
   run_cc "$lust" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name" 2>/dev/null || return 1
-  if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$work/$name.san" "$work/$name".*.c 2>"$work/$name.san.err"; then
+  if ! gcc -O1 -w -Werror=incompatible-pointer-types -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$work/$name.san" "$work/$name".*.c 2>"$work/$name.san.err"; then
     echo "gcc could not build the generated C: $(head -3 "$work/$name.san.err")"
     return 1
   fi
