@@ -1,4 +1,3 @@
-// expect: L0522
 #[repr(C)]
 struct S {
     v: i64,

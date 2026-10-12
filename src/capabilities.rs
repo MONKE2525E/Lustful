@@ -347,7 +347,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("typed `self` parameters", "L0721"),
     ("patterns in parameters", "L0820"),
     ("where clauses", "L0614"),
-    ("explicit enum discriminants", "L0632"),
     ("trait impls", "L0614"),
     ("associated consts and types", "L0621"),
     ("`impl Trait` types", "L0602"),

@@ -60,6 +60,8 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0640](L0640.md) | this std item is declared but not yet implemented |
 | [L0641](L0641.md) | this literal or std form is not supported yet |
 | [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |
+| [L0651](L0651.md) | reference to a packed field |
+| [L0652](L0652.md) | unsupported layout form |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0801](L0801.md) | macro expansion hit a limit |
 | [L0802](L0802.md) | no macro with this name is in scope |

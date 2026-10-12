@@ -1,4 +1,3 @@
-// expect: L0632
 enum E {
     A = 1,
     B,

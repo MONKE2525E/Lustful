@@ -34,6 +34,8 @@ pub struct Variant {
     pub name: Sym,
     pub shape: VariantShape,
     pub fields: Vec<Field>,
+    /// The discriminant value (explicit, or the previous variant's plus one).
+    pub disc: i128,
 }
 
 pub struct AdtDef {
@@ -43,6 +45,8 @@ pub struct AdtDef {
     pub variants: Vec<Variant>,
     pub derives: Derives,
     pub span: Span,
+    /// The `repr` of the type, in layout terms.
+    pub repr: crate::ty::layout::Repr,
 }
 
 pub struct FnInfo<'a> {
@@ -330,6 +334,155 @@ pub fn eval_array_len(ast: &Ast, e: ast::ExprId) -> Option<u128> {
     }
 }
 
+/// Evaluates a constant integer expression at collection time: literals,
+/// negation and bit-not, integer arithmetic and shifts, and `as` casts
+/// between integer types. Returns None for anything else. The full bounded
+/// evaluator lives in `ty::consteval` (ARCH 2.13); this is its scalar subset
+/// for discriminants and array lengths, which collect needs before bodies run.
+pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<i128> {
+    use crate::ast::{BinOp, Expr, UnOp};
+    match ast.expr(e) {
+        Expr::Int(v, _) => Some(*v as u128 as i128),
+        Expr::Char(c) => Some(*c as i128),
+        Expr::Bool(b) => Some(*b as i128),
+        Expr::Unary { op, expr } => {
+            let v = eval_const_int(ast, interner, known, *expr)?;
+            match op {
+                UnOp::Neg => v.checked_neg(),
+                UnOp::Not => Some(!v),
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let (a, b) = (eval_const_int(ast, interner, known, *lhs)?, eval_const_int(ast, interner, known, *rhs)?);
+            match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div => a.checked_div(b),
+                BinOp::Rem => a.checked_rem(b),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
+                BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
+                _ => None,
+            }
+        }
+        Expr::Cast { expr, ty } => {
+            let v = eval_const_int(ast, interner, known, *expr)?;
+            let target = match ast.ty(*ty) {
+                TyExpr::Path(segs) if segs.len() == 1 => known.int_ty(segs[0].name),
+                _ => None,
+            };
+            match target {
+                Some(it) => Some(truncate_to_int(v, it)),
+                None if matches!(ast.ty(*ty), TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char) => Some(v),
+                _ => None,
+            }
+        }
+        Expr::Block(b) => match ast.block(*b).tail {
+            Some(tail) if ast.block(*b).stmts.is_empty() => eval_const_int(ast, interner, known, tail),
+            _ => None,
+        },
+        _ => {
+            let _ = interner;
+            None
+        }
+    }
+}
+
+/// Wraps `v` to the range of an integer type, as an `as` cast does.
+fn truncate_to_int(v: i128, it: IntTy) -> i128 {
+    let bits = it.bits();
+    if bits >= 128 {
+        return v;
+    }
+    let mask: i128 = (1i128 << bits) - 1;
+    let u = v & mask;
+    if it.signed() && (u >> (bits - 1)) & 1 == 1 { u - (1i128 << bits) } else { u }
+}
+
+/// Parses the `repr` attributes of an item into layout terms. Unknown or
+/// unsupported forms are errors: this is where the 4.4 grammar cut lands
+/// for `repr(simd)` and `repr(packed(N))` with N other than 1.
+fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::layout::Repr, Diag> {
+    use crate::ast::AttrInput;
+    use crate::lexer::{Tok, TokenTree};
+    use crate::ty::layout::{Repr, ReprKind};
+    let mut repr = Repr::default();
+    for attr in attrs {
+        if attr.path.len() != 1 || interner.get(attr.path[0].name) != "repr" {
+            continue;
+        }
+        let AttrInput::List(_, trees) = &attr.input else {
+            return Err(Diag::new("L0110", attr.span, "`repr` needs a form such as `repr(C)`", "Write the repr in parentheses."));
+        };
+        let bad = |what: &str| {
+            Diag::new(
+                "L0652",
+                attr.span,
+                format!("unsupported layout form: `repr({what})`"),
+                "Use a supported repr: C, an integer, transparent, packed, or align.",
+            )
+        };
+        let mut i = 0;
+        while i < trees.len() {
+            match &trees[i] {
+                TokenTree::Token(t) if t.tok == Tok::Comma => i += 1,
+                TokenTree::Token(t) => {
+                    let Tok::Ident(name) = t.tok else {
+                        return Err(bad(".."));
+                    };
+                    let text = interner.get(name);
+                    match text {
+                        "C" => repr.kind = ReprKind::C,
+                        "Rust" => {}
+                        "transparent" => repr.kind = ReprKind::Transparent,
+                        "packed" => {
+                            repr.kind = ReprKind::Packed;
+                            if let Some(TokenTree::Delim(_, inner, _)) = trees.get(i + 1) {
+                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, _)));
+                                if !ok {
+                                    return Err(bad("packed(N)"));
+                                }
+                                i += 1;
+                            }
+                        }
+                        "align" => match trees.get(i + 1) {
+                            Some(TokenTree::Delim(_, inner, _)) => match inner.as_slice() {
+                                [TokenTree::Token(t2)] => match t2.tok {
+                                    Tok::Int(n, _) if n > 0 && n.is_power_of_two() => {
+                                        repr.align = Some(n);
+                                        i += 1;
+                                    }
+                                    _ => return Err(bad("align(..)")),
+                                },
+                                _ => return Err(bad("align(..)")),
+                            },
+                            _ => return Err(bad("align")),
+                        },
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => {
+                            let signed = text.starts_with('i');
+                            let bits: u32 = match text {
+                                "u8" | "i8" => 8,
+                                "u16" | "i16" => 16,
+                                "u32" | "i32" => 32,
+                                "u128" | "i128" => 128,
+                                _ => 64,
+                            };
+                            repr.int = Some((bits, signed));
+                        }
+                        _ => return Err(bad(text)),
+                    }
+                    i += 1;
+                }
+                TokenTree::Delim(..) => return Err(bad("..")),
+            }
+        }
+    }
+    Ok(repr)
+}
+
 /// Converts written variant or struct fields to (shape, (name, type, span) list).
 /// Tuple fields get their index as a synthetic name, as they had before AST v2.
 fn variant_fields_src(vf: &VariantFields) -> (VariantShape, Vec<(Sym, ast::TyId, Span)>) {
@@ -404,7 +557,14 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let disamb = p.adts.iter().filter(|a| a.name == name).count() as u32;
         let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
         let def = DefId { krate: p.krate, hash };
-        p.adts.push(AdtDef { name, is_enum, variants: Vec::new(), derives: Derives::default(), span });
+        p.adts.push(AdtDef {
+            name,
+            is_enum,
+            variants: Vec::new(),
+            derives: Derives::default(),
+            span,
+            repr: crate::ty::layout::Repr::default(),
+        });
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
         p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
@@ -415,12 +575,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     let mut adt_index = 0;
     for item in &ast.items {
         type FieldSrc = (Sym, ast::TyId, Span);
-        type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>);
+        type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
             ItemKind::Struct(s) => {
                 let (shape, fields) = variant_fields_src(&s.fields);
                 let shape = if shape == VariantShape::Unit { VariantShape::Named } else { shape };
-                (vec![(s.name, s.name_span, shape, fields)], &s.derives)
+                (vec![(s.name, s.name_span, shape, fields, None)], &s.derives)
             }
             ItemKind::Enum(e) => {
                 let vs = e
@@ -428,7 +588,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                     .iter()
                     .map(|v| {
                         let (shape, fs) = variant_fields_src(&v.fields);
-                        (v.name, v.span, shape, fs)
+                        (v.name, v.span, shape, fs, v.discriminant)
                     })
                     .collect();
                 (vs, &e.derives)
@@ -439,7 +599,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         adt_index += 1;
         let is_enum = p.adts[id.0 as usize].is_enum;
         let mut variants = Vec::new();
-        for (vname, vspan, shape, field_srcs) in variants_src {
+        let mut next_disc: i128 = 0;
+        for (vname, vspan, shape, field_srcs, disc_src) in variants_src {
             let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
             let mut fields = Vec::new();
             for (fname, fty, fspan) in field_srcs {
@@ -467,7 +628,23 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             if is_enum && variants.iter().any(|v: &Variant| v.name == vname) {
                 errs.push(dup(vspan, interner.get(vname)));
             }
-            variants.push(Variant { name: vname, shape, fields });
+            let disc = match disc_src {
+                Some(de) => match eval_const_int(ast, interner, known, de) {
+                    Some(v) => v,
+                    None => {
+                        errs.push(Diag::new(
+                            "L0110",
+                            vspan,
+                            "enum discriminant must be a constant integer",
+                            "Write a literal value such as `A = 3`.",
+                        ));
+                        next_disc
+                    }
+                },
+                None => next_disc,
+            };
+            next_disc = disc.wrapping_add(1);
+            variants.push(Variant { name: vname, shape, fields, disc });
         }
         let mut d = Derives::default();
         for &(name, span) in derives_src {
@@ -492,6 +669,45 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let adt = &mut p.adts[id.0 as usize];
         adt.variants = variants;
         adt.derives = d;
+        match parse_repr(interner, &item.attrs) {
+            Ok(r) => adt.repr = r,
+            Err(dg) => errs.push(dg),
+        }
+        // Repr and discriminant rules Rust also enforces (ARCH 4.4).
+        {
+            use crate::ty::layout::ReprKind;
+            let adt = &p.adts[id.0 as usize];
+            if adt.repr.kind == ReprKind::Transparent {
+                let non_unit = adt.variants.first().map(|v| v.fields.iter().filter(|f| f.ty != UNIT && f.ty != ERROR).count()).unwrap_or(0);
+                if adt.is_enum || non_unit != 1 {
+                    errs.push(Diag::new(
+                        "L0110",
+                        adt.span,
+                        "`repr(transparent)` needs a struct with exactly one non-unit field",
+                        "Remove the repr, or give the struct one field plus zero-sized fields.",
+                    ));
+                }
+            }
+            if let Some((bits, signed)) = adt.repr.int {
+                let (lo, hi): (i128, i128) = if signed {
+                    if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
+                } else if bits >= 128 {
+                    (0, i128::MAX)
+                } else {
+                    (0, (1i128 << bits) - 1)
+                };
+                for v in &adt.variants {
+                    if v.disc < lo || v.disc > hi {
+                        errs.push(Diag::new(
+                            "L0110",
+                            adt.span,
+                            format!("discriminant value {} overflows the repr range", v.disc),
+                            "Change the discriminant or the repr integer type.",
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     // Derived traits need every field type to have the trait too.
@@ -893,5 +1109,18 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.local_adt(t) {
         Some(a) => p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty))),
         None => false,
+    }
+}
+
+/// Layout shapes for the engine in `ty::layout`, read from the collected tables.
+impl crate::ty::layout::AdtShapes for Program<'_> {
+    fn adt_shape(&self, id: AdtId) -> Option<crate::ty::layout::AdtShape> {
+        let adt = self.adts.get(id.0 as usize)?;
+        Some(crate::ty::layout::AdtShape {
+            repr: adt.repr,
+            is_enum: adt.is_enum,
+            variants: adt.variants.iter().map(|v| v.fields.iter().map(|f| f.ty).collect()).collect(),
+            discs: adt.variants.iter().map(|v| v.disc).collect(),
+        })
     }
 }

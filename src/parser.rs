@@ -678,6 +678,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ if first == k.test && !inner => out.is_test = true,
+                _ if name_text == "repr" => {}
                 _ if first == k.allow || first == k.warn || first == k.deny => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
                     return Err(Diag::new(
@@ -1266,10 +1267,10 @@ impl<'a> Parser<'a> {
                     VariantFields::Tuple(self.tuple_fields()?)
                 }
                 Tok::LBrace => VariantFields::Struct(self.fields()?),
-                Tok::Eq => return Err(self.reject(C_CONST, "explicit enum discriminants")),
                 _ => VariantFields::Unit,
             };
-            variants.push(VariantDef { name: vname, attrs: vattrs.attrs, fields, discriminant: None, span });
+            let discriminant = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+            variants.push(VariantDef { name: vname, attrs: vattrs.attrs, fields, discriminant, span });
             if !self.eat(Tok::Comma) {
                 break;
             }

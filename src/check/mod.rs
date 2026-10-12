@@ -1077,9 +1077,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Cast { expr, ty } => {
                 let target = self.resolve_written(*ty);
                 let t = self.expr(*expr, None);
+                let enum_cast = match self.tys.local_adt(self.resolve(t)) {
+                    Some(a) => p.adt(a).is_enum && p.adt(a).variants.iter().all(|v| v.shape == VariantShape::Unit),
+                    None => false,
+                };
                 let ok = match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
+                    (_, TyKind::Int(_)) if enum_cast => true,
                     (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
                     (TyKind::Int(IntTy::U8), TyKind::Char) => true,
                     (TyKind::Error, _) | (_, TyKind::Error) => true,
@@ -1102,6 +1107,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => None,
                 });
                 let t = self.expr(*expr, inner_expected);
+                self.check_packed_borrow(*expr, span);
                 self.tys.mk_ref(*mutable, t)
             }
             Expr::Deref(inner) => {
@@ -1404,6 +1410,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// Requires an assignable place expression on the left of `=`.
+    /// A reference to a packed field could be unaligned (ARCH 4.4): any borrow
+    /// of a field place whose base is a packed Adt, explicit or implicit
+    /// (method autoref, format arguments), is an error at the borrow.
+    fn check_packed_borrow(&mut self, place_e: ExprId, span: Span) {
+        let base = match self.p.ast.expr(place_e) {
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => *base,
+            _ => return,
+        };
+        let bt = self.out.expr_ty[self.ei(base)];
+        let (_, inner) = self.autoderef(bt);
+        if let Some(a) = self.tys.local_adt(inner)
+            && self.p.adt(a).repr.kind == crate::ty::layout::ReprKind::Packed
+        {
+            self.err("L0651", span, "reference to a packed field is not allowed", "Copy the field value into a local first.");
+        }
+    }
+
     fn place_check(&mut self, e: ExprId) {
         let ok = match self.p.ast.expr(e) {
             Expr::Path(segs) => segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)),
@@ -1834,6 +1857,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 SigOf::Fn(info) => (info.params[1..].to_vec(), info.ret),
                 _ => return ERROR,
             };
+            if autoref != Autoref::None {
+                self.check_packed_borrow(recv, name_span);
+            }
             self.set_res(e, Res::Method { f, derefs, autoref });
             self.check_args(&params, args, name_span);
             return ret;
@@ -1848,11 +1874,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         cur = self.resolve(inner);
                     }
                 }
+                self.check_packed_borrow(recv, name_span);
                 self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs: derefs - 1, autoref: Autoref::Ref });
                 self.check_args(&[], args, name_span);
                 return cur;
             }
             if has_clone(p, &self.tys, base) {
+                self.check_packed_borrow(recv, name_span);
                 self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs, autoref: Autoref::Ref });
                 self.check_args(&[], args, name_span);
                 return base;
@@ -2032,6 +2060,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         match found {
             Some((b, autoref, params, ret)) => {
+                if autoref != Autoref::None {
+                    self.check_packed_borrow(recv, name_span);
+                }
                 self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
                 self.check_args(&params, args, name_span);
                 ret
@@ -2401,6 +2432,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if i >= fixed && !fmt.iter().any(|p| matches!(p, FmtPiece::Arg { index, .. } if *index == i)) {
                 self.expr(a, None);
             }
+        }
+        // Format arguments are borrowed: a packed field may not be one.
+        let borrowed_args: &[ExprId] = match kind {
+            MacroKind::AssertEq | MacroKind::AssertNe => &args[..args.len().min(2)],
+            MacroKind::Vec | MacroKind::Assert => &[],
+            _ => args,
+        };
+        for &a in borrowed_args {
+            self.check_packed_borrow(a, span);
         }
         result
     }

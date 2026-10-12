@@ -845,6 +845,24 @@ impl FnGen<'_, '_, '_> {
                             format!("(({}){{(uint64_t)({a}), 0}})", int_c(*ti))
                         }
                     }
+                    (CTy::Adt(aid), CTy::Int(_)) => {
+                        // A fieldless enum cast to an integer gives its
+                        // discriminant: map the internal tag index to the value.
+                        let adt = self.p.adt(*aid);
+                        let ct = ctype(&to);
+                        let t = self.tmp();
+                        let _ = write!(self.out, "    {ct} {t} = 0;\n    switch ({a}.tag) {{");
+                        for (vi, v) in adt.variants.iter().enumerate() {
+                            let lit = if v.disc < 0 {
+                                format!("(({ct})((int64_t){}))", v.disc)
+                            } else {
+                                format!("(({ct})((uint64_t){}ull))", v.disc as u128)
+                            };
+                            let _ = write!(self.out, " case {vi}: {t} = {lit}; break;");
+                        }
+                        let _ = writeln!(self.out, " }}");
+                        t
+                    }
                     _ => format!("(({}){a})", ctype(&to)),
                 }
             }

@@ -60,7 +60,9 @@ prints "reserved, not yet emitted".
 | L0641 | Std surface | W-STD | in use | Float or byte literal, known std type, or format form is not supported yet (S3b) |
 | L0642 | Std surface | W-STD | in use | Intrinsic called from a crate that may not use intrinsics (S5) |
 | L0643-L0649 | Std surface | W-STD | reserved | |
-| L0650-L0659 | Layout | W-CORELANG | reserved | L0650 `offset_of!` on a default-repr type, L0651 reference to a packed field, L0652 unsupported layout form |
+| L0650 | Layout | W-CORELANG | reserved | `offset_of!` on a default-repr type |
+| L0651-L0652 | Layout | W-CORELANG | in use | L0651 reference to a packed field, L0652 unsupported layout form |
+| L0653-L0659 | Layout | W-CORELANG | reserved | |
 | L0701-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | L0701 not dyn compatible (name the offending item) |
 | L0710-L0719 | Binders | W-TRAITS-CORE | reserved | L0710 nested higher-ranked binder |
 | L0720 | Methods and receivers | W-TRAITS-CORE | reserved | L0720 ambiguous method; plain "no such method" stays L0104 |
