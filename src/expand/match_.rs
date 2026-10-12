@@ -162,8 +162,15 @@ impl<'a> Compile<'a> {
                 }
                 Tt::Tok(t) => {
                     let id = self.id();
-                    out.push(MNode::Tok(*t, id));
-                    i += 1;
+                    // A written `>>` or `>>=` is one matcher token.
+                    if let Some(shr) = fused_shr(trees, i) {
+                        let next = tok_at(trees, i + 1).unwrap();
+                        out.push(MNode::Tok(Token { tok: shr, span: t.span.to(next.span) }, id));
+                        i += 2;
+                    } else {
+                        out.push(MNode::Tok(*t, id));
+                        i += 1;
+                    }
                 }
                 Tt::Delim(d, inner, _) => {
                     let inner = self.seq(inner, depth)?;
@@ -185,6 +192,30 @@ impl<'a> Compile<'a> {
     }
 }
 
+/// The fused shift token at `trees[i]`, when a `>` there touches
+/// a following `>` or `>=` (same file and context, spans back to
+/// back): rustc's token trees hold `>>` and `>>=` whole, while the
+/// lexer here emits the two halves so generics parse unsplit.
+/// The matcher fuses them where rustc counts whole tokens (a
+/// written `>>` in a matcher, a `tt` fragment, a separator); the
+/// fragment parsers keep the halves, so an end inside a `>>`
+/// (a path in `<$p:path>`) still splits exactly like rustc's.
+fn fused_shr(trees: &[Tt], i: usize) -> Option<Tok> {
+    let a = tok_at(trees, i)?;
+    if a.tok != Tok::Gt {
+        return None;
+    }
+    let b = tok_at(trees, i + 1)?;
+    if a.span.file != b.span.file || a.span.ctxt != b.span.ctxt || b.span.lo != a.span.hi {
+        return None;
+    }
+    match b.tok {
+        Tok::Gt => Some(Tok::Shr),
+        Tok::Ge => Some(Tok::ShrEq),
+        _ => None,
+    }
+}
+
 /// Parses what follows a repetition's closing paren at `trees[i..]`:
 /// an optional single separator token, then `*`, `+`, or `?`.
 /// Returns the separator, the operator, and how many trees were used.
@@ -197,6 +228,12 @@ pub fn rep_tail(trees: &[Tt], i: usize, allow_dollar_sep: bool) -> Option<(Optio
             Tok::Question => RepOp::Question,
             _ => return None,
         })
+    }
+    // A `>>` or `>>=` separator is one token, like in a matcher.
+    if let Some(shr) = fused_shr(trees, i) {
+        if let (Some(a), Some(b), Some(op)) = (tok_at(trees, i), tok_at(trees, i + 1), tok_at(trees, i + 2).and_then(|t| as_op(t.tok))) {
+            return Some((Some(Token { tok: shr, span: a.span.to(b.span) }), op, 3));
+        }
     }
     match tok_at(trees, i) {
         Some(t) if as_op(t.tok).is_some() => Some((None, as_op(t.tok).unwrap(), 1)),
@@ -221,9 +258,10 @@ fn follow_ok(kind: FragKind, tok: Tok) -> bool {
     use Tok::*;
     match kind {
         FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt => matches!(tok, FatArrow | Comma | Semi),
-        // `>>` lexes as two `Gt` tokens here, so `Gt` covers both.
+        // `>>` as a written token reached here fused; a single
+        // `>` is also fine (it closes one angle level).
         FragKind::Ty | FragKind::Path => {
-            matches!(tok, FatArrow | Comma | Semi | Eq | Pipe | Colon | Gt | LBracket | LBrace | As | Where)
+            matches!(tok, FatArrow | Comma | Semi | Eq | Pipe | Colon | Gt | Shr | LBracket | LBrace | As | Where)
         }
         // In edition 2024 `pat` still eats a top-level `|`, so `|` itself
         // may not follow it; `pat_param` stops before `|`, so it may.
@@ -631,10 +669,20 @@ fn match_seq(
     };
     match node {
         MNode::Tok(pattern, id) => {
-            let begins = matches!(input.get(pos), Some(Tt::Tok(actual)) if tok_matches(&pattern.tok, &actual.tok, m.strings));
+            // A `>>` pattern token takes the two touching halves in
+            // the input (or one already-fused tree from a template).
+            let fused = matches!(pattern.tok, Tok::Shr | Tok::ShrEq) && fused_shr(input, pos) == Some(pattern.tok);
+            // A standalone `>` pattern does not match the first
+            // half of a fused `>>`: in rustc that input token is
+            // `>>`, not `>`. (A half left by a fragment that ate
+            // the other half is not fused with what follows, so
+            // `<$p:path>` still closes over `<T>>`.)
+            let fused_half = pattern.tok == Tok::Gt && fused_shr(input, pos).is_some();
+            let begins = !fused_half
+                && (fused || matches!(input.get(pos), Some(Tt::Tok(actual)) if tok_matches(&pattern.tok, &actual.tok, m.strings)));
             m.attempt(input, pos, *id, false, begins);
             if begins {
-                match_seq(m, rest, input, pos + 1, binds, out)?;
+                match_seq(m, rest, input, pos + if fused { 2 } else { 1 }, binds, out)?;
             }
             Ok(())
         }
@@ -697,11 +745,20 @@ fn match_rep(
         if !iters.is_empty()
             && let Some(sep_tok) = sep
         {
-            let begins = matches!(input.get(start), Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings));
+            let fused = matches!(sep_tok.tok, Tok::Shr | Tok::ShrEq) && fused_shr(input, start) == Some(sep_tok.tok);
+            let fused_half = sep_tok.tok == Tok::Gt && fused_shr(input, start).is_some();
+            let begins = !fused_half
+                && (fused || matches!(input.get(start), Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings)));
             m.attempt(input, pos, rep_id, false, begins);
-            match input.get(start) {
-                Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings) => start += 1,
-                _ => sep_ok = false,
+            if fused {
+                start += 2;
+            } else if fused_half {
+                sep_ok = false;
+            } else {
+                match input.get(start) {
+                    Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings) => start += 1,
+                    _ => sep_ok = false,
+                }
             }
         }
         if sep_ok {
@@ -1160,6 +1217,8 @@ fn can_continue(kind: FragKind, tree: Option<&Tt>) -> bool {
                     | PipeEq
                     | CaretEq
                     | ShlEq
+                    | ShrEq
+                    | Shr
                     | Eq
                     | Dot
                     | Question
@@ -1209,9 +1268,7 @@ fn note_hard_fail(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize, end
             let continues = match (kind, head, next) {
                 (FragKind::Ty, Some(Tok::Dyn | Tok::Impl), Some(Tok::Plus)) => true,
                 (FragKind::Stmt, Some(Tok::Let), Some(Tok::Colon | Tok::Eq | Tok::Else)) => true,
-                (FragKind::Ty, _, Some(Tok::Arrow)) => {
-                    g >= pos + 2 && matches!(input.get(g - 1), Some(Tt::Delim(Delim::Paren, _, _)))
-                }
+                (FragKind::Ty, _, Some(Tok::Arrow)) => g >= pos + 2 && matches!(input.get(g - 1), Some(Tt::Delim(Delim::Paren, _, _))),
                 _ => false,
             };
             if continues {
@@ -1254,10 +1311,13 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             _ => vec![],
         },
         FragKind::Tt => {
-            if pos < input.len() {
-                vec![pos + 1]
-            } else {
+            if pos >= input.len() {
                 vec![]
+            } else if fused_shr(input, pos).is_some() {
+                // `>>` and `>>=` are one token tree in rustc.
+                vec![pos + 2]
+            } else {
+                vec![pos + 1]
             }
         }
         FragKind::Block => match input.get(pos) {
@@ -1366,8 +1426,9 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                     // (closures, `?`, `.await`, async and unsafe
                     // blocks); the recognizer knows their shapes
                     // and where they greedily end.
-                    None => super::recognize::expr_end(input, pos, m.interner, kind == FragKind::Expr)
-                        .map_or_else(Vec::new, |end| vec![end]),
+                    None => {
+                        super::recognize::expr_end(input, pos, m.interner, kind == FragKind::Expr).map_or_else(Vec::new, |end| vec![end])
+                    }
                 }
             }
         }
@@ -1394,7 +1455,8 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                 // subpattern after `@` may start with one, but that is
                 // not this slice's head). The subset parser accepts it
                 // as a range, so refuse it here.
-                if matches!(kind, FragKind::Pat | FragKind::PatParam) && matches!(slice.first(), Some(Tt::Tok(t)) if t.tok == Tok::DotDotEq) {
+                if matches!(kind, FragKind::Pat | FragKind::PatParam) && matches!(slice.first(), Some(Tt::Tok(t)) if t.tok == Tok::DotDotEq)
+                {
                     continue;
                 }
                 if kind == FragKind::Stmt && matches!(slice, [Tt::Tok(t)] if t.tok == Tok::Semi) {
@@ -1558,6 +1620,7 @@ fn angle_args_ok(m: &mut Matcher, inner: &[Tt]) -> bool {
         match tok {
             Some(Tok::Lt) => depth += 1,
             Some(Tok::Shl) => depth += 2,
+            Some(Tok::Shr) => depth -= 2,
             Some(Tok::Gt) => depth -= 1,
             _ => {}
         }
@@ -1584,6 +1647,12 @@ fn path_ends(m: &mut Matcher, input: &[Tt], pos: usize) -> Vec<usize> {
             match tok_at(input, i).map(|t| t.tok) {
                 Some(Tok::Lt) => depth += 1,
                 Some(Tok::Shl) => depth += 2,
+                Some(Tok::Shr) => {
+                    depth -= 2;
+                    if depth <= 0 {
+                        return Some(i + 1);
+                    }
+                }
                 Some(Tok::Gt) => {
                     depth -= 1;
                     if depth == 0 {
@@ -1742,7 +1811,7 @@ fn probe_flatten_impl(m: &Matcher, kind: FragKind, trees: &[Tt], bounds: Option<
                 continue;
             }
             match &trees[i] {
-                Tt::Tok(t) => out.push(*t),
+                Tt::Tok(t) => super::push_split_token(out, t),
                 Tt::Delim(d, inner, span) => {
                     let (open, close) = match d {
                         Delim::Paren => (Tok::LParen, Tok::RParen),

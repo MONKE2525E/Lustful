@@ -729,10 +729,10 @@ fn parse_pat_one(c: &mut Cur) -> bool {
 fn box_arg_follows(c: &Cur) -> bool {
     match c.ts.get(c.i + 1) {
         Some(Tt::Delim(_, _, _)) | Some(Tt::Frag(_, _, _)) => true,
-        Some(Tt::Tok(t)) => matches!(
-            t.tok,
-            Tok::Ident(_) | Tok::SelfUpper | Tok::Underscore | Tok::Amp | Tok::Ref | Tok::Mut | Tok::Minus | Tok::PathSep
-        ) || is_literal(t.tok),
+        Some(Tt::Tok(t)) => {
+            matches!(t.tok, Tok::Ident(_) | Tok::SelfUpper | Tok::Underscore | Tok::Amp | Tok::Ref | Tok::Mut | Tok::Minus | Tok::PathSep)
+                || is_literal(t.tok)
+        }
         None => false,
     }
 }
@@ -793,11 +793,7 @@ pub fn is_expr(slice: &[Tt], interner: &Interner, ed2024: bool) -> bool {
 pub fn expr_end(ts: &[Tt], pos: usize, interner: &Interner, ed2024: bool) -> Option<usize> {
     let mut c = Cur::new(ts, interner, ed2024, 0);
     c.i = pos;
-    if parse_expr_bp(&mut c, 0) && !c.pending_gt && !c.pending_ge && c.i > pos {
-        Some(c.i)
-    } else {
-        None
-    }
+    if parse_expr_bp(&mut c, 0) && !c.pending_gt && !c.pending_ge && c.i > pos { Some(c.i) } else { None }
 }
 
 /// The binding power of a binary operator token, or None.
@@ -937,9 +933,7 @@ fn parse_unary(c: &mut Cur) -> bool {
     c.attrs();
     c.block_like = false;
     // A label on a loop or block.
-    if matches!(c.tok(), Some(Tok::Lifetime(_)))
-        && tok_at(c.ts, c.i + 1).map(|t| t.tok) == Some(Tok::Colon)
-    {
+    if matches!(c.tok(), Some(Tok::Lifetime(_))) && tok_at(c.ts, c.i + 1).map(|t| t.tok) == Some(Tok::Colon) {
         c.bump();
         c.bump();
         return parse_primary(c);
@@ -994,11 +988,7 @@ fn parse_unary(c: &mut Cur) -> bool {
         Some(Tok::Async) => {
             c.bump();
             c.eat(Tok::Move);
-            if matches!(c.tree(), Some(Tt::Delim(Delim::Brace, _, _))) {
-                parse_primary(c)
-            } else {
-                parse_closure(c)
-            }
+            if matches!(c.tree(), Some(Tt::Delim(Delim::Brace, _, _))) { parse_primary(c) } else { parse_closure(c) }
         }
         Some(Tok::Pipe | Tok::OrOr) => parse_closure(c),
         Some(Tok::Return) => {
@@ -1407,8 +1397,10 @@ fn struct_fields(inner: &[Tt], interner: &Interner, ed2024: bool) -> bool {
             return p.len() > 1 && is_expr(&p[1..], interner, ed2024);
         }
         match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
-            Some(1) => matches!(p.first(), Some(Tt::Tok(t)) if is_seg(t.tok) || matches!(t.tok, Tok::Int(..)))
-                && is_expr(&p[2..], interner, ed2024),
+            Some(1) => {
+                matches!(p.first(), Some(Tt::Tok(t)) if is_seg(t.tok) || matches!(t.tok, Tok::Int(..)))
+                    && is_expr(&p[2..], interner, ed2024)
+            }
             Some(_) => false,
             None => matches!(p, [Tt::Tok(t)] if is_seg(t.tok) || matches!(t.tok, Tok::Int(..))),
         }
@@ -1512,9 +1504,9 @@ fn starts_item_at(c: &Cur) -> bool {
                 j += 1;
             }
             Some(Tok::Async | Tok::Unsafe | Tok::Extern) => j += 1,
-            Some(
-                Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Mod | Tok::Trait | Tok::Type | Tok::Static | Tok::Use,
-            ) => return true,
+            Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Mod | Tok::Trait | Tok::Type | Tok::Static | Tok::Use) => {
+                return true;
+            }
             Some(t) if seg_text(t, c.interner).as_deref() == Some("macro_rules") => return true,
             Some(t) if seg_text(t, c.interner).as_deref() == Some("default") => j += 1,
             Some(t) if seg_text(t, c.interner).as_deref() == Some("union") => return true,
@@ -1563,7 +1555,8 @@ fn fn_params(inner: &[Tt], interner: &Interner, allow_bare: bool) -> bool {
         // with an optional `: Type` after it.
         let self_at = p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::SelfLower));
         if let Some(s) = self_at {
-            let head_ok = p[..s].iter().all(|t| matches!(t, Tt::Tok(x) if matches!(x.tok, Tok::Amp | Tok::AndAnd | Tok::Mut | Tok::Lifetime(_))));
+            let head_ok =
+                p[..s].iter().all(|t| matches!(t, Tt::Tok(x) if matches!(x.tok, Tok::Amp | Tok::AndAnd | Tok::Mut | Tok::Lifetime(_))));
             let tail_ok = match p.get(s + 1) {
                 None => true,
                 Some(Tt::Tok(x)) if x.tok == Tok::Colon => is_ty(&p[s + 2..], interner),
@@ -1838,11 +1831,7 @@ fn parse_item(c: &mut Cur) -> bool {
             if !name(c) {
                 return false;
             }
-            if matches!(c.tree(), Some(Tt::Delim(Delim::Brace, _, _))) {
-                item_list(c)
-            } else {
-                c.eat(Tok::Semi)
-            }
+            if matches!(c.tree(), Some(Tt::Delim(Delim::Brace, _, _))) { item_list(c) } else { c.eat(Tok::Semi) }
         }
         Some(Tok::Use) => {
             c.bump();

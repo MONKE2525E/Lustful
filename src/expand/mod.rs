@@ -147,7 +147,11 @@ pub fn tt_from_tree(tree: &TokenTree) -> Tt {
 pub fn trees_from_tts(trees: &[Tt], out: &mut Vec<TokenTree>) {
     for tree in trees {
         match tree {
-            Tt::Tok(t) => out.push(TokenTree::Token(*t)),
+            Tt::Tok(t) => {
+                let mut flat = Vec::new();
+                push_split_token(&mut flat, t);
+                out.extend(flat.into_iter().map(TokenTree::Token));
+            }
             Tt::Delim(d, inner, span) => {
                 let mut converted = Vec::new();
                 trees_from_tts(inner, &mut converted);
@@ -155,6 +159,26 @@ pub fn trees_from_tts(trees: &[Tt], out: &mut Vec<TokenTree>) {
             }
             Tt::Frag(_, inner, _) => trees_from_tts(inner, out),
         }
+    }
+}
+
+/// Pushes one token into a flat token list, splitting a fused
+/// `>>` or `>>=` back into the two halves the parser reads (it
+/// joins them itself where a shift belongs). Every path from
+/// token trees back to the parser goes through here.
+pub fn push_split_token(out: &mut Vec<Token>, t: &Token) {
+    match t.tok {
+        Tok::Shr => {
+            let mid = t.span.lo + 1;
+            out.push(Token { tok: Tok::Gt, span: Span { hi: mid.min(t.span.hi), ..t.span } });
+            out.push(Token { tok: Tok::Gt, span: Span { lo: mid.min(t.span.hi), ..t.span } });
+        }
+        Tok::ShrEq => {
+            let mid = t.span.lo + 1;
+            out.push(Token { tok: Tok::Gt, span: Span { hi: mid.min(t.span.hi), ..t.span } });
+            out.push(Token { tok: Tok::Ge, span: Span { lo: mid.min(t.span.hi), ..t.span } });
+        }
+        _ => out.push(*t),
     }
 }
 
@@ -1257,7 +1281,7 @@ fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
                 flatten_final(inner, out);
                 out.push(Token { tok: Tok::RParen, span: *span });
             }
-            Tt::Tok(t) => out.push(*t),
+            Tt::Tok(t) => push_split_token(out, t),
             Tt::Delim(d, inner, span) => {
                 let (open, close) = match d {
                     Delim::Paren => (Tok::LParen, Tok::RParen),
@@ -2013,9 +2037,7 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
                 }
                 return Some(trees.len());
             }
-            Tt::Delim(Delim::Brace, _, _)
-                if j > start && matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Brace, _, _))) =>
-            {
+            Tt::Delim(Delim::Brace, _, _) if j > start && matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Brace, _, _))) => {
                 // A struct literal or pattern in a head position; the
                 // next brace group is the node's block. Step over the
                 // head group and let that group end the node.
@@ -2057,6 +2079,8 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
                     | Tok::PipeEq
                     | Tok::CaretEq
                     | Tok::ShlEq
+                    | Tok::Shr
+                    | Tok::ShrEq
                     | Tok::Eq
                     | Tok::DotDot
                     | Tok::DotDotEq,
@@ -2582,6 +2606,8 @@ fn should_wrap(expanded: &[Tt], prev_out: &[Tt], next_tok: Option<Tok>, next_tre
                 | Tok::PipeEq
                 | Tok::CaretEq
                 | Tok::ShlEq
+                    | Tok::Shr
+                    | Tok::ShrEq
                 | Tok::Dot
                 | Tok::Question
                 | Tok::As
@@ -2617,6 +2643,8 @@ fn should_wrap(expanded: &[Tt], prev_out: &[Tt], next_tok: Option<Tok>, next_tre
                     | Tok::PipeEq
                     | Tok::CaretEq
                     | Tok::ShlEq
+                    | Tok::Shr
+                    | Tok::ShrEq
                     | Tok::Eq
                     | Tok::Dot
                     | Tok::Question
