@@ -1503,9 +1503,12 @@ fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> boo
     }
 }
 
-/// Accepts an evaluated value for a declared item type: exact type, an
-/// integer that fits, or an aggregate whose shape the evaluator built from
-/// the declared type's own field information.
+/// Accepts an evaluated value for a declared item type only when the
+/// value's type is the declared type, up to the unsized coercions in
+/// `const_ty_compatible`. Tuple arity and array length are in the type the
+/// evaluator builds, so they are checked here too. One more form passes: a
+/// `None` variant, whose type the evaluator cannot name before the declared
+/// `Option` type is known.
 fn coerce_const_value(
     cx: &mut CollectCx<'_, '_>,
     v: crate::ty::consteval::ConstValue,
@@ -1514,29 +1517,18 @@ fn coerce_const_value(
     span: Span,
 ) -> Result<crate::ty::consteval::ConstValue, Diag> {
     use crate::ty::consteval::ConstValue;
-    if vt == ty {
+    if crate::ty::consteval::const_ty_compatible(&cx.p.tys, vt, ty) {
         return Ok(v);
     }
-    match (&v, cx.p.tys.kind(ty)) {
-        (ConstValue::Int(i), TyKind::Int(it)) => {
-            if crate::ty::consteval::truncate_to_int(*i, it) == *i {
-                Ok(v)
-            } else {
-                Err(Diag::new("L0110", span, "integer literal out of range for the declared type", "Change the literal or the type."))
-            }
-        }
-        (ConstValue::Variant(0, vals), _) if vals.is_empty() && cx.p.tys.option_elem(ty).is_some() => Ok(v),
-        (ConstValue::Aggregate(_), TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Adt(..)) => Ok(v),
-        (ConstValue::Variant(..), TyKind::Adt(..)) => Ok(v),
-        (ConstValue::Repeat(..), TyKind::Array(..)) => Ok(v),
-        (ConstValue::Ref(_), TyKind::Ref(..)) => Ok(v),
-        _ => Err(Diag::new(
-            "L0110",
-            span,
-            format!("mismatched types: expected `{}`, found `{}`", ty_name(cx.p, &cx.p.tys, ty), ty_name(cx.p, &cx.p.tys, vt)),
-            "Change the value or the declared type.",
-        )),
+    if matches!(&v, ConstValue::Variant(0, vals) if vals.is_empty()) && cx.p.tys.option_elem(ty).is_some() {
+        return Ok(v);
     }
+    Err(Diag::new(
+        "L0110",
+        span,
+        format!("mismatched types: expected `{}`, found `{}`", ty_name(cx.p, &cx.p.tys, ty), ty_name(cx.p, &cx.p.tys, vt)),
+        "Change the value or the declared type.",
+    ))
 }
 
 impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {

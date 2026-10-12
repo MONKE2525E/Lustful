@@ -153,6 +153,43 @@ pub fn truncate_to_int(v: i128, it: IntTy) -> i128 {
     if it.signed() && (u >> (bits - 1)) & 1 == 1 { u - (1i128 << bits) } else { u }
 }
 
+/// True when a value produced as `vt` may stand where `ty` is required in a
+/// const item: the types are equal, or they differ only by unsized coercions
+/// rustc applies at a reference (`&[T; N]` to `&[T]`), possibly nested inside
+/// tuples, arrays, or generic arguments. An `ERROR` on either side passes:
+/// that error was already reported where the type was formed.
+pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
+    if vt == ty || vt == ERROR || ty == ERROR {
+        return true;
+    }
+    match (tys.kind(vt), tys.kind(ty)) {
+        (TyKind::Ref(_, m1, a), TyKind::Ref(_, m2, b)) => {
+            (!m2.is_mut() || m1.is_mut())
+                && (const_ty_compatible(tys, a, b)
+                    || matches!((tys.kind(a), tys.kind(b)), (TyKind::Array(e1, _), TyKind::Slice(e2)) if const_ty_compatible(tys, e1, e2)))
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            let (a, b) = (tys.tys_of(a), tys.tys_of(b));
+            a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| const_ty_compatible(tys, x, y))
+        }
+        (TyKind::Array(e1, n1), TyKind::Array(e2, n2)) => n1 == n2 && const_ty_compatible(tys, e1, e2),
+        (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
+            let (a, b) = (tys.args(a1), tys.args(a2));
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| match (x, y) {
+                    (super::GenericArg::Ty(x), super::GenericArg::Ty(y)) => const_ty_compatible(tys, *x, *y),
+                    _ => x == y,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The L0110 a const item gets when its value type is not its declared type.
+pub fn const_ty_mismatch(span: Span, what: &str) -> Diag {
+    Diag::new("L0110", span, format!("mismatched types in {what}"), "Change the value or the declared type.")
+}
+
 /// True when `v` fits in the integer type (const overflow is an error).
 fn fits(v: i128, it: IntTy) -> bool {
     let bits = it.bits();
@@ -325,10 +362,29 @@ impl Evaluator {
                     && segs.len() == 1
                     && let Some((idx, sty)) = cx.static_item(segs[0].name)
                 {
+                    // `&ARR` where a slice reference is wanted is the unsize
+                    // coercion; the value keeps the static's identity and the
+                    // wanted type.
+                    if let Some(et) = expected
+                        && matches!(cx.tys_ref().kind(et), TyKind::Ref(..))
+                        && {
+                            let rt = cx.tys().mk_ref(*mutable, sty);
+                            const_ty_compatible(cx.tys_ref(), rt, et)
+                        }
+                    {
+                        return Ok(Flow::Val((ConstValue::StaticRef(idx), et)));
+                    }
                     let rt = cx.tys().mk_ref(*mutable, sty);
                     return Ok(Flow::Val((ConstValue::StaticRef(idx), rt)));
                 }
-                let (v, t) = self.value(cx, env, *expr, None)?;
+                // A wanted reference type wants its pointee type inside, so an
+                // unsuffixed literal takes that width (except the slice form
+                // below, which has no single pointee value).
+                let inner_expected = expected.and_then(|et| match cx.tys_ref().kind(et) {
+                    TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) => Some(inner),
+                    _ => None,
+                });
+                let (v, t) = self.value(cx, env, *expr, inner_expected)?;
                 if let ConstValue::Str(_) = v {
                     (v, t)
                 } else if let Some(et) = expected
@@ -414,7 +470,10 @@ impl Evaluator {
                     let Some(i) = field_defs.iter().position(|(n, _)| *n == fname) else {
                         return Err(outside(span, "this struct literal"));
                     };
-                    let (v, _) = self.value(cx, env, fe, Some(field_defs[i].1))?;
+                    let (v, vt) = self.value(cx, env, fe, Some(field_defs[i].1))?;
+                    if !const_ty_compatible(cx.tys_ref(), vt, field_defs[i].1) {
+                        return Err(const_ty_mismatch(cx.ast().expr_span(fe), "this struct literal field"));
+                    }
                     vals[i] = Some(v);
                 }
                 if let Some(u) = update {
@@ -904,10 +963,20 @@ impl Evaluator {
                 })?;
                 Ok((ConstValue::Int(l.align as i128), USIZE))
             }
-            CallTarget::VariantCtor { variant, ty, .. } => {
+            CallTarget::VariantCtor { adt, variant, ty } => {
+                // A user variant knows its field types; check each argument
+                // against them. The `Some` shim (adt u32::MAX) has none here.
+                let fields: Vec<Ty> = if adt.0 == u32::MAX { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
                 let mut vals = Vec::new();
-                for &a in args {
-                    vals.push(self.value(cx, env, a, None)?.0);
+                for (i, &a) in args.iter().enumerate() {
+                    let want = fields.get(i).copied();
+                    let (v, vt) = self.value(cx, env, a, want)?;
+                    if let Some(want) = want
+                        && !const_ty_compatible(cx.tys_ref(), vt, want)
+                    {
+                        return Err(const_ty_mismatch(cx.ast().expr_span(a), "this constructor argument"));
+                    }
+                    vals.push(v);
                 }
                 Ok((ConstValue::Variant(variant, vals), ty))
             }
@@ -917,7 +986,15 @@ impl Evaluator {
                 }
                 let mut fenv: Env = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
-                    let v = self.value(cx, env, a, body.param_tys.get(i).copied())?;
+                    let (v0, vt) = self.value(cx, env, a, body.param_tys.get(i).copied())?;
+                    if let Some(&want) = body.param_tys.get(i)
+                        && !const_ty_compatible(cx.tys_ref(), vt, want)
+                    {
+                        return Err(const_ty_mismatch(cx.ast().expr_span(a), "this call argument"));
+                    }
+                    // The parameter has its declared type inside the body,
+                    // whatever width the argument literal was written at.
+                    let v = (v0, body.param_tys.get(i).copied().unwrap_or(vt));
                     let (name, mutable, pat) = body.params[i];
                     match pat {
                         Some(pat) => {
@@ -931,7 +1008,9 @@ impl Evaluator {
                     }
                 }
                 match self.block(cx, &mut fenv, body.body, Some(body.ret))? {
-                    Flow::Val(v) | Flow::Return(v) => Ok(v),
+                    // The fn body is type-checked as a fn; its value has the
+                    // declared return type here.
+                    Flow::Val(v) | Flow::Return(v) => Ok((v.0, body.ret)),
                     _ => Err(outside(span, "control flow out of a const fn")),
                 }
             }
