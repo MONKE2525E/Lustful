@@ -22,9 +22,14 @@ pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> 
     let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0 };
     p.ast.strings = lexed.strings.clone();
     while p.peek() != Tok::Eof {
+        let before = p.pos;
         let item = p.item()?;
         if let Some(item) = item {
             p.ast.items.push(item);
+        }
+        // No parse loop may spin in place on bad input: each round must consume a token.
+        if p.pos == before {
+            return Err(syntax(p.span(), format!("expected an item, found {:?}", p.peek())));
         }
     }
     Ok(p.ast)
@@ -97,10 +102,25 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Ident(s) => Ok((s, self.bump().span)),
             Tok::SelfUpper => Ok((self.known.self_type, self.bump().span)),
+            Tok::Reserved(_) => Err(self.reserved_error(self.span())),
             Tok::Lifetime => Err(lifetime_error(self.span())),
             t => Err(syntax(self.span(), format!("expected identifier, found {t:?}"))),
         }
     }
+    /// The error for a reserved keyword (`gen`, `try`, ...) used where an identifier belongs.
+    fn reserved_error(&self, span: Span) -> Diag {
+        let Tok::Reserved(s) = self.toks[self.pos.min(self.toks.len() - 1)].tok else {
+            return syntax(span, "expected identifier");
+        };
+        let name = self.interner.get(s);
+        Diag::new(
+            "L0001",
+            span,
+            format!("expected identifier, found reserved keyword `{name}`"),
+            format!("Rename it, or write `r#{name}` to use it as an identifier."),
+        )
+    }
+
     /// True if the next two tokens are `>` `>` with no space, which means a right shift.
     fn at_shr(&self) -> bool {
         self.peek() == Tok::Gt && self.peek_at(1) == Tok::Gt && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
@@ -183,8 +203,12 @@ impl<'a> Parser<'a> {
         let start = self.span();
         self.eat(Tok::Pub);
         if self.peek() == Tok::LParen {
-            // pub(crate) and similar.
-            while self.bump().tok != Tok::RParen {}
+            // pub(crate) and similar. `bump` does not move past `Eof`, so stop there.
+            while self.bump().tok != Tok::RParen {
+                if self.peek() == Tok::Eof {
+                    return Err(syntax(self.span(), "expected `)` in visibility, found end of file"));
+                }
+            }
         }
         let kind = match self.peek() {
             Tok::Fn => {
@@ -211,6 +235,7 @@ impl<'a> Parser<'a> {
             Tok::Unsafe => return Err(Diag::new("L0404", start, "`unsafe` is not supported", "Remove the unsafe code.")),
             Tok::Async => return Err(Diag::new("L0405", start, "`async` is not supported", "Use std::thread and channels.")),
             Tok::Ident(_) if self.peek_at(1) == Tok::Bang => return Err(macro_error(start)),
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an item, found {t:?}"))),
         };
         Ok(Some(Item { kind }))
@@ -260,6 +285,7 @@ impl<'a> Parser<'a> {
             let mutable = self.eat(Tok::Mut);
             let (pname, _) = match self.peek() {
                 Tok::Ident(_) => self.ident()?,
+                Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
                 _ => return Err(unsupported(start, "patterns in parameters")),
             };
             self.expect(Tok::Colon, "`:`")?;
@@ -446,6 +472,9 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
         while self.peek() != Tok::RBrace {
+            if self.peek() == Tok::Eof {
+                return Err(syntax(self.span(), "expected `}`, found end of file"));
+            }
             if self.eat(Tok::Semi) {
                 continue;
             }
@@ -583,6 +612,7 @@ impl<'a> Parser<'a> {
             Tok::LParen => return Err(unsupported(start, "tuple patterns")),
             Tok::LBracket => return Err(unsupported(start, "slice patterns")),
             Tok::Amp => return Err(unsupported(start, "reference patterns")),
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected a pattern, found {t:?}"))),
         };
         Ok(self.push_pat(pat, start.to(self.prev_span())))
@@ -999,6 +1029,7 @@ impl<'a> Parser<'a> {
                 }
                 Expr::Path(path)
             }
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an expression, found {t:?}"))),
         };
         Ok(self.push_expr(e, start.to(self.prev_span())))

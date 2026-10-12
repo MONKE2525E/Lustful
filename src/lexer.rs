@@ -19,6 +19,9 @@ pub enum IntSuffix {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tok {
     Ident(Sym),
+    /// A Rust 2024 keyword that cannot be used as an identifier (`gen`, `try`, `await`, and kin).
+    /// The parser rejects it wherever an identifier is expected, with a clearer message.
+    Reserved(Sym),
     Int(u64, Option<IntSuffix>),
     Float,
     /// Index into `Lexed::strings`.
@@ -159,6 +162,37 @@ fn keyword(s: &str) -> Option<Tok> {
     })
 }
 
+/// Keywords of Rust 2024 (strict and reserved) that have no token of their own here.
+/// Weak keywords such as `union`, `safe`, and `macro_rules` stay usable as identifiers, as in rustc.
+fn reserved(s: &str) -> bool {
+    matches!(
+        s,
+        "abstract"
+            | "await"
+            | "become"
+            | "box"
+            | "crate"
+            | "do"
+            | "extern"
+            | "final"
+            | "gen"
+            | "macro"
+            | "override"
+            | "priv"
+            | "super"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+    )
+}
+
+/// Names that rustc does not allow even as raw identifiers (`r#self` and friends).
+fn raw_ident_invalid(s: &str) -> bool {
+    matches!(s, "self" | "Self" | "super" | "crate" | "_")
+}
+
 fn suffix(s: &str) -> Option<Option<IntSuffix>> {
     use IntSuffix::*;
     Some(Some(match s {
@@ -226,7 +260,33 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
                 i += 1;
             }
             let s = &src[start..i];
-            keyword(s).unwrap_or_else(|| Tok::Ident(*cache.entry(s).or_insert_with(|| interner.intern(s))))
+            // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
+            if s == "r"
+                && b.get(i) == Some(&b'#')
+                && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80)
+            {
+                i += 1;
+                let name_start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
+                    i += 1;
+                }
+                let name = &src[name_start..i];
+                if raw_ident_invalid(name) {
+                    return Err(Diag::new(
+                        "L0001",
+                        Span::new(base + start as u32, base + i as u32),
+                        format!("`r#{name}` is not a valid identifier"),
+                        "Use a different name. `self`, `Self`, `super`, `crate`, and `_` cannot be raw identifiers.",
+                    ));
+                }
+                Tok::Ident(*cache.entry(name).or_insert_with(|| interner.intern(name)))
+            } else if let Some(k) = keyword(s) {
+                k
+            } else if reserved(s) {
+                Tok::Reserved(*cache.entry(s).or_insert_with(|| interner.intern(s)))
+            } else {
+                Tok::Ident(*cache.entry(s).or_insert_with(|| interner.intern(s)))
+            }
         } else if c.is_ascii_digit() {
             lex_number(src, &mut i).ok_or_else(|| err(start, i, "invalid number literal"))?
         } else if c == b'"' {
