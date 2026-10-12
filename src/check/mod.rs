@@ -5707,6 +5707,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if lo > next {
                     break;
                 }
+                // An interval that reaches the segment end covers it
+                // (saturating_add would hide that at i128::MAX).
+                if hi >= shi {
+                    return true;
+                }
                 next = next.max(hi.saturating_add(1));
                 if next > shi {
                     return true;
