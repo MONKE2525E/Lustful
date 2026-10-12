@@ -1578,7 +1578,7 @@ fn main() {}
     }
 
     /// The lowered sample body carries the read set with it, and every call
-    /// in it is a terminator with an empty unwind slot.
+    /// in it is a terminator with a cleanup (unwind) successor.
     #[test]
     fn lowered_body_carries_reads_and_call_terminators() {
         use crate::ir::{CallTarget, Terminator};
@@ -1592,7 +1592,7 @@ fn main() {}
             let (mut fn_calls, mut builtin_calls) = (0, 0);
             for b in &body.blocks {
                 if let Terminator::Call { target, unwind, .. } = &b.term {
-                    assert_eq!(*unwind, None, "no unwind edges exist yet");
+                    assert!(unwind.is_some(), "every call carries a cleanup edge (W-CORELANG)");
                     match target {
                         CallTarget::Fn(_) | CallTarget::Indirect(_) => fn_calls += 1,
                         CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => builtin_calls += 1,
@@ -1749,10 +1749,12 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         with_program("fn main() { let mut v = Vec::new(); v.push(1); println!(\"{}\", v.len()); }\n", |interner, p| {
             let (ck, _) = check_fn(p, p.main.unwrap());
             let vec_def = p.tys.builtins().vec;
-            let push_key = ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("push"), form: ReceiverForm::Value });
+            let push_key =
+                ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("push"), form: ReceiverForm::Value });
             let recorded = ck.reads.get(&push_key).expect("the push probe is recorded");
             assert!(recorded.failed, "no user candidate: a failed (builtin) probe");
-            let pop_key = ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("pop"), form: ReceiverForm::Value });
+            let pop_key =
+                ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("pop"), form: ReceiverForm::Value });
             assert_ne!(
                 recorded.fingerprint,
                 p.read_fingerprint(&pop_key).fingerprint,

@@ -87,13 +87,33 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.push(StmtKind::Assign(place, rv), span);
     }
     /// Emits a call terminator that writes its result to `dest` and continues
-    /// in a fresh block. No cleanup edges exist yet, so `unwind` is `None`
-    /// (docs/ARCH.md section 7.2).
+    /// in a fresh block. The unwind successor is a cleanup block chain: one
+    /// block per enclosing scope, innermost first, each dropping that
+    /// scope's locals through the same `emit_drops` pass scope exit uses,
+    /// then propagating to the next outer scope (docs/ARCH.md section 7.2).
+    /// The innermost cleanup ends in `Unreachable`, where the wave C
+    /// runtime resumes the exception.
     fn call_into(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place, span: Span) {
         let next = self.new_block();
+        // Build the cleanup chain outside-in first so each block can name
+        // its successor, then fill the blocks innermost first.
+        let depth = self.scopes.len();
+        let mut chain: Vec<Bb> = (0..depth).map(|_| self.new_block()).collect();
+        chain.reverse();
+        let unwind = chain.first().copied();
         let b = &mut self.body.blocks[self.cur.0 as usize];
-        b.term = Terminator::Call { target, args, dest, next, unwind: None };
+        b.term = Terminator::Call { target, args, dest, next, unwind };
         b.term_span = span;
+        for (i, &cb) in chain.iter().enumerate() {
+            self.cur = cb;
+            let scope_idx = depth - 1 - i;
+            let locals = self.scopes[scope_idx].clone();
+            self.emit_drops(&locals, span);
+            match chain.get(i + 1) {
+                Some(&outer) => self.goto(outer, span),
+                None => self.terminate(Terminator::Unreachable, span),
+            }
+        }
         self.cur = next;
     }
     /// The place a call result goes: the given destination, or a throwaway
