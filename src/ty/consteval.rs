@@ -112,6 +112,8 @@ pub trait ConstCx<'a> {
     fn adt_repr(&self, adt: AdtId) -> super::layout::Repr;
     /// The discriminant of one variant of an enum type.
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128;
+    /// True when the Adt is an enum (a struct literal for it builds a variant).
+    fn is_enum(&self, adt: AdtId) -> bool;
 }
 
 /// Why evaluation left a block early.
@@ -199,6 +201,59 @@ fn fits(v: i128, it: IntTy) -> bool {
     if it.signed() { v >= -(1i128 << (bits - 1)) && v < (1i128 << (bits - 1)) } else { v >= 0 && v < (1i128 << bits) }
 }
 
+// `ConstValue::Int` stores the canonical form of its typed value:
+// sign-extended for signed types below 128 bits, zero-extended for
+// unsigned types below 128 bits, and the raw 128 bits for i128 and
+// u128 (so u128::MAX is -1). The helpers below convert between that
+// storage, the raw bits, and the signed value. Every operation runs
+// in its operand type, so u128 values at or above 2^127 compare,
+// divide, and shift as unsigned.
+
+/// The raw low bits of a stored integer, at its type's width.
+fn int_bits(v: i128, it: IntTy) -> u128 {
+    let bits = it.bits();
+    if bits >= 128 { v as u128 } else { (v as u128) & ((1u128 << bits) - 1) }
+}
+
+/// The stored form of raw bits at a type's width.
+fn int_from_bits(u: u128, it: IntTy) -> i128 {
+    if it.bits() >= 128 { u as i128 } else { truncate_to_int(u as i128, it) }
+}
+
+/// The smallest value of a signed integer type (0 for unsigned).
+fn int_min(it: IntTy) -> i128 {
+    if !it.signed() {
+        0
+    } else if it.bits() >= 128 {
+        i128::MIN
+    } else {
+        -(1i128 << (it.bits() - 1))
+    }
+}
+
+/// Compares two stored integers at a type (signed value or raw bits).
+fn cmp_int(a: i128, b: i128, it: Option<IntTy>) -> std::cmp::Ordering {
+    match it {
+        Some(it) if !it.signed() => int_bits(a, it).cmp(&int_bits(b, it)),
+        Some(it) => truncate_to_int(a, it).cmp(&truncate_to_int(b, it)),
+        None => a.cmp(&b),
+    }
+}
+
+/// True when an expression is an unsuffixed int or float literal,
+/// possibly negated: the forms whose type a cast target decides.
+pub fn is_unsuffixed_lit(ast: &Ast, e: ExprId) -> bool {
+    match ast.expr(e) {
+        Expr::Int(_, suffix) => suffix.is_none(),
+        Expr::Float(i) => {
+            let t = ast.strings[*i as usize].trim_end();
+            !t.ends_with("f32") && !t.ends_with("f64")
+        }
+        Expr::Unary { op: UnOp::Neg, expr } => is_unsuffixed_lit(ast, *expr),
+        _ => false,
+    }
+}
+
 /// Evaluates one const expression. `expected` is the type the context wants,
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
@@ -235,28 +290,42 @@ impl Evaluator {
         self.step(span)?;
         let v = match cx.ast().expr(e) {
             Expr::Int(v, suffix) => {
+                // With no expected type an unsuffixed literal stays wide
+                // (i128): a const fn local takes its real type from its
+                // uses, which this evaluator does not infer. The value
+                // is range-checked again where it meets a declared type
+                // (the item coercion in collect, the return coercion in
+                // `call`), so a wide literal never escapes unchecked.
                 let t = match suffix {
                     Some(s) => super::int(IntTy::from_suffix(*s)),
-                    None => expected.filter(|&t| self.int_ty_of(cx, t).is_some()).unwrap_or(super::I32),
+                    None => expected.filter(|&t| self.int_ty_of(cx, t).is_some()).unwrap_or(super::int(IntTy::I128)),
                 };
-                let val = *v as u128 as i128;
-                if let Some(it) = self.int_ty_of(cx, t)
-                    && !fits(val, it)
-                {
+                let it = self.int_ty_of(cx, t).unwrap_or(IntTy::I128);
+                if *v > it.max128() {
                     return Err(Diag::new(C_OUTSIDE, span, "integer literal out of range in const", "Change the literal or the type."));
                 }
-                (ConstValue::Int(val), t)
+                (ConstValue::Int(int_from_bits(*v, it)), t)
             }
             Expr::Float(i) => {
                 let text = cx.ast().strings[*i as usize].as_str();
                 match crate::check::collect::parse_float_literal(text) {
-                    Some((bits, suffix)) => {
+                    Some((_, suffix)) => {
                         let f = suffix.unwrap_or(match expected.map(|t| cx.tys_ref().kind(t)) {
                             Some(TyKind::Float(f)) => f,
                             _ => FloatTy::F64,
                         });
-                        let bits =
-                            if f == FloatTy::F32 && suffix.is_none() { (f64::from_bits(bits) as f32).to_bits() as u64 } else { bits };
+                        // One rounding, straight to the target type.
+                        if crate::check::collect::float_literal_overflows(text, f) {
+                            return Err(Diag::new(
+                                C_OUTSIDE,
+                                span,
+                                "float literal out of range in const",
+                                "Change the literal or the type.",
+                            ));
+                        }
+                        let Some(bits) = crate::check::collect::parse_float_literal_as(text, f) else {
+                            return Err(outside(span, "this float literal"));
+                        };
                         let t = cx.tys().float_ty(f);
                         (ConstValue::Float(bits, f), t)
                     }
@@ -320,39 +389,67 @@ impl Evaluator {
                 }
             }
             Expr::Unary { op, expr } => {
-                let (v, t) = self.value(cx, env, *expr, expected)?;
-                match (op, v) {
-                    (UnOp::Neg, ConstValue::Float(bits, f)) => {
-                        let nb = match f {
-                            FloatTy::F64 => (-f64::from_bits(bits)).to_bits(),
-                            FloatTy::F32 => (-f32::from_bits(bits as u32)).to_bits() as u64,
-                        };
-                        (ConstValue::Float(nb, f), t)
+                // A negated literal is range-checked after the negation,
+                // so `-128` is a valid i8: check the magnitude against
+                // the type's minimum, not its maximum.
+                if *op == UnOp::Neg
+                    && let Expr::Int(v, suffix) = cx.ast().expr(*expr)
+                {
+                    let (v, suffix) = (*v, *suffix);
+                    let t = match suffix {
+                        Some(s) => super::int(IntTy::from_suffix(s)),
+                        None => expected.filter(|&t| self.int_ty_of(cx, t).is_some()).unwrap_or(super::int(IntTy::I128)),
+                    };
+                    let it = self.int_ty_of(cx, t).unwrap_or(IntTy::I128);
+                    if !it.signed() || v > it.max128() + 1 {
+                        return Err(Diag::new(
+                            C_OUTSIDE,
+                            span,
+                            "integer literal out of range in const",
+                            "Change the literal or the type.",
+                        ));
                     }
-                    (UnOp::Neg, ConstValue::Int(i)) => {
-                        let r = i.checked_neg().ok_or_else(|| outside(span, "this negation (overflow)"))?;
-                        if let Some(it) = self.int_ty_of(cx, t)
-                            && !fits(r, it)
-                        {
-                            return Err(outside(span, "this negation (overflow)"));
+                    let r = if v == (1u128 << 127) { i128::MIN } else { -(v as i128) };
+                    (ConstValue::Int(r), t)
+                } else {
+                    let (v, t) = self.value(cx, env, *expr, expected)?;
+                    match (op, v) {
+                        (UnOp::Neg, ConstValue::Float(bits, f)) => {
+                            let nb = match f {
+                                FloatTy::F64 => (-f64::from_bits(bits)).to_bits(),
+                                FloatTy::F32 => (-f32::from_bits(bits as u32)).to_bits() as u64,
+                            };
+                            (ConstValue::Float(nb, f), t)
                         }
-                        (ConstValue::Int(r), t)
+                        (UnOp::Neg, ConstValue::Int(i)) => {
+                            let it = self.int_ty_of(cx, t);
+                            if let Some(it) = it
+                                && (!it.signed() || i == int_min(it))
+                            {
+                                return Err(outside(span, "this negation (overflow)"));
+                            }
+                            let r = i.checked_neg().ok_or_else(|| outside(span, "this negation (overflow)"))?;
+                            (ConstValue::Int(r), t)
+                        }
+                        (UnOp::Not, ConstValue::Int(i)) => {
+                            let r = match self.int_ty_of(cx, t) {
+                                Some(it) => int_from_bits(!int_bits(i, it), it),
+                                None => !i,
+                            };
+                            (ConstValue::Int(r), t)
+                        }
+                        (UnOp::Not, ConstValue::Bool(b)) => (ConstValue::Bool(!b), BOOL),
+                        _ => return Err(outside(span, "this unary operation")),
                     }
-                    (UnOp::Not, ConstValue::Int(i)) => {
-                        let r = match self.int_ty_of(cx, t) {
-                            Some(it) => truncate_to_int(!i, it),
-                            None => !i,
-                        };
-                        (ConstValue::Int(r), t)
-                    }
-                    (UnOp::Not, ConstValue::Bool(b)) => (ConstValue::Bool(!b), BOOL),
-                    _ => return Err(outside(span, "this unary operation")),
                 }
             }
             Expr::Binary { op, lhs, rhs } => return Ok(Flow::Val(self.binary(cx, env, *op, *lhs, *rhs, expected, span)?)),
             Expr::Cast { expr, ty } => {
                 let target = cx.resolve_ty(*ty);
-                let v = self.value(cx, env, *expr, None)?;
+                // An unsuffixed literal takes its type from the cast
+                // target, so `300 as u8` is out of range, not 44.
+                let exp = if is_unsuffixed_lit(cx.ast(), *expr) { Some(target) } else { None };
+                let v = self.value(cx, env, *expr, exp)?;
                 return Ok(Flow::Val(self.cast(cx, v, target, span)?));
             }
             Expr::Ref { expr, mutable, .. } => {
@@ -478,9 +575,14 @@ impl Evaluator {
                 }
                 if let Some(u) = update {
                     let (bv, _) = self.value(cx, env, *u, Some(ty))?;
-                    if let ConstValue::Aggregate(bvals) = bv {
+                    let bvals = match bv {
+                        ConstValue::Aggregate(bvals) => Some(bvals),
+                        ConstValue::Variant(_, bvals) => Some(bvals),
+                        _ => None,
+                    };
+                    if let Some(bvals) = bvals {
                         for (i, b) in bvals.into_iter().enumerate() {
-                            if vals[i].is_none() {
+                            if vals.get(i).is_some_and(|v| v.is_none()) {
                                 vals[i] = Some(b);
                             }
                         }
@@ -488,7 +590,11 @@ impl Evaluator {
                 }
                 let vals: Option<Vec<ConstValue>> = vals.into_iter().collect();
                 match vals {
-                    Some(vals) if cx.tys_ref().local_adt(ty).is_some() => (ConstValue::Aggregate(vals), ty),
+                    Some(vals) if cx.tys_ref().local_adt(ty).is_some() => {
+                        // A struct-like enum variant keeps its variant;
+                        // an aggregate would silently become variant 0.
+                        if cx.is_enum(adt) { (ConstValue::Variant(variant, vals), ty) } else { (ConstValue::Aggregate(vals), ty) }
+                    }
                     _ => return Err(outside(span, "this struct literal")),
                 }
             }
@@ -641,9 +747,10 @@ impl Evaluator {
         let mut out = (ConstValue::Unit, UNIT);
         for stmt in &block.stmts {
             match stmt {
-                ast::Stmt::Let { pat, init, .. } => {
+                ast::Stmt::Let { pat, ty, init, .. } => {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
-                    let v = self.value(cx, env, *init, None)?;
+                    let exp = ty.map(|t| cx.resolve_ty(t));
+                    let v = self.value(cx, env, *init, exp)?;
                     let mut binds = Vec::new();
                     if !self.match_pat(cx, env, *pat, &v.0.clone(), v.1, true, &mut binds)? {
                         return Err(outside(cx.ast().pat_span(*pat), "a refutable pattern"));
@@ -712,7 +819,37 @@ impl Evaluator {
                 return Ok(v);
             }
         }
+        if let Some(v) = self.float_assoc_const(cx, segs) {
+            return Ok(v);
+        }
         Err(outside(span, "this path"))
+    }
+
+    /// `f64::NAN`, `std::f64::consts::PI`, and friends, by written names.
+    fn float_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &mut C, segs: &[ast::PathSeg]) -> Option<TypedValue> {
+        let names: Vec<&str> = segs.iter().map(|s| cx.sym_text(s.name)).collect();
+        let (ty_name, item, module) = match names.as_slice() {
+            [t, i] => (*t, *i, false),
+            [p, t, c, i] if matches!(*p, "std" | "core" | "alloc") && *c == "consts" => (*t, *i, true),
+            _ => return None,
+        };
+        let f = match ty_name {
+            "f32" => FloatTy::F32,
+            "f64" => FloatTy::F64,
+            _ => return None,
+        };
+        if module {
+            let bits = float_consts_value(f, item)?;
+            let t = cx.tys().float_ty(f);
+            return Some((ConstValue::Float(bits, f), t));
+        }
+        match primitive_float_assoc(f, item)? {
+            (bits, None) => {
+                let t = cx.tys().float_ty(f);
+                Some((ConstValue::Float(bits, f), t))
+            }
+            (v, Some(it)) => Some((ConstValue::Int(v as i128), super::int(it))),
+        }
     }
 
     /// `i32::MAX` and friends, resolved by written names.
@@ -738,6 +875,7 @@ impl Evaluator {
                     0
                 }
             }
+            "BITS" => return Some((ConstValue::Int(bits as i128), super::int(IntTy::U32))),
             _ => return None,
         };
         Some((ConstValue::Int(v), super::int(it)))
@@ -785,7 +923,7 @@ impl Evaluator {
                 (ConstValue::Float(a, FloatTy::F32), ConstValue::Float(b, _)) => {
                     f32::from_bits(*a as u32).partial_cmp(&f32::from_bits(*b as u32))
                 }
-                (ConstValue::Int(a), ConstValue::Int(b)) => Some(a.cmp(b)),
+                (ConstValue::Int(a), ConstValue::Int(b)) => Some(cmp_int(*a, *b, self.int_ty_of(cx, lt))),
                 (ConstValue::Char(a), ConstValue::Char(b)) => Some(a.cmp(b)),
                 (ConstValue::Bool(a), ConstValue::Bool(b)) => Some(a.cmp(b)),
                 _ => None,
@@ -851,30 +989,98 @@ impl Evaluator {
     fn int_op<'a, C: ConstCx<'a>>(&self, cx: &C, op: BinOp, a: TypedValue, b: TypedValue, span: Span) -> Result<TypedValue, Diag> {
         let (ConstValue::Int(x), t) = a else { return Err(outside(span, "this operation")) };
         let ConstValue::Int(y) = b.0 else { return Err(outside(span, "this operation")) };
-        let r = match op {
-            BinOp::Add => x.checked_add(y),
-            BinOp::Sub => x.checked_sub(y),
-            BinOp::Mul => x.checked_mul(y),
-            BinOp::Div => x.checked_div(y),
-            BinOp::Rem => x.checked_rem(y),
-            BinOp::BitAnd => Some(x & y),
-            BinOp::BitOr => Some(x | y),
-            BinOp::BitXor => Some(x ^ y),
-            BinOp::Shl => u32::try_from(y).ok().and_then(|y| x.checked_shl(y)),
-            BinOp::Shr => u32::try_from(y).ok().and_then(|y| x.checked_shr(y)),
-            _ => return Err(outside(span, "this operation")),
+        let over = || outside(span, "this operation (overflow or division by zero)");
+        // Every operation runs in the operand type: overflow of that
+        // type is a const error (rustc E0080), and shifts check the
+        // amount against the type's width. Unsigned math runs on the
+        // raw bits, so u128 values at or above 2^127 stay correct.
+        let Some(it) = self.int_ty_of(cx, t) else {
+            let r = match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                BinOp::Div => x.checked_div(y),
+                BinOp::Rem => x.checked_rem(y),
+                BinOp::BitAnd => Some(x & y),
+                BinOp::BitOr => Some(x | y),
+                BinOp::BitXor => Some(x ^ y),
+                BinOp::Shl => u32::try_from(y).ok().and_then(|y| x.checked_shl(y)),
+                BinOp::Shr => u32::try_from(y).ok().and_then(|y| x.checked_shr(y)),
+                _ => return Err(outside(span, "this operation")),
+            };
+            return Ok((ConstValue::Int(r.ok_or_else(over)?), t));
         };
-        let r = r.ok_or_else(|| outside(span, "this operation (overflow or division by zero)"))?;
-        // Overflow of the operand type is a const error, never a wrap.
-        if let Some(it) = self.int_ty_of(cx, t)
-            && !matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr)
-            && !fits(r, it)
-        {
-            return Err(outside(span, "this operation (overflow)"));
+        // A wide (unsuffixed-literal) operand that does not fit the
+        // operation type is an overflow, never a silent wrap. The
+        // shift amount is exempt: its own check bounds it.
+        let stored_fits = |v: i128| {
+            if it.bits() >= 128 {
+                true
+            } else if it.signed() {
+                fits(v, it)
+            } else {
+                v >= 0 && (v as u128) <= it.max128()
+            }
+        };
+        if !stored_fits(x) || (!matches!(op, BinOp::Shl | BinOp::Shr) && !stored_fits(y)) {
+            return Err(over());
         }
-        let r = match self.int_ty_of(cx, t) {
-            Some(it) if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) => truncate_to_int(r, it),
-            _ => r,
+        let r: i128 = if it.signed() {
+            let (x, y) = (truncate_to_int(x, it), truncate_to_int(y, it));
+            let r = match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                BinOp::Div | BinOp::Rem => {
+                    if y == 0 || (x == int_min(it) && y == -1) {
+                        None
+                    } else if op == BinOp::Div {
+                        Some(x / y)
+                    } else {
+                        Some(x % y)
+                    }
+                }
+                BinOp::BitAnd => Some(int_from_bits(int_bits(x, it) & int_bits(y, it), it)),
+                BinOp::BitOr => Some(int_from_bits(int_bits(x, it) | int_bits(y, it), it)),
+                BinOp::BitXor => Some(int_from_bits(int_bits(x, it) ^ int_bits(y, it), it)),
+                BinOp::Shl | BinOp::Shr => {
+                    let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
+                    match (op, amt) {
+                        (BinOp::Shl, Some(s)) => Some(int_from_bits(int_bits(x, it) << s, it)),
+                        (BinOp::Shr, Some(s)) => Some(x >> s),
+                        _ => None,
+                    }
+                }
+                _ => return Err(outside(span, "this operation")),
+            };
+            let r = r.ok_or_else(over)?;
+            if !matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) && !fits(r, it) {
+                return Err(over());
+            }
+            r
+        } else {
+            let (x, y) = (int_bits(x, it), int_bits(y, it));
+            let max = it.max128();
+            let r = match op {
+                BinOp::Add => x.checked_add(y).filter(|&r| r <= max),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y).filter(|&r| r <= max),
+                BinOp::Div => x.checked_div(y),
+                BinOp::Rem => x.checked_rem(y),
+                BinOp::BitAnd => Some(x & y),
+                BinOp::BitOr => Some(x | y),
+                BinOp::BitXor => Some(x ^ y),
+                BinOp::Shl | BinOp::Shr => {
+                    let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
+                    match (op, amt) {
+                        (BinOp::Shl, Some(s)) => Some((x << s) & max),
+                        (BinOp::Shr, Some(s)) => Some(x >> s),
+                        _ => None,
+                    }
+                }
+                _ => return Err(outside(span, "this operation")),
+            };
+            int_from_bits(r.ok_or_else(over)?, it)
         };
         Ok((ConstValue::Int(r), t))
     }
@@ -904,35 +1110,16 @@ impl Evaluator {
                 Ok((ConstValue::Int(truncate_to_int(r, it)), target))
             }
             (ConstValue::Int(i), TyKind::Float(g)) => {
-                let r = match g {
-                    FloatTy::F64 => (i as f64).to_bits(),
-                    FloatTy::F32 => (i as f32).to_bits() as u64,
+                // The source type decides the conversion: an unsigned
+                // source converts from its raw bits, never as a negative.
+                let unsigned = matches!(self.int_ty_of(cx, from_ty), Some(it) if !it.signed());
+                let r = match (g, unsigned) {
+                    (FloatTy::F64, true) => ((i as u128) as f64).to_bits(),
+                    (FloatTy::F32, true) => ((i as u128) as f32).to_bits() as u64,
+                    (FloatTy::F64, false) => (i as f64).to_bits(),
+                    (FloatTy::F32, false) => (i as f32).to_bits() as u64,
                 };
                 Ok((ConstValue::Float(r, g), target))
-            }
-            (ConstValue::Bool(b), TyKind::Float(g)) => {
-                let r = match g {
-                    FloatTy::F64 => ((b as u8) as f64).to_bits(),
-                    FloatTy::F32 => ((b as u8) as f32).to_bits() as u64,
-                };
-                Ok((ConstValue::Float(r, g), target))
-            }
-            (ConstValue::Char(c), TyKind::Float(g)) => {
-                let r = match g {
-                    FloatTy::F64 => ((c as u32) as f64).to_bits(),
-                    FloatTy::F32 => ((c as u32) as f32).to_bits() as u64,
-                };
-                Ok((ConstValue::Float(r, g), target))
-            }
-            (ConstValue::Float(bits, f), TyKind::Char) => {
-                let i: i128 = match f {
-                    FloatTy::F64 => f64::from_bits(bits) as i128,
-                    FloatTy::F32 => f32::from_bits(bits as u32) as i128,
-                };
-                match u32::try_from(i).ok().and_then(char::from_u32) {
-                    Some(c) => Ok((ConstValue::Char(c), target)),
-                    None => Err(outside(span, "this cast (invalid char)")),
-                }
             }
             (ConstValue::Int(i), TyKind::Int(it)) => Ok((ConstValue::Int(truncate_to_int(i, it)), target)),
             (ConstValue::Bool(b), TyKind::Int(_)) => Ok((ConstValue::Int(b as i128), target)),
@@ -1020,8 +1207,27 @@ impl Evaluator {
                 }
                 match self.block(cx, &mut fenv, body.body, Some(body.ret))? {
                     // The fn body is type-checked as a fn; its value has the
-                    // declared return type here.
-                    Flow::Val(v) | Flow::Return(v) => Ok((v.0, body.ret)),
+                    // declared return type here. A wide (unsuffixed-literal)
+                    // integer result is range-checked against it first:
+                    // this is where an untyped local meets its real type.
+                    Flow::Val(v) | Flow::Return(v) => {
+                        if let (ConstValue::Int(i), Some(it)) = (&v.0, self.int_ty_of(cx, body.ret))
+                            && v.1 != body.ret
+                        {
+                            let ok = if it.bits() >= 128 {
+                                true
+                            } else if it.signed() {
+                                fits(*i, it)
+                            } else {
+                                *i >= 0 && (*i as u128) <= it.max128()
+                            };
+                            if !ok {
+                                return Err(outside(span, "this const fn result (overflow)"));
+                            }
+                            return Ok((ConstValue::Int(int_from_bits(int_bits(*i, it), it)), body.ret));
+                        }
+                        Ok((v.0, body.ret))
+                    }
                     _ => Err(outside(span, "control flow out of a const fn")),
                 }
             }
@@ -1164,21 +1370,28 @@ impl Evaluator {
                     _ => None,
                 };
                 let Some(n) = num else { return Ok(false) };
+                let it = self.int_ty_of(cx, t);
+                let bound = |hv: ConstValue| match hv {
+                    ConstValue::Int(h) => Some(h),
+                    ConstValue::Char(c) => Some(c as i128),
+                    _ => None,
+                };
                 if let Some(lo) = lo {
                     let (lv, _) = self.value(cx, env, *lo, Some(t))?;
-                    let ConstValue::Int(l) = lv else { return Ok(false) };
-                    if n < l {
+                    let Some(l) = bound(lv) else { return Ok(false) };
+                    if cmp_int(n, l, it) == std::cmp::Ordering::Less {
                         return Ok(false);
                     }
                 }
                 if let Some(hi) = hi {
                     let (hv, _) = self.value(cx, env, *hi, Some(t))?;
-                    let ConstValue::Int(h) = hv else { return Ok(false) };
+                    let Some(h) = bound(hv) else { return Ok(false) };
+                    let c = cmp_int(n, h, it);
                     if *inclusive {
-                        if n > h {
+                        if c == std::cmp::Ordering::Greater {
                             return Ok(false);
                         }
-                    } else if n >= h {
+                    } else if c != std::cmp::Ordering::Less {
                         return Ok(false);
                     }
                 }
@@ -1539,6 +1752,80 @@ fn values_eq(a: &ConstValue, b: &ConstValue) -> bool {
         (ConstValue::Repeat(x, xn), ConstValue::Repeat(y, yn)) => xn == yn && values_eq(x, y),
         _ => a == b,
     }
+}
+
+/// A float type's own associated consts (`f64::NAN`, `f32::EPSILON`,
+/// `f64::MAX_EXP`). Returns the float bits, or an integer value with
+/// its integer type for the count and exponent consts.
+pub fn primitive_float_assoc(f: FloatTy, item: &str) -> Option<(u64, Option<IntTy>)> {
+    let flt = |v: f64| match f {
+        FloatTy::F64 => (v.to_bits(), None),
+        FloatTy::F32 => ((v as f32).to_bits() as u64, None),
+    };
+    let int = |v: i64, signed: bool| (v as u64, Some(if signed { IntTy::I32 } else { IntTy::U32 }));
+    // The float consts are taken from the compiler's own std, which
+    // carries the same values as the Rust the checked program means.
+    let out = match (f, item) {
+        (_, "NAN") => flt(f64::NAN),
+        (_, "INFINITY") => flt(f64::INFINITY),
+        (_, "NEG_INFINITY") => flt(f64::NEG_INFINITY),
+        (FloatTy::F64, "MAX") => flt(f64::MAX),
+        (FloatTy::F32, "MAX") => flt(f32::MAX as f64),
+        (FloatTy::F64, "MIN") => flt(f64::MIN),
+        (FloatTy::F32, "MIN") => flt(f32::MIN as f64),
+        (FloatTy::F64, "MIN_POSITIVE") => flt(f64::MIN_POSITIVE),
+        (FloatTy::F32, "MIN_POSITIVE") => flt(f32::MIN_POSITIVE as f64),
+        (FloatTy::F64, "EPSILON") => flt(f64::EPSILON),
+        (FloatTy::F32, "EPSILON") => (f32::EPSILON.to_bits() as u64, None),
+        (_, "RADIX") => int(2, false),
+        (FloatTy::F64, "MANTISSA_DIGITS") => int(f64::MANTISSA_DIGITS as i64, false),
+        (FloatTy::F32, "MANTISSA_DIGITS") => int(f32::MANTISSA_DIGITS as i64, false),
+        (FloatTy::F64, "DIGITS") => int(f64::DIGITS as i64, false),
+        (FloatTy::F32, "DIGITS") => int(f32::DIGITS as i64, false),
+        (FloatTy::F64, "MIN_EXP") => int(f64::MIN_EXP as i64, true),
+        (FloatTy::F32, "MIN_EXP") => int(f32::MIN_EXP as i64, true),
+        (FloatTy::F64, "MAX_EXP") => int(f64::MAX_EXP as i64, true),
+        (FloatTy::F32, "MAX_EXP") => int(f32::MAX_EXP as i64, true),
+        (FloatTy::F64, "MIN_10_EXP") => int(f64::MIN_10_EXP as i64, true),
+        (FloatTy::F32, "MIN_10_EXP") => int(f32::MIN_10_EXP as i64, true),
+        (FloatTy::F64, "MAX_10_EXP") => int(f64::MAX_10_EXP as i64, true),
+        (FloatTy::F32, "MAX_10_EXP") => int(f32::MAX_10_EXP as i64, true),
+        _ => return None,
+    };
+    Some(out)
+}
+
+/// The `std::f32::consts` and `std::f64::consts` values, as bits.
+pub fn float_consts_value(f: FloatTy, item: &str) -> Option<u64> {
+    use std::f64::consts as d;
+    let v = match item {
+        "PI" => d::PI,
+        "TAU" => d::TAU,
+        "FRAC_PI_2" => d::FRAC_PI_2,
+        "FRAC_PI_3" => d::FRAC_PI_3,
+        "FRAC_PI_4" => d::FRAC_PI_4,
+        "FRAC_PI_6" => d::FRAC_PI_6,
+        "FRAC_PI_8" => d::FRAC_PI_8,
+        "FRAC_1_PI" => d::FRAC_1_PI,
+        "FRAC_2_PI" => d::FRAC_2_PI,
+        "FRAC_2_SQRT_PI" => d::FRAC_2_SQRT_PI,
+        "SQRT_2" => d::SQRT_2,
+        "FRAC_1_SQRT_2" => d::FRAC_1_SQRT_2,
+        "E" => d::E,
+        "LOG2_E" => d::LOG2_E,
+        "LOG10_E" => d::LOG10_E,
+        "LN_2" => d::LN_2,
+        "LN_10" => d::LN_10,
+        "LOG2_10" => d::LOG2_10,
+        "LOG10_2" => d::LOG10_2,
+        _ => return None,
+    };
+    Some(match f {
+        FloatTy::F64 => v.to_bits(),
+        // std::f32::consts holds each value rounded to f32, which is
+        // the f64 value cast to f32 (the values are not near ties).
+        FloatTy::F32 => (v as f32).to_bits() as u64,
+    })
 }
 
 /// The literal text of a format string with no arguments, if it is all literal.

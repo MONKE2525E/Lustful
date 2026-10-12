@@ -422,6 +422,34 @@ pub fn parse_float_literal(text: &str) -> Option<(u64, Option<FloatTy>)> {
     clean.parse::<f64>().ok().map(|v| (v.to_bits(), None))
 }
 
+/// Parses a float literal straight to the target type, with one rounding.
+/// The runtime parser in src/runtime/float.c gives the same bits: both are
+/// correctly rounded (ties to even) for the target precision. A literal
+/// that rounds to infinity is out of range; callers report it through
+/// `float_literal_overflows`.
+pub fn parse_float_literal_as(text: &str, f: FloatTy) -> Option<u64> {
+    let clean: String = text.chars().filter(|&c| c != '_').collect();
+    let t = clean.strip_suffix("f32").or_else(|| clean.strip_suffix("f64")).unwrap_or(&clean);
+    match f {
+        FloatTy::F32 => t.parse::<f32>().ok().map(|v| v.to_bits() as u64),
+        FloatTy::F64 => t.parse::<f64>().ok().map(|v| v.to_bits()),
+    }
+}
+
+/// True when a float literal is out of range for the target type: its
+/// correctly rounded value is infinite. Rust literals cannot write inf,
+/// so an infinite parse always means overflow (the deny-level
+/// `overflowing_literals` lint in rustc).
+pub fn float_literal_overflows(text: &str, f: FloatTy) -> bool {
+    match parse_float_literal_as(text, f) {
+        Some(bits) => match f {
+            FloatTy::F32 => f32::from_bits(bits as u32).is_infinite(),
+            FloatTy::F64 => f64::from_bits(bits).is_infinite(),
+        },
+        None => false,
+    }
+}
+
 /// Evaluates a constant integer expression at collection time: literals,
 /// negation and bit-not, integer arithmetic and shifts, and `as` casts
 /// between integer types. Returns None for anything else. The full bounded
@@ -1748,6 +1776,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     }
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
         self.p.adt(adt).variants[variant as usize].disc
+    }
+    fn is_enum(&self, adt: AdtId) -> bool {
+        adt.0 != u32::MAX && self.p.adt(adt).is_enum
     }
 }
 

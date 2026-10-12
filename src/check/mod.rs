@@ -5134,6 +5134,9 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
         self.cx.p.adt(adt).variants[variant as usize].disc
     }
+    fn is_enum(&self, adt: AdtId) -> bool {
+        adt.0 != u32::MAX && self.cx.p.adt(adt).is_enum
+    }
 }
 
 /// The (Adt, variant) a path denotes in the compat tables.
