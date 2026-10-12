@@ -5,7 +5,7 @@ pub mod collect;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
-use crate::diag::{Diag, Span, unsupported};
+use crate::diag::{Diag, Span, not_yet, unsupported};
 use crate::intern::Sym;
 use crate::ty::*;
 
@@ -261,12 +261,16 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         cx.out.param_locals.push(l);
         pi += 1;
     }
-    let body_ty = cx.block(def.body, Some(f.ret));
-    let body_span = p.ast.block(def.body).span;
-    if let Some(tail) = p.ast.block(def.body).tail {
-        cx.coerce_expr(tail, body_ty, f.ret);
-    } else {
-        cx.coerce_at(body_ty, f.ret, body_span, None);
+    // A declaration without a body (trait or foreign fn shape) has nothing
+    // to check; the parser does not build those today.
+    if let Some(body) = def.body {
+        let body_ty = cx.block(body, Some(f.ret));
+        let body_span = p.ast.block(body).span;
+        if let Some(tail) = p.ast.block(body).tail {
+            cx.coerce_expr(tail, body_ty, f.ret);
+        } else {
+            cx.coerce_at(body_ty, f.ret, body_span, None);
+        }
     }
     cx.finish();
     let Ctx { out, tys, errs, .. } = cx;
@@ -522,7 +526,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut diverges = false;
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { pat, ty, init, span } => {
+                Stmt::Let { pat, ty, init, span, .. } => {
                     let declared = ty.map(|t| self.resolve_written(t));
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {
@@ -563,6 +567,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                 }
+                // Body items and statement macros are rejected by the parser today.
+                Stmt::Item(_) | Stmt::Macro { .. } => {}
                 Stmt::Expr { expr, semi } => {
                     let t = self.expr(*expr, if *semi { None } else { Some(UNIT) });
                     if self.kind(t) == TyKind::Never {
@@ -647,7 +653,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 self.expect_expr(*cond, BOOL);
                 self.loops.push(LoopCtx { break_ty: None, is_loop: false });
                 let t = self.block(*body, Some(UNIT));
@@ -655,14 +661,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.loops.pop();
                 UNIT
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 self.loops.push(LoopCtx { break_ty: None, is_loop: true });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 let l = self.loops.pop().unwrap();
                 l.break_ty.unwrap_or(NEVER)
             }
-            Expr::For { pat, iter, body } => {
+            Expr::For { pat, iter, body, .. } => {
                 let item = self.for_iter(*iter);
                 let scope = self.scopes.len();
                 self.pattern(*pat, item, false);
@@ -693,9 +699,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 result.unwrap_or(NEVER)
             }
             Expr::Call { callee, args } => self.call(e, *callee, args, span),
-            Expr::MethodCall { recv, name, name_span, generics, args } => {
-                if !generics.is_empty() {
-                    self.errs.push(unsupported(*name_span, "turbofish on method calls"));
+            Expr::MethodCall { recv, name, name_span, generic_args, args } => {
+                if !generic_args.is_empty() {
+                    self.errs.push(not_yet("L0721", *name_span, "turbofish on method calls"));
                 }
                 self.method_call(e, *recv, *name, *name_span, args)
             }
@@ -803,7 +809,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 target
             }
-            Expr::Ref { mutable, expr } => {
+            Expr::Ref { mutable, expr, .. } => {
                 let inner_expected = expected.and_then(|t| match self.kind(t) {
                     TyKind::Ref(_, inner) => Some(inner),
                     _ => None,
@@ -869,12 +875,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld: 0, rd });
                 UNIT
             }
-            Expr::StructLit { path, fields } => self.struct_lit(e, path, fields, span),
+            Expr::StructLit { path, fields, .. } => self.struct_lit(e, path, fields, span),
             Expr::Range { .. } => {
                 self.errs.push(unsupported(span, "ranges outside `for` loops"));
                 ERROR
             }
-            Expr::Break(val) => {
+            Expr::Break { value: val, .. } => {
                 let Some(lp) = self.loops.last() else {
                     self.err("L0120", span, "`break` outside of a loop", "Remove the break, or put it inside a loop.");
                     return NEVER;
@@ -905,7 +911,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 NEVER
             }
-            Expr::Continue => {
+            Expr::Continue(_) => {
                 if self.loops.is_empty() {
                     self.err("L0120", span, "`continue` outside of a loop", "Remove the continue, or put it inside a loop.");
                 }
@@ -924,6 +930,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 NEVER
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_expr(e, *kind, args, fmt, *repeat, span, expected),
+            // AST v2 expression forms: the parser rejects each one today.
+            Expr::Float(_)
+            | Expr::Tuple(_)
+            | Expr::Array(_)
+            | Expr::ArrayRepeat { .. }
+            | Expr::Closure { .. }
+            | Expr::Try(_)
+            | Expr::Await(_)
+            | Expr::AsyncBlock { .. }
+            | Expr::UnsafeBlock(_)
+            | Expr::LabeledBlock { .. }
+            | Expr::Let { .. }
+            | Expr::TupleField { .. }
+            | Expr::QPath { .. }
+            | Expr::ConstBlock(_)
+            | Expr::Underscore
+            | Expr::MacroCall(_) => ERROR,
         }
     }
 
@@ -1061,7 +1084,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(Res::Builtin(Builtin::EnvArgs));
         }
         if segs.len() != 2 {
-            self.errs.push(unsupported(span, "module paths"));
+            self.errs.push(not_yet("L0505", span, "module paths"));
             return None;
         }
         let (ty_name, item) = (names[0], names[1]);
@@ -1197,7 +1220,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::EnvArgs => (vec![], ARGS),
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {
-                            Expr::Path(segs) => segs[0].generics.clone(),
+                            Expr::Path(segs) => segs[0].type_args(),
                             _ => Vec::new(),
                         };
                         let elem = match generics.first() {
@@ -1262,6 +1285,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ast::SelfKind::Value => Autoref::None,
                 ast::SelfKind::Ref => Autoref::Ref,
                 ast::SelfKind::RefMut => Autoref::RefMut,
+                // Typed receivers are rejected by the parser today.
+                ast::SelfKind::Typed => Autoref::None,
             };
             self.set_res(e, Res::Method { f, derefs, autoref });
             let params = info.params[1..].to_vec();
@@ -1878,10 +1903,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.errs.push(unsupported(span, "refutable patterns here"));
                 }
             }
-            Pat::Range { lo, hi } => {
-                let a = self.expr(*lo, Some(t));
-                let b = self.expr(*hi, Some(t));
-                if let (Some(lo_v), Some(hi_v)) = (self.const_scalar(*lo), self.const_scalar(*hi))
+            Pat::Range { lo, hi, .. } => {
+                // The parser only builds two-bound ranges today; a half-open
+                // range checks its one bound the same way.
+                let mut bound_tys = Vec::new();
+                if let Some(lo) = lo {
+                    bound_tys.push((*lo, self.expr(*lo, Some(t))));
+                }
+                if let Some(hi) = hi {
+                    bound_tys.push((*hi, self.expr(*hi, Some(t))));
+                }
+                if let [(lo_e, _), (hi_e, _)] = bound_tys[..]
+                    && let (Some(lo_v), Some(hi_v)) = (self.const_scalar(lo_e), self.const_scalar(hi_e))
                     && lo_v > hi_v
                 {
                     self.err(
@@ -1891,7 +1924,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         "Swap the bounds, or fix the values. An empty range pattern never matches.",
                     );
                 }
-                if !self.unify(a, t) || !self.unify(b, t) || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true)) {
+                if bound_tys.iter().any(|&(_, bt)| !self.unify(bt, t))
+                    || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true))
+                {
                     self.err(
                         "L0110",
                         span,
@@ -1992,6 +2027,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
+            // AST v2 pattern forms: the parser rejects each one today.
+            Pat::Tuple(_)
+            | Pat::Slice { .. }
+            | Pat::Ref { .. }
+            | Pat::At { .. }
+            | Pat::Rest
+            | Pat::Paren(_)
+            | Pat::QPath { .. }
+            | Pat::MacroCall(_) => {}
         }
     }
 

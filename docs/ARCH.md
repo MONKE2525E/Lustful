@@ -4711,6 +4711,7 @@ rationale, the registry is the enforced list.
 | L0730-L0739 | Regions and drop check (L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes) |
 | L0801-L0809 | Macros (L0801 expansion caps, L0802 unknown macro, L0803 include file not found, L0804 proc-macro dependency, L0805 local ambiguity) |
 | L0810-L0819 | Foreign and shim boundary |
+| L0820-L0829 | Core syntax forms (added by S3b: no range above covers core expression, pattern, and statement syntax). L0820 is the S3b parser reject for those forms. |
 | L9001 | Unsupported prototype feature (existing). New work must not add L9001 sites for planned features; use the ranges above. |
 
 

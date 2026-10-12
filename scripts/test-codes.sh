@@ -54,7 +54,7 @@ if [ -x "$lust" ]; then
   if [ $? -eq 0 ] && grep -q 'reserved, not yet emitted' <<<"$out"; then ok explain-reserved
   else bad explain-reserved "lust explain L0501 gave: $out"; fi
   out=$("$lust" explain 2>&1)
-  if grep -q 'reserved (not yet emitted):' <<<"$out" && grep -q 'L0501-L0509' <<<"$out"; then ok explain-list
+  if grep -q 'reserved (not yet emitted):' <<<"$out" && grep -q 'L0501-L0504' <<<"$out"; then ok explain-list
   else bad explain-list "lust explain does not list the reserved ranges"; fi
   out=$("$lust" explain L0999 2>&1)
   if [ $? -eq 2 ] && grep -q 'unknown error code' <<<"$out"; then ok explain-unknown

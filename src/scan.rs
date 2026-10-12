@@ -53,7 +53,8 @@ fn hash_tok(h: &mut FxHasher, t: &Tok, strings: &[String]) {
             v.hash(h);
             suf.map(|s| s as u8).hash(h);
         }
-        Tok::Str(i) => strings[*i as usize].hash(h),
+        Tok::Str(i) | Tok::Float(i) => strings[*i as usize].hash(h),
+        Tok::Lifetime(s) => s.hash(h),
         Tok::Char(c) => c.hash(h),
         _ => {}
     }

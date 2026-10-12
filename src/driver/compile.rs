@@ -354,13 +354,19 @@ fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
             sh(&mut p.span);
         }
     }
-    for item in &mut ast.items {
+    for item in ast.items.iter_mut().chain(ast.stmt_items.iter_mut()) {
+        sh(&mut item.span);
         match &mut item.kind {
             ItemKind::Fn(f) => shift_fn(f, &mut sh),
             ItemKind::Struct(s) => {
                 sh(&mut s.name_span);
-                for fd in &mut s.fields {
-                    sh(&mut fd.span);
+                match &mut s.fields {
+                    crate::ast::VariantFields::Struct(fs) | crate::ast::VariantFields::Tuple(fs) => {
+                        for fd in fs {
+                            sh(&mut fd.span);
+                        }
+                    }
+                    crate::ast::VariantFields::Unit => {}
                 }
                 for (_, sp) in &mut s.derives {
                     sh(sp);
@@ -370,7 +376,7 @@ fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
                 sh(&mut e.name_span);
                 for v in &mut e.variants {
                     sh(&mut v.span);
-                    if let crate::ast::VariantFields::Struct(fs) = &mut v.fields {
+                    if let crate::ast::VariantFields::Struct(fs) | crate::ast::VariantFields::Tuple(fs) = &mut v.fields {
                         for fd in fs {
                             sh(&mut fd.span);
                         }
@@ -385,7 +391,7 @@ fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
                     shift_fn(f, &mut sh);
                 }
             }
-            ItemKind::Use => {}
+            _ => {}
         }
     }
 }
@@ -833,7 +839,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         (ItemKind::Impl(imp), Some(k)) => &mut imp.fns[k],
                         _ => unreachable!("fn_loc out of date"),
                     };
-                    def.body = body;
+                    def.body = Some(body);
                     def.exprs = exprs;
                     def.pats = pats;
                 }

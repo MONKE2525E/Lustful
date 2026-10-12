@@ -23,11 +23,18 @@ pub enum Tok {
     /// The parser rejects it wherever an identifier is expected, with a clearer message.
     Reserved(Sym),
     Int(u64, Option<IntSuffix>),
-    Float,
+    /// Index into `Lexed::strings`, holding the literal text (the parser rejects floats for now).
+    Float(u32),
     /// Index into `Lexed::strings`.
     Str(u32),
+    /// A byte string (`b".."`, `br".."`) or C string (`c".."`, `cr".."`) literal. The bytes
+    /// are not stored: the parser rejects the form before any value is needed.
+    ByteStr,
+    /// A byte char literal (`b'x'`). Like `ByteStr`, the value is not stored.
+    ByteChar,
     Char(char),
-    Lifetime,
+    /// A lifetime or loop label name, without the leading `'` (`'a`, `'static`, `'_`).
+    Lifetime(Sym),
     // Keywords.
     As,
     Break,
@@ -63,6 +70,10 @@ pub enum Tok {
     Async,
     Dyn,
     Move,
+    Crate,
+    Super,
+    Extern,
+    Await,
     // Punctuation.
     LParen,
     RParen,
@@ -111,7 +122,26 @@ pub enum Tok {
     Underscore,
     Shl,
     Dollar,
+    At,
     Eof,
+}
+
+/// A delimiter kind for token trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delim {
+    Paren,
+    Bracket,
+    Brace,
+}
+
+/// One token tree: a single token, or a delimited group of trees. Macro calls and
+/// attributes in the AST hold token trees; the expander (docs/ARCH.md section 6) is
+/// their first consumer. The parser builds trees only for the shapes it stores.
+#[allow(dead_code)] // Delimiter kinds and spans are first read by macro expansion.
+#[derive(Clone, Debug)]
+pub enum TokenTree {
+    Token(Token),
+    Delim(Delim, Vec<TokenTree>, Span),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +191,10 @@ fn keyword(s: &str) -> Option<Tok> {
         "async" => Tok::Async,
         "dyn" => Tok::Dyn,
         "move" => Tok::Move,
+        "crate" => Tok::Crate,
+        "super" => Tok::Super,
+        "extern" => Tok::Extern,
+        "await" => Tok::Await,
         "_" => Tok::Underscore,
         _ => return None,
     })
@@ -168,22 +202,20 @@ fn keyword(s: &str) -> Option<Tok> {
 
 /// Keywords of Rust 2024 (strict and reserved) that have no token of their own here.
 /// Weak keywords such as `union`, `safe`, and `macro_rules` stay usable as identifiers, as in rustc.
+/// `crate`, `super`, `extern`, and `await` have their own tokens so the parser can
+/// recognize paths, extern items, and `.await` and reject them with the right code.
 fn reserved(s: &str) -> bool {
     matches!(
         s,
         "abstract"
-            | "await"
             | "become"
             | "box"
-            | "crate"
             | "do"
-            | "extern"
             | "final"
             | "gen"
             | "macro"
             | "override"
             | "priv"
-            | "super"
             | "try"
             | "typeof"
             | "unsized"
@@ -266,8 +298,69 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 i += 1;
             }
             let s = &src[start..i];
+            // Literal prefixes: raw strings (`r".."`, `r#".."#`), byte strings and C
+            // strings (`b".."`, `br".."`, `c".."`, `cr".."`) and byte chars (`b'x'`).
+            // A raw string is an ordinary string with the same value, so it lexes to
+            // `Tok::Str`. Byte and C forms lex to their own tokens for the parser to reject.
+            if let ("r" | "br" | "cr", Some(hashes)) = (s, raw_open(b, i)) {
+                let plain = s == "r";
+                i += hashes + 1; // `#` run plus the opening quote
+                let content = i;
+                let mut close = None;
+                while i < b.len() {
+                    if b[i] == b'"' && (0..hashes).all(|k| b.get(i + 1 + k) == Some(&b'#')) {
+                        close = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                let Some(close) = close else {
+                    return Err(err(start, i, "unterminated raw string literal"));
+                };
+                let text = if plain { Some(src[content..close].to_string()) } else { None };
+                i = close + 1 + hashes;
+                match text {
+                    Some(text) => {
+                        strings.push(text);
+                        Tok::Str(strings.len() as u32 - 1)
+                    }
+                    None => Tok::ByteStr,
+                }
+            } else if (s == "b" || s == "c") && b.get(i) == Some(&b'"') {
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return Err(err(start, i, "unterminated byte or C string literal")),
+                        Some(b'"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(b'\\') => i = (i + 2).min(b.len()),
+                        Some(_) => i += 1,
+                    }
+                }
+                Tok::ByteStr
+            } else if s == "b" && b.get(i) == Some(&b'\'') {
+                i += 1;
+                if b.get(i) == Some(&b'\\') {
+                    i += 2;
+                    if b.get(i.wrapping_sub(1)) == Some(&b'x') {
+                        i = (i + 2).min(b.len());
+                    }
+                } else if i < b.len() {
+                    i += src[i..].chars().next().map_or(1, |ch| ch.len_utf8());
+                }
+                if b.get(i) != Some(&b'\'') {
+                    return Err(err(start, i, "unterminated byte char literal"));
+                }
+                i += 1;
+                Tok::ByteChar
+            }
             // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
-            if s == "r" && b.get(i) == Some(&b'#') && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80) {
+            else if s == "r"
+                && b.get(i) == Some(&b'#')
+                && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80)
+            {
                 i += 1;
                 let name_start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
@@ -291,7 +384,7 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::Ident(*cache.entry(s).or_insert_with(|| interner.intern(s)))
             }
         } else if c.is_ascii_digit() {
-            lex_number(src, &mut i).ok_or_else(|| err(start, i, "invalid number literal"))?
+            lex_number(src, &mut i, &mut strings).ok_or_else(|| err(start, i, "invalid number literal"))?
         } else if c == b'"' {
             i += 1;
             let mut s = String::new();
@@ -329,10 +422,12 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             let after = next.map(|ch| i + 1 + ch.len_utf8());
             if next.is_some_and(|ch| ch.is_alphabetic() || ch == '_') && after.and_then(|a| b.get(a)) != Some(&b'\'') {
                 i += 1;
+                let name_start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
-                Tok::Lifetime
+                let name = &src[name_start..i];
+                Tok::Lifetime(*cache.entry(name).or_insert_with(|| interner.intern(name)))
             } else {
                 i += 1;
                 let ch = if b.get(i) == Some(&b'\\') {
@@ -403,6 +498,7 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                             b'#' => Tok::Pound,
                             b'?' => Tok::Question,
                             b'$' => Tok::Dollar,
+                            b'@' => Tok::At,
                             _ => return Err(err(start, start + 1, "unexpected character")),
                         },
                         1,
@@ -422,7 +518,22 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
 // `>>` is never lexed as one token, so generics like `Vec<Vec<i64>>` parse without splitting.
 // The parser joins two `>` tokens into a shift when they touch.
 
-fn lex_number(src: &str, i: &mut usize) -> Option<Tok> {
+/// If a raw string opening (`#` run plus `"`) starts at `i`, returns the `#` count.
+fn raw_open(b: &[u8], i: usize) -> Option<usize> {
+    let mut hashes = 0;
+    while b.get(i + hashes) == Some(&b'#') {
+        hashes += 1;
+    }
+    (b.get(i + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+/// Stores a float literal's text in `strings` and returns its token.
+fn float_tok(src: &str, start: usize, end: usize, strings: &mut Vec<String>) -> Tok {
+    strings.push(src[start..end].to_string());
+    Tok::Float(strings.len() as u32 - 1)
+}
+
+fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok> {
     let b = src.as_bytes();
     let start = *i;
     let (radix, digits_start) = match (b[start], b.get(start + 1)) {
@@ -441,7 +552,29 @@ fn lex_number(src: &str, i: &mut usize) -> Option<Tok> {
         while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
             *i += 1;
         }
-        return Some(Tok::Float);
+        // An exponent sign right after `e` belongs to the literal (`1.5e-3`).
+        if *i >= 2 && (b[*i - 1] == b'e' || b[*i - 1] == b'E') && matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+            while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+                *i += 1;
+            }
+        }
+        return Some(float_tok(src, start, *i, strings));
+    }
+    // An exponent with no dot: `1e3`, `1e-3`, `1e3f64`. Not an identifier suffix:
+    // the exponent needs at least one digit after the optional sign.
+    if radix == 10 && matches!(b.get(*i), Some(b'e' | b'E')) {
+        let mut j = *i + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        if b.get(j).is_some_and(|c| c.is_ascii_digit()) {
+            *i = j;
+            while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+                *i += 1;
+            }
+            return Some(float_tok(src, start, *i, strings));
+        }
     }
     let digits_end = *i;
     let suf_start = *i;
@@ -450,7 +583,7 @@ fn lex_number(src: &str, i: &mut usize) -> Option<Tok> {
     }
     let suf = &src[suf_start..*i];
     if suf == "f32" || suf == "f64" {
-        return Some(Tok::Float);
+        return Some(float_tok(src, start, *i, strings));
     }
     // Accumulate digits directly; underscores are separators.
     let mut value: u64 = 0;

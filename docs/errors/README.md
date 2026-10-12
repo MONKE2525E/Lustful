@@ -51,4 +51,14 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0403](L0403.md) | cannot derive this trait |
 | [L0404](L0404.md) | `unsafe` is not supported |
 | [L0405](L0405.md) | `async` is not supported |
+| [L0505](L0505.md) | modules and module paths are not supported yet |
+| [L0522](L0522.md) | this attribute is not supported yet |
+| [L0602](L0602.md) | this type form is not supported yet |
+| [L0614](L0614.md) | traits and generics are not supported yet |
+| [L0621](L0621.md) | associated items are not supported yet |
+| [L0632](L0632.md) | const and static items are not supported yet |
+| [L0641](L0641.md) | this literal or std form is not supported yet |
+| [L0721](L0721.md) | this method or receiver form is not supported yet |
+| [L0810](L0810.md) | extern blocks are not supported yet |
+| [L0820](L0820.md) | this syntax form is not supported yet |
 | [L9001](L9001.md) | feature is not supported yet |

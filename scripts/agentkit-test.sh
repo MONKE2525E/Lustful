@@ -137,7 +137,7 @@ assert len(re.findall(r"^\s+[A-Z]\w+,", macro_body, re.M)) == len(cap["macros"])
 # Rejected codes are all documented codes.
 codes = {c["code"] for c in cap["diagnostics"]["codes"]}
 assert all(r["code"] in codes for r in cap["rejected"])
-assert len(codes) == 43
+assert len(codes) == 53
 PYEOF
 check cap-content $? "see the python assert above"
 "$lust" capabilities | grep -q "methods on Vec<T>"; check cap-human $? "human output must list methods"
