@@ -1264,7 +1264,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn new_var(&mut self, int: bool) -> Ty {
         self.vars.push(Var { bound: None });
         let id = self.vars.len() as u32 - 1;
-        self.tys.intern(TyKind::Infer(InferId(id, int)))
+        self.tys.intern(TyKind::Infer(InferId(id, if int { InferKind::Int } else { InferKind::General })))
+    }
+    /// A fresh float-literal variable: binds only to a float type,
+    /// defaults to f64 at body end.
+    fn new_float_var(&mut self) -> Ty {
+        self.vars.push(Var { bound: None });
+        let id = self.vars.len() as u32 - 1;
+        self.tys.intern(TyKind::Infer(InferId(id, InferKind::Float)))
+    }
+    /// True when `t` resolves to a float type or an unbound float variable.
+    fn float_like(&self, t: Ty) -> bool {
+        matches!(self.kind(t), TyKind::Float(_)) || self.kind(t).is_float_infer()
     }
     /// Follows variable bindings at the top level only.
     fn resolve(&self, mut t: Ty) -> Ty {
@@ -1299,7 +1310,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if !zonk {
                     return t;
                 }
-                let d = if v.is_int() { I32 } else { ERROR };
+                let d = if v.is_int() {
+                    I32
+                } else if v.is_float() {
+                    self.tys.float_ty(FloatTy::F64)
+                } else {
+                    ERROR
+                };
                 self.bind_var(v.index(), d);
                 d
             }
@@ -1425,8 +1442,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match (self.tys.kind(a), self.tys.kind(b)) {
             (TyKind::Error, _) | (_, TyKind::Error) => true,
             (TyKind::Infer(v), TyKind::Infer(w)) => {
-                // Bind the general variable to the integer one, so the integer constraint survives.
-                if v.is_int() && !w.is_int() {
+                // Bind the general variable to the constrained one, so
+                // the int or float constraint survives. An int variable
+                // never unifies with a float variable.
+                if (v.is_int() && w.is_float()) || (v.is_float() && w.is_int()) {
+                    return false;
+                }
+                if (v.is_int() || v.is_float()) && !w.is_int() && !w.is_float() {
                     self.bind_var(w.index(), a);
                 } else {
                     self.bind_var(v.index(), b);
@@ -1435,6 +1457,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (TyKind::Infer(v), k) | (k, TyKind::Infer(v)) => {
                 if v.is_int() && !matches!(k, TyKind::Int(_)) {
+                    return false;
+                }
+                if v.is_float() && !matches!(k, TyKind::Float(_)) {
                     return false;
                 }
                 let other = if matches!(self.tys.kind(a), TyKind::Infer(_)) { b } else { a };
@@ -1880,9 +1905,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match crate::check::collect::parse_float_literal(text) {
                     Some((_, suffix)) => match suffix {
                         Some(f) => self.tys.float_ty(f),
-                        None => match expected.map(|t| self.kind(t)) {
-                            Some(TyKind::Float(_)) => expected.unwrap(),
-                            _ => self.tys.float_ty(FloatTy::F64),
+                        // An unsuffixed float literal stays a float
+                        // variable until a use decides f32 or f64; it
+                        // defaults to f64 at body end, like rustc.
+                        None => match expected.map(|t| (self.resolve(t), self.kind(t))) {
+                            Some((t, TyKind::Float(_))) => t,
+                            Some((t, k)) if k.is_float_infer() => t,
+                            _ => self.new_float_var(),
                         },
                     },
                     None => {
@@ -2139,6 +2168,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let k = self.kind(inner);
                 match (op, k) {
                     (UnOp::Neg, TyKind::Float(_)) => inner,
+                    (UnOp::Neg, k) if k.is_float_infer() => inner,
                     (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
                     (UnOp::Neg, k) if k.is_int_infer() => inner,
                     (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
@@ -2159,7 +2189,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Cast { expr, ty } => {
                 let target = self.resolve_written(*ty);
-                let t = self.expr(*expr, None);
+                // An unsuffixed literal takes its type from the cast
+                // target: `300 as u8` is a u8 literal out of range,
+                // and `3000000000 as u64` needs no i32 fit first.
+                let exp = if crate::ty::consteval::is_unsuffixed_lit(p.ast, *expr) { Some(target) } else { None };
+                let t = self.expr(*expr, exp);
                 let enum_cast = match self.tys.local_adt(self.resolve(t)) {
                     Some(a) => p.adt(a).is_enum && p.adt(a).variants.iter().all(|v| v.shape == VariantShape::Unit),
                     None => false,
@@ -2171,6 +2205,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let ok = match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
+                    (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
                     (_, TyKind::Int(_)) if enum_cast => true,
                     (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
                     (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
@@ -2242,6 +2277,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let ok = !rmut
                     && match (*op, lk) {
                         (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, TyKind::Float(_)) => self.unify(lt, rinner),
+                        (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, k) if k.is_float_infer() => self.unify(lt, rinner),
                         (_, TyKind::Error) => true,
                         (BinOp::Shl | BinOp::Shr, k) if int_like(k) => int_like(self.kind(rinner)),
                         (_, k) if int_like(k) => self.unify(lt, rinner),
@@ -3787,7 +3823,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let lb = self.deep(lb);
             let ok = match self.tys.kind(lb) {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
-                k if k.is_int_infer() || self.tys.is_string_ty(lb) => true,
+                k if k.is_int_infer() || k.is_float_infer() || self.tys.is_string_ty(lb) => true,
                 _ if matches!(op, Eq | Ne) => has_eq(self.p, &self.tys, lb),
                 _ => false,
             };
@@ -3826,7 +3862,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return t;
         }
         let result = match op {
-            Add | Sub | Mul | Div | Rem if matches!(lik, TyKind::Float(_)) && matches!(rik, TyKind::Float(_)) => {
+            Add | Sub | Mul | Div | Rem
+                if (matches!(lik, TyKind::Float(_)) || lik.is_float_infer()) && (matches!(rik, TyKind::Float(_)) || rik.is_float_infer()) =>
+            {
                 if !self.unify(li, ri) {
                     return bad(self);
                 }
@@ -5249,10 +5287,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.out.pat_res[i] = PatRes::Variant(inst, v);
             }
         }
-        // Literal range checks.
+        // Literal range checks (the deny-level overflowing_literals
+        // lint, for ints and floats alike).
         let base = self.out.expr_base;
         for i in 0..self.out.expr_ty.len() {
             let e = ExprId(base + i as u32);
+            if let Expr::Float(s) = self.p.ast.expr(e)
+                && let TyKind::Float(f) = self.tys.kind(self.out.expr_ty[i])
+            {
+                let text = self.p.ast.strings[*s as usize].as_str();
+                if crate::check::collect::float_literal_overflows(text, f) {
+                    let sp = self.span(e);
+                    self.err(
+                        "L0118",
+                        sp,
+                        format!("literal out of range for `{}`", f.name()),
+                        format!("Use a value that fits in `{}`, or a wider type.", f.name()),
+                    );
+                }
+            }
             if let Expr::Int(v, _) = self.p.ast.expr(e)
                 && let TyKind::Int(it) = self.tys.kind(self.out.expr_ty[i])
             {

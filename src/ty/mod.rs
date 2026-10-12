@@ -105,11 +105,20 @@ pub const EMPTY_BINDINGS: BindingsId = BindingsId(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AssocId(pub DefId);
 
-/// One body-local inference variable. `int` is true for integer literals with no type yet,
-/// which may only ever bind to an integer type. Body-local only: an `Infer` type must never
+/// What an inference variable may bind to: any type, only an integer
+/// type (an unsuffixed integer literal), or only a float type (an
+/// unsuffixed float literal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InferKind {
+    General,
+    Int,
+    Float,
+}
+
+/// One body-local inference variable. Body-local only: an `Infer` type must never
 /// enter the global store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InferId(pub u32, pub bool);
+pub struct InferId(pub u32, pub InferKind);
 
 impl InferId {
     /// The index into the checking body's variable table.
@@ -118,7 +127,11 @@ impl InferId {
     }
     /// True if this variable may only bind to an integer type.
     pub fn is_int(self) -> bool {
-        self.1
+        self.1 == InferKind::Int
+    }
+    /// True if this variable may only bind to a float type.
+    pub fn is_float(self) -> bool {
+        self.1 == InferKind::Float
     }
 }
 
@@ -501,6 +514,10 @@ impl TyKind {
     /// True for an unbound integer-literal variable (the `{integer}` of error messages).
     pub fn is_int_infer(self) -> bool {
         matches!(self, TyKind::Infer(v) if v.is_int())
+    }
+    /// True for an unbound float-literal variable (the `{float}` of error messages).
+    pub fn is_float_infer(self) -> bool {
+        matches!(self, TyKind::Infer(v) if v.1 == InferKind::Float)
     }
 }
 
@@ -1468,7 +1485,7 @@ mod tests {
         let global_vec = g.mk_vec(I32);
         let mut tys = Tys::new(&g);
         assert_eq!(tys.mk_vec(I32), global_vec);
-        let var = tys.intern(TyKind::Infer(InferId(0, false)));
+        let var = tys.intern(TyKind::Infer(InferId(0, InferKind::General)));
         let local_vec = tys.mk_vec(var);
         assert_eq!(tys.vec_elem(local_vec), Some(var));
         assert_eq!(g.get(tys.kind(local_vec)), None, "body-local kinds never enter the global store");

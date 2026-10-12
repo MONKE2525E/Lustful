@@ -880,7 +880,7 @@ impl<'g> SolveCx for PureCx<'g> {
     fn fresh_var(&mut self) -> Ty {
         self.vars.push(None);
         let id = self.vars.len() as u32 - 1;
-        self.tys.intern(TyKind::Infer(InferId(id, false)))
+        self.tys.intern(TyKind::Infer(InferId(id, InferKind::General)))
     }
 
     fn snapshot(&mut self) -> usize {
@@ -905,7 +905,7 @@ impl PureCx<'_> {
     pub fn fresh_int_var(&mut self) -> Ty {
         self.vars.push(None);
         let id = self.vars.len() as u32 - 1;
-        self.tys.intern(TyKind::Infer(InferId(id, true)))
+        self.tys.intern(TyKind::Infer(InferId(id, InferKind::Int)))
     }
 }
 

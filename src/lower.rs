@@ -378,17 +378,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Float(f) => f,
                     _ => FloatTy::F64,
                 };
-                match crate::check::collect::parse_float_literal(text) {
-                    Some((bits, _)) => {
-                        // A literal parsed as f64 narrows to f32 when the
-                        // expected type is f32 (a suffix already pinned it).
-                        let bits = if ft == FloatTy::F32 && !text.trim_end().ends_with("f32") {
-                            (f64::from_bits(bits) as f32).to_bits() as u64
-                        } else {
-                            bits
-                        };
-                        Operand::Const(Const::Float(bits, ft))
-                    }
+                // Parse straight to the literal's type: one rounding.
+                match crate::check::collect::parse_float_literal_as(text, ft) {
+                    Some(bits) => Operand::Const(Const::Float(bits, ft)),
                     None => Operand::Const(Const::Unit),
                 }
             }
@@ -1456,17 +1448,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Float(f) => f,
                     _ => FloatTy::F64,
                 };
-                match crate::check::collect::parse_float_literal(text) {
-                    Some((bits, _)) => {
-                        // A literal parsed as f64 narrows to f32 when the
-                        // expected type is f32 (a suffix already pinned it).
-                        let bits = if ft == FloatTy::F32 && !text.trim_end().ends_with("f32") {
-                            (f64::from_bits(bits) as f32).to_bits() as u64
-                        } else {
-                            bits
-                        };
-                        Operand::Const(Const::Float(bits, ft))
-                    }
+                // Parse straight to the literal's type: one rounding.
+                match crate::check::collect::parse_float_literal_as(text, ft) {
+                    Some(bits) => Operand::Const(Const::Float(bits, ft)),
                     None => Operand::Const(Const::Unit),
                 }
             }

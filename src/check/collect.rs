@@ -248,6 +248,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         TyKind::Param(param) => format!("T{}", param.0),
         TyKind::Projection(..) => "{projection}".into(),
         TyKind::Infer(v) if v.is_int() => "{integer}".into(),
+        TyKind::Infer(v) if v.is_float() => "{float}".into(),
         TyKind::Infer(_) => "_".into(),
     }
 }
@@ -1880,7 +1881,7 @@ fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
-        TyKind::Infer(v) => v.is_int(),
+        TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
@@ -1927,7 +1928,7 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
-        TyKind::Infer(v) => v.is_int(),
+        TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_eq(p, tys, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_eq(p, tys, e)),
         TyKind::Array(e, _) | TyKind::Slice(e) => has_eq(p, tys, e),
@@ -1954,7 +1955,7 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
-        TyKind::Infer(v) => v.is_int(),
+        TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_debug(p, tys, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_debug(p, tys, e)),
         TyKind::Array(e, _) | TyKind::Slice(e) => has_debug(p, tys, e),
@@ -1981,7 +1982,7 @@ pub fn has_display(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
-        TyKind::Infer(v) => v.is_int(),
+        TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_display(tys, e),
         _ => tys.is_string_ty(t),
     }
