@@ -1084,14 +1084,28 @@ fn unit_header() -> String {
     c
 }
 
+/// runtime.c with the float runtime inlined. Units compile from strings, so the
+/// `#include "rt/float.h"` at the end of runtime.c cannot read files; declaration
+/// units get float.h's prototypes, the runtime unit gets float.c's bodies too.
+fn runtime_source(with_float_impl: bool) -> String {
+    let header = include_str!("rt/float.h");
+    let header = if with_float_impl {
+        let body = include_str!("rt/float.c").replacen("#include \"ryu_tables.h\"", include_str!("rt/ryu_tables.h"), 1);
+        header.replacen("#include \"float.c\"", &body, 1)
+    } else {
+        header.replacen("#include \"float.c\"", "", 1)
+    };
+    include_str!("runtime.c").replacen("#include \"rt/float.h\"", &header, 1)
+}
+
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do
 /// not make tcc tokenize code that would expand to nothing.
 fn runtime_decls() -> &'static str {
     static DECLS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DECLS.get_or_init(|| {
-        let src = include_str!("runtime.c");
+        let src = runtime_source(false);
         let mut out = String::with_capacity(src.len() / 2);
-        let mut rest = src;
+        let mut rest = src.as_str();
         // Skip the macro's own definition lines, which mention LUST_BODY without a body.
         while let Some(i) = rest.find("LUST_BODY(") {
             let line_start = rest[..i].rfind('\n').map_or(0, |n| n + 1);
@@ -1136,7 +1150,7 @@ fn runtime_decls() -> &'static str {
 
 /// The unit with the runtime's function definitions. It only changes when lust itself does.
 pub fn runtime_unit() -> String {
-    format!("#define LUST_IMPL 1\n{}", include_str!("runtime.c"))
+    format!("#define LUST_IMPL 1\n{}", runtime_source(true))
 }
 
 /// Unit 0: the line table (by slot), globals, overlay registration, and `main`. Rebuilt on every
