@@ -1,46 +1,3 @@
-/* Lust C runtime. Every compilation unit includes this text.
-   - With LUST_IMPL defined (one unit per program): full function definitions.
-   - Without it (all other units): declarations only, so those units stay small and parse fast.
-   Rules: wrapping math is done in uint64_t, so C integer promotion never makes signed overflow;
-   every check that Rust does in debug builds is done here and panics the same way. */
-#include <stdint.h>
-#include <stddef.h>
-#ifdef LUST_IMPL
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#define LUST_BODY(...) __VA_ARGS__
-#else
-void free(void *);
-void abort(void);
-#define LUST_BODY(...) ;
-#endif
-
-typedef struct { uint8_t *ptr; uint64_t len; } lust_str;
-typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
-typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;
-typedef struct { uint64_t n; } lust_Args;
-
-/* Program globals, defined in the runtime unit and set by main. */
-extern int lust_argc;
-extern const char *lust_file;
-
-/* Every function is called through this table (see cgen.rs). */
-typedef void (*lust_fnptr)(void);
-extern lust_fnptr lust_fns[];
-void lust_base_init(void);
-
-/* A source location: (function id << 32) | (line within the function << 12) | column. Lines are
-   relative to each function's first line (lust_fn_line), so the code for an unchanged function
-   stays valid when code above it moves. */
-typedef uint64_t lust_loc;
-extern const uint32_t *lust_fn_line;
-#ifdef LUST_IMPL
-int lust_argc;
-const char *lust_file;
-const uint32_t *lust_fn_line;
-#endif
-
 void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abort(); })
 
 void *lust_realloc(void *p, uint64_t n) LUST_BODY({
@@ -106,27 +63,7 @@ int lust_str_cmp(lust_str a, lust_str b) LUST_BODY({
 })
 uint8_t lust_str_eq(lust_str a, lust_str b) LUST_BODY({ return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); })
 
-/* ---------- Panics ---------- */
-
-void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
-    fflush(stdout);
-    fprintf(stderr, "\nthread 'main' panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
-            lust_file, (unsigned)(lust_fn_line[loc >> 32] + ((loc >> 12) & 0xFFFFF)), (unsigned)(loc & 0xFFF), (int)msg->len, (const char *)msg->ptr);
-    fflush(stderr);
-    abort();
-})
-
-void lust_panic_str(lust_str msg, lust_loc loc) LUST_BODY({
-    lust_String s = lust_string_from(msg);
-    lust_panic(&s, loc);
-})
-
-void lust_panic_cstr(const char *msg, lust_loc loc) LUST_BODY({
-    lust_String s = lust_string_new();
-    lust_string_push_cstr(&s, msg);
-    lust_panic(&s, loc);
-})
-
+#include "panic.c"
 /* ---------- Formatting ---------- */
 
 void lust_fmt_u64(lust_String *out, uint64_t v) LUST_BODY({
@@ -402,4 +339,4 @@ uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
 })
 
 /* Float formatting, parsing, and casts (src/rt/float.h). */
-#include "rt/float.h"
+#include "float.h"

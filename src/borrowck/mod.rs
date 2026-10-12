@@ -11,10 +11,10 @@
 //    which Polonius would accept).
 // 4. Each access is checked against the live loans it conflicts with.
 use crate::check::Builtin;
-use crate::collect::*;
+use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};
 use crate::ir::*;
-use crate::types::*;
+use crate::ty::*;
 use std::collections::HashSet;
 
 #[derive(Clone, PartialEq, Eq)]

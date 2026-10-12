@@ -2,9 +2,9 @@
 // The borrow checker and the C backend both read it.
 use crate::ast::{BinOp, UnOp};
 use crate::check::Builtin;
-use crate::collect::FnId;
+use crate::check::collect::FnId;
 use crate::diag::Span;
-use crate::types::{AdtId, IntTy, Ty, Tys};
+use crate::ty::{AdtId, IntTy, Ty, Tys};
 
 pub type Local = u32;
 

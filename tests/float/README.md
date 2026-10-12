@@ -1,6 +1,6 @@
 # Float runtime tests
 
-Tests for `src/rt/float.c`: byte-exact Rust 1.99 float formatting,
+Tests for `src/runtime/float.c`: byte-exact Rust 1.99 float formatting,
 parsing, casts, and ryu-js (ECMAScript) number formatting.
 
 - `harness.c` compiles the real runtime with a C compiler and answers
@@ -23,7 +23,7 @@ parsing, casts, and ryu-js (ECMAScript) number formatting.
   with the pinned tcc, the same compiler lust uses, plus a gcc build
   checked on a slice to prove the answers do not depend on the C
   compiler.
-- `gen_ryu_tables.py` regenerates `src/rt/ryu_tables.h` from the
+- `gen_ryu_tables.py` regenerates `src/runtime/ryu_tables.h` from the
   ryu-js crate in the local cargo registry.
 
 Two measured facts the implementation depends on, both re-checked by

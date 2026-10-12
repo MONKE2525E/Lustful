@@ -1,9 +1,10 @@
 /* C harness for the float runtime. Compiles the real runtime (including
-   src/rt/float.c) with the pinned tcc, the same compiler lust uses.
+   src/runtime/float.c) with the pinned tcc, the same compiler lust uses.
    Modes stream cases from stdin like oracle.rs does and must byte-match
    it; `edges` runs directed assertions; `bench` reports ns per call. */
 #define LUST_IMPL 1
-#include "../../src/runtime.c"
+#include "../../src/runtime/runtime.h"
+#include "../../src/runtime/core.c"
 #include <stdio.h>
 #include <time.h>
 

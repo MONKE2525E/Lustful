@@ -1,10 +1,10 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt};
+use crate::check::collect::*;
 use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, Res};
-use crate::collect::*;
 use crate::diag::Span;
 use crate::ir::*;
-use crate::types::*;
+use crate::ty::*;
 
 struct LoopInfo {
     break_bb: Bb,

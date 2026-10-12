@@ -68,7 +68,7 @@ fn claim_start(lock: &Path) -> bool {
     false
 }
 
-/// The cache dir for daemon logs. The same rule as the disk cache (src/cache.rs).
+/// The cache dir for daemon logs. The same rule as the disk cache (src/driver/cache.rs).
 fn log_dir(file: &Path) -> PathBuf {
     match std::env::var_os("LUST_CACHE_DIR") {
         Some(d) if !d.is_empty() => PathBuf::from(d),

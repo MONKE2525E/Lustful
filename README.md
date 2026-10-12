@@ -132,14 +132,14 @@ The agent-loop benchmark also tests incremental mode: every edit's result is com
 | File | Role |
 |---|---|
 | `src/client.rs`, `src/protocol.rs` | The thin `lust` client (daemon autostart, release handoff) and the daemon wire format. |
-| `src/cache.rs` | The whole-request disk cache for cold runs. |
-| `src/main.rs`, `src/daemon.rs`, `src/driver.rs` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
+| `src/driver/cache.rs` | The whole-request disk cache for cold runs. |
+| `src/main.rs`, `src/daemon.rs`, `src/driver/` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
 | `src/diag.rs`, `docs/errors/` | Diagnostics with stable codes. `--json` uses schema 1 records with spans, labels, and a source hash. One explain page per code. |
 | `src/testrun.rs`, `src/explain.rs`, `src/capabilities.rs` | The agent kit: `lust test`, `lust explain`, and `lust capabilities`. |
 | `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas; the token scan that finds what changed. |
-| `src/collect.rs` | Item tables and signatures. |
-| `src/check.rs` | Local type inference, method resolution, exhaustiveness. |
+| `src/check/collect.rs` | Item tables and signatures. |
+| `src/check/mod.rs`, `src/ty/mod.rs` | Local type inference, method resolution, exhaustiveness; interned semantic types. |
 | `src/lower.rs`, `src/ir.rs` | Lowering to a MIR-like CFG with explicit temporaries and drops. |
-| `src/borrowck.rs` | Init, move, and loan dataflow, plus liveness. |
-| `src/cgen.rs`, `src/runtime.c` | C backend and runtime. Checked math is done in 64-bit unsigned, so C never sees signed overflow. |
+| `src/borrowck/mod.rs` | Init, move, and loan dataflow, plus liveness. |
+| `src/cgen.rs`, `src/runtime/` | C backend and runtime. Checked math is done in 64-bit unsigned, so C never sees signed overflow. |
 | `src/tcc.rs` | libtcc in process, parallel `tcc -c` for large programs, and shared-library linking. |

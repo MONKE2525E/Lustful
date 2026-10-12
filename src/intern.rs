@@ -206,8 +206,8 @@ known_syms!(
 
 impl Known {
     /// The integer type a name refers to, if any.
-    pub fn int_ty(&self, s: Sym) -> Option<crate::types::IntTy> {
-        use crate::types::IntTy::*;
+    pub fn int_ty(&self, s: Sym) -> Option<crate::ty::IntTy> {
+        use crate::ty::IntTy::*;
         let table = [
             (self.i8, I8),
             (self.i16, I16),

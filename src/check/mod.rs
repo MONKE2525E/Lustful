@@ -1,10 +1,13 @@
 // Type checking for one function body. Inference is local to the body: unification plus
 // integer-literal variables. Output is a set of side tables that lowering reads.
+// Signature collection runs before body checking, in `collect`.
+pub mod collect;
+
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
-use crate::collect::*;
+use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};
 use crate::intern::Sym;
-use crate::types::*;
+use crate::ty::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Autoref {

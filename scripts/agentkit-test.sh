@@ -113,7 +113,7 @@ assert cap["functions"] == {"std::env": ["args"]}
 assert len(cap["integer_types"]) == 10
 # Every literal at an unsupported(...) call site is named in the rejected list.
 features = [r["feature"] for r in cap["rejected"]]
-src = "\n".join(p.read_text() for p in (root / "src").glob("*.rs") if p.name != "capabilities.rs")
+src = "\n".join(p.read_text() for p in (root / "src").rglob("*.rs") if p.name != "capabilities.rs")
 missing = []
 for lit in re.findall(r'unsupported\([^,]+,\s*(?:&format!\()?"((?:[^"\\]|\\.)*)"', src):
     lit = lit.replace("{{", "{").replace("}}", "}")
@@ -121,7 +121,7 @@ for lit in re.findall(r'unsupported\([^,]+,\s*(?:&format!\()?"((?:[^"\\]|\\.)*)"
     if len(prefix) >= 4 and not any(prefix in f for f in features):
         missing.append(prefix)
 assert not missing, f"rejected list misses: {missing}"
-# Named std types rejected in collect.rs appear by name.
+# Named std types rejected in check/collect.rs appear by name.
 m = re.search(r'\["(HashMap[^]]*)\]', src)
 names = re.findall(r'"([A-Za-z0-9]+)"', m.group(1))
 assert all(any(n in f for f in features) for n in names), names

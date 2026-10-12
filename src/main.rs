@@ -7,11 +7,9 @@
 //   lust-core capabilities [--json]           what the supported subset contains
 mod ast;
 mod borrowck;
-mod cache;
 mod capabilities;
 mod cgen;
 mod check;
-mod collect;
 mod daemon;
 mod diag;
 mod driver;
@@ -25,7 +23,7 @@ mod protocol;
 mod scan;
 mod tcc;
 mod testrun;
-mod types;
+mod ty;
 
 use protocol::Invocation;
 
@@ -76,7 +74,7 @@ fn main() {
             // request is also never cached: its response can be the program's own output and
             // exit code (an in-memory run writes no executable), not a build result.
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() && req.run_args.is_none() { cache::Cache::open(&req.file) } else { None };
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() { driver::cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)

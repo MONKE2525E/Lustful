@@ -4,7 +4,7 @@ use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
 use crate::diag::{Diag, Span, unsupported};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
-use crate::types::*;
+use crate::ty::*;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Derives {

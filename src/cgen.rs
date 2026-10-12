@@ -2,10 +2,10 @@
 // eq, debug) are requested by structural type and generated once, after all functions.
 use crate::ast::{BinOp, UnOp};
 use crate::check::Builtin;
-use crate::collect::*;
+use crate::check::collect::*;
 use crate::diag::{LineIndex, Span};
 use crate::ir::*;
-use crate::types::*;
+use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -1084,18 +1084,32 @@ fn unit_header() -> String {
     c
 }
 
-/// runtime.c with the float runtime inlined. Units compile from strings, so the
-/// `#include "rt/float.h"` at the end of runtime.c cannot read files; declaration
-/// units get float.h's prototypes, the runtime unit gets float.c's bodies too.
+/// The full runtime source, assembled from `src/runtime/`: runtime.h first, then core.c
+/// with its two `#include` lines replaced by the included text (panic.c; float.h at the
+/// end). Units compile from strings, so file includes cannot read files; declaration
+/// units get float.h's prototypes only (`with_float_impl` false), the runtime unit gets
+/// float.c's bodies too. The runtime stays one amalgamated unit (see `runtime_unit`),
+/// so the split files are source fragments, not separate translation units, and the
+/// includes are also what a plain C compiler follows when a test harness includes
+/// runtime.h and core.c directly. The panic include sits where the panic section
+/// belonged in the old single runtime.c: after the string helpers it calls, before
+/// the checked math that calls it. Splice results reproduce that file byte for byte
+/// (plus the float text), so generated C does not change when text moves between
+/// fragments.
 fn runtime_source(with_float_impl: bool) -> String {
-    let header = include_str!("rt/float.h");
+    let header = include_str!("runtime/float.h");
     let header = if with_float_impl {
-        let body = include_str!("rt/float.c").replacen("#include \"ryu_tables.h\"", include_str!("rt/ryu_tables.h"), 1);
+        let body = include_str!("runtime/float.c").replacen("#include \"ryu_tables.h\"", include_str!("runtime/ryu_tables.h"), 1);
         header.replacen("#include \"float.c\"", &body, 1)
     } else {
         header.replacen("#include \"float.c\"", "", 1)
     };
-    include_str!("runtime.c").replacen("#include \"rt/float.h\"", &header, 1)
+    let (h, core, panic) = (include_str!("runtime/runtime.h"), include_str!("runtime/core.c"), include_str!("runtime/panic.c"));
+    let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len());
+    src.push_str(h);
+    src.push_str(core);
+    let src = src.replacen("#include \"panic.c\"\n", panic, 1);
+    src.replacen("#include \"float.h\"", &header, 1)
 }
 
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do

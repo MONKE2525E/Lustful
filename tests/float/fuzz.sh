@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fuzz gate for the C float runtime (src/rt/float.c).
+# Fuzz gate for the C float runtime (src/runtime/float.c).
 # The same generated cases run through a rustc oracle (and the ryu-js
 # crate for JS formatting) and the C harness built with the pinned
 # tcc; outputs must match byte for byte.

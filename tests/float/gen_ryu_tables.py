@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates src/rt/ryu_tables.h from the ryu-js 1.0.2 crate tables.
+"""Generates src/runtime/ryu_tables.h from the ryu-js 1.0.2 crate tables.
 
 The tables are the DOUBLE_POW5_SPLIT and DOUBLE_POW5_INV_SPLIT constants
 from Ulf Adams' Ryu (Apache-2.0 or Boost-1.0), as shipped in ryu-js.
@@ -44,5 +44,5 @@ for i in range(0, len(fwd), 2):
     out += f"    {row},\n"
 out += "};\n"
 
-Path(root / "src/rt/ryu_tables.h").write_text(out)
-print(f"wrote src/rt/ryu_tables.h ({len(inv)} + {len(fwd)} entries) from {candidates[0]}")
+Path(root / "src/runtime/ryu_tables.h").write_text(out)
+print(f"wrote src/runtime/ryu_tables.h ({len(inv)} + {len(fwd)} entries) from {candidates[0]}")

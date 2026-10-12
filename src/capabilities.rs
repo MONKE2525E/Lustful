@@ -11,10 +11,10 @@ use crate::check::Builtin;
 use crate::diag;
 use crate::explain;
 use crate::intern::{Interner, Known, Sym};
-use crate::types::{IntTy, TyKind};
+use crate::ty::{IntTy, TyKind};
 
 /// Every `Builtin` variant. `builtin_info` matches exhaustively, so a new builtin cannot be
-/// given a type and name by accident; the agentkit test counts the variants in check.rs and
+/// given a type and name by accident; the agentkit test counts the variants in check/mod.rs and
 /// compares with the length of this list.
 const ALL_BUILTINS: &[Builtin] = &[
     Builtin::StringNew,
