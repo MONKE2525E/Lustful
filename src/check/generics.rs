@@ -2244,10 +2244,21 @@ fn check_impl_rules(p: &mut Program, imp: &ast::ImplDef, generics: &Generics, se
             "Remove `unsafe` from the impl.",
         ));
     }
-    // Every parameter must occur in the trait ref; one that
-    // occurs only in an associated type or a where clause does
-    // not constrain the impl (rustc E0207).
-    let ref_tys: Vec<Ty> = p.tys.args(tr.args).iter().filter_map(|g| g.as_ty()).collect();
+    // Every parameter must be constrained by the header: it
+    // occurs in the trait ref, or it is the value of an
+    // associated type binding in the trait ref or a where
+    // clause (`Item = U`). Occurring only in an associated
+    // type definition, or only bounded in a where clause, does
+    // not constrain it (rustc E0207).
+    let mut ref_tys: Vec<Ty> = p.tys.args(tr.args).iter().filter_map(|g| g.as_ty()).collect();
+    ref_tys.extend(p.tys.bindings(tr.bindings).iter().filter_map(|(_, g)| g.as_ty()));
+    for pred in &generics.predicates {
+        match pred {
+            Predicate::AssocEq(b) => ref_tys.push(b.value.ty),
+            Predicate::Trait(b) => ref_tys.extend(p.tys.bindings(b.value.bindings).iter().filter_map(|(_, g)| g.as_ty())),
+            _ => {}
+        }
+    }
     for (i, param) in generics.params.iter().enumerate() {
         let used = match param.kind {
             ParamKind::Type => ref_tys.iter().any(|&t| ty_uses_param(&p.tys, t, i as u32)),
