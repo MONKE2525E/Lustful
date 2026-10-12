@@ -905,3 +905,270 @@ pub fn used_slots_hash(pairs: &[(InstanceKeyHash, u32)]) -> u64 {
     }
     h.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::{check_fn, collect};
+    use crate::def::{CrateIds, DefPathHash, LOCAL_CRATE};
+    use crate::diag::FileId;
+    use crate::intern::{Interner, Known};
+    use crate::{lexer, parser};
+
+    /// Parses and collects one sample file, then runs `run` on the program.
+    fn with_program(src: &str, run: impl FnOnce(&Interner, &mut Program)) {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let mut program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        run(&interner, &mut program);
+    }
+
+    const SAMPLE: &str = "\
+struct Foo { x: i64 }
+impl Foo { fn get(&self) -> i64 { self.x } }
+fn helper() -> i64 { 40 }
+fn main() {
+    let f: Foo = Foo { x: helper() };
+    let y = f.get() + 2;
+    println!(\"{}\", y);
+}
+";
+
+    fn foo_head(p: &Program, interner: &Interner) -> Head {
+        let a = p.type_names[&interner.intern("Foo")];
+        Head::Adt(p.def_of_adt(a))
+    }
+
+    /// The S7 gate: a checked sample body records per-binding and
+    /// method-set reads, hit and miss, through the query functions.
+    #[test]
+    fn sample_body_records_binding_and_method_set_reads() {
+        with_program(SAMPLE, |interner, p| {
+            let (ck, errs) = check_fn(p, p.main.unwrap());
+            assert!(errs.is_empty(), "{errs:?}");
+            let reads = &ck.reads;
+            let value = |name: &str| ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern(name) });
+            // The `helper()` call reads one value binding, by that name only.
+            let helper = reads.get(&value("helper")).expect("helper binding read");
+            assert!(!helper.failed);
+            // The `let f: Foo` annotation reads one type binding.
+            let foo_ty = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Type, name: interner.intern("Foo") });
+            assert_eq!(reads.get(&foo_ty).map(|r| r.failed), Some(false));
+            // A name the body never mentions has no read: reads are per name,
+            // never per scope.
+            assert!(!reads.contains(&value("missing")));
+            // `f.get()` probes receiver forms in order: the by-value probe
+            // misses and records a failed read, the `&self` probe hits, and
+            // probing stops there.
+            let head = foo_head(p, interner);
+            let probe = |form| ReadKey::MethodSet(MethodSetKey { head, name: interner.intern("get"), form });
+            assert_eq!(reads.get(&probe(ReceiverForm::Value)).map(|r| r.failed), Some(true), "by-value probe miss is recorded");
+            assert_eq!(reads.get(&probe(ReceiverForm::Ref)).map(|r| r.failed), Some(false), "shared probe hit is recorded");
+            assert!(!reads.contains(&probe(ReceiverForm::RefMut)), "probing stops at the hit");
+            // The callee signatures the body used are on record too.
+            let helper_def = p.def_id(p.fn_names[&interner.intern("helper")]);
+            assert!(reads.contains(&ReadKey::Sig(helper_def)));
+        });
+    }
+
+    /// A name that does not resolve is a failed read with the same key as a
+    /// hit, so adding the def later rechecks exactly this body (8.2 rule 3).
+    #[test]
+    fn failed_binding_is_a_failed_read() {
+        with_program("fn main() { nosuch(); }\n", |interner, p| {
+            let (ck, errs) = check_fn(p, p.main.unwrap());
+            assert!(!errs.is_empty(), "the call must also be an error");
+            let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("nosuch") });
+            assert_eq!(ck.reads.get(&key).map(|r| r.failed), Some(true));
+            // The same key in a program that defines the name is a hit with a
+            // different fingerprint.
+            let mut reads = Reads::new();
+            assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Macro, interner.intern("nosuch")), BindingRes::Absent);
+            let macro_key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Macro, name: interner.intern("nosuch") });
+            assert_eq!(reads.get(&macro_key).map(|r| r.failed), Some(true));
+            // Different keys, same fingerprint: the fingerprint covers the
+            // node's answer ("absent"), not which node was asked.
+            assert_eq!(reads.get(&macro_key).unwrap().fingerprint, ck.reads.get(&key).unwrap().fingerprint);
+        });
+    }
+
+    /// The frozen binding query answers per namespace behind today's
+    /// single-file resolver, and records each key once.
+    #[test]
+    fn binding_query_answers_per_namespace() {
+        with_program(SAMPLE, |interner, p| {
+            let mut reads = Reads::new();
+            let helper = p.binding(&mut reads, ROOT_MODULE, Namespace::Value, interner.intern("helper"));
+            let BindingRes::Def(helper_def) = helper else { panic!("helper must resolve: {helper:?}") };
+            assert_eq!(p.binding_kind(helper_def), Some(DefsKind::Fn));
+            // A struct answers in both namespaces with the same def.
+            let as_ty = p.binding(&mut reads, ROOT_MODULE, Namespace::Type, interner.intern("Foo"));
+            let as_val = p.binding(&mut reads, ROOT_MODULE, Namespace::Value, interner.intern("Foo"));
+            assert_eq!(as_ty, as_val);
+            assert_eq!(p.binding_kind(match as_ty { BindingRes::Def(d) => d, _ => unreachable!() }), Some(DefsKind::Struct));
+            // Builtin types resolve in the type namespace only.
+            let b = p.tys.builtins();
+            assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Type, interner.intern("String")), BindingRes::Def(b.string));
+            assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Value, interner.intern("String")), BindingRes::Absent);
+            // One module today: any other module is absent, and a repeated
+            // query records nothing new.
+            assert_eq!(p.binding(&mut reads, ModuleId(9), Namespace::Value, interner.intern("helper")), BindingRes::Absent);
+            let n = reads.len();
+            let _ = p.binding(&mut reads, ROOT_MODULE, Namespace::Value, interner.intern("helper"));
+            assert_eq!(reads.len(), n, "the same key records once");
+        });
+    }
+
+    /// Method-set probes split by receiver form, and an associated fn with
+    /// no `self` surfaces only in the first probe, marked as no receiver.
+    #[test]
+    fn method_set_splits_by_receiver_form() {
+        let src = "\
+struct Foo { x: i64 }
+impl Foo {
+    fn make() -> Foo { Foo { x: 1 } }
+    fn bump(&mut self) { self.x += 1; }
+}
+fn main() {}
+";
+        with_program(src, |interner, p| {
+            let head = foo_head(p, interner);
+            let mut reads = Reads::new();
+            let make = p.method_set(&mut reads, head, interner.intern("make"), ReceiverForm::Value);
+            assert_eq!(make.first().map(|c| c.receiver), Some(None), "assoc fn has no receiver");
+            assert!(p.method_set(&mut reads, head, interner.intern("make"), ReceiverForm::Ref).candidates.is_empty());
+            assert!(p.method_set(&mut reads, head, interner.intern("bump"), ReceiverForm::Value).candidates.is_empty());
+            assert!(p.method_set(&mut reads, head, interner.intern("bump"), ReceiverForm::Ref).candidates.is_empty());
+            let bump = p.method_set(&mut reads, head, interner.intern("bump"), ReceiverForm::RefMut);
+            assert_eq!(bump.first().map(|c| (c.receiver, c.trait_)), Some((Some(ReceiverForm::RefMut), None)));
+            // A miss on a primitive head still records, as a failed read.
+            assert!(p.method_set(&mut reads, Head::Int(IntTy::I64), interner.intern("nope"), ReceiverForm::Value).candidates.is_empty());
+            let key = ReadKey::MethodSet(MethodSetKey { head: Head::Int(IntTy::I64), name: interner.intern("nope"), form: ReceiverForm::Value });
+            assert_eq!(reads.get(&key).map(|r| r.failed), Some(true));
+        });
+    }
+
+    /// The impl-set node exists and records before any trait does: every
+    /// bucket is empty, and the read is a failed lookup.
+    #[test]
+    fn impl_set_records_the_empty_bucket() {
+        with_program(SAMPLE, |interner, p| {
+            let mut reads = Reads::new();
+            let any_trait = p.def_id(p.fn_names[&interner.intern("helper")]);
+            let head = foo_head(p, interner);
+            assert!(p.impl_set(&mut reads, any_trait, head).impls.is_empty());
+            let key = ReadKey::ImplSet(ImplSetKey { trait_: any_trait, head });
+            assert_eq!(reads.get(&key).map(|r| r.failed), Some(true));
+            // The layout query answers for a known Adt and fails the read for
+            // a def this crate does not have.
+            let Head::Adt(adt) = head else { unreachable!() };
+            assert!(p.layout_of(&mut reads, adt).is_some());
+            let missing = DefId { krate: p.krate, hash: DefPathHash(0xdead) };
+            assert_eq!(p.layout_of(&mut reads, missing), None);
+            assert_eq!(reads.get(&ReadKey::Layout(missing)).map(|r| r.failed), Some(true));
+        });
+    }
+
+    /// A signature edit that keeps every name (so every DefId is the same)
+    /// must still move the `Sig` fingerprint: the fingerprint is over
+    /// resolved types, not identity.
+    #[test]
+    fn sig_fingerprint_tracks_signature_types() {
+        let fp_of = |src: &str| -> Fingerprint {
+            let mut out = Fingerprint(0);
+            with_program(src, |interner, p| {
+                let mut reads = Reads::new();
+                let def = p.def_id(p.fn_names[&interner.intern("f")]);
+                let _ = p.sig_of(&mut reads, def);
+                out = reads.get(&ReadKey::Sig(def)).unwrap().fingerprint;
+            });
+            out
+        };
+        let a = fp_of("fn f(x: i64) -> i64 { x }\nfn main() {}\n");
+        let same = fp_of("fn f(x: i64) -> i64 { x + 1 }\nfn main() {}\n");
+        let changed = fp_of("fn f(x: bool) -> i64 { 1 }\nfn main() {}\n");
+        assert_eq!(a, same, "a body edit does not move the signature fingerprint");
+        assert_ne!(a, changed, "a parameter type edit does");
+    }
+
+    /// Non-generic instance keys hash exactly like today's disk-def slot
+    /// keys, and lifetime args never enter the hash (section 4.2).
+    #[test]
+    fn instance_key_hash_erases_lifetimes() {
+        with_program(SAMPLE, |interner, p| {
+            let f = p.fn_names[&interner.intern("helper")];
+            let key = p.instance_key(f);
+            let hash = p.instance_key_hash(&key);
+            assert_eq!(key.args, EMPTY_ARGS);
+            assert_eq!(hash, InstanceKeyHash::of_disk_def(p.disk_id(f), InstanceKeyHash::empty_args_fingerprint()));
+            let lt_args = p.tys.intern_args(&[GenericArg::Lifetime(Region::Static)]);
+            let lt_key = InstanceKey { def: key.def, args: lt_args };
+            assert_eq!(p.instance_key_hash(&lt_key), hash, "lifetime args are erased");
+            let ty_args = p.tys.intern_args(&[GenericArg::Ty(int(IntTy::I64))]);
+            let ty_key = InstanceKey { def: key.def, args: ty_args };
+            assert_ne!(p.instance_key_hash(&ty_key), hash, "type args are not");
+            // The type fingerprint helper behind these hashes is structural:
+            // equal types built twice hash equal, different types do not.
+            assert_eq!(ty_fingerprint(p, int(IntTy::I64)), ty_fingerprint(p, int(IntTy::I64)));
+            assert_ne!(ty_fingerprint(p, int(IntTy::I64)), ty_fingerprint(p, BOOL));
+        });
+    }
+
+    /// The section 4.2 slot rule in miniature: one new slot leaves every
+    /// unrelated unit's used-slots hash alone and moves only the full
+    /// manifest hash (the table unit's key).
+    #[test]
+    fn used_slots_hash_survives_a_new_slot() {
+        let disk = |k: u64, h: u64| DiskDefId { krate: StableCrateHash(k), hash: DefPathHash(h) };
+        let key = |k: u64, h: u64| InstanceKeyHash::of_disk_def(disk(k, h), InstanceKeyHash::empty_args_fingerprint());
+        let mut slot_of = FxMap::default();
+        slot_of.insert(disk(1, 10), 0);
+        slot_of.insert(disk(1, 20), 1);
+        slot_of.insert(disk(1, 30), 2);
+        let mut m = SlotManifest::from_disk_slots(&slot_of);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.slot_of(key(1, 20)), Some(1));
+        let unit = [key(1, 10), key(1, 30)];
+        let before = m.used_slots_hash(&unit).unwrap();
+        let table_before = m.manifest_hash();
+        assert_eq!(Some(before), Some(used_slots_hash(&[(key(1, 30), 2), (key(1, 10), 0), (key(1, 10), 0)])), "order and duplicates do not matter");
+        // One new reachable instance: append-only, old slots stay put.
+        assert_eq!(m.assign(key(1, 99)), 3);
+        assert_eq!(m.assign(key(1, 99)), 3, "assign is stable");
+        assert_eq!(m.slot_of(key(1, 10)), Some(0));
+        assert_eq!(m.used_slots_hash(&unit), Some(before), "unrelated units keep their key");
+        assert_ne!(m.manifest_hash(), table_before, "the table unit rebuilds");
+        assert_eq!(m.used_slots_hash(&[key(7, 7)]), None, "a key with no slot cannot key a unit");
+    }
+
+    /// The lowered sample body carries the read set with it, and every call
+    /// in it is a terminator with an empty unwind slot.
+    #[test]
+    fn lowered_body_carries_reads_and_call_terminators() {
+        use crate::ir::{CallTarget, Terminator};
+        with_program(SAMPLE, |interner, p| {
+            let main = p.main.unwrap();
+            let (ck, errs) = check_fn(p, main);
+            assert!(errs.is_empty(), "{errs:?}");
+            let body = crate::lower::lower(p, main, ck);
+            let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("helper") });
+            assert!(body.reads.contains(&key), "the read set rides with the body result");
+            let (mut fn_calls, mut builtin_calls) = (0, 0);
+            for b in &body.blocks {
+                if let Terminator::Call { target, unwind, .. } = &b.term {
+                    assert_eq!(*unwind, None, "no unwind edges exist yet");
+                    match target {
+                        CallTarget::Fn(_) => fn_calls += 1,
+                        CallTarget::Builtin(_) => builtin_calls += 1,
+                    }
+                }
+            }
+            assert!(fn_calls >= 2, "helper() and f.get() are fn call terminators, got {fn_calls}");
+            let _ = builtin_calls;
+            assert!(crate::borrowck::borrowck(p, &body).is_empty(), "the sample borrow-checks clean");
+        });
+    }
+}
