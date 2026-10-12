@@ -57,6 +57,18 @@ pub struct ConstItem {
     pub value: crate::ty::consteval::ConstValue,
 }
 
+/// What one item inside a function body resolved to, by `Ast::stmt_items`
+/// index. Nested statics live in the main statics table; nested consts get
+/// their own values table because their names are block-scoped.
+#[derive(Clone, Copy, Debug)]
+pub enum BodyItem {
+    Fn(LocalDefId),
+    /// Index into `Program::body_consts`.
+    Const(u32),
+    /// Index into `Program::statics`.
+    Static(u32),
+}
+
 /// One evaluated `static` item: its value becomes static data (ARCH 2.13).
 pub struct StaticItem {
     pub name: Sym,
@@ -110,6 +122,13 @@ pub struct Program<'a> {
     /// static data in the glue unit.
     pub statics: Vec<StaticItem>,
     pub static_names: HashMap<Sym, u32>,
+    /// Items inside function bodies, by `Ast::stmt_items` index.
+    pub body_items: HashMap<u32, BodyItem>,
+    /// Evaluated consts declared inside function bodies.
+    pub body_consts: Vec<ConstItem>,
+    /// For a nested fn, the stmt item indexes of its containing block:
+    /// the sibling items its body may name.
+    pub fn_siblings: HashMap<LocalDefId, Vec<u32>>,
     pub type_names: HashMap<Sym, AdtId>,
     /// Non-generic type aliases by (flat) name, fully resolved.
     pub aliases: HashMap<Sym, Ty>,
@@ -923,6 +942,9 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         static_defs: Vec::new(),
         statics: Vec::new(),
         static_names: HashMap::default(),
+        body_items: HashMap::default(),
+        body_consts: Vec::new(),
+        fn_siblings: HashMap::default(),
         type_names: HashMap::default(),
         aliases: HashMap::default(),
         fn_names: HashMap::default(),
@@ -1635,6 +1657,45 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             _ => {}
         }
     }
+    // Items inside function bodies: nested fns join the fn table (their
+    // names are block-scoped, so they stay out of `fn_names`); nested
+    // consts and statics evaluate with the top-level pass below. Type
+    // items in bodies are not in the subset yet.
+    for (idx, item) in ast.stmt_items.iter().enumerate() {
+        match &item.kind {
+            ItemKind::Fn(def) => {
+                let path = format!("#nested{idx}");
+                let hash = crate::def::free_fn_hash(p.stable_crate, &[path.as_str()], interner.get(def.name));
+                let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
+                p.body_items.insert(idx as u32, BodyItem::Fn(id));
+            }
+            ItemKind::Use(_) => {}
+            ItemKind::Const(_) | ItemKind::Static(_) => {}
+            _ => {
+                errs.push(not_yet("L0820", item.span, "type items inside function bodies"));
+            }
+        }
+    }
+    // Sibling visibility for nested fns: the items of the block that
+    // directly contains each nested fn.
+    for block in &ast.blocks {
+        let idxs: Vec<u32> = block
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                ast::Stmt::Item(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        if idxs.is_empty() {
+            continue;
+        }
+        for &i in &idxs {
+            if let Some(BodyItem::Fn(fid)) = p.body_items.get(&i).copied() {
+                p.fn_siblings.insert(fid, idxs.clone());
+            }
+        }
+    }
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
@@ -1654,6 +1715,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
 /// One const or static item waiting for evaluation.
 struct PendingConst {
     name: Option<Sym>,
+    /// Set for an item inside a function body: its stmt_items index.
+    stmt_idx: Option<u32>,
     ty: Ty,
     expr: ast::ExprId,
     span: Span,
@@ -1676,7 +1739,8 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
     let mut by_name: HashMap<Sym, usize> = HashMap::default();
     let mut static_count = 0u32;
-    for item in &ast.items {
+    for (item, stmt_idx) in ast.items.iter().map(|i| (i, None)).chain(ast.stmt_items.iter().enumerate().map(|(i, it)| (it, Some(i as u32))))
+    {
         let (name, ty_id, value, span, is_static) = match &item.kind {
             ItemKind::Const(c) => (c.name, c.ty, c.value, c.span, None),
             ItemKind::Static(s) => (Some(s.name), s.ty, s.value, s.span, Some(s.mutable)),
@@ -1707,7 +1771,15 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             0
         };
         if let Some(n) = name {
-            if by_name.insert(n, pending.len()).is_some() || p.fn_names.contains_key(&n) {
+            let dup = if stmt_idx.is_some() {
+                // A nested name may shadow a top-level one; the by-name map
+                // keeps the first registration for evaluation lookups.
+                by_name.entry(n).or_insert(pending.len());
+                false
+            } else {
+                by_name.insert(n, pending.len()).is_some() || p.fn_names.contains_key(&n)
+            };
+            if dup {
                 errs.push(Diag::new(
                     "L0106",
                     span,
@@ -1716,7 +1788,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
                 ));
             }
         }
-        pending.push((PendingConst { name, ty, expr: value, span, is_static, static_idx }, PendingState::Todo));
+        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx }, PendingState::Todo));
     }
     if pending.is_empty() {
         return;
@@ -1732,6 +1804,13 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
     for (item, state) in pending {
         let PendingState::Done(value) = state else { continue };
         match item.is_static {
+            None if item.stmt_idx.is_some() => {
+                if let Some(name) = item.name {
+                    let idx = p.body_consts.len() as u32;
+                    p.body_consts.push(ConstItem { name, ty: item.ty, value });
+                    p.body_items.insert(item.stmt_idx.unwrap(), BodyItem::Const(idx));
+                }
+            }
             None => {
                 if let Some(name) = item.name {
                     let idx = p.consts.len() as u32;
@@ -1746,14 +1825,23 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             }
             Some(mutable) => {
                 let name = item.name.unwrap();
-                let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(name), 0);
-                let def = DefId { krate: p.krate, hash };
-                p.defs.insert(def, DefData::skeleton(DefsKind::Static, None, name, Vis::Priv, item.span));
-                if p.static_defs.len() <= item.static_idx as usize {
-                    p.static_defs.resize(item.static_idx as usize + 1, def);
+                if let Some(sidx) = item.stmt_idx {
+                    p.body_items.insert(sidx, BodyItem::Static(item.static_idx));
                 }
-                p.static_defs[item.static_idx as usize] = def;
-                p.static_names.insert(name, item.static_idx);
+                // Top-level statics join the crate name tables; nested ones
+                // resolve through the checker's block item scopes instead.
+                if item.stmt_idx.is_none() {
+                    let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(name), 0);
+                    let def = DefId { krate: p.krate, hash };
+                    p.defs.insert(def, DefData::skeleton(DefsKind::Static, None, name, Vis::Priv, item.span));
+                    if p.static_defs.len() <= item.static_idx as usize {
+                        p.static_defs.resize(item.static_idx as usize + 1, def);
+                    }
+                    p.static_defs[item.static_idx as usize] = def;
+                    p.static_names.insert(name, item.static_idx);
+                } else if p.static_defs.len() <= item.static_idx as usize {
+                    p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
+                }
                 statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value });
             }
         }
@@ -1831,7 +1919,7 @@ fn eval_assoc_consts<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             };
             owners.push((owner, impl_def, c.name));
             pending.push((
-                PendingConst { name: Some(c.name), ty, expr: value, span: c.span, is_static: None, static_idx: 0 },
+                PendingConst { name: Some(c.name), ty, expr: value, span: c.span, is_static: None, static_idx: 0, stmt_idx: None },
                 PendingState::Todo,
             ));
         }

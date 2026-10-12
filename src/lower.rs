@@ -1520,6 +1520,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         let const_pat = match self.ck.pat_res(pat) {
             PatRes::ConstItem(idx) => Some(p.consts[idx as usize].value.clone()),
             PatRes::PrimConst(v) => Some(crate::ty::consteval::ConstValue::Int(v)),
+            PatRes::BodyConst(idx) => Some(p.body_consts[idx as usize].value.clone()),
             _ => None,
         };
         if let Some(cv) = const_pat {
