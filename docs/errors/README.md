@@ -24,6 +24,7 @@ wrong example that fails with that code and a fixed example that passes.
 | [L0116](L0116.md) | invalid cast |
 | [L0117](L0117.md) | recursive type has infinite size |
 | [L0118](L0118.md) | integer literal out of range |
+| [L0119](L0119.md) | lower range bound is greater than the upper bound |
 | [L0120](L0120.md) | break or continue outside a loop |
 | [L0121](L0121.md) | invalid assignment target |
 | [L0122](L0122.md) | `mut` binding under a reference |

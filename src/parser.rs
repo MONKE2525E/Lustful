@@ -15,16 +15,27 @@ pub struct Parser<'a> {
     known: &'a Known,
     /// Added to string-literal token indexes: where this token list's strings start in the AST.
     str_base: u32,
+    /// Current nesting depth, capped so pathological input cannot overflow the stack.
+    depth: u32,
 }
+
+/// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
+/// patterns, and operator or method chains). Real code stays far below this.
+const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0 };
+    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0 };
     p.ast.strings = lexed.strings.clone();
     while p.peek() != Tok::Eof {
+        let before = p.pos;
         let item = p.item()?;
         if let Some(item) = item {
             p.ast.items.push(item);
+        }
+        // No parse loop may spin in place on bad input: each round must consume a token.
+        if p.pos == before {
+            return Err(syntax(p.span(), format!("expected an item, found {:?}", p.peek())));
         }
     }
     Ok(p.ast)
@@ -41,7 +52,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     toks.push(Token { tok: Tok::Eof, span: Span::new(end.end, end.end) });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
-    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base };
+    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0 };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
@@ -97,15 +108,49 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Ident(s) => Ok((s, self.bump().span)),
             Tok::SelfUpper => Ok((self.known.self_type, self.bump().span)),
+            Tok::Reserved(_) => Err(self.reserved_error(self.span())),
             Tok::Lifetime => Err(lifetime_error(self.span())),
             t => Err(syntax(self.span(), format!("expected identifier, found {t:?}"))),
         }
     }
+    /// The error for a reserved keyword (`gen`, `try`, ...) used where an identifier belongs.
+    fn reserved_error(&self, span: Span) -> Diag {
+        let Tok::Reserved(s) = self.toks[self.pos.min(self.toks.len() - 1)].tok else {
+            return syntax(span, "expected identifier");
+        };
+        let name = self.interner.get(s);
+        Diag::new(
+            "L0001",
+            span,
+            format!("expected identifier, found reserved keyword `{name}`"),
+            format!("Rename it, or write `r#{name}` to use it as an identifier."),
+        )
+    }
+
     /// True if the next two tokens are `>` `>` with no space, which means a right shift.
     fn at_shr(&self) -> bool {
         self.peek() == Tok::Gt && self.peek_at(1) == Tok::Gt && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
     }
+    /// True at a `>>=`: lexed as `>` followed by `>=`, touching.
+    fn at_shr_assign(&self) -> bool {
+        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Ge && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
+    }
 
+    /// Runs `f` one nesting level deeper, or errors past `MAX_DEPTH`.
+    fn nest<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Diag::new(
+                "L9001",
+                self.span(),
+                format!("nesting deeper than {MAX_DEPTH} levels is not supported"),
+                "Split the expression into smaller pieces with `let`.",
+            ));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
     fn push_expr(&mut self, e: Expr, span: Span) -> ExprId {
         self.ast.exprs.push(e);
         self.ast.expr_spans.push(span);
@@ -183,8 +228,12 @@ impl<'a> Parser<'a> {
         let start = self.span();
         self.eat(Tok::Pub);
         if self.peek() == Tok::LParen {
-            // pub(crate) and similar.
-            while self.bump().tok != Tok::RParen {}
+            // pub(crate) and similar. `bump` does not move past `Eof`, so stop there.
+            while self.bump().tok != Tok::RParen {
+                if self.peek() == Tok::Eof {
+                    return Err(syntax(self.span(), "expected `)` in visibility, found end of file"));
+                }
+            }
         }
         let kind = match self.peek() {
             Tok::Fn => {
@@ -211,6 +260,7 @@ impl<'a> Parser<'a> {
             Tok::Unsafe => return Err(Diag::new("L0404", start, "`unsafe` is not supported", "Remove the unsafe code.")),
             Tok::Async => return Err(Diag::new("L0405", start, "`async` is not supported", "Use std::thread and channels.")),
             Tok::Ident(_) if self.peek_at(1) == Tok::Bang => return Err(macro_error(start)),
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an item, found {t:?}"))),
         };
         Ok(Some(Item { kind }))
@@ -260,6 +310,7 @@ impl<'a> Parser<'a> {
             let mutable = self.eat(Tok::Mut);
             let (pname, _) = match self.peek() {
                 Tok::Ident(_) => self.ident()?,
+                Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
                 _ => return Err(unsupported(start, "patterns in parameters")),
             };
             self.expect(Tok::Colon, "`:`")?;
@@ -373,6 +424,10 @@ impl<'a> Parser<'a> {
     // ---------- Types ----------
 
     fn ty(&mut self) -> PResult<TyId> {
+        self.nest(|p| p.ty_inner())
+    }
+
+    fn ty_inner(&mut self) -> PResult<TyId> {
         let start = self.span();
         match self.peek() {
             Tok::Amp | Tok::AndAnd => {
@@ -442,10 +497,17 @@ impl<'a> Parser<'a> {
     // ---------- Blocks and statements ----------
 
     fn block(&mut self) -> PResult<BlockId> {
+        self.nest(|p| p.block_inner())
+    }
+
+    fn block_inner(&mut self) -> PResult<BlockId> {
         let start = self.expect(Tok::LBrace, "`{`")?;
         let mut stmts = Vec::new();
         let mut tail = None;
         while self.peek() != Tok::RBrace {
+            if self.peek() == Tok::Eof {
+                return Err(syntax(self.span(), "expected `}`, found end of file"));
+            }
             if self.eat(Tok::Semi) {
                 continue;
             }
@@ -494,6 +556,10 @@ impl<'a> Parser<'a> {
     // ---------- Patterns ----------
 
     fn pattern(&mut self) -> PResult<PatId> {
+        self.nest(|p| p.pattern_inner())
+    }
+
+    fn pattern_inner(&mut self) -> PResult<PatId> {
         let start = self.span();
         self.eat(Tok::Pipe);
         let first = self.pattern_one()?;
@@ -583,6 +649,7 @@ impl<'a> Parser<'a> {
             Tok::LParen => return Err(unsupported(start, "tuple patterns")),
             Tok::LBracket => return Err(unsupported(start, "slice patterns")),
             Tok::Amp => return Err(unsupported(start, "reference patterns")),
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected a pattern, found {t:?}"))),
         };
         Ok(self.push_pat(pat, start.to(self.prev_span())))
@@ -618,16 +685,30 @@ impl<'a> Parser<'a> {
         }
         // Assignment is right-associative and lowest.
         let lhs = self.range_expr(no_struct)?;
-        let op = match self.peek() {
-            Tok::Eq => None,
-            Tok::PlusEq => Some(BinOp::Add),
-            Tok::MinusEq => Some(BinOp::Sub),
-            Tok::StarEq => Some(BinOp::Mul),
-            Tok::SlashEq => Some(BinOp::Div),
-            Tok::PercentEq => Some(BinOp::Rem),
-            _ => return Ok(lhs),
+        // `>>=` arrives as two tokens (`>` then `>=`), since `>>` is never lexed as one.
+        let (op, consume) = if self.at_shr_assign() {
+            (Some(BinOp::Shr), 2)
+        } else {
+            (
+                match self.peek() {
+                    Tok::Eq => None,
+                    Tok::PlusEq => Some(BinOp::Add),
+                    Tok::MinusEq => Some(BinOp::Sub),
+                    Tok::StarEq => Some(BinOp::Mul),
+                    Tok::SlashEq => Some(BinOp::Div),
+                    Tok::PercentEq => Some(BinOp::Rem),
+                    Tok::AmpEq => Some(BinOp::BitAnd),
+                    Tok::PipeEq => Some(BinOp::BitOr),
+                    Tok::CaretEq => Some(BinOp::BitXor),
+                    Tok::ShlEq => Some(BinOp::Shl),
+                    _ => return Ok(lhs),
+                },
+                1,
+            )
         };
-        self.bump();
+        for _ in 0..consume {
+            self.bump();
+        }
         let rhs = self.expr_ctx(no_struct)?;
         let span = start.to(self.prev_span());
         Ok(match op {
@@ -660,6 +741,8 @@ impl<'a> Parser<'a> {
             Tok::Ne => (BinOp::Ne, 3, 1),
             Tok::Lt => (BinOp::Lt, 3, 1),
             Tok::Le => (BinOp::Le, 3, 1),
+            // `>>=` is a compound assignment, not a shift: leave it for `expr_ctx`.
+            Tok::Gt if self.at_shr_assign() => return None,
             Tok::Gt if self.at_shr() => (BinOp::Shr, 7, 2),
             Tok::Gt => (BinOp::Gt, 3, 1),
             Tok::Ge => (BinOp::Ge, 3, 1),
@@ -682,7 +765,19 @@ impl<'a> Parser<'a> {
     }
 
     fn binary_rest(&mut self, mut lhs: ExprId, min_prec: u8, no_struct: bool) -> PResult<ExprId> {
+        // A long flat chain (`a + a + ...`) makes a deep tree without any recursion
+        // here, so count the operators to keep later passes off the stack limit.
+        let mut chain = 0u32;
         while let Some((op, prec, n)) = self.binop() {
+            chain += 1;
+            if chain > MAX_DEPTH {
+                return Err(Diag::new(
+                    "L9001",
+                    self.span(),
+                    format!("operator chains longer than {MAX_DEPTH} are not supported"),
+                    "Split the expression into smaller pieces with `let`.",
+                ));
+            }
             if prec <= min_prec {
                 break;
             }
@@ -711,6 +806,10 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self, no_struct: bool) -> PResult<ExprId> {
+        self.nest(|p| p.prefix_inner(no_struct))
+    }
+
+    fn prefix_inner(&mut self, no_struct: bool) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
             Tok::Minus => {
@@ -757,7 +856,18 @@ impl<'a> Parser<'a> {
     }
 
     fn postfix(&mut self, mut e: ExprId) -> PResult<ExprId> {
+        // Like `binary_rest`, a long postfix chain makes a deep tree iteratively.
+        let mut chain = 0u32;
         loop {
+            chain += 1;
+            if chain > MAX_DEPTH {
+                return Err(Diag::new(
+                    "L9001",
+                    self.span(),
+                    format!("method and field chains longer than {MAX_DEPTH} are not supported"),
+                    "Split the expression into smaller pieces with `let`.",
+                ));
+            }
             let start = self.ast.expr_span(e);
             match self.peek() {
                 Tok::LParen => {
@@ -999,6 +1109,7 @@ impl<'a> Parser<'a> {
                 }
                 Expr::Path(path)
             }
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an expression, found {t:?}"))),
         };
         Ok(self.push_expr(e, start.to(self.prev_span())))
@@ -1086,6 +1197,14 @@ impl<'a> Parser<'a> {
                 if !self.eat(Tok::Comma) {
                     break;
                 }
+            }
+            if args.len() < fixed {
+                return Err(syntax(self.span(), "too few arguments for this macro"));
+            }
+            // `print!`, `eprint!`, and `format!` need a format string; `println!` and kin do not.
+            let needs_str = matches!(kind, MacroKind::Print | MacroKind::Eprint | MacroKind::Format);
+            if needs_str && !matches!(self.peek(), Tok::Str(_)) {
+                return Err(syntax(self.span(), "expected a format string literal"));
             }
             if let Tok::Str(si) = self.peek() {
                 let lit_span = self.bump().span;

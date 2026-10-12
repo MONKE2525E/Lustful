@@ -762,22 +762,25 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if fresh_base || caches.glue.shared.is_none() {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
-    let units: Vec<(PathBuf, String)> = par_map(&todo, |&(u, overlay)| {
-        let c = match u {
-            0 => cgen::main_unit(main_slot, &path, &slot_lines, &registered),
-            1 => cgen::glue_unit(&program, &caches.glue),
-            2 => cgen::runtime_unit(),
-            3 => cgen::table_unit(caches.table_cap, &fn_units),
-            g => {
-                let register = if overlay { format!("lust_overlay_u{g}") } else { format!("lust_register_u{g}") };
-                cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register)
-            }
-        };
-        (if overlay { overlay_obj(u) } else { base_obj(u) }, c)
-    });
+    let gen_unit = |u: usize, overlay: bool| match u {
+        0 => cgen::main_unit(main_slot, &path, &slot_lines, &registered),
+        1 => cgen::glue_unit(&program, &caches.glue),
+        2 => cgen::runtime_unit(),
+        3 => cgen::table_unit(caches.table_cap, &fn_units),
+        g => {
+            let register = if overlay { format!("lust_overlay_u{g}") } else { format!("lust_register_u{g}") };
+            cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register)
+        }
+    };
+    let units: Vec<(PathBuf, String)> =
+        par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay)));
     if let Some(p) = &req.emit_c {
-        for (obj, c) in &units {
-            let _ = std::fs::write(format!("{}.{}.c", p.display(), obj.file_stem().unwrap().to_string_lossy()), c);
+        // Emitted C must be self-contained: write every base unit, not only the units
+        // rebuilt for this (possibly warm, incremental) build.
+        for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
+            // The standalone main unit registers no overlays; `lust_base_init` covers all units.
+            let c = if u == 0 { cgen::main_unit(main_slot, &path, &slot_lines, &[]) } else { gen_unit(u, false) };
+            let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }
     t.lap("assemble C units (par)");

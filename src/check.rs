@@ -102,7 +102,7 @@ pub enum Res {
         derefs: u8,
         index: u32,
     },
-    /// Operand deref counts for binary operators, and for compound assignment.
+    /// Operand deref counts for binary operators, compound assignment, and unary operators (`ld` only).
     Bin {
         ld: u8,
         rd: u8,
@@ -247,7 +247,13 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: FnId) -> (Checked<'p>, Vec<Diag
         cx.out.param_locals.push(l);
         pi = 1;
     }
+    let mut seen_params: Vec<Sym> = Vec::new();
     for param in &def.params {
+        if seen_params.contains(&param.name) {
+            let name = p.name(param.name).to_string();
+            cx.err("L0106", param.span, format!("`{name}` is defined more than once"), "Rename one of the parameters.");
+        }
+        seen_params.push(param.name);
         let l = cx.add_local(param.name, f.params[pi], param.mutable, param.span);
         cx.out.param_locals.push(l);
         pi += 1;
@@ -264,6 +270,25 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: FnId) -> (Checked<'p>, Vec<Diag
     let mut out = out;
     out.tys = tys;
     (out, errs)
+}
+
+/// True if Rust can compare two string-like operands for equality. `ld` and `rd` are the
+/// reference depths of the two sides and `lk` and `rk` their base kinds (`String` or `Str`).
+/// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
+/// one of the base impls: String==String, String==str, String==&str, str==String,
+/// str==str, or &str==String.
+fn string_eq_ok(ld: u8, lk: TyKind, rd: u8, rk: TyKind) -> bool {
+    let peel = ld.min(rd);
+    let (la, ra) = ((ld - peel, lk), (rd - peel, rk));
+    let string = (0, TyKind::String);
+    let str_ = (0, TyKind::Str);
+    let ref_str = (1, TyKind::Str);
+    matches!(
+        (la, ra),
+        (a, b) if (a == string && (b == string || b == str_ || b == ref_str))
+            || (a == str_ && (b == string || b == str_))
+            || (a == ref_str && b == string)
+    )
 }
 
 impl<'p, 'a> Ctx<'p, 'a> {
@@ -728,11 +753,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.negated_lits.push(*expr);
                 }
                 let t = self.expr(*expr, expected);
-                let k = self.kind(t);
+                // Rust has `-` and `!` for `&T` (shared references only, not `&mut T`).
+                let (d, inner) = match self.kind(t) {
+                    TyKind::Ref(false, inner) => (1, inner),
+                    _ => (0, t),
+                };
+                self.set_res(e, Res::Bin { ld: d, rd: 0 });
+                let k = self.kind(inner);
                 match (op, k) {
-                    (UnOp::Neg, TyKind::Int(i)) if i.signed() => t,
-                    (UnOp::Neg, TyKind::Var(_, true)) => t,
-                    (UnOp::Not, TyKind::Bool | TyKind::Int(_) | TyKind::Var(_, true)) => t,
+                    (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
+                    (UnOp::Neg, TyKind::Var(_, true)) => inner,
+                    (UnOp::Not, TyKind::Bool | TyKind::Int(_) | TyKind::Var(_, true)) => inner,
                     (_, TyKind::Error) => ERROR,
                     _ => {
                         let tn = self.tn(t);
@@ -811,15 +842,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return UNIT;
                 }
                 let (rd, rinner) = self.peel_one_ref(rt);
-                let ok = match (*op, lk) {
-                    (_, TyKind::Error) => true,
-                    (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
-                        matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
-                    }
-                    (_, TyKind::Int(_) | TyKind::Var(_, true)) => self.unify(lt, rinner),
-                    (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
-                    _ => false,
-                };
+                // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
+                let rmut = matches!(self.kind(rt), TyKind::Ref(true, _));
+                let ok = !rmut
+                    && match (*op, lk) {
+                        (_, TyKind::Error) => true,
+                        (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
+                            matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
+                        }
+                        (_, TyKind::Int(_) | TyKind::Var(_, true)) => self.unify(lt, rinner),
+                        (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
+                        _ => false,
+                    };
                 if !ok {
                     let (a, b) = (self.tn(lt), self.tn(rt));
                     self.err(
@@ -946,6 +980,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Ref(_, inner) => (1, inner),
             _ => (0, t),
         }
+    }
+    /// The value of a literal expression (an integer, possibly negated, or a char), if it is one.
+    fn const_scalar(&self, e: ExprId) -> Option<i128> {
+        match self.p.ast.expr(e) {
+            Expr::Int(v, _) => Some(*v as i128),
+            Expr::Char(c) => Some(*c as i128),
+            Expr::Unary { op: UnOp::Neg, expr } => match self.p.ast.expr(*expr) {
+                Expr::Int(v, _) => Some(-(*v as i128)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// The mutability of each reference layer of `t`, outermost first.
+    fn ref_layers(&self, t: Ty) -> Vec<bool> {
+        let mut out = Vec::new();
+        let mut t = t;
+        while let TyKind::Ref(m, inner) = self.kind(t) {
+            out.push(m);
+            t = inner;
+        }
+        out
     }
 
     fn path_expr(&mut self, e: ExprId, segs: &[ast::PathSeg], span: Span) -> Ty {
@@ -1415,9 +1471,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if lk == rk || !matches!(lk, TyKind::String | TyKind::Str) || !matches!(rk, TyKind::String | TyKind::Str) {
             return None;
         }
-        let lref = if lk == TyKind::Str { ld.checked_sub(1)? } else { ld };
-        let rref = if rk == TyKind::Str { rd.checked_sub(1)? } else { rd };
-        (lref == rref).then_some((ld, rd))
+        string_eq_ok(ld, lk, rd, rk).then_some((ld, rd))
     }
 
     /// Methods shared by `str` and `String` (through Deref). The receiver is always `&self`.
@@ -1467,15 +1521,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let (lbk, rbk) = (self.tys.kind(lb), self.tys.kind(rb));
             let stringy = |k: TyKind| matches!(k, TyKind::String | TyKind::Str);
             if stringy(lbk) && stringy(rbk) && matches!(op, Eq | Ne) {
-                let lref = if lbk == TyKind::Str { ld - 1 } else { ld };
-                let rref = if rbk == TyKind::Str { rd - 1 } else { rd };
-                // Rust has String == &str, &str == String, String == str, and same-type comparisons.
-                let ok = (lbk == rbk && ld == rd) || (lref == 0 && rref == 0) || (ld == rd && lbk != rbk && lref == rref);
-                if !ok {
+                if !string_eq_ok(ld, lbk, rd, rbk) {
                     return bad(self);
                 }
                 self.set_res(e, Res::Bin { ld, rd });
                 return BOOL;
+            }
+            // Equality allows `&T` against `&mut T`; ordering needs the same mutability.
+            if !matches!(op, Eq | Ne) && self.ref_layers(lt) != self.ref_layers(rt) {
+                return bad(self);
             }
             if ld != rd || !self.unify(lb, rb) {
                 return bad(self);
@@ -1504,6 +1558,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.coerce_expr(rhs, rt, REF_STR);
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
             return STRING;
+        }
+        // Arithmetic and bit operations exist for `&T` operands, but not for `&mut T`.
+        if matches!(lk, TyKind::Ref(true, _)) || matches!(rk, TyKind::Ref(true, _)) {
+            return bad(self);
         }
         let (ld, li) = self.peel_one_ref(lt);
         let (rd, ri) = self.peel_one_ref(rt);
@@ -1680,7 +1738,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 UNIT
             }
             MacroKind::AssertEq | MacroKind::AssertNe => {
-                if args.len() >= 2 {
+                if args.len() < 2 {
+                    self.err("L0105", span, "this macro takes 2 arguments", "Pass both values to compare.");
+                } else {
                     let a = self.expr(args[0], None);
                     let b = self.expr(args[1], Some(a));
                     let s = self.span(args[1]);
@@ -1818,6 +1878,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Range { lo, hi } => {
                 let a = self.expr(*lo, Some(t));
                 let b = self.expr(*hi, Some(t));
+                if let (Some(lo_v), Some(hi_v)) = (self.const_scalar(*lo), self.const_scalar(*hi))
+                    && lo_v > hi_v
+                {
+                    self.err(
+                        "L0119",
+                        span,
+                        "lower range bound is greater than the upper bound",
+                        "Swap the bounds, or fix the values. An empty range pattern never matches.",
+                    );
+                }
                 if !self.unify(a, t) || !self.unify(b, t) || !matches!(self.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Var(_, true)) {
                     self.err(
                         "L0110",

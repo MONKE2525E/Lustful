@@ -541,7 +541,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         if let Some(i) = info.ret_borrows_from {
                             self.holds_of(&args[i], st, &mut new_holds);
                         }
-                        self.flow_into_mut_args(args, st);
+                        self.flow_into_mut_args(args, st, span);
                     }
                     _ => {
                         let ty = self.dest_ty(dest);
@@ -551,7 +551,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             }
                         }
                         if let Rvalue::Builtin(Builtin::VecPush, args) = rv {
-                            self.flow_into_mut_args(args, st);
+                            self.flow_into_mut_args(args, st, span);
                         }
                     }
                 }
@@ -563,6 +563,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
                     }
                     self.access(dest, Access::Write, span, &live);
+                    self.check_store_into_param_ref(dest, &new_holds, st, span);
                     st.maybe_init.insert(l);
                     st.maybe_uninit.remove(l);
                     st.maybe_moved.remove(l);
@@ -571,6 +572,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.check_init(dest, span, st);
                     self.check_mutability(dest, span, st, false);
                     self.access(dest, Access::Write, span, &live);
+                    self.check_store_into_param_ref(dest, &new_holds, st, span);
                     st.holds[dest.local as usize].union(&new_holds);
                 }
             }
@@ -610,6 +612,88 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         t
     }
 
+    /// The parameter locals that the synthetic loans in `holds` stand for.
+    fn loan_origins(&self, holds: &BitSet) -> Vec<Local> {
+        let mut out: Vec<Local> = Vec::new();
+        for li in holds.iter() {
+            let loan = &self.loans[li];
+            if loan.synthetic && !out.contains(&loan.place.local) {
+                out.push(loan.place.local);
+            }
+        }
+        out
+    }
+
+    /// True if a place root is one of the function's parameter locals.
+    fn is_param(&self, l: Local) -> bool {
+        l >= 1 && (l as usize) <= self.body.arg_count
+    }
+
+    /// True if `loan` may be stored where a reference with `origins` (parameter lifetimes
+    /// from the signature) is required: it borrows from one of those parameters.
+    /// A promoted constant (`&1`) is `'static` in Rust, but lust keeps it in a stack
+    /// temporary, so storing it behind a parameter stays rejected here.
+    fn store_loan_ok(&self, origins: &[Local], loan: &Loan) -> bool {
+        if loan.synthetic {
+            return origins.contains(&loan.place.local);
+        }
+        loan.place.proj.contains(&Proj::Deref) && origins.contains(&loan.place.local)
+    }
+
+    /// Reports the first loan in `incoming` that may not be stored behind `origins`.
+    fn check_incoming_loans(&mut self, origins: &[Local], incoming: &BitSet, dest: Local, span: Span) {
+        for li in incoming.iter() {
+            let loan = &self.loans[li];
+            if self.store_loan_ok(origins, loan) {
+                continue;
+            }
+            let dest_name = self.local_name(dest);
+            if loan.synthetic {
+                let src = self.local_name(loan.place.local);
+                let want = self.local_name(origins[0]);
+                self.err(
+                    "L0202",
+                    span,
+                    format!("this stores a reference that borrows from {src}, but {dest_name} must borrow from {want}"),
+                    "Borrow from the same parameter. Lust ties each reference to one parameter, as Rust's elision does here.",
+                );
+            } else {
+                let name = self.local_name(loan.place.local);
+                self.err(
+                    "L0306",
+                    span,
+                    format!("{name} does not live long enough: it is borrowed into {dest_name}, which borrows from a parameter"),
+                    "Borrow from a parameter instead, or store an owned value (for example `*dest = value`).",
+                );
+            }
+            return;
+        }
+    }
+
+    /// A reference that comes from a parameter must keep borrowing from that parameter.
+    /// Storing a borrow of a local value into such a place is an error even if the place
+    /// is never read again (`v = &mut Vec::new()` for `v: &mut Vec<_>`), because the
+    /// signature ties the place's reference to the caller's lifetime. This applies to a
+    /// parameter local itself and to places behind a parameter-derived reference
+    /// (`*slot = &local`), but not to a plain local holding a reborrow: its lifetime
+    /// can shrink, so NLL rules apply there.
+    fn check_store_into_param_ref(&mut self, dest: &Place, new_holds: &BitSet, st: &State, span: Span) {
+        if !self.report {
+            return;
+        }
+        let root = dest.local;
+        let direct_param = dest.proj.is_empty() && self.is_param(root);
+        let through_deref = dest.proj.first() == Some(&Proj::Deref);
+        if !direct_param && !through_deref {
+            return;
+        }
+        let origins = self.loan_origins(&st.holds[root as usize]);
+        if origins.is_empty() {
+            return;
+        }
+        self.check_incoming_loans(&origins, new_holds, root, span);
+    }
+
     fn holds_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
         if let Operand::Copy(p) | Operand::Move(p) = o {
             out.union(&st.holds[p.local as usize]);
@@ -618,7 +702,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     /// References passed to a call may be stored behind one of its `&mut` arguments, if that
     /// argument's target type can hold references (for example `v.push(&x)` on a `Vec<&T>`).
-    fn flow_into_mut_args(&self, args: &[Operand], st: &mut State) {
+    fn flow_into_mut_args(&mut self, args: &[Operand], st: &mut State, span: Span) {
         for (i, a) in args.iter().enumerate() {
             let (Operand::Move(p) | Operand::Copy(p)) = a else { continue };
             let ty = self.place_ty(p);
@@ -638,6 +722,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             let targets: Vec<Local> =
                 st.holds[p.local as usize].iter().filter(|&l| self.loans[l].mutable).map(|l| self.loans[l].place.local).collect();
             for t in targets {
+                // Storing into a target behind a parameter needs the same origin check
+                // as a direct assignment behind a parameter reference.
+                if self.report {
+                    let origins = self.loan_origins(&st.holds[t as usize]);
+                    if !origins.is_empty() {
+                        self.check_incoming_loans(&origins, &incoming, t, span);
+                    }
+                }
                 st.holds[t as usize].union(&incoming);
             }
         }

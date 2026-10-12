@@ -45,7 +45,7 @@ pub fn env_hash<'a>(items: impl Iterator<Item = &'a ItemScan>) -> u64 {
 fn hash_tok(h: &mut FxHasher, t: &Tok, strings: &[String]) {
     std::mem::discriminant(t).hash(h);
     match t {
-        Tok::Ident(s) => s.hash(h),
+        Tok::Ident(s) | Tok::Reserved(s) => s.hash(h),
         Tok::Int(v, suf) => {
             v.hash(h);
             suf.map(|s| s as u8).hash(h);
