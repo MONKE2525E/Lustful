@@ -151,6 +151,23 @@ void lust_fmt_i64(lust_String *out, int64_t v) LUST_BODY({
 
 void lust_fmt_bool(lust_String *out, uint8_t v) LUST_BODY({ lust_string_push_cstr(out, v ? "true" : "false"); })
 
+#ifdef LUST_IMPL
+#include "escape_table.h"
+
+/* True when Rust's escape_debug writes this scalar as \u{...}:
+   binary search over the generated range table. */
+static int lust_escape_unicode(uint32_t c) {
+    uint32_t lo = 0, hi = (uint32_t)(sizeof lust_escape_ranges / sizeof lust_escape_ranges[0]);
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (c < lust_escape_ranges[mid][0]) hi = mid;
+        else if (c > lust_escape_ranges[mid][1]) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+#endif
+
 void lust_fmt_escape(lust_String *out, uint32_t c, uint32_t quote) LUST_BODY({
     switch (c) {
     case '\t': lust_string_push_cstr(out, "\\t"); return;
@@ -160,7 +177,7 @@ void lust_fmt_escape(lust_String *out, uint32_t c, uint32_t quote) LUST_BODY({
     case 0: lust_string_push_cstr(out, "\\0"); return;
     }
     if (c == quote) { lust_string_push_bytes(out, "\\", 1); lust_string_push_char(out, c); return; }
-    if (c < 0x20 || c == 0x7f) {
+    if (lust_escape_unicode(c)) {
         char b[16];
         snprintf(b, sizeof b, "\\u{%x}", c);
         lust_string_push_cstr(out, b);

@@ -1881,7 +1881,8 @@ fn runtime_source(with_impls: bool) -> String {
     // the symbols link; a unit whose code calls the core adds
     // `hash_decls()` to its header.
     let hash = if with_impls { hash_source(true) } else { String::new() };
-    let (h, core, panic) = (include_str!("runtime/runtime.h"), include_str!("runtime/core.c"), include_str!("runtime/panic.c"));
+    let core = include_str!("runtime/core.c").replacen("#include \"escape_table.h\"", include_str!("runtime/escape_table.h"), 1);
+    let (h, core, panic) = (include_str!("runtime/runtime.h"), core.as_str(), include_str!("runtime/panic.c"));
     let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len() + hash.len());
     src.push_str(h);
     src.push_str(core);
