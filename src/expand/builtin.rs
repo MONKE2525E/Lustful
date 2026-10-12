@@ -289,7 +289,7 @@ fn stringify_tok_text(st: &Expander, t: &Token) -> String {
             Some(s) if s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#") => s.to_string(),
             _ => plain,
         },
-        Tok::ByteStr | Tok::ByteChar => match slice {
+        Tok::ByteStr(_) | Tok::ByteChar(_) => match slice {
             Some(s) if s.starts_with(['b', 'c']) => s.to_string(),
             _ => plain,
         },

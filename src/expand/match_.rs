@@ -669,7 +669,7 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             _ => vec![],
         },
         FragKind::Literal => match first {
-            Some(Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::ByteStr | Tok::ByteChar | Tok::Char(_) | Tok::True | Tok::False) => {
+            Some(Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(_) | Tok::True | Tok::False) => {
                 vec![pos + 1]
             }
             // A negative numeric literal is one literal fragment.
@@ -772,7 +772,7 @@ fn meta_end(input: &[Tt], pos: usize) -> Option<usize> {
         Some(Tt::Tok(t)) if t.tok == Tok::Eq => {
             let lit = tok_at(input, i + 1).map(|t| t.tok);
             match lit {
-                Some(Tok::Str(_) | Tok::Int(..) | Tok::Float(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::ByteStr) => Some(i + 2),
+                Some(Tok::Str(_) | Tok::Int(..) | Tok::Float(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::ByteStr(_)) => Some(i + 2),
                 _ => None,
             }
         }

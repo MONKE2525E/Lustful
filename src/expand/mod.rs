@@ -191,7 +191,7 @@ pub fn hash_token(h: &mut impl Hasher, tok: &Token, strings: &[String]) {
             v.hash(h);
             suffix.map(|s| s as u8).hash(h);
         }
-        Tok::Str(i) | Tok::Float(i) | Tok::DocStr(i) => strings.get(i as usize).hash(h),
+        Tok::Str(i) | Tok::Float(i) | Tok::DocStr(i) | Tok::ByteStr(i) | Tok::ByteChar(i) => strings.get(i as usize).hash(h),
         Tok::Char(c) => c.hash(h),
         _ => {}
     }
@@ -364,8 +364,8 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
             let marks = "#".repeat(hashes);
             return format!("r{marks}\"{text}\"{marks}");
         }
-        ByteStr => return "b\"\"".to_string(),
-        ByteChar => return "b'?'".to_string(),
+        // Byte literals store their verbatim source text (see lexer::Tok).
+        ByteStr(i) | ByteChar(i) => return strings.get(*i as usize).cloned().unwrap_or_default(),
         Char(c) => return format!("{c:?}"),
         As => "as",
         Break => "break",
@@ -463,7 +463,11 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
 /// same kind and same value. Span and context do not take part.
 pub fn tok_matches(pattern: &Tok, input: &Tok, strings: &[String]) -> bool {
     match (pattern, input) {
-        (Tok::Str(a), Tok::Str(b)) | (Tok::Float(a), Tok::Float(b)) | (Tok::DocStr(a), Tok::DocStr(b)) => {
+        (Tok::Str(a), Tok::Str(b))
+        | (Tok::Float(a), Tok::Float(b))
+        | (Tok::DocStr(a), Tok::DocStr(b))
+        | (Tok::ByteStr(a), Tok::ByteStr(b))
+        | (Tok::ByteChar(a), Tok::ByteChar(b)) => {
             strings.get(*a as usize) == strings.get(*b as usize)
         }
         _ => pattern == input,
@@ -821,6 +825,8 @@ impl<'a> Expander<'a> {
                             Tok::Str(i) => Tok::Str(i + offset),
                             Tok::Float(i) => Tok::Float(i + offset),
                             Tok::DocStr(i) => Tok::DocStr(i + offset),
+                            Tok::ByteStr(i) => Tok::ByteStr(i + offset),
+                            Tok::ByteChar(i) => Tok::ByteChar(i + offset),
                             other => other,
                         };
                         Tt::Tok(Token { tok, span })
@@ -852,6 +858,8 @@ impl<'a> Expander<'a> {
                             Tok::Str(i) => Tok::Str(i + offset),
                             Tok::Float(i) => Tok::Float(i + offset),
                             Tok::DocStr(i) => Tok::DocStr(i + offset),
+                            Tok::ByteStr(i) => Tok::ByteStr(i + offset),
+                            Tok::ByteChar(i) => Tok::ByteChar(i + offset),
                             other => other,
                         };
                         Tt::Tok(Token { tok: kind, span: tok.span })

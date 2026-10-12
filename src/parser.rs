@@ -259,8 +259,8 @@ fn tok_name(t: Tok) -> &'static str {
         Float(_) => "float literal",
         Str(_) => "string literal",
         DocStr(_) => "doc comment string",
-        ByteStr => "byte string literal",
-        ByteChar => "byte char literal",
+        ByteStr(_) => "byte string literal",
+        ByteChar(_) => "byte char literal",
         Char(_) => "char literal",
         Lifetime(_) => "lifetime",
         As => "`as`",
@@ -2027,7 +2027,7 @@ impl<'a> Parser<'a> {
                 let hi = self.pattern_bound()?;
                 Pat::Range { lo: None, hi: Some(hi), inclusive: true }
             }
-            Tok::Float(_) | Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "float and byte literals")),
+            Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) => return Err(not_yet(C_LIT, start, "float and byte literals")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Pat::QPath { self_ty, trait_path, segs }
@@ -2645,7 +2645,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Float(i + self.str_base)
             }
-            Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "byte string and byte char literals")),
+            Tok::ByteStr(_) | Tok::ByteChar(_) => return Err(not_yet(C_LIT, start, "byte string and byte char literals")),
             Tok::Str(i) => {
                 self.bump();
                 Expr::Str(i + self.str_base)

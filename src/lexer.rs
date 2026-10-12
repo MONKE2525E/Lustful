@@ -35,11 +35,14 @@ pub enum Tok {
     /// `Lexed::strings`, holding the comment text. `stringify!` prints it
     /// as the raw string rustc prints (`r" hi"`).
     DocStr(u32),
-    /// A byte string (`b".."`, `br".."`) or C string (`c".."`, `cr".."`) literal. The bytes
-    /// are not stored: the parser rejects the form before any value is needed.
-    ByteStr,
-    /// A byte char literal (`b'x'`). Like `ByteStr`, the value is not stored.
-    ByteChar,
+    /// A byte string (`b".."`, `br".."`) or C string (`c".."`, `cr".."`) literal.
+    /// Index into `Lexed::strings`, holding the token's verbatim source text (prefix
+    /// and quotes included). The parser rejects the form before any value is needed;
+    /// the text is what macro token matching and `stringify!` compare and print, so
+    /// two byte literals with different bytes must not look equal here.
+    ByteStr(u32),
+    /// A byte char literal (`b'x'`). Like `ByteStr`, the index holds verbatim source text.
+    ByteChar(u32),
     Char(char),
     /// A lifetime or loop label name, without the leading `'` (`'a`, `'static`, `'_`).
     Lifetime(Sym),
@@ -479,7 +482,10 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         strings.push(text);
                         Tok::Str(strings.len() as u32 - 1)
                     }
-                    None => Tok::ByteStr,
+                    None => {
+                        strings.push(src[start..i].to_string());
+                        Tok::ByteStr(strings.len() as u32 - 1)
+                    }
                 }
             } else if (s == "b" || s == "c") && b.get(i) == Some(&b'"') {
                 i += 1;
@@ -494,7 +500,8 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         Some(_) => i += 1,
                     }
                 }
-                Tok::ByteStr
+                strings.push(src[start..i].to_string());
+                Tok::ByteStr(strings.len() as u32 - 1)
             } else if s == "b" && b.get(i) == Some(&b'\'') {
                 i += 1;
                 if b.get(i) == Some(&b'\\') {
@@ -509,7 +516,8 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     return Err(err(start, i, "unterminated byte char literal"));
                 }
                 i += 1;
-                Tok::ByteChar
+                strings.push(src[start..i].to_string());
+                Tok::ByteChar(strings.len() as u32 - 1)
             } else if raw_open(b, i).is_some() || b.get(i) == Some(&b'\'') {
                 // An identifier right against a quote is a reserved
                 // literal prefix (`f"x"`, `f#"x"#`, `f'x'`): rustc

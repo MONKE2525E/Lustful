@@ -1040,7 +1040,11 @@ impl Shift {
         for tree in trees {
             match tree {
                 TokenTree::Token(tok) => match &mut tok.tok {
-                    crate::lexer::Tok::Str(i) | crate::lexer::Tok::Float(i) | crate::lexer::Tok::DocStr(i) => *i += self.s,
+                    crate::lexer::Tok::Str(i)
+                    | crate::lexer::Tok::Float(i)
+                    | crate::lexer::Tok::DocStr(i)
+                    | crate::lexer::Tok::ByteStr(i)
+                    | crate::lexer::Tok::ByteChar(i) => *i += self.s,
                     _ => {}
                 },
                 TokenTree::Delim(_, inner, _) => self.trees(inner),
