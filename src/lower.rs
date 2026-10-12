@@ -11,7 +11,7 @@ struct LoopInfo {
     continue_bb: Bb,
     dest: Option<Place>,
     depth: usize,
-    label: Option<crate::intern::Sym>,
+    label: Option<(crate::intern::Sym, crate::diag::Span)>,
     is_block: bool,
 }
 
@@ -450,7 +450,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     continue_bb: head,
                     dest: None,
                     depth: self.scopes.len(),
-                    label: label.map(|l| l.name),
+                    label: label.map(|l| (l.name, l.span)),
                     is_block: false,
                 });
                 self.block_into(*body, None);
@@ -469,7 +469,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     continue_bb: head,
                     dest: dest.cloned(),
                     depth: self.scopes.len(),
-                    label: label.map(|l| l.name),
+                    label: label.map(|l| (l.name, l.span)),
                     is_block: false,
                 });
                 self.block_into(*body, None);
@@ -625,7 +625,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Break { label, value: val } => {
                 let ti = match label {
                     None => self.loops.len() - 1,
-                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)).unwrap_or(self.loops.len() - 1),
+                    Some(l) => self
+                        .loops
+                        .iter()
+                        .rposition(|lp| lp.label.is_some_and(|(n, bs)| n == l.name && crate::diag::ctxt_can_see_local(l.span.ctxt, bs)))
+                        .unwrap_or(self.loops.len() - 1),
                 };
                 let li = &self.loops[ti];
                 let (bb, depth, ld) = (li.break_bb, li.depth, li.dest.clone());
@@ -638,7 +642,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Continue(label) => {
                 let ti = match label {
                     None => self.loops.iter().rposition(|lp| !lp.is_block).unwrap_or(self.loops.len() - 1),
-                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)).unwrap_or(self.loops.len() - 1),
+                    Some(l) => self
+                        .loops
+                        .iter()
+                        .rposition(|lp| lp.label.is_some_and(|(n, bs)| n == l.name && crate::diag::ctxt_can_see_local(l.span.ctxt, bs)))
+                        .unwrap_or(self.loops.len() - 1),
                 };
                 let li = &self.loops[ti];
                 let (bb, depth) = (li.continue_bb, li.depth);
@@ -660,7 +668,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     continue_bb: exit,
                     dest: dest.cloned(),
                     depth: self.scopes.len(),
-                    label: Some(label.name),
+                    label: Some((label.name, label.span)),
                     is_block: true,
                 });
                 self.block_into(*body, dest);
@@ -1137,7 +1145,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             continue_bb: head,
             dest: None,
             depth: self.scopes.len() - 1,
-            label: label.map(|l| l.name),
+            label: label.map(|l| (l.name, l.span)),
             is_block: false,
         });
         self.block_into(body, None);

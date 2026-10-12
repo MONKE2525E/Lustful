@@ -224,7 +224,8 @@ struct LoopCtx {
     is_loop: bool,
     /// True for a labeled block, which `continue` cannot target.
     is_block: bool,
-    label: Option<Sym>,
+    /// The label and its binding span; hygiene reads the span's context.
+    label: Option<(Sym, Span)>,
 }
 
 struct Ctx<'p, 'a> {
@@ -318,9 +319,9 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
-/// The name of an optional AST label.
-fn label_of(label: &Option<ast::Label>) -> Option<Sym> {
-    label.map(|l| l.name)
+/// The name and binding span of an optional AST label.
+fn label_of(label: &Option<ast::Label>) -> Option<(Sym, Span)> {
+    label.map(|l| (l.name, l.span))
 }
 
 /// Maps written tuple pattern elements to field indexes. At most one `..`
@@ -1170,7 +1171,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Break { label, value: val } => {
                 let target = match label {
                     None => self.loops.len().checked_sub(1),
-                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)),
+                    Some(l) => self
+                        .loops
+                        .iter()
+                        .rposition(|lp| lp.label.is_some_and(|(n, bs)| n == l.name && crate::diag::ctxt_can_see_local(l.span.ctxt, bs))),
                 };
                 let Some(ti) = target else {
                     match label {
@@ -1219,7 +1223,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Continue(label) => {
                 let found = match label {
                     None => self.loops.iter().rposition(|lp| !lp.is_block),
-                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)),
+                    Some(l) => self
+                        .loops
+                        .iter()
+                        .rposition(|lp| lp.label.is_some_and(|(n, bs)| n == l.name && crate::diag::ctxt_can_see_local(l.span.ctxt, bs))),
                 };
                 match found {
                     None => match label {
@@ -1249,7 +1256,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 NEVER
             }
             Expr::LabeledBlock { label, body } => {
-                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: true, label: Some(label.name) });
+                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: true, label: Some((label.name, label.span)) });
                 let t = self.block(*body, expected);
                 let l = self.loops.pop().unwrap();
                 match l.break_ty {
