@@ -18,6 +18,9 @@
 # Knobs: CASE_TIMEOUT (seconds per compile, default 30),
 # RUN_TIMEOUT (seconds per run, default 10), SANITIZE=1 (with
 # LUST: rebuild the generated C under ASan/UBSan, as difftest).
+# LUST_USE_DAEMON=1: run the lust side through a private daemon on
+# a socket in the work dir (the MGP joint gate needs the daemon
+# path, ARCH 9.3). Default is cold, for the reason below.
 # A fixture directory that is missing or holds no .rs files
 # fails the run; corpora never skip in silence (ARCH 9.3).
 
@@ -36,9 +39,19 @@ corpus_init() {
   run_timeout=${RUN_TIMEOUT:-10}
   # Compile cold, as difftest does: a warm daemon would make
   # accept/reject depend on session state, not on the corpus.
-  export LUST_NO_DAEMON=1
-  export LUST_DAEMON_SOCKET="$corpus_work/no-daemon.sock"
+  # LUST_USE_DAEMON=1 opts into a private daemon instead: the
+  # socket lives in the work dir, the idle exit is short, and a
+  # two-check warm-up below makes every case daemon-served (the
+  # client's first command is answered cold while it autostarts
+  # the daemon; see src/client.rs).
+  export LUST_DAEMON_SOCKET="$corpus_work/daemon.sock"
   export LUST_CACHE_DIR="$corpus_work/cache"
+  if [ "${LUST_USE_DAEMON:-0}" = 1 ]; then
+    unset LUST_NO_DAEMON
+    export LUST_DAEMON_IDLE=${LUST_DAEMON_IDLE:-20s}
+  else
+    export LUST_NO_DAEMON=1
+  fi
   if ! command -v timeout >/dev/null 2>&1; then
     echo "FAIL: the timeout command is required for per-case timeouts"
     exit 1
@@ -57,6 +70,18 @@ corpus_init() {
       exit 1
     fi
     echo "lust mode: comparing $LUST against rustc (gaps do not fail${LUST_STRICT:+ unless LUST_STRICT=1})"
+    if [ "${LUST_USE_DAEMON:-0}" = 1 ]; then
+      # Warm-up: check one probe file twice. The first check
+      # autostarts the daemon, the second is served by it, so
+      # every real case below takes the daemon path.
+      echo 'fn main() {}' >"$corpus_work/warmup.rs"
+      timeout "$case_timeout" "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>&1 || true
+      if ! timeout "$case_timeout" "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>"$corpus_work/warmup.err"; then
+        echo "FAIL: daemon warm-up check failed: $(head -3 "$corpus_work/warmup.err")"
+        exit 1
+      fi
+      echo "lust daemon: private daemon on $LUST_DAEMON_SOCKET (warm-up done)"
+    fi
   fi
 }
 

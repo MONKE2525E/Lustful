@@ -21,11 +21,24 @@
 #       crashing build DOES fail, because lust accepted the program.
 #
 # [filter] keeps only entries whose name contains the text.
+# Knobs (ARCH 9.3 runner rules): CASE_TIMEOUT seconds per build
+# (default 300; a cold Cargo kernel build is slow), RUN_TIMEOUT
+# seconds per run (default 30), SANITIZE=1 in lust mode rebuilds
+# the generated C under ASan/UBSan and runs the cases on that
+# binary. Missing fixture dirs fail the run; they never skip.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 filter=${1:-}
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "FAIL: the timeout command is required for per-case timeouts"
+  exit 1
+fi
+case_timeout=${CASE_TIMEOUT:-300}
+run_timeout=${RUN_TIMEOUT:-30}
+run_cc() { timeout "$case_timeout" "$@"; }
+seen=0
 pass=0
 fail=0
 unsupported=0
@@ -45,7 +58,12 @@ keep() { [ -z "$filter" ] || [[ "$1" == *"$filter"* ]]; }
 run_case() {
   local label=$1 bin=$2 expected=$3
   shift 3
-  if ! "$bin" "$@" >"$work/out" 2>"$work/err"; then
+  seen=$((seen + 1))
+  if [ ! -f "$expected" ]; then
+    bad "$label" "expected file missing: $expected"
+    return
+  fi
+  if ! timeout "$run_timeout" "$bin" "$@" >"$work/out" 2>"$work/err"; then
     bad "$label" "exit nonzero: $(head -3 "$work/err")"
     return
   fi
@@ -89,30 +107,89 @@ bin_name() { sed -n 's/^name = "\(.*\)-kernel"/\1-kernel/p' "$1/Cargo.toml" | he
 
 kernels=(gostring json scanner gostring-amalgam json-amalgam scanner-amalgam)
 
+# Fixture dirs must exist and hold cases (ARCH 9.3: no silent skips).
+for k in "${kernels[@]}"; do
+  if [ ! -f "$root/tests/kernels/$k/src/main.rs" ] || [ ! -f "$root/tests/kernels/$k/Cargo.toml" ]; then
+    echo "FAIL fixture kernel incomplete: tests/kernels/$k (need Cargo.toml and src/main.rs)"
+    exit 1
+  fi
+done
+if ! compgen -G "$root/tests/compat/*.rs" >/dev/null; then
+  echo "FAIL fixture dir missing or empty: tests/compat"
+  exit 1
+fi
+
+# Builds one entry file with lust. With SANITIZE=1 the binary at $2 is
+# replaced by an ASan/UBSan build of the generated C, and a sanitizer
+# report at run time fails like any wrong run (run_case checks stderr
+# only via exit code, so the caller keeps the unsanitized compare too:
+# SANITIZE runs the cases twice, once per binary). Returns nonzero if
+# lust rejects the entry (unsupported in report mode).
+lust_build() {
+  # $1 entry file, $2 out binary, $3 flat name
+  run_cc "$LUST" build "$1" -o "$2" 2>"$work/$3.err"
+}
+
+lust_build_sanitized() {
+  # $1 entry file, $2 out binary, $3 flat name. The entry is known to
+  # build (lust_build just did), so a failure here is a real failure.
+  run_cc "$LUST" build "$1" -o "$work/$3.tmp" --emit-c "$work/$3.san" 2>/dev/null || return 1
+  gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$2" "$work/$3.san".*.c 2>"$work/$3.san.err"
+}
+
 if [ -n "${LUST:-}" ]; then
+  case "$LUST" in
+    /*) ;;
+    *) LUST=$PWD/$LUST ;;
+  esac
+  if [ ! -x "$LUST" ]; then
+    echo "FAIL: LUST=$LUST is not an executable file"
+    exit 1
+  fi
   # Report mode: lust builds the entry file of each kernel and each
   # compat fixture. Rejection is a report, not a failure.
   for k in "${kernels[@]}"; do
     case "$k" in *-amalgam) parent=$root/tests/kernels/${k%-amalgam} ;; *) parent=$root/tests/kernels/$k ;; esac
     entry=$root/tests/kernels/$k/src/main.rs
     keep "$k" || continue
-    if "$LUST" build "$entry" -o "$work/$k.lust" 2>"$work/$k.err"; then
+    if lust_build "$entry" "$work/$k.lust" "$k"; then
       kernel_cases "$k" "$work/$k.lust" "$parent"
+      seen=$((seen + 1))
+      if [ "${SANITIZE:-0}" = 1 ]; then
+        if lust_build_sanitized "$entry" "$work/$k.sanbin" "$k"; then
+          kernel_cases "$k/san" "$work/$k.sanbin" "$parent"
+        else
+          bad "$k/san" "sanitized build failed: $(head -3 "$work/$k.san.err")"
+        fi
+      fi
     else
+      seen=$((seen + 1))
       unsup "$k" "$(head -1 "$work/$k.err")"
     fi
   done
   for f in "$root"/tests/compat/*.rs; do
     name=$(basename "$f" .rs)
     keep "compat/$name" || continue
-    if "$LUST" build "$f" -o "$work/$name.lust" 2>"$work/$name.err"; then
+    if lust_build "$f" "$work/$name.lust" "$name"; then
       run_case "compat/$name" "$work/$name.lust" "$root/tests/compat/$name.expected"
+      if [ "${SANITIZE:-0}" = 1 ]; then
+        if lust_build_sanitized "$f" "$work/$name.sanbin" "$name"; then
+          run_case "compat/$name/san" "$work/$name.sanbin" "$root/tests/compat/$name.expected"
+        else
+          bad "compat/$name/san" "sanitized build failed: $(head -3 "$work/$name.san.err")"
+        fi
+      fi
     else
+      seen=$((seen + 1))
       unsup "compat/$name" "$(head -1 "$work/$name.err")"
     fi
   done
   echo "---"
   echo "lust report: $pass ok, $fail wrong, $unsupported unsupported (unsupported does not fail)"
+  if [ $seen -eq 0 ]; then
+    echo "FAIL: no entries matched filter '${filter}'"
+    exit 1
+  fi
   [ "$fail" -eq 0 ]
   exit $?
 fi
@@ -131,7 +208,8 @@ for k in "${kernels[@]}"; do
       bad "$k/fresh" "committed amalgam differs from amalgamate.py output; regenerate it"
     fi
   fi
-  if ! cargo build --release --manifest-path "$kdir/Cargo.toml" >"$work/$k.build" 2>&1; then
+  seen=$((seen + 1))
+  if ! run_cc cargo build --release --manifest-path "$kdir/Cargo.toml" >"$work/$k.build" 2>&1; then
     bad "$k/build" "cargo build failed: $(grep -m2 '^error' "$work/$k.build")"
     continue
   fi
@@ -144,7 +222,7 @@ for f in "$root"/tests/compat/*.rs; do
   keep "compat/$name" || continue
   mode=$(sed -n 's|// panic-mode: ||p' "$f" | head -1)
   mode=${mode:-abort}
-  if ! rustc --edition 2024 -C "panic=$mode" -C overflow-checks=on -A warnings \
+  if ! run_cc rustc --edition 2024 -C "panic=$mode" -C overflow-checks=on -A warnings \
     -o "$work/$name.rustc" "$f" 2>"$work/$name.err"; then
     bad "compat/$name" "rustc rejected it: $(head -3 "$work/$name.err")"
     continue
@@ -154,4 +232,8 @@ done
 
 echo "---"
 echo "kernels: $pass ok, $fail failed"
+if [ $seen -eq 0 ]; then
+  echo "FAIL: no entries matched filter '${filter}'"
+  exit 1
+fi
 [ "$fail" -eq 0 ]

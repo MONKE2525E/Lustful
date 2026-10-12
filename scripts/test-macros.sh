@@ -25,6 +25,10 @@
 #             `expand` command, its token stream is compared with
 #             .expanded and the match and differ counts are reported.
 #             LUST_STRICT=1 also makes a token mismatch fail.
+#   SANITIZE=1 (with LUST) also rebuilds each supported pass case's
+#             generated C under ASan/UBSan and reruns it, as difftest
+#             does (ARCH 9.3: every runner works with SANITIZE=1 where
+#             it builds C).
 set -uo pipefail
 # Resolve a relative LUST path against the caller's directory
 # before changing to the repo root, as test-corpus-lib.sh does.
@@ -127,6 +131,23 @@ lust_pass_case() {
     return 0
   fi
   lust_supported=$((lust_supported + 1))
+  if [ "${SANITIZE:-0}" = 1 ]; then
+    # The daemon is off in this runner, so --emit-c writes every unit.
+    run_cc "$LUST" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name.san" 2>/dev/null
+    if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$work/$name.sanbin" "$work/$name.san".*.c 2>"$work/$name.san.err"; then
+      echo "WRONG $name: gcc could not build the generated C under SANITIZE=1: $(head -3 "$work/$name.san.err")"
+      lust_wrong=$((lust_wrong + 1))
+      if [ "${LUST_STRICT:-0}" = 1 ]; then report bad "$name" "lust wrong result in strict mode"; return 1; fi
+      return 0
+    fi
+    run_to "$work/$name.sanbin" >"$work/$name.san.out" 2>"$work/$name.san.runerr"
+    if grep -q "runtime error\|Sanitizer" "$work/$name.san.runerr" || ! diff -q "$out" "$work/$name.san.out" >/dev/null; then
+      echo "WRONG $name: sanitized build failed or output differs: $(head -3 "$work/$name.san.runerr")"
+      lust_wrong=$((lust_wrong + 1))
+      if [ "${LUST_STRICT:-0}" = 1 ]; then report bad "$name" "lust wrong result in strict mode"; return 1; fi
+      return 0
+    fi
+  fi
   if [ "$lust_expand_ok" = 1 ]; then
     if run_cc "$LUST" expand "$f" 2>/dev/null | python3 tests/macros/normalize.py >"$work/$name.lust.expanded" \
       && [ -s "$work/$name.lust.expanded" ]; then
