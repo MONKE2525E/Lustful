@@ -353,6 +353,9 @@ impl ResolvedTables {
         }
         let (item_vis, item_module) = match target {
             Target::Def(d) | Target::Variant(d, _) => match self.def_info.get(&d) {
+                // Macros are textual: `#[macro_export]` puts them at the
+                // crate root in public, so re-export rules do not bind.
+                Some(info) if info.kind == ResKind::Macro => return true,
                 Some(info) => (info.vis.clone(), info.module),
                 None => return true,
             },
