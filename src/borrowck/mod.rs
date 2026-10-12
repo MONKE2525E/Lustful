@@ -17,25 +17,48 @@ use crate::ir::*;
 use crate::ty::*;
 use std::collections::HashSet;
 
+/// A bitset over locals or loans. Most bodies fit in one word, and that word
+/// is stored inline: dataflow clones these sets per block (two per local in
+/// every `State`), so a heap allocation per set showed up once calls became
+/// terminators and block counts grew.
 #[derive(Clone, PartialEq, Eq)]
-struct BitSet(Vec<u64>);
+struct BitSet(Words);
+
+#[derive(Clone, PartialEq, Eq)]
+enum Words {
+    One(u64),
+    Many(Vec<u64>),
+}
 
 impl BitSet {
     fn new(n: usize) -> BitSet {
-        BitSet(vec![0; n.div_ceil(64).max(1)])
+        let w = n.div_ceil(64).max(1);
+        BitSet(if w == 1 { Words::One(0) } else { Words::Many(vec![0; w]) })
+    }
+    fn words(&self) -> &[u64] {
+        match &self.0 {
+            Words::One(w) => std::slice::from_ref(w),
+            Words::Many(v) => v,
+        }
+    }
+    fn words_mut(&mut self) -> &mut [u64] {
+        match &mut self.0 {
+            Words::One(w) => std::slice::from_mut(w),
+            Words::Many(v) => v,
+        }
     }
     fn insert(&mut self, i: usize) {
-        self.0[i / 64] |= 1 << (i % 64);
+        self.words_mut()[i / 64] |= 1 << (i % 64);
     }
     fn remove(&mut self, i: usize) {
-        self.0[i / 64] &= !(1 << (i % 64));
+        self.words_mut()[i / 64] &= !(1 << (i % 64));
     }
     fn contains(&self, i: usize) -> bool {
-        self.0[i / 64] & (1 << (i % 64)) != 0
+        self.words()[i / 64] & (1 << (i % 64)) != 0
     }
     fn union(&mut self, o: &BitSet) -> bool {
         let mut changed = false;
-        for (a, b) in self.0.iter_mut().zip(&o.0) {
+        for (a, b) in self.words_mut().iter_mut().zip(o.words()) {
             let n = *a | b;
             changed |= n != *a;
             *a = n;
@@ -43,13 +66,13 @@ impl BitSet {
         changed
     }
     fn clear(&mut self) {
-        self.0.iter_mut().for_each(|w| *w = 0);
+        self.words_mut().iter_mut().for_each(|w| *w = 0);
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(wi, &w)| (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| wi * 64 + b))
+        self.words().iter().enumerate().flat_map(|(wi, &w)| (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| wi * 64 + b))
     }
     fn is_empty(&self) -> bool {
-        self.0.iter().all(|&w| w == 0)
+        self.words().iter().all(|&w| w == 0)
     }
 }
 
@@ -150,6 +173,10 @@ struct Ck<'b, 'p, 'a> {
     /// Loan created by each Ref statement, keyed by (block, statement index).
     loan_at: std::collections::HashMap<(u32, u32), usize>,
     preds: Vec<Vec<u32>>,
+    /// Successor blocks per block, computed once: with call terminators most
+    /// blocks end in a call, and recomputing edges in every pass showed up
+    /// in profiles.
+    succs: Vec<Vec<Bb>>,
     live_out_stmt: Vec<Vec<BitSet>>,
     /// Live locals at each block's entry, for the loans live after a block's
     /// terminating call.
@@ -179,6 +206,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         loans: Vec::new(),
         loan_at: Default::default(),
         preds: vec![Vec::new(); body.blocks.len()],
+        succs: Vec::new(),
         live_out_stmt: Vec::new(),
         live_in_block: Vec::new(),
         errs: Vec::new(),
@@ -381,34 +409,45 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     fn compute_preds(&mut self) {
-        for (bi, b) in self.body.blocks.iter().enumerate() {
-            for s in successors(&b.term) {
+        self.succs = self.body.blocks.iter().map(|b| successors(&b.term)).collect();
+        for bi in 0..self.succs.len() {
+            for k in 0..self.succs[bi].len() {
+                let s = self.succs[bi][k];
                 self.preds[s.0 as usize].push(bi as u32);
             }
         }
     }
 
     fn compute_reach(&mut self) {
+        // reach[b] = {b} plus everything its successors reach, to a fixpoint.
+        // The same sets a per-block search computes, without re-walking the
+        // graph once per block.
         let nb = self.body.blocks.len();
-        self.reach = (0..nb)
-            .map(|start| {
-                let mut seen = BitSet::new(nb);
-                let mut stack = vec![start];
-                while let Some(b) = stack.pop() {
-                    if seen.contains(b) {
-                        continue;
+        let mut reach = vec![BitSet::new(nb); nb];
+        for (b, r) in reach.iter_mut().enumerate() {
+            r.insert(b);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..nb).rev() {
+                for k in 0..self.succs[b].len() {
+                    let s = self.succs[b][k].0 as usize;
+                    if s != b {
+                        let (lo, hi) = if b < s { (b, s) } else { (s, b) };
+                        let (left, right) = reach.split_at_mut(hi);
+                        let (dst, src) = if b < s { (&mut left[lo], &right[0]) } else { (&mut right[0], &left[lo]) };
+                        changed |= dst.union(src);
                     }
-                    seen.insert(b);
-                    stack.extend(successors(&self.body.blocks[b].term).into_iter().map(|s| s.0 as usize));
                 }
-                seen
-            })
-            .collect();
+            }
+        }
+        self.reach = reach;
     }
 
     /// True if block `b` can reach itself again through at least one edge (it is in a loop).
     fn loops_back(&self, b: u32) -> bool {
-        successors(&self.body.blocks[b as usize].term).iter().any(|s| self.reach[s.0 as usize].contains(b as usize))
+        self.succs[b as usize].iter().any(|s| self.reach[s.0 as usize].contains(b as usize))
     }
 
     // ---------- Liveness ----------
@@ -480,13 +519,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let n = self.n_locals();
         let nb = self.body.blocks.len();
         let mut live_in = vec![BitSet::new(n); nb];
+        let mut live = BitSet::new(n);
         let mut changed = true;
         while changed {
             changed = false;
             for bi in (0..nb).rev() {
                 let b = &self.body.blocks[bi];
-                let mut live = BitSet::new(n);
-                for s in successors(&b.term) {
+                live.clear();
+                for s in &self.succs[bi] {
                     live.union(&live_in[s.0 as usize]);
                 }
                 Self::live_term(&b.term, &mut live);
@@ -494,18 +534,17 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     Self::live_stmt(&s.kind, &mut live);
                 }
                 if live != live_in[bi] {
-                    live_in[bi] = live;
+                    live_in[bi] = live.clone();
                     changed = true;
                 }
             }
         }
-        self.live_in_block = live_in.clone();
         // Per-statement live-out sets.
         self.live_out_stmt = Vec::with_capacity(nb);
         for bi in 0..nb {
             let b = &self.body.blocks[bi];
-            let mut live = BitSet::new(n);
-            for s in successors(&b.term) {
+            live.clear();
+            for s in &self.succs[bi] {
                 live.union(&live_in[s.0 as usize]);
             }
             Self::live_term(&b.term, &mut live);
@@ -516,6 +555,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
             self.live_out_stmt.push(outs);
         }
+        self.live_in_block = live_in;
     }
 
     // ---------- Forward dataflow and checks ----------
@@ -559,7 +599,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             queued[b as usize] = false;
             let mut st = entry[b as usize].clone().unwrap();
             self.run_block(b, &mut st);
-            for s in successors(&self.body.blocks[b as usize].term) {
+            for k in 0..self.succs[b as usize].len() {
+                let s = self.succs[b as usize][k];
                 let si = s.0 as usize;
                 let changed = match &mut entry[si] {
                     None => {
@@ -767,7 +808,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let skip = if dest.proj.is_empty() { Some(dest.local) } else { None };
         let live = if self.report {
             let mut locals = BitSet::new(self.n_locals());
-            for s in successors(&self.body.blocks[b as usize].term) {
+            for s in &self.succs[b as usize] {
                 locals.union(&self.live_in_block[s.0 as usize]);
             }
             self.live_loans(st, &locals, skip, b, si)

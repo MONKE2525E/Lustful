@@ -205,6 +205,15 @@ impl Reads {
         self.map.entry(key).or_insert(Read { fingerprint, failed });
     }
 
+    /// Records one read, computing the fingerprint only if the key is new:
+    /// a body that asks the same question a hundred times pays for the
+    /// fingerprint once.
+    pub fn record_with(&mut self, key: ReadKey, failed: bool, fingerprint: impl FnOnce() -> Fingerprint) {
+        if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
+            v.insert(Read { fingerprint: fingerprint(), failed });
+        }
+    }
+
     /// Records a mono call edge to a checked body. `fingerprint` is the body
     /// fingerprint mono computed; there is no mono stage yet, so no
     /// production caller records these in S7.
@@ -598,8 +607,9 @@ impl<'a> Program<'a> {
                 Namespace::Macro => BindingRes::Absent,
             }
         };
-        let fp = binding_fingerprint(self, res);
-        reads.record(ReadKey::Binding(BindingKey { module, ns, name }), fp, res == BindingRes::Absent);
+        reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || {
+            binding_fingerprint(self, res)
+        });
         res
     }
 
@@ -640,9 +650,8 @@ impl<'a> Program<'a> {
                 set.candidates.push(MethodCandidate { def: self.def_id(f), receiver, trait_: None });
             }
         }
-        let fp = method_set_fingerprint(self, &set);
         let failed = set.candidates.is_empty();
-        reads.record(ReadKey::MethodSet(MethodSetKey { head, name, form }), fp, failed);
+        reads.record_with(ReadKey::MethodSet(MethodSetKey { head, name, form }), failed, || method_set_fingerprint(self, &set));
         set
     }
 
@@ -653,8 +662,7 @@ impl<'a> Program<'a> {
     #[allow(dead_code)] // First caller is the obligation queue (W-TRAITS-CORE, wave A).
     pub fn impl_set(&self, reads: &mut Reads, trait_: DefId, head: Head) -> ImplSet {
         let set = ImplSet::default();
-        let fp = impl_set_fingerprint(self, &set);
-        reads.record(ReadKey::ImplSet(ImplSetKey { trait_, head }), fp, true);
+        reads.record_with(ReadKey::ImplSet(ImplSetKey { trait_, head }), true, || impl_set_fingerprint(self, &set));
         set
     }
 
@@ -662,7 +670,6 @@ impl<'a> Program<'a> {
     /// (kind, parent, generics, param env) use `Defs` queries, which read
     /// this same `Sig` node per section 2.1; `sig_of` is for the payload.
     pub fn sig_of(&self, reads: &mut Reads, def: DefId) -> SigOf<'_, 'a> {
-        let fp = sig_fingerprint(self, def);
         let (out, failed) = if let Some(local) = self.local_def(def.hash).filter(|l| self.def_id(*l) == def) {
             (SigOf::Fn(self.fn_info(local)), false)
         } else if let Some(a) = self.adt_by_def(def) {
@@ -672,7 +679,7 @@ impl<'a> Program<'a> {
         } else {
             (SigOf::Missing, true)
         };
-        reads.record(ReadKey::Sig(def), fp, failed);
+        reads.record_with(ReadKey::Sig(def), failed, || sig_fingerprint(self, def));
         out
     }
 
@@ -683,10 +690,17 @@ impl<'a> Program<'a> {
     /// type fingerprints. Any field edit that can move a layout changes it.
     #[allow(dead_code)] // First callers are mono instance keys and the layout engine (wave A/B).
     pub fn layout_of(&self, reads: &mut Reads, adt: DefId) -> Option<Fingerprint> {
-        let fp = sig_fingerprint(self, adt);
         let known = self.adt_by_def(adt).is_some() || self.defs.get(adt).is_some();
-        reads.record(ReadKey::Layout(adt), fp, !known);
-        known.then_some(fp)
+        if !known {
+            reads.record_with(ReadKey::Layout(adt), true, || sig_fingerprint(self, adt));
+            return None;
+        }
+        if let Some(r) = reads.get(&ReadKey::Layout(adt)) {
+            return Some(r.fingerprint);
+        }
+        let fp = sig_fingerprint(self, adt);
+        reads.record(ReadKey::Layout(adt), fp, false);
+        Some(fp)
     }
 
     /// The kind of a def a binding resolved to, through the `Defs` table.
