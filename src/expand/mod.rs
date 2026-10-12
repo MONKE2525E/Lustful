@@ -2189,7 +2189,15 @@ impl<'a> Expander<'a> {
             if matches!(&trees[i], Tt::Tok(t) if t.tok != Tok::Eof) {
                 out.push(take(&mut trees, i));
             } else if matches!(&trees[i], Tt::Frag(..)) {
-                out.push(take(&mut trees, i));
+                // Macro calls inside a fragment expand when the
+                // fragment lands in place: matching captures them
+                // unexpanded (`add!(add!(1, 2), 3)` binds the inner
+                // call inside the expr fragment), so walk the
+                // fragment's trees like any other list here.
+                let tree = take(&mut trees, i);
+                let Tt::Frag(kind, inner, fspan) = tree else { unreachable!() };
+                let expanded = self.expand_list(inner, depth, false, nest + 1)?;
+                out.push(Tt::Frag(kind, expanded, fspan));
             }
             i += 1;
         }

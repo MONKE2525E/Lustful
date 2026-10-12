@@ -175,6 +175,20 @@ pub fn probe_expr(toks: &[Token], strings: &[String], interner: &Interner, known
     probe_with(toks, strings, interner, known, |p| p.expr().is_ok() && p.peek() == Tok::Eof)
 }
 
+/// How many leading tokens of `toks` one greedy expression parse
+/// consumes, or None when no expression starts there. The matcher
+/// uses this as rustc's fragment parser does (one parse, no trying
+/// every end). Added for W-MACRO.
+pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> Option<usize> {
+    let mut v: Vec<Token> = toks.to_vec();
+    let end = toks.last().map_or(Span::default(), |t| t.span);
+    v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
+    let mut ast = Ast::default();
+    ast.strings = strings.to_vec();
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
+    p.expr().ok().map(|_| p.pos)
+}
+
 /// True when `toks` is exactly one type.
 pub fn probe_ty(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
     probe_with(toks, strings, interner, known, |p| p.ty().is_ok() && p.peek() == Tok::Eof)

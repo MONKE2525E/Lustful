@@ -736,8 +736,13 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
     while *i < b.len() && (b[*i].is_ascii_hexdigit() && radix == 16 || b[*i].is_ascii_digit() || b[*i] == b'_') {
         *i += 1;
     }
-    // A float literal: `1.5` or `1e3`. Not `1..2` and not `1.foo()`.
-    if radix == 10 && b.get(*i) == Some(&b'.') && b.get(*i + 1).is_some_and(|c| c.is_ascii_digit()) {
+    // A float literal: `1.5`, `1.`, or `1e3`. Not `1..2` (range) and
+    // not `1.foo()` (field): the dot joins the float unless another
+    // dot or an identifier start follows it.
+    let dot_joins = radix == 10
+        && b.get(*i) == Some(&b'.')
+        && !matches!(b.get(*i + 1), Some(c) if *c == b'.' || *c == b'_' || c.is_ascii_alphabetic() || *c >= 0x80);
+    if dot_joins {
         *i += 1;
         while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
             *i += 1;

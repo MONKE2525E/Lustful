@@ -1254,12 +1254,20 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                 }
             }
             if let Some(end) = macro_call_shape(input, pos) {
-                ends.push(end);
+                // A macro call is one item only when brace-delimited
+                // or followed by `;` (the item macro rule rustc
+                // applies inside a fragment too).
+                if matches!(input.get(end - 1), Some(Tt::Delim(Delim::Brace, _, _))) {
+                    ends.push(end);
+                }
                 if input.get(end).is_some_and(|t| t.is_tok(Tok::Semi)) {
                     ends.push(end + 1);
                 }
             }
-            if ends.is_empty() {
+            // The probe fallback must not resurrect a macro call the
+            // shape check just refused: this parser accepts a lone
+            // paren macro call as a crate's last item, rustc does not.
+            if ends.is_empty() && macro_call_shape(input, pos).is_none() {
                 for end in pos + 1..=input.len() {
                     m.step()?;
                     if probe(m, kind, &input[pos..end]) {
@@ -1271,7 +1279,26 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             ends.dedup();
             ends
         }
-        FragKind::Expr | FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt => {
+        FragKind::Expr => {
+            // One greedy parse, the way rustc's fragment parser runs:
+            // flatten the rest of the input once and ask the parser
+            // where one expression ends, instead of probing every
+            // candidate end (which is cubic on long repetitions).
+            m.step()?;
+            if matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore) {
+                vec![pos + 1]
+            } else {
+                let (flat, bounds) = probe_flatten_bounded(m, kind, &input[pos..]);
+                match parser::probe_expr_end(&flat, m.strings, m.interner, m.known) {
+                    Some(flat_end) => match bounds.iter().rposition(|&b| b == flat_end) {
+                        Some(k) if k > 0 => vec![pos + k],
+                        _ => vec![],
+                    },
+                    None => vec![],
+                }
+            }
+        }
+        FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt => {
             let mut ends = Vec::new();
             for end in pos + 1..=input.len() {
                 m.step()?;
@@ -1283,12 +1310,6 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                     continue;
                 }
                 if kind == FragKind::Stmt && matches!(slice, [Tt::Tok(t)] if t.tok == Tok::Semi) {
-                    ends.push(end);
-                    continue;
-                }
-                // A lone `_` is an expression to the fragment parser,
-                // which this parser's expression grammar does not take.
-                if kind == FragKind::Expr && matches!(slice, [Tt::Tok(t)] if t.tok == Tok::Underscore) {
                     ends.push(end);
                     continue;
                 }
@@ -1545,6 +1566,20 @@ fn path_ends(m: &mut Matcher, input: &[Tt], pos: usize) -> Vec<usize> {
 /// shape: opaque fragments forwarded from an outer macro, and macro
 /// calls, which parse as one node of the position they stand in.
 fn probe_flatten(m: &Matcher, kind: FragKind, trees: &[Tt]) -> Vec<Token> {
+    probe_flatten_impl(m, kind, trees, None)
+}
+
+/// `probe_flatten` plus, per top-level tree, the flat index where it
+/// starts (with one final entry for the end). A greedy parser end in
+/// flat tokens maps back to a tree index through these bounds.
+fn probe_flatten_bounded(m: &Matcher, kind: FragKind, trees: &[Tt]) -> (Vec<Token>, Vec<usize>) {
+    let mut bounds = Vec::with_capacity(trees.len() + 1);
+    let out = probe_flatten_impl(m, kind, trees, Some(&mut bounds));
+    bounds.push(out.len());
+    (out, bounds)
+}
+
+fn probe_flatten_impl(m: &Matcher, kind: FragKind, trees: &[Tt], bounds: Option<&mut Vec<usize>>) -> Vec<Token> {
     fn placeholder(m: &Matcher, kind: FragKind, span: Span, out: &mut Vec<Token>) {
         match kind {
             FragKind::Ty | FragKind::Path => out.push(Token { tok: Tok::Ident(m.interner.intern("u8")), span }),
@@ -1565,14 +1600,27 @@ fn probe_flatten(m: &Matcher, kind: FragKind, trees: &[Tt]) -> Vec<Token> {
             _ => out.push(Token { tok: Tok::Int(0, None), span }),
         }
     }
-    fn go(m: &Matcher, kind: FragKind, trees: &[Tt], out: &mut Vec<Token>) {
+    fn go(m: &Matcher, kind: FragKind, trees: &[Tt], out: &mut Vec<Token>, bounds: Option<&mut Vec<usize>>) {
+        let mut bounds = bounds;
         let mut i = 0;
         while i < trees.len() {
+            if let Some(b) = &bounds {
+                debug_assert_eq!(b.len(), i);
+            }
+            if let Some(b) = &mut bounds {
+                b.push(out.len());
+            }
             // A macro call shape: segments, `!`, one group. Its argument
             // trees are arbitrary tokens to the fragment parser, so the
             // call reads as one placeholder node of this kind.
             if let Some(end) = macro_call_shape(trees, i) {
+                let at = out.len();
                 placeholder(m, kind, trees[i].span(), out);
+                if let Some(b) = &mut bounds {
+                    for _ in i + 1..end {
+                        b.push(at);
+                    }
+                }
                 i = end;
                 continue;
             }
@@ -1605,14 +1653,14 @@ fn probe_flatten(m: &Matcher, kind: FragKind, trees: &[Tt]) -> Vec<Token> {
                         Delim::Brace => (Tok::LBrace, Tok::RBrace),
                     };
                     out.push(Token { tok: open, span: *span });
-                    go(m, kind, inner, out);
+                    go(m, kind, inner, out, None);
                     out.push(Token { tok: close, span: *span });
                 }
                 Tt::Frag(fk, inner, span) => {
                     if fk.transparent() {
-                        go(m, kind, inner, out);
+                        go(m, kind, inner, out, None);
                     } else if *fk == kind {
-                        go(m, kind, inner, out);
+                        go(m, kind, inner, out, None);
                     } else {
                         placeholder(m, *fk, *span, out);
                     }
@@ -1628,7 +1676,7 @@ fn probe_flatten(m: &Matcher, kind: FragKind, trees: &[Tt]) -> Vec<Token> {
             trees = &trees[2..];
         }
     }
-    go(m, kind, trees, &mut out);
+    go(m, kind, trees, &mut out, bounds);
     out
 }
 
