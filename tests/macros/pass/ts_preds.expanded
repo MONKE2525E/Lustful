@@ -1,18 +1,12 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; use std :: sync :: Arc ; pub struct Ctx { pub value : i32 , } pub type
-ContextPredicate = Arc < dyn Fn ( & mut Ctx ) -> bool + Send + Sync > ; fn is_positive ( ctx : & mut
-Ctx ) -> bool { ctx . value > 0 } fn is_even ( ctx : & mut Ctx ) -> bool { ctx . value % 2 == 0 } fn
-at_least ( min : i32 ) -> ContextPredicate { Arc :: new ( move | ctx : & mut Ctx | ctx . value >=
-min ) } macro_rules ! preds { ( @ one $ f : ident ( $ ( $ args : tt ) * ) ) => { $ f ( $ ( $ args )
-* ) } ; ( @ one $ f : ident ) => { Arc :: new ( $ f ) as ContextPredicate } ; ( $ ( $ f : ident $ (
-( $ ( $ args : tt ) * ) ) ? ) , * $ ( , ) ? ) => { vec ! [ $ ( preds ! ( @ one $ f $ ( ( $ ( $ args
-) * ) ) ? ) ) , * ] } ; } fn main ( ) { let ps : Vec < ContextPredicate > = :: alloc :: boxed ::
-box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
-:: Box :: new_uninit ( ) , [ Arc :: new ( is_positive ) as ContextPredicate , at_least ( 3 ) , Arc
-:: new ( is_even ) as ContextPredicate ] ) ) ; let mut ctx = Ctx { value : 4 } ; let r : Vec < bool
-> = ps . iter ( ) . map ( | p | p ( & mut ctx ) ) . collect ( ) ; { :: std :: io :: _print (
-format_args ! ( "preds={1:?} count={0}\n" , ps . len ( ) , r ) ) ; } ; let one : Vec <
+use std :: sync :: Arc ; pub struct Ctx { pub value : i32 , } pub type ContextPredicate = Arc < dyn
+Fn ( & mut Ctx ) -> bool + Send + Sync > ; fn is_positive ( ctx : & mut Ctx ) -> bool { ctx . value
+> 0 } fn is_even ( ctx : & mut Ctx ) -> bool { ctx . value % 2 == 0 } fn at_least ( min : i32 ) ->
+ContextPredicate { Arc :: new ( move | ctx : & mut Ctx | ctx . value >= min ) } fn main ( ) { let ps
+: Vec < ContextPredicate > = :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc ::
+intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ Arc :: new (
+is_positive ) as ContextPredicate , at_least ( 3 ) , Arc :: new ( is_even ) as ContextPredicate ] )
+) ; let mut ctx = Ctx { value : 4 } ; let r : Vec < bool > = ps . iter ( ) . map ( | p | p ( & mut
+ctx ) ) . collect ( ) ; println ! ( "preds={1:?} count={0}" , ps . len ( ) , r ) ; let one : Vec <
 ContextPredicate > = :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics
 :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ Arc :: new ( is_positive ) as
-ContextPredicate ] ) ) ; { :: std :: io :: _print ( format_args ! ( "one={0}\n" , one . len ( ) ) )
-; } ; }
+ContextPredicate ] ) ) ; println ! ( "one={0}" , one . len ( ) ) ; }

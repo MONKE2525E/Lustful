@@ -1,13 +1,36 @@
 #!/usr/bin/env python3
-"""Turn rustc -Zunpretty=expanded output into a token sequence.
+"""Turn an expansion (rustc -Zunpretty=expanded, or `lust expand`)
+into a canonical token sequence both compilers can be compared on.
 
 Usage: normalize.py < expanded.rs > case.expanded
 
 ARCH 6.5: the printed expansion is lossy, so the corpus compares
 tokens, not text. This tokenizer drops comments and all whitespace
-structure and writes the token stream space-joined and wrapped. It is a lexer for the
-already-valid output of the pretty printer, not a Rust lexer: it
-only needs to split that output the same way every time.
+structure and writes the token stream space-joined and wrapped. It
+is a lexer for already-valid output, not a Rust lexer: it only needs
+to split that output the same way every time.
+
+On top of tokenizing, `canonicalize` maps the forms the two
+compilers print differently to one shape, so the compare tests the
+user macro expansion, not pretty-printing:
+
+- rustc's injected prelude header is dropped.
+- `macro_rules!` definitions are dropped (rustc prints them in the
+  expansion, lust consumes them).
+- rustc's `println!` and `format!` expansions (`_print`/`_eprint`
+  and the alloc format wrapper around `format_args!`) map back to
+  `println!` and `format!`.
+- Format strings are positionalized (`{}` and `{name}` captures
+  become `{0}`, `{1}` with captures appended as arguments), which is
+  the form rustc prints and lust keeps as written.
+- Redundant parens lust's flat token stream adds around an expanded
+  fragment (doubled `( ( x ) )`, and a parenthesized assignment in
+  statement position) are unwrapped; both spellings are the same
+  program, and rustc prints neither.
+
+Derive expansions are not canonicalized: rustc prints generated
+impls and lust has no token form for them yet, so a fixture whose
+expansion contains derives can only differ here.
 """
 import sys
 
@@ -125,12 +148,276 @@ def tokens(text):
             i += 1
 
 
+OPEN = {"(": ")", "[": "]", "{": "}"}
+CLOSE = set(OPEN.values())
+
+
+def group_end(toks, i):
+    """Index just past the group that opens at toks[i], or None."""
+    if i >= len(toks) or toks[i] not in OPEN:
+        return None
+    stack = [OPEN[toks[i]]]
+    j = i + 1
+    while j < len(toks):
+        tok = toks[j]
+        if tok in OPEN:
+            stack.append(OPEN[tok])
+        elif tok in CLOSE:
+            if stack.pop() != tok:
+                return None
+            if not stack:
+                return j + 1
+        j += 1
+    return None
+
+
+def split_commas(toks):
+    """Split a token list at commas of the outermost level."""
+    parts, depth, start = [], 0, 0
+    for i, tok in enumerate(toks):
+        if tok in OPEN:
+            depth += 1
+        elif tok in CLOSE:
+            depth -= 1
+        elif tok == "," and depth == 0:
+            parts.append(toks[start:i])
+            start = i + 1
+    parts.append(toks[start:])
+    return parts
+
+
+def is_ident(tok):
+    return tok is not None and (tok[0].isalpha() or tok[0] == "_") and all(c.isalnum() or c == "_" for c in tok)
+
+
+def strip_prelude(toks):
+    head = ["#", "!", "[", "feature", "(", "prelude_import", ")", "]",
+            "extern", "crate", "std", ";", "#", "[", "prelude_import", "]",
+            "use", "std", "::", "prelude", "::"]
+    tail = ["::", "*", ";"]
+    if toks[:len(head)] == head and toks[len(head) + 1:len(head) + 4] == tail and toks[len(head)].startswith("rust_"):
+        return toks[len(head) + 4:]
+    return toks
+
+
+def drop_macro_rules(toks):
+    out, i = [], 0
+    while i < len(toks):
+        if (toks[i] == "macro_rules" and i + 3 < len(toks) and toks[i + 1] == "!"
+                and is_ident(toks[i + 2]) and toks[i + 3] in OPEN):
+            end = group_end(toks, i + 3)
+            if end is not None:
+                i = end + 1 if end < len(toks) and toks[end] == ";" else end
+                continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def format_args_at(toks, i):
+    """If `format_args ! ( ... )` starts at i, return (inner, end)."""
+    if toks[i:i + 3] == ["format_args", "!", "("]:
+        end = group_end(toks, i + 2)
+        if end is not None:
+            return toks[i + 3:end - 1], end
+    return None
+
+
+def map_alloc_format(toks):
+    wrappers = [
+        ["::", "alloc", "::", "__export", "::", "must_use", "(", "{", "::", "alloc", "::", "fmt", "::", "format", "("],
+        ["::", "alloc", "::", "fmt", "::", "format", "("],
+    ]
+    out, i = [], 0
+    while i < len(toks):
+        done = False
+        for w in wrappers:
+            if toks[i:i + len(w)] == w:
+                parsed = format_args_at(toks, i + len(w))
+                if parsed is not None:
+                    inner, end = parsed
+                    # The wrappers close as `) } )` (must_use) or `)`.
+                    close = toks[end:end + 3]
+                    total = end + (3 if close == [")", "}", ")"] else 1 if close[:1] == [")"] else 0)
+                    out += ["format", "!", "("] + inner + [")"]
+                    i = total
+                    done = True
+                    break
+        if not done:
+            out.append(toks[i])
+            i += 1
+    return out
+
+
+def unquote(tok):
+    """The raw content of a plain string token, or None."""
+    if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+        return tok[1:-1]
+    return None
+
+
+def map_print(toks):
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] == "{" and toks[i + 1:i + 7] == ["::", "std", "::", "io", "::", "_print"] or \
+                toks[i] == "{" and toks[i + 1:i + 7] == ["::", "std", "::", "io", "::", "_eprint"]:
+            eprint = toks[i + 6] == "_eprint"
+            if toks[i + 7:i + 8] == ["("]:
+                parsed = format_args_at(toks, i + 8)
+                if parsed is not None:
+                    inner, end = parsed
+                    if toks[end:end + 3] == [")", ";", "}"] and inner and unquote(inner[0]) is not None:
+                        fmt = unquote(inner[0])
+                        newline = fmt.endswith("\\n")
+                        if newline:
+                            inner = ['"' + fmt[:-2] + '"'] + inner[1:]
+                        name = ("eprintln" if newline else "eprint") if eprint else ("println" if newline else "print")
+                        out += [name, "!", "("] + inner + [")"]
+                        i = end + 3
+                        continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def positionalize(fmt, args):
+    """Rewrite one format string to positional placeholders.
+
+    args is the list of argument token-lists after the format string.
+    Returns (new_fmt, extra_capture_names), or None to leave the call
+    as written (a shape this does not model, such as `width$`).
+    """
+    named_explicit = {a[0] for a in args if len(a) >= 2 and is_ident(a[0]) and a[1] == "="}
+    out, i, implicit, captures = [], 0, 0, []
+    while i < len(fmt):
+        c = fmt[i]
+        if c == "{" and fmt[i + 1:i + 2] == "{":
+            out.append("{{")
+            i += 2
+            continue
+        if c == "}" and fmt[i + 1:i + 2] == "}":
+            out.append("}}")
+            i += 2
+            continue
+        if c != "{":
+            out.append(c)
+            i += 1
+            continue
+        close = fmt.find("}", i + 1)
+        if close < 0 or "{" in fmt[i + 1:close]:
+            return None
+        inside = fmt[i + 1:close]
+        if "$" in inside:
+            return None
+        head, _, spec = inside.partition(":")
+        spec = (":" + spec) if spec or ":" in inside else ""
+        if head == "":
+            out.append("{%d%s}" % (implicit, spec))
+            implicit += 1
+        elif head.isdigit():
+            out.append(fmt[i:close + 1])
+        elif is_ident(head):
+            if head in named_explicit:
+                out.append(fmt[i:close + 1])
+            else:
+                if head not in captures:
+                    captures.append(head)
+                out.append("{%d%s}" % (len(args) + captures.index(head), spec))
+        else:
+            return None
+        i = close + 1
+    return "".join(out), captures
+
+
+FORMAT_CALLS = {"println", "print", "eprintln", "eprint", "format", "format_args"}
+
+
+def positionalize_calls(toks):
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] in FORMAT_CALLS and toks[i + 1:i + 3] == ["!", "("]:
+            end = group_end(toks, i + 2)
+            if end is not None:
+                pieces = split_commas(toks[i + 3:end - 1])
+                if pieces and pieces[-1] == []:
+                    pieces.pop()
+                if pieces and len(pieces[0]) == 1 and unquote(pieces[0][0]) is not None:
+                    made = positionalize(unquote(pieces[0][0]), pieces[1:])
+                    if made is not None:
+                        fmt, captures = made
+                        fixed = ['"' + fmt + '"']
+                        rest = pieces[1:] + [[name] for name in captures]
+                        out += [toks[i], "!", "("] + fixed
+                        for piece in rest:
+                            out += [","] + piece
+                        out.append(")")
+                        i = end
+                        continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+
+ASSIGN_OPS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="}
+
+
+def unwrap_parens(toks):
+    """Unwrap lust's precedence parens where rustc prints none."""
+    changed = True
+    while changed:
+        changed = False
+        out, i = [], 0
+        while i < len(toks):
+            if toks[i] == "(":
+                end = group_end(toks, i)
+                if end is not None:
+                    inner = toks[i + 1:end - 1]
+                    # Doubled parens whose whole content is one group.
+                    if inner[:1] == ["("] and group_end(inner, 0) == len(inner):
+                        out += inner
+                        i = end
+                        changed = True
+                        continue
+                    # A parenthesized assignment as a whole statement.
+                    prev = out[-1] if out else None
+                    nxt = toks[end] if end < len(toks) else None
+                    if (prev is None or prev in ("{", ";")) and nxt == ";" and any(t in ASSIGN_OPS for t in inner):
+                        depth = 0
+                        top_assign = False
+                        for t in inner:
+                            if t in OPEN:
+                                depth += 1
+                            elif t in CLOSE:
+                                depth -= 1
+                            elif t in ASSIGN_OPS and depth == 0:
+                                top_assign = True
+                        if top_assign:
+                            out += inner
+                            i = end
+                            changed = True
+                            continue
+            out.append(toks[i])
+            i += 1
+        toks = out
+    return toks
+
+def canonicalize(toks):
+    toks = strip_prelude(toks)
+    toks = drop_macro_rules(toks)
+    toks = map_alloc_format(toks)
+    toks = map_print(toks)
+    toks = positionalize_calls(toks)
+    toks = unwrap_parens(toks)
+    return toks
+
+
 def main():
     # Space-joined tokens, wrapped at 100 columns. Wrapping is
     # cosmetic: normalize.py on its own output gives the same text.
     out = sys.stdout
     col = 0
-    for tok in tokens(sys.stdin.read()):
+    for tok in canonicalize(list(tokens(sys.stdin.read()))):
         if col and col + 1 + len(tok) > 100:
             out.write("\n")
             col = 0

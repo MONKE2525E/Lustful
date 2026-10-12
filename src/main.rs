@@ -4,6 +4,7 @@
 //   lust-core daemon                          serve warm, incremental compiles for this directory
 //   lust-core test <file.rs> ...              run #[test] functions, one child process each
 //   lust-core explain <L####>                 long-form help for one diagnostic code
+//   lust-core expand <file.rs>                print the file's expanded token stream
 //   lust-core capabilities [--json]           what the supported subset contains
 /// AST v2 keeps shapes for syntax whose parsers land later (docs/ARCH.md S3b),
 /// so many nodes are defined before anything reads them.
@@ -73,6 +74,7 @@ fn main() {
         Some("test") => std::process::exit(testrun::run(&args[1..])),
         Some("explain") => std::process::exit(explain::run(&args[1..])),
         Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),
+        Some("expand") => std::process::exit(expand::run_expand(&args[1..])),
         _ => {}
     }
     match protocol::parse_args(&args) {

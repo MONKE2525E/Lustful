@@ -9,7 +9,7 @@ This is the test corpus for W-MACRO (ARCH section 6). The gate is
 |---|---|
 | `pass/*.rs` | Executable fixtures. Each prints observable results. |
 | `pass/*.out` | The exact stdout of the rustc build. |
-| `pass/*.expanded` | Normalized tokens of `rustc -Zunpretty=expanded`, space-joined and wrapped. |
+| `pass/*.expanded` | Canonical tokens of the expansion (see normalize.py), space-joined and wrapped. |
 | `reject/*.rs` | Programs rustc rejects. The header records the rustc error class. |
 | `ts-rust-names.txt` | The 70 ts-rust macro names the corpus must cover. |
 | `normalize.py` | Turns expanded output into the token form (ARCH 6.5: compare tokens, not text). |
@@ -53,15 +53,15 @@ fixture directory fails the run. The runner sets
 
 In LUST mode the runner also builds and runs pass cases with lust
 and checks reject cases with `lust check`. A lust build failure
-counts as `unsupported` and does not fail the run. Today lust
-rejects user macros, so the expected line is `0 supported`.
+counts as `unsupported` and does not fail the run.
 A lust build with different output, or one that accepts a
 both-reject case, counts as `wrong`. That breaks rule zero, but
 the count does not fail the run until the W-MACRO gate. Set
 `LUST_STRICT=1` to make wrong results and expansion token
-differences fail, as in the other corpus runners. If the lust
-binary gains an `expand` command, the runner compares its tokens
-with `.expanded` and reports match and differ counts.
+differences fail, as in the other corpus runners. The runner also
+runs `lust expand` on each supported pass case, canonicalizes its
+tokens with the same normalize.py, and diffs them with
+`.expanded`.
 
 ## ts-rust fixtures
 

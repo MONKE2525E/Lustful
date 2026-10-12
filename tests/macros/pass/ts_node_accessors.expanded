@@ -1,40 +1,39 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; use crate :: ast :: synthetic :: AnyList ; pub mod astdata { pub struct NodeId (
-pub u32 ) ; # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone ::
-TrivialClone for NodeId { } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeId {
-# [ inline ] fn clone ( & self ) -> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 >
-; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy for NodeId { } # [
-automatically_derived ] impl :: core :: fmt :: Debug for NodeId { # [ inline ] fn fmt ( & self , f :
-& mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_tuple_field1_finish ( f , "NodeId" , && self . 0 ) } } # [ automatically_derived ] impl ::
-core :: default :: Default for NodeId { # [ inline ] fn default ( ) -> NodeId { NodeId ( :: core ::
-default :: Default :: default ( ) ) } } # [ automatically_derived ] impl :: core :: marker ::
-StructuralPartialEq for NodeId { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for
-NodeId { # [ inline ] fn eq ( & self , other : & NodeId ) -> bool { self . 0 == other . 0 } } # [
-automatically_derived ] impl :: core :: cmp :: Eq for NodeId { # [ inline ] # [ doc ( hidden ) ] # [
-coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq <
-u32 > ; } } impl NodeId { pub fn index ( self ) -> usize { self . 0 as usize } } pub struct NodeList
-{ pub items : Vec < NodeId > , } # [ automatically_derived ] impl :: core :: clone :: Clone for
-NodeList { # [ inline ] fn clone ( & self ) -> NodeList { NodeList { items : :: core :: clone ::
-Clone :: clone ( & self . items ) } } } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-NodeList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt
-:: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish ( f , "NodeList" , "items" ,
-&& self . items ) } } # [ automatically_derived ] impl :: core :: default :: Default for NodeList {
-# [ inline ] fn default ( ) -> NodeList { NodeList { items : :: core :: default :: Default ::
-default ( ) } } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for
-NodeList { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for NodeList { # [ inline
-] fn eq ( & self , other : & NodeList ) -> bool { self . items == other . items } } # [
-automatically_derived ] impl :: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc ( hidden ) ] #
-[ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq
-< Vec < NodeId >> ; } } pub struct ModFlags ( pub u32 ) ; # [ automatically_derived ] # [ doc (
-hidden ) ] unsafe impl :: core :: clone :: TrivialClone for ModFlags { } # [ automatically_derived ]
-impl :: core :: clone :: Clone for ModFlags { # [ inline ] fn clone ( & self ) -> ModFlags { let _ :
-:: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [ automatically_derived ] impl :: core
-:: marker :: Copy for ModFlags { } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ModFlags { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt
-:: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "ModFlags" , && self . 0
-) } } # [ automatically_derived ] impl :: core :: default :: Default for ModFlags { # [ inline ] fn
-default ( ) -> ModFlags { ModFlags ( :: core :: default :: Default :: default ( ) ) } } # [
+use crate :: ast :: synthetic :: AnyList ; pub mod astdata { pub struct NodeId ( pub u32 ) ; # [
+automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for NodeId
+{ } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeId { # [ inline ] fn clone (
+& self ) -> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
+automatically_derived ] impl :: core :: marker :: Copy for NodeId { } # [ automatically_derived ]
+impl :: core :: fmt :: Debug for NodeId { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish (
+f , "NodeId" , && self . 0 ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+NodeId { # [ inline ] fn default ( ) -> NodeId { NodeId ( :: core :: default :: Default :: default (
+) ) } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeId { } # [
+automatically_derived ] impl :: core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self ,
+other : & NodeId ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core ::
+cmp :: Eq for NodeId { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
+assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; } } impl
+NodeId { pub fn index ( self ) -> usize { self . 0 as usize } } pub struct NodeList { pub items :
+Vec < NodeId > , } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeList { # [
+inline ] fn clone ( & self ) -> NodeList { NodeList { items : :: core :: clone :: Clone :: clone ( &
+self . items ) } } } # [ automatically_derived ] impl :: core :: fmt :: Debug for NodeList { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
+core :: fmt :: Formatter :: debug_struct_field1_finish ( f , "NodeList" , "items" , && self . items
+) } } # [ automatically_derived ] impl :: core :: default :: Default for NodeList { # [ inline ] fn
+default ( ) -> NodeList { NodeList { items : :: core :: default :: Default :: default ( ) } } } # [
+automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeList { } # [
+automatically_derived ] impl :: core :: cmp :: PartialEq for NodeList { # [ inline ] fn eq ( & self
+, other : & NodeList ) -> bool { self . items == other . items } } # [ automatically_derived ] impl
+:: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
+assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < Vec < NodeId >> ; } }
+pub struct ModFlags ( pub u32 ) ; # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl ::
+core :: clone :: TrivialClone for ModFlags { } # [ automatically_derived ] impl :: core :: clone ::
+Clone for ModFlags { # [ inline ] fn clone ( & self ) -> ModFlags { let _ : :: core :: clone ::
+AssertParamIsClone < u32 > ; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy
+for ModFlags { } # [ automatically_derived ] impl :: core :: fmt :: Debug for ModFlags { # [ inline
+] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_tuple_field1_finish ( f , "ModFlags" , && self . 0 ) } } # [
+automatically_derived ] impl :: core :: default :: Default for ModFlags { # [ inline ] fn default (
+) -> ModFlags { ModFlags ( :: core :: default :: Default :: default ( ) ) } } # [
 automatically_derived ] impl :: core :: marker :: StructuralPartialEq for ModFlags { } # [
 automatically_derived ] impl :: core :: cmp :: PartialEq for ModFlags { # [ inline ] fn eq ( & self
 , other : & ModFlags ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core
@@ -1805,216 +1804,30 @@ const TYPED_TYPE : u32 = 4 ; pub const TYPED_INITIALIZER : u32 = 5 ; pub fn new 
 u32 > , other : Option < ( u32 , u32 ) > ) -> Self { SlotChildren { name , other , typed : None ,
 no_type_arguments : false } } pub fn with_typed ( mut self , typed : Option < ( u32 , u32 ) > ,
 no_type_arguments : bool ) -> Self { self . typed = typed ; self . no_type_arguments =
-no_type_arguments ; self } } macro_rules ! sel_field { ( req , $ x : expr ) => { Some ( AnyList ::
-Nodes ( & $ x ) ) } ; ( opt , $ x : expr ) => { $ x . as_ref ( ) . map ( AnyList :: Nodes ) } ; (
-mods , $ x : expr ) => { $ x . as_ref ( ) . map ( AnyList :: Modifiers ) } ; } macro_rules !
-variant_has_kind { ( Token , $ k : expr ) => { $ k . is_token ( ) } ; ( KeywordExpression , $ k :
-expr ) => { $ k . is_keyword_expression ( ) } ; ( KeywordTypeNode , $ k : expr ) => { $ k .
-is_keyword_type ( ) } ; ( ForInOrOfStatement , $ k : expr ) => { matches ! ( $ k , SyntaxKind ::
-ForInStatement | SyntaxKind :: ForOfStatement ) } ; ( CaseOrDefaultClause , $ k : expr ) => {
-matches ! ( $ k , SyntaxKind :: CaseClause | SyntaxKind :: DefaultClause ) } ; ( BindingPattern , $
-k : expr ) => { matches ! ( $ k , SyntaxKind :: ObjectBindingPattern | SyntaxKind ::
-ArrayBindingPattern ) } ; ( JsDocParameterOrPropertyTag , $ k : expr ) => { matches ! ( $ k ,
-SyntaxKind :: JsDocParameterTag | SyntaxKind :: JsDocPropertyTag ) } ; ( TypeAliasDeclaration , $ k
-: expr ) => { matches ! ( $ k , SyntaxKind :: TypeAliasDeclaration | SyntaxKind ::
-JsTypeAliasDeclaration ) } ; ( ImportDeclaration , $ k : expr ) => { matches ! ( $ k , SyntaxKind ::
-ImportDeclaration | SyntaxKind :: JsImportDeclaration ) } ; ( JsxText , $ k : expr ) => { matches !
-( $ k , SyntaxKind :: JsxText | SyntaxKind :: JsxTextAllWhiteSpaces ) } ; ( ParameterDeclaration , $
-k : expr ) => { $ k == SyntaxKind :: Parameter } ; ( CallSignatureDeclaration , $ k : expr ) => { $
-k == SyntaxKind :: CallSignature } ; ( ConstructSignatureDeclaration , $ k : expr ) => { $ k ==
-SyntaxKind :: ConstructSignature } ; ( ConstructorDeclaration , $ k : expr ) => { $ k == SyntaxKind
-:: Constructor } ; ( GetAccessorDeclaration , $ k : expr ) => { $ k == SyntaxKind :: GetAccessor } ;
-( SetAccessorDeclaration , $ k : expr ) => { $ k == SyntaxKind :: SetAccessor } ; (
-IndexSignatureDeclaration , $ k : expr ) => { $ k == SyntaxKind :: IndexSignature } ; (
-MethodSignatureDeclaration , $ k : expr ) => { $ k == SyntaxKind :: MethodSignature } ; (
-PropertySignatureDeclaration , $ k : expr ) => { $ k == SyntaxKind :: PropertySignature } ; (
-TypeParameterDeclaration , $ k : expr ) => { $ k == SyntaxKind :: TypeParameter } ; ( TypeAssertion
-, $ k : expr ) => { $ k == SyntaxKind :: TypeAssertionExpression } ; ( UnionTypeNode , $ k : expr )
-=> { $ k == SyntaxKind :: UnionType } ; ( IntersectionTypeNode , $ k : expr ) => { $ k == SyntaxKind
-:: IntersectionType } ; ( ConditionalTypeNode , $ k : expr ) => { $ k == SyntaxKind ::
-ConditionalType } ; ( TypeOperatorNode , $ k : expr ) => { $ k == SyntaxKind :: TypeOperator } ; (
-InferTypeNode , $ k : expr ) => { $ k == SyntaxKind :: InferType } ; ( ArrayTypeNode , $ k : expr )
-=> { $ k == SyntaxKind :: ArrayType } ; ( IndexedAccessTypeNode , $ k : expr ) => { $ k ==
-SyntaxKind :: IndexedAccessType } ; ( TypeReferenceNode , $ k : expr ) => { $ k == SyntaxKind ::
-TypeReference } ; ( LiteralTypeNode , $ k : expr ) => { $ k == SyntaxKind :: LiteralType } ; (
-ThisTypeNode , $ k : expr ) => { $ k == SyntaxKind :: ThisType } ; ( TypePredicateNode , $ k : expr
-) => { $ k == SyntaxKind :: TypePredicate } ; ( TypeQueryNode , $ k : expr ) => { $ k == SyntaxKind
-:: TypeQuery } ; ( MappedTypeNode , $ k : expr ) => { $ k == SyntaxKind :: MappedType } ; (
-TypeLiteralNode , $ k : expr ) => { $ k == SyntaxKind :: TypeLiteral } ; ( TupleTypeNode , $ k :
-expr ) => { $ k == SyntaxKind :: TupleType } ; ( OptionalTypeNode , $ k : expr ) => { $ k ==
-SyntaxKind :: OptionalType } ; ( RestTypeNode , $ k : expr ) => { $ k == SyntaxKind :: RestType } ;
-( ParenthesizedTypeNode , $ k : expr ) => { $ k == SyntaxKind :: ParenthesizedType } ; (
-FunctionTypeNode , $ k : expr ) => { $ k == SyntaxKind :: FunctionType } ; ( ConstructorTypeNode , $
-k : expr ) => { $ k == SyntaxKind :: ConstructorType } ; ( TemplateLiteralTypeNode , $ k : expr ) =>
-{ $ k == SyntaxKind :: TemplateLiteralType } ; ( ImportTypeNode , $ k : expr ) => { $ k ==
-SyntaxKind :: ImportType } ; ( $ v : ident , $ k : expr ) => { $ k == SyntaxKind :: $ v } ; }
-macro_rules ! kind_lacks_data { ( $ n : expr , [ $ ( $ v : ident ) , + ] ) => { match
-frozen_store_kind ( $ n ) { Some ( kind ) => kind != SyntaxKind :: Unknown $ ( && ! variant_has_kind
-! ( $ v , kind ) ) + , None => false , } } ; } macro_rules ! match_data { ( $ file_in : expr , $
-data : expr , $ def : expr , $ ( [ $ ( $ v : ident ) , + $ ( , ) ? ] => | $ file : ident , $ d :
-ident | $ e : expr ) , + $ ( , ) ? ) => { { let file : usize = $ file_in ; match $ data { $ ( $ (
-NodeData :: $ v ( $ d ) => { let $ file = file ; $ e } ) + ) + _ => $ def , } } } ; } macro_rules !
-by_data { ( $ n : expr , $ def : expr , $ ( [ $ ( $ v : ident ) , + $ ( , ) ? ] => | $ file : ident
-, $ d : ident | $ e : expr ) , + $ ( , ) ? ) => { { let node : Node = $ n ; if kind_lacks_data ! (
-node , [ $ ( $ ( $ v ) , + ) , + ] ) { debug_assert ! ( ! with_data ! ( node , | d | matches ! ( d ,
-$ ( $ ( NodeData :: $ v ( _ ) ) | + ) | + ) ) ) ; $ def } else { with_data ! ( node , | d | {
-match_data ! ( node . file_index ( ) , d , $ def , $ ( [ $ ( $ v ) , + ] => | $ file , $ d | $ e ) ,
-+ ) } ) } } } ; } macro_rules ! list_by_data { ( $ n : expr , $ of : ident , $ def : expr , $ ( [ $
-( $ v : ident ) , + $ ( , ) ? ] => $ how : ident $ field : ident ) , + $ ( , ) ? ) => { { let node :
-Node = $ n ; if kind_lacks_data ! ( node , [ $ ( $ ( $ v ) , + ) , + ] ) { $ def } else { $ of ! (
-node , | d | match d { $ ( $ ( NodeData :: $ v ( d ) => Some ( sel_field ! ( $ how , d . $ field ) )
-, ) + ) + _ => None , } ) . unwrap_or ( $ def ) } } } ; } macro_rules ! data_accessor { ( $ ( # [ $
-attr : meta ] ) * $ vis : vis fn $ name : ident , $ name_in : ident ( $ n : ident ) -> $ ty : ty { $
-def : expr , $ ( [ $ ( $ v : ident ) , + $ ( , ) ? ] => | $ file : ident , $ d : ident | $ e : expr
-) , + $ ( , ) ? } ) => { $ ( # [ $ attr ] ) * # [ must_use ] $ vis fn $ name ( self ) -> $ ty { let
-$ n : Node = self ; by_data ! ( $ n , $ def , $ ( [ $ ( $ v ) , + ] => | $ file , $ d | $ e ) , + )
-} # [ doc = concat ! ( "`Node::" , stringify ! ( $ name ) ,
-"` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`)."
-) ] # [ must_use ] $ vis fn $ name_in ( self , d : LoadedData ) -> $ ty { let Some ( d ) = d else {
-return self . $ name ( ) ; } ; let $ n : Node = self ; debug_assert ! ( is_data_of ( d , $ n ) ,
-"data of another node" ) ; match_data ! ( $ n . file_index ( ) , d , $ def , $ ( [ $ ( $ v ) , + ]
-=> | $ file , $ d | $ e ) , + ) } } ; } macro_rules ! modifiers_variants { ( $ mac : ident ! { $ ( $
-args : tt ) * } ) => { $ mac ! { $ ( $ args ) * [ ArrowFunction , BinaryExpression ,
-ClassDeclaration , ClassExpression , ClassStaticBlockDeclaration , ConstructorDeclaration ,
-ConstructorTypeNode , EnumDeclaration , EnumMember , ExportAssignment , ExportDeclaration ,
-FunctionDeclaration , FunctionExpression , FunctionTypeNode , GetAccessorDeclaration ,
-SetAccessorDeclaration , ImportDeclaration , ImportEqualsDeclaration , IndexSignatureDeclaration ,
-InterfaceDeclaration , MethodDeclaration , MethodSignatureDeclaration , MissingDeclaration ,
-ModuleDeclaration , NamespaceExportDeclaration , ParameterDeclaration , PropertyAssignment ,
-PropertyDeclaration , PropertySignatureDeclaration , ShorthandPropertyAssignment ,
-TypeAliasDeclaration , TypeParameterDeclaration , VariableStatement ] } } ; } macro_rules !
-modifiers_accessor { ( [ $ ( $ v : ident ) , + $ ( , ) ? ] ) => { # [ must_use ] pub fn modifiers (
-self ) -> ModifierList { list_by_data ! ( self , modifiers_of , ModifierList :: NIL , [ $ ( $ v ) ,
-+ ] => mods modifiers ) } # [ must_use ] pub fn modifiers_in ( self , d : LoadedData ) ->
-ModifierList { let Some ( d ) = d else { return self . modifiers ( ) ; } ; debug_assert ! (
-is_data_of ( d , self ) , "data of another node" ) ; match_data ! ( self . file_index ( ) , d ,
-ModifierList :: NIL , [ $ ( $ v ) , + ] => | f , d | mods ( f , & d . modifiers ) ) } } ; }
-macro_rules ! store_node_modifier_bits_fn { ( [ $ ( $ v : ident ) , + $ ( , ) ? ] ) => { pub ( crate
-) fn store_node_modifier_bits ( kind : SyntaxKind , data : & NodeData ) -> u32 { let mut has_list =
-false ; $ ( has_list |= variant_has_kind ! ( $ v , kind ) ; ) + if ! has_list { return 0 ; } match
-data { $ ( NodeData :: $ v ( d ) => d . modifiers . as_ref ( ) . map_or ( 0 , | m | m . flags . 0 )
-, ) + _ => 0 , } } } ; } macro_rules ! name_arms { ( $ mac : ident ! ( $ ( $ pre : tt ) * ) , $ opt
-: ident , $ req : ident ) => { $ mac ! { $ ( $ pre ) * [ BindingElement , ClassDeclaration ,
-ClassExpression , FunctionDeclaration , FunctionExpression , ImportClause , JsDocCallbackTag ,
-JsDocLink , JsDocLinkCode , JsDocLinkPlain , JsDocTypedefTag , ] => | f , d | $ opt ( f , d . name )
-, [ EnumDeclaration , EnumMember , ExportSpecifier , GetAccessorDeclaration , SetAccessorDeclaration
-, ImportAttribute , ImportEqualsDeclaration , ImportSpecifier , InterfaceDeclaration ,
-JsDocNameReference , JsDocParameterOrPropertyTag , JsxAttribute , JsxNamespacedName , MetaProperty ,
-MethodDeclaration , MethodSignatureDeclaration , ModuleDeclaration , NamedTupleMember ,
-NamespaceExport , NamespaceExportDeclaration , NamespaceImport , ParameterDeclaration ,
-PropertyAccessExpression , PropertyAssignment , PropertyDeclaration , PropertySignatureDeclaration ,
-ShorthandPropertyAssignment , TypeAliasDeclaration , TypeParameterDeclaration , VariableDeclaration
-, ] => | f , d | $ req ( f , d . name ) , } } ; } macro_rules ! expression_arms { ( $ mac : ident !
-( $ ( $ pre : tt ) * ) , $ opt : ident , $ req : ident ) => { $ mac ! { $ ( $ pre ) * [
-PropertyAccessExpression , ElementAccessExpression , ParenthesizedExpression , CallExpression ,
-NewExpression , ExpressionWithTypeArguments , ComputedPropertyName , NonNullExpression ,
-TypeAssertion , AsExpression , SatisfiesExpression , TypeOfExpression , SpreadAssignment ,
-SpreadElement , TemplateSpan , DeleteExpression , VoidExpression , AwaitExpression ,
-PartiallyEmittedExpression , IfStatement , DoStatement , WhileStatement , WithStatement ,
-ForInOrOfStatement , SwitchStatement , ExpressionStatement , ThrowStatement ,
-ExternalModuleReference , ExportAssignment , Decorator , JsxSpreadAttribute ,
-SyntheticReferenceExpression , ] => | f , d | $ req ( f , d . expression ) , [ YieldExpression ,
-ReturnStatement , JsxExpression , TypeParameterDeclaration , ] => | f , d | $ opt ( f , d .
-expression ) , } } ; } macro_rules ! postfix_arms { ( $ mac : ident ! ( $ ( $ pre : tt ) * ) , $ opt
-: ident ) => { $ mac ! { $ ( $ pre ) * [ MethodDeclaration , ShorthandPropertyAssignment ,
-MethodSignatureDeclaration , PropertySignatureDeclaration , PropertyAssignment , PropertyDeclaration
-, EnumMember , GetAccessorDeclaration , SetAccessorDeclaration , ] => | f , d | $ opt ( f , d .
-postfix_token ) , } } ; } macro_rules ! question_arms { ( $ mac : ident ! ( $ ( $ pre : tt ) * ) , $
-opt : ident , $ req : ident ) => { $ mac ! { $ ( $ pre ) * [ ParameterDeclaration , MappedTypeNode ,
-NamedTupleMember , ] => | f , d | $ opt ( f , d . question_token ) , [ ConditionalExpression ] => |
-f , d | $ req ( f , d . question_token ) , } } ; } macro_rules ! type_arms { ( $ mac : ident ! ( $ (
-$ pre : tt ) * ) , $ opt : ident , $ req : ident ) => { $ mac ! { $ ( $ pre ) * [
-JsDocParameterOrPropertyTag ] => | f , d | $ opt ( f , d . type_expression ) , [
-IndexSignatureDeclaration ] => | f , d | $ req ( f , d . type_ ) , [ VariableDeclaration ,
-ParameterDeclaration , PropertyDeclaration , PropertyAssignment , ShorthandPropertyAssignment ,
-TypePredicateNode , MappedTypeNode , ExportAssignment , BinaryExpression , ArrowFunction ,
-CallSignatureDeclaration , ConstructSignatureDeclaration , ConstructorDeclaration ,
-FunctionDeclaration , FunctionExpression , GetAccessorDeclaration , SetAccessorDeclaration ,
-JsDocSignature , MethodDeclaration , MethodSignatureDeclaration , FunctionTypeNode ,
-ConstructorTypeNode , ] => | f , d | $ opt ( f , d . type_ ) , [ PropertySignatureDeclaration ,
-ParenthesizedTypeNode , TypeOperatorNode , TypeAssertion , AsExpression , SatisfiesExpression ,
-TypeAliasDeclaration , NamedTupleMember , OptionalTypeNode , RestTypeNode , TemplateLiteralTypeSpan
-, JsDocTypeExpression , JsDocNullableType , JsDocNonNullableType , JsDocOptionalType ,
-JsDocVariadicType , ] => | f , d | $ req ( f , d . type_ ) , } } ; } macro_rules ! initializer_arms
-{ ( $ mac : ident ! ( $ ( $ pre : tt ) * ) , $ opt : ident , $ req : ident ) => { $ mac ! { $ ( $
-pre ) * [ VariableDeclaration , ParameterDeclaration , BindingElement , PropertyDeclaration ,
-EnumMember , ForStatement , JsxAttribute , ] => | f , d | $ opt ( f , d . initializer ) , [
-PropertySignatureDeclaration , PropertyAssignment , ForInOrOfStatement , ] => | f , d | $ req ( f ,
-d . initializer ) , } } ; } macro_rules ! type_arguments_arms { ( $ mac : ident ! ( $ ( $ pre : tt )
-* ) , $ list : ident ) => { $ mac ! { $ ( $ pre ) * [ CallExpression , NewExpression ,
-TaggedTemplateExpression , TypeReferenceNode , ExpressionWithTypeArguments , ImportTypeNode ,
-TypeQueryNode , JsxOpeningElement , JsxSelfClosingElement , ] => | f , d | $ list ( f , & d .
-type_arguments ) , } } ; } macro_rules ! initializer_data_accessor { ( $ ( $ arms : tt ) * ) => {
-data_accessor ! { fn initializer_data , initializer_data_in ( n ) -> Node { Node :: NIL , $ ( $ arms
-) * } } } ; } macro_rules ! other_column_match { ( @ expression $ data : expr , $ expr_opt : ident ,
-$ expr_req : ident , $ postfix : ident , $ q_opt : ident , $ q_req : ident ) => { expression_arms !
-( other_column_match ! ( @ postfix $ data , $ postfix , $ q_opt , $ q_req , ) , $ expr_opt , $
-expr_req ) } ; ( @ postfix $ data : expr , $ postfix : ident , $ q_opt : ident , $ q_req : ident , $
-( $ arms : tt ) * ) => { postfix_arms ! ( other_column_match ! ( @ question $ data , $ q_opt , $
-q_req , $ ( $ arms ) * ) , $ postfix ) } ; ( @ question $ data : expr , $ q_opt : ident , $ q_req :
-ident , $ ( $ arms : tt ) * ) => { question_arms ! ( other_column_match ! ( @ match $ data , $ ( $
-arms ) * ) , $ q_opt , $ q_req ) } ; ( @ match $ data : expr , $ ( $ arms : tt ) * ) => { match_data
-! ( 0 , $ data , Some ( ( SlotChildren :: TAG_EXPRESSION , 0 ) ) , [ CaseOrDefaultClause ,
-QualifiedName ] => | _f , _d | None , $ ( $ arms ) * ) } ; } macro_rules ! name_data_accessor { ( $
-( $ arms : tt ) * ) => { data_accessor ! { fn name_data , name_data_in ( n ) -> Node { Node :: NIL ,
-[ QualifiedName ] => | f , d | if n . kind ( ) == SyntaxKind :: PropertyAccessExpression { req ( f ,
-d . right ) } else { Node :: NIL } , $ ( $ arms ) * } } } ; } macro_rules !
-postfix_token_data_accessor { ( $ ( $ arms : tt ) * ) => { data_accessor ! { fn postfix_token_data ,
-postfix_token_data_in ( n ) -> Node { Node :: NIL , $ ( $ arms ) * } } } ; } macro_rules !
-own_question_token_accessor { ( $ ( $ arms : tt ) * ) => { data_accessor ! { fn own_question_token ,
-own_question_token_in ( n ) -> Option < Node > { None , $ ( $ arms ) * } } } ; } macro_rules !
-locals_container_variants { ( $ mac : ident ! { $ ( $ args : tt ) * } ) => { $ mac ! { $ ( $ args )
-* [ ArrowFunction , Block , CallSignatureDeclaration , CaseBlock , CatchClause , ClassDeclaration ,
-ClassExpression , ClassStaticBlockDeclaration , ConditionalTypeNode , ConstructSignatureDeclaration
-, ConstructorDeclaration , ConstructorTypeNode , ForInOrOfStatement , ForStatement ,
-FunctionDeclaration , FunctionExpression , FunctionTypeNode , GetAccessorDeclaration ,
-IndexSignatureDeclaration , JsDocSignature , MappedTypeNode , MethodDeclaration ,
-MethodSignatureDeclaration , ModuleDeclaration , SetAccessorDeclaration , SourceFile ,
-TypeAliasDeclaration ] } } ; } macro_rules ! data_is_variant { ( $ d : expr , [ $ ( $ v : ident ) ,
-+ $ ( , ) ? ] ) => { matches ! ( $ d , $ ( NodeData :: $ v ( _ ) ) | + ) } ; } macro_rules !
-with_data { ( $ n : expr , | $ d : ident | $ body : expr ) => { { let n__ : $ crate :: core :: Node
-= $ n ; match $ crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let
-$ d : & crate :: astdata :: NodeData = data__ ; $ body } None => $ crate :: ast :: synthetic ::
-read_ast_node_miss ( n__ , | data__ | { let $ d : & crate :: astdata :: NodeData = data__ ; $ body }
-) , } } } ; } macro_rules ! list_of { ( $ n : expr , | $ d : ident | $ body : expr ) => { { let n__
-: $ crate :: core :: Node = $ n ; match $ crate :: ast :: synthetic :: static_tier_ast_node ( n__ )
-{ Some ( data__ ) => { let $ d : & 'static crate :: astdata :: NodeData = data__ ; let found :
-Option < Option < $ crate :: ast :: synthetic :: AnyList < 'static >> > = $ body ; found . map ( | l
-| { $ crate :: ast :: NodeList :: from_ts ( n__ . file_index ( ) , l . map ( $ crate :: ast ::
-synthetic :: AnyList :: nodes ) , ) } ) } None => { static SITE : $ crate :: ast :: synthetic ::
-SelectorSite = $ crate :: ast :: synthetic :: SelectorSite :: new ( ) ; $ crate :: ast :: synthetic
-:: scoped_node_list_of ( n__ , & SITE , | $ d | $ body ) } } } } ; } macro_rules ! modifiers_of { (
-$ n : expr , | $ d : ident | $ body : expr ) => { { let n__ : $ crate :: core :: Node = $ n ; match
-$ crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let $ d : &
-'static crate :: astdata :: NodeData = data__ ; let found : Option < Option < $ crate :: ast ::
-synthetic :: AnyList < 'static >> > = $ body ; found . map ( | m | { $ crate :: ast :: ModifierList
-:: from_ts ( n__ . file_index ( ) , m . map ( $ crate :: ast :: synthetic :: AnyList :: modifiers )
-, ) } ) } None => { static SITE : $ crate :: ast :: synthetic :: SelectorSite = $ crate :: ast ::
-synthetic :: SelectorSite :: new ( ) ; $ crate :: ast :: synthetic :: scoped_modifiers_of ( n__ , &
-SITE , | $ d | $ body ) } } } } ; } fn sel_type_arguments ( _file : usize , l : & Option < crate ::
-astdata :: NodeList > ) -> Option < Option < AnyList < '_ >> > { Some ( l . as_ref ( ) . map (
-AnyList :: Nodes ) ) } pub ( crate ) fn store_node_modifier_bits ( kind : SyntaxKind , data : &
-NodeData ) -> u32 { let mut has_list = false ; has_list |= kind == SyntaxKind :: ArrowFunction ;
-has_list |= kind == SyntaxKind :: BinaryExpression ; has_list |= kind == SyntaxKind ::
-ClassDeclaration ; has_list |= kind == SyntaxKind :: ClassExpression ; has_list |= kind ==
-SyntaxKind :: ClassStaticBlockDeclaration ; has_list |= kind == SyntaxKind :: Constructor ; has_list
-|= kind == SyntaxKind :: ConstructorType ; has_list |= kind == SyntaxKind :: EnumDeclaration ;
-has_list |= kind == SyntaxKind :: EnumMember ; has_list |= kind == SyntaxKind :: ExportAssignment ;
-has_list |= kind == SyntaxKind :: ExportDeclaration ; has_list |= kind == SyntaxKind ::
-FunctionDeclaration ; has_list |= kind == SyntaxKind :: FunctionExpression ; has_list |= kind ==
-SyntaxKind :: FunctionType ; has_list |= kind == SyntaxKind :: GetAccessor ; has_list |= kind ==
-SyntaxKind :: SetAccessor ; has_list |= # [ allow ( non_exhaustive_omitted_patterns ) ] match kind {
-SyntaxKind :: ImportDeclaration | SyntaxKind :: JsImportDeclaration => true , _ => false , } ;
-has_list |= kind == SyntaxKind :: ImportEqualsDeclaration ; has_list |= kind == SyntaxKind ::
-IndexSignature ; has_list |= kind == SyntaxKind :: InterfaceDeclaration ; has_list |= kind ==
-SyntaxKind :: MethodDeclaration ; has_list |= kind == SyntaxKind :: MethodSignature ; has_list |=
-kind == SyntaxKind :: MissingDeclaration ; has_list |= kind == SyntaxKind :: ModuleDeclaration ;
-has_list |= kind == SyntaxKind :: NamespaceExportDeclaration ; has_list |= kind == SyntaxKind ::
-Parameter ; has_list |= kind == SyntaxKind :: PropertyAssignment ; has_list |= kind == SyntaxKind ::
-PropertyDeclaration ; has_list |= kind == SyntaxKind :: PropertySignature ; has_list |= kind ==
-SyntaxKind :: ShorthandPropertyAssignment ; has_list |= # [ allow ( non_exhaustive_omitted_patterns
-) ] match kind { SyntaxKind :: TypeAliasDeclaration | SyntaxKind :: JsTypeAliasDeclaration => true ,
-_ => false , } ; has_list |= kind == SyntaxKind :: TypeParameter ; has_list |= kind == SyntaxKind ::
+no_type_arguments ; self } } fn sel_type_arguments ( _file : usize , l : & Option < crate :: astdata
+:: NodeList > ) -> Option < Option < AnyList < '_ >> > { Some ( l . as_ref ( ) . map ( AnyList ::
+Nodes ) ) } pub ( crate ) fn store_node_modifier_bits ( kind : SyntaxKind , data : & NodeData ) ->
+u32 { let mut has_list = false ; has_list |= kind == SyntaxKind :: ArrowFunction ; has_list |= kind
+== SyntaxKind :: BinaryExpression ; has_list |= kind == SyntaxKind :: ClassDeclaration ; has_list |=
+kind == SyntaxKind :: ClassExpression ; has_list |= kind == SyntaxKind ::
+ClassStaticBlockDeclaration ; has_list |= kind == SyntaxKind :: Constructor ; has_list |= kind ==
+SyntaxKind :: ConstructorType ; has_list |= kind == SyntaxKind :: EnumDeclaration ; has_list |= kind
+== SyntaxKind :: EnumMember ; has_list |= kind == SyntaxKind :: ExportAssignment ; has_list |= kind
+== SyntaxKind :: ExportDeclaration ; has_list |= kind == SyntaxKind :: FunctionDeclaration ;
+has_list |= kind == SyntaxKind :: FunctionExpression ; has_list |= kind == SyntaxKind ::
+FunctionType ; has_list |= kind == SyntaxKind :: GetAccessor ; has_list |= kind == SyntaxKind ::
+SetAccessor ; has_list |= # [ allow ( non_exhaustive_omitted_patterns ) ] match kind { SyntaxKind ::
+ImportDeclaration | SyntaxKind :: JsImportDeclaration => true , _ => false , } ; has_list |= kind ==
+SyntaxKind :: ImportEqualsDeclaration ; has_list |= kind == SyntaxKind :: IndexSignature ; has_list
+|= kind == SyntaxKind :: InterfaceDeclaration ; has_list |= kind == SyntaxKind :: MethodDeclaration
+; has_list |= kind == SyntaxKind :: MethodSignature ; has_list |= kind == SyntaxKind ::
+MissingDeclaration ; has_list |= kind == SyntaxKind :: ModuleDeclaration ; has_list |= kind ==
+SyntaxKind :: NamespaceExportDeclaration ; has_list |= kind == SyntaxKind :: Parameter ; has_list |=
+kind == SyntaxKind :: PropertyAssignment ; has_list |= kind == SyntaxKind :: PropertyDeclaration ;
+has_list |= kind == SyntaxKind :: PropertySignature ; has_list |= kind == SyntaxKind ::
+ShorthandPropertyAssignment ; has_list |= # [ allow ( non_exhaustive_omitted_patterns ) ] match kind
+{ SyntaxKind :: TypeAliasDeclaration | SyntaxKind :: JsTypeAliasDeclaration => true , _ => false , }
+; has_list |= kind == SyntaxKind :: TypeParameter ; has_list |= kind == SyntaxKind ::
 VariableStatement ; if ! has_list { return 0 ; } match data { NodeData :: ArrowFunction ( d ) => d .
 modifiers . as_ref ( ) . map_or ( 0 , | m | m . flags . 0 ) , NodeData :: BinaryExpression ( d ) =>
 d . modifiers . as_ref ( ) . map_or ( 0 , | m | m . flags . 0 ) , NodeData :: ClassDeclaration ( d )
@@ -2119,10 +1932,10 @@ name ) } NodeData :: PropertySignatureDeclaration ( d ) => { let f = file ; id_r
 NodeData :: TypeAliasDeclaration ( d ) => { let f = file ; id_req ( f , d . name ) } NodeData ::
 TypeParameterDeclaration ( d ) => { let f = file ; id_req ( f , d . name ) } NodeData ::
 VariableDeclaration ( d ) => { let f = file ; id_req ( f , d . name ) } _ => Some ( 0 ) , } } ; let
-tagged_opt = | tag : u32 | move | _ : usize , id : Option < crate :: astdata :: NodeId > | Some ( (
-tag , id . map_or ( 0 , | i | i . 0 ) ) ) ; let tagged_req = | tag : u32 | move | _ : usize , id :
-crate :: astdata :: NodeId | Some ( ( tag , id . 0 ) ) ; let ( expr_opt , expr_req ) = ( tagged_opt
-( SlotChildren :: TAG_EXPRESSION ) , tagged_req ( SlotChildren :: TAG_EXPRESSION ) ) ; let postfix =
+tagged_opt = | tag : u32 | move | _ : usize , id : Option < crate :: astdata :: NodeId > | Some (
+tag , id . map_or ( 0 , | i | i . 0 ) ) ; let tagged_req = | tag : u32 | move | _ : usize , id :
+crate :: astdata :: NodeId | Some ( tag , id . 0 ) ; let ( expr_opt , expr_req ) = ( tagged_opt (
+SlotChildren :: TAG_EXPRESSION ) , tagged_req ( SlotChildren :: TAG_EXPRESSION ) ) ; let postfix =
 tagged_opt ( SlotChildren :: TAG_POSTFIX ) ; let ( q_opt , q_req ) = ( tagged_opt ( SlotChildren ::
 TAG_QUESTION ) , tagged_req ( SlotChildren :: TAG_QUESTION ) ) ; let other = { let file : usize = 0
 ; match data { NodeData :: CaseOrDefaultClause ( _d ) => { let _f = file ; None } NodeData ::
@@ -2172,8 +1985,8 @@ SetAccessorDeclaration ( d ) => { let f = file ; postfix ( f , d . postfix_token
 ParameterDeclaration ( d ) => { let f = file ; q_opt ( f , d . question_token ) } NodeData ::
 MappedTypeNode ( d ) => { let f = file ; q_opt ( f , d . question_token ) } NodeData ::
 NamedTupleMember ( d ) => { let f = file ; q_opt ( f , d . question_token ) } NodeData ::
-ConditionalExpression ( d ) => { let f = file ; q_req ( f , d . question_token ) } _ => Some ( (
-SlotChildren :: TAG_EXPRESSION , 0 ) ) , } } ; let type_id = { let file : usize = 0 ; match data {
+ConditionalExpression ( d ) => { let f = file ; q_req ( f , d . question_token ) } _ => Some (
+SlotChildren :: TAG_EXPRESSION , 0 ) , } } ; let type_id = { let file : usize = 0 ; match data {
 NodeData :: JsDocParameterOrPropertyTag ( d ) => { let f = file ; id_opt ( f , d . type_expression )
 } NodeData :: IndexSignatureDeclaration ( d ) => { let f = file ; id_req ( f , d . type_ ) }
 NodeData :: VariableDeclaration ( d ) => { let f = file ; id_opt ( f , d . type_ ) } NodeData ::
@@ -2836,24 +2649,21 @@ boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_v
 :: new ( ParameterDeclarationData { name : id ( 7 ) , question_token : Some ( id ( 13 ) ) , ..
 Default :: default ( ) } ) ) ) ; let md = register ( 0 , NodeData :: MethodDeclaration ( Box :: new
 ( MethodDeclarationData { name : id ( 8 ) , postfix_token : Some ( id ( 14 ) ) , .. Default ::
-default ( ) } ) ) ) ; { :: std :: io :: _print ( format_args ! ( "name fd={0} vd={1} in={2}\n" , fd
-. name_data ( ) . raw ( ) , vd . name_data ( ) . raw ( ) , fd . name_data_in ( static_ast_node ( fd
-) ) . raw ( ) ) ) ; } ; { :: std :: io :: _print ( format_args ! ( "init vd={0} fd={1}\n" , vd .
-initializer_data ( ) . raw ( ) , fd . initializer_data ( ) . raw ( ) ) ) ; } ; { :: std :: io ::
-_print ( format_args ! ( "postfix md={0} question pd={1:?} qdot={2}\n" , md . postfix_token_data ( )
-. raw ( ) , pd . own_question_token ( ) . map ( | n | n . raw ( ) ) , call . question_dot_token ( )
-. raw ( ) ) ) ; } ; { :: std :: io :: _print ( format_args ! (
-"mods bits={0} in_bits={1} store_bits={2}\n" , fd . modifiers ( ) . bits ( ) , fd . modifiers_in (
-static_ast_node ( fd ) ) . bits ( ) , store_node_modifier_bits ( fd . kind ( ) , static_ast_node (
-fd ) . unwrap ( ) ) ) ) ; } ; { :: std :: io :: _print ( format_args ! (
-"params={0} typeargs={1} typeargs_nil={2}\n" , fd . parameter_list ( ) . len ( ) , call .
-type_argument_list ( ) . len ( ) , vd . type_argument_list ( ) . is_nil ( ) ) ) ; } ; { :: std :: io
-:: _print ( format_args ! ( "locals fd={0} vd={1} rank={2} {3}\n" , is_locals_container ( fd ) ,
-is_locals_container ( vd ) , fd . locals_rank ( ) , call . locals_rank ( ) ) ) ; } ; let sc =
-store_children ( static_ast_node ( vd ) . unwrap ( ) ) ; { :: std :: io :: _print ( format_args ! (
-"children name={0:?} other={1:?} typed={2:?} no_tyargs={3}\n" , sc . name , sc . other , sc . typed
-, sc . no_type_arguments ) ) ; } ; let k = SyntaxKind :: FunctionType ; { :: std :: io :: _print (
-format_args ! ( "has_kind special={0} generic={1} token={2}\n" , k == SyntaxKind :: FunctionType ,
-vd . kind ( ) == SyntaxKind :: VariableDeclaration , SyntaxKind :: Identifier . is_token ( ) ) ) ; }
-; { :: std :: io :: _print ( format_args ! ( "nil name={0} init={1}\n" , Node :: NIL . name_data ( )
-. raw ( ) , Node :: NIL . initializer_data ( ) . raw ( ) ) ) ; } ; }
+default ( ) } ) ) ) ; println ! ( "name fd={0} vd={1} in={2}" , fd . name_data ( ) . raw ( ) , vd .
+name_data ( ) . raw ( ) , fd . name_data_in ( static_ast_node ( fd ) ) . raw ( ) ) ; println ! (
+"init vd={0} fd={1}" , vd . initializer_data ( ) . raw ( ) , fd . initializer_data ( ) . raw ( ) ) ;
+println ! ( "postfix md={0} question pd={1:?} qdot={2}" , md . postfix_token_data ( ) . raw ( ) , pd
+. own_question_token ( ) . map ( | n | n . raw ( ) ) , call . question_dot_token ( ) . raw ( ) ) ;
+println ! ( "mods bits={0} in_bits={1} store_bits={2}" , fd . modifiers ( ) . bits ( ) , fd .
+modifiers_in ( static_ast_node ( fd ) ) . bits ( ) , store_node_modifier_bits ( fd . kind ( ) ,
+static_ast_node ( fd ) . unwrap ( ) ) ) ; println ! ( "params={0} typeargs={1} typeargs_nil={2}" ,
+fd . parameter_list ( ) . len ( ) , call . type_argument_list ( ) . len ( ) , vd .
+type_argument_list ( ) . is_nil ( ) ) ; println ! ( "locals fd={0} vd={1} rank={2} {3}" ,
+is_locals_container ( fd ) , is_locals_container ( vd ) , fd . locals_rank ( ) , call . locals_rank
+( ) ) ; let sc = store_children ( static_ast_node ( vd ) . unwrap ( ) ) ; println ! (
+"children name={0:?} other={1:?} typed={2:?} no_tyargs={3}" , sc . name , sc . other , sc . typed ,
+sc . no_type_arguments ) ; let k = SyntaxKind :: FunctionType ; println ! (
+"has_kind special={0} generic={1} token={2}" , k == SyntaxKind :: FunctionType , vd . kind ( ) ==
+SyntaxKind :: VariableDeclaration , SyntaxKind :: Identifier . is_token ( ) ) ; println ! (
+"nil name={0} init={1}" , Node :: NIL . name_data ( ) . raw ( ) , Node :: NIL . initializer_data ( )
+. raw ( ) ) ; }

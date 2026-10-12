@@ -1,11 +1,7 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; pub const fn snapshot_text_hash ( text : & str ) -> u64 { let b = text . as_bytes (
-) ; let mut h : u64 = 0xcbf29ce484222325 ; let mut i = 0 ; while i < b . len ( ) { h = ( h ^ b [ i ]
-as u64 ) . wrapping_mul ( 0x100000001b3 ) ; i += 1 ; } h } pub type EmbeddedLib = ( & 'static str ,
-& 'static str , u64 ) ; macro_rules ! bundled_lib { ( $ name : literal ) => { { const TEXT : & str =
-include_str ! ( concat ! ( "../../../libs/" , $ name ) ) ; const HASH : u64 = snapshot_text_hash (
-TEXT ) ; ( concat ! ( "libs/" , $ name ) , TEXT , HASH ) } } ; } static EMBEDDED : & [ EmbeddedLib ]
-= & [ { const TEXT : & str = "declare const sample: number;\n" ; const HASH : u64 =
-snapshot_text_hash ( TEXT ) ; ( "libs/sample.d.ts" , TEXT , HASH ) } ] ; fn main ( ) { let ( path ,
-text , hash ) = EMBEDDED [ 0 ] ; { :: std :: io :: _print ( format_args ! (
-"path={2} text=\'{0}\' hash_nonzero={1}\n" , text . trim ( ) , hash != 0 , path ) ) ; } ; }
+pub const fn snapshot_text_hash ( text : & str ) -> u64 { let b = text . as_bytes ( ) ; let mut h :
+u64 = 0xcbf29ce484222325 ; let mut i = 0 ; while i < b . len ( ) { h = ( h ^ b [ i ] as u64 ) .
+wrapping_mul ( 0x100000001b3 ) ; i += 1 ; } h } pub type EmbeddedLib = ( & 'static str , & 'static
+str , u64 ) ; static EMBEDDED : & [ EmbeddedLib ] = & [ { const TEXT : & str =
+"declare const sample: number;\n" ; const HASH : u64 = snapshot_text_hash ( TEXT ) ; (
+"libs/sample.d.ts" , TEXT , HASH ) } ] ; fn main ( ) { let ( path , text , hash ) = EMBEDDED [ 0 ] ;
+println ! ( "path={2} text=\'{0}\' hash_nonzero={1}" , text . trim ( ) , hash != 0 , path ) ; }

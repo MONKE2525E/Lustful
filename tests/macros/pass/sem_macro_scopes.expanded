@@ -1,8 +1,5 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; pub mod early { use crate :: exported_val ; pub fn run ( ) -> ( i32 , i32 ) { ( 20
-, 20 + 1 ) } } macro_rules ! textual_val { ( ) => { 10 } ; } pub mod child_after { pub fn run ( ) ->
-i32 { 10 + 1 } } # [ macro_export ] macro_rules ! exported_val { ( ) => { 20 } ; } pub mod reimport
-{ pub ( crate ) use crate :: exported_val as renamed_val ; pub fn run ( ) -> i32 { 20 + 2 } } fn
-main ( ) { { :: std :: io :: _print ( format_args ! ( "textual={0} child={1}\n" , 10 , child_after
-:: run ( ) ) ) ; } ; let ( a , b ) = early :: run ( ) ; { :: std :: io :: _print ( format_args ! (
-"early path={1} early use={2} reimport={0}\n" , reimport :: run ( ) , a , b ) ) ; } ; }
+pub mod early { use crate :: exported_val ; pub fn run ( ) -> ( i32 , i32 ) { ( 20 , 20 + 1 ) } }
+pub mod child_after { pub fn run ( ) -> i32 { 10 + 1 } } # [ macro_export ] pub mod reimport { pub (
+crate ) use crate :: exported_val as renamed_val ; pub fn run ( ) -> i32 { 20 + 2 } } fn main ( ) {
+println ! ( "textual={0} child={1}" , 10 , child_after :: run ( ) ) ; let ( a , b ) = early :: run (
+) ; println ! ( "early path={1} early use={2} reimport={0}" , reimport :: run ( ) , a , b ) ; }

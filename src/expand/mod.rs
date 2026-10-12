@@ -1049,6 +1049,56 @@ pub fn expand_call(call: &MacroCall, def: &MacroDef, strings: &[String], ctx: &E
     Ok(trees)
 }
 
+/// `lust expand <file.rs>`: prints the file's expanded token stream to
+/// stdout, one space between tokens. This is lust's own expansion (the
+/// parser's builtin macros such as `println!` stay in their written
+/// form); the macro corpus compares it against rustc's
+/// `-Zunpretty=expanded` through tests/macros/normalize.py, which
+/// canonicalizes the forms the two compilers print differently.
+/// Returns the process exit code.
+pub fn run_expand(args: &[String]) -> i32 {
+    let [file] = args else {
+        eprintln!("usage: lust expand <file.rs>");
+        return 2;
+    };
+    let path = std::path::Path::new(file);
+    let src = match std::fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let mut map = crate::diag::SourceMap::default();
+    map.add_file(file, &src);
+    let interner = Interner::default();
+    let known = Known::new(&interner);
+    let out = crate::lexer::lex(&src, crate::diag::FileId(0), 0, &interner).and_then(|lexed| {
+        let ctx = ExpandCtx::for_file(&interner, &known, path, &src, false);
+        expand_lexed_with_deps(lexed, &ctx).map(|(lexed, _deps)| lexed)
+    });
+    match out {
+        Ok(lexed) => {
+            let mut text = String::new();
+            for tok in &lexed.tokens {
+                if tok.tok == Tok::Eof {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&tok_text(&tok.tok, &lexed.strings, &interner));
+            }
+            println!("{text}");
+            0
+        }
+        Err(mut d) => {
+            eprint!("{}", crate::diag::render(std::slice::from_mut(&mut d), &map, &src, false, 20));
+            1
+        }
+    }
+}
+
 /// Flattens expanded trees for the parser. An expression fragment with
 /// more than one token gets parens, so forwarding one into a larger
 /// expression keeps its rustc atomic shape in the flat token stream.

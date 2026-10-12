@@ -1,12 +1,8 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; fn collect ( parts : & [ & str ] ) -> ( Vec < String > , i32 , i32 ) { let mut
-comments : Vec < String > = Vec :: new ( ) ; let mut margin : i32 = - 1 ; let mut indent : i32 = 0 ;
-macro_rules ! push_comment { ( $ text : expr ) => { { let text : String = ( $ text ) . to_string ( )
-; if margin == - 1 { margin = indent ; } indent += text . len ( ) as i32 ; comments . push ( text )
-; } } ; } for p in parts { { let text : String = ( * p ) . to_string ( ) ; if margin == - 1 { margin
-= indent ; } indent += text . len ( ) as i32 ; comments . push ( text ) ; } ; } { let text : String
-= ( :: alloc :: __export :: must_use ( { :: alloc :: fmt :: format ( format_args ! ( "n={0}" , 3 ) )
-} ) ) . to_string ( ) ; if margin == - 1 { margin = indent ; } indent += text . len ( ) as i32 ;
+fn collect ( parts : & [ & str ] ) -> ( Vec < String > , i32 , i32 ) { let mut comments : Vec <
+String > = Vec :: new ( ) ; let mut margin : i32 = - 1 ; let mut indent : i32 = 0 ; for p in parts {
+{ let text : String = ( * p ) . to_string ( ) ; if margin == - 1 { margin = indent ; } indent +=
+text . len ( ) as i32 ; comments . push ( text ) ; } ; } { let text : String = ( format ! ( "n={0}"
+, 3 ) ) . to_string ( ) ; if margin == - 1 { margin = indent ; } indent += text . len ( ) as i32 ;
 comments . push ( text ) ; } ; ( comments , margin , indent ) } fn main ( ) { let ( c , margin ,
-indent ) = collect ( & [ "ab" , "cde" ] ) ; { :: std :: io :: _print ( format_args ! (
-"comments={0:?} margin={1} indent={2}\n" , c , margin , indent ) ) ; } ; }
+indent ) = collect ( & [ "ab" , "cde" ] ) ; println ! ( "comments={0:?} margin={1} indent={2}" , c ,
+margin , indent ) ; }

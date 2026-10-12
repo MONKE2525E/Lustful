@@ -1,15 +1,14 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; use std :: collections :: HashSet ; pub struct Opts { pub out_dir : String , pub
-strict : bool , pub target : String , } # [ automatically_derived ] impl :: core :: clone :: Clone
-for Opts { # [ inline ] fn clone ( & self ) -> Opts { Opts { out_dir : :: core :: clone :: Clone ::
-clone ( & self . out_dir ) , strict : :: core :: clone :: Clone :: clone ( & self . strict ) ,
-target : :: core :: clone :: Clone :: clone ( & self . target ) , } } } # [ automatically_derived ]
-impl :: core :: default :: Default for Opts { # [ inline ] fn default ( ) -> Opts { Opts { out_dir :
-:: core :: default :: Default :: default ( ) , strict : :: core :: default :: Default :: default ( )
-, target : :: core :: default :: Default :: default ( ) , } } } # [ automatically_derived ] impl ::
-core :: marker :: StructuralPartialEq for Opts { } # [ automatically_derived ] impl :: core :: cmp
-:: PartialEq for Opts { # [ inline ] fn eq ( & self , other : & Opts ) -> bool { self . strict ==
-other . strict && self . out_dir == other . out_dir && self . target == other . target } } # [
+use std :: collections :: HashSet ; pub struct Opts { pub out_dir : String , pub strict : bool , pub
+target : String , } # [ automatically_derived ] impl :: core :: clone :: Clone for Opts { # [ inline
+] fn clone ( & self ) -> Opts { Opts { out_dir : :: core :: clone :: Clone :: clone ( & self .
+out_dir ) , strict : :: core :: clone :: Clone :: clone ( & self . strict ) , target : :: core ::
+clone :: Clone :: clone ( & self . target ) , } } } # [ automatically_derived ] impl :: core ::
+default :: Default for Opts { # [ inline ] fn default ( ) -> Opts { Opts { out_dir : :: core ::
+default :: Default :: default ( ) , strict : :: core :: default :: Default :: default ( ) , target :
+:: core :: default :: Default :: default ( ) , } } } # [ automatically_derived ] impl :: core ::
+marker :: StructuralPartialEq for Opts { } # [ automatically_derived ] impl :: core :: cmp ::
+PartialEq for Opts { # [ inline ] fn eq ( & self , other : & Opts ) -> bool { self . strict == other
+. strict && self . out_dir == other . out_dir && self . target == other . target } } # [
 automatically_derived ] impl :: core :: fmt :: Debug for Opts { # [ inline ] fn fmt ( & self , f : &
 mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "Opts" , "out_dir" , & self . out_dir , "strict" , & self . strict
@@ -31,38 +30,28 @@ automatically_derived ] impl :: core :: default :: Default for RawOpts { # [ inl
 , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter
 :: debug_struct_field3_finish ( f , "RawOpts" , "root_dir" , & self . root_dir , "out_file" , & self
 . out_file , "other" , && self . other ) } } fn merge ( target_options : & mut Opts , source_options
-: & Opts , explicit_null_fields : & HashSet < String > ) { macro_rules ! merge_fields { ( $ ( $
-field : ident => $ json : literal , ) * ) => { $ ( if explicit_null_fields . contains ( $ json ) {
-target_options . $ field = Default :: default ( ) ; } else if ! is_zero_value ( & source_options . $
-field ) { target_options . $ field = source_options . $ field . clone ( ) ; } ) * } ; } if
-explicit_null_fields . contains ( "outDir" ) { target_options . out_dir = Default :: default ( ) ; }
-else if ! is_zero_value ( & source_options . out_dir ) { target_options . out_dir = source_options .
-out_dir . clone ( ) ; } if explicit_null_fields . contains ( "strict" ) { target_options . strict =
-Default :: default ( ) ; } else if ! is_zero_value ( & source_options . strict ) { target_options .
-strict = source_options . strict . clone ( ) ; } if explicit_null_fields . contains ( "target" ) {
-target_options . target = Default :: default ( ) ; } else if ! is_zero_value ( & source_options .
-target ) { target_options . target = source_options . target . clone ( ) ; } } fn substitute (
-compiler_options : & mut RawOpts , base_path : & str ) { macro_rules ! substitute_string_fields { (
-$ ( $ field : ident ) , * ) => { $ ( if starts_with_config_dir_template ( & CompilerOptionsValue ::
-String ( compiler_options . $ field . clone ( ) ) ) { compiler_options . $ field =
-get_substituted_path_with_config_dir_template ( & compiler_options . $ field , base_path ) ; } ) * }
-; } if starts_with_config_dir_template ( & CompilerOptionsValue :: String ( compiler_options .
-root_dir . clone ( ) ) ) { compiler_options . root_dir =
+: & Opts , explicit_null_fields : & HashSet < String > ) { if explicit_null_fields . contains (
+"outDir" ) { target_options . out_dir = Default :: default ( ) ; } else if ! is_zero_value ( &
+source_options . out_dir ) { target_options . out_dir = source_options . out_dir . clone ( ) ; } if
+explicit_null_fields . contains ( "strict" ) { target_options . strict = Default :: default ( ) ; }
+else if ! is_zero_value ( & source_options . strict ) { target_options . strict = source_options .
+strict . clone ( ) ; } if explicit_null_fields . contains ( "target" ) { target_options . target =
+Default :: default ( ) ; } else if ! is_zero_value ( & source_options . target ) { target_options .
+target = source_options . target . clone ( ) ; } } fn substitute ( compiler_options : & mut RawOpts
+, base_path : & str ) { if starts_with_config_dir_template ( & CompilerOptionsValue :: String (
+compiler_options . root_dir . clone ( ) ) ) { compiler_options . root_dir =
 get_substituted_path_with_config_dir_template ( & compiler_options . root_dir , base_path ) ; } if
 starts_with_config_dir_template ( & CompilerOptionsValue :: String ( compiler_options . out_file .
 clone ( ) ) ) { compiler_options . out_file = get_substituted_path_with_config_dir_template ( &
 compiler_options . out_file , base_path ) ; } ; } fn take_from ( source : & RawOpts , merged : & mut
-RawOpts , keys : & [ & str ] ) { let has = | k : & str | keys . contains ( & k ) ; macro_rules !
-take { ( $ ( $ key : literal => $ field : ident , ) * ) => { $ ( if has ( $ key ) { merged . $ field
-= source . $ field . clone ( ) ; } ) * } ; } if has ( "rootDir" ) { merged . root_dir = source .
-root_dir . clone ( ) ; } if has ( "outFile" ) { merged . out_file = source . out_file . clone ( ) ;
-} } fn main ( ) { let source = Opts { out_dir : "dist" . into ( ) , strict : true , target : String
-:: new ( ) } ; let mut target = Opts { out_dir : "keep" . into ( ) , strict : false , target :
-"es2022" . into ( ) , } ; let nulls : HashSet < String > = [ "outDir" . to_string ( ) ] . into_iter
-( ) . collect ( ) ; merge ( & mut target , & source , & nulls ) ; { :: std :: io :: _print (
-format_args ! ( "merged={0:?}\n" , target ) ) ; } ; let mut raw = RawOpts { root_dir :
-"${configDir}/src" . into ( ) , out_file : "plain.js" . into ( ) , other : String :: new ( ) , } ;
-substitute ( & mut raw , "/proj" ) ; { :: std :: io :: _print ( format_args ! ( "subst={0} {1}\n" ,
-raw . root_dir , raw . out_file ) ) ; } ; let mut merged = RawOpts :: default ( ) ; take_from ( &
-raw , & mut merged , & [ "rootDir" ] ) ; { :: std :: io :: _print ( format_args ! (
-"take={0} \'{1}\'\n" , merged . root_dir , merged . out_file ) ) ; } ; }
+RawOpts , keys : & [ & str ] ) { let has = | k : & str | keys . contains ( & k ) ; if has (
+"rootDir" ) { merged . root_dir = source . root_dir . clone ( ) ; } if has ( "outFile" ) { merged .
+out_file = source . out_file . clone ( ) ; } } fn main ( ) { let source = Opts { out_dir : "dist" .
+into ( ) , strict : true , target : String :: new ( ) } ; let mut target = Opts { out_dir : "keep" .
+into ( ) , strict : false , target : "es2022" . into ( ) , } ; let nulls : HashSet < String > = [
+"outDir" . to_string ( ) ] . into_iter ( ) . collect ( ) ; merge ( & mut target , & source , & nulls
+) ; println ! ( "merged={0:?}" , target ) ; let mut raw = RawOpts { root_dir : "${configDir}/src" .
+into ( ) , out_file : "plain.js" . into ( ) , other : String :: new ( ) , } ; substitute ( & mut raw
+, "/proj" ) ; println ! ( "subst={0} {1}" , raw . root_dir , raw . out_file ) ; let mut merged =
+RawOpts :: default ( ) ; take_from ( & raw , & mut merged , & [ "rootDir" ] ) ; println ! (
+"take={0} \'{1}\'" , merged . root_dir , merged . out_file ) ; }

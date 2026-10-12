@@ -1,24 +1,12 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; macro_rules ! match_like { ( $ e : expr , $ p : pat => $ b : block , _ => $ d :
-expr ) => { match $ e { $ p => $ b , _ => $ d , } } ; } macro_rules ! with_stmt { ( $ name : ident ,
-$ s : stmt ) => { { $ s $ name } } ; } macro_rules ! make_items { ( $ ( $ i : item ) * ) => { $ ( $
-i ) * } ; } macro_rules ! call_path { ( $ p : path , $ v : expr ) => { $ p ( $ v ) } ; } macro_rules
-! first_of { ( $ lt : lifetime , $ x : expr ) => { { let out = $ x ; $ lt : loop { break $ lt ; }
-out } } ; } macro_rules ! vis_fn { ( $ v : vis fn $ name : ident ( ) -> $ t : ty { $ e : expr } ) =>
-{ $ v fn $ name ( ) -> $ t { $ e } } ; } macro_rules ! table { ( $ ( $ ( $ c : literal ) , + ) ; + )
-=> { vec ! [ $ ( vec ! [ $ ( $ c ) , + ] ) , + ] } ; } macro_rules ! at_least_one { ( $ ( $ x : expr
-) , + ) => { 0 $ ( + $ x ) + } ; } pub fn made_fn ( ) -> i32 { 3 } pub const MADE_CONST : i32 = 4 ;
-pub fn vis_made ( ) -> i32 { 5 } fn twice ( x : i32 ) -> i32 { x * 2 } fn main ( ) { let v = match
-Some ( 7 ) { Some ( n ) => { n * 10 } _ => 0 , } ; { :: std :: io :: _print ( format_args ! (
-"pat/block={0}\n" , v ) ) ; } ; let s = { let doubled = 21 * 2 ; doubled } ; { :: std :: io ::
-_print ( format_args ! ( "stmt={0}\n" , s ) ) ; } ; { :: std :: io :: _print ( format_args ! (
-"item={0} {1} vis={2}\n" , made_fn ( ) , MADE_CONST , vis_made ( ) ) ) ; } ; { :: std :: io ::
-_print ( format_args ! ( "path={0}\n" , twice ( 21 ) ) ) ; } ; { :: std :: io :: _print (
-format_args ! ( "lifetime label={0}\n" , { let out = 9 ; 'a : loop { break 'a ; } out } ) ) ; } ; {
-:: std :: io :: _print ( format_args ! ( "nested={0:?}\n" , :: alloc :: boxed ::
+pub fn made_fn ( ) -> i32 { 3 } pub const MADE_CONST : i32 = 4 ; pub fn vis_made ( ) -> i32 { 5 } fn
+twice ( x : i32 ) -> i32 { x * 2 } fn main ( ) { let v = match Some ( 7 ) { Some ( n ) => { n * 10 }
+_ => 0 , } ; println ! ( "pat/block={0}" , v ) ; let s = { let doubled = 21 * 2 ; doubled } ;
+println ! ( "stmt={0}" , s ) ; println ! ( "item={0} {1} vis={2}" , made_fn ( ) , MADE_CONST ,
+vis_made ( ) ) ; println ! ( "path={0}" , twice ( 21 ) ) ; println ! ( "lifetime label={0}" , { let
+out = 9 ; 'a : loop { break 'a ; } out } ) ; println ! ( "nested={0:?}" , :: alloc :: boxed ::
 box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
 :: Box :: new_uninit ( ) , [ :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc ::
 intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ 1 , 2 ] ) ) , ::
 alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move (
-:: alloc :: boxed :: Box :: new_uninit ( ) , [ 3 ] ) ) ] ) ) ) ) ; } ; { :: std :: io :: _print (
-format_args ! ( "plus rep={0}\n" , 0 + 1 + 2 + 3 ) ) ; } ; }
+:: alloc :: boxed :: Box :: new_uninit ( ) , [ 3 ] ) ) ] ) ) ) ; println ! ( "plus rep={0}" , 0 + 1
++ 2 + 3 ) ; }

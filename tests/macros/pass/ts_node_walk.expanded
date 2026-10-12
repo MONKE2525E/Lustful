@@ -1,75 +1,73 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; pub mod astdata { pub struct NodeId ( pub u32 ) ; # [ automatically_derived ] # [
-doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for NodeId { } # [
-automatically_derived ] impl :: core :: clone :: Clone for NodeId { # [ inline ] fn clone ( & self )
--> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
-automatically_derived ] impl :: core :: marker :: Copy for NodeId { } # [ automatically_derived ]
-impl :: core :: fmt :: Debug for NodeId { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish (
-f , "NodeId" , && self . 0 ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-NodeId { # [ inline ] fn default ( ) -> NodeId { NodeId ( :: core :: default :: Default :: default (
-) ) } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeId { } # [
-automatically_derived ] impl :: core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self ,
-other : & NodeId ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core ::
-cmp :: Eq for NodeId { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
-assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; } } impl
-NodeId { pub fn index ( self ) -> usize { self . 0 as usize } } pub struct NodeList { pub items :
-Vec < NodeId > , } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeList { # [
-inline ] fn clone ( & self ) -> NodeList { NodeList { items : :: core :: clone :: Clone :: clone ( &
-self . items ) } } } # [ automatically_derived ] impl :: core :: fmt :: Debug for NodeList { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field1_finish ( f , "NodeList" , "items" , && self . items
-) } } # [ automatically_derived ] impl :: core :: default :: Default for NodeList { # [ inline ] fn
-default ( ) -> NodeList { NodeList { items : :: core :: default :: Default :: default ( ) } } } # [
-automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeList { } # [
-automatically_derived ] impl :: core :: cmp :: PartialEq for NodeList { # [ inline ] fn eq ( & self
-, other : & NodeList ) -> bool { self . items == other . items } } # [ automatically_derived ] impl
-:: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
-assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < Vec < NodeId >> ; } }
-pub struct ModFlags ( pub u32 ) ; # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl ::
-core :: clone :: TrivialClone for ModFlags { } # [ automatically_derived ] impl :: core :: clone ::
-Clone for ModFlags { # [ inline ] fn clone ( & self ) -> ModFlags { let _ : :: core :: clone ::
-AssertParamIsClone < u32 > ; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy
-for ModFlags { } # [ automatically_derived ] impl :: core :: fmt :: Debug for ModFlags { # [ inline
+pub mod astdata { pub struct NodeId ( pub u32 ) ; # [ automatically_derived ] # [ doc ( hidden ) ]
+unsafe impl :: core :: clone :: TrivialClone for NodeId { } # [ automatically_derived ] impl :: core
+:: clone :: Clone for NodeId { # [ inline ] fn clone ( & self ) -> NodeId { let _ : :: core :: clone
+:: AssertParamIsClone < u32 > ; * self } } # [ automatically_derived ] impl :: core :: marker ::
+Copy for NodeId { } # [ automatically_derived ] impl :: core :: fmt :: Debug for NodeId { # [ inline
 ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_tuple_field1_finish ( f , "ModFlags" , && self . 0 ) } } # [
-automatically_derived ] impl :: core :: default :: Default for ModFlags { # [ inline ] fn default (
-) -> ModFlags { ModFlags ( :: core :: default :: Default :: default ( ) ) } } # [
-automatically_derived ] impl :: core :: marker :: StructuralPartialEq for ModFlags { } # [
-automatically_derived ] impl :: core :: cmp :: PartialEq for ModFlags { # [ inline ] fn eq ( & self
-, other : & ModFlags ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core
-:: cmp :: Eq for ModFlags { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
-assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; } } pub struct
-ModifierList { pub list : NodeList , pub flags : ModFlags , } # [ automatically_derived ] impl ::
-core :: clone :: Clone for ModifierList { # [ inline ] fn clone ( & self ) -> ModifierList {
-ModifierList { list : :: core :: clone :: Clone :: clone ( & self . list ) , flags : :: core ::
-clone :: Clone :: clone ( & self . flags ) , } } } # [ automatically_derived ] impl :: core :: fmt
-:: Debug for ModifierList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
--> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ModifierList" , "list" , & self . list , "flags" , && self . flags ) } } # [ automatically_derived
-] impl :: core :: default :: Default for ModifierList { # [ inline ] fn default ( ) -> ModifierList
-{ ModifierList { list : :: core :: default :: Default :: default ( ) , flags : :: core :: default ::
-Default :: default ( ) , } } } # [ automatically_derived ] impl :: core :: marker ::
-StructuralPartialEq for ModifierList { } # [ automatically_derived ] impl :: core :: cmp ::
-PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : & ModifierList ) -> bool { self .
-list == other . list && self . flags == other . flags } } # [ automatically_derived ] impl :: core
-:: cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
-assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < NodeList > ; let _ :
-:: core :: cmp :: AssertParamIsEq < ModFlags > ; } } pub use crate :: NodeData ; } pub mod core {
-pub use crate :: Node ; } pub mod ast { pub use crate :: { ModifierList , NodeList } ; pub mod
-synthetic { use crate :: { Node , NodeData } ; pub enum AnyList < 'a > { Nodes ( & 'a crate ::
-astdata :: NodeList ) , Modifiers ( & 'a crate :: astdata :: ModifierList ) , } # [
-automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core :: clone :: TrivialClone for
-AnyList < 'a > { } # [ automatically_derived ] impl < 'a > :: core :: clone :: Clone for AnyList <
-'a > { # [ inline ] fn clone ( & self ) -> AnyList < 'a > { let _ : :: core :: clone ::
-AssertParamIsClone < & 'a crate :: astdata :: NodeList > ; let _ : :: core :: clone ::
-AssertParamIsClone < & 'a crate :: astdata :: ModifierList > ; * self } } # [ automatically_derived
-] impl < 'a > :: core :: marker :: Copy for AnyList < 'a > { } impl < 'a > AnyList < 'a > { pub fn
-nodes ( self ) -> & 'a crate :: astdata :: NodeList { match self { Self :: Nodes ( l ) => l , Self
-:: Modifiers ( m ) => & m . list , } } pub fn modifiers ( self ) -> & 'a crate :: astdata ::
-ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) => { :: core ::
-panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub struct
-SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
+fmt :: Formatter :: debug_tuple_field1_finish ( f , "NodeId" , && self . 0 ) } } # [
+automatically_derived ] impl :: core :: default :: Default for NodeId { # [ inline ] fn default ( )
+-> NodeId { NodeId ( :: core :: default :: Default :: default ( ) ) } } # [ automatically_derived ]
+impl :: core :: marker :: StructuralPartialEq for NodeId { } # [ automatically_derived ] impl ::
+core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self , other : & NodeId ) -> bool {
+self . 0 == other . 0 } } # [ automatically_derived ] impl :: core :: cmp :: Eq for NodeId { # [
+inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : ::
+core :: cmp :: AssertParamIsEq < u32 > ; } } impl NodeId { pub fn index ( self ) -> usize { self . 0
+as usize } } pub struct NodeList { pub items : Vec < NodeId > , } # [ automatically_derived ] impl
+:: core :: clone :: Clone for NodeList { # [ inline ] fn clone ( & self ) -> NodeList { NodeList {
+items : :: core :: clone :: Clone :: clone ( & self . items ) } } } # [ automatically_derived ] impl
+:: core :: fmt :: Debug for NodeList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish
+( f , "NodeList" , "items" , && self . items ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for NodeList { # [ inline ] fn default ( ) -> NodeList { NodeList { items : ::
+core :: default :: Default :: default ( ) } } } # [ automatically_derived ] impl :: core :: marker
+:: StructuralPartialEq for NodeList { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq
+for NodeList { # [ inline ] fn eq ( & self , other : & NodeList ) -> bool { self . items == other .
+items } } # [ automatically_derived ] impl :: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc
+( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
+AssertParamIsEq < Vec < NodeId >> ; } } pub struct ModFlags ( pub u32 ) ; # [ automatically_derived
+] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for ModFlags { } # [
+automatically_derived ] impl :: core :: clone :: Clone for ModFlags { # [ inline ] fn clone ( & self
+) -> ModFlags { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
+automatically_derived ] impl :: core :: marker :: Copy for ModFlags { } # [ automatically_derived ]
+impl :: core :: fmt :: Debug for ModFlags { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
+:: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_tuple_field1_finish ( f , "ModFlags" , && self . 0 ) } } # [ automatically_derived ] impl ::
+core :: default :: Default for ModFlags { # [ inline ] fn default ( ) -> ModFlags { ModFlags ( ::
+core :: default :: Default :: default ( ) ) } } # [ automatically_derived ] impl :: core :: marker
+:: StructuralPartialEq for ModFlags { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq
+for ModFlags { # [ inline ] fn eq ( & self , other : & ModFlags ) -> bool { self . 0 == other . 0 }
+} # [ automatically_derived ] impl :: core :: cmp :: Eq for ModFlags { # [ inline ] # [ doc ( hidden
+) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
+AssertParamIsEq < u32 > ; } } pub struct ModifierList { pub list : NodeList , pub flags : ModFlags ,
+} # [ automatically_derived ] impl :: core :: clone :: Clone for ModifierList { # [ inline ] fn
+clone ( & self ) -> ModifierList { ModifierList { list : :: core :: clone :: Clone :: clone ( & self
+. list ) , flags : :: core :: clone :: Clone :: clone ( & self . flags ) , } } } # [
+automatically_derived ] impl :: core :: fmt :: Debug for ModifierList { # [ inline ] fn fmt ( & self
+, f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter
+:: debug_struct_field2_finish ( f , "ModifierList" , "list" , & self . list , "flags" , && self .
+flags ) } } # [ automatically_derived ] impl :: core :: default :: Default for ModifierList { # [
+inline ] fn default ( ) -> ModifierList { ModifierList { list : :: core :: default :: Default ::
+default ( ) , flags : :: core :: default :: Default :: default ( ) , } } } # [ automatically_derived
+] impl :: core :: marker :: StructuralPartialEq for ModifierList { } # [ automatically_derived ]
+impl :: core :: cmp :: PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : &
+ModifierList ) -> bool { self . list == other . list && self . flags == other . flags } } # [
+automatically_derived ] impl :: core :: cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden )
+] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
+AssertParamIsEq < NodeList > ; let _ : :: core :: cmp :: AssertParamIsEq < ModFlags > ; } } pub use
+crate :: NodeData ; } pub mod core { pub use crate :: Node ; } pub mod ast { pub use crate :: {
+ModifierList , NodeList } ; pub mod synthetic { use crate :: { Node , NodeData } ; pub enum AnyList
+< 'a > { Nodes ( & 'a crate :: astdata :: NodeList ) , Modifiers ( & 'a crate :: astdata ::
+ModifierList ) , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core ::
+clone :: TrivialClone for AnyList < 'a > { } # [ automatically_derived ] impl < 'a > :: core ::
+clone :: Clone for AnyList < 'a > { # [ inline ] fn clone ( & self ) -> AnyList < 'a > { let _ : ::
+core :: clone :: AssertParamIsClone < & 'a crate :: astdata :: NodeList > ; let _ : :: core :: clone
+:: AssertParamIsClone < & 'a crate :: astdata :: ModifierList > ; * self } } # [
+automatically_derived ] impl < 'a > :: core :: marker :: Copy for AnyList < 'a > { } impl < 'a >
+AnyList < 'a > { pub fn nodes ( self ) -> & 'a crate :: astdata :: NodeList { match self { Self ::
+Nodes ( l ) => l , Self :: Modifiers ( m ) => & m . list , } } pub fn modifiers ( self ) -> & 'a
+crate :: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ )
+=> { :: core :: panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub
+struct SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
 static_tier_ast_node ( n : Node ) -> Option < & 'static NodeData > { crate :: static_ast_node ( n )
 } pub fn read_ast_node_miss < R > ( n : Node , read : impl FnOnce ( & NodeData ) -> R ) -> R { read
 ( crate :: static_ast_node ( n ) . expect ( "registered node" ) ) } pub fn scoped_node_list_of ( n :
@@ -1807,42 +1805,27 @@ no_type_arguments : false } } pub fn with_typed ( mut self , typed : Option < ( 
 no_type_arguments : bool ) -> Self { self . typed = typed ; self . no_type_arguments =
 no_type_arguments ; self } } use crate :: astdata :: NodeId ; pub struct Recorder { pub seen : Vec <
 String > , } impl Recorder { pub fn node ( & mut self , id : NodeId ) -> bool { self . seen . push (
-:: alloc :: __export :: must_use ( { :: alloc :: fmt :: format ( format_args ! ( "n{0}" , id . 0 ) )
-} ) ) ; false } pub fn opt ( & mut self , id : Option < NodeId > ) -> bool { self . seen . push ( ::
-alloc :: __export :: must_use ( { :: alloc :: fmt :: format ( format_args ! ( "o{0}" , id . map_or (
-0 , | i | i . 0 ) ) ) } ) ) ; false } pub fn list ( & mut self , l : & crate :: astdata :: NodeList
-) -> bool { self . seen . push ( :: alloc :: __export :: must_use ( { :: alloc :: fmt :: format (
-format_args ! ( "l{0}" , l . items . len ( ) ) ) } ) ) ; false } pub fn opt_list ( & mut self , l :
-& Option < crate :: astdata :: NodeList > ) -> bool { self . seen . push ( :: alloc :: __export ::
-must_use ( { :: alloc :: fmt :: format ( format_args ! ( "ol{0}" , l . as_ref ( ) . map_or ( 0 , | x
-| x . items . len ( ) ) ) ) } ) ) ; false } pub fn mods ( & mut self , m : & Option < crate ::
-astdata :: ModifierList > ) -> bool { self . seen . push ( :: alloc :: __export :: must_use ( { ::
-alloc :: fmt :: format ( format_args ! ( "m{0}" , m . as_ref ( ) . map_or ( 0 , | x | x . flags . 0
-) ) ) } ) ) ; false } } pub fn propagate_subtree_facts ( child : Node ) -> i32 { child . raw ( ) as
-i32 } pub fn propagate_node_list ( children : DataList < '_ > , f : fn ( Node ) -> i32 ) -> i32 {
-children . list . map_or ( 0 , | l | l . items . iter ( ) . map ( | i | f ( Node :: new ( children .
-file , * i ) ) ) . sum ( ) ) } pub fn propagate_eraseable ( child : Node ) -> i32 { - ( child . raw
-( ) as i32 ) } pub fn propagate_eraseable_list ( children : DataList < '_ > ) -> i32 { - ( children
-. len ( ) as i32 ) } fn id ( n : u32 ) -> NodeId { NodeId ( n ) } fn walk_children ( data : &
-NodeData , w : & mut Recorder ) -> bool { macro_rules ! n { ( $ x : expr ) => { w . node ( $ x ) } ;
-} macro_rules ! o { ( $ x : expr ) => { w . opt ( $ x ) } ; } macro_rules ! l { ( $ x : expr ) => {
-w . list ( & $ x ) } ; } macro_rules ! ol { ( $ x : expr ) => { w . opt_list ( & $ x ) } ; }
-macro_rules ! m { ( $ x : expr ) => { w . mods ( & $ x ) } ; } match data { NodeData ::
-QualifiedName ( d ) => w . node ( d . left ) || w . node ( d . right ) , NodeData ::
-ComputedPropertyName ( d ) => w . node ( d . expression ) , NodeData :: IfStatement ( d ) => w .
-node ( d . expression ) || w . node ( d . then_statement ) || w . opt ( d . else_statement ) ,
-NodeData :: FunctionDeclaration ( d ) => w . opt ( d . name ) || w . list ( & d . parameters ) || w
-. mods ( & d . modifiers ) , NodeData :: CallExpression ( d ) => w . node ( d . expression ) || w .
-opt_list ( & d . type_arguments ) , _ => false , } } fn facts_of_data ( n : Node , d : & NodeData )
--> i32 { let f = n . file_index ( ) ; macro_rules ! p { ( $ x : expr ) => { propagate_subtree_facts
-( req ( f , $ x ) ) } ; } macro_rules ! po { ( $ x : expr ) => { propagate_subtree_facts ( opt ( f ,
-$ x ) ) } ; } macro_rules ! pl { ( $ x : expr ) => { propagate_node_list ( DataList :: req ( f , & $
-x ) , propagate_subtree_facts ) } ; } macro_rules ! pol { ( $ x : expr ) => { propagate_node_list (
-DataList :: opt ( f , & $ x ) , propagate_subtree_facts ) } ; } macro_rules ! pm { ( $ x : expr ) =>
-{ propagate_node_list ( DataList :: mods ( f , & $ x ) , propagate_subtree_facts ) } ; } macro_rules
-! el { ( $ x : expr ) => { propagate_eraseable_list ( DataList :: opt ( f , & $ x ) ) } ; }
-macro_rules ! e { ( $ x : expr ) => { propagate_eraseable ( opt ( f , $ x ) ) } ; } match d {
-NodeData :: BinaryExpression ( d ) => propagate_subtree_facts ( req ( f , d . left ) ) +
+format ! ( "n{0}" , id . 0 ) ) ; false } pub fn opt ( & mut self , id : Option < NodeId > ) -> bool
+{ self . seen . push ( format ! ( "o{0}" , id . map_or ( 0 , | i | i . 0 ) ) ) ; false } pub fn list
+( & mut self , l : & crate :: astdata :: NodeList ) -> bool { self . seen . push ( format ! ( "l{0}"
+, l . items . len ( ) ) ) ; false } pub fn opt_list ( & mut self , l : & Option < crate :: astdata
+:: NodeList > ) -> bool { self . seen . push ( format ! ( "ol{0}" , l . as_ref ( ) . map_or ( 0 , |
+x | x . items . len ( ) ) ) ) ; false } pub fn mods ( & mut self , m : & Option < crate :: astdata
+:: ModifierList > ) -> bool { self . seen . push ( format ! ( "m{0}" , m . as_ref ( ) . map_or ( 0 ,
+| x | x . flags . 0 ) ) ) ; false } } pub fn propagate_subtree_facts ( child : Node ) -> i32 { child
+. raw ( ) as i32 } pub fn propagate_node_list ( children : DataList < '_ > , f : fn ( Node ) -> i32
+) -> i32 { children . list . map_or ( 0 , | l | l . items . iter ( ) . map ( | i | f ( Node :: new (
+children . file , * i ) ) ) . sum ( ) ) } pub fn propagate_eraseable ( child : Node ) -> i32 { - (
+child . raw ( ) as i32 ) } pub fn propagate_eraseable_list ( children : DataList < '_ > ) -> i32 { -
+( children . len ( ) as i32 ) } fn id ( n : u32 ) -> NodeId { NodeId ( n ) } fn walk_children ( data
+: & NodeData , w : & mut Recorder ) -> bool { match data { NodeData :: QualifiedName ( d ) => w .
+node ( d . left ) || w . node ( d . right ) , NodeData :: ComputedPropertyName ( d ) => w . node ( d
+. expression ) , NodeData :: IfStatement ( d ) => w . node ( d . expression ) || w . node ( d .
+then_statement ) || w . opt ( d . else_statement ) , NodeData :: FunctionDeclaration ( d ) => w .
+opt ( d . name ) || w . list ( & d . parameters ) || w . mods ( & d . modifiers ) , NodeData ::
+CallExpression ( d ) => w . node ( d . expression ) || w . opt_list ( & d . type_arguments ) , _ =>
+false , } } fn facts_of_data ( n : Node , d : & NodeData ) -> i32 { let f = n . file_index ( ) ;
+match d { NodeData :: BinaryExpression ( d ) => propagate_subtree_facts ( req ( f , d . left ) ) +
 propagate_subtree_facts ( req ( f , d . right ) ) , NodeData :: VariableDeclaration ( d ) =>
 propagate_subtree_facts ( req ( f , d . name ) ) + propagate_subtree_facts ( opt ( f , d .
 initializer ) ) , NodeData :: FunctionDeclaration ( d ) => propagate_node_list ( DataList :: req ( f
@@ -1864,17 +1847,17 @@ walk_children ( & fd , & mut w ) ; let call = NodeData :: CallExpression ( Box :
 CallExpressionData { expression : id ( 9 ) , type_arguments : Some ( crate :: astdata :: NodeList {
 items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
 write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ id ( 1 ) ] ) ) , } ) , ..
-Default :: default ( ) } ) ) ; walk_children ( & call , & mut w ) ; { :: std :: io :: _print (
-format_args ! ( "walk={0:?}\n" , w . seen ) ) ; } ; let n0 = Node :: new ( 0 , id ( 0 ) ) ; let bin
-= NodeData :: BinaryExpression ( Box :: new ( BinaryExpressionData { left : id ( 3 ) , right : id (
-4 ) , .. Default :: default ( ) } ) ) ; let vd = NodeData :: VariableDeclaration ( Box :: new (
-VariableDeclarationData { name : id ( 5 ) , initializer : Some ( id ( 6 ) ) , .. Default :: default
-( ) } ) ) ; let tr = NodeData :: TypeReferenceNode ( Box :: new ( TypeReferenceNodeData { type_name
-: id ( 2 ) , type_arguments : Some ( crate :: astdata :: NodeList { items : :: alloc :: boxed ::
-box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
-:: Box :: new_uninit ( ) , [ id ( 1 ) , id ( 2 ) , id ( 3 ) ] ) ) , } ) , .. Default :: default ( )
-} ) ) ; let pd = NodeData :: ParameterDeclaration ( Box :: new ( ParameterDeclarationData { name :
-id ( 1 ) , initializer : Some ( id ( 10 ) ) , .. Default :: default ( ) } ) ) ; { :: std :: io ::
-_print ( format_args ! ( "facts bin={0} vd={1} fd={2} call={3} tr={4} pd={5}\n" , facts_of_data ( n0
-, & bin ) , facts_of_data ( n0 , & vd ) , facts_of_data ( n0 , & fd ) , facts_of_data ( n0 , & call
-) , facts_of_data ( n0 , & tr ) , facts_of_data ( n0 , & pd ) ) ) ; } ; }
+Default :: default ( ) } ) ) ; walk_children ( & call , & mut w ) ; println ! ( "walk={0:?}" , w .
+seen ) ; let n0 = Node :: new ( 0 , id ( 0 ) ) ; let bin = NodeData :: BinaryExpression ( Box :: new
+( BinaryExpressionData { left : id ( 3 ) , right : id ( 4 ) , .. Default :: default ( ) } ) ) ; let
+vd = NodeData :: VariableDeclaration ( Box :: new ( VariableDeclarationData { name : id ( 5 ) ,
+initializer : Some ( id ( 6 ) ) , .. Default :: default ( ) } ) ) ; let tr = NodeData ::
+TypeReferenceNode ( Box :: new ( TypeReferenceNodeData { type_name : id ( 2 ) , type_arguments :
+Some ( crate :: astdata :: NodeList { items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe (
+:: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ id ( 1
+) , id ( 2 ) , id ( 3 ) ] ) ) , } ) , .. Default :: default ( ) } ) ) ; let pd = NodeData ::
+ParameterDeclaration ( Box :: new ( ParameterDeclarationData { name : id ( 1 ) , initializer : Some
+( id ( 10 ) ) , .. Default :: default ( ) } ) ) ; println ! (
+"facts bin={0} vd={1} fd={2} call={3} tr={4} pd={5}" , facts_of_data ( n0 , & bin ) , facts_of_data
+( n0 , & vd ) , facts_of_data ( n0 , & fd ) , facts_of_data ( n0 , & call ) , facts_of_data ( n0 , &
+tr ) , facts_of_data ( n0 , & pd ) ) ; }

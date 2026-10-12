@@ -1,5 +1,4 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; pub mod astdata { pub struct PairData { pub left : u32 , pub right : u32 , } # [
+pub mod astdata { pub struct PairData { pub left : u32 , pub right : u32 , } # [
 automatically_derived ] impl :: core :: fmt :: Debug for PairData { # [ inline ] fn fmt ( & self , f
 : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "PairData" , "left" , & self . left , "right" , && self . right ) }
@@ -19,27 +18,17 @@ impl :: core :: fmt :: Debug for NodeData { # [ inline ] fn fmt ( & self , f : &
 __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "Named" , & __self_0 )
 , } } } pub struct Decoder < 'a > { pub nums : & 'a [ u32 ] , pub pos : usize , } impl Decoder < '_
 > { pub fn num ( & mut self ) -> Option < u32 > { let v = * self . nums . get ( self . pos ) ? ;
-self . pos += 1 ; Some ( v ) } pub fn string ( & mut self ) -> Option < String > { Some ( :: alloc
-:: __export :: must_use ( { :: alloc :: fmt :: format ( format_args ! ( "s{0}" , self . num ( ) ? )
-) } ) ) } } pub struct Encoder { pub out : Vec < u32 > , } impl Encoder { pub fn u8 ( & mut self , v
-: u8 ) { self . out . push ( u32 :: from ( v ) ) ; } pub fn num ( & mut self , v : & u32 ) -> Result
-< ( ) , String > { self . out . push ( * v ) ; Ok ( ( ) ) } pub fn string ( & mut self , v : &
-String ) -> Result < ( ) , String > { self . out . push ( v . len ( ) as u32 ) ; Ok ( ( ) ) } }
-macro_rules ! payload_codec { ( $ ( $ variant_tag : literal $ variant : ident ( $ data : ident ) { $
-( $ field : ident : $ codec : ident ) , * $ ( , ) ? } ) * ) => { fn decode_payload ( dec : & mut
-Decoder < '_ > , variant_tag : u8 ) -> Option < NodeData > { Some ( match variant_tag { $ ( $
-variant_tag => NodeData :: $ variant ( Box :: new ( crate :: astdata :: $ data { $ ( $ field : dec .
-$ codec ( ) ? , ) * } ) ) , ) * _ => return None , } ) } # [ cfg ( test ) ] fn encode_payload ( enc
-: & mut Encoder , payload : & NodeData ) -> Result < ( ) , String > { match payload { $ ( NodeData
-:: $ variant ( payload ) => { let crate :: astdata :: $ data { $ ( $ field ) , * } = & * * payload ;
-enc . u8 ( $ variant_tag ) ; $ ( enc . $ codec ( $ field ) ? ; ) * } ) * } Ok ( ( ) ) } } ; } fn
-decode_payload ( dec : & mut Decoder < '_ > , variant_tag : u8 ) -> Option < NodeData > { Some (
-match variant_tag { 0 => NodeData :: Pair ( Box :: new ( crate :: astdata :: PairData { left : dec .
-num ( ) ? , right : dec . num ( ) ? , } ) ) , 1 => NodeData :: Named ( Box :: new ( crate :: astdata
-:: NameData { text : dec . string ( ) ? , flags : dec . num ( ) ? , } ) ) , _ => return None , } ) }
-fn main ( ) { let mut dec = Decoder { nums : & [ 3 , 4 ] , pos : 0 } ; { :: std :: io :: _print (
-format_args ! ( "pair={0:?}\n" , decode_payload ( & mut dec , 0 ) ) ) ; } ; let mut dec = Decoder {
-nums : & [ 9 , 1 ] , pos : 0 } ; { :: std :: io :: _print ( format_args ! ( "named={0:?}\n" ,
-decode_payload ( & mut dec , 1 ) ) ) ; } ; let mut dec = Decoder { nums : & [ ] , pos : 0 } ; { ::
-std :: io :: _print ( format_args ! ( "bad={0:?}\n" , decode_payload ( & mut dec , 7 ) . map ( | _ |
-"some" ) ) ) ; } ; }
+self . pos += 1 ; Some ( v ) } pub fn string ( & mut self ) -> Option < String > { Some ( format ! (
+"s{0}" , self . num ( ) ? ) ) } } pub struct Encoder { pub out : Vec < u32 > , } impl Encoder { pub
+fn u8 ( & mut self , v : u8 ) { self . out . push ( u32 :: from ( v ) ) ; } pub fn num ( & mut self
+, v : & u32 ) -> Result < ( ) , String > { self . out . push ( * v ) ; Ok ( ) } pub fn string ( &
+mut self , v : & String ) -> Result < ( ) , String > { self . out . push ( v . len ( ) as u32 ) ; Ok
+( ) } } fn decode_payload ( dec : & mut Decoder < '_ > , variant_tag : u8 ) -> Option < NodeData > {
+Some ( match variant_tag { 0 => NodeData :: Pair ( Box :: new ( crate :: astdata :: PairData { left
+: dec . num ( ) ? , right : dec . num ( ) ? , } ) ) , 1 => NodeData :: Named ( Box :: new ( crate ::
+astdata :: NameData { text : dec . string ( ) ? , flags : dec . num ( ) ? , } ) ) , _ => return None
+, } ) } fn main ( ) { let mut dec = Decoder { nums : & [ 3 , 4 ] , pos : 0 } ; println ! (
+"pair={0:?}" , decode_payload ( & mut dec , 0 ) ) ; let mut dec = Decoder { nums : & [ 9 , 1 ] , pos
+: 0 } ; println ! ( "named={0:?}" , decode_payload ( & mut dec , 1 ) ) ; let mut dec = Decoder {
+nums : & [ ] , pos : 0 } ; println ! ( "bad={0:?}" , decode_payload ( & mut dec , 7 ) . map ( | _ |
+"some" ) ) ; }

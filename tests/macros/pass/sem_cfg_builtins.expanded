@@ -1,15 +1,11 @@
-# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
-rust_2024 :: * ; pub const INCLUDED_TEXT : & str = "from include" ; pub fn included_answer ( ) ->
-i32 { 42 } fn main ( ) { { :: std :: io :: _print ( format_args ! ( "cfg any={0} all={1}\n" , false
-, true ) ) ; } ; { :: std :: io :: _print ( format_args ! ( "included fn={0} const={1}\n" ,
-included_answer ( ) , INCLUDED_TEXT ) ) ; } ; let bytes : & [ u8 ] = b"hello locale\n" ; let text :
-& str = "hello locale\n" ; { :: std :: io :: _print ( format_args ! (
-"include_str=\'{0}\' bytes_eq={1}\n" , text . trim ( ) , bytes == text . as_bytes ( ) ) ) ; } ; { ::
-std :: io :: _print ( format_args ! ( "env={0}\n" , "hello42" ) ) ; } ; { :: std :: io :: _print (
-format_args ! ( "option_env={0:?} missing={1:?}\n" , :: core :: option :: Option :: Some ( "hello42"
-) , :: core :: option :: Option :: None :: < & 'static str > ) ) ; } ; { :: std :: io :: _print (
-format_args ! ( "concat={0}\n" , "a1b" ) ) ; } ; { :: std :: io :: _print ( format_args ! (
-"stringify={0}\n" , "some tokens here" ) ) ; } ; let first = 29u32 ; let second = 30u32 ; { :: std
-:: io :: _print ( format_args ! ( "line delta={0} column>0={1} file ends={2} module={3}\n" , second
-- first , 25u32 > 0 , "tests/macros/pass/sem_cfg_builtins.rs" . ends_with ( "sem_cfg_builtins.rs" )
-, "sem_cfg_builtins" ) ) ; } ; }
+pub const INCLUDED_TEXT : & str = "from include" ; pub fn included_answer ( ) -> i32 { 42 } fn main
+( ) { println ! ( "cfg any={0} all={1}" , false , true ) ; println ! ( "included fn={0} const={1}" ,
+included_answer ( ) , INCLUDED_TEXT ) ; let bytes : & [ u8 ] = b"hello locale\n" ; let text : & str
+= "hello locale\n" ; println ! ( "include_str=\'{0}\' bytes_eq={1}" , text . trim ( ) , bytes ==
+text . as_bytes ( ) ) ; println ! ( "env={0}" , "hello42" ) ; println ! (
+"option_env={0:?} missing={1:?}" , :: core :: option :: Option :: Some ( "hello42" ) , :: core ::
+option :: Option :: None :: < & 'static str > ) ; println ! ( "concat={0}" , "a1b" ) ; println ! (
+"stringify={0}" , "some tokens here" ) ; let first = 29u32 ; let second = 30u32 ; println ! (
+"line delta={0} column>0={1} file ends={2} module={3}" , second - first , 25u32 > 0 ,
+"tests/macros/pass/sem_cfg_builtins.rs" . ends_with ( "sem_cfg_builtins.rs" ) , "sem_cfg_builtins" )
+; }
