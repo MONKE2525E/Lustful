@@ -3,7 +3,9 @@
 // The text lives in docs/errors/, one Markdown file per code, and is built into the
 // binary with `include_str!`. Each file has a wrong example that must fail with that
 // code and a fixed example that must pass; scripts/check-explain.sh checks both against
-// lust and rustc, and also checks that every code the compiler emits has a file here.
+// lust and rustc. docs/errors/REGISTRY.md is the checked list of in-use and reserved
+// codes (scripts/check-codes.sh); it is built in too, so `lust explain` can list the
+// reserved ranges and answer for a reserved code before any page exists for it.
 /// All error docs, in code order.
 const DOCS: &[(&str, &str)] = &[
     ("L0001", include_str!("../docs/errors/L0001.md")),
@@ -23,6 +25,7 @@ const DOCS: &[(&str, &str)] = &[
     ("L0116", include_str!("../docs/errors/L0116.md")),
     ("L0117", include_str!("../docs/errors/L0117.md")),
     ("L0118", include_str!("../docs/errors/L0118.md")),
+    ("L0119", include_str!("../docs/errors/L0119.md")),
     ("L0120", include_str!("../docs/errors/L0120.md")),
     ("L0121", include_str!("../docs/errors/L0121.md")),
     ("L0122", include_str!("../docs/errors/L0122.md")),
@@ -50,6 +53,60 @@ const DOCS: &[(&str, &str)] = &[
     ("L9001", include_str!("../docs/errors/L9001.md")),
 ];
 
+/// The registry table from docs/errors/REGISTRY.md, built into the binary.
+const REGISTRY: &str = include_str!("../docs/errors/REGISTRY.md");
+
+/// One registry row: a code or an inclusive range, with its area and owner.
+struct Range {
+    lo: u32,
+    hi: u32,
+    area: &'static str,
+    owner: &'static str,
+    reserved: bool,
+    notes: &'static str,
+}
+
+/// The number in a code like `L####`, or None if the text is not a code.
+fn code_num(s: &str) -> Option<u32> {
+    let digits = s.strip_prefix('L')?;
+    if digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()) { digits.parse().ok() } else { None }
+}
+
+/// Parses the registry table rows. Rows that do not parse are skipped here;
+/// scripts/check-codes.sh is the gate that rejects a malformed registry.
+fn ranges() -> Vec<Range> {
+    let mut out = Vec::new();
+    for line in REGISTRY.lines() {
+        let f: Vec<&str> = line.split('|').map(str::trim).collect();
+        // f is ["", range, area, owner, status, notes, ""] for a table row.
+        if f.len() < 6 {
+            continue;
+        }
+        let (lo, hi) = match f[1].split_once('-') {
+            Some((a, b)) => match (code_num(a), code_num(b)) {
+                (Some(lo), Some(hi)) => (lo, hi),
+                _ => continue,
+            },
+            None => match code_num(f[1]) {
+                Some(n) => (n, n),
+                None => continue,
+            },
+        };
+        let reserved = match f[4] {
+            "reserved" => true,
+            "in use" => false,
+            _ => continue,
+        };
+        out.push(Range { lo, hi, area: f[2], owner: f[3], reserved, notes: f[5] });
+    }
+    out
+}
+
+/// Prints a range as one code or as `L####-L####`.
+fn range_text(r: &Range) -> String {
+    if r.lo == r.hi { format!("L{:04}", r.lo) } else { format!("L{:04}-L{:04}", r.lo, r.hi) }
+}
+
 /// The title of a doc: its first line, without the leading `# `.
 fn title(doc: &str) -> &str {
     doc.lines().next().unwrap_or("").trim_start_matches("# ")
@@ -64,21 +121,35 @@ pub fn run(args: &[String]) -> i32 {
             for (_, doc) in DOCS {
                 println!("  {}", title(doc));
             }
+            let reserved: Vec<Range> = ranges().into_iter().filter(|r| r.reserved).collect();
+            if !reserved.is_empty() {
+                println!("reserved (not yet emitted):");
+                for r in &reserved {
+                    println!("  {}: {} ({})", range_text(r), r.area, r.owner);
+                }
+            }
             0
         }
         [arg] => {
             let want = arg.to_ascii_uppercase();
-            match DOCS.iter().find(|(code, _)| *code == want) {
-                Some((_, doc)) => {
-                    print!("{doc}");
-                    0
-                }
-                None => {
-                    eprintln!("error: unknown error code `{arg}`");
-                    eprintln!("run `lust explain` to list all codes");
-                    2
+            if let Some((_, doc)) = DOCS.iter().find(|(code, _)| *code == want) {
+                print!("{doc}");
+                return 0;
+            }
+            if let Some(n) = code_num(&want) {
+                if let Some(r) = ranges().iter().find(|r| r.reserved && r.lo <= n && n <= r.hi) {
+                    println!("{want}: reserved, not yet emitted");
+                    println!("area: {}", r.area);
+                    println!("owner: {}", r.owner);
+                    if !r.notes.is_empty() {
+                        println!("planned: {}", r.notes);
+                    }
+                    return 0;
                 }
             }
+            eprintln!("error: unknown error code `{arg}`");
+            eprintln!("run `lust explain` to list all codes");
+            2
         }
         _ => {
             eprintln!("usage: lust explain <L####>");
