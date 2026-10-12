@@ -621,11 +621,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             if lb == u32::MAX {
                 continue;
             }
-            let on = if lb == b {
-                ls < si || (ls > si && self.loops_back(b))
-            } else {
-                self.reach[lb as usize].contains(b as usize)
-            };
+            let on = if lb == b { ls < si || (ls > si && self.loops_back(b)) } else { self.reach[lb as usize].contains(b as usize) };
             if on {
                 out.insert(li);
             }
@@ -639,7 +635,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
             _ => None,
         };
-        let live = if self.report { self.live_loans(st, &self.live_out_stmt[b as usize][si as usize], skip, b, si) } else { BitSet::new(0) };
+        let live =
+            if self.report { self.live_loans(st, &self.live_out_stmt[b as usize][si as usize], skip, b, si) } else { BitSet::new(0) };
         match s {
             StmtKind::Assign(dest, rv) => {
                 // Reads and moves in the right-hand side.
