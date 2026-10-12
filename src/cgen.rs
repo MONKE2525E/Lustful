@@ -2844,7 +2844,9 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
     for st in &p.statics {
-        collect_types(&cty(&p.tys, st.ty), &mut types);
+        let t = cty(&p.tys, st.ty);
+        collect_types(&t, &mut types);
+        collect_promoted(p, &st.value, &t, &mut types);
     }
     if let Some(shared) = &g.shared {
         for k in shared {
@@ -3063,6 +3065,57 @@ fn static_sym(p: &Program, idx: u32) -> String {
     match p.static_defs.get(idx as usize) {
         Some(def) => format!("lust_static_{}", def.hash.0),
         None => format!("lust_static_{idx}"),
+    }
+}
+
+/// The array types `const_init` synthesizes for slice values inside a
+/// const value (a promoted backing array exists in no written type, so
+/// collecting only the static types themselves misses it).
+fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, out: &mut HashSet<CTy>) {
+    use crate::ty::consteval::ConstValue as CV;
+    match (v, t) {
+        (CV::Ref(inner), CTy::Slice(el)) => {
+            if let CV::Aggregate(vals) = &**inner {
+                let at = CTy::Array(el.clone(), vals.len() as u64);
+                collect_types(&at, out);
+                collect_promoted(p, inner, &at, out);
+            }
+        }
+        (CV::Aggregate(vals), CTy::Slice(e)) => {
+            let at = CTy::Array(e.clone(), vals.len() as u64);
+            collect_types(&at, out);
+            for x in vals {
+                collect_promoted(p, x, e, out);
+            }
+        }
+        (CV::Ref(inner), CTy::Ref(inner_ct)) => collect_promoted(p, inner, inner_ct, out),
+        (CV::Aggregate(vals), CTy::Tuple(es)) => {
+            for (x, e) in vals.iter().zip(es) {
+                collect_promoted(p, x, e, out);
+            }
+        }
+        (CV::Aggregate(vals), CTy::Array(e, _)) => {
+            for x in vals {
+                collect_promoted(p, x, e, out);
+            }
+        }
+        (CV::Repeat(x, _), CTy::Array(e, _)) => collect_promoted(p, x, e, out),
+        (CV::Aggregate(vals), CTy::Adt(a)) => {
+            for (i, x) in vals.iter().enumerate() {
+                collect_promoted(p, x, &cty(&p.tys, p.adt(*a).variants[0].fields[i].ty), out);
+            }
+        }
+        (CV::Variant(variant, vals), CTy::Adt(a)) => {
+            for (i, x) in vals.iter().enumerate() {
+                collect_promoted(p, x, &cty(&p.tys, p.adt(*a).variants[*variant as usize].fields[i].ty), out);
+            }
+        }
+        (CV::Variant(_, vals), CTy::Option(e)) => {
+            for x in vals {
+                collect_promoted(p, x, e, out);
+            }
+        }
+        _ => {}
     }
 }
 
