@@ -1,0 +1,1069 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>lust design</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:920px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:28px;margin:0 0 8px;letter-spacing:-.02em}
+h1::before{content:"";display:inline-block;width:14px;height:14px;background:#e11d48;border-radius:3px;margin-right:12px;vertical-align:middle}
+h2{font-size:20px;margin:48px 0 12px;padding-top:16px;border-top:1px solid #222}
+h3{font-size:16px;margin:28px 0 8px}
+h1 a,h2 a,h3 a{color:inherit;text-decoration:none}
+p,ul,ol{margin:0 0 14px}
+li{margin:2px 0}
+a{color:#fb7185}
+strong{color:#fff}
+nav{display:flex;flex-wrap:wrap;gap:4px 16px;margin:16px 0 8px;font-size:13px}
+nav a{color:#a3a3a3;text-decoration:none}
+nav a:hover{color:#fff}
+code{font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+:not(pre)>code{background:#141414;border:1px solid #262626;border-radius:4px;padding:1px 5px;color:#fda4af}
+pre{position:relative;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:14px 16px;overflow-x:auto;margin:0 0 16px}
+pre .lang{position:absolute;top:6px;right:10px;font:11px ui-monospace,monospace;color:#525252}
+.scroll{overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border:1px solid #222;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#0f0f0f;font-weight:600}
+.k{color:#fb7185}.t{color:#7dd3fc}.s{color:#a3e635}.n{color:#fbbf24}.c{color:#6b7280;font-style:italic}
+.m{color:#c084fc}.a{color:#a3a3a3}.f{color:#fde68a}.l{color:#f472b6}
+</style>
+</head>
+<body>
+<main>
+<h1 id="lust-design"><a href="#lust-design">lust design</a></h1>
+<nav><a href="#where-the-speed-comes-from">Where the speed comes from</a><a href="#evidence-for-the-speed-claim">Evidence for the speed claim</a><a href="#rule-zero-lust-is-a-rust-subset">Rule zero: lust is a Rust subset</a><a href="#syntax-sample">Syntax sample</a><a href="#borrow-model">Borrow model</a><a href="#traits-and-inference">Traits and inference</a><a href="#generics">Generics</a><a href="#threads-v1">Threads (v1)</a><a href="#what-lust-rejects">What lust rejects</a><a href="#semantics">Semantics</a><a href="#compiler">Compiler</a><a href="#agent-interface">Agent interface</a><a href="#performance-budget">Performance budget</a><a href="#syntax-eval">Syntax eval</a><a href="#plan">Plan</a><a href="#decisions">Decisions</a><a href="#review-log">Review log</a><a href="#open-questions">Open questions</a></nav>
+<p>Lust is a Rust-like language. It gives up some expressiveness to get very fast check and build times. The main user is a coding agent that runs <code>check</code> hundreds of times per task.</p>
+<p>Status: plan, revision 6. The prototype exists (about 11k lines, see <a href="README.md">README</a>). Cold compiles are <a href="#speed-of-light-prototype-phase-05">measured</a> (the numbers in that section predate the incremental work; current cold results are in the README), and an <a href="#incremental-daemon-phase-7-early">incremental daemon</a> makes an agent&#39;s edit loop 130x faster than rustc. Two review rounds by <code>Muse Wonder Full</code> and <code>gpt-6.1-sol</code> are in the <a href="#review-log">Review log</a>. Both reviewers say the plan is ready for Phase 0 and the Phase 1 pilot. Phase 2 starts only after Phase 0 confirms the speed assumptions.</p>
+<p>Scope stance: big is fine. macOS is a first-class target. If the best path is to fork <code>tcc</code> or write our own backend, we do it. We pick the path from measurements, not from its size.</p>
+<h2 id="where-the-speed-comes-from"><a href="#where-the-speed-comes-from">Where the speed comes from</a></h2>
+<p>Rust spends time in different places for <code>check</code> and for <code>build</code>. Lust attacks each one separately.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Cost in Rust</th>
+<th>Affects</th>
+<th>What lust does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Proc macros must compile, run, and parse tokens</td>
+<td>check, build</td>
+<td>No user macros. A fixed set of built-in macros and derives.</td>
+</tr>
+<tr>
+<td>Trait solving can search, backtrack, and recurse</td>
+<td>check</td>
+<td>Each trait obligation has at most one candidate impl. No search.</td>
+</tr>
+<tr>
+<td>LLVM, even at <code>-O0</code></td>
+<td>build</td>
+<td>Dev builds emit C and compile it with <code>tcc</code>.</td>
+</tr>
+<tr>
+<td>Linking many large object files</td>
+<td>build</td>
+<td>Few, small objects. <code>tcc</code> links them itself.</td>
+</tr>
+<tr>
+<td>One crate checks mostly in sequence</td>
+<td>check</td>
+<td>Files check in parallel. Signatures are always explicit.</td>
+</tr>
+</tbody></table></div>
+<p>Borrow checking is a real cost. On our idiomatic benchmark, rustc&#39;s &quot;MIR build + borrow check&quot; pass takes 42% of <code>check</code> time (see <a href="#evidence-for-the-speed-claim">Evidence</a>). Rust checks one function body at a time, using callee signatures at call sites. Lust does the same, but it must run its borrow checker on a simple, flat IR, not through a full MIR pipeline. The &quot;no references in structs&quot; rule keeps the checker smaller and removes lifetime syntax for agents. It is not a speed rule by itself.</p>
+<p>Phase 0 must confirm this table. We profile ts-rust and look at <code>check</code> and <code>build</code> separately.</p>
+<h3 id="tcc-spike-done"><a href="#tcc-spike-done">tcc spike (done)</a></h3>
+<p>Machine: 24-core x86_64 Linux.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Tool</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>400k lines of generated C (25k functions, structs, switches, overflow checks), one file</td>
+<td><code>tcc</code> 0.9.27 (Debian, 2020 snapshot)</td>
+<td>0.55 s</td>
+</tr>
+<tr>
+<td>same</td>
+<td><code>tcc</code> 0.9.28rc mob (2026-10-03)</td>
+<td>0.49 to 0.62 s</td>
+</tr>
+<tr>
+<td>same</td>
+<td><code>tcc</code> mob <code>-g</code></td>
+<td>0.67 s</td>
+</tr>
+<tr>
+<td>same</td>
+<td><code>gcc -O0</code></td>
+<td>44 s</td>
+</tr>
+<tr>
+<td>one 16.7k-line shard</td>
+<td><code>tcc -c</code></td>
+<td>0.04 s</td>
+</tr>
+</tbody></table></div>
+<p>Also found:</p>
+<ul>
+<li><code>tcc</code> mob has macOS arm64 and Mach-O support, DWARF debug info, and <code>stdatomic.h</code>. Its upstream CI runs on <code>macos-15</code> (arm64), <code>macos-15-intel</code>, Linux, and Windows. It is active: about 200 commits since August 2025.</li>
+<li>Debian&#39;s 0.9.27 has no <code>stdatomic.h</code>. Mob has it, and it works.</li>
+<li>Neither version has <code>__builtin_add_overflow</code>. Lust emits its own overflow checks, or our fork adds the builtins.</li>
+</ul>
+<p>Result: <code>tcc</code> is fast enough that lust <strong>plans to monomorphize all generics</strong>, the same as Rust. Dictionary-passing generics are plan B.</p>
+<p>Limits of this spike. It only measures <code>tcc</code> on C that already exists. It does not measure:</p>
+<ul>
+<li>how much C a real program makes after monomorphization. Each closure is its own type, so iterator-heavy code makes many instances. A reviewer measured 84k mono functions from 32k lines of Rust.</li>
+<li>the time to parse, check, find instances, and write C.</li>
+<li>link time.</li>
+<li>run speed. <code>tcc</code> does not inline, so each iterator adapter is a call per element. Dev binaries will be slower than Rust dev binaries.</li>
+</ul>
+<p>Phase 0 adds a mono-size spike to measure these, on Linux and on macOS arm64.</p>
+<h2 id="evidence-for-the-speed-claim"><a href="#evidence-for-the-speed-claim">Evidence for the speed claim</a></h2>
+<p>Goal: 100x faster than rustc for <code>check</code> and dev builds. Status: <strong>met for edit loops on the supported subset.</strong> An agent&#39;s edit loop on a realistic 31k-line crate is 130x faster than rustc in its best incremental setup (see <a href="#incremental-daemon-phase-7-early">Incremental daemon</a>). Cold compiles are 20x to 55x faster. The idiomatic shape (generics, closures, iterators) is not measured yet.</p>
+<h3 id="rustc-baseline-measured"><a href="#rustc-baseline-measured">rustc baseline (measured)</a></h3>
+<p>Machine: 24-core x86_64 Linux, rustc 1.99.0. One crate, one file, generated by <a href="bench/rustc-baseline"><code>bench/rustc-baseline</code></a>. Every program is valid lust, so the same file can go to both compilers later.</p>
+<ul>
+<li><strong>plain:</strong> structs, enums, <code>match</code>, <code>Vec</code>, <code>String</code>, <code>format!</code>. No generics or closures.</li>
+<li><strong>idiomatic:</strong> iterator chains with closures, <code>Result</code> and <code>?</code>, <code>HashMap::entry</code>, a trait, and a generic function.</li>
+<li><strong>edit:</strong> change one constant in one function body, then run again with the incremental cache.</li>
+</ul>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Shape</th>
+<th>Lines</th>
+<th>Check cold</th>
+<th>Check after edit</th>
+<th>Debug build cold</th>
+<th>Debug build after edit</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>plain</td>
+<td>9.6k</td>
+<td>3.45 s</td>
+<td>1.21 s</td>
+<td>5.35 s</td>
+<td>2.32 s</td>
+</tr>
+<tr>
+<td>idiomatic</td>
+<td>10.1k</td>
+<td>4.69 s</td>
+<td>1.03 s</td>
+<td>12.35 s</td>
+<td>2.18 s</td>
+</tr>
+<tr>
+<td>plain</td>
+<td>48k</td>
+<td>17.4 s</td>
+<td>6.71 s</td>
+<td>26.9 s</td>
+<td>11.6 s</td>
+</tr>
+<tr>
+<td>idiomatic</td>
+<td>50.4k</td>
+<td>37.1 s</td>
+<td>6.28 s</td>
+<td>72.1 s</td>
+<td>13.1 s</td>
+</tr>
+</tbody></table></div>
+<p>rustc&#39;s best case. The cold numbers above use the incremental cache, which is slow for a cold run. Without it, or with the parallel front end (<code>-Z threads=8</code>), rustc is about 3x faster: plain 48k <code>check</code> takes 5.75 s, not 17.4 s. Idiomatic <code>check</code> takes 1.02 s at 10k lines and 9.3 s at 50k lines with <code>-Z threads</code>. All comparisons below use rustc&#39;s best configuration.</p>
+<p>Where <code>check</code> time goes (idiomatic, 10k lines, <code>-Z time-passes</code>): MIR build + borrow check 42%, type check 41%, coherence 7%, parse and macro expansion 2%. Proc macros cost nothing here because the benchmark has none. Real crates that use <code>serde</code> will show more macro time.</p>
+<p>What 100x means against the best rustc numbers above:</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Shape</th>
+<th>Operation</th>
+<th>rustc</th>
+<th>100x target</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>idiomatic 50k</td>
+<td>check cold</td>
+<td>9.3 s</td>
+<td>93 ms</td>
+</tr>
+<tr>
+<td>idiomatic 50k</td>
+<td>check after edit</td>
+<td>6.3 s</td>
+<td>63 ms</td>
+</tr>
+<tr>
+<td>idiomatic 50k</td>
+<td>debug build cold</td>
+<td>72 s</td>
+<td>720 ms</td>
+</tr>
+<tr>
+<td>idiomatic 50k</td>
+<td>debug build after edit</td>
+<td>13.1 s</td>
+<td>131 ms</td>
+</tr>
+</tbody></table></div>
+<p>Caveat: one big crate is a bad case for rustc. Real projects split code into many crates, and cargo builds them in parallel. The fair baseline must also include a workspace version of each program.</p>
+<h3 id="how-we-prove-it"><a href="#how-we-prove-it">How we prove it</a></h3>
+<ol>
+<li><strong>Same input.</strong> The same <code>.rs</code> files go to rustc and to lust. Rule zero makes this possible.</li>
+<li><strong>rustc at its best.</strong> Compare with the faster of these: one crate with <code>-Z threads</code>, and a workspace of many crates built with <code>cargo -j</code>. Both with and without incremental.</li>
+<li><strong>Same strictness.</strong> Lust must reject the same invalid programs as rustc, on a negative corpus. A checker that skips checks is fast for no reason. This stops that.</li>
+<li><strong>Each stage on its own.</strong> Report parse, check, instance discovery, codegen, and link, cold and after a one-line edit, on both tier 1 platforms.</li>
+<li><strong>Real code too.</strong> Port part of ts-rust to the subset and measure it, not only generated code.</li>
+<li><strong>Claim only what we measured.</strong> Each shape gets its own number. &quot;100x&quot; is only stated for the shapes that reach it.</li>
+</ol>
+<h3 id="speed-of-light-prototype-phase-0-5"><a href="#speed-of-light-prototype-phase-0-5">Speed-of-light prototype (Phase 0.5)</a></h3>
+<p>Built. 8.6k lines of Rust and C. It compiles the <strong>plain</strong> shape end to end: a parallel lexer and parser, a type checker, lowering to a MIR-like IR, a borrow checker, a C backend, and <code>tcc</code>. The test suite has 34 programs: output matches rustc, rustc and lust reject the same invalid programs, and every generated program runs clean under ASan and UBSan.</p>
+<p>Results on the same file, rustc in its best configuration (<code>bench/compare.sh plain 640 3200</code>):</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Lines</th>
+<th>Operation</th>
+<th>rustc</th>
+<th>lust</th>
+<th>Speedup</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>9.6k</td>
+<td>check</td>
+<td>1.36 s</td>
+<td>33 ms</td>
+<td>41x</td>
+</tr>
+<tr>
+<td>9.6k</td>
+<td>debug build</td>
+<td>2.57 s</td>
+<td>110 ms</td>
+<td>23x</td>
+</tr>
+<tr>
+<td>48k</td>
+<td>check</td>
+<td>5.75 s</td>
+<td>73 ms</td>
+<td>79x</td>
+</tr>
+<tr>
+<td>48k</td>
+<td>check after a one-line edit</td>
+<td>6.64 s</td>
+<td>73 ms</td>
+<td>91x</td>
+</tr>
+<tr>
+<td>48k</td>
+<td>debug build</td>
+<td>12.1 s</td>
+<td>266 ms</td>
+<td>45x</td>
+</tr>
+<tr>
+<td>48k</td>
+<td>build, no debuginfo</td>
+<td>12.1 s</td>
+<td>218 ms</td>
+<td>56x</td>
+</tr>
+</tbody></table></div>
+<p>Where lust&#39;s time goes, 48k-line build (wall time on 24 cores):</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Time</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>lex + parse</td>
+<td>32 ms</td>
+<td>48 chunks in parallel, then merged by index shifting</td>
+</tr>
+<tr>
+<td>collect</td>
+<td>11 ms</td>
+<td>the only serial semantic stage</td>
+</tr>
+<tr>
+<td>typeck + lower + borrowck</td>
+<td>22 ms</td>
+<td>per function, in parallel. CPU time: typeck 71 ms, lower 116 ms, borrowck 278 ms</td>
+</tr>
+<tr>
+<td>C codegen + assembly</td>
+<td>38 ms</td>
+<td>per function, then per shard</td>
+</tr>
+<tr>
+<td>tcc compile</td>
+<td>72 ms</td>
+<td>19 shards in parallel <code>tcc -c</code> processes</td>
+</tr>
+<tr>
+<td>link</td>
+<td>17 ms</td>
+<td>libtcc, in process</td>
+</tr>
+</tbody></table></div>
+<p>What we learned:</p>
+<ol>
+<li><strong>The rustc baseline was too kind to us at first.</strong> Incremental mode makes rustc&#39;s cold runs about 3x slower. Against rustc&#39;s best configuration, the honest speedup is 40x to 90x, not &quot;100x and more&quot;.</li>
+<li><strong>The borrow checker is the most expensive front-end stage.</strong> It uses 60% of front-end CPU time. This matches the rustc profile (MIR build + borrow check is 42%). It is the next optimization target.</li>
+<li><strong>The allocator matters a lot.</strong> Switching to mimalloc made <code>check</code> 2.5x faster, because glibc malloc fights over a kernel lock with 24 threads.</li>
+<li><strong>libtcc compiles one unit at a time,</strong> behind a global lock. Parallel <code>tcc -c</code> processes on C shards work around it. A lock-free fork or a native backend (Phase 8) would remove the process cost.</li>
+<li><strong>Generated C size drives build time.</strong> Trimming the C by 2x (grouped declarations, plain literals, no dead blocks, per-shard declarations) cut <code>tcc</code> time by 2x.</li>
+<li><strong>Small programs pay fixed costs.</strong> At 10k lines the speedup is lower (23x to 41x), because process startup, thread startup, and the per-shard runtime header dominate.</li>
+</ol>
+<p>Not proven yet:</p>
+<ul>
+<li>The idiomatic shape. Generics, closures, and iterators monomorphize into much more C. This is the biggest open risk for the build number.</li>
+<li>macOS arm64. No timing run on a Mac yet.</li>
+<li>Real code. ts-rust uses many features the prototype does not have.</li>
+<li>&quot;After edit&quot; speed. lust has no incremental mode. A warm daemon (Phase 7) should turn the 73 ms into a few ms, which is where 100x+ becomes easy.</li>
+</ul>
+<h3 id="incremental-daemon-phase-7-early"><a href="#incremental-daemon-phase-7-early">Incremental daemon (Phase 7, early)</a></h3>
+<p>Built, because cold compiles alone did not reach 100x. <code>lust daemon</code> keeps a warm session per file. The <code>lust</code> command is a thin client (no custom allocator, about 1 ms to start) that sends the request over a Unix socket, or runs <code>lust-core</code> cold if no daemon answers.</p>
+<p>Benchmark: <code>bench/realish/agent_loop.py</code>. A 784-line warehouse service (inventory, an order state machine, a pricing-rule language with a tokenizer, parser, and evaluator, shortest paths with a binary heap, reports) cloned into 40 modules: 31k lines. Twelve agent-style edits: behavior changes, a new function, and two mistakes that both compilers must reject. rustc runs with <code>-Z threads=8</code>, <code>-C incremental</code>, and <code>-C debuginfo=0</code>, its fastest setup on this machine. After each edit, both compilers must agree on pass or fail, and the programs must print the same output.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th></th>
+<th>rustc</th>
+<th>lust</th>
+<th>Speedup</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>12 checks</td>
+<td>12.80 s</td>
+<td>0.101 s</td>
+<td>127x</td>
+</tr>
+<tr>
+<td>10 builds</td>
+<td>20.45 s</td>
+<td>0.155 s</td>
+<td>132x</td>
+</tr>
+<tr>
+<td>Edit loop (checks + builds)</td>
+<td>33.25 s</td>
+<td>0.255 s</td>
+<td>130x</td>
+</tr>
+<tr>
+<td>Program runs (10)</td>
+<td>131 ms</td>
+<td>219 ms</td>
+<td>0.6x</td>
+</tr>
+</tbody></table></div>
+<p>A typical edit: lust checks in 6 to 9 ms and builds in 14 to 18 ms. rustc takes 0.8 to 1.3 s to check and 1.1 to 2.5 s to build.</p>
+<p>How it works:</p>
+<ol>
+<li><strong>Edit window.</strong> Compare the new source with the last one (two <code>memcmp</code>s). Chunks of whole items before and after the changed bytes are reused (tokens and scan results); only the window is split and lexed. Chunk boundaries are content-defined (a hash of each item&#39;s header line), so inserting a function does not move them.</li>
+<li><strong>Token-level scan.</strong> For each function: a hash of its body tokens. For each top-level item: a hash of its tokens outside bodies. No positions, so moving code changes nothing.</li>
+<li><strong>Three cases.</strong> Bodies only: parse, check, and lower just those bodies, into the existing AST. Top-level functions added, removed, or changed signature: parse just the changed chunks and splice their items in; re-check those functions and every body that mentions one of their names. Anything else: full rebuild.</li>
+<li><strong>Stable slots.</strong> Each function gets a slot keyed by its name (and impl type). Cached C, objects, and the function table use slots, so adding a function does not invalidate the others.</li>
+<li><strong>No full relink.</strong> Every call goes through <code>lust_fns[slot]</code>. The first build links all units into <code>libbase.so</code>. Each edit compiles only the changed unit as an overlay, then links a small executable (main plus overlays) against <code>libbase.so</code>. At startup the overlays overwrite their table entries. After 32 overlays, the base is rebuilt.</li>
+<li><strong>Position-free code.</strong> Panic locations are stored as (slot, line within the function, column); a per-build line table turns them into file lines.</li>
+</ol>
+<p>Costs and limits:</p>
+<ul>
+<li>Indirect calls and tcc&#39;s unoptimized code make programs run about 1.7x slower than rustc&#39;s debug builds. Inline overflow checks, direct calls in release mode, and a better backend (Phase 8) are the fixes.</li>
+<li>A change to a type or an impl block is a full rebuild (about 50 ms check, 100 ms build at 31k lines). Still 25x faster than rustc, but not 100x.</li>
+<li>Daemon builds are not standalone: they load <code>libbase.so</code> from the daemon&#39;s cache directory. A cold <code>lust build</code> links a standalone executable.</li>
+</ul>
+<h2 id="rule-zero-lust-is-a-rust-subset"><a href="#rule-zero-lust-is-a-rust-subset">Rule zero: lust is a Rust subset</a></h2>
+<p>Every valid lust program is also a valid Rust program. For the cases below, it has the same behavior.</p>
+<p>Why:</p>
+<ol>
+<li><strong>Agents already know Rust.</strong> Training data gives a free prior.</li>
+<li><strong>rustc is a free test oracle.</strong> We compile each test program with both <code>lust</code> and <code>rustc</code>, then compare.</li>
+<li><strong>Free release builds.</strong> <code>rustc -O</code> works on any lust program. This is the release path.</li>
+</ol>
+<h3 id="the-exact-contract"><a href="#the-exact-contract">The exact contract</a></h3>
+<ul>
+<li>Oracle: <code>rustc 1.99.0</code>, edition 2024, targets <code>x86_64-unknown-linux-gnu</code> and <code>aarch64-apple-darwin</code>.</li>
+<li>Dev oracle flags: <code>-C panic=abort -C overflow-checks=on -A unconditional_panic</code>. Release oracle flags: <code>-C panic=abort -C overflow-checks=off -O -A unconditional_panic</code>. Without <code>-A unconditional_panic</code>, rustc rejects code like <code>[1, 2][5]</code> at compile time, but lust aborts at run time.</li>
+<li><strong>Compared:</strong> stdout, and exit status (success or abort).</li>
+<li><strong>Not compared:</strong> panic message text and location, <code>HashMap</code> and <code>HashSet</code> iteration order, thread interleaving, <code>{:p}</code> output.</li>
+<li>Corpus programs must not let map order reach the output in any way. This includes <code>keys().next()</code> and the drop order of map values. Check: run the rustc binary 3 times. Rust seeds <code>HashMap</code> per process, so if the outputs differ, the program is not allowed in the corpus.</li>
+<li>Lust&#39;s <code>HashMap</code> uses a fixed seed. Its order is stable from run to run, but it is not the same order as Rust&#39;s.</li>
+<li>Drop order is the same as Rust&#39;s. This includes temporaries, early <code>return</code>, and <code>?</code>. Differential tests check it with <code>Drop</code> impls that print.</li>
+<li>Float <code>Display</code> and <code>Debug</code> match Rust byte for byte. Tested on rustc 1.99: <code>1.0</code> prints <code>1</code> with <code>Display</code> and <code>1.0</code> with <code>Debug</code>. <code>1e21</code> prints all its digits with <code>Display</code> and <code>1e21</code> with <code>Debug</code>. The runtime needs a shortest round-trip printer (Ryu style), and a float parser with correct rounding.</li>
+</ul>
+<p>The cost: the lust std must copy the Rust std API for the parts we support.</p>
+<h2 id="syntax-sample"><a href="#syntax-sample">Syntax sample</a></h2>
+<pre><span class="lang">lust</span><code><span class="k">use</span> std::collections::<span class="t">HashMap</span>;
+
+<span class="a">#[derive(Debug, Clone, PartialEq)]</span>
+<span class="k">enum</span> <span class="t">Kind</span> {
+    <span class="t">Tool</span>,
+    <span class="t">Food</span> { expires_in_days: <span class="t">u32</span> },
+}
+
+<span class="a">#[derive(Debug, Clone)]</span>
+<span class="k">struct</span> <span class="t">Item</span> {
+    name: <span class="t">String</span>,
+    kind: <span class="t">Kind</span>,
+    count: <span class="t">u32</span>,
+}
+
+<span class="a">#[derive(Debug)]</span>
+<span class="k">enum</span> <span class="t">ParseError</span> {
+    <span class="t">MissingField</span>(<span class="t">String</span>),
+    <span class="t">BadNumber</span>(<span class="t">String</span>),
+}
+
+<span class="c">// Parses "name,count" or "name,count,days".</span>
+<span class="k">fn</span> <span class="f">parse_item</span>(line: &amp;<span class="t">str</span>) -&gt; <span class="t">Result</span>&lt;<span class="t">Item</span>, <span class="t">ParseError</span>&gt; {
+    <span class="c">// `Vec&lt;&amp;str&gt;` is fine: std types can hold borrows. User struct fields cannot.</span>
+    <span class="k">let</span> parts: <span class="t">Vec</span>&lt;&amp;<span class="t">str</span>&gt; = line.<span class="f">split</span>(<span class="s">','</span>).<span class="f">map</span>(|p| p.<span class="f">trim</span>()).<span class="f">collect</span>();
+    <span class="k">let</span> name = parts.<span class="f">get</span>(<span class="n">0</span>).<span class="f">ok_or</span>(<span class="t">ParseError</span>::<span class="t">MissingField</span>(<span class="s">"name"</span>.<span class="f">to_string</span>()))?;
+    <span class="k">let</span> count_text = parts.<span class="f">get</span>(<span class="n">1</span>).<span class="f">ok_or</span>(<span class="t">ParseError</span>::<span class="t">MissingField</span>(<span class="s">"count"</span>.<span class="f">to_string</span>()))?;
+    <span class="k">let</span> count = count_text
+        .<span class="f">parse</span>::&lt;<span class="t">u32</span>&gt;()
+        .<span class="f">map_err</span>(|_| <span class="t">ParseError</span>::<span class="t">BadNumber</span>(count_text.<span class="f">to_string</span>()))?;
+
+    <span class="k">let</span> kind = <span class="k">match</span> parts.<span class="f">get</span>(<span class="n">2</span>) {
+        <span class="t">Some</span>(days) =&gt; <span class="t">Kind</span>::<span class="t">Food</span> {
+            expires_in_days: days.<span class="f">parse</span>().<span class="f">map_err</span>(|_| <span class="t">ParseError</span>::<span class="t">BadNumber</span>(days.<span class="f">to_string</span>()))?,
+        },
+        <span class="t">None</span> =&gt; <span class="t">Kind</span>::<span class="t">Tool</span>,
+    };
+
+    <span class="t">Ok</span>(<span class="t">Item</span> { name: name.<span class="f">to_string</span>(), kind, count })
+}
+
+<span class="c">// Sums the count of each item name.</span>
+<span class="k">fn</span> <span class="f">totals</span>(items: &amp;[<span class="t">Item</span>]) -&gt; <span class="t">HashMap</span>&lt;<span class="t">String</span>, <span class="t">u32</span>&gt; {
+    <span class="k">let</span> <span class="k">mut</span> out = <span class="t">HashMap</span>::<span class="f">new</span>();
+    <span class="k">for</span> item <span class="k">in</span> items {
+        *out.<span class="f">entry</span>(item.name.<span class="f">clone</span>()).<span class="f">or_insert</span>(<span class="n">0</span>) += item.count;
+    }
+    out
+}
+
+<span class="k">trait</span> <span class="t">Describe</span> {
+    <span class="k">fn</span> <span class="f">describe</span>(&amp;<span class="k">self</span>) -&gt; <span class="t">String</span>;
+}
+
+<span class="k">impl</span> <span class="t">Describe</span> <span class="k">for</span> <span class="t">Item</span> {
+    <span class="k">fn</span> <span class="f">describe</span>(&amp;<span class="k">self</span>) -&gt; <span class="t">String</span> {
+        <span class="k">match</span> &amp;<span class="k">self</span>.kind {
+            <span class="t">Kind</span>::<span class="t">Tool</span> =&gt; <span class="m">format!</span>(<span class="s">"{} x{}"</span>, <span class="k">self</span>.name, <span class="k">self</span>.count),
+            <span class="t">Kind</span>::<span class="t">Food</span> { expires_in_days } =&gt; {
+                <span class="m">format!</span>(<span class="s">"{} x{} (expires in {} days)"</span>, <span class="k">self</span>.name, <span class="k">self</span>.count, expires_in_days)
+            }
+        }
+    }
+}
+
+<span class="c">// Generic function. Monomorphized, the same as Rust.</span>
+<span class="k">fn</span> print_all&lt;<span class="t">T</span>: <span class="t">Describe</span>&gt;(things: &amp;[<span class="t">T</span>]) {
+    <span class="k">for</span> thing <span class="k">in</span> things {
+        <span class="m">println!</span>(<span class="s">"{}"</span>, thing.<span class="f">describe</span>());
+    }
+}
+
+<span class="k">fn</span> <span class="f">main</span>() {
+    <span class="k">let</span> input = <span class="s">"hammer, 2\napple, 5, 3\nhammer, 1"</span>;
+    <span class="k">let</span> items: <span class="t">Vec</span>&lt;<span class="t">Item</span>&gt; = input.<span class="f">lines</span>().<span class="f">filter_map</span>(|l| <span class="f">parse_item</span>(l).<span class="f">ok</span>()).<span class="f">collect</span>();
+    <span class="f">print_all</span>(&amp;items);
+    <span class="m">println!</span>(<span class="s">"{:?}"</span>, <span class="f">totals</span>(&amp;items).<span class="f">get</span>(<span class="s">"hammer"</span>));
+}
+
+<span class="a">#[test]</span>
+<span class="k">fn</span> <span class="f">parses_food</span>() {
+    <span class="k">let</span> item = <span class="f">parse_item</span>(<span class="s">"apple, 5, 3"</span>).<span class="f">unwrap</span>();
+    <span class="m">assert_eq!</span>(item.kind, <span class="t">Kind</span>::<span class="t">Food</span> { expires_in_days: <span class="n">3</span> });
+}</code></pre>
+<h2 id="borrow-model"><a href="#borrow-model">Borrow model</a></h2>
+<p>Rust&#39;s model with no lifetime names in user code.</p>
+<ul>
+<li>The checker works on one function body at a time. At a call site, it uses the callee&#39;s signature. This is the same as Rust.</li>
+<li>User <code>struct</code> and <code>enum</code> definitions cannot have reference fields or lifetime parameters.</li>
+<li><strong>User generic types cannot take a type argument that carries a borrow.</strong> <code>Wrapper&lt;&amp;str&gt;</code> is rejected. This avoids variance and drop-check rules for user types. Rust allows it, so this is a deliberate limit.</li>
+<li>Std types can carry borrows: <code>&amp;T</code>, <code>Vec&lt;&amp;str&gt;</code>, <code>Option&lt;&amp;T&gt;</code>, <code>HashMap&lt;&amp;str, u32&gt;</code>, iterators, closures that capture by reference, <code>MutexGuard</code>, and <code>Entry</code>. These can be locals, parameters, and return values.</li>
+<li>Signatures use Rust&#39;s elision rules only. If a return type carries a borrow and elision cannot pick its input, lust rejects the function. Rust would need a lifetime name there.</li>
+<li>Region inference in a body is NLL-style, with <strong>two-phase borrows</strong>, the same as Rust. Without two-phase borrows, <code>v.push(v.len())</code> fails, and agents write that all the time.</li>
+<li>Closures whose parameters are references are a known hard area. In v1, such closures can only be passed to built-in iterator adapters and std methods.</li>
+</ul>
+<p>User code has no lifetime names, but the checker still needs real lifetime logic inside. Std signatures use it: <code>Iter&lt;&#39;a, T&gt;::next</code> returns a borrow tied to the iterator, <code>Fn(&amp;str)</code> is higher-ranked, and drop check applies to std containers that hold borrows. The checker is smaller than rustc&#39;s, but it is not small. Phase 2 M3 is budgeted for this.</p>
+<p>Negative tests come before features. Each rule above gets programs that must fail, including nested containers, reborrows, partial moves, and borrowed closure captures.</p>
+<h2 id="traits-and-inference"><a href="#traits-and-inference">Traits and inference</a></h2>
+<ul>
+<li>Type inference is local to one body: unification plus a queue of trait obligations, the same shape as rustc.</li>
+<li><strong>One-candidate rule:</strong> the solver selects an impl only when <code>Self</code> and all trait input parameters are known. Associated type outputs can still be unknown. Then at most one impl can match, so the solver never searches or backtracks. Example: <code>String: Borrow&lt;_&gt;</code> waits until <code>get(&quot;hammer&quot;)</code> gives <code>Borrow&lt;str&gt;</code>.</li>
+<li>An obligation that is not ready waits in the queue. If it is still not ready at the end of the body, lust asks for a type annotation.</li>
+<li>Method lookup uses Rust&#39;s autoderef order: at each deref step, try by value, then <code>&amp;</code>, then <code>&amp;mut</code>. This is how <code>parts.get(0)</code> finds the slice method through <code>Deref</code>, and how <code>parse</code> works on a <code>&amp;&amp;str</code>.</li>
+<li>Integer literals fall back to <code>i32</code> and float literals to <code>f64</code>, the same as Rust. Closure parameter types come from the expected <code>Fn</code> signature, for example from <code>Iterator::Item</code>.</li>
+<li>Users cannot write blanket impls (<code>impl&lt;T: X&gt; Y for T</code>), overlapping impls, or specialization.</li>
+<li>The std has compiler-known traits and blanket impls that users cannot write. Some of them: <code>From&lt;T&gt; for T</code>, <code>From</code> gives <code>Into</code>, <code>Display</code> gives <code>ToString</code>, <code>Display</code> and <code>Debug</code> for <code>&amp;T</code>, <code>Borrow&lt;T&gt; for T</code>, <code>Borrow&lt;str&gt; for String</code>, <code>Iterator</code> gives <code>IntoIterator</code>. Also <code>FromIterator</code>, <code>FromStr</code>, <code>Deref</code>, <code>Fn</code>/<code>FnMut</code>/<code>FnOnce</code>, <code>Send</code>, <code>Sync</code>, <code>Copy</code>, and <code>Sized</code>.</li>
+<li>Associated types are normalized once the obligation is ready. In v1, only std traits can declare associated types.</li>
+<li><code>dyn Trait</code> comes later.</li>
+<li>Phase 4 includes a traced solver test that type-checks the syntax sample step by step.</li>
+</ul>
+<h2 id="generics"><a href="#generics">Generics</a></h2>
+<ul>
+<li>Plan: monomorphize in dev builds, the same as Rust. This is provisional until the Phase 0 mono-size spike.</li>
+<li>Limits: an instantiation depth limit of 128, the same as rustc&#39;s recursion limit. Also a total instance limit and a type size limit, because a short generic program can branch into thousands of instances. Polymorphic recursion such as <code>fn f&lt;T&gt;(x: T) { f(vec![x]) }</code> fails in both compilers.</li>
+<li>Plan B, if the build budget fails: dictionary passing in dev builds. That needs a full design first: erased calling convention, generic local storage, layout, alignment, and drop.</li>
+</ul>
+<h2 id="threads-v1"><a href="#threads-v1">Threads (v1)</a></h2>
+<ul>
+<li>v1 has <code>std::thread::spawn</code>, <code>JoinHandle::join</code>, <code>Arc</code>, <code>Mutex</code>, and <code>mpsc</code> channels.</li>
+<li>The <code>spawn</code> closure and its return type must be <code>Send</code> and must not carry borrows. The compiler checks this through captures and generic arguments, at any depth. This is stricter than Rust: Rust accepts <code>&#39;static</code> borrows such as a <code>Vec&lt;&amp;str&gt;</code> of string literals. The error tells the agent to use <code>String</code>.</li>
+<li><code>spawn</code> only works in non-generic code. Lust has no <code>&#39;static</code> bound syntax, so a generic <code>T</code> cannot prove it carries no borrows. The error tells the agent to use a concrete type.</li>
+<li><code>Send</code> and <code>Sync</code> are computed from fields, plus a fixed table for std types. Some entries: <code>Rc</code> is neither. <code>RefCell</code> is not <code>Sync</code>. <code>MutexGuard</code> is not <code>Send</code>. <code>Arc&lt;T&gt;</code> is both if <code>T</code> is <code>Send + Sync</code>. <code>Mutex&lt;T&gt;</code> is both if <code>T</code> is <code>Send</code>. Users cannot implement <code>Send</code> or <code>Sync</code>.</li>
+<li>Runtime: pthreads. <code>Arc</code> counts use C11 <code>stdatomic.h</code> from <code>tcc</code> mob, so they work on x86_64 and arm64.</li>
+<li>Later: <code>RwLock</code>, public atomics, <code>thread::scope</code>.</li>
+</ul>
+<h2 id="what-lust-rejects"><a href="#what-lust-rejects">What lust rejects</a></h2>
+<p>Each error tells the agent what to do instead. The <code>fix</code> text is part of the error design.</p>
+<pre><span class="lang">lust</span><code><span class="k">struct</span> <span class="t">Parser</span>&lt;<span class="l">'a</span>&gt; {
+    input: &amp;<span class="l">'a</span> <span class="t">str</span>,
+    pos: <span class="t">usize</span>,
+}</code></pre>
+<pre><span class="lang">json</span><code>{
+  <span class="t">"code"</span>: <span class="s">"L0201"</span>,
+  <span class="t">"severity"</span>: <span class="s">"error"</span>,
+  <span class="t">"message"</span>: <span class="s">"struct fields cannot hold references"</span>,
+  <span class="t">"at"</span>: <span class="s">"src/parse.rs:2:12"</span>,
+  <span class="t">"fix"</span>: <span class="s">"Store an owned String in the struct, or keep only `pos: usize` and pass `input: &amp;str` to each method."</span>
+}</code></pre>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Rust feature</th>
+<th>Lust error says</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>&#39;a</code> lifetime syntax, <code>&#39;static</code> bounds</td>
+<td>Remove it. If elision is ambiguous, return an owned value or an index.</td>
+</tr>
+<tr>
+<td><code>macro_rules!</code>, proc macros</td>
+<td>Write a function. Built-in macros only.</td>
+</tr>
+<tr>
+<td><code>impl&lt;T: X&gt; Y for T</code></td>
+<td>Implement <code>Y</code> for each concrete type.</td>
+</tr>
+<tr>
+<td><code>Wrapper&lt;&amp;str&gt;</code> (a user generic type with a borrow inside)</td>
+<td>Use an owned type such as <code>Wrapper&lt;String&gt;</code>, or a std type such as <code>Option&lt;&amp;str&gt;</code>.</td>
+</tr>
+<tr>
+<td><code>fn f() -&gt; impl Trait</code></td>
+<td>Return a concrete type or an enum.</td>
+</tr>
+<tr>
+<td><code>dyn Trait</code></td>
+<td>Not supported yet. Use an enum or generics.</td>
+</tr>
+<tr>
+<td><code>thread::spawn</code> in a generic function</td>
+<td>Move the spawn into a non-generic function.</td>
+</tr>
+<tr>
+<td><code>std::any::type_name</code></td>
+<td>Not supported. Its output text is not stable in Rust.</td>
+</tr>
+<tr>
+<td><code>async</code>, <code>await</code></td>
+<td>Not supported. Use <code>std::thread</code> and channels.</td>
+</tr>
+<tr>
+<td><code>unsafe</code></td>
+<td>Not supported.</td>
+</tr>
+</tbody></table></div>
+<h2 id="semantics"><a href="#semantics">Semantics</a></h2>
+<ul>
+<li><strong>Ownership and moves:</strong> same as Rust.</li>
+<li><strong>Panics:</strong> abort. No unwinding. A panic in any thread ends the process.</li>
+<li><strong>Integer overflow</strong> on <code>+</code>, <code>-</code>, <code>*</code>, unary <code>-</code>, <code>pow</code>, and <code>abs</code>: panic in dev, wrap in release. Same as Rust.</li>
+<li><strong>Shifts</strong> by the bit width or more: panic in dev, mask in release. Same as Rust.</li>
+<li><strong>Always panic, in both modes:</strong> division or remainder by zero, <code>MIN / -1</code>, <code>MIN % -1</code>, and out-of-bounds indexing.</li>
+<li><strong><code>as</code> casts:</strong> integer casts truncate or extend. Float to integer saturates, and NaN becomes 0. Same as Rust.</li>
+<li><strong>Built-in macros:</strong> <code>println!</code>, <code>print!</code>, <code>eprintln!</code>, <code>format!</code>, <code>vec!</code>, <code>assert!</code>, <code>assert_eq!</code>, <code>assert_ne!</code>, <code>panic!</code>, <code>todo!</code>, <code>unreachable!</code>.</li>
+<li><strong>Built-in derives:</strong> <code>Debug</code>, <code>Clone</code>, <code>Copy</code>, <code>PartialEq</code>, <code>Eq</code>, <code>PartialOrd</code>, <code>Ord</code>, <code>Hash</code>, <code>Default</code>.</li>
+<li><strong>Modules:</strong> one file is one module. One package per program for now.</li>
+<li><strong>Tests:</strong> <code>#[test]</code> functions. <code>lust test</code> runs them.</li>
+</ul>
+<h2 id="compiler"><a href="#compiler">Compiler</a></h2>
+<p>Written in Rust. The compiler stays small, so its own build time is fine.</p>
+<pre><span class="lang">text</span><code>files ──parse (parallel)──▶ AST per file
+      ──collect──────────▶ signature table (all items, all files)
+      ──check (parallel)─▶ typed IR per function + borrow check
+      ──mono─────────────▶ list of concrete instances
+      ──lower (parallel)─▶ C shards (one per core)
+      ──tcc -c (parallel)▶ objects ──tcc──▶ binary</code></pre>
+<p>Release builds use <code>rustc -O</code> on the same source (rule zero). Plan B: send the C to <code>clang -O2</code>. That is slow on large monomorphized C.</p>
+<p>The front end is data-oriented from day one: flat arrays and indices, not pointer trees; interned types and strings; arena allocation. This is the Zig and Carbon toolchain approach. Check speed comes from the front end, so this is not an optimization for later.</p>
+<h3 id="backend"><a href="#backend">Backend</a></h3>
+<p>Platform tiers:</p>
+<ul>
+<li><strong>Tier 1:</strong> macOS arm64 and Linux x86_64. Both run the full test suite, the rustc oracle, and the performance budget in CI.</li>
+<li><strong>Tier 2:</strong> Linux arm64 and macOS x86_64. Full tests, no budget.</li>
+<li><strong>Later:</strong> Windows.</li>
+</ul>
+<p>Stages:</p>
+<ol>
+<li><strong><code>tcc</code> mob as a library.</strong> Lust links <code>libtcc</code> into the compiler and compiles C in memory. No process spawn, no temp C files. We pin an upstream commit. We fork as <code>lust-tcc</code> when we need changes. Expected fork work: overflow builtins, ad-hoc code signing in process on macOS (no <code>codesign</code> process per build), and speed work found by profiling.</li>
+<li><strong>Own native backend.</strong> Lust IR goes straight to x86_64 and arm64 machine code, in ELF and Mach-O, with an incremental linker that patches the binary in place, the way Zig does. This removes C text generation, C parsing, and the C undefined-behavior class. We start this when Phase 0 or later profiles show that C generation and C parsing are a large part of build time. With monomorphization, they probably will be.</li>
+</ol>
+<p>Phase 0 also runs a bake-off: <code>tcc</code> mob against Cranelift, on macOS arm64 and Linux, using the same generated workload. Cranelift needs no fork and has no C undefined behavior. If it is close to <code>tcc</code> in speed, it can replace stage 1.</p>
+<p>Lust IR is designed so the backend can be swapped. The C emitter and a native backend read the same IR.</p>
+<h3 id="c-backend-rules"><a href="#c-backend-rules">C backend rules</a></h3>
+<p>The spike shows <code>tcc</code> itself is fast. The main risk is undefined behavior in the emitted C.</p>
+<ul>
+<li>Lower each expression to temporaries, in Rust evaluation order. Never pass two calls with side effects as arguments to one C call.</li>
+<li>Emit explicit drop calls. Use drop flags for values that are moved on only some paths.</li>
+<li>Emit inline checks for overflow, shift amount, division by zero, <code>MIN / -1</code>, and bounds. <code>tcc</code> has no overflow builtins.</li>
+<li>Do wrapping math with unsigned types of at least 32 bits. C promotes <code>uint16_t</code> to signed <code>int</code>, so <code>65535 * 65535</code> on <code>u16</code> operands is signed overflow (UB) unless the operands are cast first.</li>
+<li>Float to integer casts go through saturating helpers. Rust gives 4294967295 for <code>1e30 as u32</code>. A raw C cast is UB, and <code>tcc</code> gives 0.</li>
+<li>Zero-initialize all locals. Keep pointer arithmetic inside runtime helpers.</li>
+<li>Emit <code>#line</code> directives so <code>tcc -g</code> maps back to <code>.rs</code> source. Panic locations come from lust source data, not from C <code>__LINE__</code>.</li>
+<li>CI also builds every test with <code>clang -O2 -fsanitize=address,undefined</code>.</li>
+</ul>
+<h2 id="agent-interface"><a href="#agent-interface">Agent interface</a></h2>
+<ul>
+<li><code>lust check --json</code> prints one JSON object per diagnostic, with <code>code</code>, <code>message</code>, <code>at</code>, and <code>fix</code>. This ships in compiler v0, not later.</li>
+<li><code>lust explain L0201</code> prints a short page with a good and a bad example.</li>
+<li>No code runs at compile time, so builds are deterministic and easy to cache.</li>
+<li>Later: <code>lust daemon</code> keeps the program in memory, and <code>lust check</code> uses it when it runs. Changes to a signature, field, or impl must invalidate dependent bodies, not only the changed body.</li>
+</ul>
+<h2 id="performance-budget"><a href="#performance-budget">Performance budget</a></h2>
+<p>These numbers are targets. They become tests after Phase 0 confirms them. After that, if a feature breaks the budget, the feature does not ship.</p>
+<p>Conditions: both tier 1 platforms (the 24-core x86_64 Linux dev box, and an Apple Silicon Mac), cold disk cache dropped, a generated program of 100k lines in 200 files. The program must be iterator- and closure-heavy, not only simple functions. The timing harness ships in compiler v0. It records each stage on its own: parse and check, instance discovery, C generation, <code>tcc</code>, and link.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Target</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Cold <code>check</code></td>
+<td>&lt; 300 ms. Not supported yet: a reviewer measured rustc <code>check</code> at about 1.4 s for this size on 24 cores. Phase 0 sets the real number.</td>
+</tr>
+<tr>
+<td>Cold dev build</td>
+<td>&lt; 1 s</td>
+</tr>
+<tr>
+<td>Warm <code>check</code> after a one-line edit (needs the daemon)</td>
+<td>&lt; 50 ms</td>
+</tr>
+<tr>
+<td>Warm dev build after a one-line edit (needs the daemon)</td>
+<td>&lt; 200 ms</td>
+</tr>
+</tbody></table></div>
+<h2 id="syntax-eval"><a href="#syntax-eval">Syntax eval</a></h2>
+<p>Two rounds. Each round asks one clear question.</p>
+<h3 id="round-1-does-the-lust-subset-hurt-agents"><a href="#round-1-does-the-lust-subset-hurt-agents">Round 1: does the lust subset hurt agents?</a></h3>
+<p>Runs in Phase 1, before the compiler exists.</p>
+<ul>
+<li><strong>Conditions:</strong> full Rust vs. the lust subset. Both are checked by rustc. The subset also runs a small subset linter, and its errors use lust terms and codes.</li>
+<li>Both conditions see rustc errors, so the comparison is fair. The only difference is the subset rules.</li>
+<li>This tells us early what &quot;no references in structs&quot; and &quot;no macros&quot; cost agents.</li>
+</ul>
+<h3 id="round-2-is-rust-lite-better-than-the-rust-subset"><a href="#round-2-is-rust-lite-better-than-the-rust-subset">Round 2: is Rust-lite better than the Rust subset?</a></h3>
+<p>Runs after compiler v0 can check code. Both variants go through lust&#39;s own checker, so errors point at the code the agent wrote.</p>
+<p><strong>A. Rust subset.</strong> The syntax above.</p>
+<p><strong>B. Rust-lite.</strong> Rust minus the parts agents get wrong most often:</p>
+<ul>
+<li>String literals are <code>String</code>. <code>&amp;str</code> only appears in parameters.</li>
+<li>Paths use <code>.</code>, not <code>::</code>.</li>
+<li>All types auto-derive <code>Debug</code>, <code>Clone</code>, and <code>PartialEq</code> when their fields allow it.</li>
+</ul>
+<pre><span class="lang">lust</span><code><span class="k">use</span> std.collections.<span class="t">HashMap</span>;
+
+<span class="k">enum</span> <span class="t">ParseError</span> {
+    <span class="t">MissingField</span>(<span class="t">String</span>),
+    <span class="t">BadNumber</span>(<span class="t">String</span>),
+}
+
+<span class="k">fn</span> <span class="f">label</span>(item: &amp;<span class="t">Item</span>) -&gt; <span class="t">String</span> {
+    <span class="k">match</span> item.kind {
+        <span class="t">Kind</span>.<span class="t">Tool</span> =&gt; <span class="s">"tool"</span>,
+        <span class="t">Kind</span>.<span class="t">Food</span> { .. } =&gt; <span class="s">"food"</span>,
+    }
+}</code></pre>
+<p>B changes semantics as well as syntax (string literals, auto derives). So round 2 compares two language packages, not syntax only. B also breaks rule zero, so B would need a printer that emits Rust to keep the oracle.</p>
+<p>Variant C (parameter modes) is cut. It conflicts with returned references, and it needs a borrow-inserting printer.</p>
+<h3 id="method-for-both-rounds"><a href="#method-for-both-rounds">Method, for both rounds</a></h3>
+<ul>
+<li><strong>Models:</strong> <code>Muse Wonder Full</code> (Muse), Claude Opus 5.5, Claude Sonnet 5.5, GPT-6.1-Sol. Pin exact model versions.</li>
+<li><strong>Tasks:</strong> about 40 small tasks with stdin and stdout tests. Examples: parse a log file, an LRU cache, a tokenizer, a bank account state machine, a graph search.</li>
+<li><strong>Pilot first:</strong> 10 tasks × 2 conditions × 4 models × 1 run = 80 runs. It finds harness bugs and bad tasks. It also measures variance.</li>
+<li><strong>Full size:</strong> chosen from pilot variance and the smallest effect we care about. Not fixed in advance.</li>
+<li><strong>Each run:</strong> a fresh session, randomized task order, one tool (<code>check</code>, which builds and runs the tests), at most 8 calls.</li>
+<li><strong>Statistics:</strong> the unit is the task. Results are paired by task. Confidence intervals are grouped by task.</li>
+</ul>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Success after each check (k = 1 to 8)</td>
+<td>Main score. A curve, not one number, so failed runs still count.</td>
+</tr>
+<tr>
+<td>Compile failure vs. test failure</td>
+<td>Shows if the language or the logic is the problem</td>
+</tr>
+<tr>
+<td>Wall time per run</td>
+<td>What the agent loop actually costs</td>
+</tr>
+<tr>
+<td>Output tokens</td>
+<td>Shorter syntax may cost less</td>
+</tr>
+<tr>
+<td>Top error codes</td>
+<td>Shows which rules agents break most</td>
+</tr>
+<tr>
+<td>Rust leaks (subset and B only)</td>
+<td>Counts Rust features used that the condition does not allow</td>
+</tr>
+</tbody></table></div>
+<h2 id="plan"><a href="#plan">Plan</a></h2>
+<p>Each phase ends with tests that pass. Line counts are rough ranges. The reviews said the first estimates were 2x to 3x too low, mostly because the std and runtime had no budget.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Work</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0</td>
+<td>Profile ts-rust <code>check</code> and <code>build</code> separately. Pin rustc 1.99.0 and a <code>tcc</code> mob commit. Mono-size spike on Linux and macOS arm64: count instances on real iterator-heavy Rust (LLVM function count), emit equivalent C and Cranelift IR, and time generation, compile, link, and run speed. Bake-off: <code>tcc</code> mob against Cranelift. Set the budgets from the results.</td>
+<td>1k to 2k lines of spike code</td>
+</tr>
+<tr>
+<td>0.5</td>
+<td><strong>Done.</strong> Speed-of-light prototype: plain-shape front end, C emitter, <code>tcc</code>, negative corpus, rustc differential tests. Linux measured; macOS not yet. Becomes the base of compiler v0.</td>
+<td>8.6k lines (estimate was 4k to 6k)</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Eval round 1: harness, 40 tasks, subset linter. Pilot, then full run.</td>
+<td>1.5k to 2.5k lines</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Compiler v0, in milestones. M1: <code>fn main</code>, integers, <code>println!</code>, C, <code>tcc</code>, plus JSON diagnostics and the timing harness. M2: structs, enums, <code>match</code>, <code>Result</code>, <code>?</code>, <code>Drop</code> and drop order. M3: borrow checker with negative tests. M4: rustc differential corpus and sanitizer builds in CI.</td>
+<td>10k to 15k lines</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Runtime and std: <code>String</code>, <code>Vec</code>, <code>HashMap</code> (fixed seed; <code>Hash</code> for <code>str</code> and <code>String</code> must match), <code>Option</code> and <code>Result</code> methods, float printing and parsing, UTF-8.</td>
+<td>5k to 8k lines</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Traits, monomorphized generics, closures, built-in iterators, std blanket impls.</td>
+<td>8k to 12k lines</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Threads: <code>spawn</code>, <code>join</code>, <code>Arc</code>, <code>Mutex</code>, <code>mpsc</code>, computed <code>Send</code> and <code>Sync</code>.</td>
+<td>2k to 3k lines</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Eval round 2: B parser and Rust printer, then A vs. B.</td>
+<td>1k to 2k lines</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Speed: daemon, incremental check with dependency invalidation, incremental build. <strong>Early version done</strong> (bodies and top-level function changes are incremental; type changes are not yet).</td>
+<td>5k to 8k lines (about 2k so far)</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Own native backend: x86_64 and arm64, ELF and Mach-O, incremental linker. Starts when profiles show C generation and parsing are a large share of build time.</td>
+<td>30k to 60k lines</td>
+</tr>
+<tr>
+<td>ongoing</td>
+<td><code>lust-tcc</code> fork, if needed: overflow builtins, in-process code signing, speed fixes. CI on <code>macos-15</code> and Linux.</td>
+<td>0.5k to 3k lines</td>
+</tr>
+</tbody></table></div>
+<p>Total: about 35k to 55k lines before Phase 8. About 65k to 115k lines with the native backend.</p>
+<h2 id="decisions"><a href="#decisions">Decisions</a></h2>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Decision</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Rust interop</td>
+<td>Not needed. C FFI later, if ever.</td>
+</tr>
+<tr>
+<td>Project goal</td>
+<td>Fun toy first. Keep the door open for real use.</td>
+</tr>
+<tr>
+<td>Syntax</td>
+<td>Rust subset by default. Eval round 2 can change it.</td>
+</tr>
+<tr>
+<td>Eval models</td>
+<td><code>Muse Wonder Full</code>, Opus 5.5, Sonnet 5.5, GPT-6.1-Sol</td>
+</tr>
+<tr>
+<td><code>tcc</code></td>
+<td><code>tcc</code> mob, linked in as <code>libtcc</code>. Fork it when needed.</td>
+</tr>
+<tr>
+<td>Platforms</td>
+<td>macOS arm64 and Linux x86_64 are tier 1. Mac support is essential.</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Big is fine. Choose paths by measurement, not by size.</td>
+</tr>
+<tr>
+<td>Native backend</td>
+<td>Planned as Phase 8, gated by profiles.</td>
+</tr>
+<tr>
+<td>Generics</td>
+<td>Monomorphize, the same as Rust, if Phase 0 confirms it. Dictionaries are plan B.</td>
+</tr>
+<tr>
+<td>Release builds</td>
+<td><code>rustc -O</code>. <code>clang -O2</code> on the emitted C is plan B.</td>
+</tr>
+<tr>
+<td>Threads</td>
+<td>Yes, in v1. <code>spawn</code>, <code>join</code>, <code>Arc</code>, <code>Mutex</code>, <code>mpsc</code>.</td>
+</tr>
+<tr>
+<td>Self-hosting</td>
+<td>No</td>
+</tr>
+</tbody></table></div>
+<h2 id="review-log"><a href="#review-log">Review log</a></h2>
+<p>Round 1 reviewers: <code>Muse Wonder Full</code> (Muse) and <code>gpt-6.1-sol</code> (Codex). Both reviews were read-only. Both reviewers ran rustc to test claims.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>From</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&quot;Borrow checking is local because structs cannot hold references&quot; is wrong. Rust already checks one body at a time. <code>Vec&lt;&amp;str&gt;</code>, iterators, closures, and guards carry borrows.</td>
+<td>both</td>
+<td>Accepted. New <a href="#borrow-model">Borrow model</a> section. The rule is now about simplicity, not speed.</td>
+</tr>
+<tr>
+<td>&quot;Lookup is a table&quot; is wrong. <code>collect</code>, <code>parse::&lt;T&gt;</code>, and <code>Borrow&lt;str&gt;</code> need inference and projection.</td>
+<td>both</td>
+<td>Accepted. One-candidate solver plus compiler-known std traits.</td>
+</tr>
+<tr>
+<td>Rule zero breaks on <code>HashMap</code> order, panic text, floats, overflow flags, and drop order.</td>
+<td>both</td>
+<td>Accepted. Exact oracle contract added.</td>
+</tr>
+<tr>
+<td>Dictionary generics do not keep Rust behavior, and they need a full representation design.</td>
+<td>both</td>
+<td>Resolved another way: monomorphize, like Rust. Round 2 made this provisional until Phase 0. Dictionaries are plan B.</td>
+</tr>
+<tr>
+<td>The <code>Send</code> / <code>&#39;static</code> story is wrong. Borrows hide in generics and captures.</td>
+<td>both</td>
+<td>Accepted. Check through captures and generic arguments at any depth. Generic <code>spawn</code> is rejected.</td>
+</tr>
+<tr>
+<td>The C backend has more UB risk than signed overflow. Evaluation order needs temporaries.</td>
+<td>sol</td>
+<td>Accepted. New C backend rules.</td>
+</tr>
+<tr>
+<td><code>tcc</code> atomics are not verified.</td>
+<td>Muse</td>
+<td>Tested. Debian 0.9.27 has no <code>stdatomic.h</code>. <code>tcc</code> mob has it, and it works.</td>
+</tr>
+<tr>
+<td>rustc as the checker for B and C favors A.</td>
+<td>both</td>
+<td>Accepted. Round 1 now compares Rust with the subset, both on rustc. B waits for lust&#39;s own checker.</td>
+</tr>
+<tr>
+<td>2,880 runs has no statistical basis.</td>
+<td>both</td>
+<td>Accepted. Pilot first. Full size comes from pilot variance. Paired by task.</td>
+</tr>
+<tr>
+<td>The std and runtime have no budget. Estimates are 2x to 3x low.</td>
+<td>both</td>
+<td>Accepted. New phase 3. Estimates raised.</td>
+</tr>
+<tr>
+<td>&quot;A crate is one compile unit&quot; is wrong. rustc splits codegen units.</td>
+<td>sol</td>
+<td>Accepted. Removed.</td>
+</tr>
+<tr>
+<td>Overflow rules are too broad. <code>MIN / -1</code> panics in both modes.</td>
+<td>sol</td>
+<td>Accepted. Each operation is now listed.</td>
+</tr>
+<tr>
+<td>Cut variant C, the daemon, <code>RwLock</code>, atomics, <code>dyn Trait</code>, and user associated types for now.</td>
+<td>both</td>
+<td>Accepted.</td>
+</tr>
+<tr>
+<td>Cut release monomorphization and use <code>rustc -O</code>.</td>
+<td>Muse</td>
+<td>Rejected in round 1, accepted in round 2 (see below).</td>
+</tr>
+<tr>
+<td>Replace line estimates with milestones.</td>
+<td>sol</td>
+<td>Did both. Phases have milestones, and the estimates stay as ranges.</td>
+</tr>
+</tbody></table></div>
+<p>Round 2 reviewed revision 2. Both reviewers said: ready for Phase 0 and the Phase 1 pilot, not yet for Phase 2.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>From</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>The one-candidate rule fails on <code>Borrow</code>: <code>String</code> has <code>Borrow&lt;str&gt;</code> and <code>Borrow&lt;String&gt;</code>.</td>
+<td>both</td>
+<td>Accepted. The solver waits for all trait input parameters, not only <code>Self</code>.</td>
+</tr>
+<tr>
+<td>The std blanket list misses <code>From&lt;T&gt; for T</code>, <code>Display for &amp;T</code>, and others. Method lookup order and literal fallback are not defined.</td>
+<td>Muse</td>
+<td>Accepted. Added to <a href="#traits-and-inference">Traits and inference</a>.</td>
+</tr>
+<tr>
+<td>Two-phase borrows are missing.</td>
+<td>Muse</td>
+<td>Accepted.</td>
+</tr>
+<tr>
+<td><code>Wrapper&lt;&amp;str&gt;</code> needs variance and drop check.</td>
+<td>both</td>
+<td>Simplified. User generic types cannot take borrow-carrying type arguments.</td>
+</tr>
+<tr>
+<td>Std signatures still need real lifetime logic in the checker.</td>
+<td>Muse</td>
+<td>Accepted. Stated plainly, and budgeted in Phase 2 M3.</td>
+</tr>
+<tr>
+<td>The <code>tcc</code> spike does not prove the budgets. Monomorphized closures and iterators make far more C than source.</td>
+<td>both</td>
+<td>Accepted. Monomorphization is provisional. Phase 0 adds a mono-size spike. Instance and type size limits added.</td>
+</tr>
+<tr>
+<td>The check budget has no evidence behind it.</td>
+<td>Muse</td>
+<td>Accepted. Budgets are targets until Phase 0.</td>
+</tr>
+<tr>
+<td><code>clang -O2</code> on large monomorphized C is slow.</td>
+<td>Muse</td>
+<td>Accepted. Release is <code>rustc -O</code>.</td>
+</tr>
+<tr>
+<td><code>tcc</code> does not inline, so dev binaries run slower.</td>
+<td>Muse</td>
+<td>Accepted as a known cost. Phase 0 measures it.</td>
+</tr>
+<tr>
+<td>Oracle needs <code>-A unconditional_panic</code>.</td>
+<td>Muse</td>
+<td>Accepted. Verified on rustc 1.99.</td>
+</tr>
+<tr>
+<td>Map order can leak through <code>keys().next()</code> and drop order.</td>
+<td>both</td>
+<td>Accepted. The corpus check runs each rustc binary 3 times and rejects programs whose output changes.</td>
+</tr>
+<tr>
+<td>&quot;Shortest round trip&quot; does not define float format.</td>
+<td>sol</td>
+<td>Accepted. Byte-for-byte match with Rust, with examples verified on rustc 1.99.</td>
+</tr>
+<tr>
+<td>C promotes <code>uint16_t</code> to signed <code>int</code>.</td>
+<td>sol</td>
+<td>Accepted. Cast to unsigned 32-bit or wider first.</td>
+</tr>
+<tr>
+<td>Float to integer casts are UB in C.</td>
+<td>Muse</td>
+<td>Accepted. Saturating helpers.</td>
+</tr>
+<tr>
+<td>The <code>spawn</code> rule is stricter than Rust. Rust accepts <code>&#39;static</code> borrows.</td>
+<td>sol</td>
+<td>Accepted. Described as a deliberate limit.</td>
+</tr>
+<tr>
+<td><code>Hash</code> for <code>str</code> and <code>String</code> must match, or <code>get(&quot;hammer&quot;)</code> fails.</td>
+<td>Muse</td>
+<td>Accepted. Added to Phase 3.</td>
+</tr>
+</tbody></table></div>
+<h2 id="open-questions"><a href="#open-questions">Open questions</a></h2>
+<ol>
+<li>Phase 0 needs an Apple Silicon Mac for timing. Which one: a fleet machine over SSH, or GitHub <code>macos-15</code> runners? Runner timings are noisy, so a real machine is better for the budget.</li>
+<li>Token cap per eval run. Proposal: 8 <code>check</code> calls and 60k output tokens.</li>
+</ol>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[package]
+name = "lust"
+version = "0.0.1"
+edition = "2024"
+description = "Speed-of-light prototype of the lust compiler (Phase 0.5)"
+
+[[bin]]
+name = "lust"
+path = "src/client.rs"
+
+[[bin]]
+name = "lust-core"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"

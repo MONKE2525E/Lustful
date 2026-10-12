@@ -1,0 +1,435 @@
+// Lexer: turns source bytes into a flat token list. Identifiers are interned here.
+use crate::diag::{Diag, Span};
+use crate::intern::{FxMap, Interner, Sym};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntSuffix {
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tok {
+    Ident(Sym),
+    Int(u64, Option<IntSuffix>),
+    Float,
+    /// Index into `Lexed::strings`.
+    Str(u32),
+    Char(char),
+    Lifetime,
+    // Keywords.
+    As,
+    Break,
+    Const,
+    Continue,
+    Else,
+    Enum,
+    False,
+    Fn,
+    For,
+    If,
+    Impl,
+    In,
+    Let,
+    Loop,
+    Match,
+    Mod,
+    Mut,
+    Pub,
+    Ref,
+    Return,
+    SelfLower,
+    SelfUpper,
+    Static,
+    Struct,
+    Trait,
+    True,
+    Type,
+    Unsafe,
+    Use,
+    Where,
+    While,
+    Async,
+    Dyn,
+    Move,
+    // Punctuation.
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semi,
+    Colon,
+    PathSep,
+    Dot,
+    DotDot,
+    DotDotEq,
+    Arrow,
+    FatArrow,
+    Eq,
+    EqEq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    Amp,
+    AndAnd,
+    Pipe,
+    OrOr,
+    Caret,
+    Bang,
+    Pound,
+    Question,
+    Underscore,
+    Shl,
+    Dollar,
+    Eof,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Token {
+    pub tok: Tok,
+    pub span: Span,
+}
+
+pub struct Lexed {
+    pub tokens: Vec<Token>,
+    pub strings: Vec<String>,
+}
+
+fn keyword(s: &str) -> Option<Tok> {
+    Some(match s {
+        "as" => Tok::As,
+        "break" => Tok::Break,
+        "const" => Tok::Const,
+        "continue" => Tok::Continue,
+        "else" => Tok::Else,
+        "enum" => Tok::Enum,
+        "false" => Tok::False,
+        "fn" => Tok::Fn,
+        "for" => Tok::For,
+        "if" => Tok::If,
+        "impl" => Tok::Impl,
+        "in" => Tok::In,
+        "let" => Tok::Let,
+        "loop" => Tok::Loop,
+        "match" => Tok::Match,
+        "mod" => Tok::Mod,
+        "mut" => Tok::Mut,
+        "pub" => Tok::Pub,
+        "ref" => Tok::Ref,
+        "return" => Tok::Return,
+        "self" => Tok::SelfLower,
+        "Self" => Tok::SelfUpper,
+        "static" => Tok::Static,
+        "struct" => Tok::Struct,
+        "trait" => Tok::Trait,
+        "true" => Tok::True,
+        "type" => Tok::Type,
+        "unsafe" => Tok::Unsafe,
+        "use" => Tok::Use,
+        "where" => Tok::Where,
+        "while" => Tok::While,
+        "async" => Tok::Async,
+        "dyn" => Tok::Dyn,
+        "move" => Tok::Move,
+        "_" => Tok::Underscore,
+        _ => return None,
+    })
+}
+
+fn suffix(s: &str) -> Option<Option<IntSuffix>> {
+    use IntSuffix::*;
+    Some(Some(match s {
+        "" => return Some(None),
+        "i8" => I8,
+        "i16" => I16,
+        "i32" => I32,
+        "i64" => I64,
+        "isize" => Isize,
+        "u8" => U8,
+        "u16" => U16,
+        "u32" => U32,
+        "u64" => U64,
+        "usize" => Usize,
+        _ => return None,
+    }))
+}
+
+/// Lexes `src`, which starts at byte `base` of the file. Stops at the first error.
+pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
+    let b = src.as_bytes();
+    let mut tokens = Vec::with_capacity(src.len() / 4);
+    let mut strings = Vec::new();
+    let mut i = 0usize;
+    // Local cache in front of the shared interner, so repeated names skip its lock.
+    let mut cache: FxMap<&str, Sym> = FxMap::default();
+    let err =
+        |start: usize, end: usize, msg: &str| Diag::new("L0001", Span::new(base + start as u32, base + end as u32), msg, "Fix the syntax.");
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 0;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if depth != 0 {
+                return Err(err(start, i, "unterminated block comment"));
+            }
+            continue;
+        }
+        let tok = if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
+                i += 1;
+            }
+            let s = &src[start..i];
+            keyword(s).unwrap_or_else(|| Tok::Ident(*cache.entry(s).or_insert_with(|| interner.intern(s))))
+        } else if c.is_ascii_digit() {
+            lex_number(src, &mut i).ok_or_else(|| err(start, i, "invalid number literal"))?
+        } else if c == b'"' {
+            i += 1;
+            let mut s = String::new();
+            loop {
+                match b.get(i) {
+                    None => return Err(err(start, i, "unterminated string literal")),
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(b'\\') => {
+                        // A backslash before a newline skips the newline and leading whitespace.
+                        if b.get(i + 1) == Some(&b'\n') {
+                            i += 2;
+                            while i < b.len() && b[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                        let ch = lex_escape(src, &mut i).ok_or_else(|| err(i, i + 2, "invalid escape"))?;
+                        s.push(ch);
+                    }
+                    Some(_) => {
+                        let ch = src[i..].chars().next().unwrap();
+                        s.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            strings.push(s);
+            Tok::Str(strings.len() as u32 - 1)
+        } else if c == b'\'' {
+            // Either a char literal or a lifetime.
+            let next = src[i + 1..].chars().next();
+            let after = next.map(|ch| i + 1 + ch.len_utf8());
+            if next.is_some_and(|ch| ch.is_alphabetic() || ch == '_') && after.and_then(|a| b.get(a)) != Some(&b'\'') {
+                i += 1;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                Tok::Lifetime
+            } else {
+                i += 1;
+                let ch = if b.get(i) == Some(&b'\\') {
+                    lex_escape(src, &mut i).ok_or_else(|| err(i, i + 2, "invalid escape"))?
+                } else {
+                    let ch = src[i..].chars().next().ok_or_else(|| err(start, i, "bad char literal"))?;
+                    i += ch.len_utf8();
+                    ch
+                };
+                if b.get(i) != Some(&b'\'') {
+                    return Err(err(start, i, "unterminated char literal"));
+                }
+                i += 1;
+                Tok::Char(ch)
+            }
+        } else {
+            let two = if i + 1 < b.len() { &b[i..i + 2] } else { &b[i..i + 1] };
+            let three = if i + 2 < b.len() { &b[i..i + 3] } else { &[][..] };
+            let (t, n) = if three == b"..=" {
+                (Tok::DotDotEq, 3)
+            } else {
+                match two {
+                    b"::" => (Tok::PathSep, 2),
+                    b".." => (Tok::DotDot, 2),
+                    b"->" => (Tok::Arrow, 2),
+                    b"=>" => (Tok::FatArrow, 2),
+                    b"==" => (Tok::EqEq, 2),
+                    b"!=" => (Tok::Ne, 2),
+                    b"<=" => (Tok::Le, 2),
+                    b">=" => (Tok::Ge, 2),
+                    b"+=" => (Tok::PlusEq, 2),
+                    b"-=" => (Tok::MinusEq, 2),
+                    b"*=" => (Tok::StarEq, 2),
+                    b"/=" => (Tok::SlashEq, 2),
+                    b"%=" => (Tok::PercentEq, 2),
+                    b"&&" => (Tok::AndAnd, 2),
+                    b"||" => (Tok::OrOr, 2),
+                    b"<<" => (Tok::Shl, 2),
+                    _ => (
+                        match c {
+                            b'(' => Tok::LParen,
+                            b')' => Tok::RParen,
+                            b'{' => Tok::LBrace,
+                            b'}' => Tok::RBrace,
+                            b'[' => Tok::LBracket,
+                            b']' => Tok::RBracket,
+                            b',' => Tok::Comma,
+                            b';' => Tok::Semi,
+                            b':' => Tok::Colon,
+                            b'.' => Tok::Dot,
+                            b'=' => Tok::Eq,
+                            b'<' => Tok::Lt,
+                            b'>' => Tok::Gt,
+                            b'+' => Tok::Plus,
+                            b'-' => Tok::Minus,
+                            b'*' => Tok::Star,
+                            b'/' => Tok::Slash,
+                            b'%' => Tok::Percent,
+                            b'&' => Tok::Amp,
+                            b'|' => Tok::Pipe,
+                            b'^' => Tok::Caret,
+                            b'!' => Tok::Bang,
+                            b'#' => Tok::Pound,
+                            b'?' => Tok::Question,
+                            b'$' => Tok::Dollar,
+                            _ => return Err(err(start, start + 1, "unexpected character")),
+                        },
+                        1,
+                    ),
+                }
+            };
+            i += n;
+            t
+        };
+        tokens.push(Token { tok, span: Span::new(base + start as u32, base + i as u32) });
+    }
+    let end = base + b.len() as u32;
+    tokens.push(Token { tok: Tok::Eof, span: Span::new(end, end) });
+    Ok(Lexed { tokens, strings })
+}
+
+// `>>` is never lexed as one token, so generics like `Vec<Vec<i64>>` parse without splitting.
+// The parser joins two `>` tokens into a shift when they touch.
+
+fn lex_number(src: &str, i: &mut usize) -> Option<Tok> {
+    let b = src.as_bytes();
+    let start = *i;
+    let (radix, digits_start) = match (b[start], b.get(start + 1)) {
+        (b'0', Some(b'x')) => (16, start + 2),
+        (b'0', Some(b'o')) => (8, start + 2),
+        (b'0', Some(b'b')) => (2, start + 2),
+        _ => (10, start),
+    };
+    *i = digits_start;
+    while *i < b.len() && (b[*i].is_ascii_hexdigit() && radix == 16 || b[*i].is_ascii_digit() || b[*i] == b'_') {
+        *i += 1;
+    }
+    // A float literal: `1.5` or `1e3`. Not `1..2` and not `1.foo()`.
+    if radix == 10 && b.get(*i) == Some(&b'.') && b.get(*i + 1).is_some_and(|c| c.is_ascii_digit()) {
+        *i += 1;
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+            *i += 1;
+        }
+        return Some(Tok::Float);
+    }
+    let digits_end = *i;
+    let suf_start = *i;
+    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+        *i += 1;
+    }
+    let suf = &src[suf_start..*i];
+    if suf == "f32" || suf == "f64" {
+        return Some(Tok::Float);
+    }
+    // Accumulate digits directly; underscores are separators.
+    let mut value: u64 = 0;
+    let mut any = false;
+    for &c in &b[digits_start..digits_end] {
+        if c == b'_' {
+            continue;
+        }
+        let d = (c as char).to_digit(radix)? as u64;
+        value = value.checked_mul(radix as u64)?.checked_add(d)?;
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    Some(Tok::Int(value, suffix(suf)?))
+}
+
+fn lex_escape(src: &str, i: &mut usize) -> Option<char> {
+    let b = src.as_bytes();
+    let c = *b.get(*i + 1)?;
+    *i += 2;
+    Some(match c {
+        b'n' => '\n',
+        b't' => '\t',
+        b'r' => '\r',
+        b'0' => '\0',
+        b'\\' => '\\',
+        b'\'' => '\'',
+        b'"' => '"',
+        b'x' => {
+            let v = u8::from_str_radix(src.get(*i..*i + 2)?, 16).ok()?;
+            *i += 2;
+            if v > 0x7f {
+                return None;
+            }
+            v as char
+        }
+        b'u' => {
+            if b.get(*i) != Some(&b'{') {
+                return None;
+            }
+            let end = src[*i..].find('}')? + *i;
+            let v = u32::from_str_radix(&src[*i + 1..end].replace('_', ""), 16).ok()?;
+            *i = end + 1;
+            char::from_u32(v)?
+        }
+        _ => return None,
+    })
+}
