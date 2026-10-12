@@ -371,12 +371,19 @@ impl FnGen<'_, '_, '_> {
         match o {
             Operand::Copy(pl) => self.place(pl, loc),
             Operand::Move(pl) => {
-                // Moving the whole local, or a payload out of it (which moves the whole local).
-                let whole = pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_)));
-                if whole && self.local_drop[pl.local as usize] {
-                    post.push(format!("d{} = 0;", pl.local));
+                let (e, t) = self.place(pl, loc);
+                if self.local_drop[pl.local as usize] {
+                    if pl.proj.is_empty() {
+                        // Moving the whole local: it owns nothing now.
+                        post.push(format!("d{} = 0;", pl.local));
+                    } else if pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_))) {
+                        // Moving one field out (a partial move, or an enum payload). Zero the
+                        // field so the local's later drop skips it (a zero `String` or `Vec`
+                        // drops as a no-op) but still drops every other field.
+                        post.push(format!("{e} = ({}){{0}};", ctype(&t)));
+                    }
                 }
-                self.place(pl, loc)
+                (e, t)
             }
             Operand::Const(c) => match c {
                 Const::Int(v, it) => {
