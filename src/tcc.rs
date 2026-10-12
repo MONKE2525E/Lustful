@@ -88,7 +88,10 @@ struct Tcc {
 impl Tcc {
     fn new(output: c_int, debug: bool) -> Result<Tcc, String> {
         let lib = CString::new(env!("LUST_TCC_LIB_PATH")).unwrap();
-        let opts = CString::new(if debug { "-g -w" } else { "-w" }).unwrap();
+        // No asynchronous unwind tables: tcc writes overlapping .eh_frame
+        // FDEs (spike K6), which makes the system linker reject its
+        // objects. Lust frames never unwind, so the tables are pure cost.
+        let opts = CString::new(if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }).unwrap();
         // SAFETY: a fresh libtcc state; the error vector is boxed so its address is stable.
         unsafe {
             let s = tcc_new();
@@ -142,7 +145,7 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
         let c = obj.with_extension("c");
         std::fs::write(&c, src).map_err(|e| format!("cannot write {}: {e}", c.display()))?;
         let mut cmd = Command::new(env!("LUST_TCC_BIN"));
-        cmd.arg("-c").arg("-w");
+        cmd.arg("-c").arg("-w").arg("-fno-asynchronous-unwind-tables");
         if debug {
             cmd.arg("-g");
         }
@@ -213,6 +216,9 @@ pub fn cached_runtime_object(runtime_src: &str, debug: bool) -> Result<PathBuf, 
     runtime_src.hash(&mut h);
     debug.hash(&mut h);
     env!("LUST_TCC_LIB_PATH").hash(&mut h);
+    // The compile options change the object's bytes too; name the set so
+    // a flag change does not reuse an object built without it.
+    "opts:no-asynchronous-unwind-tables".hash(&mut h);
     let obj = std::env::temp_dir().join(format!("lust-runtime-{:016x}.o", h.finish()));
     if obj.exists() {
         return Ok(obj);
