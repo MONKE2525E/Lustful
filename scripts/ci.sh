@@ -48,6 +48,11 @@ if [ -e scripts/test-client.sh ]; then
   scripts/test-client.sh
 fi
 
+if [ -e scripts/test-slots.py ]; then
+  step "slot identity tests"
+  python3 scripts/test-slots.py
+fi
+
 if [ "${CI_SANITIZE:-1}" = 1 ]; then
   step "difftest (sanitize)"
   SANITIZE=1 scripts/difftest.sh
