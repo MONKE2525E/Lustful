@@ -14,6 +14,16 @@
 //!   a `Vec` with linear search. Iteration order matches the real crate
 //!   (insertion order), which the JSON kernel output does depend on.
 
+/// Stand-in for the ts-rust `unported!` macro (`gopanic.rs`): it panics
+/// with the same text. The recording side effect is dropped; no kernel
+/// driver reaches an unported path.
+#[macro_export]
+macro_rules! unported {
+    ($go_name:expr) => {{
+        panic!("unported Go code: {}", $go_name)
+    }};
+}
+
 /// Stand-in for the `memchr` crate: first/next byte search in a slice.
 pub mod memchr {
     /// `memchr::memchr`: first index of `needle` in `haystack`.
@@ -169,15 +179,47 @@ pub mod indexmap {
     use std::hash::Hash;
 
     /// `indexmap::IndexMap` with the subset of the API the kernels use.
-    /// Iteration is in insertion order, as in the real crate.
-    #[derive(Clone, Debug, Default)]
-    pub struct IndexMap<K, V> {
+    /// Iteration is in insertion order, as in the real crate. The `S`
+    /// hasher parameter exists for API shape only; search is linear.
+    #[derive(Clone)]
+    pub struct IndexMap<K, V, S = crate::support::rustc_hash::FxBuildHasher> {
         entries: Vec<(K, V)>,
+        hasher: std::marker::PhantomData<S>,
     }
 
-    impl<K: Eq + Hash, V> IndexMap<K, V> {
+    /// Debug prints as a map, as the real crate does.
+    impl<K: std::fmt::Debug, V: std::fmt::Debug, S> std::fmt::Debug for IndexMap<K, V, S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_map().entries(self.entries.iter().map(|(k, v)| (k, v))).finish()
+        }
+    }
+
+    impl<K, V, S> Default for IndexMap<K, V, S> {
+        fn default() -> Self {
+            IndexMap {
+                entries: Vec::new(),
+                hasher: std::marker::PhantomData,
+            }
+        }
+    }
+
+    /// Map equality in indexmap is order-independent: same keys with
+    /// equal values, in any order.
+    impl<K: Eq + Hash, V: PartialEq, S, S2> PartialEq<IndexMap<K, V, S2>> for IndexMap<K, V, S> {
+        fn eq(&self, other: &IndexMap<K, V, S2>) -> bool {
+            self.entries.len() == other.entries.len()
+                && self
+                    .entries
+                    .iter()
+                    .all(|(k, v)| other.entries.iter().any(|(ok, ov)| ok == k && ov == v))
+        }
+    }
+
+    impl<K: Eq + Hash, V: Eq, S> Eq for IndexMap<K, V, S> {}
+
+    impl<K, V, S> IndexMap<K, V, S> {
         pub fn new() -> Self {
-            IndexMap { entries: Vec::new() }
+            IndexMap::default()
         }
 
         pub fn len(&self) -> usize {
@@ -187,6 +229,25 @@ pub mod indexmap {
         pub fn is_empty(&self) -> bool {
             self.entries.is_empty()
         }
+
+        pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+            self.entries.iter().map(|(k, v)| (k, v))
+        }
+
+        pub fn keys(&self) -> impl Iterator<Item = &K> {
+            self.entries.iter().map(|(k, _)| k)
+        }
+
+        pub fn values(&self) -> impl Iterator<Item = &V> {
+            self.entries.iter().map(|(_, v)| v)
+        }
+
+        pub fn clear(&mut self) {
+            self.entries.clear();
+        }
+    }
+
+    impl<K: Eq + Hash, V, S> IndexMap<K, V, S> {
 
         /// Insert; returns the old value. A repeated key keeps its
         /// first position, as in the real crate.
@@ -243,22 +304,6 @@ pub mod indexmap {
             self.shift_remove(key)
         }
 
-        pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-            self.entries.iter().map(|(k, v)| (k, v))
-        }
-
-        pub fn keys(&self) -> impl Iterator<Item = &K> {
-            self.entries.iter().map(|(k, _)| k)
-        }
-
-        pub fn values(&self) -> impl Iterator<Item = &V> {
-            self.entries.iter().map(|(_, v)| v)
-        }
-
-        pub fn clear(&mut self) {
-            self.entries.clear();
-        }
-
         /// Entry API subset: mutable reference to the value for `key`,
         /// inserting `default` first when absent.
         pub fn entry_or_insert(&mut self, key: K, default: V) -> &mut V
@@ -274,7 +319,7 @@ pub mod indexmap {
         }
     }
 
-    impl<K: Eq + Hash, V> FromIterator<(K, V)> for IndexMap<K, V> {
+    impl<K: Eq + Hash, V, S> FromIterator<(K, V)> for IndexMap<K, V, S> {
         fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
             let mut map = IndexMap::new();
             for (k, v) in iter {
@@ -284,7 +329,7 @@ pub mod indexmap {
         }
     }
 
-    impl<'a, K, V> IntoIterator for &'a IndexMap<K, V> {
+    impl<'a, K, V, S> IntoIterator for &'a IndexMap<K, V, S> {
         type Item = (&'a K, &'a V);
         type IntoIter = std::iter::Map<
             std::slice::Iter<'a, (K, V)>,
@@ -295,7 +340,7 @@ pub mod indexmap {
         }
     }
 
-    impl<K, V> IntoIterator for IndexMap<K, V> {
+    impl<K, V, S> IntoIterator for IndexMap<K, V, S> {
         type Item = (K, V);
         type IntoIter = std::vec::IntoIter<(K, V)>;
         fn into_iter(self) -> Self::IntoIter {
@@ -304,14 +349,42 @@ pub mod indexmap {
     }
 
     /// `indexmap::IndexSet` with the subset of the API the kernels use.
-    #[derive(Clone, Debug, Default)]
-    pub struct IndexSet<T> {
+    /// The `S` hasher parameter exists for API shape only.
+    #[derive(Clone)]
+    pub struct IndexSet<T, S = crate::support::rustc_hash::FxBuildHasher> {
         entries: Vec<T>,
+        hasher: std::marker::PhantomData<S>,
     }
 
-    impl<T: Eq + Hash> IndexSet<T> {
+    impl<T, S> Default for IndexSet<T, S> {
+        fn default() -> Self {
+            IndexSet {
+                entries: Vec::new(),
+                hasher: std::marker::PhantomData,
+            }
+        }
+    }
+
+    /// Debug prints as a set, as the real crate does.
+    impl<T: std::fmt::Debug, S> std::fmt::Debug for IndexSet<T, S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_set().entries(self.entries.iter()).finish()
+        }
+    }
+
+    /// Set equality in indexmap is order-independent.
+    impl<T: Eq + Hash, S, S2> PartialEq<IndexSet<T, S2>> for IndexSet<T, S> {
+        fn eq(&self, other: &IndexSet<T, S2>) -> bool {
+            self.entries.len() == other.entries.len()
+                && self.entries.iter().all(|v| other.entries.contains(v))
+        }
+    }
+
+    impl<T: Eq + Hash, S> Eq for IndexSet<T, S> {}
+
+    impl<T, S> IndexSet<T, S> {
         pub fn new() -> Self {
-            IndexSet { entries: Vec::new() }
+            IndexSet::default()
         }
 
         pub fn len(&self) -> usize {
@@ -321,6 +394,17 @@ pub mod indexmap {
         pub fn is_empty(&self) -> bool {
             self.entries.is_empty()
         }
+
+        pub fn iter(&self) -> impl Iterator<Item = &T> {
+            self.entries.iter()
+        }
+
+        pub fn clear(&mut self) {
+            self.entries.clear();
+        }
+    }
+
+    impl<T: Eq + Hash, S> IndexSet<T, S> {
 
         pub fn insert(&mut self, value: T) -> bool {
             if self.entries.contains(&value) {
@@ -337,17 +421,9 @@ pub mod indexmap {
         {
             self.entries.iter().any(|e| e.borrow() == value)
         }
-
-        pub fn iter(&self) -> impl Iterator<Item = &T> {
-            self.entries.iter()
-        }
-
-        pub fn clear(&mut self) {
-            self.entries.clear();
-        }
     }
 
-    impl<T: Eq + Hash> FromIterator<T> for IndexSet<T> {
+    impl<T: Eq + Hash, S> FromIterator<T> for IndexSet<T, S> {
         fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
             let mut set = IndexSet::new();
             for v in iter {

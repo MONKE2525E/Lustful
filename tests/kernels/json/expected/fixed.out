@@ -1,0 +1,28 @@
+== fixed cases
+fxmap merge ok: true
+fxmap a=1
+fxmap b=2
+fxmap keep=old
+dup default error: jsontext: duplicate object member name "a"
+dup allowed: Object({"a": Number(2.0)})
+ordered ok: true
+ordered compact: {"z":1,"m":[true,null],"a":{"n":"x"}}
+str ok: true
+str value: "hi \n"
+str from number error: json: cannot unmarshal JSON number into Go string
+bool from string error: json: cannot unmarshal JSON string into Go bool
+f64 ok: true
+f64 value: -1500
+f64 from null: ok 0
+bad "{" error: jsontext: unexpected EOF after offset 1
+bad "[1,]" error: jsontext: invalid character ',' at start of value after offset 2
+bad "'x'" error: jsontext: invalid character '\'' at start of value
+bad "{\"a\" 1}" error: jsontext: invalid character '1' after object name (expecting ':') within "/a" after offset 5
+bad "tru" error: jsontext: unexpected EOF after offset 3
+bad "01" error: jsontext: invalid character '1' after top-level value after offset 1
+bad "\"bad\u{1}\"" error: jsontext: invalid character '\x01' in string (expecting non-control character) after offset 4
+deep len: 81
+deep round trip: true
+escapes ok: true
+escapes bytes: 61 c3 a9 f0 9d 84 9e 09 5c
+escapes compact: "aé𝄞\t\\"
