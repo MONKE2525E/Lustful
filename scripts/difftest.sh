@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Differential tests against rustc (the oracle).
 #   tests/pass/*.rs: rustc and lust must both build. Stdout and exit status must match.
+#                    A `// panic: <text>` comment also requires <text> in lust's stderr.
+#                    Rustc's panic text is not compared (see DESIGN.md).
 #   tests/fail/*.rs: rustc must reject the program, and `lust check` must report the code
 #                    named on the first line (`// expect: L0301`).
 #   tests/reject/*.rs: valid Rust that lust rejects on purpose (lifetimes, user macros).
@@ -37,12 +39,15 @@ for f in "$root"/tests/pass/*.rs; do
   if ! "$lust" build "$f" -o "$work/$name.lust" 2>"$work/$name.lust.err"; then
     report bad "$name" "lust rejected it: $(head -5 "$work/$name.lust.err")"; continue
   fi
+  panic_expect=$(sed -n 's|.*// panic: ||p' "$f" | head -1 | sed 's/[[:space:]]*$//')
   "$work/$name.rustc" >"$work/$name.rustc.out" 2>/dev/null; rs=$?
-  "$work/$name.lust" >"$work/$name.lust.out" 2>/dev/null; ls=$?
+  "$work/$name.lust" >"$work/$name.lust.out" 2>"$work/$name.lust.stderr"; ls=$?
   if [ $rs -ne $ls ]; then
     report bad "$name" "exit status rustc=$rs lust=$ls"
   elif ! diff -q "$work/$name.rustc.out" "$work/$name.lust.out" >/dev/null; then
     report bad "$name" "stdout differs:"; diff "$work/$name.rustc.out" "$work/$name.lust.out" | head -10
+  elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$work/$name.lust.stderr"; then
+    report bad "$name" "lust stderr lacks panic text '$panic_expect': $(head -3 "$work/$name.lust.stderr")"
   elif [ "${SANITIZE:-0}" = 1 ]; then
     "$lust" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name" 2>/dev/null
     if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$work/$name.san" "$work/$name".*.c 2>"$work/$name.san.err"; then

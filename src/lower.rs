@@ -378,7 +378,22 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::MethodCall { recv, args, .. } => self.method_into(e, *recv, args, dest, span),
             Expr::Binary { op, lhs, rhs } => self.binary_into(e, *op, *lhs, *rhs, dest, span),
             Expr::Unary { op, expr } => {
-                let o = self.operand(*expr);
+                // A negated integer literal is one literal, not a runtime negate:
+                // folding it is what makes `-128i8` (and the other MIN values) work.
+                if *op == crate::ast::UnOp::Neg
+                    && let Expr::Int(v, _) = p.ast.expr(*expr)
+                    && let TyKind::Int(it) = self.kind(ty)
+                {
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Int(v.wrapping_neg(), it))), span);
+                    }
+                    return;
+                }
+                let ld = match self.ck.res(e) {
+                    Res::Bin { ld, .. } => ld,
+                    _ => 0,
+                };
+                let o = self.operand_derefs(*expr, ld);
                 if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Un(*op, o), span);
                 } else {
