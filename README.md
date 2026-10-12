@@ -73,13 +73,22 @@ cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
 ## Use
 
 ```sh
-lust daemon                                        # optional: warm, incremental compiles for this directory
 lust check main.rs [--json] [--timings]
 lust build main.rs [-o out] [-g] [--emit-c prefix] [--timings]
 lust run main.rs [-- args]
+lust build main.rs --release            # release build: Cargo if a Cargo.toml is above the file, else rustc -O
+lust build main.rs --profile fast       # same, with a named Cargo profile
+lust check main.rs --rustc              # second opinion: the real rustc checks the file
+lust daemon                             # serve this directory yourself (not needed: see below)
 ```
 
-Without a daemon, `lust` compiles cold in a fresh process and links a standalone executable. With a daemon, the executable loads `libbase.so` from the daemon's cache directory.
+No setup is needed for warm speed. When `check`, `build`, or `run` finds no daemon for the directory, it answers that one command cold and starts a daemon in the background (its own session, log at `.lust-cache/daemon.log`). The next command is warm. The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, in seconds or with an `s`/`m`/`h` suffix; `0` means never). `LUST_NO_DAEMON=1` turns autostart off. Without a daemon, `lust` compiles cold in a fresh process and links a standalone executable. With a daemon, the executable loads `libbase.so` from the daemon's cache directory.
+
+Cold runs also use a whole-request disk cache in `.lust-cache/` next to the source file (`LUST_CACHE_DIR` overrides it, `LUST_NO_CACHE=1` turns it off, `LUST_CACHE_MAX_BYTES` sets the size cap; default 512 MiB, oldest entries deleted first). An unchanged file with the same flags replays in about 4 ms (check) or 8 ms (build). The key covers the compiler build, the tcc binary and runtime files, the source bytes and path, the flags, and the target.
+
+Trust rule for the cache: it is trusted like ccache's local cache. A cached build result is copied out and can run, so a poisoned cache is code execution. Never commit `.lust-cache/` (it is in `.gitignore`), never share it, and delete it if a checkout brings one along.
+
+Release builds go through the real Rust toolchain on the same source, and lust prints which tool ran. With a `Cargo.toml` above the file, lust runs `cargo build --release` (or `--profile <name>`) with the file's package and bin selection; `-o` copies the artifact out of `target/`. Without one, it runs `rustc -O --edition 2024` with the release oracle flags from [DESIGN.md](DESIGN.md).
 
 `--json` prints one diagnostic per line, each with `code`, `message`, `at`, and `fix`.
 
@@ -102,6 +111,7 @@ Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields 
 ```sh
 scripts/difftest.sh             # compare with rustc
 SANITIZE=1 scripts/difftest.sh  # also run the generated C under ASan and UBSan
+scripts/test-client.sh          # daemon autostart, disk cache, release handoff
 ```
 
 - `tests/pass`: lust and rustc must give the same stdout and exit status.
@@ -114,7 +124,8 @@ The agent-loop benchmark also tests incremental mode: every edit's result is com
 
 | File | Role |
 |---|---|
-| `src/client.rs`, `src/protocol.rs` | The thin `lust` client and the daemon wire format. |
+| `src/client.rs`, `src/protocol.rs` | The thin `lust` client (daemon autostart, release handoff) and the daemon wire format. |
+| `src/cache.rs` | The whole-request disk cache for cold runs. |
 | `src/main.rs`, `src/daemon.rs`, `src/driver.rs` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
 | `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas; the token scan that finds what changed. |
 | `src/collect.rs` | Item tables and signatures. |

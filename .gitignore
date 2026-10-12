@@ -1,3 +1,9 @@
 /target
 /third_party/tinycc
 /third_party/tcc
+# lust's own local state. The cache is trusted local data: never commit it.
+.lust-cache/
+.lust-daemon.sock
+.lust-daemon.sock.lock
+/tests/cargo-proj/target
+/tests/cargo-proj/Cargo.lock
