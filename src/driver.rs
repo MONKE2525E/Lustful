@@ -662,7 +662,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.ok[slot(i)] = results[k].1.is_empty();
         diags.extend(results[k].1.iter().cloned());
     }
-    if req.cmd == Cmd::Build && program.main.is_none() {
+    // A lust file is a bin crate, so check needs `main` too, as `rustc --emit=metadata`
+    // does. `lust test` sets `harness`: it adds a generated `main` after this check.
+    if !req.harness && program.main.is_none() {
         diags.push(Diag::new("L0130", diag::Span::default(), "no `main` function", "Add `fn main() { ... }`."));
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });

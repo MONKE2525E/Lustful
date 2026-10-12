@@ -33,6 +33,10 @@ pub struct Request {
     /// not carry this (decode sets None): a daemon build still writes the executable and the
     /// client runs it.
     pub run_args: Option<Vec<String>>,
+    /// For `lust test`: the file gets a generated `main`, so a missing user `main` is not
+    /// an error. The daemon wire format does not carry this (decode sets false): `lust
+    /// test` compiles in its own process.
+    pub harness: bool,
 }
 
 #[derive(Default)]
@@ -131,6 +135,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         emit_c: emit_c.map(|p| abs(&p)),
         max_errors,
         run_args: if run { Some(run_args.clone()) } else { None },
+        harness: false,
     };
     Some(Invocation::Compile { req, run, args: run_args })
 }
@@ -165,6 +170,7 @@ pub fn decode(line: &str) -> Option<Request> {
         emit_c: if f[6].is_empty() { None } else { Some(f[6].into()) },
         max_errors: if f.len() == 8 { f[7].parse().ok()? } else { 20 },
         run_args: None,
+        harness: false,
     })
 }
 

@@ -295,6 +295,7 @@ mod tests {
             emit_c: None,
             max_errors: 20,
             run_args: None,
+            harness: false,
         }
     }
 
