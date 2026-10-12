@@ -9,14 +9,17 @@
 #   - for `run`: program stdout, program exit status, and the first panic span
 #     (`panicked at file:line:col`), when the program panics.
 # A daemon crash, a daemon hang, or a cold-compile crash (exit 101, signal, hang) is a
-# failure by itself. `--strict` also requires the full stderr text to match.
+# failure by itself. One exception: for `run`, a timeout on both sides means the
+# edited program itself does not terminate, which is the same behavior both ways,
+# not a compiler hang. A `check` timeout is always a compiler hang. `--strict`
+# also requires the full stderr text to match.
 #
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|realish [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
 #   fuzz.py shrink --prev A.rs --cur B.rs --out DIR
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
-import argparse, os, random, re, shutil, subprocess, sys, tempfile, time
+import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -152,8 +155,12 @@ class Harness:
     def start_daemon(self):
         if os.path.exists(self.sock):
             os.unlink(self.sock)
+        # Own session, so kill_daemon can take down the whole group: an
+        # in-memory `run` forks the user program from the daemon, and a
+        # non-terminating program must die with its daemon, not spin on
+        # as an orphan.
         self.daemon = subprocess.Popen([LUST, "daemon"], cwd=self.work, env=self.env,
-                                       stderr=self.log)
+                                       stderr=self.log, start_new_session=True)
         # Any guard check the previous daemon left pending is dead with it.
         self._poll_log()
         self._gstart_base = self._gstart
@@ -166,7 +173,13 @@ class Harness:
 
     def kill_daemon(self):
         try:
-            self.daemon.kill()
+            os.killpg(os.getpgid(self.daemon.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                self.daemon.kill()
+            except Exception:
+                pass
+        try:
             self.daemon.wait(timeout=5)
         except Exception:
             pass
@@ -175,12 +188,25 @@ class Harness:
         args = [LUST, cmd, self.crate]
         if cmd != "check":
             args += ["-o", os.path.join(self.work, "prog")]
+        # Own session per request: on timeout the whole group dies, client
+        # and the program it ran alike. Killing only the client used to
+        # leave a non-terminating edited program spinning as an orphan.
+        p = subprocess.Popen(args, cwd=self.work,
+                             env=self.env if use_daemon else self.cold,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
         try:
-            r = subprocess.run(args, cwd=self.work,
-                               env=self.env if use_daemon else self.cold,
-                               capture_output=True, text=True, timeout=self.timeout)
-            return (r.returncode, r.stdout, r.stderr)
+            out, err = p.communicate(timeout=self.timeout)
+            return (p.returncode, out, err)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                p.communicate(timeout=5)
+            except Exception:
+                pass
             return ("TIMEOUT", "", "")
 
     def write(self, text):
@@ -243,14 +269,25 @@ class Harness:
 
 
 def compare(h, cmd, strict):
-    """Runs cmd both ways on the current crate bytes. Returns (ok, why, da, cold)."""
+    """Runs cmd both ways on the current crate bytes. Returns (ok, why, da, cold).
+
+    A `run` timeout on the daemon side is not yet a verdict: the edited
+    program may simply not terminate. The cold side decides: a cold
+    timeout too is a matching program hang (ok, why "program hang");
+    a cold answer makes it a daemon hang. The caller restarts the
+    daemon after any daemon-side run timeout, because the daemon may
+    still be waiting on the program it forked for an in-memory run."""
     da = h.run_cmd(cmd, True)
     if not h.daemon_alive():
         return False, "daemon died", da, None
     ck = crash_kind(cmd, da[0])
-    if ck:
+    if ck and not (cmd == "run" and da[0] == "TIMEOUT"):
         return False, f"daemon {ck}", da, None
     co = h.run_cmd(cmd, False)
+    if cmd == "run" and da[0] == "TIMEOUT":
+        if co[0] == "TIMEOUT":
+            return True, "program hang", da, co
+        return False, "daemon hang", da, co
     ck = crash_kind(cmd, co[0])
     if ck:
         return False, f"cold {ck}", da, co
@@ -434,6 +471,15 @@ def cmd_run(a):
                 snapshots.append(text)
             if it % 25 == 24 and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
+                if ok and why == "program hang":
+                    # The edited program does not terminate on either side:
+                    # same behavior, not a failure. The daemon may still be
+                    # waiting on the copy it forked, so restart it; the next
+                    # edit primes the fresh session.
+                    print(f"note: program hang at iter {it} op {op} (both sides); daemon restarted",
+                          flush=True)
+                    h.kill_daemon()
+                    h.start_daemon()
                 if not ok:
                     failures += 1
                     bad_ops[f"run {why}"] += 1
