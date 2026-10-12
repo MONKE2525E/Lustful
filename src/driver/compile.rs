@@ -636,18 +636,45 @@ fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
     out
 }
 
-/// Compiles one request, reusing whatever `session` holds.
+/// Compiles one request, reusing whatever `session` holds. The session
+/// serves one `SessionKey`: a request for another key is a routing bug and
+/// gets an internal error, never this session's state.
 pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut t = Timer::new();
+    if req.session != session.key {
+        return Response {
+            stderr: format!(
+                "error: internal: request routed to the wrong session\n  request: {}\n  session: {}\n",
+                req.session.describe(),
+                session.key.describe()
+            ),
+            code: 3,
+            ..Default::default()
+        };
+    }
+    // Lust builds for the host target today. A named non-host triple is a
+    // clear error, not a host binary under a foreign name.
+    let triple = &req.session.target_triple;
+    if !triple.is_empty() && triple != crate::protocol::host_triple() {
+        return Response {
+            stderr: format!(
+                "error: unsupported target `{triple}`: lust builds for the host target `{}` today\n",
+                crate::protocol::host_triple()
+            ),
+            code: 2,
+            ..Default::default()
+        };
+    }
     let path = req.file.to_string_lossy().to_string();
     let src = match std::fs::read_to_string(&req.file) {
         Ok(s) => s,
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };
-    let Session { front, caches } = session;
-    // The crate identity for stable defs: today's synthetic one-file bin crate
-    // (src/def.rs). `lust test` harness builds are a distinct test target.
-    let crate_ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash(&path, req.harness) };
+    // The crate identity for stable defs comes from the session's key (its
+    // package and target identity, `Session::crate_ids`). For a single-file
+    // program that is the synthetic one-file bin crate, as before.
+    let crate_ids = session.crate_ids();
+    let Session { front, caches, .. } = session;
     t.lap("read");
 
     // Lex and scan in chunks of whole items, in parallel. Only the region an edit touched is
@@ -1210,5 +1237,43 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
             assert_eq!(program.local_def(k.disk.hash), Some(local), "fn {i}");
         }
         assert_eq!(program.main.map(|m| program.def_id(m)), keys.get(2).map(|k| crate::def::DefId { krate: ids.local, hash: k.disk.hash }));
+    }
+
+    fn req_for(key: crate::protocol::SessionKey) -> Request {
+        Request {
+            cmd: Cmd::Check,
+            file: key.krate.root.clone(),
+            session: key,
+            out: PathBuf::from("/tmp/out"),
+            json: false,
+            timings: false,
+            debug: false,
+            emit_c: None,
+            max_errors: 20,
+            run_args: None,
+            harness: false,
+        }
+    }
+
+    /// Routing guard: a request for another crate selection never compiles in
+    /// this session (code 3 before any file read), and a non-host target is a
+    /// clear code 2, not a host build under a foreign name.
+    #[test]
+    fn compile_refuses_a_misrouted_request() {
+        let dir = PathBuf::from("/tmp/lust-route-test");
+        let a = crate::protocol::SessionKey::synthetic(std::path::Path::new("/tmp/nope/a.rs"), false);
+        let mut b = crate::protocol::SessionKey::synthetic(std::path::Path::new("/tmp/nope/a.rs"), false);
+        b.features = vec!["alpha".into()];
+        let mut s = Session::new(dir.clone(), false, a.clone());
+        let r = compile(&req_for(b), &mut s);
+        assert_eq!(r.code, 3);
+        assert!(r.stderr.contains("wrong session"), "{}", r.stderr);
+        let mut foreign = a;
+        foreign.target_triple = "wasm32-wasip1".into();
+        let req = req_for(foreign.clone());
+        let mut s = Session::new(dir, false, foreign);
+        let r = compile(&req, &mut s);
+        assert_eq!(r.code, 2);
+        assert!(r.stderr.contains("unsupported target"), "{}", r.stderr);
     }
 }

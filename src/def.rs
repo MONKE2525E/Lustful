@@ -81,8 +81,8 @@ impl DiskDefId {
 }
 
 /// Both identities of the crate a compile works on: the session-local id and the
-/// stable hash. The driver makes one per request today; S6 makes one per crate
-/// session from the Cargo graph (W-RESOLVE owns the real package identity).
+/// stable hash. The driver makes one per crate session from its session key
+/// (S6); W-RESOLVE supplies the real package identity from the Cargo graph.
 #[derive(Clone, Copy, Debug)]
 pub struct CrateIds {
     pub local: CrateId,
@@ -134,6 +134,10 @@ pub fn stable_crate_hash(package_id: &str, target_kind: &str, target_name: &str,
 /// daemon's session key) stands in for the package id, and the file stem is the
 /// bin target name. `test` is set for `lust test` harness builds. W-RESOLVE
 /// replaces this with the real package id and target when Cargo loading lands.
+/// Since S6 the driver hashes the request's session key instead; this helper
+/// stays as the reference form the synthetic key must match (its tests and
+/// `driver::session`'s test pin the two together).
+#[allow(dead_code)]
 pub fn synthetic_crate_hash(file_path: &str, test: bool) -> StableCrateHash {
     let stem = file_path.rsplit('/').next().unwrap_or(file_path);
     let stem = stem.strip_suffix(".rs").unwrap_or(stem);

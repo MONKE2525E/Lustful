@@ -1,13 +1,15 @@
 // Session state for the compile pipeline: everything an edit can reuse (the AST,
-// per-function body hashes, generated C, glue, and object files). `lust daemon` keeps
-// one session per file alive between requests; a plain `lust check` uses a fresh
-// session once. The pipeline itself is in compile.rs.
+// per-function body hashes, generated C, glue, and object files). One session
+// serves one crate under one selection: `lust daemon` keeps one session per
+// `SessionKey` alive between requests (docs/ARCH.md section 1.8); a plain
+// `lust check` uses a fresh session once. The pipeline itself is in compile.rs.
 use crate::ast::Ast;
 use crate::cgen::{FnOut, GlueSet};
-use crate::def::DiskDefId;
+use crate::def::{CrateIds, DiskDefId, LOCAL_CRATE, stable_crate_hash};
 use crate::diag::SourceMap;
 use crate::intern::{FxMap, Interner, Known};
 use crate::lexer::Lexed;
+use crate::protocol::SessionKey;
 use crate::scan;
 use std::path::{Path, PathBuf};
 
@@ -43,8 +45,8 @@ pub(crate) struct Front {
     pub(crate) chunks: Vec<Chunk>,
     /// The source text of the last request, to find what an edit changed.
     pub(crate) src: String,
-    /// The session's source map: each file's path and line index. One file per session
-    /// today, always `FileId(0)`; spans in the AST name it.
+    /// The session's source map: each file's path and line index. One crate
+    /// root file per session today, always `FileId(0)`; spans in the AST name it.
     pub(crate) map: SourceMap,
     /// The chunk-boundary mask (see `split_items`). Fixed for the session, so boundaries are too.
     pub(crate) split_mask: Option<u64>,
@@ -94,15 +96,19 @@ pub(crate) struct Caches {
 }
 
 pub struct Session {
+    /// The one crate selection this session serves. A request whose key does
+    /// not match is a routing bug; compile rejects it instead of mixing state.
+    pub(crate) key: SessionKey,
     pub(crate) front: Front,
     pub(crate) caches: Caches,
 }
 
 impl Session {
-    pub fn new(obj_dir: PathBuf, persistent: bool) -> Session {
+    pub fn new(obj_dir: PathBuf, persistent: bool, key: SessionKey) -> Session {
         let interner = Interner::default();
         let known = Known::new(&interner);
         Session {
+            key,
             front: Front {
                 interner,
                 known,
@@ -139,6 +145,17 @@ impl Session {
     }
     pub fn obj_dir(&self) -> &Path {
         &self.caches.obj_dir
+    }
+
+    /// Both crate identities for stable defs: the session-local id (one crate
+    /// per session today) and the stable hash over the key's package and
+    /// target identity (docs/ARCH.md section 1.7 steps 1 and 2). Features and
+    /// the target triple select the session; they are not part of def
+    /// identity, matching section 1.8's split of SessionKey from the crate
+    /// disambiguator.
+    pub(crate) fn crate_ids(&self) -> CrateIds {
+        let k = &self.key.krate;
+        CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&k.package_id, &k.target_kind, &k.target_name, k.test) }
     }
 }
 
@@ -198,6 +215,25 @@ mod tests {
 
     fn key(krate: u64, hash: u64) -> DiskDefId {
         DiskDefId { krate: StableCrateHash(krate), hash: DefPathHash(hash) }
+    }
+
+    /// The session key's stable crate hash matches the pre-S6 synthetic hash
+    /// byte for byte (same package string, `bin` target, stem name, test
+    /// flag), so slot identities for single-file programs do not move.
+    /// Features select a session without changing def identity (section 1.8).
+    #[test]
+    fn session_key_keeps_the_synthetic_crate_hash() {
+        let dir = PathBuf::from("/tmp/lust-session-test");
+        for test in [false, true] {
+            let key = SessionKey::synthetic(Path::new("/tmp/x/main.rs"), test);
+            let s = Session::new(dir.clone(), false, key.clone());
+            assert_eq!(s.crate_ids().stable, crate::def::synthetic_crate_hash("/tmp/x/main.rs", test));
+            assert_eq!(s.key, key);
+        }
+        let mut key = SessionKey::synthetic(Path::new("/tmp/x/main.rs"), false);
+        key.features = vec!["alpha".into()];
+        let s = Session::new(dir, false, key);
+        assert_eq!(s.crate_ids().stable, crate::def::synthetic_crate_hash("/tmp/x/main.rs", false), "features do not rename defs");
     }
 
     /// Serialize, then read back in a fresh map (a restarted daemon): every
