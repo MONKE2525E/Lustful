@@ -484,7 +484,28 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.assign(d.clone(), Rvalue::Use(op), span);
                     }
                 }
-                Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, Vec::new()), ty, span),
+                Res::Variant(a, v) => {
+                    if matches!(self.kind(ty), TyKind::FnDef(..)) {
+                        // A constructor used as a value: the value itself
+                        // is zero-sized; calls through it decode the
+                        // constructor from the type.
+                        self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span)
+                    } else {
+                        self.set_or_temp(dest, Rvalue::Aggregate(a, v, Vec::new()), ty, span)
+                    }
+                }
+                Res::Fn(f) => {
+                    // A fn item used as a value: zero-sized at its FnDef
+                    // type, the slot trampoline where a fn pointer goes.
+                    let want = match dest {
+                        Some(d) if d.proj.is_empty() => {
+                            let dt = self.body.locals[d.local as usize].ty;
+                            if matches!(self.kind(dt), TyKind::FnPtr(_)) { dt } else { ty }
+                        }
+                        _ => ty,
+                    };
+                    self.set_or_temp(dest, Rvalue::FnValue(f, want), ty, span)
+                }
                 Res::Static(idx) => self.set_or_temp(dest, Rvalue::StaticLoad(idx), ty, span),
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
                 _ => {}
@@ -604,8 +625,26 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Expr::For { label, pat, iter, body } => self.for_loop(e, *label, *pat, *iter, *body, span, dest),
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
-            Expr::Call { args, .. } => {
+            Expr::Call { callee, args } => {
                 let res = self.ck.res(e);
+                // An indirect call reads the callee value before the
+                // arguments run, as Rust evaluates the callee first.
+                let indirect_local = if res == Res::Indirect {
+                    let ct = self.ty(*callee);
+                    let op = self.operand(*callee);
+                    match op {
+                        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() => Some(pl.local),
+                        Operand::Copy(pl) | Operand::Move(pl) => {
+                            let t = self.temp(ct);
+                            let op2 = self.operand_from(pl, ct);
+                            self.assign(Place::local(t), Rvalue::Use(op2), span);
+                            Some(t)
+                        }
+                        Operand::Const(_) => None,
+                    }
+                } else {
+                    None
+                };
                 let ops: Vec<Operand> = args.iter().map(|&a| self.operand(a)).collect();
                 match res {
                     Res::Fn(f) => {
@@ -639,6 +678,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(zero)), ty, span)
                     }
                     Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
+                    Res::Indirect => {
+                        if let Some(l) = indirect_local {
+                            let d = self.call_dest(dest, ty);
+                            self.call_into(CallTarget::Indirect(l), ops, d, span);
+                        }
+                    }
                     _ => return,
                 }
             }
