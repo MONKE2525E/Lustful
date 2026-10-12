@@ -173,7 +173,11 @@ pub(super) fn trait_method_probe(
     let Some(traits) = p.gx.traits_by_method.get(&name).cloned() else { return Probe::Miss };
     // First pass: probe every in-scope trait by selection, with
     // rollback, and count the hits at this form.
-    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>)> = Vec::new();
+    // A hit: trait, its method template, the impl method (or
+    // default) local, the instantiation prefix, and the trait
+    // input types a trial argument check inferred (when plain
+    // selection with fresh inputs was ambiguous).
+    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>)> = Vec::new();
     for trait_def in traits {
         if !trait_in_scope(cx, trait_def) {
             continue;
@@ -205,6 +209,7 @@ pub(super) fn trait_method_probe(
         let args_id = cx.tys.intern_args(&tr_args);
         let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
         let sel = cx.select_obligation(tr);
+        let ambiguous = matches!(sel, Selection::Ambiguous);
         let found: Option<(LocalDefId, Vec<GenericArg>)> = match sel {
             Selection::Impl { id, args: impl_args, .. } => {
                 let rec_impl = p.gx.index.get(id);
@@ -233,19 +238,94 @@ pub(super) fn trait_method_probe(
         cx.rollback_vars(snap);
         cx.obl_truncate(obl_len);
         if let Some((local, prefix)) = found {
-            hits.push((trait_def, tmpl, local, prefix));
+            hits.push((trait_def, tmpl, local, prefix, None));
+            continue;
+        }
+        // Ambiguous selection with fresh trait inputs is common
+        // with one impl per input (`Convert<u8>` and
+        // `Convert<u16>` for one Self): the written arguments
+        // fix the inputs through the trait method's own
+        // signature. Trial-check the arguments against that
+        // signature (rolled back in full), then select again
+        // with the inferred inputs.
+        if ambiguous && let Some(t) = &tmpl {
+            let snap = cx.snapshot_vars();
+            let obl_len = cx.obl_len();
+            let err_len = cx.errs.len();
+            let sites_len = cx.generic_sites.len();
+            let csites_len = cx.closure_sites.len();
+            let mut input_vars: Vec<Ty> = Vec::new();
+            let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
+            for _ in 0..n_inputs {
+                let v = cx.new_var(false);
+                input_vars.push(v);
+                full.push(GenericArg::Ty(v));
+            }
+            let n_trait_params = rec.generics.params.len();
+            for (i, param) in t.generics.params.iter().enumerate().skip(n_trait_params) {
+                let given = explicit.get(i - n_trait_params).copied().flatten();
+                full.push(match (given, &param.kind) {
+                    (Some(g), _) => g,
+                    (None, ParamKind::Type) => GenericArg::Ty(cx.new_var(false)),
+                    (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
+                    (None, ParamKind::Const(_)) => GenericArg::Const(cx.fresh_const_var()),
+                });
+            }
+            let params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
+            let want_form = receiver_for_form(cx, step, form);
+            let zonked: Option<Vec<Ty>> = if !params.is_empty() && cx.unify(params[0], want_form) {
+                cx.check_args(&params[1..], args, name_span);
+                Some(input_vars.iter().map(|&v| cx.deep(v)).collect())
+            } else {
+                None
+            };
+            cx.rollback_vars(snap);
+            cx.obl_truncate(obl_len);
+            cx.errs.truncate(err_len);
+            cx.generic_sites.truncate(sites_len);
+            cx.closure_sites.truncate(csites_len);
+            if let Some(inputs) = zonked {
+                let snap = cx.snapshot_vars();
+                let obl_len = cx.obl_len();
+                let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
+                tr_args.extend(inputs.iter().map(|&t| GenericArg::Ty(t)));
+                let args_id = cx.tys.intern_args(&tr_args);
+                let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+                let found: Option<(LocalDefId, Vec<GenericArg>)> = match cx.select_obligation(tr) {
+                    Selection::Impl { id, args: impl_args, .. } => {
+                        let rec_impl = p.gx.index.get(id);
+                        let by_name =
+                            rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
+                        match by_name {
+                            Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
+                            None => p.local_def(method_def.hash).map(|l| (l, tr_args.clone())),
+                        }
+                    }
+                    _ => None,
+                };
+                cx.rollback_vars(snap);
+                cx.obl_truncate(obl_len);
+                if let Some((local, prefix)) = found {
+                    hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs)));
+                }
+            }
         }
     }
     match hits.len() {
         0 => Probe::Miss,
         1 => {
-            let (trait_def, _tmpl, local, prefix) = hits.into_iter().next().unwrap();
+            let (trait_def, _tmpl, local, prefix, zonked) = hits.into_iter().next().unwrap();
             // Re-select to commit the selection bindings and get
             // the confirmed instantiation prefix.
-            let n_inputs = prefix.len().saturating_sub(1);
             let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
-            for _ in 0..n_inputs {
-                tr_args.push(GenericArg::Ty(cx.new_var(false)));
+            match &zonked {
+                Some(inputs) => tr_args.extend(inputs.iter().map(|&t| GenericArg::Ty(t))),
+                None => {
+                    let n_inputs = prefix.len().saturating_sub(1);
+                    for _ in 0..n_inputs {
+                        tr_args.push(GenericArg::Ty(cx.new_var(false)));
+                    }
+                }
             }
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
