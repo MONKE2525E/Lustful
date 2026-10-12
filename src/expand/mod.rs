@@ -572,6 +572,11 @@ pub struct ExpandCtx<'a> {
     pub file_path: String,
     pub src: &'a str,
     pub cfg: builtin::CfgEnv,
+    /// The module path (from the crate root) of the file being expanded.
+    /// Empty for a crate root file and for single-file programs. The
+    /// resolve worklist sets it per module file so `super::mac!`,
+    /// `self::mac!`, and prescan module tables read from the right module.
+    pub module_path: Vec<Sym>,
 }
 
 impl<'a> ExpandCtx<'a> {
@@ -583,6 +588,7 @@ impl<'a> ExpandCtx<'a> {
             file_path: file_path.to_string_lossy().to_string(),
             src,
             cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new() },
+            module_path: Vec::new(),
         }
     }
     /// The crate name `module_path!` starts with: the file stem, with
@@ -752,7 +758,7 @@ impl<'a> Expander<'a> {
             by_path: FxMap::default(),
             module_defs: FxMap::default(),
             module_imports: FxMap::default(),
-            module: Vec::new(),
+            module: ctx.module_path.clone(),
             cur_file: ctx.file_path.clone(),
             cur_src: ctx.src.to_string(),
             deps_hash: 0,
@@ -873,10 +879,36 @@ pub fn splice_placeholders(trees: Vec<Tt>, name: &str, replacement: &[Tt], inter
     out
 }
 
+/// One macro definition the worklist hands to the expander before a
+/// file walk (ARCH 6.1): a `macro_rules!` definition written in another
+/// file or crate, addressable by a module path from the expanding
+/// crate's root. An empty path is the crate root itself, which is where
+/// `#[macro_export]` macros of this crate live (`crate::name!`); a path
+/// of one segment names a dependency crate (`dep::name!`); longer paths
+/// name a public re-export module (`crate::m::name!`). Seeds never enter
+/// textual scope: a plain `name!` call still needs textual order or a
+/// `use` in the expanding file, exactly as in Rust. `tokens` is the
+/// flat token slice of the definition (from `macro_rules` to its
+/// closing group and optional `;`), and `strings` is the string table
+/// those tokens index into; the expander remaps them into its own table
+/// and compiles the definition there, so string values stay exact.
+pub struct MacroSeed {
+    pub path: Vec<Sym>,
+    pub tokens: Vec<Token>,
+    pub strings: Vec<String>,
+}
+
 /// Expands every macro in one lexed file or chunk, returning the
 /// expanded token list. A file that cannot contain macros comes back
 /// unchanged (the same `Lexed`).
 pub fn expand_lexed(lexed: Lexed, ctx: &ExpandCtx) -> Result<Lexed, Diag> {
+    expand_lexed_seeded(lexed, ctx, &[])
+}
+
+/// `expand_lexed` with worklist macro seeds registered in the path
+/// tables before the prescan, so this file's own `use` items and path
+/// calls can resolve macros defined in other files and crates.
+pub fn expand_lexed_seeded(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<Lexed, Diag> {
     if !needs_expansion(&lexed.tokens, ctx.interner) {
         return Ok(lexed);
     }
@@ -887,6 +919,9 @@ pub fn expand_lexed(lexed: Lexed, ctx: &ExpandCtx) -> Result<Lexed, Diag> {
     }
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
     let mut st = Expander::new(ctx, lexed.strings);
+    for seed in seeds {
+        st.seed_macro(seed)?;
+    }
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
     st.prescan(&tts)?;
     let out = st.expand_list(tts, 0, true, 0)?;
@@ -1072,7 +1107,7 @@ impl<'a> Expander<'a> {
             Ok(())
         }
         let mut uses: Vec<UseSite> = Vec::new();
-        let mut module: Vec<Sym> = Vec::new();
+        let mut module: Vec<Sym> = self.ctx.module_path.clone();
         walk(self, trees, &mut module, true, &mut uses)?;
         // Public re-exports first, so other modules' imports can resolve
         // through the path table they create.
@@ -1129,6 +1164,54 @@ impl<'a> Expander<'a> {
                 path(&module).or_else(|| path(&middle)).or_else(|| self.module_defs.get(&(module.clone(), last)).copied())
             }
         }
+    }
+
+    /// Compiles one worklist macro seed into this expander's path
+    /// tables. The seed's string table is appended to this run's table
+    /// and its tokens are remapped before compilation, so the compiled
+    /// definition reads strings from the right table. A seed whose
+    /// tokens hold no `macro_rules!` definition is ignored: the
+    /// worklist only seeds outline-proven definitions.
+    fn seed_macro(&mut self, seed: &MacroSeed) -> Result<(), Diag> {
+        let offset = self.strings.len() as u32;
+        self.strings.extend(seed.strings.iter().cloned());
+        let toks: Vec<Token> = seed
+            .tokens
+            .iter()
+            .map(|t| {
+                let tok = match t.tok {
+                    Tok::Str(i) => Tok::Str(i + offset),
+                    Tok::Float(i) => Tok::Float(i + offset),
+                    other => other,
+                };
+                Token { tok, span: t.span }
+            })
+            .collect();
+        let (trees, balanced) = build_trees(&toks);
+        if !balanced {
+            return Ok(());
+        }
+        let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
+        let mut i = 0;
+        while i < tts.len() {
+            if let Some(attr) = attr_at(&tts, i, self.ctx.interner) {
+                i = attr.end;
+                continue;
+            }
+            if let Some(def) = macro_rules_at(&tts, i, self.ctx.interner) {
+                let body = match &tts[def.group] {
+                    Tt::Delim(_, inner, _) => inner.clone(),
+                    _ => return Ok(()),
+                };
+                let at_root = seed.path.is_empty();
+                let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
+                let idx = self.register(Rc::new(compiled), at_root, false);
+                self.by_path.insert((seed.path.clone(), def.name), idx);
+                return Ok(());
+            }
+            i += 1;
+        }
+        Ok(())
     }
 
     /// Stores a compiled definition. `path` also puts it in the crate

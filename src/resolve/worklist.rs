@@ -664,6 +664,7 @@ pub fn resolve_crate_cached(
                     file_path: job.path.to_string_lossy().to_string(),
                     src: &job.text,
                     cfg: expand_cfg(&input.env),
+                    module_path: Vec::new(),
                 };
                 let lexed = crate::expand::expand_lexed(raw, &ects)?;
                 let store = clone_lexed(&lexed);

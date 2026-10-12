@@ -197,14 +197,18 @@ pub struct ModDecl {
 
 /// One `macro_rules!` definition name in a file outline.
 #[allow(dead_code)] // Fields are read by the resolve worklist as it lands.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MacroDecl {
     pub name: Sym,
     /// True when a `#[macro_export]` attribute is present.
     pub exported: bool,
     /// True when `#[macro_export]` also carries `local_inner_macros`.
     pub local_inner: bool,
+    /// (inline container depth, token index of `macro_rules`).
     pub container: (usize, usize),
+    /// The inline module name path that contains this definition (empty
+    /// at the top level of the file), as in `ModDecl::container`.
+    pub container_path: Vec<Sym>,
     pub span: crate::diag::Span,
 }
 
@@ -425,6 +429,7 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                         exported: pending.macro_export,
                         local_inner: pending.local_inner,
                         container: (container.len(), i),
+                        container_path: container,
                         span: toks[i].span,
                     });
                 }
