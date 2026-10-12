@@ -1046,6 +1046,8 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
                     | Unsafe
                     | Async
                     | Const
+                    // An outer attribute on the expression (`#[a] 1`).
+                    | Pound
             );
             match kind {
                 FragKind::Expr => expr_start,
@@ -1093,8 +1095,10 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
                             | Minus
                             | Amp
                             | AndAnd
+                            // `..` begins a rest or range-to pattern;
+                            // `..=` does not begin a pattern fragment
+                            // in rustc, so it is absent here.
                             | DotDot
-                            | DotDotEq
                             | Mut
                             | Ref
                             | PathSep
@@ -1340,8 +1344,23 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                 let slice = &input[pos..end];
                 // A statement fragment never owns the `;` after it: a
                 // matcher that wants it writes the token itself. A lone
-                // `;` is itself an (empty) statement in rustc.
-                if kind == FragKind::Stmt && slice.len() > 1 && matches!(slice.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi) {
+                // `;` is itself an (empty) statement in rustc. An item
+                // statement is the exception: its own `;` belongs to
+                // the item (`struct S;`), so an item-shaped slice may
+                // end with it.
+                if kind == FragKind::Stmt
+                    && slice.len() > 1
+                    && matches!(slice.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
+                    && super::item_end(input, pos, m.interner) != Some(end)
+                {
+                    continue;
+                }
+                // A pattern fragment cannot start with `..=`: rustc's
+                // fragment parser does not begin a pattern there (a
+                // subpattern after `@` may start with one, but that is
+                // not this slice's head). The subset parser accepts it
+                // as a range, so refuse it here.
+                if matches!(kind, FragKind::Pat | FragKind::PatParam) && matches!(slice.first(), Some(Tt::Tok(t)) if t.tok == Tok::DotDotEq) {
                     continue;
                 }
                 if kind == FragKind::Stmt && matches!(slice, [Tt::Tok(t)] if t.tok == Tok::Semi) {

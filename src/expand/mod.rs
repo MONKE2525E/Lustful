@@ -1350,6 +1350,12 @@ impl<'a> Expander<'a> {
                     i = def.end;
                     continue;
                 }
+                // Any other tree here is the node the pending
+                // attributes attach to, so they are spent: a `#[cfg]`
+                // on a plain item must not leak onto a macro
+                // definition that comes later in the same list.
+                exported = false;
+                cfg_off = false;
                 if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Mod)
                     && matches!(tok_at(trees, i + 1).map(|t| t.tok), Some(Tok::Ident(_)))
                     && matches!(trees.get(i + 2), Some(Tt::Delim(Delim::Brace, _, _)))
@@ -1975,9 +1981,11 @@ fn mark_format_str(expanded: &mut [Tt], span: Span) {
 /// node. A brace group ends the node unless an operator, `else`, or
 /// `;` follows it. With no terminator the node is the list's tail.
 /// Used to drop `#[cfg(off)]` nodes exactly as rustc does. A brace
-/// group in a head position (a struct literal scrutinee or iterator)
-/// reads as the node's end; cfg on such a head is rare enough to note
-/// rather than parse for.
+/// group in a head position does not end the node when what follows
+/// it can only continue the head: a second brace group (the real
+/// block after a struct literal scrutinee), `=>`, `if`, or `in` (a
+/// struct pattern), or any operator. A brace group that starts the
+/// node is the node's own block and always ends it.
 fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
     if start >= trees.len() {
         return None;
@@ -2002,10 +2010,20 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
                 }
                 return Some(trees.len());
             }
+            Tt::Delim(Delim::Brace, _, _)
+                if j > start && matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Brace, _, _))) =>
+            {
+                // A struct literal or pattern in a head position; the
+                // next brace group is the node's block. Step over the
+                // head group and let that group end the node.
+                j += 1;
+            }
             Tt::Delim(Delim::Brace, _, _) => match tok_at(trees, j + 1).map(|t| t.tok) {
                 Some(Tok::Semi) => return Some(j + 2),
                 Some(Tok::Comma) => return Some(j + 2),
                 Some(Tok::Else) => j += 2,
+                // A struct pattern's guard, arm arrow, or `for .. in`.
+                Some(Tok::FatArrow | Tok::If | Tok::In) if j > start => j += 1,
                 Some(
                     Tok::Dot
                     | Tok::Question

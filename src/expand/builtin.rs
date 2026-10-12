@@ -378,6 +378,11 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
     }
     fn space_between(prev: &Piece, cur: &Piece) -> bool {
         match cur.kind {
+            // A doc comment's literal always follows its `=` with a
+            // space. The lexer tiles the synthetic spans over the
+            // comment's bytes, and a very short comment (`///` alone)
+            // has no byte left to carry that gap.
+            Kind::Tok(Tok::DocStr(_)) if matches!(prev.kind, Kind::Tok(Tok::Eq)) => return true,
             Kind::Tok(Tok::Comma | Tok::Semi | Tok::Dot) => return false,
             Kind::Close(Delim::Paren | Delim::Bracket) => return false,
             Kind::Open(Delim::Paren | Delim::Bracket) => {
@@ -407,7 +412,12 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
             _ => {}
         }
         match prev.kind {
-            Kind::Tok(Tok::Dot | Tok::Dollar) => return false,
+            Kind::Tok(Tok::Dot) => return false,
+            // A `$` glues only to the name it was written against in
+            // the same template (`$y` kept as tokens). A `$` a
+            // repetition inserts as its separator stands alone
+            // (`a $ b`), like every other template token.
+            Kind::Tok(Tok::Dollar) if cur.ctxt == prev.ctxt && cur.file == prev.file && cur.lo == prev.hi => return false,
             Kind::Open(Delim::Paren | Delim::Bracket) => return false,
             _ => {}
         }
