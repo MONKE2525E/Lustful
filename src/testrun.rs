@@ -266,6 +266,7 @@ pub fn run(args: &[String]) -> i32 {
         debug: false,
         emit_c: None,
         max_errors: opts.max_errors,
+        run_args: None,
     };
     let check = driver::compile(&req(Cmd::Check, file.clone(), dir.join("testbin")), &mut session);
     if check.code != 0 {

@@ -198,28 +198,43 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
 /// content-defined: the chunk is cut before an item when a hash of the item's header line hits a
 /// mask. So editing or inserting an item only changes the chunk it is in, and every other chunk
 /// keeps its exact text (and can be reused). A chunk only starts at a line that begins an item at
-/// column 0, and never between an attribute and its item.
-fn split_items(src: &str, region: std::ops::Range<usize>, mask: u64) -> Vec<(usize, usize)> {
+/// column 0, and never between an attribute and its item. `headers`, when given, are the
+/// `item_headers` of the whole source (used on a session's first compile, where the region is
+/// the whole source and the mask needed the same table).
+fn split_items(src: &str, region: std::ops::Range<usize>, mask: u64, headers: Option<&[(usize, u64)]>) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut chunk_start = region.start;
-    for (at, h) in item_headers(&src[region.clone()]).into_iter().skip(1) {
+    let cut = |at: usize, h: u64, ranges: &mut Vec<(usize, usize)>, chunk_start: &mut usize| {
         // The multiply spreads FxHash's low bits.
         if (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) & mask == 0 {
-            ranges.push((chunk_start, region.start + at));
-            chunk_start = region.start + at;
+            ranges.push((*chunk_start, region.start + at));
+            *chunk_start = region.start + at;
+        }
+    };
+    match headers {
+        Some(headers) => {
+            for &(at, h) in headers.iter().skip(1) {
+                cut(at, h, &mut ranges, &mut chunk_start);
+            }
+        }
+        None => {
+            for (at, h) in item_headers(&src[region.clone()]).into_iter().skip(1) {
+                cut(at, h, &mut ranges, &mut chunk_start);
+            }
         }
     }
     ranges.push((chunk_start, region.end));
     ranges
 }
 
-/// The mask that makes `split_items` produce about `2 * cores` chunks for this source.
-fn split_mask(src: &str, cores: usize) -> u64 {
-    if src.len() < 64 * 1024 {
+/// The mask that makes `split_items` produce about `2 * cores` chunks for a source with
+/// `item_count` top-level items.
+fn split_mask(src_len: usize, item_count: usize, cores: usize) -> u64 {
+    if src_len < 64 * 1024 {
         // Small files: one chunk (no item hash has all 24 masked bits zero in practice).
         return (1 << 24) - 1;
     }
-    ((item_headers(src).len() / (cores * 2)).max(1).next_power_of_two() - 1) as u64
+    ((item_count / (cores * 2)).max(1).next_power_of_two() - 1) as u64
 }
 
 /// (offset of each top-level item's first line, hash of its header line), skipping attributes.
@@ -313,7 +328,11 @@ fn slot_update(
         caches.glue = GlueSet::default();
         caches.objects = None;
         caches.overlays.clear();
-        caches.per_unit = (fn_count / (cores * 4)).clamp(16, 256);
+        // Cold builds gain nothing from many small units: each extra unit pays a tcc process
+        // start and a header parse. Use about one unit per core. The daemon keeps small
+        // units, so an edit recompiles little code.
+        caches.per_unit =
+            if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
     }
     // Assign slots by name. New functions get new slots; a removed function's slot is emptied.
     let keys = fn_keys(&front.ast, &front.fn_loc);
@@ -422,7 +441,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // split and lexed again: chunks entirely before it are kept as they are, and chunks entirely
     // after it are kept with shifted offsets.
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let mask = *front.split_mask.get_or_insert_with(|| split_mask(&src, cores));
+    // On the first compile the mask needs the item header table, and so does the split below
+    // (the region is then the whole source). Compute it once. It cost a full serial source
+    // scan, about 2 ms on a 48k-line file (front-end probe, milestone 2).
+    let mut fresh_headers: Option<Vec<(usize, u64)>> = None;
+    let mask = match front.split_mask {
+        Some(m) => m,
+        None => {
+            let headers = item_headers(&src);
+            let m = split_mask(src.len(), headers.len(), cores);
+            fresh_headers = Some(headers);
+            front.split_mask = Some(m);
+            m
+        }
+    };
     let old_len = front.src.len();
     let (prefix, suffix) = common_ends(front.src.as_bytes(), src.as_bytes());
     let delta = src.len() as i64 - old_len as i64;
@@ -440,7 +472,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let region_end = (region_end_old as i64 + delta) as usize;
     let lines = if old_len == 0 { LineIndex::new(&src) } else { front.lines.splice(&src, region_start, region_end_old, region_end) };
     let mut ranges: Vec<(usize, usize)> = kept_front.iter().map(|c| (c.start, c.start + c.text.len())).collect();
-    let middle = if region_start < region_end { split_items(&src, region_start..region_end, mask) } else { Vec::new() };
+    let headers = if region_start == 0 && region_end == src.len() { fresh_headers.as_deref() } else { None };
+    let middle = if region_start < region_end { split_items(&src, region_start..region_end, mask, headers) } else { Vec::new() };
     ranges.extend(middle.iter().copied());
     ranges.extend(kept_back.iter().map(|c| ((c.start as i64 + delta) as usize, (c.start as i64 + delta) as usize + c.text.len())));
     let mut reused: Vec<Option<Chunk>> =
@@ -633,14 +666,27 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         diags.push(Diag::new("L0130", diag::Span::default(), "no `main` function", "Add `fn main() { ... }`."));
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });
+    // A one-shot (non-persistent) process exits right after this call. Freeing the IR and
+    // program arenas, mostly built on worker threads, costs about 10 ms on a 31k-line crate,
+    // so leak them on every return below and let the OS reclaim the memory at exit.
+    let leak_at_exit = !caches.persistent;
     if !diags.is_empty() {
-        return errors(&mut diags, &path, &src, req);
+        let resp = errors(&mut diags, &path, &src, req);
+        if leak_at_exit {
+            std::mem::forget(results);
+            std::mem::forget(program);
+        }
+        return resp;
     }
     let mut resp = Response::default();
     if req.cmd == Cmd::Check {
         if req.timings {
             let _ = writeln!(resp.stderr, "lust check {path}: ok ({} functions, {mode}: {} rechecked)", program.fns.len(), work.len());
             t.render(&mut resp.stderr);
+        }
+        if leak_at_exit {
+            std::mem::forget(results);
+            std::mem::forget(program);
         }
         return resp;
     }
@@ -710,6 +756,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     for i in 0..fn_count {
         slot_lines[slot(i)] = scan_of(front, i).1;
     }
+    // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
+    // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
+    // glue unit's C is built below, only when unit 1 is in `todo`.
+    if fresh_base || caches.glue.shared.is_none() {
+        caches.glue.compute_shared(&caches.out, &groups, 3);
+    }
     let units: Vec<(PathBuf, String)> = par_map(&todo, |&(u, overlay)| {
         let c = match u {
             0 => cgen::main_unit(main_slot, &path, &slot_lines, &registered),
@@ -729,6 +781,40 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("assemble C units (par)");
+    // `lust run` of a small program (one function unit, fresh base): compile in memory and run
+    // it there, with no object files, link, or exec. The runtime comes from a cached object.
+    // libtcc compiles serially, so bigger programs keep the parallel file-based path below.
+    // Any setup failure falls back to that path (user code has not run yet). A debug run also
+    // keeps the file path, so a debugger sees a real binary.
+    if let Some(run_args) = &req.run_args
+        && fresh_base
+        && groups.len() == 1
+        && !req.debug
+        && let Ok(runtime_obj) = crate::tcc::cached_runtime_object(&cgen::runtime_unit(), req.debug)
+    {
+        let mem_units: Vec<(PathBuf, String)> = units.iter().filter(|(o, _)| *o != base_obj(2)).cloned().collect();
+        let mut argv = vec![req.out.to_string_lossy().into_owned()];
+        argv.extend(run_args.iter().cloned());
+        if let Ok(run) = crate::tcc::run_in_memory(&mem_units, &runtime_obj, &argv, caches.persistent, req.debug) {
+            t.lap("tcc compile + run (memory)");
+            resp.code = run.code;
+            resp.ran = true;
+            resp.stdout = run.stdout;
+            if req.timings {
+                let kb = mem_units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
+                let _ =
+                    writeln!(resp.stderr, "lust run {path}: exit {} ({} functions, {kb} KB of C, in memory)", run.code, program.fns.len());
+                t.render(&mut resp.stderr);
+            }
+            resp.stderr.push_str(&run.stderr);
+            if leak_at_exit {
+                std::mem::forget(bodies);
+                std::mem::forget(units);
+                std::mem::forget(program);
+            }
+            return resp;
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| crate::tcc::compile_units(&units, req.debug)) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
@@ -765,6 +851,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.overlays.len(),
         );
         t.render(&mut resp.stderr);
+    }
+    if leak_at_exit {
+        std::mem::forget(bodies);
+        std::mem::forget(units);
+        std::mem::forget(program);
     }
     resp
 }

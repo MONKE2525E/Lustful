@@ -966,9 +966,10 @@ impl FnGen<'_, '_, '_> {
 
 // ---------- Compilation units ----------
 //
-// Unit 0 holds the globals, the function line table, and `main`. Unit 1 holds all glue. The other
-// units hold functions, in fixed groups of FnIds. Grouping depends only on the function count, so
-// an edit that keeps the program's shape recompiles only the units it touches (plus unit 0).
+// Unit 0 holds the globals, the function line table, and `main`. Unit 1 holds the shared glue
+// (see `GlueSet`); other glue is static in the function units. The other units hold functions, in
+// fixed groups of FnIds. Grouping depends only on the function count, so an edit that keeps the
+// program's shape recompiles only the units it touches (plus unit 0).
 
 /// Function groups for units 2 and up.
 pub fn group_fns(n: usize, per_unit: usize) -> Vec<std::ops::Range<usize>> {
@@ -976,29 +977,92 @@ pub fn group_fns(n: usize, per_unit: usize) -> Vec<std::ops::Range<usize>> {
 }
 
 /// All glue needed by a set of functions, closed over field types.
+//
+// Glue placement is hybrid. `shared` holds the keys that live once in the glue unit (unit 1):
+// glue that many function units reach (see `compute_shared`). Every other key is emitted as a
+// static copy in each function unit that reaches it, so an edit that needs new glue does not
+// rebuild the glue unit. `shared` is None until the first `compute_shared`; before that, all
+// glue lives in the glue unit, as before.
 #[derive(Default)]
 pub struct GlueSet {
     pub protos: HashMap<(Glue, CTy), String>,
     defs: String,
+    /// Each key's definition on its own, so units can carry static copies of just what they reach.
+    def_map: HashMap<(Glue, CTy), String>,
+    /// The glue keys each key's definition calls.
+    deps: HashMap<(Glue, CTy), Vec<(Glue, CTy)>>,
+    /// Keys that live in the shared glue unit. Frozen until the next `compute_shared`.
+    pub shared: Option<HashSet<(Glue, CTy)>>,
 }
 
 impl GlueSet {
-    /// Adds glue for `keys` and everything it needs. Returns true if anything was new.
+    /// Adds glue for `keys` and everything it needs. Returns true when the shared glue unit's
+    /// content changed, so the caller must recompile it. New glue that no unit shared at freeze
+    /// time is not in `shared`, so it returns false for that: the new glue is static in the
+    /// function units that reach it.
     pub fn add<'k>(&mut self, p: &Program, keys: impl Iterator<Item = &'k (Glue, CTy)>) -> bool {
         let mut pending: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k)).cloned().collect();
-        let mut changed = false;
+        let mut shared_changed = false;
         while let Some(g) = pending.pop() {
             if self.protos.contains_key(&g) {
                 continue;
             }
             let mut more = Vec::new();
             let mut proto = String::new();
-            glue_def(p, &g.0, &g.1, &mut proto, &mut self.defs, &mut more);
+            let mut def = String::new();
+            glue_def(p, &g.0, &g.1, &mut proto, &mut def, &mut more);
+            self.defs.push_str(&def);
+            self.def_map.insert(g.clone(), def);
+            self.deps.insert(g.clone(), more.clone());
+            shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
             self.protos.insert(g, proto);
             pending.extend(more);
-            changed = true;
         }
-        changed
+        shared_changed
+    }
+
+    /// The glue keys a set of direct needs reaches, deps included.
+    fn closure<'a>(&'a self, roots: impl Iterator<Item = &'a (Glue, CTy)>) -> HashSet<&'a (Glue, CTy)> {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<&(Glue, CTy)> = roots.collect();
+        while let Some(k) = stack.pop() {
+            if seen.insert(k) {
+                if let Some(deps) = self.deps.get(k) {
+                    stack.extend(deps.iter());
+                }
+            }
+        }
+        seen
+    }
+
+    /// Picks the shared set: keys reached by at least `k` function units (`fns` is indexed by
+    /// slot, `groups` are the units). The set is closed over deps, so the shared glue unit's
+    /// definitions only call each other. Call this only on a fresh base, then keep it frozen:
+    /// a key that turned shared later would need the base glue unit rebuilt.
+    pub fn compute_shared(&mut self, fns: &[FnOut], groups: &[std::ops::Range<usize>], k: usize) {
+        let mut count: HashMap<&(Glue, CTy), usize> = HashMap::new();
+        for range in groups {
+            for key in self.closure(fns[range.clone()].iter().flat_map(|f| f.glue.iter())) {
+                *count.entry(key).or_default() += 1;
+            }
+        }
+        let mut shared: HashSet<(Glue, CTy)> = count.into_iter().filter(|&(_, n)| n >= k).map(|(key, _)| key.clone()).collect();
+        // Close over deps (the count already implies this, but keep the glue unit self-contained).
+        let mut stack: Vec<(Glue, CTy)> = shared.iter().cloned().collect();
+        while let Some(key) = stack.pop() {
+            if let Some(deps) = self.deps.get(&key) {
+                for dep in deps {
+                    if shared.insert(dep.clone()) {
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+        self.shared = Some(shared);
+    }
+
+    fn is_shared(&self, k: &(Glue, CTy)) -> bool {
+        self.shared.as_ref().is_some_and(|s| s.contains(k))
     }
 }
 
@@ -1047,7 +1111,15 @@ fn runtime_decls() -> &'static str {
             rest = &rest[end..];
         }
         out.push_str(rest);
-        out
+        // Units do not include <stdint.h> or <stddef.h>: tcc spends about 1 ms per unit parsing
+        // the system headers behind them. The compiler's predefined types define the same names
+        // (tcc and gcc both predefine them; on macOS arm64 tcc's __INT64_TYPE__ is long long,
+        // which matches Apple's int64_t). The runtime unit keeps the real includes.
+        out.replacen(
+            "#include <stdint.h>\n#include <stddef.h>\n",
+            "typedef signed char int8_t; typedef unsigned char uint8_t; typedef short int16_t; typedef unsigned short uint16_t;\ntypedef int int32_t; typedef unsigned int uint32_t;\n#ifdef __INT64_TYPE__\ntypedef __INT64_TYPE__ int64_t; typedef unsigned __INT64_TYPE__ uint64_t;\n#else\ntypedef long long int64_t; typedef unsigned long long uint64_t;\n#endif\n#ifdef __SIZE_TYPE__\ntypedef __SIZE_TYPE__ size_t; typedef __PTRDIFF_TYPE__ ptrdiff_t; typedef __UINTPTR_TYPE__ uintptr_t; typedef __INTPTR_TYPE__ intptr_t;\n#else\ntypedef unsigned long size_t; typedef long ptrdiff_t; typedef unsigned long uintptr_t; typedef long intptr_t;\n#endif\n#define INT64_MIN (-9223372036854775807LL-1)\n#ifndef NULL\n#define NULL ((void*)0)\n#endif\n",
+            1,
+        )
     })
 }
 
@@ -1093,9 +1165,26 @@ pub fn table_unit(capacity: usize, fn_units: &[usize]) -> String {
     c
 }
 
+/// The shared glue unit. With a frozen shared set it holds only those keys; the rest of the
+/// glue is static in the function units (see `GlueSet`).
 pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
+    if let Some(shared) = &g.shared {
+        for k in shared {
+            collect_types(&k.1, &mut types);
+        }
+        type_decls(p, &mut c, &types);
+        let mut keys: Vec<&(Glue, CTy)> = shared.iter().collect();
+        keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+        for k in &keys {
+            c.push_str(&g.protos[*k]);
+        }
+        for k in &keys {
+            c.push_str(&g.def_map[*k]);
+        }
+        return c;
+    }
     for k in g.protos.keys() {
         collect_types(&k.1, &mut types);
     }
@@ -1114,20 +1203,44 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
 pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &GlueSet, register: &str) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
-    let mut glue: Vec<&String> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
     for f in &fns[range.clone()] {
         types.extend(f.types.iter().cloned());
-        for k in &f.glue {
-            if seen.insert(k) {
-                glue.push(&g.protos[k]);
+        seen.extend(f.glue.iter());
+    }
+    // With a frozen shared set, glue that is not shared is static in this unit: walk its deps
+    // too, and stop at shared keys (their deps live in the glue unit). Shared keys still need
+    // their prototype, and every reached key needs its C type declared.
+    let hybrid = g.shared.is_some();
+    if hybrid {
+        let mut stack: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
+        while let Some(k) = stack.pop() {
+            collect_types(&k.1, &mut types);
+            if !g.is_shared(k) {
+                if let Some(deps) = g.deps.get(k) {
+                    for dep in deps {
+                        if seen.insert(dep) {
+                            stack.push(dep);
+                        }
+                    }
+                }
             }
         }
     }
     type_decls(p, &mut c, &types);
-    glue.sort();
-    for proto in glue {
-        c.push_str(proto);
+    let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
+    keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+    for k in &keys {
+        if hybrid && !g.is_shared(k) {
+            c.push_str("static ");
+        }
+        c.push_str(&g.protos[*k]);
+    }
+    if hybrid {
+        for k in keys.iter().filter(|k| !g.is_shared(k)) {
+            c.push_str("static ");
+            c.push_str(&g.def_map[*k]);
+        }
     }
     for f in &fns[range.clone()] {
         c.push_str(&f.code);

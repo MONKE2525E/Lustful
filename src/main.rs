@@ -32,6 +32,29 @@ use protocol::Invocation;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Deletes a one-shot session's object directory. A serial walk costs 3 to 6 ms on a cold
+/// build (one unlink per object and C file), so many files are unlinked in parallel. The
+/// final remove_dir_all handles subdirectories and anything the parallel pass missed.
+fn remove_obj_dir(dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let files: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+        if files.len() > 16 {
+            let n = 8usize;
+            std::thread::scope(|s| {
+                for k in 0..n {
+                    let files = &files;
+                    s.spawn(move || {
+                        for f in files.iter().skip(k).step_by(n) {
+                            let _ = std::fs::remove_file(f);
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn main() {
     tcc::use_mimalloc();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,9 +72,11 @@ fn main() {
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args }) => {
             // Whole-request disk cache (cold runs only; the daemon path keeps its own
-            // in-memory state). `--emit-c` writes side files, so it always compiles.
+            // in-memory state). `--emit-c` writes side files, so it always compiles. A `run`
+            // request is also never cached: its response can be the program's own output and
+            // exit code (an in-memory run writes no executable), not a build result.
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() { cache::Cache::open(&req.file) } else { None };
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() { cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)
@@ -61,10 +86,15 @@ fn main() {
             let dir = std::env::temp_dir().join(format!("lust-{}", std::process::id()));
             let mut session = driver::Session::new(dir, false);
             let resp = driver::compile(&req, &mut session);
-            let _ = std::fs::remove_dir_all(session.obj_dir());
+            remove_obj_dir(session.obj_dir());
             if let (Some(cache), Some(src)) = (&cache, &src) {
                 cache.store(&req, src, &resp);
             }
+            // This process exits inside `finish`. Leak the session instead of freeing it:
+            // dropping millions of small allocations (many made on worker threads) costs
+            // about 10 ms on a 31k-line crate, and the OS reclaims the memory for free.
+            // The daemon path never reaches this code, so it still frees normally.
+            std::mem::forget(session);
             protocol::finish(resp, run, &req.out, &args);
         }
         None => {
