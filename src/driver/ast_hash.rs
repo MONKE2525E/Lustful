@@ -18,31 +18,30 @@ use std::hash::{Hash, Hasher};
 /// One scan of a merged crate Ast: item scans parallel to `ast.items`,
 /// and per-fn (body hash, body idents) in fn-location order (top-level
 /// fns and impl methods in item order, as `collect` numbers them).
-pub(crate) struct AstScans {
+pub struct AstScans {
     pub items: Vec<scan::ItemScan>,
     pub bodies: Vec<(u64, Vec<Sym>)>,
 }
 
-/// Scans one merged Ast. Item and body hashing are read-only walks,
-/// so they run in parallel across items (one pass produces each
-/// item's scan and its fns' body scans). See the module docs.
-pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
-    let per_item = super::compile::par_map(&ast.items, |item| {
-        let mut w = Walker { ast, idents: None };
-        let mut h = FxHasher::default();
-        w.item(&mut h, item, false);
-        let fn_name = match &item.kind {
-            ItemKind::Fn(f) => Some(f.name),
-            _ => None,
-        };
-        let scan = scan::ItemScan { hash: h.finish(), fn_name };
-        let bodies: Vec<(u64, Vec<Sym>)> = match &item.kind {
-            ItemKind::Fn(f) => vec![body_scan(ast, f)],
-            ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f)).collect(),
-            _ => Vec::new(),
-        };
-        (scan, bodies)
-    });
+/// One item's scan and its fns' body scans.
+fn scan_item(ast: &Ast, item: &Item) -> (scan::ItemScan, Vec<(u64, Vec<Sym>)>) {
+    let mut w = Walker { ast, idents: None };
+    let mut h = FxHasher::default();
+    w.item(&mut h, item, false);
+    let fn_name = match &item.kind {
+        ItemKind::Fn(f) => Some(f.name),
+        _ => None,
+    };
+    let scan = scan::ItemScan { hash: h.finish(), fn_name };
+    let bodies: Vec<(u64, Vec<Sym>)> = match &item.kind {
+        ItemKind::Fn(f) => vec![body_scan(ast, f)],
+        ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f)).collect(),
+        _ => Vec::new(),
+    };
+    (scan, bodies)
+}
+
+fn assemble(ast: &Ast, per_item: Vec<(scan::ItemScan, Vec<(u64, Vec<Sym>)>)>) -> AstScans {
     let mut items = Vec::with_capacity(per_item.len());
     let mut bodies = Vec::new();
     for (scan, bs) in per_item {
@@ -56,6 +55,21 @@ pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
         }
     }
     AstScans { items, bodies }
+}
+
+/// Scans one merged Ast. Item and body hashing are read-only walks,
+/// so they run in parallel across items (one pass produces each
+/// item's scan and its fns' body scans). See the module docs.
+pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
+    assemble(ast, super::compile::par_map(&ast.items, |item| scan_item(ast, item)))
+}
+
+/// Scans one per-file Ast chunk serially. The worklist scans each
+/// flattened chunk on its own (in parallel across files) and caches
+/// the result per file; chunk scans concatenate to the merged scan
+/// because string indices hash by content and spans never hash.
+pub(crate) fn scan_ast_seq(ast: &Ast) -> AstScans {
+    assemble(ast, ast.items.iter().map(|item| scan_item(ast, item)).collect())
 }
 
 /// The hash of one fn's head: name, qualifiers, generics, self and
@@ -1209,6 +1223,28 @@ mod tests {
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         scan_ast(&ast)
+    }
+
+    /// Per-chunk serial scans concatenate to the merged Ast scan:
+    /// the worklist caches one scan per file chunk and joins them.
+    #[test]
+    fn chunk_scans_join_to_merged_scan() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let parse = |src: &str, file: u32| {
+            let lexed = lexer::lex(src, FileId(file), 0, &interner).unwrap();
+            parser::parse(&lexed, &interner, &known).unwrap()
+        };
+        let a = parse("struct A { x: i64 }\nfn fa(a: i64) -> i64 { a + 1 }\n", 0);
+        let b = parse("fn fb() -> &'static str { \"hi\" }\nfn main() { println!(\"{}\", fa(2)); }\n", 1);
+        let (sa, sb) = (scan_ast_seq(&a), scan_ast_seq(&b));
+        let merged = scan_ast(&Ast::concat(vec![a, b]));
+        let joined_items: Vec<u64> = sa.items.iter().chain(&sb.items).map(|i| i.hash).collect();
+        assert_eq!(joined_items, merged.items.iter().map(|i| i.hash).collect::<Vec<_>>());
+        let joined_bodies: Vec<u64> = sa.bodies.iter().chain(&sb.bodies).map(|b| b.0).collect();
+        assert_eq!(joined_bodies, merged.bodies.iter().map(|b| b.0).collect::<Vec<_>>());
+        let joined_idents: Vec<&Vec<Sym>> = sa.bodies.iter().chain(&sb.bodies).map(|b| &b.1).collect();
+        assert_eq!(joined_idents, merged.bodies.iter().map(|b| &b.1).collect::<Vec<_>>());
     }
 
     const BASE: &str = "\

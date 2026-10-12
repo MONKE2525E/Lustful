@@ -92,6 +92,10 @@ pub struct ResolvedCrate {
     /// Wall time per worklist phase in milliseconds, summed over the
     /// workspace's crates, for the driver's `--timings` output.
     pub timings: Vec<(&'static str, f64)>,
+    /// The structural Ast scan, assembled from per-file chunk scans
+    /// (cached per file in `ResolveCache`). It is equal to a scan of
+    /// the merged `ast`; the driver uses it instead of rescanning.
+    pub scans: crate::driver::ast_hash::AstScans,
 }
 
 /// A failed resolution: the source map and combined text for rendering,
@@ -164,6 +168,18 @@ struct FileWork {
     ast: Ast,
     /// The module this file's top-level items belong to.
     module: ModuleId,
+    /// The `ResolveCache` key and text hash of this file, for the
+    /// final-chunk lookup and store at flatten time.
+    key: String,
+    text_hash: u64,
+    /// True when the file's expansion reads outside data: its
+    /// parsed Ast and final chunk are never cached.
+    outside: bool,
+    /// The hash of the expanded token stream this Ast came from:
+    /// a final-chunk hit needs it to stand too, because a macro
+    /// environment change can move bodies without moving the
+    /// rewrite epoch.
+    exp_hash: u64,
 }
 
 /// The key under which a module's item list is later found in the walks:
@@ -336,6 +352,10 @@ fn make_map(seen: &[(PathBuf, String, FileId)]) -> (SourceMap, String) {
 pub struct ResolveCache {
     env_fp: u64,
     files: FxMap<String, CachedFile>,
+    /// Canonical path strings by written path: canonicalizing is a
+    /// filesystem call per path, and discovery asks for every file
+    /// on every request.
+    canon: FxMap<PathBuf, String>,
 }
 
 struct CachedFile {
@@ -349,6 +369,47 @@ struct CachedFile {
     /// The expanded token stream the parser consumes (cfg-name
     /// checking and expansion already applied to `raw`).
     expanded: Option<lexer::Lexed>,
+    /// The parsed Ast with the hash of the expanded token stream
+    /// it was parsed from. Expansion answers depend on the whole
+    /// crate's macro environment, so own text alone cannot key a
+    /// parsed Ast; the expanded stream's own hash can. Never
+    /// stored for a file whose expansion reads outside data.
+    parsed: Option<(u64, Ast)>,
+    /// The file's flattened, rewritten chunk plus its per-fn facts
+    /// and structural scan, from a successful resolve. Valid only
+    /// under the epoch it was stored with (see
+    /// `ResolvedTables::rewrite_epoch`): strip, register, and the
+    /// import fixpoint still run each request to rebuild the
+    /// tables and the epoch, but the rewrite walk, the flatten,
+    /// and the Ast scan for this file are skipped on a hit.
+    final_chunk: Option<FinalChunk>,
+}
+
+/// One file's post-rewrite, post-flatten chunk, as cached in
+/// `CachedFile::final_chunk`.
+#[derive(Clone)]
+struct FinalChunk {
+    epoch: u64,
+    exp_hash: u64,
+    ast: Ast,
+    fn_lines: Vec<u32>,
+    body_hashes: Vec<u64>,
+    nested_lines: Vec<u32>,
+    nested_hashes: Vec<u64>,
+    /// Each top-level fn's module as a name path (module ids are
+    /// request local; paths are not).
+    fn_module_paths: Vec<Vec<Sym>>,
+    /// Each nested fn's module as a name path.
+    nested_module_paths: Vec<Vec<Sym>>,
+    /// This file's structure hash: its path text plus its `mod`,
+    /// `use`, and `extern crate` items (`structure_items`).
+    structure: u64,
+    scan_items: Vec<scan::ItemScan>,
+    /// Top-level fn body scans, then nested fn body scans, kept
+    /// apart because the merged order puts every nested fn after
+    /// every top-level fn (collect's order).
+    scan_bodies: Vec<(u64, Vec<Sym>)>,
+    nested_bodies: Vec<(u64, Vec<Sym>)>,
 }
 
 /// True when a file's expansion can read data outside its own text
@@ -404,24 +465,31 @@ impl ResolveCache {
         }
     }
 
+    /// The canonical string of one path, memoized for the session.
+    fn canon(&mut self, path: &std::path::Path) -> String {
+        self.canon.entry(path.to_path_buf()).or_insert_with(|| modules::canonical_string(path)).clone()
+    }
+
     fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
-        let e = self.files.entry(key.to_string()).or_insert_with(|| CachedFile {
-            text_hash,
-            file_id,
-            raw: None,
-            outline: None,
-            expanded: None,
-        });
+        let fresh = || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, parsed: None, final_chunk: None };
+        let e = self.files.entry(key.to_string()).or_insert_with(fresh);
         if e.text_hash != text_hash || e.file_id != file_id {
-            *e = CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None };
+            *e = fresh();
         }
         e
+    }
+
+    /// The valid entry for one file, when present, without
+    /// allocating the key string (read accessors use this; a stale
+    /// entry reads as absent and the next put resets it).
+    fn peek(&self, key: &str, text_hash: u64, file_id: FileId) -> Option<&CachedFile> {
+        self.files.get(key).filter(|e| e.text_hash == text_hash && e.file_id == file_id)
     }
 
     /// The cached raw token stream for one file, cloned out, when
     /// its text and file id stand.
     fn raw(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
-        self.entry(key, text_hash, file_id).raw.as_ref().map(clone_lexed)
+        self.peek(key, text_hash, file_id).and_then(|e| e.raw.as_ref()).map(clone_lexed)
     }
 
     fn put_raw(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
@@ -430,7 +498,7 @@ impl ResolveCache {
 
     /// The cached outline for one file, when its text and file id stand.
     fn outline(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<scan::Outline> {
-        self.entry(key, text_hash, file_id).outline.clone()
+        self.peek(key, text_hash, file_id).and_then(|e| e.outline.clone())
     }
 
     fn put_outline(&mut self, key: &str, text_hash: u64, file_id: FileId, outline: scan::Outline) {
@@ -439,12 +507,69 @@ impl ResolveCache {
 
     /// The cached expanded token stream for one file, cloned out.
     fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
-        self.entry(key, text_hash, file_id).expanded.as_ref().map(clone_lexed)
+        self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()).map(clone_lexed)
     }
 
     fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
         self.entry(key, text_hash, file_id).expanded = Some(clone_lexed(lexed));
     }
+
+    /// The cached parsed Ast for one expanded token stream, cloned out.
+    fn parsed(&self, key: &str, text_hash: u64, file_id: FileId, expanded_hash: u64) -> Option<Ast> {
+        self.peek(key, text_hash, file_id).and_then(|e| e.parsed.as_ref()).filter(|(h, _)| *h == expanded_hash).map(|(_, a)| a.clone())
+    }
+
+    fn put_parsed(&mut self, key: &str, text_hash: u64, file_id: FileId, expanded_hash: u64, ast: Ast) {
+        self.entry(key, text_hash, file_id).parsed = Some((expanded_hash, ast));
+    }
+
+    /// The rewrite epoch under which one file's final chunk is cached.
+    fn final_epoch(&self, key: &str, text_hash: u64, file_id: FileId) -> Option<u64> {
+        self.peek(key, text_hash, file_id).and_then(|e| e.final_chunk.as_ref()).map(|c| c.epoch)
+    }
+
+    /// One file's cached final chunk, cloned out; the cache keeps
+    /// its copy for the next request.
+    fn final_chunk(&self, key: &str, text_hash: u64, file_id: FileId) -> Option<FinalChunk> {
+        self.peek(key, text_hash, file_id).and_then(|e| e.final_chunk.clone())
+    }
+
+    fn put_final(&mut self, key: &str, text_hash: u64, file_id: FileId, chunk: FinalChunk) {
+        self.entry(key, text_hash, file_id).final_chunk = Some(chunk);
+    }
+}
+
+/// A content hash of one expanded token stream: token kinds,
+/// payloads, spans, and string contents. This keys the parsed-Ast
+/// cache, because expansion output is exactly what the parser
+/// consumes, whatever macro environment produced it.
+fn hash_lexed(l: &lexer::Lexed) -> u64 {
+    use crate::lexer::Tok;
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    "expanded-v1".hash(&mut h);
+    for s in &l.strings {
+        s.hash(&mut h);
+    }
+    for t in &l.tokens {
+        std::mem::discriminant(&t.tok).hash(&mut h);
+        match t.tok {
+            Tok::Ident(s) | Tok::Reserved(s) | Tok::Lifetime(s) => h.write_u64(s.0 as u64),
+            Tok::Int(v, suffix) => {
+                h.write_u128(v);
+                std::mem::discriminant(&suffix).hash(&mut h);
+            }
+            Tok::Float(i) | Tok::Str(i) | Tok::DocStr(i) => {
+                l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
+            }
+            Tok::Char(c) => h.write_u64(c as u64),
+            _ => {}
+        }
+        h.write_u64(t.span.file.0 as u64);
+        h.write_u64(t.span.lo as u64);
+        h.write_u64(t.span.hi as u64);
+    }
+    h.finish()
 }
 
 /// Runs `f` for each item on all cores, results in input order. The
@@ -553,6 +678,11 @@ struct CrateOut {
     /// The outside inputs this crate's last expansion round read.
     expand_deps: Vec<crate::expand::Dep>,
     timings: Vec<(&'static str, f64)>,
+    /// Item scans and top-level fn body scans of this crate.
+    scans: crate::driver::ast_hash::AstScans,
+    /// Nested fn body scans of this crate; the workspace wrapper
+    /// appends them after every crate's top-level bodies.
+    nested_bodies: Vec<(u64, Vec<crate::intern::Sym>)>,
 }
 
 /// One crate's failed resolution inside a session.
@@ -733,6 +863,9 @@ pub fn resolve_crate_cached(
     let mut exported_of: FxMap<usize, Vec<OwnedMacroSource>> = FxMap::default();
     let mut expand_deps: Vec<crate::expand::Dep> = Vec::new();
     let mut timings: Vec<(&'static str, f64)> = Vec::new();
+    let mut scan_items = Vec::new();
+    let mut scan_bodies = Vec::new();
+    let mut nested_scan_bodies = Vec::new();
     for &j in &order {
         let dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
             .deps
@@ -757,6 +890,9 @@ pub fn resolve_crate_cached(
                 }
                 tables.fn_module.extend(out.fn_module);
                 expand_deps.extend(out.expand_deps);
+                scan_items.extend(out.scans.items);
+                scan_bodies.extend(out.scans.bodies);
+                nested_scan_bodies.extend(out.nested_bodies);
                 exported_of.insert(j, out.exported_macros);
                 for (name, ms) in out.timings {
                     match timings.iter_mut().find(|(n, _)| *n == name) {
@@ -779,7 +915,9 @@ pub fn resolve_crate_cached(
     tables.fn_module.extend(nested_modules);
     let (map, all_text) = make_map(&all_seen);
     let ast = Ast::concat(chunks);
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps, timings })
+    scan_bodies.extend(nested_scan_bodies);
+    let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps, timings, scans })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -1044,7 +1182,7 @@ fn process_disc_orig(
     *needs_std |= crate::ty::lang::needs_std_load(&text);
     // Raw tokens and outline from the per-file cache when the text
     // stands (keyed by canonical path plus module, as in discovery).
-    let file_key = format!("{}#{}", modules::canonical_string(&discs[di].path), module.0);
+    let file_key = format!("{}#{}", cache.canon(&discs[di].path), module.0);
     let text_hash = hash_str(&text);
     let lexed = match cache.raw(&file_key, text_hash, file_id) {
         Some(l) => l,
@@ -1908,24 +2046,83 @@ fn resolve_one(
     }
     let seen = seen_of(&discs);
     let (map, _all) = make_map(&seen);
-    // Parse the expanded files in parallel, in FileId order.
+    // Parse the expanded files in parallel, in FileId order. A
+    // file whose expanded stream hashes to a cached parse clones
+    // that Ast instead of parsing again; the hash runs in parallel
+    // first because the cache itself is serial.
     let mut order: Vec<usize> = (0..discs.len()).collect();
     order.sort_by_key(|&di| discs[di].file_id.0);
-    let parsed = par_map(&order, |&di| -> Result<FileWork, Diag> {
-        let disc = &discs[di];
-        let lexed = expanded[di]
+    let lexed_of = |di: usize| -> lexer::Lexed {
+        expanded[di]
             .clone()
-            .unwrap_or_else(|| disc.lexed.clone().unwrap_or_else(|| lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }));
-        let ast = parser::parse(&lexed, interner, known)?;
-        Ok(FileWork { path: disc.path.clone(), text: disc.text.clone(), file_id: disc.file_id, ast, module: disc.module })
+            .unwrap_or_else(|| discs[di].lexed.clone().unwrap_or_else(|| lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }))
+    };
+    let exp_hashes = par_map(&order, |&di| match (expanded[di].as_ref(), discs[di].lexed.as_ref()) {
+        (Some(l), _) | (None, Some(l)) => hash_lexed(l),
+        (None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
     });
-    let mut works: Vec<FileWork> = Vec::with_capacity(parsed.len());
-    for r in parsed {
+    let mut works: Vec<Option<FileWork>> = Vec::with_capacity(order.len());
+    let mut todo: Vec<usize> = Vec::new();
+    for (pos, &di) in order.iter().enumerate() {
+        let disc = &discs[di];
+        let key = format!("{}#{}", cache.canon(&disc.path), disc.module.0);
+        let text_hash = hash_str(&disc.text);
+        let outside = reads_outside(&disc.text);
+        let hit = if outside { None } else { cache.parsed(&key, text_hash, disc.file_id, exp_hashes[pos]) };
+        match hit {
+            Some(ast) => works.push(Some(FileWork {
+                path: disc.path.clone(),
+                text: disc.text.clone(),
+                file_id: disc.file_id,
+                ast,
+                module: disc.module,
+                key,
+                text_hash,
+                outside,
+                exp_hash: exp_hashes[pos],
+            })),
+            None => {
+                works.push(None);
+                todo.push(pos);
+            }
+        }
+    }
+    let parsed = par_map(&todo, |&pos| -> Result<(FileWork, Option<Ast>), Diag> {
+        let di = order[pos];
+        let disc = &discs[di];
+        let lexed = lexed_of(di);
+        let ast = parser::parse(&lexed, interner, known)?;
+        let outside = reads_outside(&disc.text);
+        let store = if outside { None } else { Some(ast.clone()) };
+        let key = format!("{}#{}", modules::canonical_string(&disc.path), disc.module.0);
+        Ok((
+            FileWork {
+                path: disc.path.clone(),
+                text: disc.text.clone(),
+                file_id: disc.file_id,
+                ast,
+                module: disc.module,
+                key,
+                text_hash: hash_str(&disc.text),
+                outside,
+                exp_hash: 0,
+            },
+            store,
+        ))
+    });
+    for (&pos, r) in todo.iter().zip(parsed) {
         match r {
-            Ok(w) => works.push(w),
+            Ok((mut w, store)) => {
+                if let Some(ast) = store {
+                    cache.put_parsed(&w.key, w.text_hash, w.file_id, exp_hashes[pos], ast);
+                }
+                w.exp_hash = exp_hashes[pos];
+                works[pos] = Some(w);
+            }
             Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
         }
     }
+    let mut works: Vec<FileWork> = works.into_iter().map(|w| w.expect("every file parsed or ready")).collect();
     lap!("resolve: expand+parse");
     // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
@@ -1983,6 +2180,20 @@ fn resolve_one(
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
     }
     lap!("resolve: strip+register");
+    // The tables are frozen now. Every file whose cached final
+    // chunk was stored under this exact epoch (and expanded
+    // stream) rewrites to that chunk, so its rewrite walk is
+    // skipped and the chunk is taken over at flatten time.
+    let epoch = tables.rewrite_epoch();
+    let mut final_hits: Vec<Option<FinalChunk>> = Vec::with_capacity(works.len());
+    for w in works.iter() {
+        let hit = match cache.final_epoch(&w.key, w.text_hash, w.file_id) {
+            Some(e) if e == epoch => cache.final_chunk(&w.key, w.text_hash, w.file_id).filter(|c| c.exp_hash == w.exp_hash),
+            _ => None,
+        };
+        final_hits.push(hit);
+    }
+    lap!("resolve: epoch");
     // Rewrite paths to flat names, checking visibility. The tables
     // are frozen at this point and each file's Ast is its own, so
     // the pass runs in parallel across files; diagnostics merge
@@ -1996,10 +2207,14 @@ fn resolve_one(
             interner: &Interner,
             list_module: &FxMap<ItemListKey, ModuleId>,
             local_names: &FxMap<Sym, ()>,
+            skip: &[bool],
         ) -> Vec<Diag> {
             if works.len() <= 1 || depth == 0 {
                 let mut rw = Rewrite { tables, interner, list_module, local_names, diags: Vec::new() };
                 for (i, w) in works.iter_mut().enumerate() {
+                    if skip[base + i] {
+                        continue;
+                    }
                     let module = w.module;
                     rw.file_items(&mut w.ast, base + i, module, &[]);
                 }
@@ -2008,8 +2223,8 @@ fn resolve_one(
             let mid = works.len() / 2;
             let (left, right) = works.split_at_mut(mid);
             std::thread::scope(|s| {
-                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module, local_names));
-                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module, local_names);
+                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module, local_names, skip));
+                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module, local_names, skip);
                 let mut diags = handle.join().unwrap();
                 diags.append(&mut right_diags);
                 diags
@@ -2018,7 +2233,8 @@ fn resolve_one(
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let depth = (usize::BITS - cores.leading_zeros()).min(5);
         let local_names = tables.local_named_set();
-        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module, &local_names)
+        let skip: Vec<bool> = final_hits.iter().map(|h| h.is_some()).collect();
+        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module, &local_names, &skip)
     };
     if !rw_diags.is_empty() {
         return Err(OneError { diags: rw_diags, seen, needs_std });
@@ -2032,33 +2248,70 @@ fn resolve_one(
     // ran method bodies in the root module (wrong bindings and field
     // visibility). Per-fn lines and body hashes ride the same pass, in
     // the flattened order collect uses.
-    let mut chunks = Vec::new();
-    let mut fn_lines = Vec::new();
-    let mut body_hashes = Vec::new();
-    // Nested fns ride after every file's top-level fns (collect's order).
-    let mut nested_lines: Vec<u32> = Vec::new();
-    let mut nested_hashes: Vec<u64> = Vec::new();
-    let mut nested_modules: Vec<ModuleId> = Vec::new();
-    let mut fn_module = Vec::new();
-    let mut structure = crate::intern::FxHasher::default();
-    for (fi, mut w) in works.into_iter().enumerate() {
-        // Module/import structure, hashed before flattening drops it.
-        {
-            use std::hash::Hash;
-            w.path.to_string_lossy().hash(&mut structure);
-            structure_items(&w.ast.items, &mut structure);
+    // One pending chunk per file: a cache hit contributes its
+    // stored chunk whole; a miss is flattened here and stored at
+    // the end under the current epoch.
+    struct Pending {
+        key: String,
+        text_hash: u64,
+        exp_hash: u64,
+        file_id: FileId,
+        cacheable: bool,
+        ast: Ast,
+        fn_lines: Vec<u32>,
+        body_hashes: Vec<u64>,
+        nested_lines: Vec<u32>,
+        nested_hashes: Vec<u64>,
+        fn_module_paths: Vec<Vec<Sym>>,
+        nested_module_paths: Vec<Vec<Sym>>,
+        structure: u64,
+        scan: Option<crate::driver::ast_hash::AstScans>,
+    }
+    let mut pendings: Vec<Pending> = Vec::with_capacity(works.len());
+    for ((fi, mut w), hit) in works.into_iter().enumerate().zip(final_hits) {
+        if let Some(c) = hit {
+            pendings.push(Pending {
+                key: w.key,
+                text_hash: w.text_hash,
+                exp_hash: w.exp_hash,
+                file_id: w.file_id,
+                cacheable: false,
+                ast: c.ast,
+                fn_lines: c.fn_lines,
+                body_hashes: c.body_hashes,
+                nested_lines: c.nested_lines,
+                nested_hashes: c.nested_hashes,
+                fn_module_paths: c.fn_module_paths,
+                nested_module_paths: c.nested_module_paths,
+                structure: c.structure,
+                scan: Some(crate::driver::ast_hash::AstScans {
+                    items: c.scan_items,
+                    bodies: c.scan_bodies.into_iter().chain(c.nested_bodies).collect(),
+                }),
+            });
+            continue;
         }
+        // Module/import structure of this file, hashed before
+        // flattening drops it.
+        let structure = {
+            use std::hash::{Hash, Hasher};
+            let mut h = crate::intern::FxHasher::default();
+            w.path.to_string_lossy().hash(&mut h);
+            structure_items(&w.ast.items, &mut h);
+            h.finish()
+        };
         let mut flat_items = Vec::new();
         let mut flat_mods: Vec<ModuleId> = Vec::new();
         flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], &list_module, &mut flat_items, &mut flat_mods);
+        let (mut p_lines, mut p_hashes, mut p_paths) = (Vec::new(), Vec::new(), Vec::new());
         for (item, module) in flat_items.iter().zip(flat_mods.iter()) {
             let mut push = |def: &FnDef| {
-                fn_lines.push(map.line_col(def.name_span).0);
+                p_lines.push(map.line_col(def.name_span).0);
                 let text = map.text(def.name_span.file).unwrap_or("");
                 let body_span = def.body.map(|b| w.ast.block(b).span).unwrap_or(def.name_span);
                 let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
-                body_hashes.push(hash_str(slice));
-                fn_module.push(*module);
+                p_hashes.push(hash_str(slice));
+                p_paths.push(tables.modules[module.0 as usize].path.clone());
             };
             match &item.kind {
                 ItemKind::Fn(d) => push(d),
@@ -2072,25 +2325,110 @@ fn resolve_one(
         }
         // Nested fns (W-CORELANG body items) ride after the file's
         // top-level fns, in stmt item order, matching collect.
+        let (mut n_lines, mut n_hashes, mut n_paths) = (Vec::new(), Vec::new(), Vec::new());
         for item in &w.ast.stmt_items {
             if let crate::ast::ItemKind::Fn(d) = &item.kind {
-                nested_lines.push(map.line_col(d.name_span).0);
+                n_lines.push(map.line_col(d.name_span).0);
                 let text = map.text(d.name_span.file).unwrap_or("");
                 let body_span = d.body.map(|b| w.ast.block(b).span).unwrap_or(d.name_span);
                 let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
-                nested_hashes.push(hash_str(slice));
-                nested_modules.push(w.module);
+                n_hashes.push(hash_str(slice));
+                n_paths.push(tables.modules[w.module.0 as usize].path.clone());
             }
         }
         w.ast.items = flat_items;
-        chunks.push(w.ast);
+        pendings.push(Pending {
+            cacheable: !w.outside,
+            key: w.key,
+            text_hash: w.text_hash,
+            exp_hash: w.exp_hash,
+            file_id: w.file_id,
+            ast: w.ast,
+            fn_lines: p_lines,
+            body_hashes: p_hashes,
+            nested_lines: n_lines,
+            nested_hashes: n_hashes,
+            fn_module_paths: p_paths,
+            nested_module_paths: n_paths,
+            structure,
+            scan: None,
+        });
+    }
+    lap!("resolve: flatten");
+    // Structural scans for the chunks that missed, in parallel
+    // across files.
+    let fresh_scans = par_map(&pendings, |pd| pd.scan.is_none().then(|| crate::driver::ast_hash::scan_ast_seq(&pd.ast)));
+    for (pd, fresh) in pendings.iter_mut().zip(fresh_scans) {
+        if pd.scan.is_none() {
+            pd.scan = fresh;
+        }
+    }
+    // Store the fresh chunks under this epoch for the next request.
+    // A chunk scan lists nested bodies after its own top-level
+    // bodies; split at the top-level count for storage.
+    for pd in pendings.iter().filter(|pd| pd.cacheable) {
+        let scan = pd.scan.as_ref().expect("every pending chunk is scanned");
+        let top = pd.fn_lines.len().min(scan.bodies.len());
+        cache.put_final(
+            &pd.key,
+            pd.text_hash,
+            pd.file_id,
+            FinalChunk {
+                epoch,
+                exp_hash: pd.exp_hash,
+                ast: pd.ast.clone(),
+                fn_lines: pd.fn_lines.clone(),
+                body_hashes: pd.body_hashes.clone(),
+                nested_lines: pd.nested_lines.clone(),
+                nested_hashes: pd.nested_hashes.clone(),
+                fn_module_paths: pd.fn_module_paths.clone(),
+                nested_module_paths: pd.nested_module_paths.clone(),
+                structure: pd.structure,
+                scan_items: scan.items.clone(),
+                scan_bodies: scan.bodies[..top].to_vec(),
+                nested_bodies: scan.bodies[top..].to_vec(),
+            },
+        );
+    }
+    // Assemble the crate outputs in file order.
+    let module_by_path: FxMap<Vec<Sym>, ModuleId> =
+        tables.modules.iter().enumerate().map(|(i, m)| (m.path.clone(), ModuleId(i as u32))).collect();
+    let mut chunks = Vec::with_capacity(pendings.len());
+    let mut fn_lines = Vec::new();
+    let mut body_hashes = Vec::new();
+    let mut nested_lines: Vec<u32> = Vec::new();
+    let mut nested_hashes: Vec<u64> = Vec::new();
+    let mut nested_modules: Vec<ModuleId> = Vec::new();
+    let mut fn_module = Vec::new();
+    let mut scan_items = Vec::new();
+    let mut scan_bodies = Vec::new();
+    let mut nested_bodies = Vec::new();
+    let mut structure = crate::intern::FxHasher::default();
+    for pd in pendings {
+        {
+            use std::hash::Hash;
+            pd.structure.hash(&mut structure);
+        }
+        let top = pd.fn_lines.len();
+        fn_lines.extend(pd.fn_lines);
+        body_hashes.extend(pd.body_hashes);
+        nested_lines.extend(pd.nested_lines);
+        nested_hashes.extend(pd.nested_hashes);
+        nested_modules.extend(pd.nested_module_paths.iter().map(|p| module_by_path.get(p).copied().unwrap_or(ROOT_MODULE)));
+        fn_module.extend(pd.fn_module_paths.iter().map(|p| module_by_path.get(p).copied().unwrap_or(ROOT_MODULE)));
+        let mut scan = pd.scan.expect("every pending chunk is scanned");
+        scan_items.extend(scan.items);
+        nested_bodies.extend(scan.bodies.drain(top.min(scan.bodies.len())..));
+        scan_bodies.extend(scan.bodies);
+        chunks.push(pd.ast);
     }
     let ast = Ast::concat(chunks);
     let structure_hash = {
         use std::hash::Hasher;
         structure.finish()
     };
-    lap!("resolve: flatten+concat");
+    let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
+    lap!("resolve: chunk scan+concat");
     Ok(CrateOut {
         ast,
         fn_lines,
@@ -2105,6 +2443,8 @@ fn resolve_one(
         exported_macros: menv.exported_sources(),
         expand_deps: file_deps.into_iter().flatten().collect(),
         timings,
+        scans,
+        nested_bodies,
     })
 }
 
@@ -3843,6 +4183,28 @@ mod tests {
         assert_eq!(first.body_hashes, second.body_hashes);
         assert_eq!(first.structure_hash, second.structure_hash);
         assert_eq!(first.ast.items.len(), second.ast.items.len());
+        // The cache now holds parsed Asts and final chunks, and the
+        // assembled chunk scans equal a fresh scan of the merged Ast.
+        assert!(cache.files.values().all(|f| f.parsed.is_some() && f.final_chunk.is_some()), "every file is cached");
+        let fresh = crate::driver::ast_hash::scan_ast(&second.ast);
+        assert_eq!(
+            second.scans.items.iter().map(|i| i.hash).collect::<Vec<_>>(),
+            fresh.items.iter().map(|i| i.hash).collect::<Vec<_>>()
+        );
+        assert_eq!(second.scans.bodies, fresh.bodies);
+        assert_eq!(first.tables.fn_module, second.tables.fn_module);
+        // An import edit moves the rewrite epoch: chunks rebuild and
+        // the answer still matches a fresh scan.
+        std::fs::write(dir.join("main.rs"), "mod a;\nmod b;\nuse crate::a::v as av;\nfn main() { println!(\"{}\", av() + b::v()); }").unwrap();
+        let imported = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("import edit resolves");
+        let fresh = crate::driver::ast_hash::scan_ast(&imported.ast);
+        assert_eq!(
+            imported.scans.items.iter().map(|i| i.hash).collect::<Vec<_>>(),
+            fresh.items.iter().map(|i| i.hash).collect::<Vec<_>>()
+        );
+        assert_eq!(imported.scans.bodies, fresh.bodies);
+        std::fs::write(dir.join("main.rs"), "mod a;\nmod b;\nfn main() { println!(\"{}\", a::v() + b::v()); }").unwrap();
+        let _ = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("import edit back resolves");
         // An edit to one file changes exactly its body hash.
         std::fs::write(dir.join("b.rs"), "pub fn v() -> i64 { 3 }").unwrap();
         let third = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("edited resolves");
@@ -3851,6 +4213,37 @@ mod tests {
         // A deleted module file is an error, never a cached stream.
         std::fs::remove_file(dir.join("b.rs")).unwrap();
         assert!(resolve_crate_cached(&input(&dir), interner, known, &mut cache).is_err(), "missing file errors");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nested (body-local) fns keep collect's order through the
+    /// per-file chunk scans: every top-level body first, then every
+    /// nested body, on a cold and on a fully cached resolve.
+    #[test]
+    fn resolve_cache_nested_fn_scan_order() {
+        let dir = std::env::temp_dir().join(format!("lust-worklist-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "mod a;\nfn main() { fn inner(x: i64) -> i64 { x + 1 } println!(\"{}\", inner(a::v())); }").unwrap();
+        std::fs::write(dir.join("a.rs"), "pub fn v() -> i64 { fn deep() -> i64 { 7 } deep() }").unwrap();
+        let interner: &'static Interner = Box::leak(Box::new(Interner::default()));
+        let known: &'static Known = Box::leak(Box::new(Known::new(interner)));
+        let input = CrateInput {
+            root_path: dir.join("main.rs"),
+            root_text: std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:nestedtest", "bin", "nestedtest", false) },
+            crate_name: "nestedtest".into(),
+            deps: Vec::new(),
+        };
+        let mut cache = ResolveCache::new();
+        for round in 0..2 {
+            let r = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("nested resolves");
+            let fresh = crate::driver::ast_hash::scan_ast(&r.ast);
+            assert_eq!(r.scans.bodies, fresh.bodies, "round {round}: chunk scan order matches the merged scan");
+            assert_eq!(r.scans.bodies.len(), r.fn_lines.len(), "round {round}: one body scan per fn line");
+            assert_eq!(r.fn_lines.len(), 4, "main, a::v, and two nested fns");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

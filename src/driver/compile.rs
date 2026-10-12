@@ -783,24 +783,23 @@ fn slot_update(
     // Every fn's head hash at this parse (see `Front::slot_head`), and
     // whether it is a const fn (its body feeds const evaluation, so a
     // body edit can move values other items baked in).
-    let (heads, is_const): (Vec<u64>, Vec<bool>) = front
-        .fn_loc
-        .iter()
-        .map(|&(item, sub)| {
-            let f = match (item != usize::MAX, sub) {
-                (false, Some(k)) => match &front.ast.stmt_items[k].kind {
-                    ItemKind::Fn(d) => d,
-                    _ => unreachable!("fn_loc out of date"),
-                },
-                _ => match (&front.ast.items[item].kind, sub) {
-                    (ItemKind::Fn(d), None) => d,
-                    (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
-                    _ => unreachable!("fn_loc out of date"),
-                },
-            };
-            (super::ast_hash::fn_head_hash(&front.ast, f), f.qual.is_const)
-        })
-        .collect();
+    let head_ast = &front.ast;
+    let (heads, is_const): (Vec<u64>, Vec<bool>) = par_map(&front.fn_loc, |&(item, sub)| {
+        let f = match (item != usize::MAX, sub) {
+            (false, Some(k)) => match &head_ast.stmt_items[k].kind {
+                ItemKind::Fn(d) => d,
+                _ => unreachable!("fn_loc out of date"),
+            },
+            _ => match (&head_ast.items[item].kind, sub) {
+                (ItemKind::Fn(d), None) => d,
+                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+                _ => unreachable!("fn_loc out of date"),
+            },
+        };
+        (super::ast_hash::fn_head_hash(head_ast, f), f.qual.is_const)
+    })
+    .into_iter()
+    .unzip();
     for slot in (0..n_slots).filter(|&s| !live[s]) {
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
@@ -937,19 +936,17 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
         impl_paths.push(path);
     }
     let key = |hash, path, free, name| FnKey { disk: DiskDefId { krate: stable, hash }, path, free, name };
-    fn_loc
-        .iter()
-        .map(|&(item, sub)| match (item != usize::MAX, sub) {
-            (false, Some(k)) => {
-                let d = match &ast.stmt_items[k].kind {
-                    ItemKind::Fn(d) => d,
-                    _ => unreachable!("fn_loc points at a function"),
-                };
-                let seg = format!("#nested{k}");
-                let (hash, path) = def::free_fn_path(stable, &[seg.as_str()], interner.get(d.name));
-                key(hash, path, true, d.name)
-            }
-            _ => match (&ast.items[item].kind, sub) {
+    par_map(fn_loc, |&(item, sub)| match (item != usize::MAX, sub) {
+        (false, Some(k)) => {
+            let d = match &ast.stmt_items[k].kind {
+                ItemKind::Fn(d) => d,
+                _ => unreachable!("fn_loc points at a function"),
+            };
+            let seg = format!("#nested{k}");
+            let (hash, path) = def::free_fn_path(stable, &[seg.as_str()], interner.get(d.name));
+            key(hash, path, true, d.name)
+        }
+        _ => match (&ast.items[item].kind, sub) {
             (ItemKind::Fn(d), None) => {
                 let (hash, path) = def::free_fn_path(stable, &[], interner.get(d.name));
                 key(hash, path, true, d.name)
@@ -960,9 +957,8 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
                 key(hash, path, false, imp.fns[k].name)
             }
             _ => unreachable!("fn_loc points at a function"),
-            },
-        })
-        .collect()
+        },
+    })
 }
 
 /// LocalDefId order: top-level functions and impl methods, in item order. Same as `collect`.
@@ -1127,21 +1123,29 @@ fn resolved_setup(
             }
         }
     };
-    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, .. } =
+    let worklist::ResolvedCrate {
+        ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, ..
+    } =
         resolved;
     t.lap_parts(resolve_timings);
     let fn_count = fn_lines.len();
-    front.ast = ast;
+    // Dropping the previous merged Ast walks every node string and
+    // Vec; at crate scale that is milliseconds on the request path.
+    // A large old Ast drops on a side thread.
+    let old_ast = std::mem::replace(&mut front.ast, ast);
+    if old_ast.exprs.len() > 20_000 {
+        std::thread::spawn(move || drop(old_ast));
+    }
     front.map = map.clone();
     front.src.clone_from(&root_text);
     front.resolved_crate_ids = Some(crate_ids);
-    // Structural scan of the merged Ast: real per-item hashes (no
-    // bodies), per-fn body hashes, and body identifier sets. The
+    // Structural scan of the merged Ast, assembled by the worklist
+    // from per-file chunk scans (real per-item hashes without
+    // bodies, per-fn body hashes, and body identifier sets). The
     // worklist's module/import structure hash rides in as one extra
     // non-fn item scan at the end: flattening dropped the `mod` and
     // `use` items from the Ast, so without it an import-only edit
     // would look like a body-only edit (or no edit at all).
-    let scans = super::ast_hash::scan_ast(&front.ast);
     if scans.bodies.len() != fn_count {
         // The worklist and the Ast scan disagree on the fn list: an
         // internal error, never a guess at reuse.

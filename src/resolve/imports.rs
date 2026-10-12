@@ -478,6 +478,187 @@ impl ResolvedTables {
         out
     }
 
+    /// A fingerprint of every fact the path rewrite pass can read:
+    /// modules, bindings, def info, associated and field visibility,
+    /// variants, flat names, module defs, and the extern prelude.
+    /// Spans never hash (a line shift in one file must not move the
+    /// epoch of the others). The worklist keys its per-file
+    /// rewritten-Ast cache on this value: when it stands, a file
+    /// whose text stands rewrites to the same Ast. Accumulation is
+    /// order-independent per entry (map iteration order is not a
+    /// fact), with entry counts folded in.
+    pub fn rewrite_epoch(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn vis(h: &mut crate::intern::FxHasher, v: &VisKind) {
+            match v {
+                VisKind::Priv => h.write_u64(1),
+                VisKind::Pub => h.write_u64(2),
+                VisKind::Crate => h.write_u64(3),
+                VisKind::Super => h.write_u64(4),
+                VisKind::In(path) => {
+                    h.write_u64(5);
+                    for s in path {
+                        h.write_u64(s.0 as u64);
+                    }
+                }
+            }
+        }
+        fn target(h: &mut crate::intern::FxHasher, t: &Target) {
+            match t {
+                Target::Def(d) => {
+                    h.write_u64(1);
+                    h.write_u64(d.hash.0);
+                    h.write_u64(d.krate.0 as u64);
+                }
+                Target::Module(m) => {
+                    h.write_u64(2);
+                    h.write_u64(m.0 as u64);
+                }
+                Target::Extern(i) => {
+                    h.write_u64(3);
+                    h.write_u64(*i as u64);
+                }
+                Target::Variant(d, s) => {
+                    h.write_u64(4);
+                    h.write_u64(d.hash.0);
+                    h.write_u64(d.krate.0 as u64);
+                    h.write_u64(s.0 as u64);
+                }
+            }
+        }
+        let mut acc: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut n: u64 = 0;
+        macro_rules! fold {
+            ($tag:expr, $body:expr) => {{
+                let mut h = crate::intern::FxHasher::default();
+                h.write_u64($tag);
+                $body(&mut h);
+                acc = acc.wrapping_add(h.finish().wrapping_mul(0x9e_37_79_b9_7f_4a_7c_15));
+                n += 1;
+            }};
+        }
+        for (i, m) in self.modules.iter().enumerate() {
+            fold!(0x10, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(i as u64);
+                h.write_u64(m.parent.map_or(u64::MAX, |p| p.0 as u64));
+                h.write_u64(m.name.0 as u64);
+                h.write_u64(m.no_prelude as u64);
+                for s in &m.path {
+                    h.write_u64(s.0 as u64);
+                }
+                vis(h, &m.vis);
+            });
+        }
+        for (mi, maps) in self.maps.iter().enumerate() {
+            for (ns, m) in maps.iter().enumerate() {
+                for (name, state) in m {
+                    fold!(0x20, |h: &mut crate::intern::FxHasher| {
+                        h.write_u64(mi as u64);
+                        h.write_u64(ns as u64);
+                        h.write_u64(name.0 as u64);
+                        match state {
+                            BindState::Ambiguous => h.write_u64(0),
+                            BindState::One(b) => {
+                                h.write_u64(1);
+                                target(h, &b.target);
+                                vis(h, &b.vis);
+                                h.write_u64(b.rank as u64);
+                                h.write_u64(b.def_module.0 as u64);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        for (i, e) in self.externs.iter().enumerate() {
+            fold!(0x30, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(i as u64);
+                e.name.hash(h);
+                h.write_u64(e.def.hash.0);
+                h.write_u64(e.def.krate.0 as u64);
+                h.write_u64(e.is_std_lib as u64);
+                h.write_u64(e.owner.0 as u64);
+                h.write_u64(e.root_module.map_or(u64::MAX, |m| m.0 as u64));
+                e.unsupported.hash(h);
+            });
+        }
+        for (magic, root) in &self.crate_magic {
+            fold!(0x46, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(magic.0 as u64);
+                h.write_u64(root.0 as u64);
+            });
+        }
+        for (def, m) in &self.assoc_vis {
+            for (name, (v, dm)) in m {
+                fold!(0x40, |h: &mut crate::intern::FxHasher| {
+                    h.write_u64(def.hash.0);
+                    h.write_u64(def.krate.0 as u64);
+                    h.write_u64(name.0 as u64);
+                    h.write_u64(dm.0 as u64);
+                    vis(h, v);
+                });
+            }
+        }
+        for (def, (dm, m)) in &self.field_vis {
+            for (name, v) in m {
+                fold!(0x41, |h: &mut crate::intern::FxHasher| {
+                    h.write_u64(def.hash.0);
+                    h.write_u64(def.krate.0 as u64);
+                    h.write_u64(name.0 as u64);
+                    h.write_u64(dm.0 as u64);
+                    vis(h, v);
+                });
+            }
+        }
+        for (def, names) in &self.variants {
+            fold!(0x42, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(def.hash.0);
+                h.write_u64(def.krate.0 as u64);
+                for s in names {
+                    h.write_u64(s.0 as u64);
+                }
+            });
+        }
+        for (def, info) in &self.def_info {
+            fold!(0x43, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(def.hash.0);
+                h.write_u64(def.krate.0 as u64);
+                h.write_u64(match info.kind {
+                    ResKind::Fn => 1,
+                    ResKind::Adt => 2,
+                    ResKind::Const => 3,
+                    ResKind::Static => 4,
+                    ResKind::Alias => 5,
+                    ResKind::Macro => 6,
+                });
+                h.write_u64(info.flat.0 as u64);
+                h.write_u64(info.module.0 as u64);
+                vis(h, &info.vis);
+            });
+        }
+        for (i, d) in self.module_defs.iter().enumerate() {
+            fold!(0x44, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(i as u64);
+                h.write_u64(d.hash.0);
+                h.write_u64(d.krate.0 as u64);
+            });
+        }
+        for (ns, m) in self.flat.iter().enumerate() {
+            for (name, def) in m {
+                fold!(0x45, |h: &mut crate::intern::FxHasher| {
+                    h.write_u64(ns as u64);
+                    h.write_u64(name.0 as u64);
+                    h.write_u64(def.hash.0);
+                    h.write_u64(def.krate.0 as u64);
+                });
+            }
+        }
+        let mut h = crate::intern::FxHasher::default();
+        h.write_u64(acc);
+        h.write_u64(n);
+        h.finish()
+    }
+
     /// The answer for the S7 query fns: the module table first, then the
     /// flat-name index (the merged AST's rewritten names, which the
     /// checker asks about in the root module). None means "no answer
