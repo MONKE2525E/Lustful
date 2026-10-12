@@ -141,7 +141,13 @@ for n in 1 2 3 4 5; do
   [ "$n" = 1 ] && first_entry=$(ls "$d/c" | grep '^req-' | grep -v '\.exe$' | head -1)
 done
 total=$(du -sb "$d/c" | cut -f1)
-if [ "$total" -le $((cap + 16384)) ]; then ok "evict: cache stays near the cap ($total bytes)"; else bad "evict: cache stays near the cap" "$total bytes over cap $cap"; fi
+# Near the cap means at most one entry over it: the newest entry is
+# kept whole even when it alone exceeds the cap (a linked binary is
+# bigger than this test's cap now), so the slack is the largest
+# single file in the cache, not a fixed byte count.
+largest=$(find "$d/c" -type f -printf '%s\n' | sort -n | tail -1)
+largest=${largest:-0}
+if [ "$total" -le $((cap + largest)) ]; then ok "evict: cache stays near the cap ($total bytes)"; else bad "evict: cache stays near the cap" "$total bytes over cap $cap (largest entry $largest)"; fi
 if [ -n "${first_entry:-}" ] && [ ! -e "$d/c/$first_entry" ]; then ok "evict: oldest entry deleted first"; else bad "evict: oldest entry deleted first" "$first_entry still present"; fi
 out=$(evict_run build f5.rs -o h5 --timings)
 case "$out" in *"cache hit"*) ok "evict: newest entry kept";; *) bad "evict: newest entry kept" "f5 missed";; esac
