@@ -263,22 +263,121 @@ struct FnGen<'b, 'p, 'a> {
     /// LocalDefId to table slot. Slots are stable across edits; local ids are not.
     slots: &'b [u32],
     tmp: u32,
+    /// This function's return value uses the out-pointer ABI (`ret_is_large`).
+    ret_large: bool,
+}
+
+/// Size and alignment of a CTy as the emitted C types lay it out:
+/// declaration order, natural alignment, a uint32 tag first in enums
+/// and Options. This mirrors `type_decls`, not the Rust layout engine
+/// (that arrives with W-CORELANG and will own both). Used only for
+/// the return-ABI threshold below, so it must match the C structs
+/// this file emits, nothing else.
+fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
+    fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> (u64, u64) {
+        fn align_up(x: u64, a: u64) -> u64 {
+            (x + a - 1) / a * a
+        }
+        fn fields(p: &Program, v: &Variant, seen: &mut HashSet<AdtId>) -> (u64, u64) {
+            let (mut size, mut align) = (0u64, 1u64);
+            for f in &v.fields {
+                let (fs, fa) = go(p, &cty(&p.tys, f.ty), seen);
+                size = align_up(size, fa) + fs;
+                align = align.max(fa);
+            }
+            (align_up(size, align), align)
+        }
+        match t {
+            CTy::Unit | CTy::Bool => (1, 1),
+            CTy::Char => (4, 4),
+            CTy::Int(i) => {
+                let s = (i.bits() / 8) as u64;
+                (s, if is128(*i) { 16 } else { s.min(8) })
+            }
+            CTy::Str => (16, 8),
+            CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
+            CTy::Args => (8, 8),
+            CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
+            CTy::Ref(_) => (8, 8),
+            CTy::Option(e) => {
+                let (es, ea) = go(p, e, seen);
+                let align = ea.max(4);
+                (align_up(align_up(4, ea) + es, align), align)
+            }
+            CTy::Adt(a) => {
+                if !seen.insert(*a) {
+                    // A by-value cycle has no finite size; check rejects
+                    // it long before here. Report huge, never loop.
+                    return (u64::MAX / 2, 8);
+                }
+                let adt = p.adt(*a);
+                let r = if adt.is_enum {
+                    let (mut usize_, mut ualign) = (0u64, 1u64);
+                    for v in &adt.variants {
+                        if !v.fields.is_empty() {
+                            let (vs, va) = fields(p, v, seen);
+                            usize_ = usize_.max(vs);
+                            ualign = ualign.max(va);
+                        }
+                    }
+                    if usize_ == 0 {
+                        (4, 4)
+                    } else {
+                        let align = ualign.max(4);
+                        (align_up(align_up(4, ualign) + usize_, align), align)
+                    }
+                } else if adt.variants[0].fields.is_empty() {
+                    (1, 1) // the emitted `uint8_t unused`
+                } else {
+                    fields(p, &adt.variants[0], seen)
+                };
+                seen.remove(a);
+                r
+            }
+        }
+    }
+    go(p, t, &mut HashSet::new())
+}
+
+/// Returns over 32 bytes go through a hidden out-pointer (ARCH 4.5);
+/// parameters stay by value, which keeps the slot cast simple.
+fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
+    c_size_align(p, &cty(&p.tys, p.fn_info(f).ret)).0 > 32
 }
 
 /// `(RET (*)(PARAMS))`, the cast that calls function `f` through the table.
+/// A large return becomes `(void (*)(RET*, PARAMS))` (see `ret_is_large`).
 fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     let info = p.fn_info(f);
-    let params: Vec<String> = info.params.iter().map(|&t| ctype(&cty(&p.tys, t))).collect();
+    let ret = ctype(&cty(&p.tys, info.ret));
+    let mut params: Vec<String> = Vec::new();
+    if ret_is_large(p, f) {
+        params.push(format!("{ret}*"));
+    }
+    params.extend(info.params.iter().map(|&t| ctype(&cty(&p.tys, t))));
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    format!("({} (*)({}))", ctype(&cty(&p.tys, info.ret)), params)
+    if ret_is_large(p, f) {
+        format!("(void (*)({params}))")
+    } else {
+        format!("({ret} (*)({params}))")
+    }
 }
 
 /// The C signature of function `f`, defined under the C name `f<slot>`.
 fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
     let info = p.fn_info(f);
-    let params: Vec<String> = info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
+    let ret = ctype(&cty(&p.tys, info.ret));
+    let mut params: Vec<String> = Vec::new();
+    if ret_is_large(p, f) {
+        params.push(format!("{ret} *out"));
+    }
+    params.extend(info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)));
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    format!("{} f{slot}({})", ctype(&cty(&p.tys, info.ret)), params)
+    if ret_is_large(p, f) {
+        format!("void f{slot}({params})")
+    } else {
+        format!("{ret} f{slot}({params})")
+    }
 }
 
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
@@ -298,6 +397,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         base_line,
         slots,
         tmp: 0,
+        ret_large: ret_is_large(p, body.fn_id),
     };
     g.function();
     let mut types = std::mem::take(&mut g.sig_types);
@@ -618,7 +718,13 @@ impl FnGen<'_, '_, '_> {
                     let _ = writeln!(self.out, "  goto bb{};", next.0);
                 }
             }
-            Terminator::Return => self.out.push_str("  return l0;\n"),
+            Terminator::Return => {
+                if self.ret_large {
+                    self.out.push_str("  *out = l0; return;\n")
+                } else {
+                    self.out.push_str("  return l0;\n")
+                }
+            }
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
             Terminator::Panic(parts) => {
                 self.out.push_str("  {\n");
@@ -642,7 +748,15 @@ impl FnGen<'_, '_, '_> {
                     collect_types(&ct, &mut self.sig_types);
                 }
                 let args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
-                format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
+                if ret_is_large(self.p, f) {
+                    let t = self.tmp();
+                    let ret = ctype(&cty(&self.p.tys, info.ret));
+                    let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
+                    let _ = writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
+                    t
+                } else {
+                    format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
+                }
             }
             CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
