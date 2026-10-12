@@ -31,6 +31,9 @@ else
 fi
 cargo build --release
 
+step "diagnostic code registry"
+scripts/check-codes.sh
+
 step "difftest"
 scripts/difftest.sh
 
