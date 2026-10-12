@@ -125,6 +125,10 @@ impl<'a> Parser<'a> {
     fn at_shr(&self) -> bool {
         self.peek() == Tok::Gt && self.peek_at(1) == Tok::Gt && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
     }
+    /// True at a `>>=`: lexed as `>` followed by `>=`, touching.
+    fn at_shr_assign(&self) -> bool {
+        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Ge && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
+    }
 
     fn push_expr(&mut self, e: Expr, span: Span) -> ExprId {
         self.ast.exprs.push(e);
@@ -648,16 +652,30 @@ impl<'a> Parser<'a> {
         }
         // Assignment is right-associative and lowest.
         let lhs = self.range_expr(no_struct)?;
-        let op = match self.peek() {
-            Tok::Eq => None,
-            Tok::PlusEq => Some(BinOp::Add),
-            Tok::MinusEq => Some(BinOp::Sub),
-            Tok::StarEq => Some(BinOp::Mul),
-            Tok::SlashEq => Some(BinOp::Div),
-            Tok::PercentEq => Some(BinOp::Rem),
-            _ => return Ok(lhs),
+        // `>>=` arrives as two tokens (`>` then `>=`), since `>>` is never lexed as one.
+        let (op, consume) = if self.at_shr_assign() {
+            (Some(BinOp::Shr), 2)
+        } else {
+            (
+                match self.peek() {
+                    Tok::Eq => None,
+                    Tok::PlusEq => Some(BinOp::Add),
+                    Tok::MinusEq => Some(BinOp::Sub),
+                    Tok::StarEq => Some(BinOp::Mul),
+                    Tok::SlashEq => Some(BinOp::Div),
+                    Tok::PercentEq => Some(BinOp::Rem),
+                    Tok::AmpEq => Some(BinOp::BitAnd),
+                    Tok::PipeEq => Some(BinOp::BitOr),
+                    Tok::CaretEq => Some(BinOp::BitXor),
+                    Tok::ShlEq => Some(BinOp::Shl),
+                    _ => return Ok(lhs),
+                },
+                1,
+            )
         };
-        self.bump();
+        for _ in 0..consume {
+            self.bump();
+        }
         let rhs = self.expr_ctx(no_struct)?;
         let span = start.to(self.prev_span());
         Ok(match op {
@@ -690,6 +708,8 @@ impl<'a> Parser<'a> {
             Tok::Ne => (BinOp::Ne, 3, 1),
             Tok::Lt => (BinOp::Lt, 3, 1),
             Tok::Le => (BinOp::Le, 3, 1),
+            // `>>=` is a compound assignment, not a shift: leave it for `expr_ctx`.
+            Tok::Gt if self.at_shr_assign() => return None,
             Tok::Gt if self.at_shr() => (BinOp::Shr, 7, 2),
             Tok::Gt => (BinOp::Gt, 3, 1),
             Tok::Ge => (BinOp::Ge, 3, 1),
@@ -1117,6 +1137,14 @@ impl<'a> Parser<'a> {
                 if !self.eat(Tok::Comma) {
                     break;
                 }
+            }
+            if args.len() < fixed {
+                return Err(syntax(self.span(), "too few arguments for this macro"));
+            }
+            // `print!`, `eprint!`, and `format!` need a format string; `println!` and kin do not.
+            let needs_str = matches!(kind, MacroKind::Print | MacroKind::Eprint | MacroKind::Format);
+            if needs_str && !matches!(self.peek(), Tok::Str(_)) {
+                return Err(syntax(self.span(), "expected a format string literal"));
             }
             if let Tok::Str(si) = self.peek() {
                 let lit_span = self.bump().span;
