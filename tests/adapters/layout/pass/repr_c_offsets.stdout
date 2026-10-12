@@ -1,0 +1,4 @@
+C size=24 align=8 a=0 b=8 c=16
+Outer size=16 align=4 tag=0 inner=4 tail=12 inner_size=8
+Hot size=64 align=64 flags=0 id=8 alias=16 data=24
+Nested size=32 head=0 head_b=8 after=24

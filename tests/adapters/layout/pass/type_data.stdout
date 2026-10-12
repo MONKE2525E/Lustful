@@ -1,0 +1,35 @@
+Type size=128 align=64
+TypeData size=104 align=8
+TypeReference size=104 align=8
+ObjectType size=64 align=8
+StructuredType size=48 align=8
+StructuredSignatures size=64 align=64
+GenericArgumentsMemo size=8 align=8
+SharedList_TypeId size=24 align=8
+SharedList_SymbolId size=24 align=8
+IntrinsicType size=24 align=8
+LiteralType size=56 align=8
+LiteralValue size=32 align=8
+UniqueESSymbolType size=24 align=8
+TypeParameter size=28 align=4
+IndexType size=12 align=4
+IndexedAccessType size=16 align=4
+TemplateLiteralType size=48 align=8
+StringMappingType size=8 align=4
+SubstitutionType size=12 align=4
+ConditionalType size=48 align=8
+ConditionalRoot size=112 align=8
+InterfaceType size=280 align=8
+TupleType size=320 align=8
+InstantiationExpressionType size=72 align=8
+MappedType size=104 align=8
+ReverseMappedType size=80 align=8
+EvolvingArrayType size=72 align=8
+UnionType size=176 align=8
+IntersectionType size=112 align=8
+TypeMapper size=16 align=8
+ArrayTypeMapper size=48 align=8
+SimpleTypeMapper size=12 align=4
+offset Type.data=24
+offset TypeReference.object.mapper=36
+offset ObjectType.structured=8
