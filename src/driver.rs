@@ -727,6 +727,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     for i in 0..fn_count {
         slot_lines[slot(i)] = scan_of(front, i).1;
     }
+    // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
+    // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
+    // glue unit's C is built below, only when unit 1 is in `todo`.
+    if fresh_base || caches.glue.shared.is_none() {
+        caches.glue.compute_shared(&caches.out, &groups, 3);
+    }
     let units: Vec<(PathBuf, String)> = par_map(&todo, |&(u, overlay)| {
         let c = match u {
             0 => cgen::main_unit(main_slot, &path, &slot_lines, &registered),
