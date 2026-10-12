@@ -6,11 +6,13 @@
 //      re-check, and re-generate only those functions.
 //   2. Only top-level functions were added, removed, or changed signature (all other items the
 //      same): re-parse the file, but re-check and re-generate only the changed functions and the
-//      bodies that mention their names. A mention-only candidate whose body is unchanged and
-//      whose recorded reads all still match the new program (`Program::reads_dirty`, the
-//      section 8.3 step 5 dirty walk for Binding and MethodSet nodes first) is reused without
-//      a recheck: per-name binding reads, method-set probes, and failed lookups are precise
-//      where name mentions are not. Candidates with no stored reads always recheck.
+//      bodies that mention their names. A changed function always rechecks: its body is checked
+//      against its own signature, which the body hash does not cover. A mention-only candidate
+//      (own signature unchanged, body unchanged) whose recorded reads all still match the new
+//      program (`Program::reads_dirty`, the section 8.3 step 5 dirty walk for Binding and
+//      MethodSet nodes first) is reused without a recheck: per-name binding reads, method-set
+//      probes, and failed lookups are precise where name mentions are not. Candidates with no
+//      stored reads always recheck.
 //   3. Anything else (a type, an impl, a use changed): full rebuild.
 use super::session::{Caches, Chunk, Front, Session};
 use super::{Cmd, Request, Response};
@@ -527,10 +529,10 @@ fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Resp
 /// After a parse that was not "bodies only": update item tables, assign slots by
 /// stable def hash, and pick the functions to re-check. Returns (changed,
 /// mention_only): changed local ids as indexes, plus the subset that changed
-/// only by mentioning a changed name (body hash equal, last check passed).
-/// Mention-only functions are the candidates the read-set dirty walk can
-/// reuse after collect. The one failure is a def hash collision (src/def.rs):
-/// an internal error the caller turns into a code 3 response.
+/// only by mentioning a changed name (body hash equal, last check passed, own
+/// signature item unchanged). Mention-only functions are the candidates the
+/// read-set dirty walk can reuse after collect. The one failure is a def hash
+/// collision (src/def.rs): an internal error the caller turns into a code 3 response.
 #[allow(clippy::too_many_arguments)]
 fn slot_update(
     front: &mut Front,
@@ -621,9 +623,14 @@ fn slot_update(
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
     // function's name (only possible in the "signatures" case). A function in the last
-    // group only (same body hash, last check passed) is a reuse candidate for the read-set
-    // dirty walk after collect; its `has_out` is cleared only if the walk keeps it changed,
-    // which the caller does when it stays in the work set (see the walk in `compile`).
+    // group only (same body hash, last check passed, and its own signature unchanged) is a
+    // reuse candidate for the read-set dirty walk after collect; its `has_out` is cleared
+    // only if the walk keeps it changed, which the caller does when it stays in the work
+    // set (see the walk in `compile`). A function whose own signature item changed is
+    // never a candidate: its body is checked against that signature (parameter names and
+    // types bind the locals, the return type coerces the tail), and the body hash does
+    // not cover the signature tokens, so no recorded read set can prove the old result
+    // stands. It rechecks like a body change.
     let names = changed_names.unwrap_or_default();
     let mut changed = Vec::new();
     let mut mention_only = Vec::new();
@@ -631,10 +638,11 @@ fn slot_update(
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
-        let mentions = idents.iter().any(|s| names.contains(s)) || keys[i].free && names.contains(&keys[i].name);
+        let own_sig_changed = keys[i].free && names.contains(&keys[i].name);
+        let mentions = own_sig_changed || idents.iter().any(|s| names.contains(s));
         let body_same = front.slot_hash[slot] == hash;
         if !body_same || !caches.ok[slot] || mentions {
-            if body_same && caches.ok[slot] && mentions {
+            if body_same && caches.ok[slot] && mentions && !own_sig_changed {
                 mention_only.push(i);
             } else {
                 caches.has_out[slot] = false;
@@ -1205,12 +1213,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // Store the read set with the result (section 8.2 rule 2): the
         // next signature-only edit replays it in the dirty walk above.
         // Only passing functions get one; a failing function always
-        // rechecks (its `ok` is false), so it needs no read set.
+        // rechecks (its `ok` is false), so it needs no read set. The
+        // stored set gains a `Sig` read of the function itself: body
+        // checking reads its own signature (parameter types bind the
+        // locals, the return type coerces the tail) through the compat
+        // `FnInfo` path, which records nothing, so this entry is the only
+        // record of that read. `slot_update` already keeps a fn whose
+        // own signature item changed out of the reuse candidates; the
+        // read keeps the walk itself honest about the same edge.
         if results[k].1.is_empty()
             && let Some(body) = &results[k].0
-            && let Some(slot_reads) = caches.slot_reads.get_mut(slot(i))
+            && caches.slot_reads.get(slot(i)).is_some()
         {
-            *slot_reads = Some(body.reads.clone());
+            let mut stored = body.reads.clone();
+            let _ = program.sig_of(&mut stored, program.def_id(LocalDefId(i as u32)));
+            caches.slot_reads[slot(i)] = Some(stored);
         }
         diags.extend(results[k].1.iter().cloned());
     }
