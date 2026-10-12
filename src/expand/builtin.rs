@@ -637,7 +637,7 @@ fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Resu
             let trees = st.lex_file_trees(&text, file)?;
             let old_file = std::mem::replace(&mut st.cur_file, path.to_string_lossy().to_string());
             let old_src = std::mem::replace(&mut st.cur_src, text);
-            let expanded = st.expand_list(trees, depth + 1, true, 0);
+            let expanded = st.expand_list(trees, depth + 1, true, false, 0);
             st.cur_file = old_file;
             st.cur_src = old_src;
             expanded

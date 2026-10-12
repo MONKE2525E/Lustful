@@ -1130,7 +1130,7 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
     st.recursion_limit = scan_recursion_limit(&tts, &st.strings, ctx.interner);
     st.prescan(&tts)?;
-    let out = st.expand_list(tts, 0, true, 0)?;
+    let out = st.expand_list(tts, 0, true, false, 0)?;
     if std::env::var_os("LUST_EXPAND_STATS").is_some() {
         let (hits, misses) = cache_stats();
         eprintln!("expand cache: {hits} hits, {misses} misses");
@@ -2101,9 +2101,11 @@ fn take(trees: &mut [Tt], i: usize) -> Tt {
 impl<'a> Expander<'a> {
     /// Expands one tree list, outermost first (ARCH 6.1). `depth` is the
     /// expansion nesting depth of this list; `item_list` marks the file
-    /// root and module bodies, where item-position rules apply; `nest`
+    /// root and module bodies, where item-position rules apply;
+    /// `stmt_list` marks a block body, where a brace-delimited macro
+    /// call at a statement boundary is a whole statement; `nest`
     /// bounds delimiter recursion so pathological input cannot overflow.
-    pub fn expand_list(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
+    pub fn expand_list(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
         if nest > 1000 {
             return Ok(trees);
         }
@@ -2141,7 +2143,7 @@ impl<'a> Expander<'a> {
                 if let Some(sym) = name_sym {
                     self.module.push(sym);
                 }
-                let expanded = self.expand_list(inner, depth, true, nest + 1);
+                let expanded = self.expand_list(inner, depth, true, false, nest + 1);
                 if name_sym.is_some() {
                     self.module.pop();
                 }
@@ -2193,7 +2195,7 @@ impl<'a> Expander<'a> {
                 // (the format family costs two: it expands through a
                 // nested `format_args!` in rustc).
                 let cost = if matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
-                let mut expanded_inner = self.expand_list(inner, depth + cost, false, nest + 1)?;
+                let mut expanded_inner = self.expand_list(inner, depth + cost, false, false, nest + 1)?;
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
                 }
@@ -2213,7 +2215,7 @@ impl<'a> Expander<'a> {
                 let call = Call { segs, leading_colon, head, delim, inner, group_span, span };
                 let mut next = group_idx + 1;
                 let expanded = self.expand_call(&call, depth)?;
-                let mut expanded = self.expand_list(expanded, depth + 1, item_list, nest)?;
+                let mut expanded = self.expand_list(expanded, depth + 1, item_list, stmt_list, nest)?;
                 let begins_item = starts_item(&expanded, self.ctx.interner);
                 let next_is_semi = tok_at(&trees, next).map(|t| t.tok) == Some(Tok::Semi);
                 if item_list && !expanded.is_empty() && begins_item && call.delim != Delim::Brace && !next_is_semi {
@@ -2253,7 +2255,65 @@ impl<'a> Expander<'a> {
                 if should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner) {
                     expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
                 }
+                // A brace-delimited call in statement position is a
+                // whole statement in rustc: `m!{} - 1;` is the call,
+                // then a separate `-1` statement. The flat stream
+                // would glue the operator onto the expansion's last
+                // expression, so close the statement where rustc
+                // does. Only statement lists qualify: in expression
+                // position the operator belongs to the expansion.
+                let brace_stmt = stmt_list
+                    && !item_list
+                    && stmt_boundary
+                    && call.delim == Delim::Brace
+                    && !expanded.is_empty()
+                    && !begins_item
+                    && !next_is_semi
+                    && !matches!(expanded.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
+                    && !matches!(expanded.first(), Some(Tt::Tok(t)) if t.tok == Tok::Let)
+                    && matches!(
+                        tok_at(&trees, next).map(|t| t.tok),
+                        Some(
+                            Tok::Minus
+                                | Tok::Plus
+                                | Tok::Star
+                                | Tok::Slash
+                                | Tok::Percent
+                                | Tok::EqEq
+                                | Tok::Ne
+                                | Tok::Lt
+                                | Tok::Le
+                                | Tok::Gt
+                                | Tok::Ge
+                                | Tok::AndAnd
+                                | Tok::OrOr
+                                | Tok::Amp
+                                | Tok::Pipe
+                                | Tok::Caret
+                                | Tok::Shl
+                                | Tok::Shr
+                                | Tok::Dot
+                                | Tok::Question
+                                | Tok::As
+                                | Tok::DotDot
+                                | Tok::DotDotEq
+                                | Tok::Eq
+                                | Tok::PlusEq
+                                | Tok::MinusEq
+                                | Tok::StarEq
+                                | Tok::SlashEq
+                                | Tok::PercentEq
+                                | Tok::AmpEq
+                                | Tok::PipeEq
+                                | Tok::CaretEq
+                                | Tok::ShlEq
+                                | Tok::ShrEq
+                        )
+                    );
                 out.extend(expanded);
+                if brace_stmt {
+                    out.push(Tt::Tok(Token { tok: Tok::Semi, span: call.span }));
+                }
                 i = next;
                 pending_macro_use = false;
                 continue;
@@ -2264,7 +2324,7 @@ impl<'a> Expander<'a> {
                 let Tt::Delim(d, inner, gspan) = tree else { unreachable!() };
                 let textual_len = self.textual.len();
                 let imports_len = self.imports.len();
-                let expanded = self.expand_list(inner, depth, false, nest + 1);
+                let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
                 self.textual.truncate(textual_len);
                 self.imports.truncate(imports_len);
                 out.push(Tt::Delim(d, expanded?, gspan));
@@ -2282,7 +2342,7 @@ impl<'a> Expander<'a> {
                 // fragment's trees like any other list here.
                 let tree = take(&mut trees, i);
                 let Tt::Frag(kind, inner, fspan) = tree else { unreachable!() };
-                let expanded = self.expand_list(inner, depth, false, nest + 1)?;
+                let expanded = self.expand_list(inner, depth, false, false, nest + 1)?;
                 out.push(Tt::Frag(kind, expanded, fspan));
             }
             i += 1;
@@ -2516,7 +2576,7 @@ impl<'a> Expander<'a> {
                 let head = &call.head[call.head.len().saturating_sub(2)..];
                 let mut out: Vec<Tt> = head.to_vec();
                 let written_lit = is_str_lit_arg(&call.inner);
-                let mut inner = self.expand_list(call.inner.clone(), depth + cost, false, 0)?;
+                let mut inner = self.expand_list(call.inner.clone(), depth + cost, false, false, 0)?;
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut inner, call.span);
                 }
@@ -2535,7 +2595,7 @@ impl<'a> Expander<'a> {
     /// Expands trees that must come back as statements or expressions of
     /// their written shape (builtin arguments), one level from `depth`.
     pub fn expand_more(&mut self, trees: Vec<Tt>, depth: u32) -> Result<Vec<Tt>, Diag> {
-        self.expand_list(trees, depth + 1, false, 0)
+        self.expand_list(trees, depth + 1, false, false, 0)
     }
 
     /// The current module path as `module_path!` prints it.
