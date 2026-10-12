@@ -858,10 +858,11 @@ impl FnGen<'_, '_, '_> {
                     if pl.proj.is_empty() {
                         // Moving the whole local: it owns nothing now.
                         post.push(format!("d{} = 0;", pl.local));
-                    } else if pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_))) {
-                        // Moving one field out (a partial move, or an enum payload). Zero the
-                        // field so the local's later drop skips it (a zero `String` or `Vec`
-                        // drops as a no-op) but still drops every other field.
+                    } else if pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_) | Proj::Index(_))) {
+                        // Moving one field or array element out (a partial move, or an
+                        // enum payload). Zero the slot so the local's later drop skips
+                        // it (a zero `String` or `Vec` drops as a no-op) but still
+                        // drops every other field.
                         post.push(format!("{e} = {};", zero_lit(self.p, &t)));
                     }
                 }
