@@ -1,9 +1,11 @@
 // Command-line parsing and the daemon wire protocol. Shared by the thin `lust` client and the
 // `lust-core` compiler, so the client stays small and starts fast.
 //
-// Wire format. Request: one line of tab-separated fields:
-//   cmd  file  out  json  timings  debug  emit_c  max_errors
-// The last field is optional on decode so an older client still works.
+// Wire format. Request: a header line with no user data in it,
+//   cmd json timings debug max_errors
+// followed by length-prefixed fields (file, out, emit_c), each as "<byte len>\n<bytes>".
+// Length prefixes carry any byte a path can hold, including tabs and newlines; emit_c uses
+// len 0 for None. Run arguments never cross the wire (see `Request::run_args`).
 // Response: "<code> <stdout len> <stderr len>\n" followed by the two byte strings.
 // Both binaries include this module and each uses only part of it.
 #![allow(dead_code)]
@@ -30,8 +32,8 @@ pub struct Request {
     pub max_errors: usize,
     /// For `lust run`: the program's arguments (without argv[0]), so a one-shot compile can
     /// run a small program in memory instead of building a file. The daemon wire format does
-    /// not carry this (decode sets None): a daemon build still writes the executable and the
-    /// client runs it.
+    /// not carry this (read_request sets None): a daemon build still writes the executable and
+    /// the client runs it.
     pub run_args: Option<Vec<String>>,
     /// For `lust test`: the file gets a generated `main`, so a missing user `main` is not
     /// an error. The daemon wire format does not carry this (decode sets false): `lust
@@ -148,27 +150,64 @@ pub fn socket_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!(".lust-daemon-{}.sock", &env!("LUST_BUILD_HASH")[..8])))
 }
 
-pub fn encode(r: &Request) -> String {
-    let b = |x: bool| if x { "1" } else { "0" };
-    let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
-    let emit = r.emit_c.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-    format!("{cmd}\t{}\t{}\t{}\t{}\t{}\t{emit}\t{}\n", r.file.display(), r.out.display(), b(r.json), b(r.timings), b(r.debug), r.max_errors)
+/// Appends one length-prefixed field: "<byte len>\n<bytes>".
+fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(bytes.len().to_string().as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(bytes);
 }
 
-pub fn decode(line: &str) -> Option<Request> {
-    let f: Vec<&str> = line.trim_end_matches('\n').split('\t').collect();
-    if f.len() != 7 && f.len() != 8 {
+/// Reads one length-prefixed field written by `put_field`.
+fn get_field(r: &mut impl BufRead) -> Option<Vec<u8>> {
+    let mut head = String::new();
+    if r.read_line(&mut head).ok()? == 0 {
         return None;
     }
+    let len: usize = head.trim().parse().ok()?;
+    // A length this large is a bad request, not an allocation to attempt.
+    if len > (1 << 28) {
+        return None;
+    }
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+pub fn encode(r: &Request) -> Vec<u8> {
+    let b = |x: bool| if x { "1" } else { "0" };
+    let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
+    let mut out = format!("{cmd} {} {} {} {}\n", b(r.json), b(r.timings), b(r.debug), r.max_errors).into_bytes();
+    put_field(&mut out, r.file.as_os_str().as_encoded_bytes());
+    put_field(&mut out, r.out.as_os_str().as_encoded_bytes());
+    put_field(&mut out, r.emit_c.as_ref().map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()));
+    out
+}
+
+/// Reads one request. None on EOF, a bad header, or a short read.
+pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
+    let mut head = String::new();
+    if r.read_line(&mut head).ok()? == 0 {
+        return None;
+    }
+    let f: Vec<&str> = head.split_whitespace().collect();
+    if f.len() != 5 {
+        return None;
+    }
+    #[allow(unused_imports)]
+    use std::os::unix::ffi::OsStringExt as _;
+    let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let file = path(get_field(r)?);
+    let out = path(get_field(r)?);
+    let emit = get_field(r)?;
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
-        file: f[1].into(),
-        out: f[2].into(),
-        json: f[3] == "1",
-        timings: f[4] == "1",
-        debug: f[5] == "1",
-        emit_c: if f[6].is_empty() { None } else { Some(f[6].into()) },
-        max_errors: if f.len() == 8 { f[7].parse().ok()? } else { 20 },
+        file,
+        out,
+        json: f[1] == "1",
+        timings: f[2] == "1",
+        debug: f[3] == "1",
+        emit_c: if emit.is_empty() { None } else { Some(path(emit)) },
+        max_errors: f[4].parse().ok()?,
         run_args: None,
         harness: false,
     })
@@ -181,7 +220,7 @@ pub fn write_response(w: &mut impl Write, r: &Response) -> std::io::Result<()> {
 /// Sends a request to a running daemon. None if no daemon answers.
 pub fn request(sock: &Path, req: &Request) -> Option<Response> {
     let mut conn = UnixStream::connect(sock).ok()?;
-    conn.write_all(encode(req).as_bytes()).ok()?;
+    conn.write_all(&encode(req)).ok()?;
     let mut reader = BufReader::new(conn);
     let mut head = String::new();
     reader.read_line(&mut head).ok()?;
