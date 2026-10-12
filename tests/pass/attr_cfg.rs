@@ -1,5 +1,4 @@
-// expect: L0522
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg(unix)]
 fn one() -> i64 {
     1
 }
