@@ -5,6 +5,9 @@
 //   lust-core test <file.rs> ...              run #[test] functions, one child process each
 //   lust-core explain <L####>                 long-form help for one diagnostic code
 //   lust-core capabilities [--json]           what the supported subset contains
+/// AST v2 keeps shapes for syntax whose parsers land later (docs/ARCH.md S3b),
+/// so many nodes are defined before anything reads them.
+#[allow(dead_code)]
 mod ast;
 mod borrowck;
 mod capabilities;

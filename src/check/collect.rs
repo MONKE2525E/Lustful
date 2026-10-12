@@ -3,7 +3,7 @@
 use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
 pub use crate::def::{CrateId, DefId, DefPathHash, LocalDefId, StableCrateHash};
 use crate::def::{CrateIds, DiskDefId};
-use crate::diag::{Diag, Span, unsupported};
+use crate::diag::{Diag, Span, not_yet, unsupported};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
 use crate::ty::*;
@@ -147,7 +147,7 @@ pub fn resolve_ty(
     let span = ast.ty_span(id);
     match ast.ty(id) {
         TyExpr::Unit => Ok(UNIT),
-        TyExpr::Ref { mutable, inner } => {
+        TyExpr::Ref { mutable, inner, .. } => {
             let inner = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
             Ok(tys.intern(TyKind::Ref(*mutable, inner)))
         }
@@ -158,11 +158,11 @@ pub fn resolve_ty(
             } else if segs.len() == 1 {
                 &segs[0]
             } else {
-                return Err(unsupported(span, "module paths in types"));
+                return Err(not_yet("L0505", span, "module paths in types"));
             };
             let name = seg.name;
             let no_generics = |tys: Ty| -> Result<Ty, Diag> {
-                if seg.generics.is_empty() {
+                if !seg.has_args() {
                     Ok(tys)
                 } else {
                     Err(Diag::new("L0110", span, "this type takes no generic arguments", "Remove the `<...>` part."))
@@ -187,17 +187,19 @@ pub fn resolve_ty(
                 return self_ty.ok_or_else(|| Diag::new("L0102", span, "`Self` is only valid inside an impl", "Write the type name."));
             }
             if name == known.Vec {
-                if seg.generics.len() != 1 {
+                let args = seg.type_args();
+                if args.len() != 1 {
                     return Err(Diag::new("L0110", span, "Vec takes one type argument", "Write `Vec<T>`."));
                 }
-                let e = resolve_ty(ast, interner, known, type_names, tys, seg.generics[0], self_ty)?;
+                let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
                 return Ok(tys.intern(TyKind::Vec(e)));
             }
             if name == known.Option {
-                if seg.generics.len() != 1 {
+                let args = seg.type_args();
+                if args.len() != 1 {
                     return Err(Diag::new("L0110", span, "Option takes one type argument", "Write `Option<T>`."));
                 }
-                let e = resolve_ty(ast, interner, known, type_names, tys, seg.generics[0], self_ty)?;
+                let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
                 return Ok(tys.intern(TyKind::Option(e)));
             }
             if let Some(&adt) = type_names.get(&name) {
@@ -207,10 +209,23 @@ pub fn resolve_ty(
             if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell", "f32", "f64", "i128", "u128"]
                 .contains(&n)
             {
-                return Err(unsupported(span, &format!("`{n}`")));
+                return Err(not_yet("L0641", span, &format!("the `{n}` type")));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
         }
+        // AST v2 type forms: the parser rejects each one today, so this is
+        // only a reject path for completeness.
+        _ => Err(not_yet("L0602", span, "this type form")),
+    }
+}
+
+/// Converts written variant or struct fields to (shape, (name, type, span) list).
+/// Tuple fields get their index as a synthetic name, as they had before AST v2.
+fn variant_fields_src(vf: &VariantFields) -> (VariantShape, Vec<(Sym, ast::TyId, Span)>) {
+    match vf {
+        VariantFields::Unit => (VariantShape::Unit, Vec::new()),
+        VariantFields::Tuple(fs) => (VariantShape::Tuple, fs.iter().enumerate().map(|(i, f)| (Sym(i as u32), f.ty, f.span)).collect()),
+        VariantFields::Struct(fs) => (VariantShape::Named, fs.iter().map(|f| (f.name, f.ty, f.span)).collect()),
     }
 }
 
@@ -258,21 +273,16 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
             ItemKind::Struct(s) => {
-                let fields = s.fields.iter().map(|f| (f.name, f.ty, f.span)).collect();
-                (vec![(s.name, s.name_span, VariantShape::Named, fields)], &s.derives)
+                let (shape, fields) = variant_fields_src(&s.fields);
+                let shape = if shape == VariantShape::Unit { VariantShape::Named } else { shape };
+                (vec![(s.name, s.name_span, shape, fields)], &s.derives)
             }
             ItemKind::Enum(e) => {
                 let vs = e
                     .variants
                     .iter()
                     .map(|v| {
-                        let (shape, fs): (VariantShape, Vec<FieldSrc>) = match &v.fields {
-                            VariantFields::Unit => (VariantShape::Unit, Vec::new()),
-                            VariantFields::Tuple(ts) => {
-                                (VariantShape::Tuple, ts.iter().enumerate().map(|(i, &t)| (Sym(i as u32), t, ast.ty_span(t))).collect())
-                            }
-                            VariantFields::Struct(fs) => (VariantShape::Named, fs.iter().map(|f| (f.name, f.ty, f.span)).collect()),
-                        };
+                        let (shape, fs) = variant_fields_src(&v.fields);
                         (v.name, v.span, shape, fs)
                     })
                     .collect();
@@ -391,6 +401,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 SelfKind::Value => st,
                 SelfKind::Ref => p.tys.intern(TyKind::Ref(false, st)),
                 SelfKind::RefMut => p.tys.intern(TyKind::Ref(true, st)),
+                // Typed receivers are rejected by the parser today; treat as by-value.
+                SelfKind::Typed => st,
             });
         }
         for param in &def.params {
@@ -459,7 +471,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             }
             ItemKind::Impl(imp) => {
                 let owner = match ast.ty(imp.self_ty) {
-                    TyExpr::Path(segs) if segs.len() == 1 && segs[0].generics.is_empty() => p.type_names.get(&segs[0].name).copied(),
+                    TyExpr::Path(segs) if segs.len() == 1 && !segs[0].has_args() => p.type_names.get(&segs[0].name).copied(),
                     _ => None,
                 };
                 let Some(owner) = owner else {

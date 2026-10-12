@@ -43,8 +43,15 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         lw.local_map[cl as usize] = l;
         lw.scopes[0].push(l);
     }
-    let span = p.ast.block(f.def.body).span;
-    lw.block_into(f.def.body, Some(&Place::local(0)));
+    // The parser only builds fns with bodies today; a declaration shape
+    // lowers to an empty return so this can never panic.
+    let (span, body) = match f.def.body {
+        Some(b) => (p.ast.block(b).span, Some(b)),
+        None => (Span::default(), None),
+    };
+    if let Some(b) = body {
+        lw.block_into(b, Some(&Place::local(0)));
+    }
     let root = lw.scopes.pop().unwrap();
     lw.emit_drops(&root, span);
     lw.terminate(Terminator::Return, span);
@@ -352,7 +359,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 self.goto(end, span);
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
                 self.goto(head, span);
                 let cl = self.cond(*cond, span);
@@ -369,7 +376,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
                 }
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 let (head, exit) = (self.new_block(), self.new_block());
                 self.goto(head, span);
                 self.loops.push(LoopInfo { break_bb: exit, continue_bb: head, dest: dest.cloned(), depth: self.scopes.len() });
@@ -378,7 +385,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.goto(head, span);
                 self.cur = exit;
             }
-            Expr::For { pat, iter, body } => self.for_loop(*pat, *iter, *body, span, dest),
+            Expr::For { pat, iter, body, .. } => self.for_loop(*pat, *iter, *body, span, dest),
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
             Expr::Call { args, .. } => {
                 let res = self.ck.res(e);
@@ -433,7 +440,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.assign(d.clone(), Rvalue::Cast(o, ty), span);
                 }
             }
-            Expr::Ref { mutable, expr } => {
+            Expr::Ref { mutable, expr, .. } => {
                 let pl = if *mutable { self.place_for_mut(*expr) } else { self.place(*expr) };
                 if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Ref(*mutable, pl), span);
@@ -493,7 +500,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span);
             }
             Expr::Range { .. } => {}
-            Expr::Break(val) => {
+            Expr::Break { value: val, .. } => {
                 let li = self.loops.last().unwrap();
                 let (bb, depth, ld) = (li.break_bb, li.depth, li.dest.clone());
                 if let Some(v) = val {
@@ -502,7 +509,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.exit_to(depth, span);
                 self.terminate(Terminator::Goto(bb), span);
             }
-            Expr::Continue => {
+            Expr::Continue(_) => {
                 let li = self.loops.last().unwrap();
                 let (bb, depth) = (li.continue_bb, li.depth);
                 self.exit_to(depth, span);
@@ -517,6 +524,23 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Return, span);
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_into(e, *kind, args, fmt, *repeat, dest, ty, span),
+            // AST v2 expression forms: the parser rejects each one today.
+            Expr::Float(_)
+            | Expr::Tuple(_)
+            | Expr::Array(_)
+            | Expr::ArrayRepeat { .. }
+            | Expr::Closure { .. }
+            | Expr::Try(_)
+            | Expr::Await(_)
+            | Expr::AsyncBlock { .. }
+            | Expr::UnsafeBlock(_)
+            | Expr::LabeledBlock { .. }
+            | Expr::Let { .. }
+            | Expr::TupleField { .. }
+            | Expr::QPath { .. }
+            | Expr::ConstBlock(_)
+            | Expr::Underscore
+            | Expr::MacroCall(_) => {}
         }
     }
 
@@ -550,6 +574,8 @@ impl<'p, 'a> Lower<'p, 'a> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, init, span, .. } => self.let_stmt(*pat, *init, *span),
+                // Body items and statement macros are rejected by the parser today.
+                Stmt::Item(_) | Stmt::Macro { .. } => {}
                 Stmt::Expr { expr, .. } => {
                     let span = self.span(*expr);
                     self.scopes.push(Vec::new());
@@ -584,7 +610,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     match mode {
                         BindMode::Move => {
                             // `let x = &temp();` extends the temporary to the enclosing block.
-                            if let Expr::Ref { mutable, expr } = p.ast.expr(init)
+                            if let Expr::Ref { mutable, expr, .. } = p.ast.expr(init)
                                 && self.ck.coerce(init) == Coerce::None
                                 && !self.is_place_expr(*expr)
                             {
@@ -1007,10 +1033,16 @@ impl<'p, 'a> Lower<'p, 'a> {
                     branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(place), lit));
                 }
             }
-            Pat::Range { lo, hi } => {
-                let (a, b) = (self.lit_operand(*lo, ty), self.lit_operand(*hi, ty));
-                branch(self, Rvalue::Bin(BinOp::Ge, Operand::Copy(place.clone()), a));
-                branch(self, Rvalue::Bin(BinOp::Le, Operand::Copy(place), b));
+            Pat::Range { lo, hi, .. } => {
+                // The parser only builds two-bound ranges today.
+                if let Some(lo) = lo {
+                    let a = self.lit_operand(*lo, ty);
+                    branch(self, Rvalue::Bin(BinOp::Ge, Operand::Copy(place.clone()), a));
+                }
+                if let Some(hi) = hi {
+                    let b = self.lit_operand(*hi, ty);
+                    branch(self, Rvalue::Bin(BinOp::Le, Operand::Copy(place), b));
+                }
             }
             Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
                 let PatRes::Variant(a, v) = self.ck.pat_res(pat) else { return };
@@ -1039,6 +1071,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Goto(fail), span);
                 self.cur = cont;
             }
+            // AST v2 pattern forms: the parser rejects each one today.
+            Pat::Tuple(_)
+            | Pat::Slice { .. }
+            | Pat::Ref { .. }
+            | Pat::At { .. }
+            | Pat::Rest
+            | Pat::Paren(_)
+            | Pat::QPath { .. }
+            | Pat::MacroCall(_) => {}
         }
     }
 

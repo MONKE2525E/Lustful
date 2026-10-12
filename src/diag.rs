@@ -108,6 +108,13 @@ impl Diag {
     }
 }
 
+/// Error for a Rust syntax form whose AST shape exists (docs/ARCH.md S3b) but whose
+/// parser, checker, and codegen land with a later feature package. `code` is the stable
+/// Appendix A code for the form's area; `what` names the form in one short phrase.
+pub fn not_yet(code: &'static str, span: Span, what: &str) -> Diag {
+    Diag::new(code, span, format!("{what} is not supported yet"), "Rewrite this part with the supported subset (see README).")
+}
+
 /// Error for a Rust feature that lust will support later but this prototype does not.
 pub fn unsupported(span: Span, what: &str) -> Diag {
     Diag::new(

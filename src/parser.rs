@@ -1,9 +1,33 @@
 // Recursive-descent parser with precedence climbing for binary operators.
-// Rust syntax that lust rejects on purpose (lifetimes, user macros) gets its own error code here.
+// Rust syntax that lust rejects on purpose gets its own stable error code here:
+// lifetimes and user macros keep their original codes (L0203, L0401), `unsafe`
+// and `async` keep theirs (L0404, L0405), and each AST v2 form whose parser
+// lands later rejects with the Appendix A code for its area (docs/ARCH.md S3b).
 use crate::ast::*;
-use crate::diag::{Diag, Span, unsupported};
+use crate::diag::{Diag, Span, not_yet};
 use crate::intern::{Interner, Known, Sym};
-use crate::lexer::{Lexed, Tok, Token};
+use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree};
+
+// Stable Appendix A codes for AST v2 forms the parser recognizes but does not
+// build yet. Each code's registry row and explain page name its area.
+const C_MOD: &str = "L0505"; // modules, imports, and module paths
+const C_ATTR: &str = "L0522"; // cfg and known-but-unhandled attributes
+const C_TY: &str = "L0602"; // type forms and type aliases
+const C_TRAIT: &str = "L0614"; // traits, generics, and where clauses
+const C_ASSOC: &str = "L0621"; // associated items and qualified paths
+const C_CONST: &str = "L0632"; // const and static items, const generics
+const C_LIT: &str = "L0641"; // float and byte literals, other std-surface syntax
+const C_METHOD: &str = "L0721"; // method and receiver forms
+const C_EXTERN: &str = "L0810"; // extern blocks and foreign items
+const C_CORE: &str = "L0820"; // core expression, pattern, and statement forms
+
+fn unsafe_error(span: Span) -> Diag {
+    Diag::new("L0404", span, "`unsafe` is not supported", "Remove the unsafe code.")
+}
+
+fn async_error(span: Span) -> Diag {
+    Diag::new("L0405", span, "`async` is not supported", "Use std::thread and channels.")
+}
 
 type PResult<T> = Result<T, Diag>;
 
@@ -44,6 +68,53 @@ pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> 
 /// A parsed function body: its block, and its expression and pattern ranges.
 pub type ParsedBody = (BlockId, (u32, u32), (u32, u32));
 
+/// What one run of attributes in front of an item or part of an item yielded:
+/// the derive list and `#[test]` flag today's stages read, plus the recorded
+/// attributes later stages will read.
+#[derive(Default)]
+struct ParsedAttrs {
+    derives: Vec<(Sym, Span)>,
+    is_test: bool,
+    attrs: Vec<Attr>,
+}
+
+/// Rust attribute names lust knows by name but does not handle yet
+/// (docs/ARCH.md section 1.6 lists what each later package must honor).
+/// These reject with L0522; any other name rejects with L0402.
+const KNOWN_ATTRS: &[&str] = &[
+    "cfg",
+    "cfg_attr",
+    "repr",
+    "path",
+    "inline",
+    "cold",
+    "must_use",
+    "track_caller",
+    "non_exhaustive",
+    "deprecated",
+    "doc",
+    "macro_use",
+    "macro_export",
+    "no_implicit_prelude",
+    "bench",
+    "ignore",
+    "should_panic",
+    "global_allocator",
+    "default",
+    "target_feature",
+    "link_section",
+    "export_name",
+    "link",
+    "no_mangle",
+    "no_link",
+    "crate_type",
+    "crate_name",
+    "recursion_limit",
+    "type_length_limit",
+    "feature",
+    "forbid",
+];
+
 /// Parses one function body (`tokens` runs from its `{` to its `}`) and appends it to `ast`.
 /// Returns the body block and the new expression and pattern ranges for the function.
 pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner: &Interner, known: &Known) -> PResult<ParsedBody> {
@@ -60,6 +131,41 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     Ok((body?, ranges.0, ranges.1))
 }
 
+/// Converts a flat token slice into nested token trees. Unbalanced input
+/// nests on a best-effort basis; attribute contents are stored, not checked.
+fn token_trees(toks: &[Token]) -> Vec<TokenTree> {
+    fn delim_of(t: Tok) -> Option<Delim> {
+        match t {
+            Tok::LParen => Some(Delim::Paren),
+            Tok::LBracket => Some(Delim::Bracket),
+            Tok::LBrace => Some(Delim::Brace),
+            _ => None,
+        }
+    }
+    fn closes(open: Delim, t: Tok) -> bool {
+        matches!((open, t), (Delim::Paren, Tok::RParen) | (Delim::Bracket, Tok::RBracket) | (Delim::Brace, Tok::RBrace))
+    }
+    fn build(toks: &[Token], pos: &mut usize, close: Option<Delim>, depth: u32) -> Vec<TokenTree> {
+        let mut out = Vec::new();
+        while let Some(t) = toks.get(*pos) {
+            if close.is_some_and(|d| closes(d, t.tok)) {
+                *pos += 1;
+                break;
+            }
+            *pos += 1;
+            if let Some(d) = delim_of(t.tok).filter(|_| depth < MAX_DEPTH) {
+                let inner = build(toks, pos, Some(d), depth + 1);
+                out.push(TokenTree::Delim(d, inner, t.span));
+            } else {
+                out.push(TokenTree::Token(*t));
+            }
+        }
+        out
+    }
+    let mut pos = 0;
+    build(toks, &mut pos, None, 0)
+}
+
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
 }
@@ -72,10 +178,12 @@ fn tok_name(t: Tok) -> &'static str {
         Ident(_) => "identifier",
         Reserved(_) => "reserved keyword",
         Int(..) => "integer literal",
-        Float => "float literal",
+        Float(_) => "float literal",
         Str(_) => "string literal",
+        ByteStr => "byte string literal",
+        ByteChar => "byte char literal",
         Char(_) => "char literal",
-        Lifetime => "lifetime",
+        Lifetime(_) => "lifetime",
         As => "`as`",
         Break => "`break`",
         Const => "`const`",
@@ -110,6 +218,10 @@ fn tok_name(t: Tok) -> &'static str {
         Async => "`async`",
         Dyn => "`dyn`",
         Move => "`move`",
+        Crate => "`crate`",
+        Super => "`super`",
+        Extern => "`extern`",
+        Await => "`await`",
         LParen => "`(`",
         RParen => "`)`",
         LBrace => "`{`",
@@ -157,6 +269,7 @@ fn tok_name(t: Tok) -> &'static str {
         Underscore => "`_`",
         Shl => "`<<`",
         Dollar => "`$`",
+        At => "`@`",
         Eof => "end of file",
     }
 }
@@ -210,7 +323,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) => Ok((s, self.bump().span)),
             Tok::SelfUpper => Ok((self.known.self_type, self.bump().span)),
             Tok::Reserved(_) => Err(self.reserved_error(self.span())),
-            Tok::Lifetime => Err(lifetime_error(self.span())),
+            Tok::Lifetime(_) => Err(lifetime_error(self.span())),
             t => Err(syntax(self.span(), format!("expected identifier, found {}", tok_name(t)))),
         }
     }
@@ -226,6 +339,63 @@ impl<'a> Parser<'a> {
             format!("expected identifier, found reserved keyword `{name}`"),
             format!("Rename it, or write `r#{name}` to use it as an identifier."),
         )
+    }
+
+    /// The rejection for an AST v2 form that starts at the current token.
+    fn reject(&self, code: &'static str, what: &str) -> Diag {
+        not_yet(code, self.span(), what)
+    }
+
+    /// True when the current token is the identifier `name` (for weak keywords
+    /// such as `union`, `macro_rules`, and `raw`).
+    fn at_ident(&self, name: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(s) if self.interner.get(s) == name)
+    }
+
+    /// True at a macro call head: a path of one or more segments ending in `!`
+    /// (for example `a::b!(..)`). Bounded: stops at the first other token.
+    fn at_path_macro_call(&self) -> bool {
+        let mut j = self.pos;
+        loop {
+            match self.toks.get(j).map(|t| t.tok) {
+                Some(Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower) => j += 1,
+                _ => return false,
+            }
+            match self.toks.get(j).map(|t| t.tok) {
+                Some(Tok::Bang) => return true,
+                Some(Tok::PathSep) => j += 1,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Parses visibility: `pub`, `pub(crate)`, `pub(super)`, or `pub(in path)`.
+    /// Tolerant inside the parentheses, as the old skip-to-`)` code was: name
+    /// tokens become the restricted path and other tokens are skipped.
+    fn vis(&mut self) -> PResult<Vis> {
+        if !self.eat(Tok::Pub) {
+            return Ok(Vis::Private);
+        }
+        if self.peek() != Tok::LParen {
+            return Ok(Vis::Public);
+        }
+        let start = self.bump().span;
+        let mut path = Vec::new();
+        while self.peek() != Tok::RParen {
+            if self.peek() == Tok::Eof {
+                return Err(syntax(self.span(), "expected `)` in visibility, found end of file"));
+            }
+            match self.bump().tok {
+                Tok::Ident(s) | Tok::Reserved(s) => path.push(PathSeg::plain(s)),
+                Tok::Crate => path.push(PathSeg::plain(self.interner.intern("crate"))),
+                Tok::Super => path.push(PathSeg::plain(self.interner.intern("super"))),
+                Tok::SelfLower => path.push(PathSeg::plain(self.known.self_value)),
+                Tok::SelfUpper => path.push(PathSeg::plain(self.known.self_type)),
+                _ => {}
+            }
+        }
+        let end = self.bump().span;
+        Ok(Vis::Restricted { path, span: start.to(end) })
     }
 
     /// True when the token after the current one starts where the current one ends, in
@@ -281,105 +451,321 @@ impl<'a> Parser<'a> {
 
     // ---------- Items ----------
 
-    /// Parses outer attributes. Returns the derive list and whether `#[test]` was present.
-    /// Lint attributes are accepted and ignored.
-    fn attributes(&mut self) -> PResult<(Vec<(Sym, Span)>, bool)> {
-        let mut derives = Vec::new();
-        let mut is_test = false;
+    /// Parses attributes (outer, or inner at the start of a file or block).
+    /// Returns the derive list, whether `#[test]` was present, and the recorded
+    /// attributes. Lint attributes and known tool attributes (`rustfmt::`,
+    /// `clippy::`) are accepted and ignored, as before. A known Rust attribute
+    /// lust does not handle yet (cfg, repr, path, inline, and kin) rejects with
+    /// L0522; a name lust does not know at all rejects with L0402.
+    fn attributes(&mut self) -> PResult<ParsedAttrs> {
+        let mut out = ParsedAttrs::default();
         while self.peek() == Tok::Pound {
             let start = self.bump().span;
             let inner = self.eat(Tok::Bang);
             self.expect(Tok::LBracket, "`[`")?;
-            let (name, name_span) = self.ident()?;
-            let k = self.known;
-            match name {
-                _ if name == k.derive && !inner => {
-                    self.expect(Tok::LParen, "`(`")?;
-                    while self.peek() != Tok::RParen {
-                        derives.push(self.ident()?);
-                        if !self.eat(Tok::Comma) {
+            // Find the matching `]` first, so nested brackets inside the
+            // attribute cannot confuse the per-attribute handling below.
+            let body_start = self.pos;
+            let mut depth = 1usize;
+            let mut body_end = None;
+            for j in body_start..self.toks.len() {
+                match self.toks[j].tok {
+                    Tok::LBracket => depth += 1,
+                    Tok::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            body_end = Some(j);
                             break;
                         }
                     }
-                    self.expect(Tok::RParen, "`)`")?;
+                    Tok::Eof => break,
+                    _ => {}
                 }
-                _ if name == k.test && !inner => is_test = true,
-                _ if name == k.allow || name == k.warn || name == k.deny => {
-                    // Lint attributes have no effect in lust. Skip the argument list.
-                    self.expect(Tok::LParen, "`(`")?;
-                    let mut depth = 1;
-                    while depth > 0 {
-                        match self.bump().tok {
-                            Tok::LParen => depth += 1,
-                            Tok::RParen => depth -= 1,
-                            Tok::Eof => return Err(syntax(start, "unterminated attribute")),
-                            _ => {}
+            }
+            let Some(body_end) = body_end else {
+                return Err(syntax(start, "unterminated attribute"));
+            };
+            let body: Vec<Token> = self.toks[body_start..body_end].to_vec();
+            self.pos = body_end + 1;
+            // The attribute path: name segments joined by `::` at the start.
+            let mut path: Vec<PathSeg> = Vec::new();
+            let mut bi = 0usize;
+            while let Some(t) = body.get(bi) {
+                match t.tok {
+                    Tok::Ident(s) => {
+                        path.push(PathSeg::plain(s));
+                        bi += 1;
+                        if body.get(bi).map(|t| t.tok) == Some(Tok::PathSep) {
+                            bi += 1;
+                        } else {
+                            break;
                         }
                     }
+                    _ => break,
+                }
+            }
+            let Some(first) = path.first().map(|s| s.name) else {
+                return Err(syntax(start, "expected an attribute name"));
+            };
+            let name_span = body.first().map_or(start, |t| t.span);
+            let name_text = self.interner.get(first).to_string();
+            let input = if body.get(bi).map(|t| t.tok) == Some(Tok::LParen) {
+                // The usual form: `#[name(..)]`. The list is what is inside.
+                let mut d = 0usize;
+                let mut end = body.len();
+                for (j, t) in body.iter().enumerate().skip(bi) {
+                    match t.tok {
+                        Tok::LParen => d += 1,
+                        Tok::RParen => {
+                            d -= 1;
+                            if d == 0 {
+                                end = j;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                AttrInput::List(Delim::Paren, token_trees(&body[bi + 1..end]))
+            } else if bi < body.len() {
+                AttrInput::List(Delim::Bracket, token_trees(&body[bi..]))
+            } else {
+                AttrInput::None
+            };
+            let attr = Attr { style: if inner { AttrStyle::Inner } else { AttrStyle::Outer }, path: path.clone(), input, span: start.to(name_span) };
+            let k = self.known;
+            if path.len() > 1 {
+                // Tool attributes under a known tool namespace are ignored.
+                if name_text == "rustfmt" || name_text == "clippy" {
+                    out.attrs.push(attr);
+                    continue;
+                }
+                return Err(Diag::new(
+                    "L0402",
+                    name_span,
+                    format!("unsupported attribute `{name_text}`"),
+                    "Lust supports #[derive(...)], #[test], and lint attributes such as #[allow(...)].",
+                ));
+            }
+            match first {
+                _ if first == k.derive && !inner => {
+                    // The derive names are the identifiers inside the `(..)`.
+                    if body.get(bi).map(|t| t.tok) != Some(Tok::LParen) {
+                        return Err(syntax(name_span, "expected `(` after `derive`"));
+                    }
+                    for t in &body[bi + 1..] {
+                        match t.tok {
+                            Tok::Ident(s) => out.derives.push((s, t.span)),
+                            Tok::Comma | Tok::PathSep => {}
+                            Tok::RParen => break,
+                            _ => return Err(syntax(t.span, "expected a trait name in `derive`")),
+                        }
+                    }
+                }
+                _ if first == k.test && !inner => out.is_test = true,
+                _ if first == k.allow || first == k.warn || first == k.deny => {}
+                _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
+                    return Err(Diag::new(
+                        C_ATTR,
+                        name_span,
+                        format!("the `#[{name_text}]` attribute is not supported yet"),
+                        "Remove the attribute, or rewrite this part with the supported subset (see README).",
+                    ));
                 }
                 _ => {
                     return Err(Diag::new(
                         "L0402",
                         name_span,
-                        format!("unsupported attribute `{}`", self.interner.get(name)),
+                        format!("unsupported attribute `{name_text}`"),
                         "Lust supports #[derive(...)], #[test], and lint attributes such as #[allow(...)].",
                     ));
                 }
             }
-            self.expect(Tok::RBracket, "`]`")?;
+            out.attrs.push(attr);
         }
-        Ok((derives, is_test))
+        Ok(out)
     }
 
     fn item(&mut self) -> PResult<Option<Item>> {
-        let (derives, is_test) = self.attributes()?;
         let start = self.span();
-        self.eat(Tok::Pub);
-        if self.peek() == Tok::LParen {
-            // pub(crate) and similar. `bump` does not move past `Eof`, so stop there.
-            while self.bump().tok != Tok::RParen {
-                if self.peek() == Tok::Eof {
-                    return Err(syntax(self.span(), "expected `)` in visibility, found end of file"));
+        let parsed = self.attributes()?;
+        let derives = parsed.derives.clone();
+        let vis = self.vis()?;
+        // Function and impl qualifiers, in any written order: `const`,
+        // `async`, `unsafe`, and `extern "abi"`. A lone `const` with no `fn`
+        // after it is a const item, handled in the match below.
+        let mut qual = FnQual::default();
+        loop {
+            match self.peek() {
+                Tok::Const if !qual.is_const => {
+                    self.bump();
+                    qual.is_const = true;
                 }
+                Tok::Async if !qual.is_async => {
+                    self.bump();
+                    qual.is_async = true;
+                }
+                Tok::Unsafe if !qual.is_unsafe => {
+                    self.bump();
+                    qual.is_unsafe = true;
+                }
+                Tok::Extern if qual.abi.is_none() => {
+                    self.bump();
+                    if let Tok::Str(i) = self.peek() {
+                        self.bump();
+                        qual.abi = Some(i + self.str_base);
+                    } else {
+                        // `extern { .. }`, `extern crate`, or `extern fn`: put the
+                        // marker in with no ABI string, told apart by what follows.
+                        qual.abi = Some(u32::MAX);
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
+        let has_qual = qual.is_const || qual.is_async || qual.is_unsafe || qual.abi.is_some();
         let kind = match self.peek() {
+            Tok::Fn if has_qual => {
+                return Err(if qual.is_async {
+                    async_error(start)
+                } else if qual.is_unsafe {
+                    unsafe_error(start)
+                } else if qual.abi.is_some() {
+                    not_yet(C_EXTERN, start, "extern functions")
+                } else {
+                    not_yet(C_CONST, start, "const functions")
+                });
+            }
             Tok::Fn => {
                 let mut def = self.fn_def()?;
-                def.is_test = is_test;
+                def.is_test = parsed.is_test;
+                def.vis = vis.clone();
+                def.attrs = parsed.attrs.clone();
                 ItemKind::Fn(def)
             }
-            Tok::Struct => ItemKind::Struct(self.struct_def(derives)?),
-            Tok::Enum => ItemKind::Enum(self.enum_def(derives)?),
-            Tok::Impl => ItemKind::Impl(self.impl_def()?),
-            Tok::Use => {
-                self.bump();
+            Tok::Struct if !has_qual => ItemKind::Struct(self.struct_def(derives)?),
+            Tok::Enum if !has_qual => ItemKind::Enum(self.enum_def(derives)?),
+            Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => {
+                return Err(not_yet(C_TRAIT, start, "trait impls"));
+            }
+            Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def()?),
+            Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
+            Tok::Eof if derives.is_empty() && !has_qual => return Ok(None),
+            Tok::Trait => return Err(not_yet(C_TRAIT, start, "trait definitions")),
+            Tok::Mod => return Err(not_yet(C_MOD, start, "modules")),
+            Tok::Static => return Err(not_yet(C_CONST, start, "const and static items")),
+            Tok::Type => return Err(not_yet(C_TY, start, "type aliases")),
+            // `extern { .. }` and `extern crate ..;`: the qualifier loop ate `extern`.
+            Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
+            Tok::Crate if qual.abi.is_some() => return Err(not_yet(C_MOD, start, "`extern crate` items")),
+            _ if qual.is_const => return Err(not_yet(C_CONST, start, "const and static items")),
+            _ if qual.is_async => return Err(async_error(start)),
+            _ if qual.is_unsafe => return Err(unsafe_error(start)),
+            Tok::Ident(_) if self.at_ident("union") && matches!(self.peek_at(1), Tok::Ident(_)) => {
+                return Err(not_yet(C_TY, start, "unions"));
+            }
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super if self.at_path_macro_call() => {
+                return Err(macro_error(start));
+            }
+            Tok::Reserved(_) => return Err(self.reserved_error(start)),
+            t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
+        };
+        Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }))
+    }
+
+    /// Parses a `use` declaration into a tree. If the tree parse fails, falls
+    /// back to the old behavior (skip to the `;`, record an empty group) so
+    /// every program that parsed before still parses.
+    fn use_def(&mut self) -> PResult<UseDef> {
+        let start = self.expect(Tok::Use, "`use`")?;
+        let saved = self.pos;
+        let tree = match self.use_tree() {
+            Ok(tree) if self.eat(Tok::Semi) => tree,
+            _ => {
+                self.pos = saved;
                 while self.peek() != Tok::Semi && self.peek() != Tok::Eof {
                     self.bump();
                 }
                 self.expect(Tok::Semi, "`;`")?;
-                ItemKind::Use
+                UseTree { leading_colon: false, prefix: Vec::new(), kind: UseKind::Group(Vec::new()), span: start }
             }
-            Tok::Eof if derives.is_empty() => return Ok(None),
-            Tok::Trait => return Err(unsupported(start, "trait definitions")),
-            Tok::Mod => return Err(unsupported(start, "modules")),
-            Tok::Const | Tok::Static => return Err(unsupported(start, "const and static items")),
-            Tok::Type => return Err(unsupported(start, "type aliases")),
-            Tok::Unsafe => return Err(Diag::new("L0404", start, "`unsafe` is not supported", "Remove the unsafe code.")),
-            Tok::Async => return Err(Diag::new("L0405", start, "`async` is not supported", "Use std::thread and channels.")),
-            Tok::Ident(_) if self.peek_at(1) == Tok::Bang => return Err(macro_error(start)),
-            Tok::Reserved(_) => return Err(self.reserved_error(start)),
-            t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
-        Ok(Some(Item { kind }))
+        Ok(UseDef { tree, span: start.to(self.prev_span()) })
+    }
+
+    /// One use tree: a prefix path, then a name, a `*`, or a `{..}` group.
+    fn use_tree(&mut self) -> PResult<UseTree> {
+        let start = self.span();
+        let leading_colon = self.eat(Tok::PathSep);
+        if self.eat(Tok::LBrace) {
+            return Ok(UseTree { leading_colon, prefix: Vec::new(), kind: UseKind::Group(self.use_group()?), span: start.to(self.prev_span()) });
+        }
+        if self.eat(Tok::Star) {
+            return Ok(UseTree { leading_colon, prefix: Vec::new(), kind: UseKind::Glob, span: start.to(self.prev_span()) });
+        }
+        let mut prefix = Vec::new();
+        loop {
+            let name = match self.peek() {
+                Tok::Ident(_) | Tok::SelfUpper => self.ident()?.0,
+                Tok::SelfLower => {
+                    self.bump();
+                    self.known.self_value
+                }
+                Tok::Crate => {
+                    self.bump();
+                    self.interner.intern("crate")
+                }
+                Tok::Super => {
+                    self.bump();
+                    self.interner.intern("super")
+                }
+                t => return Err(syntax(self.span(), format!("expected a name in `use`, found {}", tok_name(t)))),
+            };
+            prefix.push(PathSeg::plain(name));
+            if !self.eat(Tok::PathSep) {
+                break;
+            }
+            if self.eat(Tok::Star) {
+                return Ok(UseTree { leading_colon, prefix, kind: UseKind::Glob, span: start.to(self.prev_span()) });
+            }
+            if self.eat(Tok::LBrace) {
+                return Ok(UseTree { leading_colon, prefix, kind: UseKind::Group(self.use_group()?), span: start.to(self.prev_span()) });
+            }
+        }
+        let rename = if self.eat(Tok::As) {
+            Some(match self.peek() {
+                Tok::Underscore => {
+                    self.bump();
+                    self.interner.intern("_")
+                }
+                _ => self.ident()?.0,
+            })
+        } else {
+            None
+        };
+        Ok(UseTree { leading_colon, prefix, kind: UseKind::Simple { rename }, span: start.to(self.prev_span()) })
+    }
+
+    /// The children of a use group, after its `{`.
+    fn use_group(&mut self) -> PResult<Vec<UseTree>> {
+        let mut out = Vec::new();
+        while self.peek() != Tok::RBrace {
+            out.push(self.nest(|p| p.use_tree())?);
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        Ok(out)
     }
 
     fn no_generics(&mut self, what: &str) -> PResult<()> {
         if self.peek() == Tok::Lt {
-            if self.peek_at(1) == Tok::Lifetime {
+            if matches!(self.peek_at(1), Tok::Lifetime(_)) {
                 return Err(lifetime_error(self.toks[self.pos + 1].span));
             }
-            return Err(unsupported(self.span(), &format!("generic {what}")));
+            return Err(not_yet(C_TRAIT, self.span(), &format!("generic {what}")));
         }
         Ok(())
     }
@@ -398,32 +784,36 @@ impl<'a> Parser<'a> {
             (Tok::Mut, Tok::SelfLower, _) => Some((SelfKind::Value, true, 2)),
             (Tok::Amp, Tok::SelfLower, _) => Some((SelfKind::Ref, false, 2)),
             (Tok::Amp, Tok::Mut, Tok::SelfLower) => Some((SelfKind::RefMut, false, 3)),
-            (Tok::Amp, Tok::Lifetime, _) => return Err(lifetime_error(self.toks[self.pos + 1].span)),
+            (Tok::Amp, Tok::Lifetime(_), _) => return Err(lifetime_error(self.toks[self.pos + 1].span)),
             _ => None,
         };
         if let Some((kind, mutable, n)) = self_form {
             for _ in 0..n {
                 self.bump();
             }
-            self_param = Some(SelfParam { kind, mutable, span: s.to(self.prev_span()) });
+            self_param = Some(SelfParam { kind, mutable, lifetime: None, ty: None, attrs: Vec::new(), span: s.to(self.prev_span()) });
             if self.peek() == Tok::Colon {
-                return Err(unsupported(self.span(), "typed `self` parameters"));
+                return Err(self.reject(C_METHOD, "typed `self` parameters"));
             }
             if !self.eat(Tok::Comma) && self.peek() != Tok::RParen {
                 return Err(syntax(self.span(), "expected `,` or `)`"));
             }
         }
         while self.peek() != Tok::RParen {
+            let pattrs = self.attributes()?;
             let start = self.span();
+            if self.peek() == Tok::DotDot {
+                return Err(self.reject(C_CORE, "variadic parameters"));
+            }
             let mutable = self.eat(Tok::Mut);
             let (pname, _) = match self.peek() {
                 Tok::Ident(_) => self.ident()?,
                 Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
-                _ => return Err(unsupported(start, "patterns in parameters")),
+                _ => return Err(not_yet(C_CORE, start, "patterns in parameters")),
             };
             self.expect(Tok::Colon, "`:`")?;
             let ty = self.ty()?;
-            params.push(Param { name: pname, mutable, ty, span: start.to(self.prev_span()) });
+            params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: start.to(self.prev_span()) });
             if !self.eat(Tok::Comma) {
                 break;
             }
@@ -431,24 +821,41 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RParen, "`)`")?;
         let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
         if self.peek() == Tok::Where {
-            return Err(unsupported(self.span(), "where clauses"));
+            return Err(self.reject(C_TRAIT, "where clauses"));
         }
         let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
         let body = self.block()?;
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
-        Ok(FnDef { name, name_span, is_test: false, self_param, params, ret, body, exprs, pats })
+        Ok(FnDef {
+            name,
+            name_span,
+            is_test: false,
+            vis: Vis::Private,
+            attrs: Vec::new(),
+            qual: FnQual::default(),
+            generics: Generics::default(),
+            self_param,
+            params,
+            variadic: false,
+            ret,
+            where_clause: WhereClause::default(),
+            body: Some(body),
+            exprs,
+            pats,
+        })
     }
 
     fn fields(&mut self) -> PResult<Vec<FieldDef>> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while self.peek() != Tok::RBrace {
-            self.eat(Tok::Pub);
+            let fattrs = self.attributes()?;
+            let vis = self.vis()?;
             let (name, span) = self.ident()?;
             self.expect(Tok::Colon, "`:`")?;
             let ty = self.ty()?;
-            fields.push(FieldDef { name, ty, span });
+            fields.push(FieldDef { name, vis, attrs: fattrs.attrs, ty, span });
             if !self.eat(Tok::Comma) {
                 break;
             }
@@ -457,76 +864,121 @@ impl<'a> Parser<'a> {
         Ok(fields)
     }
 
+    /// Tuple variant fields after the `(`: types with optional attributes.
+    /// `FieldDef::name` is unused for these (see `StructDef::fields`).
+    fn tuple_fields(&mut self) -> PResult<Vec<FieldDef>> {
+        let mut fields = Vec::new();
+        while self.peek() != Tok::RParen {
+            let fattrs = self.attributes()?;
+            let span = self.span();
+            let ty = self.ty()?;
+            fields.push(FieldDef { name: Sym(0), vis: Vis::Private, attrs: fattrs.attrs, ty, span });
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen, "`)`")?;
+        Ok(fields)
+    }
+
     fn struct_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<StructDef> {
         self.expect(Tok::Struct, "`struct`")?;
         let (name, name_span) = self.ident()?;
         self.no_generics("structs")?;
+        if self.peek() == Tok::Where {
+            return Err(self.reject(C_TRAIT, "where clauses"));
+        }
         let fields = match self.peek() {
             Tok::Semi => {
                 self.bump();
-                Vec::new()
+                VariantFields::Unit
             }
-            Tok::LParen => return Err(unsupported(self.span(), "tuple structs")),
-            _ => self.fields()?,
+            Tok::LParen => return Err(self.reject(C_CORE, "tuple structs")),
+            _ => VariantFields::Struct(self.fields()?),
         };
-        Ok(StructDef { name, name_span, fields, derives })
+        Ok(StructDef { name, name_span, generics: Generics::default(), fields, where_clause: WhereClause::default(), derives })
     }
 
     fn enum_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<EnumDef> {
         self.expect(Tok::Enum, "`enum`")?;
         let (name, name_span) = self.ident()?;
         self.no_generics("enums")?;
+        if self.peek() == Tok::Where {
+            return Err(self.reject(C_TRAIT, "where clauses"));
+        }
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
         while self.peek() != Tok::RBrace {
+            let vattrs = self.attributes()?;
             let (vname, span) = self.ident()?;
             let fields = match self.peek() {
                 Tok::LParen => {
                     self.bump();
-                    let mut tys = Vec::new();
-                    while self.peek() != Tok::RParen {
-                        tys.push(self.ty()?);
-                        if !self.eat(Tok::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(Tok::RParen, "`)`")?;
-                    VariantFields::Tuple(tys)
+                    VariantFields::Tuple(self.tuple_fields()?)
                 }
                 Tok::LBrace => VariantFields::Struct(self.fields()?),
-                Tok::Eq => return Err(unsupported(self.span(), "explicit enum discriminants")),
+                Tok::Eq => return Err(self.reject(C_CONST, "explicit enum discriminants")),
                 _ => VariantFields::Unit,
             };
-            variants.push(VariantDef { name: vname, fields, span });
+            variants.push(VariantDef { name: vname, attrs: vattrs.attrs, fields, discriminant: None, span });
             if !self.eat(Tok::Comma) {
                 break;
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(EnumDef { name, name_span, variants, derives })
+        Ok(EnumDef { name, name_span, generics: Generics::default(), variants, where_clause: WhereClause::default(), derives })
     }
 
     fn impl_def(&mut self) -> PResult<ImplDef> {
-        self.expect(Tok::Impl, "`impl`")?;
+        let start = self.expect(Tok::Impl, "`impl`")?;
+        if self.peek() == Tok::Bang {
+            return Err(self.reject(C_TRAIT, "trait impls"));
+        }
         self.no_generics("impls")?;
         let self_ty = self.ty()?;
         if self.peek() == Tok::For {
-            return Err(unsupported(self.span(), "trait impls"));
+            return Err(self.reject(C_TRAIT, "trait impls"));
+        }
+        if self.peek() == Tok::Where {
+            return Err(self.reject(C_TRAIT, "where clauses"));
         }
         self.expect(Tok::LBrace, "`{`")?;
         let mut fns = Vec::new();
         while self.peek() != Tok::RBrace {
-            let (_, is_test) = self.attributes()?;
-            self.eat(Tok::Pub);
-            if self.peek() != Tok::Fn {
-                return Err(unsupported(self.span(), "associated consts and types"));
+            let parsed = self.attributes()?;
+            let vis = self.vis()?;
+            let is_test = parsed.is_test;
+            match self.peek() {
+                Tok::Fn => {}
+                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => {
+                    return Err(self.reject(C_ASSOC, "associated consts and types"));
+                }
+                Tok::Const => return Err(self.reject(C_CONST, "const functions")),
+                Tok::Type => return Err(self.reject(C_ASSOC, "associated consts and types")),
+                Tok::Unsafe => return Err(unsafe_error(self.span())),
+                Tok::Async => return Err(async_error(self.span())),
+                Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
+                _ => return Err(self.reject(C_ASSOC, "associated consts and types")),
             }
             let mut def = self.fn_def()?;
             def.is_test = is_test;
+            def.vis = vis;
+            def.attrs = parsed.attrs;
             fns.push(def);
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(ImplDef { self_ty, fns })
+        Ok(ImplDef {
+            generics: Generics::default(),
+            is_unsafe: false,
+            is_negative: false,
+            trait_ref: None,
+            self_ty,
+            where_clause: WhereClause::default(),
+            fns,
+            consts: Vec::new(),
+            types: Vec::new(),
+            span: start,
+        })
     }
 
     // ---------- Types ----------
@@ -540,15 +992,15 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Amp | Tok::AndAnd => {
                 let double = self.bump().tok == Tok::AndAnd;
-                if self.peek() == Tok::Lifetime {
+                if matches!(self.peek(), Tok::Lifetime(_)) {
                     return Err(lifetime_error(self.span()));
                 }
                 let mutable = self.eat(Tok::Mut);
                 let inner = self.ty()?;
                 let span = start.to(self.prev_span());
-                let mut t = self.push_ty(TyExpr::Ref { mutable, inner }, span);
+                let mut t = self.push_ty(TyExpr::Ref { lifetime: None, mutable, inner }, span);
                 if double {
-                    t = self.push_ty(TyExpr::Ref { mutable: false, inner: t }, span);
+                    t = self.push_ty(TyExpr::Ref { lifetime: None, mutable: false, inner: t }, span);
                 }
                 Ok(t)
             }
@@ -557,11 +1009,26 @@ impl<'a> Parser<'a> {
                 if self.eat(Tok::RParen) {
                     return Ok(self.push_ty(TyExpr::Unit, start.to(self.prev_span())));
                 }
-                Err(unsupported(start, "tuple types"))
+                Err(not_yet(C_TY, start, "tuple types"))
             }
-            Tok::LBracket => Err(unsupported(start, "array and slice types")),
-            Tok::Impl | Tok::Dyn => Err(unsupported(start, "`impl Trait` and `dyn Trait` types")),
-            Tok::Fn => Err(unsupported(start, "function pointer types")),
+            Tok::LBracket => Err(not_yet(C_TY, start, "array and slice types")),
+            Tok::Impl => Err(not_yet(C_TY, start, "`impl Trait` types")),
+            Tok::Dyn => Err(not_yet(C_TY, start, "`dyn Trait` types")),
+            Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
+            Tok::Star => Err(not_yet(C_TY, start, "raw pointer types")),
+            Tok::Bang => Err(not_yet(C_TY, start, "the never type `!`")),
+            Tok::Underscore => Err(not_yet(C_TY, start, "inferred types (`_`)")),
+            Tok::Unsafe => Err(unsafe_error(start)),
+            Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),
+            Tok::Lt => Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::For => {
+                if self.peek_at(1) == Tok::Lt && matches!(self.peek_at(2), Tok::Lifetime(_)) {
+                    Err(lifetime_error(self.toks[self.pos + 2].span))
+                } else {
+                    Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds"))
+                }
+            }
+            Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => Err(macro_error(start)),
             _ => {
                 let path = self.path(true)?;
                 Ok(self.push_ty(TyExpr::Path(path), start.to(self.prev_span())))
@@ -569,30 +1036,54 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Angle generic arguments, starting at the `<` and eating through the
+    /// matching `>`. Type arguments parse as before; lifetime, const, and
+    /// binding arguments reject with their own codes.
+    fn generic_args(&mut self) -> PResult<Vec<GenericArg>> {
+        self.expect(Tok::Lt, "`<`")?;
+        let mut args = Vec::new();
+        while self.peek() != Tok::Gt {
+            match self.peek() {
+                Tok::Lifetime(_) => return Err(lifetime_error(self.span())),
+                Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
+                    return Err(self.reject(C_CONST, "const generic arguments"));
+                }
+                Tok::Ident(_) if self.peek_at(1) == Tok::Eq || self.peek_at(1) == Tok::Colon => {
+                    return Err(self.reject(C_ASSOC, "associated bindings in generic arguments"));
+                }
+                _ => args.push(GenericArg::Type(self.ty()?)),
+            }
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::Gt, "`>`")?;
+        Ok(args)
+    }
+
     /// Parses `a::b::<T>::c`. In type position (`in_type`), generics need no `::`.
     fn path(&mut self, in_type: bool) -> PResult<Vec<PathSeg>> {
+        // Module-anchored path starts are valid Rust that the flat namespace
+        // cannot resolve yet: reject them as module paths, not as bad syntax.
+        match self.peek() {
+            Tok::PathSep => return Err(self.reject(C_MOD, "absolute paths (`::a::b`)")),
+            Tok::Crate | Tok::Super => return Err(self.reject(C_MOD, "module paths (`crate::` and `super::`)")),
+            Tok::SelfLower if self.peek_at(1) == Tok::PathSep => return Err(self.reject(C_MOD, "module paths (`self::`)")),
+            _ => {}
+        }
         let mut segs = Vec::new();
         loop {
             let (name, _) = self.ident()?;
-            let mut generics = Vec::new();
             let turbofish = self.peek() == Tok::PathSep && self.peek_at(1) == Tok::Lt;
-            if (in_type && self.peek() == Tok::Lt) || turbofish {
+            let args = if (in_type && self.peek() == Tok::Lt) || turbofish {
                 if turbofish {
                     self.bump();
                 }
-                self.bump();
-                while self.peek() != Tok::Gt {
-                    if self.peek() == Tok::Lifetime {
-                        return Err(lifetime_error(self.span()));
-                    }
-                    generics.push(self.ty()?);
-                    if !self.eat(Tok::Comma) {
-                        break;
-                    }
-                }
-                self.expect(Tok::Gt, "`>`")?;
-            }
-            segs.push(PathSeg { name, generics });
+                GenericArgs::Angle(self.generic_args()?)
+            } else {
+                GenericArgs::None
+            };
+            segs.push(PathSeg { name, args });
             if self.peek() == Tok::PathSep && matches!(self.peek_at(1), Tok::Ident(_) | Tok::SelfUpper) {
                 self.bump();
             } else {
@@ -619,8 +1110,15 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Semi) {
                 continue;
             }
-            if matches!(self.peek(), Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Pound) {
-                return Err(unsupported(self.span(), "items inside function bodies"));
+            // Statement attributes: parsed here so a `#[cfg]` on a statement
+            // gets the attribute code; lint attributes are kept on `let`s.
+            let stmt_attrs = self.attributes()?;
+            if matches!(
+                self.peek(),
+                Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Mod | Tok::Trait | Tok::Const | Tok::Static | Tok::Type
+                    | Tok::Extern
+            ) {
+                return Err(self.reject(C_CORE, "items inside function bodies"));
             }
             if self.peek() == Tok::Let {
                 let s = self.bump().span;
@@ -628,10 +1126,10 @@ impl<'a> Parser<'a> {
                 let ty = if self.eat(Tok::Colon) { Some(self.ty()?) } else { None };
                 let init = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
                 if self.peek() == Tok::Else {
-                    return Err(unsupported(self.span(), "let-else"));
+                    return Err(self.reject(C_CORE, "let-else"));
                 }
                 self.expect(Tok::Semi, "`;`")?;
-                stmts.push(Stmt::Let { pat, ty, init, span: s.to(self.prev_span()) });
+                stmts.push(Stmt::Let { pat, ty, init, els: None, attrs: stmt_attrs.attrs, span: s.to(self.prev_span()) });
                 continue;
             }
             let block_like = matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
@@ -692,26 +1190,38 @@ impl<'a> Parser<'a> {
                 let by_ref = self.eat(Tok::Ref);
                 let mutable = self.eat(Tok::Mut);
                 let (name, _) = self.ident()?;
+                if self.peek() == Tok::At {
+                    return Err(self.reject(C_CORE, "`@` bindings in patterns"));
+                }
                 Pat::Binding { name, mutable, by_ref }
             }
             Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
                     let hi = self.literal_expr()?;
-                    Pat::Range { lo, hi }
+                    Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: true }
+                } else if self.peek() == Tok::DotDot {
+                    return Err(self.reject(C_CORE, "half-open range patterns"));
                 } else {
                     Pat::Lit(lo)
                 }
             }
+            Tok::DotDot | Tok::DotDotEq => return Err(not_yet(C_CORE, start, "half-open range patterns")),
+            Tok::Float(_) | Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "float and byte literals")),
+            Tok::Lt => return Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(start)),
             Tok::Ident(_) | Tok::SelfUpper => {
                 let path = self.path(false)?;
+                if self.peek() == Tok::At {
+                    return Err(self.reject(C_CORE, "`@` bindings in patterns"));
+                }
                 match self.peek() {
                     Tok::LParen => {
                         self.bump();
                         let mut elems = Vec::new();
                         while self.peek() != Tok::RParen {
                             if self.peek() == Tok::DotDot {
-                                return Err(unsupported(self.span(), "`..` in tuple patterns"));
+                                return Err(self.reject(C_CORE, "`..` in tuple patterns"));
                             }
                             elems.push(self.pattern()?);
                             if !self.eat(Tok::Comma) {
@@ -731,9 +1241,16 @@ impl<'a> Parser<'a> {
                                 break;
                             }
                             let fstart = self.span();
+                            if matches!(self.peek(), Tok::Int(..)) {
+                                return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
+                            }
+                            let _fattrs = self.attributes()?;
                             let by_ref = self.eat(Tok::Ref);
                             let mutable = self.eat(Tok::Mut);
                             let (fname, fspan) = self.ident()?;
+                            if self.peek() == Tok::At {
+                                return Err(self.reject(C_CORE, "`@` bindings in patterns"));
+                            }
                             let p = if !by_ref && !mutable && self.eat(Tok::Colon) {
                                 self.pattern()?
                             } else {
@@ -754,9 +1271,9 @@ impl<'a> Parser<'a> {
                     _ => Pat::Path(path),
                 }
             }
-            Tok::LParen => return Err(unsupported(start, "tuple patterns")),
-            Tok::LBracket => return Err(unsupported(start, "slice patterns")),
-            Tok::Amp => return Err(unsupported(start, "reference patterns")),
+            Tok::LParen => return Err(not_yet(C_CORE, start, "tuple patterns")),
+            Tok::LBracket => return Err(not_yet(C_CORE, start, "slice patterns")),
+            Tok::Amp | Tok::AndAnd => return Err(not_yet(C_CORE, start, "reference patterns")),
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected a pattern, found {}", tok_name(t)))),
         };
@@ -789,7 +1306,7 @@ impl<'a> Parser<'a> {
     fn expr_ctx(&mut self, no_struct: bool) -> PResult<ExprId> {
         let start = self.span();
         if matches!(self.peek(), Tok::Pipe | Tok::OrOr | Tok::Move) {
-            return Err(unsupported(start, "closures"));
+            return Err(not_yet(C_CORE, start, "closures"));
         }
         // Assignment is right-associative and lowest.
         let lhs = self.range_expr(no_struct)?;
@@ -936,12 +1453,15 @@ impl<'a> Parser<'a> {
             }
             Tok::Amp | Tok::AndAnd => {
                 let double = self.bump().tok == Tok::AndAnd;
+                if !double && self.at_ident("raw") && matches!(self.peek_at(1), Tok::Const | Tok::Mut) {
+                    return Err(not_yet(C_CORE, start, "raw references (`&raw`)"));
+                }
                 let mutable = self.eat(Tok::Mut);
                 let inner = self.prefix(no_struct)?;
                 let span = start.to(self.prev_span());
-                let mut id = self.push_expr(Expr::Ref { mutable, expr: inner }, span);
+                let mut id = self.push_expr(Expr::Ref { mutable, raw: false, expr: inner }, span);
                 if double {
-                    id = self.push_expr(Expr::Ref { mutable: false, expr: id }, span);
+                    id = self.push_expr(Expr::Ref { mutable: false, raw: false, expr: id }, span);
                 }
                 return Ok(id);
             }
@@ -985,24 +1505,20 @@ impl<'a> Parser<'a> {
                 Tok::Dot => {
                     self.bump();
                     if let Tok::Int(..) = self.peek() {
-                        return Err(unsupported(self.span(), "tuple fields"));
+                        return Err(self.reject(C_CORE, "tuple fields"));
+                    }
+                    if self.peek() == Tok::Await {
+                        return Err(async_error(self.span()));
                     }
                     let (name, name_span) = self.ident()?;
-                    let mut generics = Vec::new();
+                    let mut generic_args = Vec::new();
                     if self.peek() == Tok::PathSep && self.peek_at(1) == Tok::Lt {
                         self.bump();
-                        self.bump();
-                        while self.peek() != Tok::Gt {
-                            generics.push(self.ty()?);
-                            if !self.eat(Tok::Comma) {
-                                break;
-                            }
-                        }
-                        self.expect(Tok::Gt, "`>`")?;
+                        generic_args = self.generic_args()?;
                     }
                     if self.peek() == Tok::LParen {
                         let args = self.call_args()?;
-                        e = self.push_expr(Expr::MethodCall { recv: e, name, name_span, generics, args }, start.to(self.prev_span()));
+                        e = self.push_expr(Expr::MethodCall { recv: e, name, name_span, generic_args, args }, start.to(self.prev_span()));
                     } else {
                         e = self.push_expr(Expr::Field { base: e, name }, start.to(self.prev_span()));
                     }
@@ -1013,7 +1529,7 @@ impl<'a> Parser<'a> {
                     self.expect(Tok::RBracket, "`]`")?;
                     e = self.push_expr(Expr::Index { base: e, index }, start.to(self.prev_span()));
                 }
-                Tok::Question => return Err(unsupported(self.span(), "the `?` operator")),
+                Tok::Question => return Err(self.reject(C_CORE, "the `?` operator")),
                 _ => return Ok(e),
             }
         }
@@ -1044,11 +1560,11 @@ impl<'a> Parser<'a> {
                 }
                 let cond = self.expr_ctx(true)?;
                 let body = self.block()?;
-                Expr::While { cond, body }
+                Expr::While { label: None, cond, body }
             }
             Tok::Loop => {
                 self.bump();
-                Expr::Loop { body: self.block()? }
+                Expr::Loop { label: None, body: self.block()? }
             }
             Tok::For => {
                 self.bump();
@@ -1056,7 +1572,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::In, "`in`")?;
                 let iter = self.expr_ctx(true)?;
                 let body = self.block()?;
-                Expr::For { pat, iter, body }
+                Expr::For { label: None, pat, iter, body }
             }
             Tok::Match => {
                 self.bump();
@@ -1064,12 +1580,13 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::LBrace, "`{`")?;
                 let mut arms = Vec::new();
                 while self.peek() != Tok::RBrace {
+                    let aattrs = self.attributes()?;
                     let pat = self.pattern()?;
                     let guard = if self.eat(Tok::If) { Some(self.expr()?) } else { None };
                     self.expect(Tok::FatArrow, "`=>`")?;
                     let block_body = self.peek() == Tok::LBrace;
                     let body = if block_body { self.block_like_expr()? } else { self.expr()? };
-                    arms.push(Arm { pat, guard, body });
+                    arms.push(Arm { attrs: aattrs.attrs, pat, guard, body });
                     if !self.eat(Tok::Comma) && !block_body && self.peek() != Tok::RBrace {
                         return Err(syntax(self.span(), "expected `,` after match arm"));
                     }
@@ -1124,7 +1641,7 @@ impl<'a> Parser<'a> {
         };
         let span = start.to(self.prev_span());
         let wild = self.push_pat(Pat::Wild, span);
-        let arms = vec![Arm { pat, guard: None, body: then_e }, Arm { pat: wild, guard: None, body: els }];
+        let arms = vec![Arm { attrs: Vec::new(), pat, guard: None, body: then_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: els }];
         Ok(self.push_expr(Expr::Match { scrut, arms }, span))
     }
 
@@ -1136,12 +1653,12 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         let span = start.to(self.prev_span());
         let body_e = self.push_expr(Expr::Block(body), span);
-        let brk = self.push_expr(Expr::Break(None), span);
+        let brk = self.push_expr(Expr::Break { label: None, value: None }, span);
         let wild = self.push_pat(Pat::Wild, span);
-        let arms = vec![Arm { pat, guard: None, body: body_e }, Arm { pat: wild, guard: None, body: brk }];
+        let arms = vec![Arm { attrs: Vec::new(), pat, guard: None, body: body_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: brk }];
         let m = self.push_expr(Expr::Match { scrut, arms }, span);
         let block = self.push_block(Block { stmts: vec![Stmt::Expr { expr: m, semi: true }], tail: None, span });
-        Ok(self.push_expr(Expr::Loop { body: block }, span))
+        Ok(self.push_expr(Expr::Loop { label: None, body: block }, span))
     }
 
     fn primary(&mut self, no_struct: bool) -> PResult<ExprId> {
@@ -1151,7 +1668,8 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Int(v, s)
             }
-            Tok::Float => return Err(unsupported(start, "floating point numbers")),
+            Tok::Float(_) => return Err(not_yet(C_LIT, start, "floating point numbers")),
+            Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "byte string and byte char literals")),
             Tok::Str(i) => {
                 self.bump();
                 Expr::Str(i + self.str_base)
@@ -1168,6 +1686,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Bool(false)
             }
+            Tok::SelfLower if self.peek_at(1) == Tok::PathSep => return Err(not_yet(C_MOD, start, "module paths (`self::`)")),
             Tok::SelfLower => {
                 self.bump();
                 Expr::SelfValue
@@ -1179,37 +1698,48 @@ impl<'a> Parser<'a> {
                 } else {
                     let inner = self.expr()?;
                     if self.peek() == Tok::Comma {
-                        return Err(unsupported(self.span(), "tuples"));
+                        return Err(self.reject(C_CORE, "tuples"));
                     }
                     self.expect(Tok::RParen, "`)`")?;
                     return Ok(inner);
                 }
             }
-            Tok::LBracket => return Err(unsupported(start, "array literals")),
+            Tok::LBracket => return Err(not_yet(C_CORE, start, "array literals")),
             Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace => return self.block_like_expr(),
             Tok::Break => {
                 self.bump();
-                if matches!(self.peek(), Tok::Lifetime) {
-                    return Err(unsupported(self.span(), "loop labels"));
+                if matches!(self.peek(), Tok::Lifetime(_)) {
+                    return Err(self.reject(C_CORE, "labels"));
                 }
                 let val = if self.can_start_expr() { Some(self.expr()?) } else { None };
-                Expr::Break(val)
+                Expr::Break { label: None, value: val }
             }
             Tok::Continue => {
                 self.bump();
-                Expr::Continue
+                if matches!(self.peek(), Tok::Lifetime(_)) {
+                    return Err(self.reject(C_CORE, "labels"));
+                }
+                Expr::Continue(None)
             }
             Tok::Return => {
                 self.bump();
                 let val = if self.can_start_expr() { Some(self.expr()?) } else { None };
                 Expr::Return(val)
             }
-            Tok::Lifetime => return Err(unsupported(start, "loop labels")),
-            Tok::Pipe | Tok::OrOr | Tok::Move => return Err(unsupported(start, "closures")),
-            Tok::Unsafe => return Err(Diag::new("L0404", start, "`unsafe` is not supported", "Remove the unsafe code.")),
+            Tok::Lifetime(_) => return Err(not_yet(C_CORE, start, "labels")),
+            Tok::Pipe | Tok::OrOr | Tok::Move => return Err(not_yet(C_CORE, start, "closures")),
+            Tok::Unsafe => return Err(unsafe_error(start)),
+            Tok::Async => return Err(async_error(start)),
+            Tok::Const => return Err(not_yet(C_CONST, start, "inline const blocks")),
+            Tok::Let => return Err(not_yet(C_CORE, start, "let chains")),
+            Tok::Lt => return Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::Underscore => return Err(not_yet(C_CORE, start, "inferred expressions (`_`)")),
             Tok::Ident(_) | Tok::SelfUpper => {
                 if self.peek_at(1) == Tok::Bang {
                     return self.macro_call();
+                }
+                if self.at_path_macro_call() {
+                    return Err(macro_error(start));
                 }
                 let path = self.path(false)?;
                 if self.peek() == Tok::LBrace && !no_struct {
@@ -1232,13 +1762,13 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while self.peek() != Tok::RBrace {
             if self.peek() == Tok::DotDot {
-                return Err(unsupported(self.span(), "struct update syntax"));
+                return Err(self.reject(C_CORE, "struct update syntax"));
             }
             let (name, span) = self.ident()?;
             let value = if self.eat(Tok::Colon) {
                 self.expr()?
             } else {
-                let seg = PathSeg { name, generics: Vec::new() };
+                let seg = PathSeg::plain(name);
                 self.push_expr(Expr::Path(vec![seg]), span)
             };
             fields.push((name, span, value));
@@ -1247,7 +1777,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(self.push_expr(Expr::StructLit { path, fields }, start.to(self.prev_span())))
+        Ok(self.push_expr(Expr::StructLit { path, fields, update: None }, start.to(self.prev_span())))
     }
 
     fn macro_call(&mut self) -> PResult<ExprId> {
@@ -1322,7 +1852,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     if matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == Tok::Eq {
-                        return Err(unsupported(self.span(), "named format arguments"));
+                        return Err(self.reject(C_LIT, "named format arguments"));
                     }
                     extra.push(self.expr()?);
                 }
@@ -1366,7 +1896,7 @@ impl<'a> Parser<'a> {
                 let debug = match fmt {
                     "" => false,
                     "?" => true,
-                    _ => return Err(unsupported(span, &format!("format spec `{{:{fmt}}}`"))),
+                    _ => return Err(not_yet(C_LIT, span, &format!("format spec `{{:{fmt}}}`"))),
                 };
                 let index = if name.is_empty() {
                     next += 1;
@@ -1375,7 +1905,7 @@ impl<'a> Parser<'a> {
                     n
                 } else {
                     let sym = self.interner.intern(name);
-                    let seg = PathSeg { name: sym, generics: Vec::new() };
+                    let seg = PathSeg::plain(sym);
                     let e = self.push_expr(Expr::Path(vec![seg]), span);
                     extra.push(e);
                     used.push(true);
