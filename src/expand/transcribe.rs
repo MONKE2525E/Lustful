@@ -189,6 +189,14 @@ impl<'a> Tx<'a> {
                 "A repetition needs a metavariable matched inside a repetition of the same depth.",
             ));
         };
+        if op == RepOp::Plus && count == 0 {
+            return Err(err(
+                C_DEF,
+                span,
+                "this repetition must repeat at least once",
+                "Use `*` for a variable the matcher may leave empty.",
+            ));
+        }
         if op == RepOp::Question && count > 1 {
             return Err(err(C_DEF, span, "a `?` repetition matched more than once", "Use `*` for a variable that can repeat."));
         }

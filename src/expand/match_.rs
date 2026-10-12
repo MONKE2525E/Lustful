@@ -502,8 +502,9 @@ pub struct Matcher<'a> {
     pub budget: u32,
     pub probe_cache: FxMap<(FragKind, u64), bool>,
     /// Keyed by (input list pointer, list length, first span start,
-    /// position): the (node id, is-fragment) pairs that consumed input
-    /// starting at that position.
+    /// position): the (node id, is-fragment) pairs that were live at
+    /// that position and could begin on the tree there (rustc's
+    /// can-begin sets, not only successful parses).
     pub consumers: FxMap<(usize, usize, u32, usize), Vec<(u32, bool)>>,
     /// A fragment parser began a parse and failed (rustc's hard error:
     /// the call fails even when a later arm would token-match). Set
@@ -535,14 +536,20 @@ impl<'a> Matcher<'a> {
         Ok(())
     }
 
-    fn record(&mut self, input: &[Tt], pos: usize, id: u32, is_frag: bool) {
+    /// Records one live matcher node at `pos` for the ambiguity check,
+    /// when the node can begin on the tree there.
+    fn attempt(&mut self, input: &[Tt], pos: usize, id: u32, is_frag: bool, begins: bool) {
+        if !begins {
+            return;
+        }
         let first = input.first().map_or(0, |t| t.span().lo);
         let key = (input.as_ptr() as usize, input.len(), first, pos);
         self.consumers.entry(key).or_default().push((id, is_frag));
     }
 
-    /// True when any recorded position had two different consumers and at
-    /// least one was a fragment: the call is locally ambiguous.
+    /// True when any position had two different live nodes that could
+    /// begin there and at least one was a fragment: the call is
+    /// locally ambiguous, whether or not either path later matches.
     pub fn ambiguous(&self) -> bool {
         self.consumers.values().any(|list| {
             list.iter().any(|&(_, is_frag)| is_frag) && list.iter().map(|&(id, _)| id).collect::<std::collections::HashSet<_>>().len() > 1
@@ -603,34 +610,30 @@ fn match_seq(
     };
     match node {
         MNode::Tok(pattern, id) => {
-            if let Some(Tt::Tok(actual)) = input.get(pos)
-                && tok_matches(&pattern.tok, &actual.tok, m.strings)
-            {
-                m.record(input, pos, *id, false);
+            let begins = matches!(input.get(pos), Some(Tt::Tok(actual)) if tok_matches(&pattern.tok, &actual.tok, m.strings));
+            m.attempt(input, pos, *id, false, begins);
+            if begins {
                 match_seq(m, rest, input, pos + 1, binds, out)?;
             }
             Ok(())
         }
         MNode::Meta { name, kind, id, span } => match_meta(m, *name, *kind, *id, *span, rest, input, pos, binds, out),
         MNode::Group(delim, inner, id) => {
+            let begins = matches!(input.get(pos), Some(Tt::Delim(d, _, _)) if d == delim);
+            m.attempt(input, pos, *id, false, begins);
             if let Some(Tt::Delim(d, inner_input, _)) = input.get(pos)
                 && d == delim
             {
                 let inner_input = splice_transparent(inner_input);
                 let mut inner_results = Vec::new();
                 match_seq(m, inner, &inner_input, 0, BindMap::default(), &mut inner_results)?;
-                let mut any = false;
                 for (end, inner_binds) in inner_results {
                     if end != inner_input.len() {
                         continue;
                     }
-                    any = true;
                     let mut merged = binds.clone();
                     merged.extend(inner_binds);
                     match_seq(m, rest, input, pos + 1, merged, out)?;
-                }
-                if any {
-                    m.record(input, pos, *id, false);
                 }
             }
             Ok(())
@@ -673,6 +676,8 @@ fn match_rep(
         if !iters.is_empty()
             && let Some(sep_tok) = sep
         {
+            let begins = matches!(input.get(start), Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings));
+            m.attempt(input, pos, rep_id, false, begins);
             match input.get(start) {
                 Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings) => start += 1,
                 _ => sep_ok = false,
@@ -686,9 +691,6 @@ fn match_rep(
                 // match empty never advances and rustc rejects the shape.
                 if end == start {
                     continue;
-                }
-                if sep.is_some() && !iters.is_empty() {
-                    m.record(input, pos, rep_id, false);
                 }
                 let mut next_iters: Vec<BindMap> = iters.to_vec();
                 next_iters.push(iter_binds);
@@ -720,6 +722,137 @@ fn frag_span(slice: &[Tt], at: Span) -> Span {
     }
 }
 
+/// True for tokens an `ident` fragment matches: an identifier or a
+/// keyword (rustc accepts `self`, `fn`, `true`, `Self` here).
+fn is_ident_tok(tok: Tok) -> bool {
+    matches!(
+        tok,
+        Tok::Ident(_)
+            | Tok::Reserved(_)
+            | Tok::As
+            | Tok::Break
+            | Tok::Const
+            | Tok::Continue
+            | Tok::Else
+            | Tok::Enum
+            | Tok::False
+            | Tok::Fn
+            | Tok::For
+            | Tok::If
+            | Tok::Impl
+            | Tok::In
+            | Tok::Let
+            | Tok::Loop
+            | Tok::Match
+            | Tok::Mod
+            | Tok::Mut
+            | Tok::Pub
+            | Tok::Ref
+            | Tok::Return
+            | Tok::SelfLower
+            | Tok::SelfUpper
+            | Tok::Static
+            | Tok::Struct
+            | Tok::Trait
+            | Tok::True
+            | Tok::Type
+            | Tok::Unsafe
+            | Tok::Use
+            | Tok::Where
+            | Tok::While
+            | Tok::Async
+            | Tok::Dyn
+            | Tok::Move
+            | Tok::Crate
+            | Tok::Super
+            | Tok::Extern
+            | Tok::Await
+    )
+}
+
+/// True for one literal token (a leading `-` is the caller's concern).
+fn is_literal_tok(tok: Tok) -> bool {
+    matches!(tok, Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(_) | Tok::True | Tok::False)
+}
+
+/// True when these trees read as exactly one literal: one literal
+/// token, or `-` before one, splicing nested fragments open. A
+/// forwarded fragment that holds just a literal can rebind to a
+/// `literal` metavariable whatever kind first matched it.
+fn trees_read_literal(trees: &[Tt]) -> bool {
+    fn toks(trees: &[Tt], out: &mut Vec<Tok>) -> bool {
+        trees.iter().all(|t| match t {
+            Tt::Tok(tok) => {
+                out.push(tok.tok);
+                true
+            }
+            Tt::Frag(_, inner, _) => toks(inner, out),
+            Tt::Delim(_, _, _) => false,
+        })
+    }
+    let mut flat = Vec::new();
+    if !toks(trees, &mut flat) {
+        return false;
+    }
+    matches!(flat.as_slice(), [t] if is_literal_tok(*t)) || matches!(flat.as_slice(), [Tok::Minus, t] if is_literal_tok(*t))
+}
+
+/// True when a fragment of `kind` can begin at this input position
+/// (rustc's can-begin sets). Drives the attempt record behind local
+/// ambiguity: a `-` can begin a literal even when the literal parse
+/// then fails, and `[` can begin a type.
+fn meta_can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
+    match input.get(pos) {
+        None => false,
+        Some(Tt::Frag(fk, inner, _)) if !fk.transparent() => {
+            can_forward(*fk, kind) || (kind == FragKind::Literal && trees_read_literal(inner))
+        }
+        Some(_) => match kind {
+            FragKind::Ident => matches!(tok_at(input, pos), Some(t) if is_ident_tok(t.tok)),
+            FragKind::Lifetime => matches!(tok_at(input, pos).map(|t| t.tok), Some(Tok::Lifetime(_))),
+            FragKind::Literal => matches!(tok_at(input, pos), Some(t) if is_literal_tok(t.tok) || t.tok == Tok::Minus),
+            FragKind::Tt => true,
+            FragKind::Vis => tok_at(input, pos).map(|t| t.tok) == Some(Tok::Pub),
+            FragKind::Meta => tok_at(input, pos).is_some_and(|t| super::meta_sym(t.tok, m.interner).is_some()),
+            _ => can_begin(m, kind, input, pos),
+        },
+    }
+}
+
+/// Binds `name` to the fragment slice ending at each of `ends` and
+/// matches the rest of the sequence from there.
+#[allow(clippy::too_many_arguments)]
+fn match_meta_ends(
+    m: &mut Matcher,
+    name: Sym,
+    kind: FragKind,
+    ends: Vec<usize>,
+    rest: &[MNode],
+    input: &[Tt],
+    pos: usize,
+    binds: BindMap,
+    out: &mut Vec<(usize, BindMap)>,
+) -> Result<(), Diag> {
+    let at = input.get(pos).map_or(m.call_span, |t| t.span());
+    for end in ends {
+        let slice: Vec<Tt> = input[pos..end].to_vec();
+        // A whole forwarded fragment rebinds as itself, keeping its
+        // kind identity; a longer re-parse wraps the new slice.
+        let value = if let [Tt::Frag(..)] = slice.as_slice() {
+            Bind::Leaf(slice)
+        } else if kind.transparent() {
+            Bind::Leaf(slice)
+        } else {
+            let slice = if kind == FragKind::Stmt { stmt_with_semi(slice) } else { slice };
+            Bind::Leaf(vec![Tt::Frag(kind, slice.clone(), frag_span(&slice, at))])
+        };
+        let mut next = binds.clone();
+        next.insert(name, value);
+        match_seq(m, rest, input, end, next, out)?;
+    }
+    Ok(())
+}
+
 /// Matches one metavariable node, then the rest of the sequence.
 fn match_meta(
     m: &mut Matcher,
@@ -734,38 +867,32 @@ fn match_meta(
     out: &mut Vec<(usize, BindMap)>,
 ) -> Result<(), Diag> {
     let _ = meta_span;
-    // A forwarded opaque fragment is one unit: it can only rebind to a
-    // compatible kind, or be taken whole as one token tree (ARCH 6.2).
-    if let Some(Tt::Frag(fk, _, _)) = input.get(pos)
+    m.attempt(input, pos, id, true, meta_can_begin(m, kind, input, pos));
+    // A forwarded opaque fragment is one unit: it can rebind to a
+    // compatible kind (ARCH 6.2), be taken whole as one token tree,
+    // or, for a literal target, rebind when it holds just a literal.
+    if let Some(Tt::Frag(fk, inner, _)) = input.get(pos)
         && !fk.transparent()
     {
-        if can_forward(*fk, kind) {
-            m.record(input, pos, id, true);
+        let fk = *fk;
+        // Same-kind fragments re-parse with what follows: an outer
+        // macro that forwards `$e + 1` into an `$a:expr` matcher must
+        // read `2 + 1` as one expression, not stop at the fragment.
+        if fk == kind && parsed_kind(kind) {
+            let ends = fragment_ends(m, kind, input, pos)?;
+            if !ends.is_empty() {
+                return match_meta_ends(m, name, kind, ends, rest, input, pos, binds, out);
+            }
+        }
+        if can_forward(fk, kind) || (kind == FragKind::Literal && trees_read_literal(inner)) {
             let mut next = binds;
             next.insert(name, Bind::Leaf(vec![input[pos].clone()]));
             return match_seq(m, rest, input, pos + 1, next, out);
         }
         return Ok(());
     }
-    let at = input.get(pos).map_or(m.call_span, |t| t.span());
-    for end in fragment_ends(m, kind, input, pos)? {
-        if end > pos {
-            m.record(input, pos, id, true);
-        }
-        let slice: Vec<Tt> = input[pos..end].to_vec();
-        let value = if kind.transparent() {
-            // Transparent kinds keep their trees, so an inner matcher can
-            // still see them token by token.
-            Bind::Leaf(slice)
-        } else {
-            let slice = if kind == FragKind::Stmt { stmt_with_semi(slice) } else { slice };
-            Bind::Leaf(vec![Tt::Frag(kind, slice.clone(), frag_span(&slice, at))])
-        };
-        let mut next = binds.clone();
-        next.insert(name, value);
-        match_seq(m, rest, input, end, next, out)?;
-    }
-    Ok(())
+    let ends = fragment_ends(m, kind, input, pos)?;
+    match_meta_ends(m, name, kind, ends, rest, input, pos, binds, out)
 }
 
 /// Gives a matched statement fragment the `;` form it transcribes with:
@@ -1043,50 +1170,7 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
     let first = tok_at(input, pos).map(|t| t.tok);
     let mut ends = match kind {
         FragKind::Ident => match first {
-            // An ident fragment matches an identifier or a keyword
-            // (rustc accepts `self`, `fn`, `true`, `Self` here).
-            Some(
-                Tok::Ident(_)
-                | Tok::Reserved(_)
-                | Tok::As
-                | Tok::Break
-                | Tok::Const
-                | Tok::Continue
-                | Tok::Else
-                | Tok::Enum
-                | Tok::False
-                | Tok::Fn
-                | Tok::For
-                | Tok::If
-                | Tok::Impl
-                | Tok::In
-                | Tok::Let
-                | Tok::Loop
-                | Tok::Match
-                | Tok::Mod
-                | Tok::Mut
-                | Tok::Pub
-                | Tok::Ref
-                | Tok::Return
-                | Tok::SelfLower
-                | Tok::SelfUpper
-                | Tok::Static
-                | Tok::Struct
-                | Tok::Trait
-                | Tok::True
-                | Tok::Type
-                | Tok::Unsafe
-                | Tok::Use
-                | Tok::Where
-                | Tok::While
-                | Tok::Async
-                | Tok::Dyn
-                | Tok::Move
-                | Tok::Crate
-                | Tok::Super
-                | Tok::Extern
-                | Tok::Await,
-            ) => vec![pos + 1],
+            Some(t) if is_ident_tok(t) => vec![pos + 1],
             _ => vec![],
         },
         FragKind::Lifetime => match first {
@@ -1094,29 +1178,17 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             _ => vec![],
         },
         FragKind::Literal => match first {
-            Some(
-                Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(_) | Tok::True | Tok::False,
-            ) => {
-                vec![pos + 1]
-            }
+            Some(t) if is_literal_tok(t) => vec![pos + 1],
             // A `-` before any literal token is one literal fragment in
             // rustc (even `- "x"`, which only fails later if typed).
-            Some(Tok::Minus)
-                if matches!(
-                    tok_at(input, pos + 1).map(|t| t.tok),
-                    Some(
-                        Tok::Int(..)
-                            | Tok::Float(_)
-                            | Tok::Str(_)
-                            | Tok::ByteStr(_)
-                            | Tok::ByteChar(_)
-                            | Tok::Char(_)
-                            | Tok::True
-                            | Tok::False
-                    )
-                ) =>
-            {
+            Some(Tok::Minus) if matches!(tok_at(input, pos + 1), Some(t) if is_literal_tok(t.tok)) => {
                 vec![pos + 2]
+            }
+            // A `-` began the literal parse and no literal followed:
+            // rustc's hard failure, not a cue to try the next arm.
+            Some(Tok::Minus) => {
+                m.hard_fail = true;
+                vec![]
             }
             _ => vec![],
         },
@@ -1141,10 +1213,27 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
         FragKind::Vis => {
             // Greedy, like rustc: a `pub` here is the visibility, never
             // left for a later matcher token by matching empty instead.
+            // The parenthesized form counts only for the restricted
+            // paths (`pub(crate)`, `pub(in a::b)`); `pub(foo)` is just
+            // `pub`. At the end of the input, rustc's vis parser has no
+            // token to decide on and the call fails, so empty vis
+            // needs a following tree.
             if first == Some(Tok::Pub) {
-                if matches!(input.get(pos + 1), Some(Tt::Delim(Delim::Paren, _, _))) { vec![pos + 2] } else { vec![pos + 1] }
-            } else {
+                if let Some(Tt::Delim(Delim::Paren, inner, _)) = input.get(pos + 1) {
+                    let restricted = matches!(
+                        inner.as_slice(),
+                        [Tt::Tok(t)] if matches!(t.tok, Tok::Crate | Tok::SelfLower | Tok::Super)
+                    ) || (tok_at(inner, 0).map(|t| t.tok) == Some(Tok::In)
+                        && inner.len() > 1
+                        && inner[1..].iter().all(|t| matches!(t, Tt::Tok(tok) if is_seg_tok(tok.tok) || tok.tok == Tok::PathSep)));
+                    if restricted { vec![pos + 2] } else { vec![pos + 1] }
+                } else {
+                    vec![pos + 1]
+                }
+            } else if pos < input.len() {
                 vec![pos]
+            } else {
+                vec![]
             }
         }
         FragKind::Meta => meta_end(input, pos, m.interner).into_iter().collect(),
@@ -1178,6 +1267,8 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                     }
                 }
             }
+            ends.sort_unstable();
+            ends.dedup();
             ends
         }
         FragKind::Expr | FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt => {

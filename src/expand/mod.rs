@@ -542,7 +542,12 @@ pub fn compile_macro(
         i += 3;
         if tok_at(body, i).map(|t| t.tok) == Some(Tok::Semi) {
             i += 1;
+        } else if i < body.len() {
+            return Err(err(C_DEF, mspan, "expected `;` between macro rules", "End each rule with `;`."));
         }
+    }
+    if arms.is_empty() {
+        return Err(err(C_DEF, def_span, "a macro must contain at least one rule", "Add a rule such as `() => {};`."));
     }
     Ok(MacroDef {
         name,
@@ -1149,6 +1154,13 @@ fn atomic_shaped(trees: &[Tt]) -> bool {
 fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
     for tree in trees {
         match tree {
+            // A negative literal fragment (`-2`) is one operand; without
+            // parens `- 2 . pow(..)` would read as `-(2.pow(..))`.
+            Tt::Frag(FragKind::Literal, inner, span) if matches!(inner.first(), Some(Tt::Tok(t)) if t.tok == Tok::Minus) => {
+                out.push(Token { tok: Tok::LParen, span: *span });
+                flatten_final(inner, out);
+                out.push(Token { tok: Tok::RParen, span: *span });
+            }
             Tt::Frag(FragKind::Expr, inner, span) if count_tokens(inner) > 1 && !atomic_shaped(inner) => {
                 out.push(Token { tok: Tok::LParen, span: *span });
                 flatten_final(inner, out);
@@ -1236,6 +1248,8 @@ impl<'a> Expander<'a> {
                             Tt::Delim(_, inner, _) => inner.clone(),
                             _ => unreachable!(),
                         };
+                        st.check_dup_export(def.name, def.name_span, exported)?;
+                        check_def_form(trees, &def)?;
                         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
                         compiled.local_def = !at_module_list;
                         let idx = st.register(Rc::new(compiled), exported, false);
@@ -1394,6 +1408,26 @@ impl<'a> Expander<'a> {
 
     /// Stores a compiled definition. `path` also puts it in the crate
     /// root table; `textual` makes it visible from this point on.
+    /// Two `#[macro_export]` definitions under one name do not shadow:
+    /// the second is a definition error (rustc E0428). The same def
+    /// seen again (same name span, from the walk after the prescan)
+    /// is not a duplicate.
+    fn check_dup_export(&self, name: Sym, name_span: Span, exported: bool) -> Result<(), Diag> {
+        if exported
+            && let Some(&idx) = self.exported.get(&name)
+            && self.defs[idx as usize].name_span != name_span
+        {
+            return Err(err(
+                C_DEF,
+                name_span,
+                format!("macro `{}` is exported more than once", self.ctx.interner.get(name)),
+                "Rename one of the exported macros.",
+            )
+            .with_label(self.defs[idx as usize].name_span, "first exported here"));
+        }
+        Ok(())
+    }
+
     fn register(&mut self, def: Rc<MacroDef>, path: bool, textual: bool) -> u32 {
         let idx = self.defs.len() as u32;
         if path {
@@ -1504,6 +1538,18 @@ impl<'a> Expander<'a> {
         for (arm_i, arm) in def.arms.iter().enumerate() {
             let mut matcher = match_::Matcher::new(self.ctx.interner, self.ctx.known, &self.strings, call.span);
             let matches = match_::match_arm(&mut matcher, &arm.nodes, &call.inner)?;
+            // Local ambiguity is fatal even when this arm goes on to
+            // fail: rustc stops at the first ambiguous token, it does
+            // not fall through to a later arm.
+            if matcher.ambiguous() || matches.len() > 1 {
+                return Err(err(
+                    C_AMBIG,
+                    call.span,
+                    format!("local ambiguity when calling macro `{}!`", def.name_text),
+                    "Make the matcher decide each token's role without guessing between fragments.",
+                )
+                .with_label(def.def_span, "the macro is defined here"));
+            }
             if matches.is_empty() {
                 // A fragment parser that began and failed is rustc's
                 // hard error: the call fails here instead of falling
@@ -1518,21 +1564,6 @@ impl<'a> Expander<'a> {
                     .with_label(def.def_span, "the macro is defined here"));
                 }
                 continue;
-            }
-            let ambiguous = matcher.ambiguous() || {
-                // Two full matches with different bindings are ambiguous
-                // in effect even when no fragment shared a token.
-                let first = bind_hash(&matches[0], &self.strings);
-                matches[1..].iter().any(|b| bind_hash(b, &self.strings) != first)
-            };
-            if ambiguous {
-                return Err(err(
-                    C_AMBIG,
-                    call.span,
-                    format!("local ambiguity when calling macro `{}!`", def.name_text),
-                    "Make the matcher decide each token's role without guessing between fragments.",
-                )
-                .with_label(def.def_span, "the macro is defined here"));
             }
             chosen = Some((arm_i, matches.into_iter().next().unwrap()));
             break;
@@ -1588,35 +1619,6 @@ fn restamp_ctxt(trees: &mut [Tt], old: CtxtId, new: CtxtId) {
             Tt::Frag(_, _, _) => {}
         }
     }
-}
-
-/// A stable fingerprint of one match's bindings, for the
-/// distinct-bindings ambiguity check.
-fn bind_hash(binds: &BindMap, strings: &[String]) -> u64 {
-    let mut h = crate::intern::FxHasher::default();
-    let mut names: Vec<Sym> = binds.keys().copied().collect();
-    names.sort();
-    fn go(h: &mut impl Hasher, bind: &Bind, strings: &[String]) {
-        match bind {
-            Bind::Leaf(trees) => {
-                1u8.hash(h);
-                hash_tts(trees, strings).hash(h);
-            }
-            Bind::Seq(items) => {
-                2u8.hash(h);
-                items.len().hash(h);
-                for item in items {
-                    go(h, item, strings);
-                }
-            }
-            Bind::Empty => 3u8.hash(h),
-        }
-    }
-    for name in names {
-        name.0.hash(&mut h);
-        go(&mut h, &binds[&name], strings);
-    }
-    h.finish()
 }
 
 /// An attribute the walker found at a list position.
@@ -1682,6 +1684,24 @@ pub struct DefStart {
     pub group: usize,
     pub end: usize,
     pub span: Span,
+    /// The delimiter of the definition body group.
+    pub delim: Delim,
+}
+
+/// A `macro_rules!` definition whose body is not brace-delimited must
+/// end with `;`, like every item macro call (rustc: "macros that
+/// expand to items must be delimited with braces or followed by a
+/// semicolon").
+fn check_def_form(trees: &[Tt], def: &DefStart) -> Result<(), Diag> {
+    if def.delim != Delim::Brace && tok_at(trees, def.group + 1).map(|t| t.tok) != Some(Tok::Semi) {
+        return Err(err(
+            C_CALL,
+            def.span,
+            "a macro definition not delimited with braces must end with `;`",
+            "Write the definition with braces or end it with `;`.",
+        ));
+    }
+    Ok(())
 }
 
 /// If a `macro_rules!` definition starts at `trees[i]`, describes it.
@@ -1701,7 +1721,7 @@ pub fn macro_rules_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<Def
             if *d != Delim::Brace && tok_at(trees, end).map(|t| t.tok) == Some(Tok::Semi) {
                 end += 1;
             }
-            Some(DefStart { name, name_span: name_tok.span, group: i + 3, end, span: head.span.to(*group_span) })
+            Some(DefStart { name, name_span: name_tok.span, group: i + 3, end, span: head.span.to(*group_span), delim: *d })
         }
         _ => None,
     }
@@ -2025,6 +2045,16 @@ impl<'a> Expander<'a> {
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
                 }
+                // A passthrough builtin still costs recursion depth
+                // (the format family costs two: it expands through a
+                // nested `format_args!` in rustc).
+                let cost = if matches!(segs.last().map_or("", |s| s.text.as_str()), "println" | "print" | "eprintln" | "eprint" | "format")
+                {
+                    2
+                } else {
+                    1
+                };
+                let expanded_inner = self.expand_list(inner, depth + cost, false, nest + 1)?;
                 out.push(Tt::Delim(delim, expanded_inner, group_span));
                 i = group_idx + 1;
                 pending_macro_use = false;
@@ -2052,8 +2082,31 @@ impl<'a> Expander<'a> {
                         "Write the call with braces or end it with `;`.",
                     ));
                 }
-                if next_is_semi && (expanded.is_empty() || begins_item) {
+                // The call's own `;` is consumed with an empty or item
+                // expansion only at a statement or item boundary. In
+                // expression position the empty expansion is an error,
+                // and dropping the `;` would let the flat stream read
+                // the next statement as the expression.
+                let stmt_boundary = item_list
+                    || out.is_empty()
+                    || matches!(out.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
+                    || matches!(out.last(), Some(Tt::Delim(Delim::Brace, _, _)));
+                if next_is_semi && begins_item {
                     next += 1;
+                } else if next_is_semi && expanded.is_empty() && stmt_boundary {
+                    next += 1;
+                }
+                // A statement-position expansion whose last statement
+                // is a `let` without its own `;` is incomplete: the
+                // call's `;` belongs to the macro statement, it does
+                // not finish the let.
+                if !item_list && stmt_boundary && ends_with_unfinished_let(&expanded) {
+                    return Err(err(
+                        C_CALL,
+                        call.span,
+                        "this macro expansion ends with an incomplete `let` statement",
+                        "End the `let` with `;` inside the macro expansion.",
+                    ));
                 }
                 if should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner) {
                     expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
@@ -2220,6 +2273,14 @@ impl<'a> Expander<'a> {
 
     /// Compiles and registers the `macro_rules!` definition at `def`.
     fn define_macro(&mut self, trees: &[Tt], def: &DefStart, exported: bool, local_def: bool) -> Result<(), Diag> {
+        // A `#[macro_export]` definition an expansion produced is only
+        // a textual macro: rustc keeps it out of the crate root path
+        // namespace ("macro-expanded macro_export macros cannot be
+        // referred to by absolute paths"). Written defs carry the
+        // root context; expansion output is stamped with its own.
+        let exported = exported && def.span.ctxt == CtxtId::ROOT;
+        self.check_dup_export(def.name, def.name_span, exported)?;
+        check_def_form(trees, def)?;
         let Tt::Delim(_, body, _) = &trees[def.group] else { unreachable!() };
         let body = body.clone();
         // An exported def was already compiled in the prescan; the walk
@@ -2278,6 +2339,16 @@ impl<'a> Expander<'a> {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
         }
+        // Builtin and passthrough macros count toward the recursion
+        // depth too (rustc counts every expansion level).
+        if depth >= 128 {
+            return Err(err(
+                C_CAP,
+                call.span,
+                format!("recursion limit reached while expanding `{}!`", call.path_text()),
+                "Give the macro a base case it can reach.",
+            ));
+        }
         let name = call.name_text().to_string();
         let std_prefixed = matches!(call.segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc"));
         if call.segs.len() == 1 || std_prefixed {
@@ -2287,11 +2358,14 @@ impl<'a> Expander<'a> {
             if builtin::is_passthrough(&name) {
                 // The head already ends with the call's `!`. The parser
                 // owns only the plain `name!` form, so keep just the
-                // last segment and the bang of a qualified path.
+                // last segment and the bang of a qualified path. The
+                // format family expands through a nested `format_args!`
+                // in rustc, so it costs two depth levels, others one.
+                let cost = if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
                 let head = &call.head[call.head.len().saturating_sub(2)..];
                 let mut out: Vec<Tt> = head.to_vec();
                 let written_lit = is_str_lit_arg(&call.inner);
-                let mut inner = self.expand_list(call.inner.clone(), depth, false, 0)?;
+                let mut inner = self.expand_list(call.inner.clone(), depth + cost, false, 0)?;
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut inner, call.span);
                 }
@@ -2323,6 +2397,16 @@ impl<'a> Expander<'a> {
     }
 }
 
+/// True when the last top-level statement segment of an expansion
+/// starts with `let` and carries no `;` of its own.
+fn ends_with_unfinished_let(expanded: &[Tt]) -> bool {
+    let seg = match expanded.iter().rposition(|t| t.is_tok(Tok::Semi)) {
+        Some(i) => &expanded[i + 1..],
+        None => expanded,
+    };
+    matches!(seg.first(), Some(Tt::Tok(t)) if t.tok == Tok::Let)
+}
+
 /// True when a one-step expansion should be parenthesized in the flat
 /// token stream. A macro call is one syntax node in rustc; in a flat
 /// stream a multi-token expansion would re-bind under surrounding
@@ -2334,7 +2418,87 @@ fn should_wrap(expanded: &[Tt], prev_out: &[Tt], next_tok: Option<Tok>, next_tre
         return false;
     }
     if expanded.iter().any(|t| t.is_tok(Tok::Semi)) {
-        return false;
+        // Statement sequences stand as written. In expression
+        // position a `;` in the expansion is where rustc stops
+        // ("trailing semicolon in macro used in expression
+        // position", "macro expansion ignores ..."); wrapping makes
+        // the flat stream reject there too instead of silently
+        // reading the expansion as statements of the caller.
+        let prev_expr = matches!(prev_out.last(), Some(Tt::Tok(t)) if matches!(
+            t.tok,
+            Tok::Eq
+                | Tok::Comma
+                | Tok::Colon
+                | Tok::Plus
+                | Tok::Minus
+                | Tok::Star
+                | Tok::Slash
+                | Tok::Percent
+                | Tok::EqEq
+                | Tok::Ne
+                | Tok::Lt
+                | Tok::Le
+                | Tok::Gt
+                | Tok::Ge
+                | Tok::AndAnd
+                | Tok::OrOr
+                | Tok::Amp
+                | Tok::Pipe
+                | Tok::Caret
+                | Tok::Shl
+                | Tok::PlusEq
+                | Tok::MinusEq
+                | Tok::StarEq
+                | Tok::SlashEq
+                | Tok::PercentEq
+                | Tok::AmpEq
+                | Tok::PipeEq
+                | Tok::CaretEq
+                | Tok::ShlEq
+                | Tok::Dot
+                | Tok::Question
+                | Tok::As
+                | Tok::Return
+                | Tok::FatArrow
+        ));
+        let next_expr = matches!(
+            next_tok,
+            Some(
+                Tok::Plus
+                    | Tok::Minus
+                    | Tok::Star
+                    | Tok::Slash
+                    | Tok::Percent
+                    | Tok::EqEq
+                    | Tok::Ne
+                    | Tok::Lt
+                    | Tok::Le
+                    | Tok::Gt
+                    | Tok::Ge
+                    | Tok::AndAnd
+                    | Tok::OrOr
+                    | Tok::Amp
+                    | Tok::Pipe
+                    | Tok::Caret
+                    | Tok::Shl
+                    | Tok::PlusEq
+                    | Tok::MinusEq
+                    | Tok::StarEq
+                    | Tok::SlashEq
+                    | Tok::PercentEq
+                    | Tok::AmpEq
+                    | Tok::PipeEq
+                    | Tok::CaretEq
+                    | Tok::ShlEq
+                    | Tok::Eq
+                    | Tok::Dot
+                    | Tok::Question
+                    | Tok::As
+                    | Tok::DotDot
+                    | Tok::DotDotEq
+            )
+        );
+        return prev_expr || next_expr;
     }
     if matches!(expanded.first(), Some(Tt::Tok(t)) if t.tok == Tok::Let) {
         return false;

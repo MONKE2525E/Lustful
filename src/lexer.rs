@@ -451,6 +451,12 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             }
             continue;
         }
+        if c == b'#' && b.get(i + 1) == Some(&b'#') {
+            return Err(err(start, i + 2, "reserved multi-hash token is forbidden"));
+        }
+        if c == b'#' && b.get(i + 1) == Some(&b'"') {
+            return Err(err(start, i + 2, "invalid string literal"));
+        }
         let tok = if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
                 i += 1;
