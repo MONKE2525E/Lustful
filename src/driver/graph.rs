@@ -700,6 +700,7 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
     use crate::ty::consteval::ConstValue;
     match v {
         ConstValue::Int(x) => (0u8, x).hash(h),
+        ConstValue::Float(bits, f) => (10u8, bits, f.name()).hash(h),
         ConstValue::Bool(b) => (1u8, b).hash(h),
         ConstValue::Char(c) => (2u8, c).hash(h),
         ConstValue::Str(i) => {
