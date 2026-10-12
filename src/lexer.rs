@@ -265,10 +265,7 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
             }
             let s = &src[start..i];
             // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
-            if s == "r"
-                && b.get(i) == Some(&b'#')
-                && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80)
-            {
+            if s == "r" && b.get(i) == Some(&b'#') && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80) {
                 i += 1;
                 let name_start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {

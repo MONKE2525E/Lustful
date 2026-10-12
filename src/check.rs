@@ -844,15 +844,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let (rd, rinner) = self.peel_one_ref(rt);
                 // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
                 let rmut = matches!(self.kind(rt), TyKind::Ref(true, _));
-                let ok = !rmut && match (*op, lk) {
-                    (_, TyKind::Error) => true,
-                    (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
-                        matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
-                    }
-                    (_, TyKind::Int(_) | TyKind::Var(_, true)) => self.unify(lt, rinner),
-                    (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
-                    _ => false,
-                };
+                let ok = !rmut
+                    && match (*op, lk) {
+                        (_, TyKind::Error) => true,
+                        (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
+                            matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
+                        }
+                        (_, TyKind::Int(_) | TyKind::Var(_, true)) => self.unify(lt, rinner),
+                        (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
+                        _ => false,
+                    };
                 if !ok {
                     let (a, b) = (self.tn(lt), self.tn(rt));
                     self.err(
