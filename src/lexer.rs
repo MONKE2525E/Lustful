@@ -96,6 +96,10 @@ pub enum Tok {
     StarEq,
     SlashEq,
     PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
     Amp,
     AndAnd,
     Pipe,
@@ -350,6 +354,8 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
             let three = if i + 2 < b.len() { &b[i..i + 3] } else { &[][..] };
             let (t, n) = if three == b"..=" {
                 (Tok::DotDotEq, 3)
+            } else if three == b"<<=" {
+                (Tok::ShlEq, 3)
             } else {
                 match two {
                     b"::" => (Tok::PathSep, 2),
@@ -365,6 +371,9 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
                     b"*=" => (Tok::StarEq, 2),
                     b"/=" => (Tok::SlashEq, 2),
                     b"%=" => (Tok::PercentEq, 2),
+                    b"&=" => (Tok::AmpEq, 2),
+                    b"|=" => (Tok::PipeEq, 2),
+                    b"^=" => (Tok::CaretEq, 2),
                     b"&&" => (Tok::AndAnd, 2),
                     b"||" => (Tok::OrOr, 2),
                     b"<<" => (Tok::Shl, 2),

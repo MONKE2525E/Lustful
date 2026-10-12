@@ -728,6 +728,11 @@ impl<'p, 'a> Lower<'p, 'a> {
         let span = self.span(e);
         let base = self.peel(self.ty(e), n);
         if self.kind(base) == TyKind::Str {
+            if n == 0 {
+                // The expression itself is a `str` place (`*t` for `t: &str`): borrow it back.
+                let (r, _) = self.borrow_of(e, 0);
+                return r;
+            }
             let p = self.place(e);
             return Operand::Copy(Self::derefs(p, n - 1));
         }
