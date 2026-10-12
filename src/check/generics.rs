@@ -2544,6 +2544,9 @@ fn build_owned_args(p: &mut Program, args: &[OwnedArg]) -> ArgsId {
 /// structural form). None when the type still contains an
 /// inference variable (the request that named it is not
 /// concrete yet).
+// Used by ensure_adt_instances_in below; both are kept for the
+// cross-store mono wiring that lands after this increment.
+#[allow(dead_code)]
 pub fn lift_ty(p: &mut Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
     let owned = snapshot_ty(src, t)?;
     Some(build_owned_ty(p, &owned))
@@ -3305,6 +3308,8 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class
 
 /// Walks one checked type for generic Adt applications mono has
 /// not made yet, creating them (their own fields may name more).
+// Not wired yet; see the note on lift_ty above.
+#[allow(dead_code)]
 fn ensure_adt_instances_in(p: &mut Program, src: &dyn TyIntern, t: Ty, depth: u32) {
     if depth > 32 {
         return;
