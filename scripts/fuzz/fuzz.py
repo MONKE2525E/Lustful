@@ -25,15 +25,25 @@ from collections import Counter
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LUST = os.path.join(ROOT, "target/release/lust")
 
-SMALL_CRATE = '''struct Point {
+SMALL_CRATE = '''#[derive(Debug, Clone, PartialEq)]
+struct Point {
     x: i64,
     y: i64,
 }
 
+#[derive(Debug)]
 enum Shape {
     Dot,
     Pair(i64, i64),
 }
+
+const fn seed_val() -> i64 {
+    3
+}
+
+const SEED: i64 = seed_val();
+
+static TABLE: [i64; 2] = [SEED, SEED + 1];
 
 impl Point {
     fn sum(&self) -> i64 {
@@ -73,6 +83,13 @@ fn pick(v: &Vec<i64>, i: usize) -> i64 {
     v[i]
 }
 
+fn hit(n: i64) -> i64 {
+    match n {
+        SEED => 1,
+        _ => 0,
+    }
+}
+
 fn main() {
     let mut pts: Vec<Point> = Vec::new();
     pts.push(Point { x: 1, y: 2 });
@@ -81,14 +98,22 @@ fn main() {
     let t = total(&pts);
     let c = classify(Shape::Pair(2, 3));
     let nums = vec![10, 20, 30];
-    println!("{} {} {} {}", label(t), c, pick(&nums, 1), pts.len());
+    println!("{} {} {} {} {} {} {:?} {}", label(t), c, pick(&nums, 1), pts.len(),
+             TABLE[1], hit(3), pts[0].clone(), std::mem::size_of::<Point>());
 }
 '''
 
 SNIPPETS = ["/*", "*/", '"', "fn zz() {", "}", "#[derive(Debug)]\n", "\n\n", "pub ",
             "struct Qq {", "// note\n", "x", "123", "->", "impl Qq {", 'let q = "abc\n',
             "/* a\nb\nfn fake() {}\n*/\n", "#[derive(Clone)]\n\n", "fn", "(", "/*\n\n\n",
-            'static S: &str = "a\nfn fake2() {}\nb";\n']
+            'static S: &str = "a\nfn fake2() {}\nb";\n',
+            # Cross-item value flows: const/static/derive items whose edits
+            # must invalidate the bodies and glue that baked their values in.
+            "const K9: i64 = 3;\n", "const K9: i64 = 4;\n", "static S9: i64 = 4;\n",
+            "const fn cf9() -> i64 { 5 }\n", "const fn cf9() -> i64 { 6 }\n",
+            "const K9: i64 = cf9();\n", "static S9: i64 = K9;\n",
+            "#[derive(Debug, Clone, PartialEq)]\n", "#[derive(Copy, Clone)]\n",
+            "const K9: usize = std::mem::size_of::<i64>();\n", "SEED", "seed_val()"]
 ITEM_STARTS = ("fn ", "pub ", "struct ", "enum ", "impl ", "#[", "use ")
 ERR_CODE = re.compile(r"error\[(L\d+)\]")
 ERR_SPAN = re.compile(r"-->[^:\n]*:(\d+):(\d+)")
@@ -305,9 +330,9 @@ def item_bounds(lines):
 def make_edit(rng, text, snapshots):
     op = rng.choices(
         ["truncate", "restore", "grow_prefix", "insert_snippet", "delete_lines",
-         "delete_bytes", "move_item", "insert_fn", "word_sub", "dup_lines",
+         "delete_bytes", "move_item", "insert_fn", "insert_item", "const_edit", "word_sub", "dup_lines",
          "join_line", "split_line", "swap_lines"],
-        weights=[10, 10, 8, 14, 8, 6, 8, 6, 8, 5, 5, 5, 5])[0]
+        weights=[10, 10, 8, 14, 8, 6, 8, 6, 7, 8, 8, 5, 5, 5, 5])[0]
     lines = text.splitlines(keepends=True)
     if op == "truncate" and len(text) > 2:
         return text[:rng.randrange(1, len(text))], op
@@ -349,8 +374,43 @@ def make_edit(rng, text, snapshots):
         n = rng.randint(0, 10**6)
         lines.insert(i, f"fn added_{n}() -> i64 {{ {n % 97} }}\n")
         return "".join(lines), op
+    if op == "insert_item":
+        # Whole items that carry values across items: a const fn feeding a
+        # const feeding a static, or a derived struct. Later edits (word
+        # subs, moves, restores) then mutate one side of those edges.
+        b = item_bounds(lines)
+        i = rng.choice(b) if b else 0
+        n = rng.randint(0, 10**6)
+        item = rng.choice([
+            f"const fn cf{n}() -> i64 {{ {n % 53} }}\nconst C{n}: i64 = cf{n}();\nstatic T{n}: i64 = C{n};\n",
+            f"const C{n}: i64 = {n % 89};\nstatic T{n}: [i64; 2] = [C{n}, C{n} + 1];\n",
+            f"#[derive(Debug, Clone, PartialEq)]\nstruct D{n} {{\n    a: i64,\n    b: bool,\n}}\n",
+            f"const C{n}: usize = std::mem::size_of::<i64>();\n",
+        ])
+        lines.insert(i, item)
+        return "".join(lines), op
+    if op == "const_edit":
+        # Bump one integer that feeds const evaluation: a const or static
+        # initializer literal, or a const fn's one-line body literal. The
+        # value flows into other items (patterns, lengths, statics), so
+        # the run loops run-compare right after this op, not only every
+        # 25 edits: a stale baked value passes `check` and only a run
+        # shows it.
+        pats = [r"\bconst\s+(?:fn\s+\w+\s*\([^)]*\)\s*->\s*\w+\s*\{|[A-Za-z_][\w]*\s*:[^=;]+=\s*)\s*(-?\d+)",
+                r"\bstatic\s+[A-Za-z_][\w]*\s*:[^=;]+=\s*(-?\d+)"]
+        hits = []
+        for pat in pats:
+            hits += [(m.start(1), m.end(1)) for m in re.finditer(pat, text)]
+        if hits:
+            s, e = rng.choice(hits)
+            return text[:s] + str(int(text[s:e]) + rng.choice([1, 1, 7, -1])) + text[e:], op
+        return text, op
     if op == "word_sub":
-        for a, bb in [("10", "2"), ("100", "7"), ("i64", "i32"), ("true", "false"), ("+", "-")]:
+        pairs = [("10", "2"), ("100", "7"), ("i64", "i32"), ("true", "false"), ("+", "-"),
+                 ("x: i64", "x: bool"), ("y: i64", "y: u8"), ("SEED", "3"),
+                 ("derive(Debug)", "derive(Debug, Clone)"), ("= seed_val()", "= 3")]
+        rng.shuffle(pairs)
+        for a, bb in pairs:
             idxs = [i for i in range(len(text)) if text.startswith(a, i)]
             if idxs:
                 k = rng.choice(idxs)
@@ -471,7 +531,9 @@ def cmd_run(a):
                 continue
             if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
                 snapshots.append(text)
-            if it % 25 == 24 and da[0] == 0:
+            # A const_edit can move a baked-in value while `check` still
+            # passes; run-compare right after it, not only every 25 edits.
+            if (it % 25 == 24 or op == "const_edit") and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
                 if ok and why == "program hang":
                     # The edited program does not terminate on either side:
@@ -521,17 +583,31 @@ mod b;
 
 use crate::a::Point;
 
+const FROM_A: i64 = a::make(2);
+
+static TALLY: i64 = FROM_A + a::K;
+
 fn helper() -> i64 {
     100
 }
 
+fn hit(n: i64) -> i64 {
+    match n {
+        FROM_A => 1,
+        _ => 0,
+    }
+}
+
 fn main() {
     let p = Point { x: a::value(), y: b::value() };
-    println!("multi {} {} {}", p.sum(), a::inner::deep(), helper());
+    let q = Point { x: 3, y: 4 };
+    println!("multi {} {} {} {} {} {}", p.sum(), a::inner::deep(), helper(),
+             TALLY, hit(6), p == q);
 }
 """,
     "a.rs": """pub mod inner;
 
+#[derive(Clone, PartialEq)]
 pub struct Point {
     pub x: i64,
     pub y: i64,
@@ -541,6 +617,12 @@ impl Point {
     pub fn sum(&self) -> i64 {
         self.x + self.y
     }
+}
+
+pub const K: i64 = 3;
+
+pub const fn make(x: i64) -> i64 {
+    x * K
 }
 
 pub fn value() -> i64 {
@@ -670,7 +752,7 @@ def cmd_run_multi(a):
                 continue
             if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
                 snapshots.append(dict(files))
-            if it % 25 == 24 and da[0] == 0:
+            if (it % 25 == 24 or op.endswith(":const_edit")) and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
                 if ok and why == "program hang":
                     # Same as single-file mode: matching program hang, but
