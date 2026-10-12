@@ -113,12 +113,28 @@ def crash_kind(cmd, rc):
 
 
 class Harness:
-    """One temp dir, one daemon, one crate file. `check(text, daemon)` writes and compiles."""
+    """One temp dir, one daemon, one crate file. `check(text, daemon)` writes and compiles.
+
+    The daemon's fresh-session guard runs in the background, so guard lines
+    can land after the client answer returns. `wait_guard_idle` restores the
+    old synchronous-guard reading: it polls the daemon log's paired
+    `guard-check: start/done` lines until every started check has been
+    applied, and only then is `guard_count` exact for the edits so far."""
 
     keep_work = False
 
     def __init__(self, timeout):
         self.timeout = timeout
+        # Incremental daemon-log counters (see _poll_log). The baselines are
+        # reset at each daemon start, so checks left pending by a dead
+        # daemon never block the new daemon's idle wait.
+        self._log_off = 0
+        self._log_partial = ""
+        self._guard = 0
+        self._gstart = 0
+        self._gdone = 0
+        self._gstart_base = 0
+        self._gdone_base = 0
         self.work = tempfile.mkdtemp(prefix="lust-fuzz-")
         self.crate = os.path.join(self.work, "crate.rs")
         self.sock = os.path.join(self.work, "d.sock")
@@ -138,6 +154,10 @@ class Harness:
             os.unlink(self.sock)
         self.daemon = subprocess.Popen([LUST, "daemon"], cwd=self.work, env=self.env,
                                        stderr=self.log)
+        # Any guard check the previous daemon left pending is dead with it.
+        self._poll_log()
+        self._gstart_base = self._gstart
+        self._gdone_base = self._gdone
         t0 = time.time()
         while not os.path.exists(self.sock):
             if time.time() - t0 > 10 or self.daemon.poll() is not None:
@@ -170,13 +190,48 @@ class Harness:
     def daemon_alive(self):
         return self.daemon.poll() is None
 
-    def guard_count(self):
+    def _poll_log(self):
+        """Reads only the daemon log bytes new since the last poll and folds
+        complete lines into the guard counters. O(new bytes) per call, so
+        polling during a long run stays cheap."""
         self.log.flush()
         try:
             with open(self.logpath) as f:
-                return sum(1 for line in f if "guard:" in line)
+                f.seek(self._log_off)
+                data = f.read()
+                self._log_off = f.tell()
         except OSError:
-            return 0
+            return
+        lines = (self._log_partial + data).split("\n")
+        self._log_partial = lines.pop()
+        for line in lines:
+            if "guard:" in line:
+                self._guard += 1
+            if "guard-check: start " in line:
+                self._gstart += 1
+            if "guard-check: done " in line:
+                self._gdone += 1
+
+    def guard_count(self):
+        self._poll_log()
+        return self._guard
+
+    def guard_pending(self):
+        """Background guard checks started by the current daemon, not yet applied."""
+        self._poll_log()
+        return (self._gstart - self._gstart_base) - (self._gdone - self._gdone_base)
+
+    def wait_guard_idle(self):
+        """Waits until every background guard check has been applied (or the
+        daemon dies, which the caller's liveness checks will report). After
+        this returns, `guard_count` covers every answer given so far, so a
+        background mismatch counts exactly like the old synchronous guard.
+        A timeout raises, because a stuck check would skew every verdict."""
+        deadline = time.time() + max(60.0, self.timeout * 6)
+        while self.daemon_alive() and self.guard_pending() > 0:
+            if time.time() > deadline:
+                raise RuntimeError("background guard checks did not finish")
+            time.sleep(0.005)
 
     def close(self):
         self.kill_daemon()
@@ -343,10 +398,14 @@ def cmd_run(a):
                 h.run_cmd("check", True)
                 continue
             ok, why, da, co = compare(h, "check", a.strict)
+            # The guard now runs behind the answer. Wait for it before
+            # counting or editing again, so a mismatch is charged to this
+            # edit (and the next edit never races the background check).
+            h.wait_guard_idle()
             g = h.guard_count()
             if g > seen_guard:
-                # The answer matched cold only because the daemon's fresh-session guard
-                # replaced the warm answer. Save the pair: it is a real incremental bug.
+                # The warm answer differed from a fresh session (found in the
+                # background). Save the pair: it is a real incremental bug.
                 save_pair(a.out, f"guard-{it}", prev, text)
                 print(f"GUARD iter {it} op {op}: warm answer differed; pair guard-{it} saved",
                       flush=True)
@@ -394,6 +453,7 @@ def cmd_run(a):
             if (it + 1) % 250 == 0:
                 print(f"... {it + 1}/{a.edits} failures={failures} "
                       f"{time.time() - t0:.0f}s", flush=True)
+        h.wait_guard_idle()
         guard = h.guard_count()
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
               f"failures={failures} guard_fired={guard} wall={time.time() - t0:.0f}s")
@@ -410,16 +470,20 @@ def cmd_run(a):
 def replay_pair(prev, cur, timeout, strict=False):
     """Fresh daemon checks prev, then cur; cold checks cur. True if the pair fails.
 
-    A fresh-session guard firing counts as a failure: the warm answer was wrong even
-    though the final answer matched cold."""
+    A fresh-session guard firing counts as a failure: the warm answer was wrong
+    even when it happened to match cold. The guard runs in the background, so
+    both checks wait for it to settle before the file changes or the verdict
+    is read."""
     h = Harness(timeout)
     try:
         h.write(prev)
         h.run_cmd("check", True)
+        h.wait_guard_idle()
         if not h.daemon_alive():
             return True, "daemon died on prev"
         h.write(cur)
         ok, why, da, co = compare(h, "check", strict)
+        h.wait_guard_idle()
         if not ok:
             return True, why
         if h.guard_count() > 0:

@@ -120,7 +120,77 @@ def main():
               f"rc1={rc1} warm={warm_loc.groups() if warm_loc else None} "
               f"cold={cold_loc.groups() if cold_loc else None}")
 
-        # 7. The daemon is still alive and correct after all of it.
+        # 7. Routing (S6): two feature selections of one file in one daemon
+        # stay in separate sessions, and a repeat selection reuses its own.
+        # Proof is the daemon's own session records: one "new session" log
+        # line per key naming a distinct session dir, plus a libbase built in
+        # each of those dirs. Program output is the same under both
+        # selections today (lust has no cfg(feature) yet), so output alone
+        # cannot prove the sessions apart; the session dirs can.
+        feat = os.path.join(work, "feat.rs")
+        open(feat, "w").write('fn main() { println!("feat {}", 20 + 22); }\n')
+        logpath = os.path.join(work, "daemon.log")
+
+        def session_dirs_for(root_path):
+            log.flush()
+            dirs = {}
+            for line in open(logpath):
+                if "new session for crate" in line and f"root={root_path}" in line:
+                    m = re.search(r"features=\[([^\]]*)\].* in (\S+)$", line.strip())
+                    if m:
+                        dirs[m.group(1)] = m.group(2)
+            return dirs
+
+        rc, out, err = run_lust(["build", feat, "-o", os.path.join(work, "fa.bin"), "--features", "alpha"])
+        check("routing: alpha build", rc == 0, err)
+        rc, out, err = run_lust(["build", feat, "-o", os.path.join(work, "fb.bin"), "--features", "beta"])
+        check("routing: beta build", rc == 0, err)
+        dirs = session_dirs_for(feat)
+        check("routing: alpha and beta are separate sessions",
+              set(dirs) == {"alpha", "beta"} and dirs.get("alpha") != dirs.get("beta"),
+              f"dirs={dirs}")
+        based = {k: bool(glob.glob(os.path.join(v, "libbase-*.so"))) for k, v in dirs.items()}
+        check("routing: each session built its own base", len(based) == 2 and all(based.values()),
+              f"based={based}")
+        r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
+        r2 = subprocess.run([os.path.join(work, "fb.bin")], capture_output=True, text=True)
+        check("routing: both builds run", r.stdout == r2.stdout == "feat 42\n",
+              f"alpha={r.stdout!r} beta={r2.stdout!r}")
+        rc, out, err = run_lust(["check", feat, "--features", "alpha"])
+        check("routing: alpha again ok", rc == 0, err)
+        dirs = session_dirs_for(feat)
+        check("routing: repeat selection reuses its session", set(dirs) == {"alpha", "beta"},
+              f"dirs={dirs}")
+        # An error under alpha must not poison beta: the same source error is
+        # reported by both, and after the fix each answers from its own state.
+        open(feat, "w").write('fn main() { let x: i64 = "s"; println!("{}", x); }\n')
+        rca, _, ea = run_lust(["check", feat, "--features", "alpha"])
+        rcb, _, eb = run_lust(["check", feat, "--features", "beta"])
+        check("routing: both selections reject the bad edit",
+              rca == 1 and rcb == 1 and ea.splitlines()[:1] == eb.splitlines()[:1],
+              f"alpha rc={rca}, beta rc={rcb}")
+        open(feat, "w").write('fn main() { println!("feat {}", 20 + 22); }\n')
+        rca, _, ea = run_lust(["check", feat, "--features", "alpha"])
+        rcb, _, eb = run_lust(["check", feat, "--features", "beta"])
+        check("routing: both selections accept the fix", rca == 0 and rcb == 0,
+              f"alpha rc={rca} {ea!r}, beta rc={rcb} {eb!r}")
+        # Background guards for the two error answers must settle with no
+        # mismatch: wait for every started check's done line in the log.
+        t0 = time.time()
+        settled = False
+        while time.time() - t0 < 30:
+            text = open(logpath).read()
+            if text.count("guard-check: start ") == text.count("guard-check: done ") \
+                    and "guard-check: start " in text:
+                settled = True
+                break
+            time.sleep(0.02)
+        text = open(logpath).read()
+        check("routing: background guards settled, none fired",
+              settled and "guard:" not in text,
+              f"settled={settled} guard_lines={[l for l in text.splitlines() if 'guard:' in l]}")
+
+        # 8. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
     finally:
         daemon.terminate()

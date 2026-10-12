@@ -1,0 +1,3 @@
+bin=extra
+root=src/bin/extra.rs
+args=one

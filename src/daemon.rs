@@ -1,24 +1,33 @@
-// `lust daemon`: keeps a warm compile session per file and serves requests from the `lust` client
-// over a Unix socket (see protocol.rs). One request at a time.
+// `lust daemon`: keeps a warm compile session per crate selection (`SessionKey`,
+// docs/ARCH.md section 1.8) and serves requests from the `lust` client over a Unix
+// socket (see protocol.rs). One request at a time on the serve loop; background
+// guard checks (below) compile in their own sessions on their own threads.
 // One daemon per socket: it holds an flock on `<socket>.lock` (which holds its pid) for its
 // whole life. A second daemon sees the lock taken and exits without touching the socket, so
 // a stale socket file can always be removed safely by the lock holder.
 // The daemon exits on its own after an idle span (`LUST_DAEMON_IDLE`, default 30 minutes;
 // see protocol::daemon_idle) and removes its socket on the way out.
-// Two safety nets make a warm answer as trustworthy as a cold compile:
-//   - A panic in one request is caught. That file's session is dropped, the request is answered
-//     by a fresh session, and the daemon keeps serving.
-//   - The fresh-session guard: when the incremental answer is an error, the request is redone in
-//     a fresh session. If the answers differ, the fresh session and its answer are adopted and
-//     the event is logged (lines starting with "guard:"). If they match, the warm session (and
-//     its caches) is kept. Success answers are trusted as they are.
+// Two safety nets watch the warm answers:
+//   - A panic in one request is caught. That crate's session is dropped, the request is
+//     answered by a fresh session at once, and the daemon keeps serving.
+//   - The fresh-session guard: when the incremental answer is an error, the client gets
+//     that answer at once and the request is redone in a fresh session in the background.
+//     If the answers differ, the event is logged loudly (lines starting with "guard:"),
+//     the fresh session replaces the warm one, and the next answer for that crate is
+//     recomputed in another new session. If they match, the warm session (and its caches)
+//     is kept. Success answers are trusted as they are. Background results are compared
+//     only when the source bytes did not change during the check, and they are applied
+//     on the serve loop (`GuardJobs::drain`), never on the worker thread. The fuzz gate
+//     waits for all started checks to finish (`guard-check: start/done` log lines) and
+//     counts any "guard:" line as a failure, as it did when the guard was synchronous.
 use crate::driver::{self, Request, Session};
-use crate::protocol::{self, Response};
+use crate::protocol::{self, Response, SessionKey};
 use std::collections::HashMap;
 use std::io::{BufReader, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -47,9 +56,17 @@ fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) 
 
 struct Entry {
     session: Session,
-    /// Directory stem for this file's sessions; fresh sessions get "<dir>r<n>".
+    /// Directory stem for this crate's sessions; fresh sessions get "<dir>r<n>".
     dir: PathBuf,
     resets: u64,
+    /// Requests served for this key. A background guard carries the count at
+    /// its spawn, so a slow older result cannot replace a session that a
+    /// newer guard already replaced (`replaced_gen`).
+    served: u64,
+    replaced_gen: u64,
+    /// A background guard found a mismatch: the next request for this key is
+    /// recomputed in a brand-new session before it is answered.
+    recompute_next: bool,
 }
 
 impl Entry {
@@ -59,53 +76,239 @@ impl Entry {
         d.push(format!("r{}", self.resets));
         PathBuf::from(d)
     }
+
+    fn new(dir: PathBuf, key: SessionKey) -> Entry {
+        Entry { session: Session::new(dir.clone(), true, key), dir, resets: 0, served: 0, replaced_gen: 0, recompute_next: false }
+    }
 }
 
-/// Compiles with the entry's warm session, with the panic net and the fresh-session guard.
-fn compile_guarded(entry: &mut Entry, req: &Request) -> Response {
-    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session)));
-    match first {
-        Ok(r) if r.code == 0 || r.code == 2 => r,
-        first => {
-            // An error answer, or a panic: redo in a fresh session and trust that instead.
-            let dir = entry.fresh_dir();
-            let mut fresh = Session::new(dir.clone(), true);
-            let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut fresh)));
-            match second {
-                Ok(r) => {
-                    let same = matches!(&first, Ok(f) if f.code == r.code && f.stdout == r.stdout && f.stderr == r.stderr);
-                    if same {
-                        // The warm session was right; keep its caches. The fresh build failed
-                        // the same way, so nothing links its base files: remove them.
-                        let _ = std::fs::remove_dir_all(&dir);
-                    } else {
-                        let first_line = |s: &str| s.lines().next().unwrap_or("").chars().take(120).collect::<String>();
-                        eprintln!(
-                            "guard: fresh session disagreed for {} (warm {}, fresh {}); adopting fresh; warm: {}; fresh: {}",
-                            req.file.display(),
-                            first.as_ref().map_or("panic".to_string(), |f| f.code.to_string()),
-                            r.code,
-                            first.as_ref().map_or("<panic>".to_string(), |f| first_line(&f.stderr)),
-                            first_line(&r.stderr)
-                        );
-                        entry.session = fresh;
-                    }
-                    r
+/// What one background fresh-session check found.
+enum GuardOutcome {
+    /// A fresh compile of the same source bytes; its session travels along
+    /// for adoption on a mismatch.
+    Fresh(Response),
+    /// The fresh compile panicked.
+    Panicked,
+    /// The source bytes changed during the check: no comparison is possible.
+    Stale,
+}
+
+/// One finished background check, sent from its worker thread to the serve loop.
+struct GuardDone {
+    seq: u64,
+    key: SessionKey,
+    served: u64,
+    /// The answer the client already got.
+    warm: Response,
+    /// The fresh session's object dir (removed unless the session is adopted).
+    dir: PathBuf,
+    session: Option<Session>,
+    outcome: GuardOutcome,
+}
+
+/// Background fresh-session checks: spawn on the serve loop, apply on the
+/// serve loop. Workers only compile in their own fresh session and send the
+/// result back; they never touch the session map. Start and done log lines
+/// come in pairs by sequence number, so a reader of the daemon log (the fuzz
+/// gate) can wait until every started check has been applied.
+struct GuardJobs {
+    tx: Sender<GuardDone>,
+    rx: Receiver<GuardDone>,
+    next_seq: u64,
+    pending: usize,
+}
+
+impl GuardJobs {
+    fn new() -> GuardJobs {
+        let (tx, rx) = std::sync::mpsc::channel();
+        GuardJobs { tx, rx, next_seq: 0, pending: 0 }
+    }
+
+    /// Redoes `req` in a fresh session on a new thread. `src` is the source
+    /// bytes read on the serve loop right after the warm compile; the worker
+    /// compares only when the file still holds exactly those bytes before
+    /// and after its compile, so an edit in between reads as stale, never as
+    /// a guard mismatch.
+    fn spawn(&mut self, req: Request, warm: Response, src: Vec<u8>, dir: PathBuf, served: u64) {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.pending += 1;
+        eprintln!("guard-check: start {seq} for {}", req.file.display());
+        let tx = self.tx.clone();
+        let key = req.session.clone();
+        std::thread::spawn(move || {
+            let work_dir = dir.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let same = |req: &Request| std::fs::read(&req.file).ok().as_deref() == Some(&src[..]);
+                if !same(&req) {
+                    return (GuardOutcome::Stale, None);
                 }
-                Err(_) => {
-                    // Even a fresh compile panicked. Drop the session so the next request starts
-                    // clean, and say so plainly instead of dying.
-                    eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
-                    let dir = entry.fresh_dir();
-                    entry.session = Session::new(dir, true);
-                    Response { stderr: "error: internal: compile failed in a fresh session\n".into(), code: 3, ..Default::default() }
+                let mut fresh = Session::new(work_dir, true, req.session.clone());
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(&req, &mut fresh))) {
+                    Ok(resp) if same(&req) => (GuardOutcome::Fresh(resp), Some(fresh)),
+                    Ok(_) => (GuardOutcome::Stale, None),
+                    Err(_) => (GuardOutcome::Panicked, None),
+                }
+            }));
+            // A panic anywhere in the worker still produces a done record, so
+            // `pending` and the log's start/done counts always settle.
+            let (outcome, session) = result.unwrap_or((GuardOutcome::Panicked, None));
+            let _ = tx.send(GuardDone { seq, key, served, warm, dir, session, outcome });
+        });
+    }
+
+    /// Applies every finished check. Runs only on the serve loop.
+    fn drain(&mut self, sessions: &mut HashMap<SessionKey, Entry>) {
+        while let Ok(done) = self.rx.try_recv() {
+            self.pending -= 1;
+            apply_guard(sessions, done);
+        }
+    }
+}
+
+/// First line of a response's stderr, for guard log lines.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(120).collect()
+}
+
+/// Applies one finished background check to the session map. On a real
+/// mismatch the fresh session is adopted and the next answer for the key is
+/// marked recomputed; a result from before the last such replacement is
+/// dropped (its bug is already reported, its session already replaced).
+fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
+    let file = done.key.krate.root.display().to_string();
+    let seq = done.seq;
+    match done.outcome {
+        GuardOutcome::Stale => {
+            let _ = std::fs::remove_dir_all(&done.dir);
+            eprintln!("guard-check: done {seq} stale for {file} (source changed during the check)");
+        }
+        GuardOutcome::Panicked => {
+            let _ = std::fs::remove_dir_all(&done.dir);
+            if let Some(entry) = sessions.get_mut(&done.key)
+                && done.served > entry.replaced_gen
+            {
+                eprintln!("guard: background fresh compile panicked for {file}; dropping the session, next answer recomputed");
+                let dir = entry.fresh_dir();
+                entry.session = Session::new(dir, true, done.key.clone());
+                entry.replaced_gen = done.served;
+                entry.recompute_next = true;
+            }
+            eprintln!("guard-check: done {seq} panic for {file}");
+        }
+        GuardOutcome::Fresh(ref fresh) => {
+            let same = fresh.code == done.warm.code && fresh.stdout == done.warm.stdout && fresh.stderr == done.warm.stderr;
+            if same {
+                // The warm session was right; keep its caches. The fresh
+                // build failed the same way, so nothing links its base
+                // files: remove them.
+                let _ = std::fs::remove_dir_all(&done.dir);
+                eprintln!("guard-check: done {seq} match for {file}");
+                return;
+            }
+            match sessions.get_mut(&done.key) {
+                Some(entry) if done.served > entry.replaced_gen => {
+                    eprintln!(
+                        "guard: background fresh session disagreed for {file} (warm {}, fresh {}); adopting fresh, next answer recomputed; warm: {}; fresh: {}",
+                        done.warm.code,
+                        fresh.code,
+                        first_line(&done.warm.stderr),
+                        first_line(&fresh.stderr)
+                    );
+                    entry.session = done.session.take().expect("a fresh outcome carries its session");
+                    entry.replaced_gen = done.served;
+                    entry.recompute_next = true;
+                    eprintln!("guard-check: done {seq} mismatch for {file}");
+                }
+                _ => {
+                    let _ = std::fs::remove_dir_all(&done.dir);
+                    eprintln!("guard-check: done {seq} mismatch for {file} (already replaced by a newer check)");
                 }
             }
         }
     }
 }
 
-/// Serves requests until idle. Each file has its own session.
+/// Compiles `req` in a brand-new session, which replaces the entry's. The
+/// bool is false when even the fresh compile panicked (the entry then holds
+/// another new empty session and the answer is the code 3 plain failure).
+fn compile_fresh(entry: &mut Entry, req: &Request) -> (Response, bool) {
+    let dir = entry.fresh_dir();
+    let mut fresh = Session::new(dir, true, req.session.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut fresh))) {
+        Ok(r) => {
+            entry.session = fresh;
+            (r, true)
+        }
+        Err(_) => {
+            eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
+            let dir = entry.fresh_dir();
+            entry.session = Session::new(dir, true, req.session.clone());
+            (Response { stderr: "error: internal: compile failed in a fresh session\n".into(), code: 3, ..Default::default() }, false)
+        }
+    }
+}
+
+/// Compiles with the entry's warm session, with the panic net and the
+/// fresh-session guard. An error answer goes to the client at once and is
+/// rechecked in the background (`jobs`); a panic, or a request marked
+/// recomputed by an earlier mismatch, is answered from a fresh session here.
+fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Response {
+    entry.served += 1;
+    let served = entry.served;
+    if entry.recompute_next {
+        entry.recompute_next = false;
+        eprintln!("guard-check: recomputing {} in a fresh session (marked by a background mismatch)", req.file.display());
+        // This answer already comes from a fresh session, so no background
+        // check is spawned for it.
+        return compile_fresh(entry, req).0;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session))) {
+        Ok(r) if r.code == 0 || r.code == 2 => r,
+        Ok(r) => {
+            // An error answer: hand it out now, verify it in the background.
+            // Without the current source bytes no honest comparison is
+            // possible, so a read failure here just skips the check.
+            if let Ok(src) = std::fs::read(&req.file) {
+                let dir = entry.fresh_dir();
+                jobs.spawn(req.clone(), r.clone(), src, dir, served);
+            }
+            r
+        }
+        Err(_) => {
+            // A panic has no answer to hand out and the session may be
+            // corrupt: redo in a fresh session at once, as before.
+            let (r, fresh_ok) = compile_fresh(entry, req);
+            if fresh_ok {
+                eprintln!(
+                    "guard: compile panicked in the warm session for {}; answered from a fresh session (fresh {}); fresh: {}",
+                    req.file.display(),
+                    r.code,
+                    first_line(&r.stderr)
+                );
+            }
+            r
+        }
+    }
+}
+
+/// The session entry for `key`, made on first use. New keys get the next
+/// directory number (entries are never removed, so numbers stay unique)
+/// and one log line naming the full key and its directory.
+fn entry_for<'m>(sessions: &'m mut HashMap<SessionKey, Entry>, base: &Path, key: &SessionKey) -> &'m mut Entry {
+    use std::collections::hash_map::Entry as MapEntry;
+    let n = sessions.len();
+    match sessions.entry(key.clone()) {
+        MapEntry::Occupied(e) => e.into_mut(),
+        MapEntry::Vacant(v) => {
+            let dir = base.join(n.to_string());
+            eprintln!("lust daemon: new session for crate {} in {}", key.describe(), dir.display());
+            v.insert(Entry::new(dir, key.clone()))
+        }
+    }
+}
+
+/// Serves requests until idle. Each crate selection (`SessionKey`) has its own session.
 pub fn serve(sock: &Path) -> ! {
     // Single instance, decided before anything touches the socket.
     let lock_path = protocol::daemon_lock_path(sock);
@@ -137,7 +340,8 @@ pub fn serve(sock: &Path) -> ! {
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
     let base = std::env::temp_dir().join(format!("lust-daemon-{}", std::process::id()));
-    let mut sessions: HashMap<PathBuf, Entry> = HashMap::new();
+    let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+    let mut jobs = GuardJobs::new();
     // Autostart pre-warm: the client that started us names the file it is compiling
     // cold. Checking it here fills a session, so the next command is truly warm. It
     // waits for that cold process to exit first, so it never competes with it. A
@@ -155,6 +359,7 @@ pub fn serve(sock: &Path) -> ! {
         let file = PathBuf::from(file);
         let req = protocol::Request {
             cmd: protocol::Cmd::Check,
+            session: SessionKey::synthetic(&file, false),
             out: file.with_extension(""),
             json: false,
             timings: false,
@@ -165,18 +370,24 @@ pub fn serve(sock: &Path) -> ! {
             harness: false,
             file: file.clone(),
         };
-        let entry = sessions.entry(file).or_insert_with(|| {
-            let dir = base.join("0");
-            Entry { session: Session::new(dir.clone(), true), dir, resets: 0 }
-        });
-        let _ = compile_guarded(entry, &req);
+        let entry = entry_for(&mut sessions, &base, &req.session);
+        let _ = compile_guarded(entry, &req, &mut jobs);
         last = std::time::Instant::now();
     }
     loop {
+        // Apply any finished guard checks before waiting, so a mismatch
+        // replaces its session before the next request for that key.
+        jobs.drain(&mut sessions);
         // Block in poll() until a connection lands or the idle span runs out.
-        let left = idle.map(|d| d.saturating_sub(last.elapsed()));
+        // While guard checks run, wake often to drain them; the idle exit
+        // also waits for them, so a mismatch is never lost at shutdown.
+        let mut left = idle.map(|d| d.saturating_sub(last.elapsed()));
+        if jobs.pending > 0 {
+            let cap = std::time::Duration::from_millis(20);
+            left = Some(left.map_or(cap, |d| d.min(cap)));
+        }
         if !wait_readable(&listener, left) {
-            if idle.is_some_and(|d| last.elapsed() >= d) {
+            if jobs.pending == 0 && idle.is_some_and(|d| last.elapsed() >= d) {
                 let _ = std::fs::remove_file(sock);
                 eprintln!("lust daemon: idle timeout, exiting");
                 std::process::exit(0);
@@ -195,16 +406,73 @@ pub fn serve(sock: &Path) -> ! {
         };
         let resp = match req {
             Some(req) => {
-                let n = sessions.len();
-                let entry = sessions.entry(req.file.clone()).or_insert_with(|| {
-                    let dir = base.join(n.to_string());
-                    Entry { session: Session::new(dir.clone(), true), dir, resets: 0 }
-                });
-                compile_guarded(entry, &req)
+                // Finished guard checks for this key land before its next
+                // compile, so a marked recompute takes effect here.
+                jobs.drain(&mut sessions);
+                let entry = entry_for(&mut sessions, &base, &req.session);
+                compile_guarded(entry, &req, &mut jobs)
             }
             None => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
         };
         let _ = protocol::write_response(&mut conn, &resp);
         last = std::time::Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(code: i32, stderr: &str) -> Response {
+        Response { stdout: String::new(), stderr: stderr.into(), code, ran: false }
+    }
+
+    fn done(key: &SessionKey, seq: u64, served: u64, warm: Response, fresh: Response, dir: PathBuf) -> GuardDone {
+        GuardDone {
+            seq,
+            key: key.clone(),
+            served,
+            warm,
+            session: Some(Session::new(dir.clone(), true, key.clone())),
+            dir,
+            outcome: GuardOutcome::Fresh(fresh),
+        }
+    }
+
+    /// The background mismatch path, which no live incremental bug reaches
+    /// today: a differing fresh answer replaces the session and marks the
+    /// next answer recomputed; an older result after that replacement is
+    /// dropped; an equal answer keeps the warm session untouched.
+    #[test]
+    fn guard_apply_adopts_mismatch_and_drops_stale_results() {
+        let base = std::env::temp_dir().join(format!("lust-guard-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base, &key);
+        entry.served = 5;
+        let warm_dir = entry.session.obj_dir().to_path_buf();
+
+        // Mismatch at served=3: adopt the fresh session, mark recompute.
+        apply_guard(&mut sessions, done(&key, 1, 3, resp(1, "warm err\n"), resp(1, "fresh err\n"), base.join("f1")));
+        let entry = sessions.get(&key).unwrap();
+        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "fresh session adopted");
+        assert!(entry.recompute_next, "next answer marked recomputed");
+        assert_eq!(entry.replaced_gen, 3);
+
+        // An older result (served=2) after the replacement changes nothing.
+        apply_guard(&mut sessions, done(&key, 2, 2, resp(1, "warm err\n"), resp(0, ""), base.join("f2")));
+        let entry = sessions.get(&key).unwrap();
+        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "stale result dropped");
+        assert_eq!(entry.replaced_gen, 3);
+
+        // Equal answers keep the current session and clear nothing.
+        let same = resp(1, "same err\n");
+        apply_guard(&mut sessions, done(&key, 3, 5, same.clone(), same, base.join("f3")));
+        let entry = sessions.get(&key).unwrap();
+        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "match keeps the session");
+        assert!(entry.recompute_next, "the earlier recompute mark stands");
+        assert_ne!(entry.session.obj_dir(), warm_dir.as_path());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

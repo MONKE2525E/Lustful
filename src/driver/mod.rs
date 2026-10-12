@@ -6,6 +6,6 @@ pub mod cache;
 mod compile;
 mod session;
 
-pub use crate::protocol::{Cmd, Request, Response};
+pub use crate::protocol::{Cmd, Request, Response, SessionKey};
 pub use compile::compile;
 pub use session::Session;

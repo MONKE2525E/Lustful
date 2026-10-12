@@ -48,6 +48,9 @@ if [ -e scripts/test-client.sh ]; then
   scripts/test-client.sh
 fi
 
+step "crate fixture tests"
+scripts/test-crates.sh
+
 if [ -e scripts/test-slots.py ]; then
   step "slot identity tests"
   python3 scripts/test-slots.py

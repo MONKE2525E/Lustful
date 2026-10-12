@@ -2,10 +2,15 @@
 // `lust-core` compiler, so the client stays small and starts fast.
 //
 // Wire format. Request: a header line with no user data in it,
-//   cmd json timings debug max_errors
-// followed by length-prefixed fields (file, out, emit_c), each as "<byte len>\n<bytes>".
-// Length prefixes carry any byte a path can hold, including tabs and newlines; emit_c uses
-// len 0 for None. Run arguments never cross the wire (see `Request::run_args`).
+//   cmd json timings debug max_errors test default_features all_features
+//   panic_abort overflow_checks debug_assertions feature_count
+// followed by length-prefixed fields, each as "<byte len>\n<bytes>": file, out,
+// emit_c, then the crate selector (package id, manifest path, target kind,
+// target name, crate root, target triple), then one field per feature.
+// Length prefixes carry any byte a path can hold, including tabs and newlines; emit_c
+// and the manifest path use len 0 for None. Run arguments never cross the wire
+// (see `Request::run_args`). The socket name holds the build hash, so a client
+// only ever talks to a daemon of the same build: the wire needs no compat mode.
 // Response: "<code> <stdout len> <stderr len>\n" followed by the two byte strings.
 // Both binaries include this module and each uses only part of it.
 #![allow(dead_code)]
@@ -20,8 +25,131 @@ pub enum Cmd {
     Build,
 }
 
+/// One crate: one target of one package (docs/ARCH.md section 1.1). A crate is
+/// the unit of daemon sessions. `root` is the crate root file; today it is the
+/// file the user named, because a crate is one file until W-RESOLVE loads
+/// modules. `package_id` is the identity string the stable crate hash covers
+/// (section 1.7): a synthetic `file:<path>` for a single-file program, or a
+/// Cargo-shaped stand-in until W-RESOLVE reads real package ids from Cargo
+/// metadata. `test` marks the same target built as a test crate (`lust test`):
+/// test and non-test defs never share identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CrateKey {
+    pub package_id: String,
+    pub manifest_path: Option<PathBuf>,
+    pub target_kind: String,
+    pub target_name: String,
+    pub root: PathBuf,
+    pub test: bool,
+}
+
+/// The profile values that can change program output (section 1.1). They enter
+/// every session and cache key. Lust dev builds always use the dev values
+/// today; the fields exist now so a profile change can never reuse a session
+/// or a disk entry built under other flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProfileFlags {
+    pub panic_abort: bool,
+    pub overflow_checks: bool,
+    pub debug_assertions: bool,
+}
+
+impl ProfileFlags {
+    /// The dev profile lust compiles with (the rustc parity flags in DESIGN.md).
+    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true };
+}
+
+/// Daemon routing key (section 1.8): the crate plus the resolver inputs that
+/// select how it is built (features with the default-feature policy, target
+/// triple, profile flags). Two feature selections or two targets of one crate
+/// get two sessions. The Cargo graph key and adapter versions join this key
+/// with W-RESOLVE; `features` is sorted and deduped at construction.
+/// `target_triple` empty means the host.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub krate: CrateKey,
+    pub features: Vec<String>,
+    pub default_features: bool,
+    pub all_features: bool,
+    pub target_triple: String,
+    pub profile: ProfileFlags,
+}
+
+impl SessionKey {
+    /// The synthetic one-crate package for a single-file program: the file
+    /// path is the package identity, the target is a `bin` named by the file
+    /// stem, and `test` marks a `lust test` harness build. This keeps
+    /// `lust check file.rs` unchanged for users (section 9.2, S6).
+    pub fn synthetic(file: &Path, test: bool) -> SessionKey {
+        let path = file.to_string_lossy();
+        let stem = path.rsplit('/').next().unwrap_or(&path);
+        let stem = stem.strip_suffix(".rs").unwrap_or(stem);
+        SessionKey {
+            krate: CrateKey {
+                package_id: format!("file:{path}"),
+                manifest_path: None,
+                target_kind: "bin".into(),
+                target_name: stem.into(),
+                root: file.to_path_buf(),
+                test,
+            },
+            features: Vec::new(),
+            default_features: true,
+            all_features: false,
+            target_triple: String::new(),
+            profile: ProfileFlags::DEV,
+        }
+    }
+
+    /// One-line form naming every field. Daemon logs and the cold disk cache
+    /// key both use it, so a field that is not in this text is not in either.
+    pub fn describe(&self) -> String {
+        let b = |x: bool| if x { "1" } else { "0" };
+        let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
+        format!(
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={}",
+            self.krate.package_id,
+            manifest,
+            self.krate.target_kind,
+            self.krate.target_name,
+            self.krate.root.display(),
+            b(self.krate.test),
+            self.features.join(","),
+            b(self.default_features),
+            b(self.all_features),
+            if self.target_triple.is_empty() { "host" } else { &self.target_triple },
+            b(self.profile.panic_abort),
+            b(self.profile.overflow_checks),
+            b(self.profile.debug_assertions),
+        )
+    }
+}
+
+/// Sorts and dedupes a feature list, so `--features b,a` and `--features a,b`
+/// select the same session. Used wherever a `SessionKey` is built from flags.
+fn sort_features(features: &mut Vec<String>) {
+    features.sort();
+    features.dedup();
+}
+
+/// The host target triple, for the tier-1 hosts lust runs on. Empty when the
+/// host is not in the table (an explicit `--target` then never matches it).
+pub fn host_triple() -> &'static str {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        _ => "",
+    }
+}
+
+#[derive(Clone)]
 pub struct Request {
     pub cmd: Cmd,
+    /// The crate this request names and the session it routes to. `file` is
+    /// the file the user named; today it is also `session.krate.root`.
+    pub session: SessionKey,
     pub file: PathBuf,
     pub out: PathBuf,
     pub json: bool,
@@ -41,7 +169,7 @@ pub struct Request {
     pub harness: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Response {
     pub stdout: String,
     pub stderr: String,
@@ -72,7 +200,77 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust capabilities [--json]\n       lust daemon";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust capabilities [--json]\n       lust daemon";
+
+/// Crate-selection flags from the command line, before defaults are filled in.
+#[derive(Default)]
+struct CrateFlags {
+    manifest_path: Option<PathBuf>,
+    package: Option<String>,
+    bin: Option<String>,
+    lib: bool,
+    features: Vec<String>,
+    no_default_features: bool,
+    all_features: bool,
+    target_triple: Option<String>,
+}
+
+impl CrateFlags {
+    /// True when any crate-selection flag was given. Release and rustc-oracle
+    /// invocations reject these instead of silently ignoring them.
+    fn any(&self) -> bool {
+        self.manifest_path.is_some()
+            || self.package.is_some()
+            || self.bin.is_some()
+            || self.lib
+            || !self.features.is_empty()
+            || self.no_default_features
+            || self.all_features
+            || self.target_triple.is_some()
+    }
+}
+
+/// Builds the session key for a dev request from the crate flags. With no
+/// manifest or package flag the crate is synthetic (one file). With one, the
+/// package identity comes from the manifest text (`find_manifest` below)
+/// until W-RESOLVE reads real package ids from Cargo metadata. The file is
+/// still the crate root: `lust check file.rs` keeps its meaning.
+fn session_key_for(file: &Path, flags: CrateFlags) -> SessionKey {
+    let mut key = SessionKey::synthetic(file, false);
+    let mut features = flags.features;
+    sort_features(&mut features);
+    key.features = features;
+    key.default_features = !flags.no_default_features;
+    key.all_features = flags.all_features;
+    key.target_triple = flags.target_triple.unwrap_or_default();
+    if flags.manifest_path.is_none() && flags.package.is_none() && flags.bin.is_none() && !flags.lib {
+        return key;
+    }
+    // An explicit manifest path wins; else the nearest Cargo.toml above the file.
+    let manifest = match &flags.manifest_path {
+        Some(p) => std::fs::read_to_string(p).ok().map(|text| {
+            let (package, version, bins) = parse_manifest(&text);
+            Manifest { dir: p.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf), path: p.clone(), package, version, bins }
+        }),
+        None => find_manifest(file),
+    };
+    let package =
+        flags.package.or_else(|| manifest.as_ref().and_then(|m| m.package.clone())).unwrap_or_else(|| key.krate.target_name.clone());
+    let version = manifest.as_ref().and_then(|m| m.version.clone()).unwrap_or_else(|| "0.0.0".into());
+    key.krate.package_id = match &manifest {
+        Some(m) => format!("{package} {version} (path+file://{})", m.dir.display()),
+        None => format!("pkg:{package} {version}"),
+    };
+    key.krate.manifest_path = manifest.as_ref().map(|m| m.path.clone()).or(flags.manifest_path);
+    if flags.lib {
+        key.krate.target_kind = "lib".into();
+        key.krate.target_name = package;
+    } else {
+        key.krate.target_kind = "bin".into();
+        key.krate.target_name = flags.bin.or_else(|| manifest.as_ref().and_then(|m| selected_bin(m, file))).unwrap_or(package);
+    }
+    key
+}
 
 /// Parses the command line (without the program name). Paths become absolute.
 pub fn parse_args(args: &[String]) -> Option<Invocation> {
@@ -88,6 +286,16 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let (mut out, mut json, mut timings, mut debug, mut emit_c, mut run_args) = (None, false, false, false, None, Vec::new());
     let (mut release, mut profile, mut rustc) = (false, None, false);
     let mut max_errors = 20usize;
+    let mut crate_flags = CrateFlags::default();
+    // Splits one `--features` value (comma- or space-separated, as Cargo takes).
+    fn push_features(into: &mut Vec<String>, value: &str) -> Option<()> {
+        let names: Vec<&str> = value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+        if names.is_empty() {
+            return None;
+        }
+        into.extend(names.iter().map(|s| s.to_string()));
+        Some(())
+    }
     while let Some(a) = it.next() {
         match a.as_str() {
             "--json" => json = true,
@@ -100,24 +308,42 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "--rustc" => rustc = true,
             "--max-errors" => max_errors = it.next()?.parse().ok()?,
             _ if a.starts_with("--max-errors=") => max_errors = a["--max-errors=".len()..].parse().ok()?,
+            "--manifest-path" => crate_flags.manifest_path = Some(PathBuf::from(it.next()?)),
+            _ if a.starts_with("--manifest-path=") => crate_flags.manifest_path = Some(PathBuf::from(&a["--manifest-path=".len()..])),
+            "--package" | "-p" => crate_flags.package = Some(it.next()?.clone()),
+            _ if a.starts_with("--package=") => crate_flags.package = Some(a["--package=".len()..].to_string()),
+            "--bin" => crate_flags.bin = Some(it.next()?.clone()),
+            _ if a.starts_with("--bin=") => crate_flags.bin = Some(a["--bin=".len()..].to_string()),
+            "--lib" => crate_flags.lib = true,
+            "--features" => push_features(&mut crate_flags.features, it.next()?)?,
+            _ if a.starts_with("--features=") => push_features(&mut crate_flags.features, &a["--features=".len()..])?,
+            "--no-default-features" => crate_flags.no_default_features = true,
+            "--all-features" => crate_flags.all_features = true,
+            "--target" => crate_flags.target_triple = Some(it.next()?.clone()),
+            _ if a.starts_with("--target=") => crate_flags.target_triple = Some(a["--target=".len()..].to_string()),
             "--" => run_args = it.by_ref().cloned().collect(),
             _ if file.as_os_str().is_empty() => file = a.into(),
             _ => return None,
         }
+    }
+    if crate_flags.lib && crate_flags.bin.is_some() {
+        return None;
     }
     if file.as_os_str().is_empty() {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     // Release and the rustc oracle are build/check-only, with no extra lust flags.
+    // Crate-selection flags are lust dev flags today: reject them there rather
+    // than build a different crate selection than the user named.
     if rustc {
-        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() {
+        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() {
             return None;
         }
         return Some(Invocation::RustcCheck { file: abs(&file) });
     }
     if release || profile.is_some() {
-        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() {
+        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() {
             return None;
         }
         if release && profile.is_none() {
@@ -127,9 +353,15 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     }
     let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
     let run = cmd == "run";
+    let file = abs(&file);
+    if let Some(p) = crate_flags.manifest_path.take() {
+        crate_flags.manifest_path = Some(abs(&p));
+    }
+    let session = session_key_for(&file, crate_flags);
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
-        file: abs(&file),
+        session,
+        file,
         out: abs(&out),
         json,
         timings,
@@ -176,10 +408,35 @@ fn get_field(r: &mut impl BufRead) -> Option<Vec<u8>> {
 pub fn encode(r: &Request) -> Vec<u8> {
     let b = |x: bool| if x { "1" } else { "0" };
     let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
-    let mut out = format!("{cmd} {} {} {} {}\n", b(r.json), b(r.timings), b(r.debug), r.max_errors).into_bytes();
-    put_field(&mut out, r.file.as_os_str().as_encoded_bytes());
-    put_field(&mut out, r.out.as_os_str().as_encoded_bytes());
-    put_field(&mut out, r.emit_c.as_ref().map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()));
+    let s = &r.session;
+    let mut out = format!(
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {}\n",
+        b(r.json),
+        b(r.timings),
+        b(r.debug),
+        r.max_errors,
+        b(s.krate.test),
+        b(s.default_features),
+        b(s.all_features),
+        b(s.profile.panic_abort),
+        b(s.profile.overflow_checks),
+        b(s.profile.debug_assertions),
+        s.features.len()
+    )
+    .into_bytes();
+    let path_field = |out: &mut Vec<u8>, p: Option<&Path>| put_field(out, p.map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()));
+    path_field(&mut out, Some(&r.file));
+    path_field(&mut out, Some(&r.out));
+    path_field(&mut out, r.emit_c.as_deref());
+    put_field(&mut out, s.krate.package_id.as_bytes());
+    path_field(&mut out, s.krate.manifest_path.as_deref());
+    put_field(&mut out, s.krate.target_kind.as_bytes());
+    put_field(&mut out, s.krate.target_name.as_bytes());
+    path_field(&mut out, Some(&s.krate.root));
+    put_field(&mut out, s.target_triple.as_bytes());
+    for f in &s.features {
+        put_field(&mut out, f.as_bytes());
+    }
     out
 }
 
@@ -190,17 +447,49 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
         return None;
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 5 {
+    if f.len() != 12 {
         return None;
     }
     #[allow(unused_imports)]
     use std::os::unix::ffi::OsStringExt as _;
     let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
     let file = path(get_field(r)?);
     let out = path(get_field(r)?);
     let emit = get_field(r)?;
+    let package_id = text(get_field(r)?)?;
+    let manifest = get_field(r)?;
+    let target_kind = text(get_field(r)?)?;
+    let target_name = text(get_field(r)?)?;
+    let root = path(get_field(r)?);
+    let target_triple = text(get_field(r)?)?;
+    // A feature count this large is a bad request, not a loop to run.
+    let n_features: usize = f[11].parse().ok()?;
+    if n_features > 4096 {
+        return None;
+    }
+    let mut features = Vec::with_capacity(n_features);
+    for _ in 0..n_features {
+        features.push(text(get_field(r)?)?);
+    }
+    sort_features(&mut features);
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
+        session: SessionKey {
+            krate: CrateKey {
+                package_id,
+                manifest_path: if manifest.is_empty() { None } else { Some(path(manifest)) },
+                target_kind,
+                target_name,
+                root,
+                test: f[5] == "1",
+            },
+            features,
+            default_features: f[6] == "1",
+            all_features: f[7] == "1",
+            target_triple,
+            profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1" },
+        },
         file,
         out,
         json: f[1] == "1",
@@ -274,11 +563,12 @@ fn exit_with(status: std::process::ExitStatus) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// The bits of a Cargo.toml that bin selection needs.
+/// The bits of a Cargo.toml that bin selection and crate identity need.
 struct Manifest {
     dir: PathBuf,
     path: PathBuf,
     package: Option<String>,
+    version: Option<String>,
     /// (bin name, path as written) per `[[bin]]` table.
     bins: Vec<(String, Option<String>)>,
 }
@@ -294,10 +584,12 @@ fn toml_value(line: &str) -> Option<String> {
     Some(v.trim_end_matches(|c: char| c == ',' || c.is_whitespace()).to_string())
 }
 
-/// Reads package name and `[[bin]]` tables from manifest text. Section-gated on purpose:
-/// a `name` in `[dependencies]` or a profile table must never match.
-fn parse_manifest(text: &str) -> (Option<String>, Vec<(String, Option<String>)>) {
+/// Reads package name, package version, and `[[bin]]` tables from manifest
+/// text. Section-gated on purpose: a `name` in `[dependencies]` or a profile
+/// table must never match.
+fn parse_manifest(text: &str) -> (Option<String>, Option<String>, Vec<(String, Option<String>)>) {
     let mut package = None;
+    let mut version = None;
     let mut bins: Vec<(String, Option<String>)> = Vec::new();
     let mut section = "";
     for raw in text.lines() {
@@ -312,6 +604,7 @@ fn parse_manifest(text: &str) -> (Option<String>, Vec<(String, Option<String>)>)
         let key = line.split('=').next().unwrap_or("").trim();
         match (section, key) {
             ("package", "name") if package.is_none() => package = toml_value(line),
+            ("package", "version") if version.is_none() => version = toml_value(line),
             ("bin", "name") => {
                 if let (Some(last), Some(v)) = (bins.last_mut(), toml_value(line)) {
                     last.0 = v;
@@ -325,7 +618,7 @@ fn parse_manifest(text: &str) -> (Option<String>, Vec<(String, Option<String>)>)
             _ => {}
         }
     }
-    (package, bins)
+    (package, version, bins)
 }
 
 /// The nearest Cargo.toml at or above the file's directory, if one exists.
@@ -334,8 +627,8 @@ fn find_manifest(file: &Path) -> Option<Manifest> {
     while let Some(d) = dir {
         let path = d.join("Cargo.toml");
         if let Ok(text) = std::fs::read_to_string(&path) {
-            let (package, bins) = parse_manifest(&text);
-            return Some(Manifest { dir: d.to_path_buf(), path, package, bins });
+            let (package, version, bins) = parse_manifest(&text);
+            return Some(Manifest { dir: d.to_path_buf(), path, package, version, bins });
         }
         dir = d.parent();
     }
@@ -507,5 +800,123 @@ pub fn daemon_idle() -> Option<std::time::Duration> {
         Ok(0) => None,
         Ok(n) => Some(std::time::Duration::from_secs(n * mul)),
         Err(_) => Some(std::time::Duration::from_secs(1800)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn compile_req(list: &[&str]) -> Request {
+        match parse_args(&args(list)) {
+            Some(Invocation::Compile { req, .. }) => req,
+            _ => panic!("not a compile invocation: {list:?}"),
+        }
+    }
+
+    /// The synthetic crate for one file: path identity, `bin` target named by
+    /// the stem, and the test flag as the only variant (section 1.7: test and
+    /// non-test defs never share identity).
+    #[test]
+    fn synthetic_key_shape() {
+        let k = SessionKey::synthetic(Path::new("/tmp/x/main.rs"), false);
+        assert_eq!(k.krate.package_id, "file:/tmp/x/main.rs");
+        assert_eq!((k.krate.target_kind.as_str(), k.krate.target_name.as_str()), ("bin", "main"));
+        assert_eq!(k.krate.root, PathBuf::from("/tmp/x/main.rs"));
+        assert!(k.krate.manifest_path.is_none() && k.features.is_empty() && k.default_features && !k.all_features);
+        assert_ne!(k, SessionKey::synthetic(Path::new("/tmp/x/main.rs"), true), "test target differs");
+        assert_ne!(k, SessionKey::synthetic(Path::new("/tmp/x/other.rs"), false), "file differs");
+    }
+
+    /// Two feature selections of one file are two session keys (the S6
+    /// routing rule), and flag order or repetition does not make a third.
+    #[test]
+    fn feature_selections_are_distinct_keys() {
+        let a = compile_req(&["check", "/tmp/x/main.rs", "--features", "alpha"]);
+        let b = compile_req(&["check", "/tmp/x/main.rs", "--features", "beta"]);
+        let both = compile_req(&["check", "/tmp/x/main.rs", "--features", "beta,alpha", "--features=alpha"]);
+        assert_ne!(a.session, b.session);
+        assert_eq!(a.session.features, ["alpha"]);
+        assert_eq!(both.session.features, ["alpha", "beta"]);
+        let plain = compile_req(&["check", "/tmp/x/main.rs"]);
+        assert_eq!(plain.session, SessionKey::synthetic(Path::new("/tmp/x/main.rs"), false), "no flags stays synthetic");
+        // Every resolver input separates keys on its own.
+        let t = compile_req(&["check", "/tmp/x/main.rs", "--target", "x86_64-unknown-linux-gnu"]);
+        assert_ne!(plain.session, t.session, "target triple");
+        assert_ne!(
+            plain.session.describe(),
+            compile_req(&["check", "/tmp/x/main.rs", "--no-default-features"]).session.describe(),
+            "default policy"
+        );
+        assert_ne!(
+            plain.session.describe(),
+            compile_req(&["check", "/tmp/x/main.rs", "--all-features"]).session.describe(),
+            "all features"
+        );
+    }
+
+    /// Manifest and package flags name a real crate: package identity from
+    /// the manifest text, `src/main.rs` selecting the package bin.
+    #[test]
+    fn manifest_flags_name_the_crate() {
+        let dir = std::env::temp_dir().join(format!("lust-key-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let manifest = "[package]\nname = \"widget\"\nversion = \"1.2.3\"\nedition = \"2024\"\n\n[workspace]\n";
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let req = compile_req(&[
+            "check",
+            main_rs.to_str().unwrap(),
+            "--manifest-path",
+            dir.join("Cargo.toml").to_str().unwrap(),
+            "--features",
+            "zest",
+        ]);
+        assert_eq!(req.session.krate.package_id, format!("widget 1.2.3 (path+file://{})", dir.display()));
+        assert_eq!((req.session.krate.target_kind.as_str(), req.session.krate.target_name.as_str()), ("bin", "widget"));
+        assert_eq!(req.session.krate.manifest_path.as_deref(), Some(dir.join("Cargo.toml").as_path()));
+        let lib = compile_req(&["check", main_rs.to_str().unwrap(), "--package", "widget", "--lib"]);
+        assert_eq!((lib.session.krate.target_kind.as_str(), lib.session.krate.target_name.as_str()), ("lib", "widget"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Contradictory or misplaced crate flags are usage errors, not guesses.
+        assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--lib", "--bin", "x"])).is_none());
+        assert!(parse_args(&args(&["build", "/tmp/x/main.rs", "--release", "--features", "a"])).is_none());
+        assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--rustc", "--target", "t"])).is_none());
+    }
+
+    /// The wire carries the full session key: encode, then read back, every
+    /// field equal (features sorted on both sides).
+    #[test]
+    fn wire_round_trips_the_session_key() {
+        let mut req = compile_req(&[
+            "build",
+            "/tmp/x/main.rs",
+            "-o",
+            "/tmp/x/out",
+            "--features",
+            "beta,alpha",
+            "--no-default-features",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--package",
+            "widget",
+            "--bin",
+            "wbin",
+        ]);
+        req.session.krate.test = true;
+        let bytes = encode(&req);
+        let back = read_request(&mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(back.session, req.session);
+        assert_eq!((back.file.as_path(), back.out.as_path()), (req.file.as_path(), req.out.as_path()));
+        assert!(matches!(back.cmd, Cmd::Build) && !back.harness && back.run_args.is_none());
+        // A truncated wire form never reads as a request.
+        let bytes = encode(&req);
+        assert!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).is_none());
     }
 }

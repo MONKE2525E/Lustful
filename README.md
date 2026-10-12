@@ -56,7 +56,7 @@ Same generated file, same output. rustc gets its best configuration for each num
 
 ## How incremental compiles work
 
-The daemon keeps one session per file. An edit costs time that grows with the size of the edit, not of the program:
+The daemon keeps one session per crate selection: the crate (package and target) plus the resolver inputs that select its build (features, target triple, profile flags). A single file is a synthetic one-crate package, so `lust check file.rs` needs no setup. Two feature selections of one file get two sessions. An edit costs time that grows with the size of the edit, not of the program:
 
 1. **Find what changed.** It compares the new source with the last one (two `memcmp`s), and lexes again only the chunks of whole items that the edit touched. Chunk boundaries are content-defined, so an inserted function does not move the others.
 2. **Classify the edit.** A token-level scan hashes each function body, and everything outside bodies, without positions. If only bodies changed, only those bodies are parsed, checked, and borrow-checked again. If only top-level functions were added, removed, or changed signature, it parses only the changed chunks, and re-checks only those functions and the bodies that mention their names. Anything else (a type, an impl) is a full rebuild.
@@ -75,6 +75,7 @@ cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
 ```sh
 lust check main.rs [--json] [--max-errors N] [--timings]
 lust build main.rs [-o out] [-g] [--emit-c prefix] [--timings]
+lust build src/main.rs --manifest-path Cargo.toml [--bin name] [--features a,b] [--target triple]  # name a Cargo crate target; the file stays the crate root
 lust run main.rs [-- args]
 lust build main.rs --release            # release build: Cargo if a Cargo.toml is above the file, else rustc -O
 lust build main.rs --profile fast       # same, with a named Cargo profile
@@ -115,6 +116,7 @@ Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields 
 scripts/difftest.sh             # compare with rustc
 SANITIZE=1 scripts/difftest.sh  # also run the generated C under ASan and UBSan
 scripts/test-client.sh          # daemon autostart, disk cache, release handoff
+scripts/test-crates.sh          # Cargo package fixtures built by Cargo and by lust
 scripts/testtest.sh             # compare `lust test` with `rustc --test`
 scripts/check-explain.sh        # check every `lust explain` example against lust and rustc
 scripts/agentkit-test.sh        # JSON diagnostics, explain, capabilities, test edges

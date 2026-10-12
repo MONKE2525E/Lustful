@@ -86,7 +86,7 @@ fn main() {
                 protocol::finish(resp, run, &req.out, &args);
             }
             let dir = std::env::temp_dir().join(format!("lust-{}", std::process::id()));
-            let mut session = driver::Session::new(dir, false);
+            let mut session = driver::Session::new(dir, false, req.session.clone());
             let resp = driver::compile(&req, &mut session);
             remove_obj_dir(session.obj_dir());
             if let (Some(cache), Some(src)) = (&cache, &src) {

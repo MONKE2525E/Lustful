@@ -12,7 +12,7 @@
 // test is never reported as a pass; it is counted in `filtered_out`.
 use crate::ast::{ItemKind, TyExpr};
 use crate::diag::{self, Diag, FileId, SourceMap};
-use crate::driver::{self, Cmd, Request};
+use crate::driver::{self, Cmd, Request, SessionKey};
 use crate::intern::{Interner, Known};
 use crate::{lexer, parser};
 use std::io::Read;
@@ -258,10 +258,14 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     // Check the user file as written first, so diagnostics name the real file and hash.
+    // One session per crate root: the user file as a test crate, then the
+    // generated harness file as its own bin crate (driver sessions are keyed
+    // by crate, so the harness build below gets a fresh session).
     let dir = std::env::temp_dir().join(format!("lust-test-{}", std::process::id()));
-    let mut session = driver::Session::new(dir.join("obj"), false);
+    let mut session = driver::Session::new(dir.join("obj"), false, SessionKey::synthetic(&file, true));
     let req = |cmd: Cmd, file: PathBuf, out: PathBuf| Request {
         cmd,
+        session: SessionKey::synthetic(&file, cmd == Cmd::Check),
         file,
         out,
         json: opts.json,
@@ -309,6 +313,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let harness_path = abs(&dir.join("harness.rs"));
     let bin = dir.join("testbin");
+    let mut session = driver::Session::new(dir.join("obj-harness"), false, SessionKey::synthetic(&harness_path, false));
     let build = driver::compile(&req(Cmd::Build, harness_path.clone(), bin.clone()), &mut session);
     if build.code != 0 {
         // Spans match the user file byte for byte; only the file name differs.

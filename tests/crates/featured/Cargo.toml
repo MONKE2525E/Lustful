@@ -1,0 +1,17 @@
+# Feature selection plumbing: fixture.txt selects `beta` (which enables
+# `alpha`) for both the Cargo build and the lust build. Lust has no
+# cfg(feature) in the language yet, so the source does not branch on the
+# features; this fixture proves both toolchains accept the same selection
+# and produce the same program. The daemon-side proof that two selections
+# stay in separate sessions is in scripts/fuzz/smoke.py.
+[package]
+name = "featured"
+version = "0.2.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = []
+alpha = []
+beta = ["alpha"]

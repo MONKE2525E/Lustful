@@ -113,12 +113,16 @@ fn compiler_id() -> (u64, u64) {
 }
 
 /// The whole-request key for `req` over `src` bytes: compiler id, target, path, flags, source.
-/// `--timings` is not in the key: stored responses keep no timing text, and a hit makes its
-/// own timing line. `out` is not in the key: the built bytes do not depend on the out name.
+/// The session key text (`SessionKey::describe`, which names every field) is in
+/// the key, so two crate selections of one file never replay each other's
+/// stored answer. `--timings` is not in the key: stored responses keep no timing
+/// text, and a hit makes its own timing line. `out` is not in the key: the built
+/// bytes do not depend on the out name.
 fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
     let cmd: &[u8] = if req.cmd == Cmd::Check { b"check" } else { b"build" };
     let flags = [req.json as u8, req.debug as u8];
+    let session = req.session.describe();
     let (a, b) = hash128(
         &[
             &id.0.to_le_bytes(),
@@ -128,6 +132,7 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
             &flags,
             &req.max_errors.to_le_bytes(),
             req.file.to_string_lossy().as_bytes(),
+            session.as_bytes(),
             src,
         ],
         13,
@@ -283,10 +288,12 @@ fn decode_response(b: &[u8]) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionKey;
 
     fn req(cmd: Cmd, json: bool, debug: bool) -> Request {
         Request {
             cmd,
+            session: SessionKey::synthetic(std::path::Path::new("/tmp/x/main.rs"), false),
             file: "/tmp/x/main.rs".into(),
             out: "/tmp/x/main".into(),
             json,
@@ -315,6 +322,12 @@ mod tests {
         let mut other = req(Cmd::Check, false, false);
         other.file = "/tmp/y/main.rs".into();
         assert_ne!(base, request_key(id, &other, b"fn main() {}"), "source path");
+        let mut other = req(Cmd::Check, false, false);
+        other.session.features = vec!["alpha".into()];
+        assert_ne!(base, request_key(id, &other, b"fn main() {}"), "feature selection");
+        let mut other = req(Cmd::Check, false, false);
+        other.session.target_triple = "x86_64-unknown-linux-gnu".into();
+        assert_ne!(base, request_key(id, &other, b"fn main() {}"), "target triple");
         assert_eq!(base, request_key(id, &req(Cmd::Check, false, false), b"fn main() {}"), "stable");
     }
 
