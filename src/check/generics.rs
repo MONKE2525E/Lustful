@@ -797,7 +797,7 @@ pub fn resolve_scoped(
         TyExpr::Infer => match &scope.infer_cell {
             Some(cell) => {
                 let id = cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(tys.intern(TyKind::Infer(InferId(id, false))))
+                Ok(tys.intern(TyKind::Infer(InferId(id, InferKind::General))))
             }
             None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
         },
