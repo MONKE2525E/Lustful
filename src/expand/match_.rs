@@ -1386,6 +1386,10 @@ fn meta_end(input: &[Tt], pos: usize, interner: &Interner) -> Option<usize> {
             {
                 return Some(i + 3);
             }
+            // A macro call as the value (`doc = concat!("a")`).
+            if let Some(end) = macro_call_shape(input, i + 1) {
+                return Some(end);
+            }
             match tok_at(input, i + 1).map(|t| t.tok) {
                 Some(Tok::Str(_) | Tok::Int(..) | Tok::Float(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::ByteStr(_)) => Some(i + 2),
                 _ => None,
@@ -1509,11 +1513,20 @@ fn path_ends(m: &mut Matcher, input: &[Tt], pos: usize) -> Vec<usize> {
             }
         }
         // Parenthesized arguments (`Fn(A, B)` sugar): the group is
-        // part of the path when its pieces read as types.
+        // part of the path when its pieces read as types, and a
+        // following `-> T` return type belongs to it as well.
         if let Some(Tt::Delim(Delim::Paren, inner, _)) = input.get(i) {
             let inner = inner.clone();
             if angle_args_ok(m, &inner) {
                 i += 1;
+                if tok_at(input, i).map(|t| t.tok) == Some(Tok::Arrow) {
+                    for end in (i + 2..=input.len()).rev() {
+                        if probe(m, FragKind::Ty, &input[i + 1..end]) || is_fn_type(m, &input[i + 1..end]) {
+                            i = end;
+                            break;
+                        }
+                    }
+                }
             }
         }
         ends.push(i);

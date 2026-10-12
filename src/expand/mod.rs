@@ -507,6 +507,42 @@ pub struct MacroDef {
     pub fingerprint: u64,
     /// The macro name alone, for diagnostics.
     pub name_text: String,
+    /// A template mentions `stringify!`, `line!`, `column!`, or
+    /// `file!`: its expansion reads token positions or spacing, so
+    /// the expansion cache key must include the input layout.
+    pub pos_sensitive: bool,
+}
+
+/// True when template trees contain a position-reading builtin call
+/// (`stringify!` spacing, `line!`/`column!`/`file!` positions).
+fn template_pos_sensitive(trees: &[Tt], interner: &Interner) -> bool {
+    trees.iter().enumerate().any(|(i, t)| match t {
+        Tt::Tok(tok) => {
+            matches!(tok.tok, Tok::Ident(s2) if matches!(interner.get(s2), "stringify" | "line" | "column" | "file"))
+                && tok_at(trees, i + 1).map(|n| n.tok) == Some(Tok::Bang)
+        }
+        Tt::Delim(_, inner, _) => template_pos_sensitive(inner, interner),
+        Tt::Frag(_, inner, _) => template_pos_sensitive(inner, interner),
+    })
+}
+
+/// Hashes the span layout of input trees (every token and group
+/// position), for position-sensitive expansion cache keys.
+fn span_layout_hash(trees: &[Tt]) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    fn go(h: &mut impl Hasher, trees: &[Tt]) {
+        for tree in trees {
+            let span = tree.span();
+            span.lo.hash(h);
+            span.hi.hash(h);
+            match tree {
+                Tt::Delim(_, inner, _) | Tt::Frag(_, inner, _) => go(h, inner),
+                Tt::Tok(_) => {}
+            }
+        }
+    }
+    go(&mut h, trees);
+    h.finish()
 }
 
 /// Compiles the arms inside one `macro_rules!` body group into a
@@ -549,6 +585,7 @@ pub fn compile_macro(
     if arms.is_empty() {
         return Err(err(C_DEF, def_span, "a macro must contain at least one rule", "Add a rule such as `() => {};`."));
     }
+    let pos_sensitive = arms.iter().any(|a| template_pos_sensitive(&a.template, interner));
     Ok(MacroDef {
         name,
         name_span,
@@ -561,6 +598,7 @@ pub fn compile_macro(
         // `stringify!(x + y)`) must not hit a cached transcription.
         fingerprint: hash_tts(body, strings) ^ span_hash_tts(body, body.first().map_or(0, |t| t.span().lo)),
         name_text: interner.get(name).to_string(),
+        pos_sensitive,
     })
 }
 
@@ -617,8 +655,18 @@ impl<'a> ExpandCtx<'a> {
 /// file or environment that no longer exists in that form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dep {
-    File { path: std::path::PathBuf, hash: u64 },
-    Env { name: String, value: Option<String> },
+    File {
+        path: std::path::PathBuf,
+        hash: u64,
+    },
+    Env {
+        name: String,
+        value: Option<String>,
+    },
+    /// The expansion read a token position (`line!` or `column!`):
+    /// a chunk carrying it must not be reused at a different start
+    /// line, which the driver checks (see `deps_stale`).
+    Position,
 }
 
 /// Hashes bytes for a file dependency record.
@@ -636,6 +684,7 @@ pub fn deps_stale_with(deps: &[Dep], env: &dyn Fn(&str) -> Option<String>) -> bo
     deps.iter().any(|dep| match dep {
         Dep::File { path, hash } => std::fs::read(path).map_or(true, |bytes| dep_bytes_hash(&bytes) != *hash),
         Dep::Env { name, value } => env(name) != *value,
+        Dep::Position => false,
     })
 }
 
@@ -703,6 +752,10 @@ struct CacheKey {
     cfg_hash: u64,
     edition: u16,
     deps_hash: u64,
+    /// Input span layout for position-sensitive templates, else 0:
+    /// `f(a,b)` and `f( a , b )` hash alike as tokens but stringify
+    /// apart, so they must not share a cached transcription.
+    layout: u64,
 }
 
 fn expansion_cache() -> &'static std::sync::Mutex<FxMap<CacheKey, (Vec<Tt>, CtxtId)>> {
@@ -848,6 +901,14 @@ impl<'a> Expander<'a> {
         let dep = Dep::File { path: path.to_path_buf(), hash: dep_bytes_hash(bytes) };
         if !self.deps.contains(&dep) {
             self.deps.push(dep);
+        }
+    }
+
+    /// Records that this expansion read a token position (`line!`
+    /// or `column!`), whose baked value depends on the chunk's line.
+    pub fn read_dep_position(&mut self) {
+        if !self.deps.contains(&Dep::Position) {
+            self.deps.push(Dep::Position);
         }
     }
 
@@ -1523,6 +1584,7 @@ impl<'a> Expander<'a> {
             cfg_hash: self.ctx.cfg.hash(),
             edition: 2024,
             deps_hash: 0,
+            layout: if def.pos_sensitive { span_layout_hash(&call.inner) } else { 0 },
         };
         if let Some((cached, old_ctxt)) = expansion_cache().lock().unwrap().get(&key).cloned() {
             CACHE_HITS.fetch_add(1, Ordering::Relaxed);
@@ -2041,20 +2103,14 @@ impl<'a> Expander<'a> {
                 out.push(take(&mut trees, group_idx - 1));
                 let fmt_name = segs.last().map_or("", |s| s.text.as_str());
                 let written_lit = is_str_lit_arg(&inner);
-                let mut expanded_inner = self.expand_list(inner, depth, false, nest + 1)?;
-                if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
-                    mark_format_str(&mut expanded_inner, group_span);
-                }
                 // A passthrough builtin still costs recursion depth
                 // (the format family costs two: it expands through a
                 // nested `format_args!` in rustc).
-                let cost = if matches!(segs.last().map_or("", |s| s.text.as_str()), "println" | "print" | "eprintln" | "eprint" | "format")
-                {
-                    2
-                } else {
-                    1
-                };
-                let expanded_inner = self.expand_list(inner, depth + cost, false, nest + 1)?;
+                let cost = if matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
+                let mut expanded_inner = self.expand_list(inner, depth + cost, false, nest + 1)?;
+                if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
+                    mark_format_str(&mut expanded_inner, group_span);
+                }
                 out.push(Tt::Delim(delim, expanded_inner, group_span));
                 i = group_idx + 1;
                 pending_macro_use = false;
@@ -2241,6 +2297,12 @@ impl<'a> Expander<'a> {
                             return Ok(end);
                         }
                         let _ = attr_start;
+                        return Err(err(
+                            C_UNSUPPORTED,
+                            attr.span,
+                            "`#[cfg]` on this statement form is not supported yet",
+                            "Move the cfg to an item, or rewrite the statement with cfg!.",
+                        ));
                     }
                 }
                 "macro_export" => exported = true,

@@ -427,7 +427,6 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
             text.push(' ');
         }
         text.push_str(&piece.text);
-        prev = Some(piece);
     }
     text
 }
@@ -449,6 +448,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             Ok(vec![Tt::Tok(Token { tok: if on { Tok::True } else { Tok::False }, span })])
         }
         "line" | "column" => {
+            st.read_dep_position();
             expect_args(name, call, 0)?;
             let site = crate::diag::call_site_span(span);
             let (line, col) = st.line_col(site);

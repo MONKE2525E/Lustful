@@ -70,5 +70,21 @@ else
   bad "deleted include" "build failed without L0803: $(head -2 "$work/h4.log")"
 fi
 
+# A chunk that baked in a line! value must not be reused when lines
+# above it move it to a different start line.
+mkdir -p "$work/line"
+printf 'fn main() { println!("{}", line!()); }\n' >"$work/line/main.rs"
+(cd "$work/line" && "$lust" run main.rs) >/dev/null 2>&1
+for i in $(seq 1 100); do [ -S "$(sock "$work/line")" ] && break; sleep 0.05; done
+w1=$(cd "$work/line" && "$lust" run main.rs 2>/dev/null)
+printf '\n\nfn main() { println!("{}", line!()); }\n' >"$work/line/main.rs"
+w2=$(cd "$work/line" && "$lust" run main.rs 2>/dev/null)
+stop_daemon "$work/line"
+if [ "$w1" = "1" ] && [ "$w2" = "3" ]; then
+  ok "line! follows a moved chunk"
+else
+  bad "line! after blank lines" "want 1 then 3, got '$w1' then '$w2' (stale baked line)"
+fi
+
 echo "test-macro-deps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

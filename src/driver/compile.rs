@@ -1341,7 +1341,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // request (expansion is per chunk, but a changed include can hold
     // macro definitions other chunks used; dropping all is the simple
     // sound rule). Added for W-MACRO (docs/ARCH.md section 6.4).
-    let deps_stale = front.chunks.iter().any(|c| expand::deps_stale(&c.expand_deps));
+    // Same for a chunk whose expansion baked in a position (`line!`):
+    // reused at a different start line its baked values are wrong.
+    let line_of = |text: &str, at: usize| text.as_bytes()[..at.min(text.len())].iter().filter(|&&b| b == b'\n').count();
+    let pos_stale = front.chunks.iter().any(|c| {
+        if !c.expand_deps.contains(&expand::Dep::Position) {
+            return false;
+        }
+        if c.start + c.text.len() <= prefix {
+            false
+        } else if c.start >= old_len - suffix && suffix > 0 {
+            line_of(&front.src, c.start) != line_of(&src, (c.start as i64 + delta) as usize)
+        } else {
+            false
+        }
+    });
+    let deps_stale = pos_stale || front.chunks.iter().any(|c| expand::deps_stale(&c.expand_deps));
     let mut kept_front = Vec::new();
     let mut kept_back = Vec::new();
     for c in std::mem::take(&mut front.chunks) {
