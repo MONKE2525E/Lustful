@@ -400,3 +400,6 @@ uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
     uint32_t d = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'z' ? (c | 32) - 'a' + 10 : 0xFFFFFFFFu;
     return d < radix ? d : 0xFFFFFFFFu;
 })
+
+/* Float formatting, parsing, and casts (src/rt/float.h). */
+#include "rt/float.h"
