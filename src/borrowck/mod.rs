@@ -323,6 +323,12 @@ struct Ck<'b, 'p, 'a> {
     mpaths: Vec<(Local, Path)>,
     /// The `mpaths` index range of each local's paths.
     mpath_at: Vec<(u32, u32)>,
+    /// Per local: its type contains a reference (computed once; every
+    /// assignment asks, in every pass).
+    ref_local: Vec<bool>,
+    /// Reused operand list of the statement being checked, so a statement
+    /// visit does not allocate.
+    ops_buf: Vec<&'b Operand>,
 }
 
 /// The Adt defs that have a user `Drop` impl: every impl of the lang
@@ -367,6 +373,8 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         sh: Shape { n: 0, wn: 0, wl: 0, wm: 0 },
         mpaths: Vec::new(),
         mpath_at: Vec::new(),
+        ref_local: body.locals.iter().map(|l| contains_ref(&body.tys, l.ty)).collect(),
+        ops_buf: Vec::new(),
     };
     ck.collect_loans();
     ck.collect_move_paths();
@@ -861,6 +869,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // Fixpoint without reporting, then one reporting pass over the final states.
         // `st` is the one scratch state: each visit copies a block's entry state
         // into it, so no visit allocates.
+        //
+        // The fixpoint also learns which loans escape into a return value or
+        // behind a parameter (`collecting`); the reporting pass then keeps those
+        // loans live everywhere rustc's NLL does. Collecting during the fixpoint
+        // gives the same set as a pass over the final states: states only grow
+        // toward the final ones, the escape rules are monotone in the state, and
+        // every block's last visit runs on its final entry state.
+        self.collecting = true;
         let mut st = State::new(self.sh);
         while let Some(b) = work.pop() {
             queued[b as usize] = false;
@@ -880,15 +896,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     queued[si] = true;
                     work.push(s.0);
                 }
-            }
-        }
-        // One pass to learn which loans escape into a return value or behind a parameter.
-        // The reporting pass then keeps those loans live everywhere rustc's NLL does.
-        self.collecting = true;
-        for (b, e) in entry.iter().enumerate() {
-            if let Some(e) = e {
-                st.w.copy_from_slice(&e.w);
-                self.run_block(b as u32, &mut st);
             }
         }
         self.collecting = false;
@@ -952,7 +959,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         out
     }
 
-    fn stmt(&mut self, b: u32, si: u32, s: &StmtKind, span: Span, st: &mut State) {
+    fn stmt(&mut self, b: u32, si: u32, s: &'b StmtKind, span: Span, st: &mut State) {
         // Loans live after this statement. Only needed in the reporting pass.
         let skip = match s {
             StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
@@ -962,7 +969,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         match s {
             StmtKind::Assign(dest, rv) => {
                 // Reads and moves in the right-hand side.
-                let mut ops: Vec<&Operand> = Vec::new();
+                let mut ops = std::mem::take(&mut self.ops_buf);
+                ops.clear();
                 rvalue_operands(rv, &mut |o| ops.push(o));
                 for o in &ops {
                     self.operand(o, span, st, &live);
@@ -1023,8 +1031,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.access(place, Access::Read, span, &live);
                     }
                     _ => {
-                        let ty = self.dest_ty(dest);
-                        if contains_ref(&self.body.tys, ty) {
+                        if self.dest_holds_refs(dest) {
                             for o in &ops {
                                 self.holds_of(o, st, &mut new_holds);
                                 self.origins_of(o, st, &mut new_origins);
@@ -1033,6 +1040,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                 }
                 self.write_dest(dest, new_holds, &new_origins, span, &live, st);
+                self.ops_buf = ops;
             }
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
                 let place = Place::local(*l);
@@ -1137,8 +1145,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 // argument's loans, and loans flow into &mut args. The
                 // IR owner refines this when fn pointers lower.
                 self.operand(&Operand::Copy(Place::local(callee)), span, st, &live);
-                let ty = self.dest_ty(dest);
-                if contains_ref(&self.body.tys, ty) {
+                if self.dest_holds_refs(dest) {
                     for o in args {
                         self.holds_of(o, st, &mut new_holds);
                         self.origins_of(o, st, &mut new_origins);
@@ -1149,8 +1156,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => {
                 // Builtins were plain rvalues before S7: a reference-typed
                 // result may hold any argument's loans.
-                let ty = self.dest_ty(dest);
-                if contains_ref(&self.body.tys, ty) {
+                if self.dest_holds_refs(dest) {
                     for o in args {
                         self.holds_of(o, st, &mut new_holds);
                         self.origins_of(o, st, &mut new_origins);
@@ -1162,6 +1168,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         self.write_dest(dest, new_holds, &new_origins, span, &live, st);
+    }
+
+    /// True when the type written at `dest` contains a reference.
+    fn dest_holds_refs(&self, dest: &Place) -> bool {
+        if dest.proj.is_empty() { self.ref_local[dest.local as usize] } else { contains_ref(&self.body.tys, self.dest_ty(dest)) }
     }
 
     /// True when a slice-making assignment's destination is a `&mut [T]` local.
