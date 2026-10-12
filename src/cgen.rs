@@ -721,7 +721,7 @@ impl FnGen<'_, '_, '_> {
             Rvalue::VecLit(elem, ops) => {
                 let et = ctype(&cty(&self.body.tys, *elem));
                 let t = self.tmp();
-                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({}, sizeof({et}));", ops.len());
+                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({}, sizeof({et}), _Alignof({et}));", ops.len());
                 for (i, o) in ops.iter().enumerate() {
                     let (v, _) = self.operand(o, loc, post);
                     let _ = writeln!(self.out, "    (({et}*){t}.ptr)[{i}] = {v};");
@@ -736,7 +736,7 @@ impl FnGen<'_, '_, '_> {
                 let (nv, _) = self.operand(n, loc, post);
                 let (t, xt, i) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {et} {xt} = {xv};\n    uint64_t {i}_n = {nv};");
-                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}));");
+                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));");
                 let clone = if is_copy_c(self.p, &ec) {
                     xt.to_string()
                 } else {
@@ -968,7 +968,7 @@ impl FnGen<'_, '_, '_> {
                 // buffer: `v.push(v[0])` in one C assignment could read the freed buffer.
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
-                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et})) = {t};", vals[0]);
+                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et}), _Alignof({et})) = {t};", vals[0]);
                 "0".into()
             }
             B::Clone => {
@@ -1094,7 +1094,7 @@ impl FnGen<'_, '_, '_> {
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
                 let (vv, i, x) = (&vals[0], &vals[1], &vals[2]);
-                let _ = writeln!(self.out, "    lust_vec_insert_at({vv}, {i}, sizeof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};");
+                let _ = writeln!(self.out, "    lust_vec_insert_at({vv}, {i}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};");
                 "0".into()
             }
             B::VecRemove => {
@@ -1719,7 +1719,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 }
                 CTy::Vec(e) => {
                     let et = ctype(e);
-                    let _ = writeln!(body, "  lust_Vec r = lust_vec_with_capacity(p->len, sizeof({et}));");
+                    let _ = writeln!(body, "  lust_Vec r = lust_vec_with_capacity(p->len, sizeof({et}), _Alignof({et}));");
                     let c = clone_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
                     let _ =
                         writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) (({et}*)r.ptr)[i] = {c};\n  r.len = p->len;\n  return r;");

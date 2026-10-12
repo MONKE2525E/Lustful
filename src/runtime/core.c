@@ -1,26 +1,97 @@
+/* tcc predefines __STDC_VERSION__ as 199901L, so glibc hides the C11
+   aligned_alloc declaration; without an explicit declaration tcc truncates
+   its pointer return to int (spike K3-18). Declare both aligned entry
+   points here. */
+void *aligned_alloc(size_t alignment, size_t size);
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+
 void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abort(); })
 
-void *lust_realloc(void *p, uint64_t n) LUST_BODY({
-    void *r = realloc(p, n ? n : 1);
-    if (!r) lust_oom();
-    return r;
+void lust_oom_size(uint64_t n) LUST_BODY({
+    fprintf(stderr, "memory allocation of %llu bytes failed\n", (unsigned long long)n);
+    abort();
 })
+
+/* The `alloc(size, align)` intrinsic family (ARCH 3.2). `align` is a power
+   of two, as Rust's Layout guarantees. Alignment up to 4 MiB works (the
+   ts-rust jemalloc case). A zero size returns a dangling pointer with the
+   requested alignment and allocates nothing; well-formed wrappers never
+   ask for one, but the Vec core uses the same form for empty buffers.
+   Every pointer these return can go to plain free(). */
+void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
+    if (!size) return (void *)(uintptr_t)(align ? align : 1);
+    void *p = 0;
+    if (align <= 16) p = malloc(size);
+    else if (size % align == 0) p = aligned_alloc(align, size);
+    else if (posix_memalign(&p, align, size) != 0) p = 0;
+    if (!p) lust_oom_size(size);
+    return p;
+})
+
+void *lust_alloc_zeroed(uint64_t size, uint64_t align) LUST_BODY({
+    void *p = lust_alloc(size, align);
+    if (size) memset(p, 0, size);
+    return p;
+})
+
+void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
+    (void)align;
+    if (size) free(ptr);
+})
+
+/* realloc(ptr, old_size, align, new_size): the Rust GlobalAlloc argument
+   order with Layout flattened. Always moves when the alignment exceeds
+   what plain realloc promises; the copy is the smaller size. */
+void *lust_realloc(void *ptr, uint64_t old_size, uint64_t align, uint64_t new_size) LUST_BODY({
+    if (!new_size) {
+        lust_dealloc(ptr, old_size, align);
+        return (void *)(uintptr_t)(align ? align : 1);
+    }
+    if (!old_size) return lust_alloc(new_size, align);
+    void *p = lust_alloc(new_size, align);
+    memcpy(p, ptr, old_size < new_size ? old_size : new_size);
+    free(ptr);
+    return p;
+})
+
+/* Byte and raw-pointer intrinsics (ARCH 3.2). ptr_read and ptr_write are
+   unaligned byte copies of `size` bytes: read is (dst, src, size), write
+   is (dst, src, size), matching memcpy argument order. ptr_offset adds a
+   signed byte offset carried in a usize. */
+void lust_memcpy(void *dst, const void *src, uint64_t n) LUST_BODY({ memcpy(dst, src, n); })
+void lust_memmove(void *dst, const void *src, uint64_t n) LUST_BODY({ memmove(dst, src, n); })
+void lust_memset(void *dst, uint32_t byte, uint64_t n) LUST_BODY({ memset(dst, (int)byte, n); })
+int32_t lust_memcmp(const void *a, const void *b, uint64_t n) LUST_BODY({ return memcmp(a, b, n); })
+void lust_ptr_read(void *dst, const void *src, uint64_t size) LUST_BODY({ memcpy(dst, src, size); })
+void lust_ptr_write(void *dst, const void *src, uint64_t size) LUST_BODY({ memcpy(dst, src, size); })
+void *lust_ptr_offset(void *ptr, uint64_t offset) LUST_BODY({ return (char *)ptr + (int64_t)offset; })
 
 /* ---------- Strings ---------- */
 
 lust_String lust_string_new(void) LUST_BODY({ lust_String s = {0, 0, 0}; return s; })
 
+/* String capacity follows the Vec<u8> RawVec rules below: minimum
+   capacity 8, then max(cap * 2, len + extra) on the amortized path and
+   exactly len + extra on the exact path. */
 void lust_string_reserve(lust_String *s, uint64_t extra) LUST_BODY({
-    if (s->len + extra <= s->cap) return;
-    uint64_t cap = s->cap ? s->cap * 2 : 8;
-    while (cap < s->len + extra) cap *= 2;
-    s->ptr = lust_realloc(s->ptr, cap);
+    if (s->cap - s->len >= extra) return;
+    uint64_t cap = s->cap * 2;
+    if (cap < s->len + extra) cap = s->len + extra;
+    if (cap < 8) cap = 8;
+    s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
+    s->cap = cap;
+})
+
+void lust_string_reserve_exact(lust_String *s, uint64_t extra) LUST_BODY({
+    if (s->cap - s->len >= extra) return;
+    uint64_t cap = s->len + extra;
+    s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
     s->cap = cap;
 })
 
 lust_String lust_string_with_capacity(uint64_t n) LUST_BODY({
     lust_String s = {0, 0, 0};
-    if (n) { s.ptr = lust_realloc(0, n); s.cap = n; }
+    if (n) { s.ptr = lust_alloc(n, 1); s.cap = n; }
     return s;
 })
 
@@ -138,22 +209,77 @@ void lust_exit(int32_t code) LUST_BODY({ fflush(stdout); exit(code); })
 
 /* ---------- Vec ---------- */
 
-void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem) LUST_BODY({
-    if (v->len + extra <= v->cap) return;
-    uint64_t cap = v->cap ? v->cap * 2 : 4;
-    while (cap < v->len + extra) cap *= 2;
-    v->ptr = lust_realloc(v->ptr, cap * elem);
-    v->cap = cap;
+/* Erased Vec core (ARCH 3.3): capacity rules copy Rust 1.99 RawVec, so
+   `capacity()` in the typed layer matches rustc byte for byte.
+   - Minimum non-zero capacity: 8 elements when the element size is 1,
+     4 when it is 2 to 1024, 1 above 1024.
+   - Amortized reserve grows to max(cap * 2, len + extra, minimum).
+   - Exact reserve and with_capacity take exactly the requested count.
+   - A zero-sized element never allocates and reports capacity
+     UINT64_MAX (usize::MAX), with a dangling aligned pointer.
+   - A byte size above isize::MAX is a capacity overflow, as in Rust.
+   The typed layer owns the shrink_to length assert; this core clamps
+   the target at len, which is the same end state. */
+void lust_vec_capacity_overflow(void) LUST_BODY({ fputs("capacity overflow\n", stderr); abort(); })
+
+void lust_vec_grow_to(lust_Vec *v, uint64_t new_cap, uint64_t elem, uint64_t align) LUST_BODY({
+    if (new_cap > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();
+    v->ptr = lust_realloc(v->ptr, v->cap * elem, align, new_cap * elem);
+    v->cap = new_cap;
 })
 
-lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem) LUST_BODY({
+void lust_vec_set_zst(lust_Vec *v, uint64_t align) LUST_BODY({
+    v->ptr = (void *)(uintptr_t)(align ? align : 1);
+    v->cap = 18446744073709551615ull;
+})
+
+void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align) LUST_BODY({
+    if (!elem) { lust_vec_set_zst(v, align); return; }
+    if (v->cap - v->len >= extra) return;
+    uint64_t needed = v->len + extra;
+    if (needed < v->len) lust_vec_capacity_overflow();
+    uint64_t cap = v->cap * 2;
+    if (cap < needed) cap = needed;
+    uint64_t min_cap = elem == 1 ? 8 : elem <= 1024 ? 4 : 1;
+    if (cap < min_cap) cap = min_cap;
+    lust_vec_grow_to(v, cap, elem, align);
+})
+
+void lust_vec_reserve_exact(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align) LUST_BODY({
+    if (!elem) { lust_vec_set_zst(v, align); return; }
+    if (v->cap - v->len >= extra) return;
+    uint64_t needed = v->len + extra;
+    if (needed < v->len) lust_vec_capacity_overflow();
+    lust_vec_grow_to(v, needed, elem, align);
+})
+
+lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem, uint64_t align) LUST_BODY({
     lust_Vec v = {0, 0, 0};
-    if (n) { v.ptr = lust_realloc(0, n * elem); v.cap = n; }
+    if (!elem) { lust_vec_set_zst(&v, align); return v; }
+    if (n) {
+        if (n > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();
+        v.ptr = lust_alloc(n * elem, align);
+        v.cap = n;
+    }
     return v;
 })
 
-void *lust_vec_push_slot(lust_Vec *v, uint64_t elem) LUST_BODY({
-    lust_vec_reserve(v, 1, elem);
+void lust_vec_shrink_to(lust_Vec *v, uint64_t min_cap, uint64_t elem, uint64_t align) LUST_BODY({
+    if (!elem) return;
+    uint64_t target = min_cap > v->len ? min_cap : v->len;
+    if (v->cap <= target) return;
+    if (!target) {
+        free(v->ptr);
+        v->ptr = (void *)(uintptr_t)(align ? align : 1);
+        v->cap = 0;
+        return;
+    }
+    v->ptr = lust_realloc(v->ptr, v->cap * elem, align, target * elem);
+    v->cap = target;
+})
+
+void *lust_vec_push_slot(lust_Vec *v, uint64_t elem, uint64_t align) LUST_BODY({
+    lust_vec_reserve(v, 1, elem, align);
     return (char *)v->ptr + (v->len++) * elem;
 })
 
@@ -270,7 +396,7 @@ LUST_ABS(int8_t, i8) LUST_ABS(int16_t, i16) LUST_ABS(int32_t, i32) LUST_ABS(int6
 
 /* ---------- Vec insert/remove ---------- */
 
-void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, lust_loc loc) LUST_BODY({
+void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, lust_loc loc) LUST_BODY({
     if (i > v->len) {
         lust_String s = lust_string_new();
         lust_string_push_cstr(&s, "insertion index (is ");
@@ -280,7 +406,7 @@ void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, lust_loc loc) LU
         lust_string_push_cstr(&s, ")");
         lust_panic(&s, loc);
     }
-    lust_vec_reserve(v, 1, elem);
+    lust_vec_reserve(v, 1, elem, align);
     memmove((char *)v->ptr + (i + 1) * elem, (char *)v->ptr + i * elem, (v->len - i) * elem);
     v->len++;
 })
