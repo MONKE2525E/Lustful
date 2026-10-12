@@ -1,7 +1,7 @@
 // The layout engine (docs/ARCH.md section 4.4). One engine computes size, align,
 // field offsets, enum tag placement, and the niche for every sized type lust
 // accepts. A type outside the supported-shape grammar of 4.4 returns `Err(())`;
-// the caller turns that into L0652. The engine never guesses a size.
+// the caller turns that into the layout reject code. The engine never guesses a size.
 //
 // The core functions work on field `Layout`s, so the standalone gate test can
 // build the real nested Type/TypeData field graph directly (4.4). `layout_of_ty`
