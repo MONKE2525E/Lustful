@@ -135,15 +135,7 @@ pub fn encode(r: &Request) -> String {
     let b = |x: bool| if x { "1" } else { "0" };
     let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
     let emit = r.emit_c.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-    format!(
-        "{cmd}\t{}\t{}\t{}\t{}\t{}\t{emit}\t{}\n",
-        r.file.display(),
-        r.out.display(),
-        b(r.json),
-        b(r.timings),
-        b(r.debug),
-        r.max_errors
-    )
+    format!("{cmd}\t{}\t{}\t{}\t{}\t{}\t{emit}\t{}\n", r.file.display(), r.out.display(), b(r.json), b(r.timings), b(r.debug), r.max_errors)
 }
 
 pub fn decode(line: &str) -> Option<Request> {

@@ -262,9 +262,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 };
                 match &s.kind {
                     // A reborrow of a holder (for example for a method call) also counts as a use.
-                    StmtKind::Assign(_, Rvalue::Ref(_, p)) | StmtKind::Assign(_, Rvalue::Discriminant(p)) => {
-                        uses.push((p.local, s.span))
-                    }
+                    StmtKind::Assign(_, Rvalue::Ref(_, p)) | StmtKind::Assign(_, Rvalue::Discriminant(p)) => uses.push((p.local, s.span)),
                     StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut note),
                     StmtKind::Print { parts, .. } => parts_operands(parts, &mut note),
                     _ => {}

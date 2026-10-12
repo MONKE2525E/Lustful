@@ -43,9 +43,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--timeout" => timeout = parse_secs(it.next().ok_or(USAGE)?)?,
             "--max-errors" => max_errors = it.next().and_then(|v| v.parse().ok()).ok_or(USAGE)?,
             _ if a.starts_with("--timeout=") => timeout = parse_secs(&a["--timeout=".len()..].to_string())?,
-            _ if a.starts_with("--max-errors=") => {
-                max_errors = a["--max-errors=".len()..].parse().map_err(|_| USAGE.to_string())?
-            }
+            _ if a.starts_with("--max-errors=") => max_errors = a["--max-errors=".len()..].parse().map_err(|_| USAGE.to_string())?,
             _ if a.starts_with("--") => return Err(USAGE.into()),
             _ if file.is_none() => file = Some(PathBuf::from(a)),
             _ if filter.is_none() => filter = Some(a.clone()),

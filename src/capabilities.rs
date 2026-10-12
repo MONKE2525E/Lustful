@@ -469,12 +469,9 @@ pub fn run(args: &[String]) -> i32 {
     let codes = explain::codes();
 
     if json {
-        let rejected: Vec<String> = REJECTED
-            .iter()
-            .map(|(f, c)| format!("{{\"feature\":{},\"code\":\"{}\"}}", diag::json_str(f), c))
-            .collect();
-        let code_objs: Vec<String> =
-            codes.iter().map(|(c, t)| format!("{{\"code\":\"{}\",\"title\":{}}}", c, diag::json_str(t))).collect();
+        let rejected: Vec<String> =
+            REJECTED.iter().map(|(f, c)| format!("{{\"feature\":{},\"code\":\"{}\"}}", diag::json_str(f), c)).collect();
+        let code_objs: Vec<String> = codes.iter().map(|(c, t)| format!("{{\"code\":\"{}\",\"title\":{}}}", c, diag::json_str(t))).collect();
         println!(
             "{{\"schema\":1,\"kind\":\"capabilities\",\"commands\":{},\"items\":{},\"types\":{},\"integer_types\":{},\"methods\":{},\"associated_functions\":{},\"functions\":{},\"macros\":{},\"attributes\":{},\"derives\":{},\"operators\":{{\"binary\":{},\"unary\":{}}},\"control_flow\":{},\"patterns\":{},\"expressions\":{},\"rejected\":[{}],\"diagnostics\":{{\"schema\":{},\"codes\":[{}]}}}}",
             json_str_arr(&["check", "build", "run", "test", "explain", "capabilities", "daemon"]),
@@ -499,7 +496,10 @@ pub fn run(args: &[String]) -> i32 {
     } else {
         let list = |name: &str, items: &[String]| println!("{name}: {}", items.join(", "));
         println!("lust capabilities (schema 1)");
-        list("commands", &["check".into(), "build".into(), "run".into(), "test".into(), "explain".into(), "capabilities".into(), "daemon".into()]);
+        list(
+            "commands",
+            &["check".into(), "build".into(), "run".into(), "test".into(), "explain".into(), "capabilities".into(), "daemon".into()],
+        );
         list("items", &ITEMS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         list("types", &TYPES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         list("integer types", &int_types);
