@@ -40,6 +40,9 @@ scripts/difftest.sh
 step "macro corpus"
 scripts/test-macros.sh
 
+step "ts-rust kernels and compat fixtures"
+scripts/test-kernels.sh
+
 if [ -e scripts/test-client.sh ]; then
   step "client tests"
   scripts/test-client.sh
