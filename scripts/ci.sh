@@ -51,6 +51,9 @@ fi
 step "crate fixture tests"
 scripts/test-crates.sh
 
+step "daemon edit scenarios (warm vs cold vs rustc)"
+python3 scripts/test-daemon-scenarios.py
+
 if [ -e scripts/test-slots.py ]; then
   step "slot identity tests"
   python3 scripts/test-slots.py
