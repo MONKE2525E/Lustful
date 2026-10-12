@@ -1,0 +1,75 @@
+== invalid.ts (235 bytes, port form 235 bytes)
+-- pass standard
+tok ConstKeyword(86) 0..5 lb=0 flags=0 text="const" value="const"
+tok Identifier(79) 6..7 lb=0 flags=0 text="a" value="a"
+tok EqualsToken(63) 8..9 lb=0 flags=0 text="=" value="a"
+tok StringLiteral(10) 10..30 lb=0 flags=4 text="\\\"unterminated string" value="unterminated string"
+tok ConstKeyword(86) 31..36 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 37..38 lb=0 flags=0 text="b" value="b"
+tok EqualsToken(63) 39..40 lb=0 flags=0 text="=" value="b"
+tok NumericLiteral(8) 41..43 lb=0 flags=64 text="0x" value="0"
+tok SemicolonToken(26) 43..44 lb=0 flags=0 text=";" value="0"
+tok ConstKeyword(86) 45..50 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 51..52 lb=0 flags=0 text="c" value="c"
+tok EqualsToken(63) 53..54 lb=0 flags=0 text="=" value="c"
+tok NumericLiteral(8) 55..59 lb=0 flags=16896 text="1__2" value="12"
+tok SemicolonToken(26) 59..60 lb=0 flags=0 text=";" value="12"
+tok ConstKeyword(86) 61..66 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 67..68 lb=0 flags=0 text="d" value="d"
+tok EqualsToken(63) 69..70 lb=0 flags=0 text="=" value="d"
+tok NumericLiteral(8) 71..73 lb=0 flags=8192 text="08" value="8"
+tok SemicolonToken(26) 73..74 lb=0 flags=0 text=";" value="8"
+tok ConstKeyword(86) 75..80 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 81..82 lb=0 flags=0 text="e" value="e"
+tok EqualsToken(63) 83..84 lb=0 flags=0 text="=" value="e"
+tok RegularExpressionLiteral(13) 85..104 lb=0 flags=4 text="/unterminated regex" value="/unterminated regex"
+tok ConstKeyword(86) 105..110 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 111..112 lb=0 flags=0 text="f" value="f"
+tok EqualsToken(63) 113..114 lb=0 flags=0 text="=" value="f"
+tok TemplateHead(15) 115..140 lb=0 flags=0 text="`unterminated template ${" value="unterminated template "
+tok Identifier(79) 140..141 lb=0 flags=0 text="x" value="x"
+tok TemplateTail(17) 141..235 lb=0 flags=4 text="}\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n" value="\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n"
+tok EndOfFile(1) 235..235 lb=0 flags=0 text="" value="\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n"
+error TS1002 at 30+0: Unterminated string literal.
+error TS1125 at 43+0: Hexadecimal digit expected.
+error TS6189 at 57+1: Multiple consecutive numeric separators are not permitted.
+error TS1489 at 71+2: Decimals with leading zeros are not allowed.
+error TS1161 at 85+19: Unterminated regular expression literal.
+error TS1160 at 235+0: Unterminated template literal.
+-- pass jsx
+tok ConstKeyword(86) 0..5 lb=0 flags=0 text="const" value="const"
+tok Identifier(79) 6..7 lb=0 flags=0 text="a" value="a"
+tok EqualsToken(63) 8..9 lb=0 flags=0 text="=" value="a"
+tok StringLiteral(10) 10..30 lb=0 flags=4 text="\\\"unterminated string" value="unterminated string"
+tok ConstKeyword(86) 31..36 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 37..38 lb=0 flags=0 text="b" value="b"
+tok EqualsToken(63) 39..40 lb=0 flags=0 text="=" value="b"
+tok NumericLiteral(8) 41..43 lb=0 flags=64 text="0x" value="0"
+tok SemicolonToken(26) 43..44 lb=0 flags=0 text=";" value="0"
+tok ConstKeyword(86) 45..50 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 51..52 lb=0 flags=0 text="c" value="c"
+tok EqualsToken(63) 53..54 lb=0 flags=0 text="=" value="c"
+tok NumericLiteral(8) 55..59 lb=0 flags=16896 text="1__2" value="12"
+tok SemicolonToken(26) 59..60 lb=0 flags=0 text=";" value="12"
+tok ConstKeyword(86) 61..66 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 67..68 lb=0 flags=0 text="d" value="d"
+tok EqualsToken(63) 69..70 lb=0 flags=0 text="=" value="d"
+tok NumericLiteral(8) 71..73 lb=0 flags=8192 text="08" value="8"
+tok SemicolonToken(26) 73..74 lb=0 flags=0 text=";" value="8"
+tok ConstKeyword(86) 75..80 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 81..82 lb=0 flags=0 text="e" value="e"
+tok EqualsToken(63) 83..84 lb=0 flags=0 text="=" value="e"
+tok RegularExpressionLiteral(13) 85..104 lb=0 flags=4 text="/unterminated regex" value="/unterminated regex"
+tok ConstKeyword(86) 105..110 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 111..112 lb=0 flags=0 text="f" value="f"
+tok EqualsToken(63) 113..114 lb=0 flags=0 text="=" value="f"
+tok TemplateHead(15) 115..140 lb=0 flags=0 text="`unterminated template ${" value="unterminated template "
+tok Identifier(79) 140..141 lb=0 flags=0 text="x" value="x"
+tok TemplateTail(17) 141..235 lb=0 flags=4 text="}\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n" value="\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n"
+tok EndOfFile(1) 235..235 lb=0 flags=0 text="" value="\\nconst g = 1.5n;\\nconst h = 0b2;\\n<<<<<<< HEAD\\nconflict side\\n=======\\nother side\\n>>>>>>> branch\\n"
+error TS1002 at 30+0: Unterminated string literal.
+error TS1125 at 43+0: Hexadecimal digit expected.
+error TS6189 at 57+1: Multiple consecutive numeric separators are not permitted.
+error TS1489 at 71+2: Decimals with leading zeros are not allowed.
+error TS1161 at 85+19: Unterminated regular expression literal.
+error TS1160 at 235+0: Unterminated template literal.

@@ -1,0 +1,14 @@
+# Owned kernel fixture: ts-rust Go string helpers (small tier).
+# Standalone on purpose: no dependencies, no workspace. lust-port scans
+# this manifest to record the feature list (see ../README.md).
+[package]
+name = "lust-kernel-gostring"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "gostring-kernel"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

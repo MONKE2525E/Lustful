@@ -1,0 +1,20 @@
+job plain: ok 42
+job str-panic: panicked str:bind failed
+job string-panic: panicked string:file 7 broke
+job nested: ok 5
+poison job panicked: true
+lock poisoned, data kept: [1, 2, 3, 4]
+log: open outer
+log: close outer
+log: open first
+log: open second
+log: vec ready 3
+log: close second
+log: close first
+log: open only
+log: close only
+log: open outer
+log: open inner
+log: close inner
+log: inner recovered: true
+log: close outer

@@ -1,0 +1,11 @@
+none bits=0 empty=true
+f bits=0x2001
+has let=true has const=false
+meets await=true
+after ops bits=0x2010
+default=0
+debug: NodeFlags(0x2)
+sorted: [0, 1, 2]
+ctx &= f -> 0x2000
+variant jsx=1 standard=0 eq=true
+variant debug: LanguageVariant(1)

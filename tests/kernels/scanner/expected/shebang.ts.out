@@ -1,0 +1,15 @@
+== shebang.ts (44 bytes, port form 44 bytes)
+-- pass standard
+tok ConstKeyword(86) 20..25 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 26..38 lb=0 flags=0 text="afterShebang" value="afterShebang"
+tok EqualsToken(63) 39..40 lb=0 flags=0 text="=" value="afterShebang"
+tok NumericLiteral(8) 41..42 lb=0 flags=0 text="1" value="1"
+tok SemicolonToken(26) 42..43 lb=0 flags=0 text=";" value="1"
+tok EndOfFile(1) 44..44 lb=1 flags=1 text="" value="1"
+-- pass jsx
+tok ConstKeyword(86) 20..25 lb=1 flags=1 text="const" value="const"
+tok Identifier(79) 26..38 lb=0 flags=0 text="afterShebang" value="afterShebang"
+tok EqualsToken(63) 39..40 lb=0 flags=0 text="=" value="afterShebang"
+tok NumericLiteral(8) 41..42 lb=0 flags=0 text="1" value="1"
+tok SemicolonToken(26) 42..43 lb=0 flags=0 text=";" value="1"
+tok EndOfFile(1) 44..44 lb=1 flags=1 text="" value="1"

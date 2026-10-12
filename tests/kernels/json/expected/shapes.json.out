@@ -1,0 +1,15 @@
+== shapes.json (142 bytes)
+tok 1: [ BeginArray
+tok 2: " String("escapes \" \\ / \u{8} \u{c} \n \r \t")
+tok 3: " String("unicode é € 𝄞")
+tok 4: " String("")
+tok 5: 0 Number("0")
+tok 6: 0 Number("-0")
+tok 7: 0 Number("1e100")
+tok 8: 0 Number("5e-324")
+tok 9: 0 Number("9007199254740993")
+tok 10: { BeginObject
+tok 11: " String("dup")
+tok 12: 0 Number("1")
+tok 13: error: jsontext: duplicate object member name "dup" within "/8"
+decode error: jsontext: duplicate object member name "dup" within "/8"

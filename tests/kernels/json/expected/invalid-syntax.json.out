@@ -1,0 +1,7 @@
+== invalid-syntax.json (15 bytes)
+tok 1: { BeginObject
+tok 2: " String("a")
+tok 3: 0 Number("1")
+tok 4: " String("b")
+tok 5: error: jsontext: missing value after object name within "/b" after offset 14
+decode error: jsontext: invalid character '}' at start of value within "/b" after offset 14

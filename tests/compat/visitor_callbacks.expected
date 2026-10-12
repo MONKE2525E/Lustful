@@ -1,0 +1,15 @@
+returned root: 5
+hook root
+visit v_root
+visit v_a
+visit v_b
+visit v_c
+visit v_d
+visit v_e
+factory made: 6
+v_root
+  v_a
+    v_b
+    v_c
+  v_d
+    v_e

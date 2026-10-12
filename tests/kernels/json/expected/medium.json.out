@@ -1,0 +1,209 @@
+== medium.json (2177 bytes)
+tok 1: { BeginObject
+tok 2: " String("compilerOptions")
+tok 3: { BeginObject
+tok 4: " String("target")
+tok 5: " String("ESNext")
+tok 6: " String("module")
+tok 7: " String("NodeNext")
+tok 8: " String("moduleResolution")
+tok 9: " String("NodeNext")
+tok 10: " String("noEmit")
+tok 11: t True
+tok 12: " String("allowImportingTsExtensions")
+tok 13: t True
+tok 14: " String("rewriteRelativeImportExtensions")
+tok 15: t True
+tok 16: " String("erasableSyntaxOnly")
+tok 17: t True
+tok 18: " String("verbatimModuleSyntax")
+tok 19: t True
+tok 20: " String("strict")
+tok 21: t True
+tok 22: " String("noUncheckedIndexedAccess")
+tok 23: t True
+tok 24: " String("exactOptionalPropertyTypes")
+tok 25: t True
+tok 26: " String("noImplicitOverride")
+tok 27: t True
+tok 28: " String("useDefineForClassFields")
+tok 29: t True
+tok 30: " String("forceConsistentCasingInFileNames")
+tok 31: t True
+tok 32: " String("skipLibCheck")
+tok 33: t True
+tok 34: " String("allowSyntheticDefaultImports")
+tok 35: t True
+tok 36: " String("esModuleInterop")
+tok 37: t True
+tok 38: " String("resolveJsonModule")
+tok 39: t True
+tok 40: " String("plugins")
+tok 41: [ BeginArray
+tok 42: { BeginObject
+tok 43: " String("name")
+tok 44: " String("@effect/language-service")
+tok 45: " String("namespaceImportPackages")
+tok 46: [ BeginArray
+tok 47: " String("@effect/platform-node")
+tok 48: " String("effect")
+tok 49: ] EndArray
+tok 50: " String("diagnosticSeverity")
+tok 51: { BeginObject
+tok 52: " String("anyUnknownInErrorContext")
+tok 53: " String("error")
+tok 54: " String("unsafeEffectTypeAssertion")
+tok 55: " String("error")
+tok 56: " String("instanceOfSchema")
+tok 57: " String("error")
+tok 58: " String("deterministicKeys")
+tok 59: " String("error")
+tok 60: " String("strictEffectProvide")
+tok 61: " String("off")
+tok 62: " String("missingEffectServiceDependency")
+tok 63: " String("error")
+tok 64: " String("leakingRequirements")
+tok 65: " String("error")
+tok 66: " String("globalErrorInEffectCatch")
+tok 67: " String("error")
+tok 68: " String("globalErrorInEffectFailure")
+tok 69: " String("error")
+tok 70: " String("unknownInEffectCatch")
+tok 71: " String("error")
+tok 72: " String("strictBooleanExpressions")
+tok 73: " String("off")
+tok 74: " String("lazyEffect")
+tok 75: " String("off")
+tok 76: " String("preferSchemaOverJson")
+tok 77: " String("error")
+tok 78: " String("schemaSyncInEffect")
+tok 79: " String("error")
+tok 80: " String("cryptoRandomUUID")
+tok 81: " String("error")
+tok 82: " String("cryptoRandomUUIDInEffect")
+tok 83: " String("error")
+tok 84: " String("nodeBuiltinImport")
+tok 85: " String("error")
+tok 86: " String("globalDate")
+tok 87: " String("error")
+tok 88: " String("globalDateInEffect")
+tok 89: " String("error")
+tok 90: " String("globalConsole")
+tok 91: " String("error")
+tok 92: " String("globalConsoleInEffect")
+tok 93: " String("error")
+tok 94: " String("globalRandom")
+tok 95: " String("error")
+tok 96: " String("globalRandomInEffect")
+tok 97: " String("error")
+tok 98: " String("globalTimers")
+tok 99: " String("error")
+tok 100: " String("globalTimersInEffect")
+tok 101: " String("error")
+tok 102: " String("globalFetch")
+tok 103: " String("error")
+tok 104: " String("globalFetchInEffect")
+tok 105: " String("error")
+tok 106: " String("schemaNumber")
+tok 107: " String("off")
+tok 108: } EndObject
+tok 109: " String("overrides")
+tok 110: [ BeginArray
+tok 111: { BeginObject
+tok 112: " String("include")
+tok 113: [ BeginArray
+tok 114: " String("**/*.test.ts")
+tok 115: " String("**/*.test.tsx")
+tok 116: ] EndArray
+tok 117: " String("options")
+tok 118: { BeginObject
+tok 119: " String("diagnosticSeverity")
+tok 120: { BeginObject
+tok 121: " String("preferSchemaOverJson")
+tok 122: " String("off")
+tok 123: } EndObject
+tok 124: } EndObject
+tok 125: } EndObject
+tok 126: ] EndArray
+tok 127: } EndObject
+tok 128: ] EndArray
+tok 129: } EndObject
+tok 130: } EndObject
+tok 131: error: jsontext: unexpected EOF after offset 2177
+value: Object({"compilerOptions": Object({"target": String("ESNext"), "module": String("NodeNext"), "moduleResolution": String("NodeNext"), "noEmit": Bool(true), "allowImportingTsExtensions": Bool(true), "rewriteRelativeImportExtensions": Bool(true), "erasableSyntaxOnly": Bool(true), "verbatimModuleSyntax": Bool(true), "strict": Bool(true), "noUncheckedIndexedAccess": Bool(true), "exactOptionalPropertyTypes": Bool(true), "noImplicitOverride": Bool(true), "useDefineForClassFields": Bool(true), "forceConsistentCasingInFileNames": Bool(true), "skipLibCheck": Bool(true), "allowSyntheticDefaultImports": Bool(true), "esModuleInterop": Bool(true), "resolveJsonModule": Bool(true), "plugins": Array([Object({"name": String("@effect/language-service"), "namespaceImportPackages": Array([String("@effect/platform-node"), String("effect")]), "diagnosticSeverity": Object({"anyUnknownInErrorContext": String("error"), "unsafeEffectTypeAssertion": String("error"), "instanceOfSchema": String("error"), "deterministicKeys": String("error"), "strictEffectProvide": String("off"), "missingEffectServiceDependency": String("error"), "leakingRequirements": String("error"), "globalErrorInEffectCatch": String("error"), "globalErrorInEffectFailure": String("error"), "unknownInEffectCatch": String("error"), "strictBooleanExpressions": String("off"), "lazyEffect": String("off"), "preferSchemaOverJson": String("error"), "schemaSyncInEffect": String("error"), "cryptoRandomUUID": String("error"), "cryptoRandomUUIDInEffect": String("error"), "nodeBuiltinImport": String("error"), "globalDate": String("error"), "globalDateInEffect": String("error"), "globalConsole": String("error"), "globalConsoleInEffect": String("error"), "globalRandom": String("error"), "globalRandomInEffect": String("error"), "globalTimers": String("error"), "globalTimersInEffect": String("error"), "globalFetch": String("error"), "globalFetchInEffect": String("error"), "schemaNumber": String("off")}), "overrides": Array([Object({"include": Array([String("**/*.test.ts"), String("**/*.test.tsx")]), "options": Object({"diagnosticSeverity": Object({"preferSchemaOverJson": String("off")})})})])})])})})
+compact: {"compilerOptions":{"target":"ESNext","module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"allowImportingTsExtensions":true,"rewriteRelativeImportExtensions":true,"erasableSyntaxOnly":true,"verbatimModuleSyntax":true,"strict":true,"noUncheckedIndexedAccess":true,"exactOptionalPropertyTypes":true,"noImplicitOverride":true,"useDefineForClassFields":true,"forceConsistentCasingInFileNames":true,"skipLibCheck":true,"allowSyntheticDefaultImports":true,"esModuleInterop":true,"resolveJsonModule":true,"plugins":[{"name":"@effect/language-service","namespaceImportPackages":["@effect/platform-node","effect"],"diagnosticSeverity":{"anyUnknownInErrorContext":"error","unsafeEffectTypeAssertion":"error","instanceOfSchema":"error","deterministicKeys":"error","strictEffectProvide":"off","missingEffectServiceDependency":"error","leakingRequirements":"error","globalErrorInEffectCatch":"error","globalErrorInEffectFailure":"error","unknownInEffectCatch":"error","strictBooleanExpressions":"off","lazyEffect":"off","preferSchemaOverJson":"error","schemaSyncInEffect":"error","cryptoRandomUUID":"error","cryptoRandomUUIDInEffect":"error","nodeBuiltinImport":"error","globalDate":"error","globalDateInEffect":"error","globalConsole":"error","globalConsoleInEffect":"error","globalRandom":"error","globalRandomInEffect":"error","globalTimers":"error","globalTimersInEffect":"error","globalFetch":"error","globalFetchInEffect":"error","schemaNumber":"off"},"overrides":[{"include":["**/*.test.ts","**/*.test.tsx"],"options":{"diagnosticSeverity":{"preferSchemaOverJson":"off"}}}]}]}}
+indent:
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "namespaceImportPackages": [
+          "@effect/platform-node",
+          "effect"
+        ],
+        "diagnosticSeverity": {
+          "anyUnknownInErrorContext": "error",
+          "unsafeEffectTypeAssertion": "error",
+          "instanceOfSchema": "error",
+          "deterministicKeys": "error",
+          "strictEffectProvide": "off",
+          "missingEffectServiceDependency": "error",
+          "leakingRequirements": "error",
+          "globalErrorInEffectCatch": "error",
+          "globalErrorInEffectFailure": "error",
+          "unknownInEffectCatch": "error",
+          "strictBooleanExpressions": "off",
+          "lazyEffect": "off",
+          "preferSchemaOverJson": "error",
+          "schemaSyncInEffect": "error",
+          "cryptoRandomUUID": "error",
+          "cryptoRandomUUIDInEffect": "error",
+          "nodeBuiltinImport": "error",
+          "globalDate": "error",
+          "globalDateInEffect": "error",
+          "globalConsole": "error",
+          "globalConsoleInEffect": "error",
+          "globalRandom": "error",
+          "globalRandomInEffect": "error",
+          "globalTimers": "error",
+          "globalTimersInEffect": "error",
+          "globalFetch": "error",
+          "globalFetchInEffect": "error",
+          "schemaNumber": "off"
+        },
+        "overrides": [
+          {
+            "include": [
+              "**/*.test.ts",
+              "**/*.test.tsx"
+            ],
+            "options": {
+              "diagnosticSeverity": {
+                "preferSchemaOverJson": "off"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

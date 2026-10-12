@@ -1,0 +1,8 @@
+start refs: 1
+same dir: ptr_eq=true refs=2
+moved dir: ptr_eq=false dir=node_modules/preact/compat exists=true contents=Some("{\"name\":\"preact\"}")
+original unchanged: node_modules/preact
+filled: ptr_eq=false contents=Some("{\"name\":\"preact/compat\"}")
+refilled same: ptr_eq=true
+cache entry node_modules/preact -> same=true
+cache entry node_modules/preact/compat -> same=false

@@ -1,0 +1,67 @@
+== small.json (141 bytes)
+tok 1: { BeginObject
+tok 2: " String("name")
+tok 3: " String("lust")
+tok 4: " String("count")
+tok 5: 0 Number("42")
+tok 6: " String("ratio")
+tok 7: 0 Number("-1.5e3")
+tok 8: " String("ok")
+tok 9: t True
+tok 10: " String("none")
+tok 11: n Null
+tok 12: " String("list")
+tok 13: [ BeginArray
+tok 14: 0 Number("1")
+tok 15: " String("two")
+tok 16: f False
+tok 17: [ BeginArray
+tok 18: ] EndArray
+tok 19: { BeginObject
+tok 20: } EndObject
+tok 21: ] EndArray
+tok 22: " String("nested")
+tok 23: { BeginObject
+tok 24: " String("a")
+tok 25: { BeginObject
+tok 26: " String("b")
+tok 27: { BeginObject
+tok 28: " String("c")
+tok 29: [ BeginArray
+tok 30: 0 Number("0.1")
+tok 31: 0 Number("2e-7")
+tok 32: 0 Number("123456789")
+tok 33: ] EndArray
+tok 34: } EndObject
+tok 35: } EndObject
+tok 36: } EndObject
+tok 37: } EndObject
+tok 38: error: jsontext: unexpected EOF after offset 141
+value: Object({"name": String("lust"), "count": Number(42.0), "ratio": Number(-1500.0), "ok": Bool(true), "none": Null, "list": Array([Number(1.0), String("two"), Bool(false), Array([]), Object({})]), "nested": Object({"a": Object({"b": Object({"c": Array([Number(0.1), Number(2e-7), Number(123456789.0)])})})})})
+compact: {"name":"lust","count":42,"ratio":-1500,"ok":true,"none":null,"list":[1,"two",false,[],{}],"nested":{"a":{"b":{"c":[0.1,2e-7,123456789]}}}}
+indent:
+{
+  "name": "lust",
+  "count": 42,
+  "ratio": -1500,
+  "ok": true,
+  "none": null,
+  "list": [
+    1,
+    "two",
+    false,
+    [],
+    {}
+  ],
+  "nested": {
+    "a": {
+      "b": {
+        "c": [
+          0.1,
+          2e-7,
+          123456789
+        ]
+      }
+    }
+  }
+}
