@@ -1498,3 +1498,4 @@ double lust_f32_to_f64(float v) {
                                    (mant & (((uint64_t)1 << 52) - 1)));
     }
 }
+

@@ -1594,7 +1594,7 @@ fn main() {}
                 if let Terminator::Call { target, unwind, .. } = &b.term {
                     assert_eq!(*unwind, None, "no unwind edges exist yet");
                     match target {
-                        CallTarget::Fn(_) => fn_calls += 1,
+                        CallTarget::Fn(_) | CallTarget::Indirect(_) => fn_calls += 1,
                         CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => builtin_calls += 1,
                     }
                 }

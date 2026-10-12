@@ -264,7 +264,8 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
         | Rvalue::SliceOf(_)
         | Rvalue::LenOf(_)
         | Rvalue::StaticLoad(_)
-        | Rvalue::StaticRef(_) => {}
+        | Rvalue::StaticRef(_)
+        | Rvalue::FnValue(..) => {}
         Rvalue::Subslice { lo, hi, .. } => {
             f(lo);
             if let Some(h) = hi {
@@ -412,7 +413,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             };
             match &b.term {
                 Terminator::If(o, ..) | Terminator::Switch(o, ..) => note(o),
-                Terminator::Call { args, .. } => args.iter().for_each(&mut note),
+                Terminator::Call { target, args, .. } => {
+                    if let CallTarget::Indirect(callee) = target {
+                        note(&Operand::Copy(Place::local(*callee)));
+                    }
+                    args.iter().for_each(&mut note);
+                }
                 Terminator::Panic(parts) => parts_operands(parts, &mut note),
                 _ => {}
             }
@@ -529,11 +535,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
         match t {
             Terminator::If(o, ..) | Terminator::Switch(o, ..) => uses(live, o),
-            Terminator::Call { args, dest, .. } => {
+            Terminator::Call { target, args, dest, .. } => {
                 if dest.proj.is_empty() {
                     live.remove(dest.local as usize);
                 } else {
                     Self::uses_place(live, dest);
+                }
+                if let CallTarget::Indirect(callee) = target {
+                    live.insert(*callee as usize);
                 }
                 for o in args {
                     uses(live, o);
@@ -890,6 +899,22 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 if let Some(i) = info.ret_borrows_from {
                     self.holds_of(&args[i], st, &mut new_holds);
                     self.origins_of(&args[i], st, &mut new_origins);
+                }
+                self.flow_into_mut_args(args, st, span);
+            }
+            CallTarget::Indirect(callee) => {
+                // The callee signature is not a fn the checker can
+                // summarize yet, so treat the call conservatively: the
+                // callee local is read, a reference result may hold any
+                // argument's loans, and loans flow into &mut args. The
+                // IR owner refines this when fn pointers lower.
+                self.operand(&Operand::Copy(Place::local(callee)), span, st, &live);
+                let ty = self.dest_ty(dest);
+                if contains_ref(&self.body.tys, ty) {
+                    for o in args {
+                        self.holds_of(o, st, &mut new_holds);
+                        self.origins_of(o, st, &mut new_origins);
+                    }
                 }
                 self.flow_into_mut_args(args, st, span);
             }

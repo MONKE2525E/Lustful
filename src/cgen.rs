@@ -985,6 +985,7 @@ impl FnGen<'_, '_, '_> {
             }
             CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
+            CallTarget::Indirect(_) => unreachable!("cgen: indirect calls land with fn pointer codegen"),
         }
     }
 
@@ -1092,6 +1093,7 @@ impl FnGen<'_, '_, '_> {
                 match (op, &at) {
                     (UnOp::Neg, CTy::Float(_)) => format!("(-{a})"),
                     (UnOp::Neg, CTy::Int(i)) => format!("lust_neg_{}({a}, {loc})", int_fn(*i)),
+                    (UnOp::Neg, CTy::Float(_)) => format!("(-{a})"),
                     (UnOp::Not, CTy::Bool) => format!("(!{a})"),
                     (UnOp::Not, CTy::Int(i)) if is128(*i) => format!("lust_{}_not({a})", int_fn(*i)),
                     (UnOp::Not, CTy::Int(i)) => format!("(({})~{a})", int_c(*i)),
@@ -1141,6 +1143,31 @@ impl FnGen<'_, '_, '_> {
                             format!("lust_{}_from_{}({a})", int_fn(*ti), int_fn(*fi))
                         }
                     }
+                    // Float casts go through the runtime's bit-level
+                    // helpers, so rounding and saturation match Rust
+                    // no matter what the C compiler would do.
+                    (CTy::Int(fi), CTy::Float(tf)) if is128(*fi) => {
+                        let how = if fi.signed() { "i128" } else { "u128" };
+                        format!("lust_{how}_to_{}(({a}).lo, ({a}).hi)", tf.name())
+                    }
+                    (CTy::Float(ff), CTy::Float(tf)) => {
+                        if ff == tf { a } else { format!("lust_{}_to_{}({a})", ff.name(), tf.name()) }
+                    }
+                    (CTy::Float(ff), CTy::Int(ti)) if is128(*ti) => {
+                        let t = self.tmp();
+                        let _ = writeln!(self.out, "    {} {t}; lust_{}_to_{}({a}, &{t}.lo, &{t}.hi);", int_c(*ti), ff.name(), int_fn(*ti));
+                        t
+                    }
+                    (CTy::Float(ff), CTy::Int(ti)) => format!("lust_{}_to_{}({a})", ff.name(), int_fn(*ti)),
+                    (CTy::Int(fi), CTy::Float(tf)) => {
+                        if fi.signed() {
+                            format!("lust_i64_to_{}((int64_t)({a}))", tf.name())
+                        } else {
+                            format!("lust_u64_to_{}((uint64_t)({a}))", tf.name())
+                        }
+                    }
+                    (CTy::Char, CTy::Float(tf)) => format!("lust_u64_to_{}((uint64_t)({a}))", tf.name()),
+                    (CTy::Bool, CTy::Float(tf)) => format!("lust_u64_to_{}((uint64_t)({a}))", tf.name()),
                     (CTy::Int(fi), _) if is128(*fi) => format!("(({})(({a}).lo))", ctype(&to)),
                     (CTy::Adt(aid), CTy::Int(ti)) => {
                         // A fieldless enum cast to an integer gives its
@@ -1332,6 +1359,7 @@ impl FnGen<'_, '_, '_> {
                     _ => format!("({e})->len"),
                 }
             }
+            Rvalue::FnValue(..) => unreachable!("cgen: fn values land with fn pointer codegen"),
         }
     }
 
@@ -1435,7 +1463,7 @@ impl FnGen<'_, '_, '_> {
         match t {
             CTy::Unit => "1".into(),
             CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
-            CTy::Bool | CTy::Char | CTy::Int(_) => format!("(*{a} == *{b})"),
+            CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => format!("(*{a} == *{b})"),
             _ => {
                 self.want(Glue::Eq, t);
                 format!("eq_{}({a}, {b})", mangle(t))
@@ -2937,6 +2965,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     CTy::Int(i) if is128(*i) => format!("lust_fmt_{}(out, {e});", int_fn(*i)),
                     CTy::Int(i) if i.signed() => format!("lust_fmt_i64(out, (int64_t){e});"),
                     CTy::Int(_) => format!("lust_fmt_u64(out, (uint64_t){e});"),
+                    CTy::Float(f) => format!("lust_fmt_{}_debug(out, {e});", f.name()),
                     CTy::Bool => format!("lust_fmt_bool(out, {e});"),
                     CTy::Char => format!("lust_fmt_char_debug(out, {e});"),
                     CTy::String => format!("lust_fmt_str_debug(out, lust_string_as_str(&{e}));"),
@@ -3080,6 +3109,7 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
         Rvalue::ArrayRepeat(_, o, _) => op_has(o),
         Rvalue::Opt(_, o) => o.as_ref().is_some_and(op_has),
         Rvalue::Format(parts) => parts_has(parts),
+        Rvalue::FnValue(..) => false,
     }
 }
 

@@ -122,6 +122,11 @@ pub enum Rvalue {
     StaticLoad(u32),
     /// The address of a static item, by index into `Program::statics`.
     StaticRef(u32),
+    /// A function item used as a value, of the given result type: the
+    /// zero-sized `FnDef`, or `FnPtr` when the use coerces it (codegen
+    /// then yields the slot trampoline address). Proposed by W-CGEN
+    /// for W-CORELANG's fn-pointer lowering.
+    FnValue(LocalDefId, Ty),
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +161,10 @@ pub enum CallTarget {
     /// for the whole family; codegen emits the row's C symbol with the
     /// row's signature.
     Intrinsic(u32),
+    /// A call through the function pointer value held in this local.
+    /// The local's type is the `FnPtr` signature; `args` are the call
+    /// arguments only. Proposed by W-CGEN for W-CORELANG.
+    Indirect(Local),
 }
 
 #[derive(Clone, Debug)]
