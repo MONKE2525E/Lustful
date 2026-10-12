@@ -1831,7 +1831,7 @@ fn eval_assoc_consts<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             };
             owners.push((owner, impl_def, c.name));
             pending.push((
-                PendingConst { name: Some(c.name), stmt_idx: None, ty, expr: value, span: c.span, is_static: None, static_idx: 0 },
+                PendingConst { name: Some(c.name), ty, expr: value, span: c.span, is_static: None, static_idx: 0 },
                 PendingState::Todo,
             ));
         }

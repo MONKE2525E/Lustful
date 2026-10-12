@@ -282,8 +282,8 @@ pub enum PatRes {
     /// A const item used as a pattern, by index into `Program::consts`.
     ConstItem(u32),
     /// A primitive associated const used as a pattern (`i64::MAX`):
-    /// the value and its integer type.
-    PrimConst(i128, IntTy),
+    /// its value (the pattern type carries the width).
+    PrimConst(i128),
     Binding {
         local: u32,
         mode: BindMode,
@@ -5540,7 +5540,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 let cv = crate::ty::consteval::ConstValue::Int(val);
                 if self.check_const_value(ct, &cv, t, span, in_match) {
-                    self.out.pat_res[pi] = PatRes::PrimConst(val, if item == "BITS" { IntTy::U32 } else { it });
+                    self.out.pat_res[pi] = PatRes::PrimConst(val);
                 }
                 return true;
             }
