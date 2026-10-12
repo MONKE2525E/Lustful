@@ -2,7 +2,7 @@
 // The interner is sharded by hash, so many threads can lex and parse at once.
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// FxHash (from rustc). Much faster than SipHash for short keys; no DoS resistance needed here.
 #[derive(Default, Clone, Copy)]
@@ -77,21 +77,37 @@ fn is_dep_prefix(seg: &str) -> bool {
 
 const SHARD_BITS: u32 = 6;
 const SHARDS: usize = 1 << SHARD_BITS;
+/// Entries in a shard's first bucket; bucket `b` holds `FIRST << b` entries.
+const FIRST: usize = 64;
+const BUCKETS: usize = 32;
 
+/// One shard. `map` (behind the lock) finds a string's index on intern.
+/// `buckets` hold the strings by index for `get`, which takes no lock:
+/// a bucket and each entry in it are written once, under the lock and
+/// before their index is handed out, and never move or change after.
+/// Checkers on many threads call `get` constantly, so a lock there
+/// serialized them.
 #[derive(Default)]
 struct Shard {
-    map: FxMap<Box<str>, u32>,
-    strs: Vec<Box<str>>,
+    map: Mutex<FxMap<Box<str>, u32>>,
+    buckets: [OnceLock<Box<[OnceLock<Box<str>>]>>; BUCKETS],
+}
+
+/// The bucket and offset of entry `i` in a shard: bucket `b` starts at
+/// `FIRST * (2^b - 1)`.
+fn slot(i: usize) -> (usize, usize) {
+    let b = (usize::BITS - 1 - (i / FIRST + 1).leading_zeros()) as usize;
+    (b, i - FIRST * ((1 << b) - 1))
 }
 
 /// A `Sym` packs `(index in shard << SHARD_BITS) | shard`.
 pub struct Interner {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<Shard>,
 }
 
 impl Default for Interner {
     fn default() -> Interner {
-        Interner { shards: (0..SHARDS).map(|_| Mutex::default()).collect() }
+        Interner { shards: (0..SHARDS).map(|_| Shard::default()).collect() }
     }
 }
 
@@ -100,22 +116,47 @@ impl Interner {
         let mut h = FxHasher::default();
         s.hash(&mut h);
         let shard = (h.finish() >> 58) as usize & (SHARDS - 1);
-        let mut sh = self.shards[shard].lock().unwrap();
-        if let Some(&i) = sh.map.get(s) {
+        let sh = &self.shards[shard];
+        let mut map = sh.map.lock().unwrap();
+        if let Some(&i) = map.get(s) {
             return Sym((i << SHARD_BITS) | shard as u32);
         }
-        let i = sh.strs.len() as u32;
-        sh.strs.push(s.into());
-        sh.map.insert(s.into(), i);
-        Sym((i << SHARD_BITS) | shard as u32)
+        let i = map.len();
+        let (b, off) = slot(i);
+        let bucket = sh.buckets[b].get_or_init(|| (0..FIRST << b).map(|_| OnceLock::new()).collect());
+        let _ = bucket[off].set(s.into());
+        map.insert(s.into(), i as u32);
+        Sym(((i as u32) << SHARD_BITS) | shard as u32)
     }
 
     pub fn get(&self, sym: Sym) -> &str {
-        let sh = self.shards[(sym.0 as usize) & (SHARDS - 1)].lock().unwrap();
-        let s: *const str = &*sh.strs[(sym.0 >> SHARD_BITS) as usize];
-        // SAFETY: strings are boxed and never removed or mutated, so the heap data stays valid
-        // after the lock guard drops, for as long as the interner lives.
-        unsafe { &*s }
+        let (b, off) = slot((sym.0 >> SHARD_BITS) as usize);
+        self.shards[(sym.0 as usize) & (SHARDS - 1)].buckets[b]
+            .get()
+            .and_then(|bucket| bucket[off].get())
+            .expect("a Sym from this interner")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every interned string reads back through `get` across bucket edges,
+    /// and interning it again returns the same symbol.
+    #[test]
+    fn get_reads_back_across_buckets() {
+        assert_eq!(slot(0), (0, 0));
+        assert_eq!(slot(63), (0, 63));
+        assert_eq!(slot(64), (1, 0));
+        assert_eq!(slot(191), (1, 127));
+        assert_eq!(slot(192), (2, 0));
+        let i = Interner::default();
+        let syms: Vec<Sym> = (0..20_000).map(|n| i.intern(&format!("name{n}"))).collect();
+        for (n, &s) in syms.iter().enumerate() {
+            assert_eq!(i.get(s), format!("name{n}"));
+            assert_eq!(i.intern(&format!("name{n}")), s);
+        }
     }
 }
 
