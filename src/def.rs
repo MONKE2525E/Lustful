@@ -99,6 +99,11 @@ pub enum DefKind {
     Impl = 3,
     Adt = 4,
     Macro = 5,
+    // Added by W-RESOLVE for the item kinds resolution binds (section 1.3).
+    Const = 6,
+    Static = 7,
+    TypeAlias = 8,
+    Module = 9,
 }
 
 impl DefKind {
@@ -110,6 +115,10 @@ impl DefKind {
             DefKind::Impl => "impl",
             DefKind::Adt => "adt",
             DefKind::Macro => "macro",
+            DefKind::Const => "const",
+            DefKind::Static => "static",
+            DefKind::TypeAlias => "type",
+            DefKind::Module => "mod",
         }
     }
 }

@@ -93,14 +93,16 @@ struct ParsedAttrs {
     attrs: Vec<Attr>,
 }
 
+/// Attributes the resolver reads (docs/ARCH.md section 1.6): parsed and
+/// recorded like `derive`, then honored by cfg stripping and module
+/// loading. `cfg!` the macro is a separate form and stays with W-MACRO.
+const RESOLVE_ATTRS: &[&str] = &["cfg", "cfg_attr", "path", "macro_use", "macro_export", "no_implicit_prelude"];
+
 /// Rust attribute names lust knows by name but does not handle yet
 /// (docs/ARCH.md section 1.6 lists what each later package must honor).
 /// These reject with L0522; any other name rejects with L0402.
 const KNOWN_ATTRS: &[&str] = &[
-    "cfg",
-    "cfg_attr",
     "repr",
-    "path",
     "inline",
     "cold",
     "must_use",
@@ -108,9 +110,6 @@ const KNOWN_ATTRS: &[&str] = &[
     "non_exhaustive",
     "deprecated",
     "doc",
-    "macro_use",
-    "macro_export",
-    "no_implicit_prelude",
     "bench",
     "ignore",
     "should_panic",
@@ -680,6 +679,7 @@ impl<'a> Parser<'a> {
                 _ if first == k.test && !inner => out.is_test = true,
                 _ if name_text == "repr" => {}
                 _ if first == k.allow || first == k.warn || first == k.deny => {}
+                _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
                     return Err(Diag::new(
                         C_ATTR,
@@ -707,6 +707,12 @@ impl<'a> Parser<'a> {
         let parsed = self.attributes()?;
         let derives = parsed.derives.clone();
         let vis = self.vis()?;
+        // A `const` item (`const NAME: Ty = ...;`), told apart from a
+        // `const fn` qualifier by the name and colon after it.
+        if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
+            let kind = ItemKind::Const(self.const_def()?);
+            return Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }));
+        }
         // Function and impl qualifiers, in any written order: `const`,
         // `async`, `unsafe`, and `extern "abi"`. A lone `const` with no `fn`
         // after it is a const item, handled in the match below.
@@ -771,12 +777,12 @@ impl<'a> Parser<'a> {
                 def.is_unsafe = qual.is_unsafe;
                 ItemKind::Trait(def)
             }
-            Tok::Mod => return Err(not_yet(C_MOD, start, "modules")),
-            Tok::Static => return Err(not_yet(C_CONST, start, "const and static items")),
-            Tok::Type => return Err(not_yet(C_TY, start, "type aliases")),
+            Tok::Mod if !has_qual => ItemKind::Mod(self.mod_def()?),
+            Tok::Static if !has_qual => ItemKind::Static(self.static_def()?),
+            Tok::Type if !has_qual => ItemKind::Type(self.type_alias_def()?),
             // `extern { .. }` and `extern crate ..;`: the qualifier loop ate `extern`.
             Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
-            Tok::Crate if qual.abi.is_some() => return Err(not_yet(C_MOD, start, "`extern crate` items")),
+            Tok::Crate if qual.abi.is_some() => ItemKind::ExternCrate(self.extern_crate_def()?),
             _ if qual.is_const => return Err(not_yet(C_CONST, start, "const and static items")),
             _ if qual.is_async => return Err(async_error(start)),
             _ if qual.is_unsafe => return Err(unsafe_error(start)),
@@ -868,6 +874,107 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(UseTree { leading_colon, prefix, kind: UseKind::Simple { rename }, span: start.to(self.prev_span()) })
+    }
+
+    /// A `mod` item: `mod name;` (a file module; the resolver finds the
+    /// file) or `mod name { ... }` (inline items parsed in place).
+    fn mod_def(&mut self) -> PResult<ModDef> {
+        let start = self.expect(Tok::Mod, "`mod`")?;
+        let (name, name_span) = self.ident()?;
+        if self.eat(Tok::Semi) {
+            return Ok(ModDef { name, name_span, body: None, span: start.to(self.prev_span()) });
+        }
+        self.expect(Tok::LBrace, "`{` or `;`")?;
+        let mut items = Vec::new();
+        while self.peek() != Tok::RBrace {
+            if self.peek() == Tok::Eof {
+                return Err(syntax(self.span(), "expected `}`, found end of file"));
+            }
+            let before = self.pos;
+            if let Some(item) = self.nest(|p| p.item())? {
+                items.push(item);
+            }
+            if self.pos == before {
+                return Err(syntax(self.span(), format!("expected an item, found {}", tok_name(self.peek()))));
+            }
+        }
+        self.bump();
+        Ok(ModDef { name, name_span, body: Some(items), span: start.to(self.prev_span()) })
+    }
+
+    /// A `const` item: `const NAME: Ty = value;` (`_` for an unnamed const).
+    fn const_def(&mut self) -> PResult<ConstDef> {
+        let start = self.expect(Tok::Const, "`const`")?;
+        let (name, name_span) = if self.peek() == Tok::Underscore {
+            (None, self.bump().span)
+        } else {
+            let (n, s) = self.ident()?;
+            (Some(n), s)
+        };
+        self.expect(Tok::Colon, "`:`")?;
+        let ty = self.ty()?;
+        let value = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(ConstDef { name, name_span, ty, value, span: start.to(self.prev_span()) })
+    }
+
+    /// A `static` item: `static [mut] NAME: Ty = value;`.
+    fn static_def(&mut self) -> PResult<StaticDef> {
+        let start = self.expect(Tok::Static, "`static`")?;
+        let mutable = self.eat(Tok::Mut);
+        let (name, name_span) = self.ident()?;
+        self.expect(Tok::Colon, "`:`")?;
+        let ty = self.ty()?;
+        let value = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(StaticDef { name, name_span, mutable, ty, value, span: start.to(self.prev_span()) })
+    }
+
+    /// A `type` alias: `type Name = Target;`. Generic aliases reject with
+    /// the generics code, like generic structs today.
+    fn type_alias_def(&mut self) -> PResult<TypeAliasDef> {
+        let start = self.expect(Tok::Type, "`type`")?;
+        let (name, name_span) = self.ident()?;
+        self.no_generics("type aliases")?;
+        if self.peek() == Tok::Where {
+            return Err(self.reject(C_TRAIT, "where clauses"));
+        }
+        self.expect(Tok::Eq, "`=`")?;
+        let ty = self.ty()?;
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(TypeAliasDef {
+            name,
+            name_span,
+            generics: Generics::default(),
+            where_clause: WhereClause::default(),
+            ty,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// An `extern crate` item, after the qualifier loop ate `extern`:
+    /// `crate name;` or `crate name as rename;` (`crate self as name;`
+    /// for the crate itself).
+    fn extern_crate_def(&mut self) -> PResult<ExternCrateDef> {
+        let start = self.expect(Tok::Crate, "`crate`")?;
+        let (name, name_span) = if self.peek() == Tok::SelfLower {
+            let s = self.bump().span;
+            (self.known.self_value, s)
+        } else {
+            self.ident()?
+        };
+        let rename = if self.eat(Tok::As) {
+            Some(if self.peek() == Tok::Underscore {
+                self.bump();
+                self.interner.intern("_")
+            } else {
+                self.ident()?.0
+            })
+        } else {
+            None
+        };
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(ExternCrateDef { name, name_span, rename, span: start.to(self.prev_span()) })
     }
 
     /// The children of a use group, after its `{`.
@@ -1692,6 +1799,21 @@ impl<'a> Parser<'a> {
             // Statement attributes: parsed here so a `#[cfg]` on a statement
             // gets the attribute code; lint attributes are kept on `let`s.
             let stmt_attrs = self.part_attributes()?;
+            // A function-local `use` is an item statement; the resolver
+            // binds it for the rest of the block (docs/ARCH.md 1.3).
+            if self.peek() == Tok::Use {
+                let s = self.span();
+                let tree_use = self.use_def()?;
+                let idx = self.ast.stmt_items.len() as u32;
+                self.ast.stmt_items.push(Item {
+                    vis: Vis::Private,
+                    attrs: stmt_attrs.attrs,
+                    kind: ItemKind::Use(tree_use),
+                    span: s.to(self.prev_span()),
+                });
+                stmts.push(Stmt::Item(idx));
+                continue;
+            }
             if matches!(
                 self.peek(),
                 Tok::Fn
