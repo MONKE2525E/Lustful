@@ -1,0 +1,8 @@
+# Two bins in one package. fixture.txt selects the src/bin target, so the
+# runner must build `extra`, not the package bin from src/main.rs.
+[package]
+name = "extra-bin"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -1,0 +1,8 @@
+# The plain case: one package, one bin, no fixture.txt selections.
+# The empty [workspace] keeps the fixture independent of the lust package.
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
