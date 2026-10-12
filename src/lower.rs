@@ -670,21 +670,25 @@ impl<'p, 'a> Lower<'p, 'a> {
             None => Place::local(self.temp(ty)),
         };
         if matches!(op, BinOp::And | BinOp::Or) {
-            // Short circuit.
-            self.expr_into(lhs, Some(&out));
+            // Short circuit. Both sides write a mutable temporary, and the destination is
+            // written once at the end. Writing the destination twice would make the borrow
+            // checker see `let hot = a && b;` as two assignments to an immutable binding.
+            let tmp = Place::local(self.temp(ty));
+            self.expr_into(lhs, Some(&tmp));
             let (rhs_bb, end) = (self.new_block(), self.new_block());
             let b = &mut self.body.blocks[self.cur.0 as usize];
             b.term = if op == BinOp::And {
-                Terminator::If(Operand::Copy(out.clone()), rhs_bb, end)
+                Terminator::If(Operand::Copy(tmp.clone()), rhs_bb, end)
             } else {
-                Terminator::If(Operand::Copy(out.clone()), end, rhs_bb)
+                Terminator::If(Operand::Copy(tmp.clone()), end, rhs_bb)
             };
             b.term_span = span;
             self.cur = rhs_bb;
             self.scopes.push(Vec::new());
-            self.expr_into(rhs, Some(&out));
+            self.expr_into(rhs, Some(&tmp));
             self.pop_scope(span);
             self.goto(end, span);
+            self.assign(out, Rvalue::Use(Operand::Copy(tmp)), span);
             return;
         }
         let (ld, rd) = match self.ck.res(e) {
