@@ -67,11 +67,12 @@ for i in range(cases):
         write(i, bytes(data))
 PY
 
-# Run from the temp dir so no lust daemon for this repo answers instead of a cold check.
+# Run from the temp dir so no lust daemon for this repo answers instead of a cold check,
+# and do not autostart a daemon for the temp dir either.
 export LUST_BIN="$lust" FAILDIR="$faildir"
 run_one() {
   f="$1"
-  timeout 2 "$LUST_BIN" check "$f" >/dev/null 2>&1
+  LUST_NO_DAEMON=1 timeout 2 "$LUST_BIN" check "$f" >/dev/null 2>&1
   code=$?
   if [ "$code" -eq 124 ] || [ "$code" -eq 101 ] || [ "$code" -gt 128 ]; then
     cp "$f" "$FAILDIR/"
