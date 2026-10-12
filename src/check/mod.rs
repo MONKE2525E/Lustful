@@ -2572,6 +2572,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
     ) -> (Vec<Ty>, Ty, Vec<GenericArg>) {
         let p = self.p;
         let info = p.fn_info(template);
+        // More written generic arguments than the item has
+        // parameters is an arity error (rustc E0107); `explicit`
+        // is aligned to `generics.params` at every call site.
+        if explicit.len() > generics.params.len() {
+            self.err(
+                "L0107",
+                span,
+                format!("too many generic arguments: this item takes {}", generics.params.len()),
+                "Remove the extra arguments.",
+            );
+        }
         let mut args: Vec<GenericArg> = Vec::with_capacity(generics.params.len());
         for (i, param) in generics.params.iter().enumerate() {
             let given = explicit.get(i).copied().flatten();

@@ -1932,6 +1932,17 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let mut combined = generics.clone();
             combined.params.extend(own_generics.params.iter().cloned());
             combined.predicates.extend(own_generics.predicates.iter().copied());
+            // No shadowing of the trait's parameters (E0403).
+            for (i, param) in combined.params.iter().enumerate() {
+                if combined.params[..i].iter().any(|q| q.name == param.name) {
+                    errs.push(Diag::new(
+                        "L0106",
+                        param.span,
+                        format!("the parameter `{}` is already used for a parameter of an enclosing item", p.name(param.name)),
+                        "Rename one of the parameters.",
+                    ));
+                }
+            }
             let mut mscope = scope.clone();
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
@@ -2195,7 +2206,7 @@ pub fn finish_trait_impl(
 
 /// True when const parameter `idx` occurs in a type (in an
 /// array length or a const argument).
-fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
+pub fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
     let in_const = |c: ConstId| matches!(tys.const_kind(c), ConstKind::Param(p) if p == idx);
     let in_args = |a: ArgsId| {
         tys.args(a).iter().any(|g| match g {
@@ -2420,14 +2431,83 @@ fn validate_method_sig(
         ));
         return;
     }
+    // The method's own generics must line up with the trait's:
+    // the same number and kinds (rustc E0049), no `impl Trait`
+    // written for a generic parameter or the reverse (E0643),
+    // and no requirement on them the trait does not imply
+    // (E0276: a looser impl is fine, a stricter one is not).
+    let trait_n = p.gx.index.trait_record(tr.def).map_or(0, |r| r.generics.params.len());
+    let own_trait = tmpl.generics.params.len().saturating_sub(trait_n);
+    let impl_gen: Option<Generics> = p.gx.fn_templates.get(local.0 as usize).cloned().flatten().map(|t| t.generics);
+    let own_impl = impl_gen.as_ref().map_or(0, |g| g.params.len().saturating_sub(impl_parent_n));
+    let kind_class = |k: &ParamKind| match k {
+        ParamKind::Type => 0,
+        ParamKind::Const(_) => 1,
+        ParamKind::Lifetime => 2,
+    };
+    let kinds_match = own_impl == own_trait
+        && impl_gen.as_ref().is_none_or(|g| {
+            (0..own_trait)
+                .all(|j| kind_class(&g.params[impl_parent_n + j].kind) == kind_class(&tmpl.generics.params[trait_n + j].kind))
+        });
+    if !kinds_match {
+        errs.push(Diag::new(
+            "L0110",
+            f_name_span,
+            "method has a different number of generic parameters than the trait method",
+            "Match the generic parameters in the trait definition.",
+        ));
+        return;
+    }
+    {
+        let idef = p.fn_info(local).def;
+        for (ip, tp) in idef.params.iter().zip(tmpl.def.params.iter()) {
+            let i_impl = matches!(p.ast.ty(ip.ty), TyExpr::ImplTrait { .. });
+            let t_impl = matches!(p.ast.ty(tp.ty), TyExpr::ImplTrait { .. });
+            if i_impl != t_impl {
+                errs.push(Diag::new(
+                    "L0110",
+                    f_name_span,
+                    "method writes `impl Trait` where the trait writes a generic parameter (or the reverse)",
+                    "Match the parameter form in the trait definition.",
+                ));
+                return;
+            }
+        }
+    }
     // Substitution for the trait template: trait params from the
     // impl's trait ref, method params onto the impl's own.
-    let trait_n = p.gx.index.trait_record(tr.def).map_or(0, |r| r.generics.params.len());
     let mut subst_args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
-    let own = tmpl.generics.params.len().saturating_sub(trait_n);
+    let own = own_trait;
     for j in 0..own {
         let t = p.tys.intern(TyKind::Param(ParamId((impl_parent_n + j) as u32)));
         subst_args.push(GenericArg::Ty(t));
+    }
+    if let Some(ig) = &impl_gen {
+        use crate::traits::index::subst_predicate;
+        let env_subst: Vec<Predicate> = tmpl.generics.predicates.iter().map(|&pr| subst_predicate(&mut p.tys, pr, &subst_args)).collect();
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &env_subst);
+        for pred in &ig.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 || b.value.def == p.gx.lang.sized {
+                continue;
+            }
+            let mentions_own = p
+                .tys
+                .args(b.value.args)
+                .iter()
+                .filter_map(|g| g.as_ty())
+                .any(|t| (0..own_impl as u32).any(|j| ty_uses_param(&p.tys, t, impl_parent_n as u32 + j)));
+            if mentions_own && !prove_goal(p, &env, b.value) {
+                errs.push(Diag::new(
+                    "L0110",
+                    f_name_span,
+                    "this method requires more of its generic parameters than the trait method does",
+                    "Remove the extra bound, or add it to the trait definition.",
+                ));
+                break;
+            }
+        }
     }
     let want_params: Vec<Ty> = tmpl
         .params

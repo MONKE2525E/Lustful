@@ -1501,6 +1501,18 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         generics.params.extend(own_generics.params.iter().cloned());
         generics.predicates.extend(own_generics.predicates.iter().copied());
         generics.parent = parent;
+        // A parameter may not reuse a name from the same list or
+        // from the enclosing impl or trait (rustc E0403).
+        for (i, param) in generics.params.iter().enumerate() {
+            if generics.params[..i].iter().any(|q| q.name == param.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    param.span,
+                    format!("the parameter `{}` is already used for a parameter of an enclosing item", interner.get(param.name)),
+                    "Rename one of the parameters.",
+                ));
+            }
+        }
         let mut scope = parent_gen.scope.clone();
         scope.type_params.extend(own_scope.type_params.iter().copied());
         scope.const_params.extend(own_scope.const_params.iter().copied());
@@ -1629,6 +1641,25 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         }
                     }
                 };
+                // An inherent impl parameter must occur in the
+                // Self type (rustc E0207's inherent half).
+                if trait_ref.is_none() {
+                    for (i, param) in impl_generics.params.iter().enumerate() {
+                        let used = match param.kind {
+                            ParamKind::Type => generics::ty_uses_param(&p.tys, self_pat, i as u32),
+                            ParamKind::Const(_) => generics::ty_uses_const_param(&p.tys, self_pat, i as u32),
+                            ParamKind::Lifetime => continue,
+                        };
+                        if !used {
+                            errs.push(Diag::new(
+                                "L0110",
+                                param.span,
+                                format!("the parameter `{}` is not used in the impl header", interner.get(param.name)),
+                                "Use it in the Self type, or remove it.",
+                            ));
+                        }
+                    }
+                }
                 if trait_ref.is_none() && owner.is_none() {
                     errs.push(Diag::new(
                         "L0102",

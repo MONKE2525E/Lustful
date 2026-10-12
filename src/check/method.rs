@@ -142,6 +142,7 @@ fn confirm_method(
     let snap_vars = cx.snapshot_vars();
     let obl_len = cx.obl_len();
     let sites_len = cx.generic_sites.len();
+    let err_len = cx.errs.len();
     let mut full_explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
     full_explicit.extend_from_slice(explicit);
     let (params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
@@ -150,6 +151,7 @@ fn confirm_method(
         cx.rollback_vars(snap_vars);
         cx.obl_truncate(obl_len);
         cx.generic_sites.truncate(sites_len);
+        cx.errs.truncate(err_len);
         return None;
     }
     cx.set_res(e, Res::Method { f: template, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
