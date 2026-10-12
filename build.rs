@@ -48,9 +48,11 @@ fn main() {
     println!("cargo:rustc-env=LUST_TCC_BIN={}", tcc.join("bin/tcc").display());
     println!("cargo:rerun-if-env-changed=LUST_TCC_HOME");
     println!("cargo:rerun-if-changed=build.rs");
-    // Build hash: compiler sources, the manifest, and the tcc tree as built against.
+    // Build hash: compiler sources, the shipped library sources (built into
+    // the binary by src/stdload.rs, S5), the manifest, and the tcc tree.
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_tree(&mut h, &root.join("src"));
+    hash_tree(&mut h, &root.join("library"));
     if let Ok(bytes) = std::fs::read(root.join("Cargo.toml")) {
         bytes.hash(&mut h);
     }
@@ -58,6 +60,7 @@ fn main() {
     hash_tree(&mut h, &lib);
     println!("cargo:rustc-env=LUST_BUILD_HASH={:016x}", h.finish());
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=library");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed={}", tcc.join("bin").display());
     println!("cargo:rerun-if-changed={}", lib.display());

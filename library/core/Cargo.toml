@@ -1,0 +1,8 @@
+# Lust shipped crate (docs/ARCH.md section 3.1). Lust compiles this
+# crate with lust itself; the manifest is read by the driver when
+# W-RESOLVE lands. The crate identity for privilege checks is the
+# disambiguator in src/ty/lang.rs (ShippedCrate::Core), never this name.
+[package]
+name = "core"
+version = "0.0.1"
+edition = "2024"

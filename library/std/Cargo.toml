@@ -1,0 +1,6 @@
+# Lust shipped crate (docs/ARCH.md section 3.1). See library/core/Cargo.toml.
+# A user crate's std dependency is implicit and rooted at this crate.
+[package]
+name = "std"
+version = "0.0.1"
+edition = "2024"
