@@ -12,11 +12,13 @@
 #   target=<triple>   passed to cargo and to lust as --target; the value
 #                     `host` means the rustc host triple. No line = no flag.
 #   args=<words>      program arguments (split on spaces; no quoting)
+#   expect=<L####>    negative fixture: lust must reject with this code.
+#                     Cargo must also reject unless the line cargo=pass is
+#                     present (valid Rust lust rejects on purpose).
 # The lust build names the same crate to the compiler:
 #   lust build <root> --manifest-path <Cargo.toml> --bin <bin> [--features ..] [--target ..]
-# Cargo graph loading is W-RESOLVE work; here lust compiles the one root file
-# (lust has no modules yet), so fixtures must work as single-file crates.
-# A two-file `mod` fixture joins with W-RESOLVE, not before.
+# Lust loads the crate through the Cargo graph and its module files
+# (W-RESOLVE), so fixtures are real multi-file crates.
 #
 # Usage: scripts/test-crates.sh [filter]
 #   SANITIZE=1 also builds the lust-generated C with gcc
@@ -70,6 +72,8 @@ for dir in "$fixtures"/*/; do
   root_file=src/main.rs
   features=""
   target=""
+  expect=""
+  cargo_pass=""
   prog_args=()
   if [ -f "$case_dir/proj/fixture.txt" ]; then
     while IFS='=' read -r k v; do
@@ -78,6 +82,8 @@ for dir in "$fixtures"/*/; do
         root) root_file=$v ;;
         features) features=$v ;;
         target) target=$v ;;
+        expect) expect=$v ;;
+        cargo) cargo_pass=$v ;;
         args) # split on spaces by design (see header)
           read -r -a prog_args <<<"$v" ;;
         "" | \#*) ;;
@@ -101,7 +107,34 @@ for dir in "$fixtures"/*/; do
     cargo_bin=$case_dir/cargo-target/$target/debug/$bin
   fi
 
+  cargo_ok=1
   if ! timeout 60 cargo "${cargo_args[@]}" --target-dir "$case_dir/cargo-target" >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"; then
+    cargo_ok=0
+  fi
+  if [ -n "$expect" ]; then
+    # Negative fixture: the oracle outcome is pinned by `cargo=pass`
+    # (valid Rust lust rejects) or its absence (both must reject), and
+    # lust must reject with exactly the expected code present.
+    if [ "$cargo_pass" = pass ] && [ $cargo_ok -eq 0 ]; then
+      report bad "$name" "cargo=pass but cargo rejects it: $(tail -3 "$case_dir/cargo.err")"
+      continue
+    fi
+    if [ "$cargo_pass" != pass ] && [ $cargo_ok -eq 1 ]; then
+      report bad "$name" "cargo accepts it; add cargo=pass if lust rejects valid Rust on purpose"
+      continue
+    fi
+    if timeout 60 "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; then
+      report bad "$name" "lust accepted it, want $expect"
+      continue
+    fi
+    if grep -q "$expect" "$case_dir/lust.err"; then
+      report ok "$name"
+    else
+      report bad "$name" "want $expect, got: $(head -3 "$case_dir/lust.err")"
+    fi
+    continue
+  fi
+  if [ $cargo_ok -eq 0 ]; then
     report bad "$name" "cargo build failed: $(tail -3 "$case_dir/cargo.err")"
     continue
   fi

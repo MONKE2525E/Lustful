@@ -1,0 +1,7 @@
+# Function-local use: an explicit import and a glob, scoped to bodies.
+[package]
+name = "fn-local-use"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

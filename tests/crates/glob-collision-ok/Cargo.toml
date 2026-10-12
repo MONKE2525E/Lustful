@@ -1,0 +1,7 @@
+# A glob collision that is never used is fine; an explicit import pins the used one.
+[package]
+name = "glob-collision-ok"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

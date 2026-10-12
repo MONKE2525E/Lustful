@@ -360,7 +360,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("named format arguments", "L0641"),
     ("format spec forms other than {} and {:?} (named in the message)", "L0641"),
     ("#[test] functions inside impl blocks", "L9001"),
-    ("module paths (`self::`)", "L0505"),
     ("associated bindings in generic arguments", "L0621"),
     ("qualified paths", "L0621"),
     ("const functions", "L0632"),

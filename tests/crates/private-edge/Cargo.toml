@@ -1,0 +1,7 @@
+# Both reject: a private fn called from another module.
+[package]
+name = "private-edge"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

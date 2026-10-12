@@ -1,0 +1,7 @@
+# Both reject: x.rs and x/mod.rs both exist.
+[package]
+name = "ambig-file"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

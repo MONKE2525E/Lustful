@@ -1,0 +1,7 @@
+# One physical file as two modules: two ASTs, two item sets, one output sum.
+[package]
+name = "shared-file"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

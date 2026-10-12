@@ -1,0 +1,7 @@
+# Both reject: a private field read in another module.
+[package]
+name = "field-private"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -1,0 +1,7 @@
+# pub(crate), pub(super), pub(in path) edges that hold.
+[package]
+name = "vis-edges"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

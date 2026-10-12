@@ -124,11 +124,13 @@ def main():
         # stay in separate sessions, and a repeat selection reuses its own.
         # Proof is the daemon's own session records: one "new session" log
         # line per key naming a distinct session dir, plus a libbase built in
-        # each of those dirs. Program output is the same under both
-        # selections today (lust has no cfg(feature) yet), so output alone
-        # cannot prove the sessions apart; the session dirs can.
+        # each of those dirs. Since W-RESOLVE the program also branches on
+        # cfg(feature), so the two binaries must print different lines.
         feat = os.path.join(work, "feat.rs")
-        open(feat, "w").write('fn main() { println!("feat {}", 20 + 22); }\n')
+        feat_src = ('#[cfg(feature = "alpha")]\nfn which() -> i64 { 11 }\n'
+                    '#[cfg(not(feature = "alpha"))]\nfn which() -> i64 { 22 }\n'
+                    'fn main() { println!("feat {}", which()); }\n')
+        open(feat, "w").write(feat_src)
         logpath = os.path.join(work, "daemon.log")
 
         def session_dirs_for(root_path):
@@ -154,13 +156,30 @@ def main():
               f"based={based}")
         r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
         r2 = subprocess.run([os.path.join(work, "fb.bin")], capture_output=True, text=True)
-        check("routing: both builds run", r.stdout == r2.stdout == "feat 42\n",
+        check("routing: cfg(feature) differs per session",
+              r.stdout == "feat 11\n" and r2.stdout == "feat 22\n",
               f"alpha={r.stdout!r} beta={r2.stdout!r}")
+        # Two targets in one daemon: the host triple named explicitly and
+        # the default also key separate sessions (lust builds host only).
+        host = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+        host = re.search(r"host: (\S+)", host).group(1)
+        rc, out, err = run_lust(["build", feat, "-o", os.path.join(work, "ft.bin"), "--target", host])
+        check("routing: named host target build", rc == 0, err)
+        log.flush()
+        target_dirs = set()
+        for line in open(logpath):
+            if "new session for crate" in line and f"root={feat}" in line:
+                m = re.search(r"target=(\S+) .* in (\S+)$", line.strip())
+                if m:
+                    target_dirs.add(m.group(2))
+        check("routing: two targets, separate sessions", len(target_dirs) >= 3,
+              f"dirs={target_dirs}")
+        before = session_dirs_for(feat)
         rc, out, err = run_lust(["check", feat, "--features", "alpha"])
         check("routing: alpha again ok", rc == 0, err)
         dirs = session_dirs_for(feat)
-        check("routing: repeat selection reuses its session", set(dirs) == {"alpha", "beta"},
-              f"dirs={dirs}")
+        check("routing: repeat selection reuses its session", dirs == before,
+              f"dirs={dirs} before={before}")
         # An error under alpha must not poison beta: the same source error is
         # reported by both, and after the fix each answers from its own state.
         open(feat, "w").write('fn main() { let x: i64 = "s"; println!("{}", x); }\n')
@@ -169,7 +188,7 @@ def main():
         check("routing: both selections reject the bad edit",
               rca == 1 and rcb == 1 and ea.splitlines()[:1] == eb.splitlines()[:1],
               f"alpha rc={rca}, beta rc={rcb}")
-        open(feat, "w").write('fn main() { println!("feat {}", 20 + 22); }\n')
+        open(feat, "w").write(feat_src)
         rca, _, ea = run_lust(["check", feat, "--features", "alpha"])
         rcb, _, eb = run_lust(["check", feat, "--features", "beta"])
         check("routing: both selections accept the fix", rca == 0 and rcb == 0,

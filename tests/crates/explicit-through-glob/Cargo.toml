@@ -1,0 +1,7 @@
+# The ARCH 1.3 shape: an explicit import that resolves through a glob re-export.
+[package]
+name = "explicit-through-glob"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

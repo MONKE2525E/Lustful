@@ -1,0 +1,7 @@
+# Both reject: the module file does not exist.
+[package]
+name = "missing-mod"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -1,0 +1,7 @@
+# Valid Rust lust rejects: a path into a dependency crate (no deps here, so cargo fails too... see fixture.txt).
+[package]
+name = "cross-crate-item"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

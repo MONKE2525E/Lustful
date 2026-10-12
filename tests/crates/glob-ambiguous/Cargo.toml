@@ -1,0 +1,7 @@
+# Both reject: a glob collision used by name.
+[package]
+name = "glob-ambiguous"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

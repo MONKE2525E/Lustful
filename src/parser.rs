@@ -10,6 +10,7 @@ use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree};
 
 // Stable Appendix A codes for AST v2 forms the parser recognizes but does not
 // build yet. Each code's registry row and explain page name its area.
+#[allow(dead_code)] // Module forms parse now; the resolver rejects the rest.
 const C_MOD: &str = "L0505"; // modules, imports, and module paths
 const C_ATTR: &str = "L0522"; // cfg and known-but-unhandled attributes
 const C_TY: &str = "L0602"; // type forms and type aliases
@@ -2561,7 +2562,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Bool(false)
             }
-            Tok::SelfLower if self.peek_at(1) == Tok::PathSep => return Err(not_yet(C_MOD, start, "module paths (`self::`)")),
+            Tok::Crate | Tok::Super | Tok::PathSep => {
+                let path = self.path(false)?;
+                if self.peek() == Tok::LBrace && !no_struct {
+                    return self.struct_lit(path, start);
+                }
+                Expr::Path(path)
+            }
+            Tok::SelfLower if self.peek_at(1) == Tok::PathSep => {
+                let path = self.path(false)?;
+                if self.peek() == Tok::LBrace && !no_struct {
+                    return self.struct_lit(path, start);
+                }
+                Expr::Path(path)
+            }
             Tok::SelfLower => {
                 self.bump();
                 Expr::SelfValue

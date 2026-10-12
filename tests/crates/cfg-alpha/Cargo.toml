@@ -1,0 +1,11 @@
+# cfg(feature) on: fixture.txt selects alpha for both builds.
+[package]
+name = "cfg-alpha"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = []
+alpha = []

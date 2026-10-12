@@ -1141,6 +1141,29 @@ impl Rewrite<'_> {
         }
         let (res, local) = self.resolve(&names, ns, module, scopes);
         if !local {
+            // Lexical scope (section 1.3): an unqualified name that only
+            // another module defines is not found here, even though the
+            // merged flat tables could answer it. Names no module
+            // defines (primitives, builtins) fall through as before.
+            if res == PathRes::Absent && names.first().is_some_and(|n| self.tables.any_local_named(*n)) {
+                let first = self.interner.get(names[0]).to_string();
+                self.diags.push(if ns == Namespace::Type {
+                    Diag::new(
+                        "L0102",
+                        span,
+                        format!("cannot find type `{first}` in this scope"),
+                        "Import it with `use`, or write its module path.",
+                    )
+                } else {
+                    Diag::new(
+                        "L0101",
+                        span,
+                        format!("cannot find value `{first}` in this scope"),
+                        "Import it with `use`, or write its module path.",
+                    )
+                });
+                return;
+            }
             self.apply(segs, res, span, module);
         }
     }

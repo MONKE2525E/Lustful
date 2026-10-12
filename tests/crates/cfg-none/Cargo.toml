@@ -1,0 +1,11 @@
+# cfg(feature) off: no selection, the not(alpha) item stays.
+[package]
+name = "cfg-none"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = []
+alpha = []

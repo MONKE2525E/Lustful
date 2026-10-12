@@ -1,0 +1,7 @@
+# Both reject: an enclosing module name is not in lexical scope.
+[package]
+name = "lexical-scope"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

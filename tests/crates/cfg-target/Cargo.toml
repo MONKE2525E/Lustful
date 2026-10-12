@@ -1,0 +1,7 @@
+# Target cfg picks one of two fns; cargo and lust agree per host.
+[package]
+name = "cfg-target"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

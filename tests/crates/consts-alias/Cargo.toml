@@ -1,0 +1,7 @@
+# const, static, and type alias items across modules.
+[package]
+name = "consts-alias"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

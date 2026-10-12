@@ -1,0 +1,7 @@
+# #[path] at the root and inside an inline module.
+[package]
+name = "path-attr"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

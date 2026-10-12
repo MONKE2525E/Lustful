@@ -307,6 +307,16 @@ impl ResolvedTables {
         self.maps.get(module.0 as usize).and_then(|m| m[ns_index(ns)].get(&name))
     }
 
+    /// True when some module defines `name` locally (not by import), in
+    /// any namespace. The rewrite pass uses it for the lexical-scope
+    /// rule: a bare name that only an enclosing or sibling module
+    /// defines must error, never fall through to the flat tables.
+    pub fn any_local_named(&self, name: Sym) -> bool {
+        self.maps.iter().enumerate().any(|(mi, maps)| {
+            maps.iter().any(|m| matches!(m.get(&name), Some(BindState::One(b)) if b.rank == 2 && b.def_module.0 as usize == mi))
+        })
+    }
+
     /// The answer for the S7 query fns: the module table first, then the
     /// flat-name index (the merged AST's rewritten names, which the
     /// checker asks about in the root module). None means "no answer

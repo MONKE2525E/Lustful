@@ -1,0 +1,7 @@
+# The ts-rust prelude.rs shape: glob re-exports with explicit pins for collisions.
+[package]
+name = "ts-prelude"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

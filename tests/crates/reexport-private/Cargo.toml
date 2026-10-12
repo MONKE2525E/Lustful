@@ -1,0 +1,7 @@
+# A pub item in a private module is public through a pub use alias.
+[package]
+name = "reexport-private"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
