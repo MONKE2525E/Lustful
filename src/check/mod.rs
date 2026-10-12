@@ -281,6 +281,9 @@ pub enum PatRes {
     None,
     /// A const item used as a pattern, by index into `Program::consts`.
     ConstItem(u32),
+    /// A primitive associated const used as a pattern (`i64::MAX`):
+    /// the value and its integer type.
+    PrimConst(i128, IntTy),
     Binding {
         local: u32,
         mode: BindMode,
@@ -5512,6 +5515,35 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // Free consts and statics in one segment are handled by
             // the pattern-identifier resolution in the Path arm.
             return false;
+        }
+        // Primitive associated consts (`i64::MAX`, `u32::BITS`), the
+        // same table `path_expr` reads for expression positions.
+        if segs.len() == 2
+            && let Some(it) = p.known.int_ty(segs[0].name)
+        {
+            let item = self.name(segs[1].name).to_string();
+            let item = item.as_str();
+            let bits = it.bits();
+            let v = match item {
+                "MAX" => Some(crate::ty::consteval::truncate_to_int(it.max128() as i128, it)),
+                "MIN" => Some(if it.signed() { if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } } else { 0 }),
+                "BITS" => Some(bits as i128),
+                _ => None,
+            };
+            if let Some(v) = v {
+                let (ct, val) = if item == "BITS" {
+                    (int(IntTy::U32), v)
+                } else if it == IntTy::U128 && item == "MAX" {
+                    (int(it), -1)
+                } else {
+                    (int(it), v)
+                };
+                let cv = crate::ty::consteval::ConstValue::Int(val);
+                if self.check_const_value(ct, &cv, t, span, in_match) {
+                    self.out.pat_res[pi] = PatRes::PrimConst(val, if item == "BITS" { IntTy::U32 } else { it });
+                }
+                return true;
+            }
         }
         if let Some((adt, item)) = self.assoc_const_key(segs) {
             match p.assoc_const_names.get(&(adt, item)) {

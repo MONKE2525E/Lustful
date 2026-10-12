@@ -59,4 +59,12 @@ fn main() {
         ..=HI => println!("le"),
         _ => println!("gt"),
     }
+    match 5i64 {
+        i64::MAX => println!("max"),
+        _ => println!("small"),
+    }
+    match i64::MAX {
+        i64::MAX => println!("max"),
+        _ => println!("small"),
+    }
 }

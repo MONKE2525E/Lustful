@@ -1517,8 +1517,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             return;
         }
-        if let PatRes::ConstItem(idx) = self.ck.pat_res(pat) {
-            let cv = p.consts[idx as usize].value.clone();
+        let const_pat = match self.ck.pat_res(pat) {
+            PatRes::ConstItem(idx) => Some(p.consts[idx as usize].value.clone()),
+            PatRes::PrimConst(v, _) => Some(crate::ty::consteval::ConstValue::Int(v)),
+            _ => None,
+        };
+        if let Some(cv) = const_pat {
             let op = self.const_operand(&cv, ty, span);
             let c = self.temp(BOOL);
             let cond = if matches!(cv, crate::ty::consteval::ConstValue::Str(_)) {
