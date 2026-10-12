@@ -1,0 +1,21 @@
+E1_A_u8_u32_B size=8 align=4
+E1b_A_u8_u64_u8 size=16 align=8
+E1c_A_u32_u64 size=16 align=8
+E1d_A_u16_arr3 size=6 align=2
+MapperLike size=16 align=8
+S_bool_ref size=16 align=8
+OptS size=16 align=8
+OptOptS size=16 align=8
+Payload size=16 align=8
+Several size=16 align=8
+OtherData size=16 align=8
+ExplicitTag_repr_u8 size=16 align=8
+CTag_repr_C size=16 align=8
+E3_A_u32_B_u32 size=8 align=4
+OptE3 size=8 align=4
+Opt3E3 size=8 align=4
+SMixed_u8_u64_u8 size=16 align=8
+OptBool size=1 align=1
+Disc_1000 size=2 align=2
+Disc_A 1000
+Disc_B 1001
