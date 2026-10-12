@@ -8,6 +8,7 @@
 mod ast;
 mod borrowck;
 mod cache;
+mod capabilities;
 mod cgen;
 mod check;
 mod collect;
@@ -38,6 +39,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("test") => std::process::exit(testrun::run(&args[1..])),
         Some("explain") => std::process::exit(explain::run(&args[1..])),
+        Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),
         _ => {}
     }
     match protocol::parse_args(&args) {
