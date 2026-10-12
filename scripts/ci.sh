@@ -39,6 +39,7 @@ scripts/difftest.sh
 
 step "macro corpus"
 scripts/test-macros.sh
+scripts/test-macro-deps.sh
 
 step "ts-rust kernels and compat fixtures"
 scripts/test-kernels.sh

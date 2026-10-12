@@ -96,6 +96,10 @@ pub(crate) struct Chunk {
     pub(crate) scan: scan::ChunkScan,
     /// This chunk's items in `front.ast.items`, or None if it has not been parsed yet.
     pub(crate) items: Option<std::ops::Range<usize>>,
+    /// Outside inputs this chunk's macro expansion read (included files
+    /// with content hashes, env values; see `expand::Dep`). The chunk is
+    /// dropped instead of reused when one changes (added for W-MACRO).
+    pub(crate) expand_deps: Vec<crate::expand::Dep>,
 }
 
 /// Per-slot results and build state.

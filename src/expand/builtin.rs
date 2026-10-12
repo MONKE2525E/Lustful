@@ -242,7 +242,7 @@ fn read_include(st: &mut Expander, rel: &str, span: Span) -> Result<(std::path::
     let path = base.join(rel);
     match std::fs::read(&path) {
         Ok(bytes) => {
-            st.read_dep(&path.to_string_lossy(), &bytes);
+            st.read_dep_file(&path, &bytes);
             Ok((path, bytes))
         }
         Err(_) => Err(err(
@@ -303,6 +303,13 @@ fn stringify_tok_text(st: &Expander, t: &Token) -> String {
         },
         _ => plain,
     }
+}
+
+/// The value `env!` and `option_env!` see for `name` in this process.
+/// The one lookup both the builtin and the stale-deps check use, so a
+/// recorded env dependency is judged against the same snapshot.
+pub fn compile_env(name: &str) -> Option<String> {
+    env_snapshot().get(name).cloned()
 }
 
 /// Renders trees the way `stringify!` does. Spacing follows rustc's
@@ -467,8 +474,8 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let Some((var, _)) = literal_string(st, &expanded) else {
                 return Err(bad(format!("{name}! takes one string literal")));
             };
-            let value = env_snapshot().get(&var).cloned();
-            st.read_dep(&format!("env:{var}"), value.as_deref().unwrap_or("").as_bytes());
+            let value = compile_env(&var);
+            st.read_dep_env(&var, value.as_deref());
             match (name, value) {
                 ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),
                 ("env", None) => Err(err(

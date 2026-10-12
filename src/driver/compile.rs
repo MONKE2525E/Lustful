@@ -44,9 +44,15 @@ const ROOT_FILE: FileId = FileId(0);
 /// is the spot that moves into the 6.1 outline worklist). Expansion is a
 /// no-op for files with no macro definitions or non-parser macro calls,
 /// so macro-free files keep the current path bit for bit.
-fn expand_tokens(front: &Front, lexed: lexer::Lexed, file: &std::path::Path, src: &str, test: bool) -> Result<lexer::Lexed, Diag> {
+fn expand_tokens(
+    front: &Front,
+    lexed: lexer::Lexed,
+    file: &std::path::Path,
+    src: &str,
+    test: bool,
+) -> Result<(lexer::Lexed, Vec<expand::Dep>), Diag> {
     let ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
-    expand::expand_lexed(lexed, &ctx)
+    expand::expand_lexed_with_deps(lexed, &ctx)
 }
 
 /// Wall time per stage.
@@ -1158,6 +1164,7 @@ fn resolved_setup(
             ends_at_boundary: true,
         },
         items: Some(0..n_items),
+        expand_deps: Vec::new(),
     }];
     let env = scan::env_hash(item_scans.iter());
     // The same mode split as the single-file path. Bodies mode goes
@@ -1329,9 +1336,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let old_len = front.src.len();
     let (prefix, suffix) = common_ends(front.src.as_bytes(), src.as_bytes());
     let delta = src.len() as i64 - old_len as i64;
+    // A chunk whose expansion read a file or env value that has since
+    // changed expands differently now, so no chunk is reused this
+    // request (expansion is per chunk, but a changed include can hold
+    // macro definitions other chunks used; dropping all is the simple
+    // sound rule). Added for W-MACRO (docs/ARCH.md section 6.4).
+    let deps_stale = front.chunks.iter().any(|c| expand::deps_stale(&c.expand_deps));
     let mut kept_front = Vec::new();
     let mut kept_back = Vec::new();
     for c in std::mem::take(&mut front.chunks) {
+        if deps_stale {
+            continue;
+        }
         if c.start + c.text.len() <= prefix {
             kept_front.push(c);
         } else if c.start >= old_len - suffix && suffix > 0 {
@@ -1412,9 +1428,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
         lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)).map(
-            |l| {
+            |(l, deps)| {
                 let sc = scan::scan(&l);
-                (l, sc)
+                (l, sc, deps)
             },
         )
     });
@@ -1428,9 +1444,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // whole file. Its error is the answer; if it lexes, compile as one chunk. Never panic.
         match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
-            Ok(whole) => {
+            Ok((whole, deps)) => {
                 let sc = scan::scan(&whole);
-                front.chunks = vec![Chunk { start: 0, text: src.clone(), lexed: whole, lexed_start: 0, scan: sc, items: None }];
+                front.chunks =
+                    vec![Chunk { start: 0, text: src.clone(), lexed: whole, lexed_start: 0, scan: sc, items: None, expand_deps: deps }];
             }
         }
     } else {
@@ -1455,9 +1472,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     c
                 }
                 None => {
-                    let (_, (lexed, sc)) = next_fresh.take().unwrap();
+                    let (_, (lexed, sc, deps)) = next_fresh.take().unwrap();
                     next_fresh = fresh.next();
-                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None }
+                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None, expand_deps: deps }
                 }
             };
             front.chunks.push(chunk);
@@ -1632,7 +1649,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // Re-parse serially for an exact error.
             let whole =
                 match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
-                    Ok(w) => w,
+                    Ok((w, _deps)) => w,
                     Err(mut d) => {
                         front.env_hash = None;
                         return errors(std::slice::from_mut(&mut d), &map, &src, req);

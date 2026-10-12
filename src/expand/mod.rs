@@ -603,6 +603,42 @@ impl<'a> ExpandCtx<'a> {
     }
 }
 
+/// One input expansion read from outside the source text: a file an
+/// `include!` family macro read (path plus a hash of its bytes), or an
+/// environment variable an `env!`/`option_env!` read (name plus the
+/// value seen, None when unset). The driver stores these with the
+/// chunk they expanded into and drops the chunk when one changes
+/// (ARCH 6.4, 6.5), so a daemon never answers from an expansion of a
+/// file or environment that no longer exists in that form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dep {
+    File { path: std::path::PathBuf, hash: u64 },
+    Env { name: String, value: Option<String> },
+}
+
+/// Hashes bytes for a file dependency record.
+fn dep_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// True when any recorded dependency no longer reads as it did at
+/// expansion time, judging env names through `env` (the compile-time
+/// env snapshot the expander itself reads). A file that cannot be
+/// read counts as changed: re-expanding then reports the real error.
+pub fn deps_stale_with(deps: &[Dep], env: &dyn Fn(&str) -> Option<String>) -> bool {
+    deps.iter().any(|dep| match dep {
+        Dep::File { path, hash } => std::fs::read(path).map_or(true, |bytes| dep_bytes_hash(&bytes) != *hash),
+        Dep::Env { name, value } => env(name) != *value,
+    })
+}
+
+/// `deps_stale_with` against the compile-time env snapshot (ARCH 6.4).
+pub fn deps_stale(deps: &[Dep]) -> bool {
+    deps_stale_with(deps, &builtin::compile_env)
+}
+
 /// One segment of a macro call path.
 #[derive(Clone)]
 pub struct Seg {
@@ -744,9 +780,12 @@ pub struct Expander<'a> {
     /// its text for `line!` / `column!`. `include!` swaps these.
     cur_file: String,
     cur_src: String,
-    /// Hashes of files and env vars read by builtins during this run
-    /// (they feed cache keys and would feed the dep graph, ARCH 8).
+    /// Hash of files and env vars read by builtins during this run
+    /// (it feeds cache keys, ARCH 6.5).
     deps_hash: u64,
+    /// The outside inputs this run read, in read order. The driver
+    /// stores them next to the expanded chunk (see `Dep`).
+    deps: Vec<Dep>,
     total_tokens: usize,
 }
 
@@ -766,6 +805,7 @@ impl<'a> Expander<'a> {
             cur_file: ctx.file_path.clone(),
             cur_src: ctx.src.to_string(),
             deps_hash: 0,
+            deps: Vec::new(),
             total_tokens: 0,
         }
     }
@@ -787,13 +827,32 @@ impl<'a> Expander<'a> {
         Tt::Tok(Token { tok: Tok::Ident(self.ctx.interner.intern(name)), span })
     }
 
-    /// Records one file or env dependency read into the deps hash.
-    pub fn read_dep(&mut self, what: &str, bytes: &[u8]) {
+    /// Folds one dependency read into the running deps hash.
+    fn fold_dep(&mut self, what: &str, bytes: &[u8]) {
         let mut h = crate::intern::FxHasher::default();
         self.deps_hash.hash(&mut h);
         what.hash(&mut h);
         bytes.hash(&mut h);
         self.deps_hash = h.finish();
+    }
+
+    /// Records a file a builtin read: its path and a hash of the bytes
+    /// seen, so the driver can tell when the file changes (`Dep`).
+    pub fn read_dep_file(&mut self, path: &std::path::Path, bytes: &[u8]) {
+        self.fold_dep(&path.to_string_lossy(), bytes);
+        let dep = Dep::File { path: path.to_path_buf(), hash: dep_bytes_hash(bytes) };
+        if !self.deps.contains(&dep) {
+            self.deps.push(dep);
+        }
+    }
+
+    /// Records an env var a builtin read and the value it saw.
+    pub fn read_dep_env(&mut self, name: &str, value: Option<&str>) {
+        self.fold_dep(&format!("env:{name}"), value.unwrap_or("").as_bytes());
+        let dep = Dep::Env { name: name.to_string(), value: value.map(str::to_string) };
+        if !self.deps.contains(&dep) {
+            self.deps.push(dep);
+        }
     }
 
     /// 1-based line and column of `span` in the current file's text,
@@ -922,14 +981,29 @@ pub fn expand_lexed(lexed: Lexed, ctx: &ExpandCtx) -> Result<Lexed, Diag> {
 /// `expand_lexed` with worklist macro seeds registered in the path
 /// tables before the prescan, so this file's own `use` items and path
 /// calls can resolve macros defined in other files and crates.
+/// `expand_lexed_seeded_with_deps` without the dependency record.
 pub fn expand_lexed_seeded(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<Lexed, Diag> {
+    expand_lexed_seeded_with_deps(lexed, ctx, seeds).map(|(lexed, _deps)| lexed)
+}
+
+/// `expand_lexed_seeded_with_deps` with no seeds: expands one lexed
+/// file or chunk and returns the outside inputs expansion read
+/// (`Dep` records for `include!` files and `env!` values).
+pub fn expand_lexed_with_deps(lexed: Lexed, ctx: &ExpandCtx) -> Result<(Lexed, Vec<Dep>), Diag> {
+    expand_lexed_seeded_with_deps(lexed, ctx, &[])
+}
+
+/// The seeded, dependency-returning expansion both wrappers use.
+/// A file that cannot contain macros comes back unchanged (the
+/// same `Lexed`, no deps).
+pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
     if !needs_expansion(&lexed.tokens, ctx.interner) {
-        return Ok(lexed);
+        return Ok((lexed, Vec::new()));
     }
     let (trees, balanced) = build_trees(&lexed.tokens);
     if !balanced {
         // The parser gives the real syntax error on the flat tokens.
-        return Ok(lexed);
+        return Ok((lexed, Vec::new()));
     }
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
     let mut st = Expander::new(ctx, lexed.strings);
@@ -950,7 +1024,7 @@ pub fn expand_lexed_seeded(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -
         eprintln!("expanded tokens: {}", texts.join(" "));
     }
     tokens.push(eof);
-    Ok(Lexed { tokens, strings: st.strings })
+    Ok((Lexed { tokens, strings: st.strings }, st.deps))
 }
 
 /// The frozen worklist interface (ARCH 6.1): expand one call against one
@@ -2376,6 +2450,32 @@ mod tests {
             expand_src(&interner, &known, "macro_rules! m { (b\"a\") => { 1 }; ($t:tt) => { 2 } }\nfn main() { let _ = m!(b\"b\"); }")
                 .expect("tt arm takes the other byte string");
         assert!(bytes.iter().any(|t| t == "2"), "tokens: {bytes:?}");
+    }
+
+    /// An `include_str!` read records a file dependency whose hash
+    /// goes stale when the file changes; an `option_env!` read records
+    /// the value it saw (ARCH 6.4). The daemon drops a chunk on stale
+    /// deps instead of serving the old expansion.
+    #[test]
+    fn include_and_env_reads_record_deps() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let dir = std::env::temp_dir().join(format!("lust-deps-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data.txt");
+        std::fs::write(&data, "one").unwrap();
+        let main_rs = dir.join("main.rs");
+        let src = "fn main() { let _s = include_str!(\"data.txt\"); let _e = option_env!(\"LUST_DEPS_TEST_UNSET\"); }";
+        let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ctx = ExpandCtx::for_file(&interner, &known, &main_rs, src, false);
+        let (_out, deps) = expand_lexed_with_deps(lexed, &ctx).expect("expansion");
+        assert!(deps.iter().any(|d| matches!(d, Dep::File { path, .. } if *path == data)), "deps: {deps:?}");
+        assert!(deps.iter().any(|d| matches!(d, Dep::Env { name, value: None } if name == "LUST_DEPS_TEST_UNSET")), "deps: {deps:?}");
+        assert!(!deps_stale(&deps), "fresh deps are not stale");
+        assert!(deps_stale_with(&deps, &|_: &str| Some("now set".to_string())), "a changed env value is stale");
+        std::fs::write(&data, "two").unwrap();
+        assert!(deps_stale(&deps), "a changed included file is stale");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// stringify! keeps the source's own spacing between tokens.
