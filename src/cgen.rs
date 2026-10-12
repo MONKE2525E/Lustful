@@ -371,12 +371,19 @@ impl FnGen<'_, '_, '_> {
         match o {
             Operand::Copy(pl) => self.place(pl, loc),
             Operand::Move(pl) => {
-                // Moving the whole local, or a payload out of it (which moves the whole local).
-                let whole = pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_)));
-                if whole && self.local_drop[pl.local as usize] {
-                    post.push(format!("d{} = 0;", pl.local));
+                let (e, t) = self.place(pl, loc);
+                if self.local_drop[pl.local as usize] {
+                    if pl.proj.is_empty() {
+                        // Moving the whole local: it owns nothing now.
+                        post.push(format!("d{} = 0;", pl.local));
+                    } else if pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_))) {
+                        // Moving one field out (a partial move, or an enum payload). Zero the
+                        // field so the local's later drop skips it (a zero `String` or `Vec`
+                        // drops as a no-op) but still drops every other field.
+                        post.push(format!("{e} = ({}){{0}};", ctype(&t)));
+                    }
                 }
-                self.place(pl, loc)
+                (e, t)
             }
             Operand::Const(c) => match c {
                 Const::Int(v, it) => {
@@ -725,7 +732,11 @@ impl FnGen<'_, '_, '_> {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
-                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et})) = {};", vals[0], vals[1]);
+                // The value must be read before `lust_vec_push_slot` can reallocate the
+                // buffer: `v.push(v[0])` in one C assignment could read the freed buffer.
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
+                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et})) = {t};", vals[0]);
                 "0".into()
             }
             B::Clone => {

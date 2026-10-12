@@ -1,8 +1,14 @@
 // Borrow checking on the IR, one function at a time.
 //
-// 1. Initialization: forward dataflow of maybe-init and maybe-moved locals.
-// 2. Loans: each `&place` creates a loan. Forward dataflow tracks which locals may hold which loans.
-// 3. Liveness: backward dataflow. A loan is live where some live local may hold it (NLL style).
+// 1. Initialization: forward dataflow of maybe-init and maybe-moved locals. Moves are
+//    tracked per field path, so moving `p.x` leaves `p.y` usable (a partial move).
+// 2. Loans: each `&place` creates a loan. Forward dataflow tracks which locals may hold
+//    which loans, and (for lifetime checks at returns and parameter stores) every loan a
+//    local was ever assigned, because a local has one fixed lifetime.
+// 3. Liveness: backward dataflow. A loan is live where some live local may hold it. A
+//    loan that flows into a return value or behind a parameter is also live at every
+//    point reachable from the borrow, as in rustc's NLL (this rejects problem case 3,
+//    which Polonius would accept).
 // 4. Each access is checked against the live loans it conflicts with.
 use crate::check::Builtin;
 use crate::collect::*;
@@ -58,6 +64,36 @@ struct Loan {
     last_use: Option<Span>,
 }
 
+/// One field path below a local, as encoded projections (`Field`/`Downcast`). An empty path
+/// is the whole local. Used to track partial moves per field.
+type Path = Vec<u64>;
+
+fn encode_proj(p: &Proj) -> Option<u64> {
+    match p {
+        Proj::Field(i) => Some((*i as u64) << 1),
+        Proj::Downcast(v) => Some(((*v as u64) << 1) | 1),
+        _ => None,
+    }
+}
+
+/// The leading `Field`/`Downcast` part of a place, and whether that is the whole place.
+/// A place that goes through a dereference or an index is not exact: its field prefix
+/// still identifies the field of the root local that it reaches into.
+fn field_prefix(p: &Place) -> (Path, bool) {
+    let mut path = Vec::new();
+    for pr in &p.proj {
+        match encode_proj(pr) {
+            Some(e) => path.push(e),
+            None => return (path, false),
+        }
+    }
+    (path, true)
+}
+
+fn is_prefix(a: &[u64], b: &[u64]) -> bool {
+    a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct State {
     maybe_init: BitSet,
@@ -65,6 +101,15 @@ struct State {
     maybe_moved: BitSet,
     /// For each local, the loans it may hold.
     holds: Vec<BitSet>,
+    /// For each local, every loan it was ever assigned on this path. Unlike `holds` this is
+    /// never overwritten by a later assignment (until storage ends). A local in Rust has
+    /// one fixed lifetime, so at a return or a store behind a parameter every value the
+    /// local ever held must satisfy that lifetime. Later assignments cannot hide an
+    /// earlier one. This is only used at those sinks, not for loan liveness.
+    origins: Vec<BitSet>,
+    /// For each local, the field paths that may have been moved out of it. An empty path
+    /// means the whole local may have been moved.
+    moved_paths: Vec<std::collections::HashSet<Path>>,
 }
 
 impl State {
@@ -74,6 +119,14 @@ impl State {
         c |= self.maybe_moved.union(&o.maybe_moved);
         for (a, b) in self.holds.iter_mut().zip(&o.holds) {
             c |= a.union(b);
+        }
+        for (a, b) in self.origins.iter_mut().zip(&o.origins) {
+            c |= a.union(b);
+        }
+        for (a, b) in self.moved_paths.iter_mut().zip(&o.moved_paths) {
+            let before = a.len();
+            a.extend(b.iter().cloned());
+            c |= a.len() != before;
         }
         c
     }
@@ -101,6 +154,18 @@ struct Ck<'b, 'p, 'a> {
     errs: Vec<Diag>,
     seen: HashSet<(&'static str, u32, u32)>,
     report: bool,
+    /// Loans that flow into a return value or behind a parameter reference. Their region
+    /// must outlive a parameter lifetime, and rustc's NLL treats such a region as live at
+    /// every point reachable from the borrow (not only where a holder local is used).
+    /// This is what makes rustc reject NLL problem case 3; Polonius would accept it.
+    escaped: BitSet,
+    /// Creation point of each loan (`u32::MAX` for synthetic parameter loans).
+    loan_block: Vec<u32>,
+    loan_stmt: Vec<u32>,
+    /// `reach[b]` is the set of blocks reachable from `b`, including `b`.
+    reach: Vec<BitSet>,
+    /// True in the pass that only collects `escaped` loans.
+    collecting: bool,
 }
 
 /// Borrow-checks one function body.
@@ -115,9 +180,16 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         errs: Vec::new(),
         seen: HashSet::new(),
         report: false,
+        escaped: BitSet::new(0),
+        loan_block: Vec::new(),
+        loan_stmt: Vec::new(),
+        reach: Vec::new(),
+        collecting: false,
     };
     ck.collect_loans();
+    ck.escaped = BitSet::new(ck.loans.len());
     ck.compute_preds();
+    ck.compute_reach();
     ck.liveness();
     ck.dataflow();
     ck.errs
@@ -219,6 +291,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // Synthetic loans for reference parameters, so returned references can be traced to them.
         for l in 1..=self.body.arg_count {
             if contains_ref(&self.body.tys, self.body.locals[l].ty) {
+                self.loan_block.push(u32::MAX);
+                self.loan_stmt.push(u32::MAX);
                 self.loans.push(Loan {
                     place: Place::local(l as Local).deref(),
                     mutable: false,
@@ -232,6 +306,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for (bi, b) in self.body.blocks.iter().enumerate() {
             for (si, s) in b.stmts.iter().enumerate() {
                 if let StmtKind::Assign(dest, Rvalue::Ref(m, place)) = &s.kind {
+                    self.loan_block.push(bi as u32);
+                    self.loan_stmt.push(si as u32);
                     self.loan_at.insert((bi as u32, si as u32), self.loans.len());
                     holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
                     self.loans.push(Loan { place: place.clone(), mutable: *m, synthetic: false, span: s.span, last_use: None });
@@ -307,6 +383,29 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 self.preds[s.0 as usize].push(bi as u32);
             }
         }
+    }
+
+    fn compute_reach(&mut self) {
+        let nb = self.body.blocks.len();
+        self.reach = (0..nb)
+            .map(|start| {
+                let mut seen = BitSet::new(nb);
+                let mut stack = vec![start];
+                while let Some(b) = stack.pop() {
+                    if seen.contains(b) {
+                        continue;
+                    }
+                    seen.insert(b);
+                    stack.extend(successors(&self.body.blocks[b].term).into_iter().map(|s| s.0 as usize));
+                }
+                seen
+            })
+            .collect();
+    }
+
+    /// True if block `b` can reach itself again through at least one edge (it is in a loop).
+    fn loops_back(&self, b: u32) -> bool {
+        successors(&self.body.blocks[b as usize].term).iter().any(|s| self.reach[s.0 as usize].contains(b as usize))
     }
 
     // ---------- Liveness ----------
@@ -415,6 +514,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             maybe_uninit: BitSet::new(n),
             maybe_moved: BitSet::new(n),
             holds: vec![BitSet::new(nl); n],
+            origins: vec![BitSet::new(nl); n],
+            moved_paths: vec![Default::default(); n],
         };
         for l in 0..n {
             if l >= 1 && l <= self.body.arg_count {
@@ -426,6 +527,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for (i, loan) in self.loans.iter().enumerate() {
             if loan.synthetic {
                 st.holds[loan.place.local as usize].insert(i);
+                st.origins[loan.place.local as usize].insert(i);
             }
         }
         st
@@ -458,6 +560,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
         }
+        // One pass to learn which loans escape into a return value or behind a parameter.
+        // The reporting pass then keeps those loans live everywhere rustc's NLL does.
+        self.collecting = true;
+        for (b, st) in entry.iter().enumerate() {
+            if let Some(mut st) = st.clone() {
+                self.run_block(b as u32, &mut st);
+            }
+        }
+        self.collecting = false;
         self.report = true;
         for (b, st) in entry.into_iter().enumerate() {
             if let Some(mut st) = st {
@@ -480,6 +591,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             Terminator::Return if self.report => {
                 self.check_return(st, span);
             }
+            Terminator::Return if self.collecting => {
+                let holds = st.holds[0].clone();
+                let origins = st.origins[0].clone();
+                self.escaped.union(&holds);
+                self.escaped.union(&origins);
+            }
             _ => {}
         }
         // Nothing runs after a terminator inside this block, so no loan is live past its reads.
@@ -489,14 +606,25 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 
-    /// Loans that are live after the current statement: held by some live local.
-    fn live_loans(&self, st: &State, live: &BitSet, skip: Option<Local>) -> BitSet {
+    /// Loans that are live after the current statement: held by some live local, plus the
+    /// escaped loans (see `escaped`) at every point reachable from their creation.
+    fn live_loans(&self, st: &State, live: &BitSet, skip: Option<Local>, b: u32, si: u32) -> BitSet {
         let mut out = BitSet::new(self.loans.len());
         for l in live.iter() {
             if Some(l as Local) == skip {
                 continue;
             }
             out.union(&st.holds[l]);
+        }
+        for li in self.escaped.iter() {
+            let (lb, ls) = (self.loan_block[li], self.loan_stmt[li]);
+            if lb == u32::MAX {
+                continue;
+            }
+            let on = if lb == b { ls < si || (ls > si && self.loops_back(b)) } else { self.reach[lb as usize].contains(b as usize) };
+            if on {
+                out.insert(li);
+            }
         }
         out
     }
@@ -507,7 +635,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
             _ => None,
         };
-        let live = if self.report { self.live_loans(st, &self.live_out_stmt[b as usize][si as usize], skip) } else { BitSet::new(0) };
+        let live =
+            if self.report { self.live_loans(st, &self.live_out_stmt[b as usize][si as usize], skip, b, si) } else { BitSet::new(0) };
         match s {
             StmtKind::Assign(dest, rv) => {
                 // Reads and moves in the right-hand side.
@@ -517,6 +646,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.operand(o, span, st, &live);
                 }
                 let mut new_holds = BitSet::new(self.loans.len());
+                let mut new_origins = BitSet::new(self.loans.len());
                 match rv {
                     Rvalue::Ref(m, place) => {
                         self.check_init(place, span, st);
@@ -526,10 +656,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         }
                         self.access(place, kind, span, &live);
                         new_holds.insert(self.loan_at[&(b, si)]);
+                        new_origins.insert(self.loan_at[&(b, si)]);
                         // A reborrow through a reference depends on that reference's loans.
                         if place.proj.contains(&Proj::Deref) {
                             let h = st.holds[place.local as usize].clone();
                             new_holds.union(&h);
+                            let o = st.origins[place.local as usize].clone();
+                            new_origins.union(&o);
                         }
                     }
                     Rvalue::Discriminant(place) => {
@@ -540,6 +673,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         let info = self.p.fn_info(*f);
                         if let Some(i) = info.ret_borrows_from {
                             self.holds_of(&args[i], st, &mut new_holds);
+                            self.origins_of(&args[i], st, &mut new_origins);
                         }
                         self.flow_into_mut_args(args, st, span);
                     }
@@ -548,6 +682,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         if contains_ref(&self.body.tys, ty) {
                             for o in &ops {
                                 self.holds_of(o, st, &mut new_holds);
+                                self.origins_of(o, st, &mut new_origins);
                             }
                         }
                         if let Rvalue::Builtin(Builtin::VecPush, args) = rv {
@@ -563,17 +698,26 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
                     }
                     self.access(dest, Access::Write, span, &live);
-                    self.check_store_into_param_ref(dest, &new_holds, st, span);
+                    self.check_store_into_param_ref(dest, &new_origins, st, span);
                     st.maybe_init.insert(l);
                     st.maybe_uninit.remove(l);
                     st.maybe_moved.remove(l);
+                    st.moved_paths[l].clear();
                     st.holds[l] = new_holds;
+                    st.origins[l].union(&new_origins);
                 } else {
-                    self.check_init(dest, span, st);
+                    self.check_init_write(dest, span, st);
                     self.check_mutability(dest, span, st, false);
                     self.access(dest, Access::Write, span, &live);
-                    self.check_store_into_param_ref(dest, &new_holds, st, span);
+                    self.check_store_into_param_ref(dest, &new_origins, st, span);
+                    // Writing a field puts back a field that was moved out, and every
+                    // field below it. Other moved fields stay moved.
+                    let (path, exact) = field_prefix(dest);
+                    if exact {
+                        st.moved_paths[dest.local as usize].retain(|m| !is_prefix(&path, m));
+                    }
                     st.holds[dest.local as usize].union(&new_holds);
+                    st.origins[dest.local as usize].union(&new_origins);
                 }
             }
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
@@ -584,6 +728,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 st.maybe_uninit.insert(li);
                 if matches!(s, StmtKind::StorageDead(_)) {
                     st.holds[li].clear();
+                    st.origins[li].clear();
+                    st.moved_paths[li].clear();
                 }
             }
             StmtKind::FakeRead(l) => {
@@ -677,8 +823,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     /// parameter local itself and to places behind a parameter-derived reference
     /// (`*slot = &local`), but not to a plain local holding a reborrow: its lifetime
     /// can shrink, so NLL rules apply there.
-    fn check_store_into_param_ref(&mut self, dest: &Place, new_holds: &BitSet, st: &State, span: Span) {
-        if !self.report {
+    fn check_store_into_param_ref(&mut self, dest: &Place, new_origins: &BitSet, st: &State, span: Span) {
+        if !self.report && !self.collecting {
             return;
         }
         let root = dest.local;
@@ -691,12 +837,25 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         if origins.is_empty() {
             return;
         }
-        self.check_incoming_loans(&origins, new_holds, root, span);
+        if self.collecting {
+            self.escaped.union(new_origins);
+            return;
+        }
+        // `new_origins` holds every loan the source local ever held, so a value that was
+        // first borrowed from the wrong place and only later from the right parameter is
+        // still rejected. Rust gives the source local one lifetime; it cannot change.
+        self.check_incoming_loans(&origins, new_origins, root, span);
     }
 
     fn holds_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
         if let Operand::Copy(p) | Operand::Move(p) = o {
             out.union(&st.holds[p.local as usize]);
+        }
+    }
+
+    fn origins_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
+        if let Operand::Copy(p) | Operand::Move(p) = o {
+            out.union(&st.origins[p.local as usize]);
         }
     }
 
@@ -711,12 +870,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 continue;
             }
             let mut incoming = BitSet::new(self.loans.len());
+            let mut incoming_origins = BitSet::new(self.loans.len());
             for (j, b) in args.iter().enumerate() {
                 if j != i {
                     self.holds_of(b, st, &mut incoming);
+                    self.origins_of(b, st, &mut incoming_origins);
                 }
             }
-            if incoming.is_empty() {
+            if incoming.is_empty() && incoming_origins.is_empty() {
                 continue;
             }
             let targets: Vec<Local> =
@@ -724,13 +885,17 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             for t in targets {
                 // Storing into a target behind a parameter needs the same origin check
                 // as a direct assignment behind a parameter reference.
-                if self.report {
-                    let origins = self.loan_origins(&st.holds[t as usize]);
-                    if !origins.is_empty() {
-                        self.check_incoming_loans(&origins, &incoming, t, span);
+                let origins = self.loan_origins(&st.holds[t as usize]);
+                if !origins.is_empty() {
+                    if self.collecting {
+                        self.escaped.union(&incoming_origins);
+                    }
+                    if self.report {
+                        self.check_incoming_loans(&origins, &incoming_origins, t, span);
                     }
                 }
                 st.holds[t as usize].union(&incoming);
+                st.origins[t as usize].union(&incoming_origins);
             }
         }
     }
@@ -748,14 +913,25 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             Operand::Move(p) => {
                 self.check_init(p, span, st);
                 self.access(p, Access::Move, span, live);
-                // Moving a payload out of a local enum or struct (`match opt { Some(s) => .. }`)
-                // moves the whole local: it cannot be used again.
-                let partial = p.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_)));
-                if partial {
+                // A move out of a local, or out of one of its fields. Moving one field is a
+                // partial move: sibling fields stay usable, but the moved field and every
+                // value that contains it do not, until the field is assigned again. Rust
+                // also forbids partial moves out of a type with a `Drop` impl (E0509).
+                // Lust rejects trait impls, so no lust type has a user `Drop` impl yet and
+                // every struct, enum, and `Option` here may be moved out of by field. When
+                // `Drop` impls land, reject a non-empty path for such a root type here.
+                let (path, exact) = field_prefix(p);
+                if exact {
                     let l = p.local as usize;
-                    st.maybe_init.remove(l);
-                    st.maybe_uninit.insert(l);
-                    st.maybe_moved.insert(l);
+                    if path.is_empty() {
+                        st.maybe_init.remove(l);
+                        st.maybe_uninit.insert(l);
+                        st.maybe_moved.insert(l);
+                        st.moved_paths[l].clear();
+                        st.moved_paths[l].insert(path);
+                    } else {
+                        st.moved_paths[l].insert(path);
+                    }
                 } else {
                     self.bad_move(p, span);
                 }
@@ -787,8 +963,61 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     fn check_init(&mut self, p: &Place, span: Span, st: &State) {
+        if !self.report {
+            return;
+        }
         let l = p.local as usize;
-        if self.report && st.maybe_uninit.contains(l) {
+        let (path, exact) = field_prefix(p);
+        // A moved field blocks uses of itself, of fields below it, and of every value
+        // that contains it. A sibling field is fine.
+        for m in &st.moved_paths[l] {
+            let name = self.local_name(p.local);
+            let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
+            if is_prefix(m, &path) {
+                self.err("L0301", span, format!("use of moved value: {name}"), fix);
+                return;
+            }
+            if exact && is_prefix(&path, m) {
+                self.err("L0301", span, format!("use of partially moved value: {name}"), fix);
+                return;
+            }
+        }
+        if st.maybe_uninit.contains(l) {
+            let name = self.local_name(p.local);
+            if st.maybe_moved.contains(l) {
+                let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
+                self.err("L0301", span, format!("use of moved value: {name}"), fix);
+            } else {
+                self.err(
+                    "L0310",
+                    span,
+                    format!("{name} is used before it is assigned on some path"),
+                    "Assign a value on every path before this use.",
+                );
+            }
+        }
+    }
+
+    /// The check for a write through a projection (`p.x = ...`). Writing a moved-out
+    /// field puts it back, and writing a value puts back every moved field below it.
+    /// Writing under a moved-out field, or into a value that was never assigned, is
+    /// still an error.
+    fn check_init_write(&mut self, p: &Place, span: Span, st: &State) {
+        if !self.report {
+            return;
+        }
+        let l = p.local as usize;
+        let (path, exact) = field_prefix(p);
+        for m in &st.moved_paths[l] {
+            let under_moved = is_prefix(m, &path) && !(exact && m.len() == path.len());
+            if under_moved {
+                let name = self.local_name(p.local);
+                let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
+                self.err("L0301", span, format!("use of moved value: {name}"), fix);
+                return;
+            }
+        }
+        if st.maybe_uninit.contains(l) && st.moved_paths[l].is_empty() {
             let name = self.local_name(p.local);
             if st.maybe_moved.contains(l) {
                 let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
@@ -867,6 +1096,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             if loan.synthetic {
                 continue;
             }
+            // A write to a whole local is shallow: writing a reference local itself does
+            // not touch the value behind it, so a loan on `*a` does not block `a = ...`.
+            if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) {
+                continue;
+            }
             let conflict = match kind {
                 Access::Read | Access::BorrowShared => loan.mutable && overlap(p, &loan.place),
                 Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place),
@@ -924,7 +1158,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     fn check_return(&mut self, st: &State, span: Span) {
         let expected = self.p.fn_info(self.body.fn_id).ret_borrows_from.map(|i| (i + 1) as Local);
-        let holds = st.holds[0].clone();
+        // Every loan the return value ever held counts (see `State::origins`): a local
+        // that first borrowed from a local value and only later from the right parameter
+        // still cannot be returned, because its lifetime is fixed.
+        let mut holds = st.holds[0].clone();
+        holds.union(&st.origins[0].clone());
         for li in holds.iter() {
             let loan = &self.loans[li];
             let root = loan.place.local;
