@@ -1595,6 +1595,19 @@ impl Rewrite<'_> {
         }
     }
 
+    /// Rewrites a struct-literal or pattern path. A variant brought in
+    /// by `use E::*` or `use E::V` binds in the value namespace, so
+    /// probe it first; a plain struct name takes the type path as before.
+    fn rewrite_ctor_path(&mut self, segs: &mut Vec<PathSeg>, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
+        let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
+        let (res, local) = self.resolve(&names, Namespace::Value, module, scopes);
+        if !local && matches!(res, PathRes::Done(Target::Variant(..))) {
+            self.rewrite_path(segs, Namespace::Value, span, module, scopes, ast);
+        } else {
+            self.rewrite_path(segs, Namespace::Type, span, module, scopes, ast);
+        }
+    }
+
     /// Rewrites one written path (segments borrowed out of the arena by
     /// the caller, then put back through `set`).
     fn rewrite_path(&mut self, segs: &mut Vec<PathSeg>, ns: Namespace, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
@@ -1829,14 +1842,14 @@ impl Rewrite<'_> {
                 ast.pats[id.0 as usize] = Pat::Path(segs);
             }
             Pat::TupleStruct { path: mut s, elems } => {
-                self.rewrite_path(&mut s, Namespace::Type, span, module, scopes, ast);
+                self.rewrite_ctor_path(&mut s, span, module, scopes, ast);
                 for e in &elems {
                     self.pat(ast, *e, module, scopes);
                 }
                 ast.pats[id.0 as usize] = Pat::TupleStruct { path: s, elems };
             }
             Pat::Struct { path: mut s, fields, rest } => {
-                self.rewrite_path(&mut s, Namespace::Type, span, module, scopes, ast);
+                self.rewrite_ctor_path(&mut s, span, module, scopes, ast);
                 for (_, f) in &fields {
                     self.pat(ast, *f, module, scopes);
                 }
@@ -1899,7 +1912,7 @@ impl Rewrite<'_> {
             let Expr::StructLit { path: mut segs, fields, update } = std::mem::replace(&mut ast.exprs[id.0 as usize], Expr::Unit) else {
                 return;
             };
-            self.rewrite_path(&mut segs, Namespace::Type, span, module, scopes, ast);
+            self.rewrite_ctor_path(&mut segs, span, module, scopes, ast);
             for (_, _, e) in &fields {
                 let e = *e;
                 self.expr(ast, e, module, scopes);
