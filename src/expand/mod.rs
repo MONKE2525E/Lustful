@@ -191,7 +191,7 @@ pub fn hash_token(h: &mut impl Hasher, tok: &Token, strings: &[String]) {
             v.hash(h);
             suffix.map(|s| s as u8).hash(h);
         }
-        Tok::Str(i) | Tok::Float(i) => strings.get(i as usize).hash(h),
+        Tok::Str(i) | Tok::Float(i) | Tok::DocStr(i) => strings.get(i as usize).hash(h),
         Tok::Char(c) => c.hash(h),
         _ => {}
     }
@@ -218,6 +218,29 @@ pub fn hash_tts(trees: &[Tt], strings: &[String]) -> u64 {
         }
     }
     go(&mut h, trees, strings);
+    h.finish()
+}
+
+/// Hashes the spans of token trees against `base`: each token's file
+/// and its byte range minus `base`, in tree order. With the first
+/// token's start as base this is the trees' spacing shape, unchanged
+/// when the code only moves; with base 0 it is the absolute layout.
+/// Expansion reads spans (`line!`, `stringify!` spacing), so cache
+/// keys and definition fingerprints must include what they read.
+pub fn span_hash_tts(trees: &[Tt], base: u32) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    fn go(h: &mut impl Hasher, trees: &[Tt], base: u32) {
+        for tree in trees {
+            let span = tree.span();
+            span.file.0.hash(h);
+            span.lo.wrapping_sub(base).hash(h);
+            span.hi.wrapping_sub(base).hash(h);
+            if let Tt::Delim(_, inner, _) | Tt::Frag(_, inner, _) = tree {
+                go(h, inner, base);
+            }
+        }
+    }
+    go(&mut h, trees, base);
     h.finish()
 }
 
@@ -324,6 +347,21 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
         }
         Float(i) => return strings.get(*i as usize).cloned().unwrap_or_default(),
         Str(i) => return format!("{:?}", strings.get(*i as usize).map_or("", String::as_str)),
+        // A doc comment's literal prints as the raw string rustc uses
+        // for it in token streams, with enough `#`s to close safely.
+        DocStr(i) => {
+            let text = strings.get(*i as usize).map_or("", String::as_str);
+            let mut hashes = 0usize;
+            let bytes = text.as_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if b == b'"' {
+                    let run = bytes[j + 1..].iter().take_while(|&&c| c == b'#').count();
+                    hashes = hashes.max(run + 1);
+                }
+            }
+            let marks = "#".repeat(hashes);
+            return format!("r{marks}\"{text}\"{marks}");
+        }
         ByteStr => return "b\"\"".to_string(),
         ByteChar => return "b'?'".to_string(),
         Char(c) => return format!("{c:?}"),
@@ -378,6 +416,7 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
         Dot => ".",
         DotDot => "..",
         DotDotEq => "..=",
+        Ellipsis => "...",
         Arrow => "->",
         FatArrow => "=>",
         Eq => "=",
@@ -422,7 +461,9 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
 /// same kind and same value. Span and context do not take part.
 pub fn tok_matches(pattern: &Tok, input: &Tok, strings: &[String]) -> bool {
     match (pattern, input) {
-        (Tok::Str(a), Tok::Str(b)) | (Tok::Float(a), Tok::Float(b)) => strings.get(*a as usize) == strings.get(*b as usize),
+        (Tok::Str(a), Tok::Str(b)) | (Tok::Float(a), Tok::Float(b)) | (Tok::DocStr(a), Tok::DocStr(b)) => {
+            strings.get(*a as usize) == strings.get(*b as usize)
+        }
         _ => pattern == input,
     }
 }
@@ -504,7 +545,10 @@ pub fn compile_macro(
         exported,
         local_def: false,
         def_span,
-        fingerprint: hash_tts(body, strings),
+        // The fingerprint includes the body's spacing shape: an edit
+        // that only respaces a template (`stringify!(x+y)` to
+        // `stringify!(x + y)`) must not hit a cached transcription.
+        fingerprint: hash_tts(body, strings) ^ span_hash_tts(body, body.first().map_or(0, |t| t.span().lo)),
         name_text: interner.get(name).to_string(),
     })
 }
@@ -594,6 +638,14 @@ impl Call {
 struct CacheKey {
     def_fingerprint: u64,
     input_hash: u64,
+    /// Absolute input layout and the call site: a transcription embeds
+    /// the caller's token spans, and `line!` and `stringify!` in the
+    /// output read them, so the same tokens at a new position or with
+    /// new spacing are a different expansion.
+    input_span_hash: u64,
+    call_file: u32,
+    call_lo: u32,
+    call_hi: u32,
     call_ctxt: u32,
     cfg_hash: u64,
     edition: u16,
@@ -760,6 +812,7 @@ impl<'a> Expander<'a> {
                         let tok = match tok.tok {
                             Tok::Str(i) => Tok::Str(i + offset),
                             Tok::Float(i) => Tok::Float(i + offset),
+                            Tok::DocStr(i) => Tok::DocStr(i + offset),
                             other => other,
                         };
                         Tt::Tok(Token { tok, span })
@@ -790,6 +843,7 @@ impl<'a> Expander<'a> {
                         let kind = match tok.tok {
                             Tok::Str(i) => Tok::Str(i + offset),
                             Tok::Float(i) => Tok::Float(i + offset),
+                            Tok::DocStr(i) => Tok::DocStr(i + offset),
                             other => other,
                         };
                         Tt::Tok(Token { tok: kind, span: tok.span })
@@ -1143,6 +1197,10 @@ impl<'a> Expander<'a> {
         let key = CacheKey {
             def_fingerprint: def.fingerprint,
             input_hash: hash_tts(&call.inner, &self.strings),
+            input_span_hash: span_hash_tts(&call.inner, 0),
+            call_file: call.span.file.0,
+            call_lo: call.span.lo,
+            call_hi: call.span.hi,
             call_ctxt: call.span.ctxt.0,
             cfg_hash: self.ctx.cfg.hash(),
             edition: 2024,
@@ -2032,5 +2090,18 @@ mod tests {
         let known = Known::new(&interner);
         let out = expand_src(&interner, &known, "fn main() { let _s = stringify!(a+b); }").expect("expansion");
         assert!(out.iter().any(|t| t == "\"a+b\""), "tokens: {out:?}");
+    }
+
+    /// Two calls of one macro whose inputs differ only in spacing are
+    /// different expansions for `stringify!`: the cache key reads the
+    /// input spans, so the second call does not reuse the first's.
+    #[test]
+    fn stringify_spacing_not_cached_across_calls() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let src = "macro_rules! s { ($e:expr) => { stringify!($e) }; }\nfn main() { let _a = s!(f(a,b)); let _b = s!(f( a , b )); }";
+        let out = expand_src(&interner, &known, src).expect("expansion");
+        assert!(out.iter().any(|t| t == "\"f(a,b)\""), "tokens: {out:?}");
+        assert!(out.iter().any(|t| t == "\"f(a, b)\""), "tokens: {out:?}");
     }
 }

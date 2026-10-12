@@ -254,6 +254,7 @@ fn tok_name(t: Tok) -> &'static str {
         Int(..) => "integer literal",
         Float(_) => "float literal",
         Str(_) => "string literal",
+        DocStr(_) => "doc comment string",
         ByteStr => "byte string literal",
         ByteChar => "byte char literal",
         Char(_) => "char literal",
@@ -309,6 +310,7 @@ fn tok_name(t: Tok) -> &'static str {
         Dot => "`.`",
         DotDot => "`..`",
         DotDotEq => "`..=`",
+        Ellipsis => "`...`",
         Arrow => "`->`",
         FatArrow => "`=>`",
         Eq => "`=`",
@@ -678,6 +680,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ if first == k.test && !inner => out.is_test = true,
+                // Doc comments lex to this attribute; it carries no code.
+                _ if name_text == "doc" => {}
                 _ if name_text == "repr" => {}
                 _ if first == k.allow || first == k.warn || first == k.deny => {}
                 _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}

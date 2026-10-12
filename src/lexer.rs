@@ -27,6 +27,12 @@ pub enum Tok {
     Float(u32),
     /// Index into `Lexed::strings`.
     Str(u32),
+    /// The string of a doc comment (`///`, `/** */`, and kin). The lexer
+    /// emits a doc comment as the `#[doc = ...]` tokens it stands for in
+    /// rustc's token trees; this is the literal's index into
+    /// `Lexed::strings`, holding the comment text. `stringify!` prints it
+    /// as the raw string rustc prints (`r" hi"`).
+    DocStr(u32),
     /// A byte string (`b".."`, `br".."`) or C string (`c".."`, `cr".."`) literal. The bytes
     /// are not stored: the parser rejects the form before any value is needed.
     ByteStr,
@@ -88,6 +94,9 @@ pub enum Tok {
     Dot,
     DotDot,
     DotDotEq,
+    /// `...`: one token tree in rustc, so macro matching and tt
+    /// counting must see it whole, not as `..` plus `.`.
+    Ellipsis,
     Arrow,
     FatArrow,
     Eq,
@@ -185,7 +194,9 @@ pub fn build_trees(toks: &[Token]) -> (Vec<TokenTree>, bool) {
             match stack.last() {
                 Some((d, _, _)) if closes(*d, t.tok) => {
                     let (d, span, inner) = stack.pop().unwrap();
-                    let tree = TokenTree::Delim(d, inner, span);
+                    // A group's span covers both delimiters, so spacing
+                    // readers (`stringify!`) can see where it ends.
+                    let tree = TokenTree::Delim(d, inner, span.to(t.span));
                     match stack.last_mut() {
                         Some((_, _, parent)) => parent.push(tree),
                         None => out.push(tree),
@@ -340,6 +351,38 @@ fn suffix(s: &str) -> Option<Option<IntSuffix>> {
     }))
 }
 
+/// Emits one doc comment as the attribute tokens it stands for:
+/// `#[doc = "content"]`, or `#![doc = "content"]` for an inner comment.
+/// Spans tile the comment's own bytes in token order (with one-byte gaps
+/// where `stringify!` prints spaces), so positions stay inside the
+/// comment and the tokens that follow keep their own.
+#[allow(clippy::too_many_arguments)]
+fn push_doc_tokens(
+    tokens: &mut Vec<Token>,
+    strings: &mut Vec<String>,
+    interner: &Interner,
+    file: FileId,
+    base: u32,
+    start: usize,
+    end: usize,
+    content: &str,
+    inner: bool,
+) {
+    let at = |lo: usize, hi: usize| Span::new(file, base + lo as u32, base + hi as u32);
+    let s = start;
+    let shift = |n: usize| if inner { n + 1 } else { n };
+    tokens.push(Token { tok: Tok::Pound, span: at(s, s + 1) });
+    if inner {
+        tokens.push(Token { tok: Tok::Bang, span: at(s + 1, s + 2) });
+    }
+    tokens.push(Token { tok: Tok::LBracket, span: at(shift(s + 1), shift(s + 2)) });
+    tokens.push(Token { tok: Tok::Ident(interner.intern("doc")), span: at(shift(s + 2), shift(s + 3)) });
+    tokens.push(Token { tok: Tok::Eq, span: at(shift(s + 4), shift(s + 5)) });
+    strings.push(content.to_string());
+    tokens.push(Token { tok: Tok::DocStr(strings.len() as u32 - 1), span: at(shift(s + 6).min(end), end) });
+    tokens.push(Token { tok: Tok::RBracket, span: at(end, end) });
+}
+
 /// Lexes `src`, which starts at byte `base` of file `file`. Every token span names that
 /// file with the root context. Stops at the first error.
 pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
@@ -363,6 +406,13 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
+            // A doc comment is tokens (`#[doc = ...]`), not whitespace:
+            // macro inputs count it as two token trees. `////` is plain.
+            let inner = b.get(start + 2) == Some(&b'!');
+            if inner || (b.get(start + 2) == Some(&b'/') && b.get(start + 3) != Some(&b'/')) {
+                let content = src[start + 3..i].strip_suffix('\r').unwrap_or(&src[start + 3..i]);
+                push_doc_tokens(&mut tokens, &mut strings, interner, file, base, start, i, content, inner);
+            }
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
@@ -383,6 +433,13 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             }
             if depth != 0 {
                 return Err(err(start, i, "unterminated block comment"));
+            }
+            // `/*! .. */` and `/** .. */` are doc comments; `/***` and
+            // `/**/` are plain block comments.
+            let inner = b.get(start + 2) == Some(&b'!');
+            let outer = b.get(start + 2) == Some(&b'*') && b.get(start + 3) != Some(&b'*') && &b[start..i] != b"/**/";
+            if (inner || outer) && i >= start + 5 {
+                push_doc_tokens(&mut tokens, &mut strings, interner, file, base, start, i, &src[start + 3..i - 2], inner);
             }
             continue;
         }
@@ -448,6 +505,16 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 }
                 i += 1;
                 Tok::ByteChar
+            } else if raw_open(b, i).is_some() || b.get(i) == Some(&b'\'') {
+                // An identifier right against a quote is a reserved
+                // literal prefix (`f"x"`, `f#"x"#`, `f'x'`): rustc
+                // rejects every prefix but the ones handled above.
+                return Err(Diag::new(
+                    "L0001",
+                    Span::new(file, base + start as u32, base + i as u32),
+                    format!("prefix `{s}` is unknown"),
+                    "Prefixed identifiers and literals are reserved. Insert whitespace, or use a known prefix (r, b, c, br, cr).",
+                ));
             }
             // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
             else if s == "r"
@@ -537,10 +604,21 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::Char(ch)
             }
         } else {
+            // `#` runs are reserved in edition 2024: a guarded string
+            // (`#"x"#`) and a multi-hash (`##`) are lexer errors, not
+            // a `#` token next to a literal or another `#`.
+            if c == b'#' && b.get(i + 1) == Some(&b'"') {
+                return Err(err(start, start + 2, "invalid string literal: unprefixed guarded strings are reserved"));
+            }
+            if c == b'#' && b.get(i + 1) == Some(&b'#') {
+                return Err(err(start, start + 2, "reserved multi-hash token is forbidden"));
+            }
             let two = if i + 1 < b.len() { &b[i..i + 2] } else { &b[i..i + 1] };
             let three = if i + 2 < b.len() { &b[i..i + 3] } else { &[][..] };
             let (t, n) = if three == b"..=" {
                 (Tok::DotDotEq, 3)
+            } else if three == b"..." {
+                (Tok::Ellipsis, 3)
             } else if three == b"<<=" {
                 (Tok::ShlEq, 3)
             } else {
@@ -652,6 +730,17 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
                 *i += 1;
             }
         }
+        return Some(float_tok(src, start, *i, strings));
+    }
+    // A trailing dot with no digits after it is still a float (`1.`) when
+    // the dot does not start a range (`1..2`) or a field or method name
+    // (`1.foo()`): rustc lexes it as one float literal token.
+    if radix == 10
+        && b.get(*i) == Some(&b'.')
+        && b.get(*i + 1) != Some(&b'.')
+        && !b.get(*i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80)
+    {
+        *i += 1;
         return Some(float_tok(src, start, *i, strings));
     }
     // An exponent with no dot: `1e3`, `1e-3`, `1e3f64`. Not an identifier suffix:
