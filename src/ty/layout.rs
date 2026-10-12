@@ -140,10 +140,11 @@ pub fn nonzero_layout(t: IntTy) -> Layout {
     l
 }
 
-/// The layout of `[elem; len]`. A one-element array keeps the element niche.
+/// The layout of `[elem; len]`. A non-empty array keeps the element niche
+/// at offset 0, as rustc does: the first element sits there.
 pub fn array_layout(elem: &Layout, len: u64) -> Result<Layout, ()> {
     let size = elem.size.checked_mul(len).ok_or(())?;
-    let niche = if len == 1 { elem.niche } else { None };
+    let niche = if len > 0 { elem.niche } else { None };
     Ok(Layout::simple(size, elem.align, niche))
 }
 
@@ -246,28 +247,43 @@ fn tag_width(discs: &[i128]) -> Result<(u64, bool), ()> {
 }
 
 /// Free values and first free value of an explicit tag scalar, under rustc's
-/// valid-range model: valid values are the contiguous range from the smallest
-/// to the largest discriminant, read as bit patterns of the tag width.
+/// wrapping valid-range model: the valid values form the smallest wrapping
+/// arc of bit patterns that covers every discriminant, and the niche is the
+/// rest of the circle (the largest gap between consecutive discriminants in
+/// bit order). Negative discriminants therefore keep their niche: the signed
+/// range, read as bit patterns, is one wrapping arc. Niche values run
+/// upward from `start`, wrapping at the top of the scalar range.
 fn tag_niche(width: u64, discs: &[i128]) -> Option<Niche> {
     if discs.is_empty() {
         return None;
     }
     let bits = width * 8;
-    let total: u128 = if bits >= 128 { u128::MAX } else { 1u128 << bits };
     let mask: u128 = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
-    let lo = (*discs.iter().min().unwrap() as u128) & mask;
-    let hi = (*discs.iter().max().unwrap() as u128) & mask;
-    // Discriminants that wrap the signed range edge make the valid range
-    // non-contiguous in bit order; report no niche rather than a wrong one.
-    if hi < lo {
+    let mut pats: Vec<u128> = discs.iter().map(|&d| (d as u128) & mask).collect();
+    pats.sort_unstable();
+    pats.dedup();
+    // The largest gap between consecutive patterns, in circular bit order.
+    let mut best_start: u128 = 0;
+    let mut best_free: u128 = 0;
+    for (i, &cur) in pats.iter().enumerate() {
+        let next = pats[(i + 1) % pats.len()];
+        let gap = next.wrapping_sub(cur).wrapping_sub(1) & mask;
+        if i + 1 == pats.len() && pats.len() > 1 && bits < 128 {
+            // The wrap pair: distance runs through the top of the range.
+            let gap = (mask - cur) + next;
+            if gap > best_free {
+                best_free = gap;
+                best_start = cur.wrapping_add(1) & mask;
+            }
+        } else if gap > best_free {
+            best_free = gap;
+            best_start = cur.wrapping_add(1) & mask;
+        }
+    }
+    if best_free == 0 {
         return None;
     }
-    let valid = hi - lo + 1;
-    let free = total.saturating_sub(valid);
-    if free == 0 {
-        return None;
-    }
-    Some(Niche { offset: 0, scalar_size: width, free, start: (hi + 1) & mask })
+    Some(Niche { offset: 0, scalar_size: width, free: best_free, start: best_start })
 }
 
 /// One variant laid out as a struct that starts with a tag of `tag_w` bytes:
@@ -399,14 +415,39 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
         l.enum_tag = Some(EnumTag::Explicit { size: tag_w, signed });
         return finish(l, repr);
     }
-    let fixed = repr.int.is_some() || repr.kind == ReprKind::C;
+    if repr.kind == ReprKind::C {
+        // repr(C) data enums are `struct { tag; union { variant structs } }`:
+        // each variant payload is a repr(C) struct of its fields (no tag
+        // inside), and the union starts after the tag, aligned to the
+        // largest payload alignment. Only repr(int) alone keeps the tag
+        // first inside each variant struct (the `fixed` path below).
+        let mut union_size = 0u64;
+        let mut union_align = 1u64;
+        let mut payloads: Vec<Layout> = Vec::with_capacity(variants.len());
+        for v in variants {
+            let pl = struct_layout(v, Repr { kind: ReprKind::C, ..Repr::default() })?;
+            union_size = union_size.max(pl.size);
+            union_align = union_align.max(pl.align);
+            payloads.push(pl);
+        }
+        let payload_off = align_up(tag_w, union_align);
+        let align = tag_w.max(1).max(union_align);
+        let size = align_up(payload_off + union_size, align);
+        let variant_offsets: Vec<Vec<u64>> =
+            payloads.iter().map(|pl| pl.field_offsets.iter().map(|&o| payload_off + o).collect()).collect();
+        let mut l = Layout::simple(size, align, tag_niche(tag_w, discs));
+        l.variant_offsets = variant_offsets;
+        l.enum_tag = Some(EnumTag::Explicit { size: tag_w, signed });
+        return finish(l, repr);
+    }
+    let fixed = repr.int.is_some();
     let layout_with = |tag_w: u64| -> (u64, u64, Vec<Vec<u64>>) {
         let mut size = 0u64;
         let mut align = tag_w.max(1);
         let mut variant_offsets = Vec::new();
         for v in variants {
             let (end, a, offs) = if fixed {
-                // repr(int) and repr(C) keep declaration order after the tag.
+                // repr(int) keeps declaration order after the tag.
                 let mut offs = vec![0u64; v.len()];
                 let mut cur = tag_w;
                 let mut a = tag_w.max(1);
@@ -480,22 +521,37 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
     if niche.free < others {
         return None;
     }
+    // Another variant may need a larger alignment than the niche variant
+    // (a u128 payload next to an align-8 niche variant): the enum then
+    // takes that alignment, and its size is rounded up to it. The other
+    // fields must still fit in that size outside the niche scalar bytes.
+    let mut eff_align = base.align;
+    for (i, v) in variants.iter().enumerate() {
+        if i != vi {
+            for f in v {
+                eff_align = eff_align.max(f.align);
+            }
+        }
+    }
+    let eff_size = align_up(base.size, eff_align);
     let mut variant_offsets: Vec<Vec<u64>> = Vec::with_capacity(variants.len());
     for (i, v) in variants.iter().enumerate() {
         if i == vi {
             variant_offsets.push(base.field_offsets.clone());
         } else {
-            if v.iter().any(|f| f.align > base.align && f.size > 0) {
-                return None;
-            }
-            variant_offsets.push(fits_outside_niche(v, base.size, niche)?);
+            variant_offsets.push(fits_outside_niche(v, eff_size, niche)?);
         }
     }
     let remaining = niche.free - others;
+    let niche_mask: u128 = if niche.scalar_size * 8 >= 128 { u128::MAX } else { (1u128 << (niche.scalar_size * 8)) - 1 };
     let mut l = Layout::simple(
-        base.size,
-        base.align,
-        if remaining > 0 { Some(Niche { free: remaining, start: niche.start + others, ..niche }) } else { None },
+        eff_size,
+        eff_align,
+        if remaining > 0 {
+            Some(Niche { free: remaining, start: niche.start.wrapping_add(others) & niche_mask, ..niche })
+        } else {
+            None
+        },
     );
     l.variant_offsets = variant_offsets;
     l.enum_tag = Some(EnumTag::NicheFilled { variant: vi, niche });
@@ -745,6 +801,79 @@ mod tests {
         assert_eq!(sz(&l), (8, 8));
         let o = enum_layout(&[vec![], vec![l]], &[0, 1], Repr::default()).unwrap();
         assert_eq!(o.size, 8);
+    }
+
+    #[test]
+    fn repr_c_data_enum_is_tag_plus_union() {
+        // #[repr(C)] enum { V0(i16, f64) }: tag 4, payload at 8, f64 at 16. 24.
+        let l = enum_layout(
+            &[vec![int_layout(IntTy::I16), float_layout(FloatTy::F64)]],
+            &[0],
+            Repr { kind: ReprKind::C, ..Repr::default() },
+        )
+        .unwrap();
+        assert_eq!(sz(&l), (24, 8));
+        assert_eq!(l.variant_offsets, vec![vec![8, 16]]);
+        // #[repr(C, u8)] enum { V0(bool, u8), V1(Option<char>, u128, u128) } is 64.
+        let opt_char = enum_layout(&[vec![], vec![char_layout()]], &[0, 1], Repr::default()).unwrap();
+        let l = enum_layout(
+            &[vec![bool_layout(), int_layout(IntTy::U8)], vec![opt_char, int_layout(IntTy::U128), int_layout(IntTy::U128)]],
+            &[0, 1],
+            Repr { kind: ReprKind::C, int: Some((8, false)), ..Repr::default() },
+        )
+        .unwrap();
+        assert_eq!(sz(&l), (64, 16));
+        assert_eq!(l.variant_offsets[1], vec![16, 32, 48]);
+        // repr(u8) alone keeps the tag in each variant struct: same shape is 48.
+        let opt_char = enum_layout(&[vec![], vec![char_layout()]], &[0, 1], Repr::default()).unwrap();
+        let l = enum_layout(
+            &[vec![bool_layout(), int_layout(IntTy::U8)], vec![opt_char, int_layout(IntTy::U128), int_layout(IntTy::U128)]],
+            &[0, 1],
+            Repr { int: Some((8, false)), ..Repr::default() },
+        )
+        .unwrap();
+        assert_eq!(sz(&l), (48, 16));
+    }
+
+    #[test]
+    fn array_carries_element_niche() {
+        // Option<[bool; 2]> is 2 and Option<[char; 3]> is 12.
+        let a = array_layout(&bool_layout(), 2).unwrap();
+        let l = enum_layout(&[vec![], vec![a]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 2);
+        let a = array_layout(&char_layout(), 3).unwrap();
+        let l = enum_layout(&[vec![], vec![a]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 12);
+        // An empty array carries no niche: Option<[bool; 0]> is 1 (the tag).
+        let a = array_layout(&bool_layout(), 0).unwrap();
+        assert_eq!(a.niche, None);
+        let l = enum_layout(&[vec![], vec![a]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 1);
+    }
+
+    #[test]
+    fn niche_fit_allows_align16_other_variant() {
+        // enum { V0(u128), V1([u64; 2], (bool, u64)) } is 32, align 16.
+        let arr = array_layout(&int_layout(IntTy::U64), 2).unwrap();
+        let tup = struct_layout(&[bool_layout(), int_layout(IntTy::U64)], Repr::default()).unwrap();
+        let l = enum_layout(&[vec![int_layout(IntTy::U128)], vec![arr, tup]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(sz(&l), (32, 16));
+        assert!(matches!(l.enum_tag, Some(EnumTag::NicheFilled { .. })));
+    }
+
+    #[test]
+    fn negative_discriminants_keep_tag_niche() {
+        // Option of each of these fieldless enums is 1 byte.
+        for discs in [&[-1i128, 127][..], &[-128, 127][..], &[0, 255][..], &[-100, 100][..]] {
+            let e = enum_layout(&[vec![], vec![]], discs, Repr::default()).unwrap();
+            assert_eq!(e.size, 1, "discs {discs:?}");
+            let o = enum_layout(&[vec![], vec![e]], &[0, 1], Repr::default()).unwrap();
+            assert_eq!(o.size, 1, "discs {discs:?}");
+        }
+        // The niche is the largest gap in bit order: {-100, 100} in one
+        // byte leaves 199 free values (the small arc is 100..=156).
+        let e = enum_layout(&[vec![], vec![]], &[-100, 100], Repr::default()).unwrap();
+        assert_eq!(e.niche.map(|n| n.free), Some(199));
     }
 
     #[test]
