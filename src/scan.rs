@@ -31,6 +31,9 @@ pub struct ChunkScan {
     /// Identifiers used in each function body (parallel to `fns`), to find the bodies that
     /// mention a function whose signature changed.
     pub body_idents: Vec<Vec<Sym>>,
+    /// The chunk ends exactly at a top-level item boundary: every item it started is complete.
+    /// The driver only reuses a chunk in front of other text when this holds.
+    pub ends_at_boundary: bool,
 }
 
 /// Combines item hashes in order into the environment hash.
@@ -66,6 +69,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     let mut depth = 0usize;
     let mut impl_pending = false;
     let mut in_impl = false;
+    let mut complete = true;
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i].tok;
@@ -78,6 +82,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                 j += 1;
             }
             if j >= toks.len() || toks[j].tok != Tok::LBrace {
+                complete = false;
                 break;
             }
             let mut k = j;
@@ -97,6 +102,9 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                     break;
                 }
                 k += 1;
+            }
+            if d != 0 {
+                complete = false;
             }
             fns.push(FnScan { body_hash: body.finish(), fn_offset: toks[i].span.start, body: j..k + 1 });
             idents.sort_unstable();
@@ -140,6 +148,8 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     // A chunk ends at an item boundary, so leftover tokens are only possible on a syntax error.
     if env.finish() != FxHasher::default().finish() {
         items.push(ItemScan { hash: env.finish(), fn_name: None });
+        complete = false;
     }
-    ChunkScan { fns, items, body_idents }
+    let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending;
+    ChunkScan { fns, items, body_idents, ends_at_boundary }
 }
