@@ -1,0 +1,12 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; macro_rules ! a { ( $ x : expr ) => { b ! ( $ x ) } ; } macro_rules ! b { ( 3 ) =>
+{ 3 } ; ( $ x : expr ) => { 4 } ; } macro_rules ! ty_inner { ( Vec < u8 > ) => { "split" } ; ( $ t :
+ty ) => { "whole" } ; } macro_rules ! ty_outer { ( $ t : ty ) => { ty_inner ! ( $ t ) } ; }
+macro_rules ! id_inner { ( special ) => { "matched-special" } ; ( $ i : ident ) => { "matched-ident"
+} ; } macro_rules ! id_outer { ( $ i : ident ) => { id_inner ! ( $ i ) } ; } macro_rules ! tt_inner
+{ ( a b ) => { "two" } ; ( $ ( $ t : tt ) * ) => { "other" } ; } macro_rules ! tt_outer { ( $ ( $ t
+: tt ) * ) => { tt_inner ! ( $ ( $ t ) * ) } ; } fn main ( ) { { :: std :: io :: _print (
+format_args ! ( "direct={0} forwarded={1}\n" , 3 , 4 ) ) ; } ; { :: std :: io :: _print (
+format_args ! ( "ty direct={0} forwarded={1}\n" , "split" , "whole" ) ) ; } ; { :: std :: io ::
+_print ( format_args ! ( "ident={0} {1}\n" , "matched-special" , "matched-ident" ) ) ; } ; { :: std
+:: io :: _print ( format_args ! ( "tt={0}\n" , "two" ) ) ; } ; }

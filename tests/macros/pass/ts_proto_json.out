@@ -1,0 +1,4 @@
+marshal={"version":2,"name":"tsgo"}
+unmarshal=InitResponse { version: 7, name: "hi", ready: false }
+handle=12 display=12 zero=false name_zero=true
+modulekind=5 zero=false

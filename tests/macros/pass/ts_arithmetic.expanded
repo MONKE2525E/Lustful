@@ -1,0 +1,21 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; use std :: ops ; pub struct Number ( pub f64 ) ; # [ automatically_derived ] # [
+doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for Number { } # [
+automatically_derived ] impl :: core :: clone :: Clone for Number { # [ inline ] fn clone ( & self )
+-> Number { let _ : :: core :: clone :: AssertParamIsClone < f64 > ; * self } } # [
+automatically_derived ] impl :: core :: marker :: Copy for Number { } # [ automatically_derived ]
+impl :: core :: fmt :: Debug for Number { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish (
+f , "Number" , && self . 0 ) } } # [ automatically_derived ] impl :: core :: marker ::
+StructuralPartialEq for Number { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for
+Number { # [ inline ] fn eq ( & self , other : & Number ) -> bool { self . 0 == other . 0 } }
+macro_rules ! arithmetic { ( $ trait : ident , $ method : ident , $ operator : tt ) => { impl ops ::
+$ trait for Number { type Output = Self ; fn $ method ( self , other : Self ) -> Self { Self ( self
+. 0 $ operator other . 0 ) } } } ; } impl ops :: Add for Number { type Output = Self ; fn add ( self
+, other : Self ) -> Self { Self ( self . 0 + other . 0 ) } } impl ops :: Sub for Number { type
+Output = Self ; fn sub ( self , other : Self ) -> Self { Self ( self . 0 - other . 0 ) } } impl ops
+:: Mul for Number { type Output = Self ; fn mul ( self , other : Self ) -> Self { Self ( self . 0 *
+other . 0 ) } } impl ops :: Div for Number { type Output = Self ; fn div ( self , other : Self ) ->
+Self { Self ( self . 0 / other . 0 ) } } fn main ( ) { let a = Number ( 6.0 ) ; let b = Number ( 4.0
+) ; { :: std :: io :: _print ( format_args ! ( "{0} {1} {2} {3}\n" , ( a + b ) . 0 , ( a - b ) . 0 ,
+( a * b ) . 0 , ( a / b ) . 0 ) ) ; } ; }

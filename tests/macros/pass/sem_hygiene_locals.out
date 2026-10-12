@@ -1,0 +1,6 @@
+tmp kept=5 macro tmp plus caller tmp=105
+passed ident assigned=42
+inner count=3
+inner count=3
+outer rounds=2
+shadow inside=1 caller=9

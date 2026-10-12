@@ -1,0 +1,20 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; use std :: cell :: RefCell ; # [ macro_export ] macro_rules ! args { ( $ ( $ arg :
+expr ) , * $ ( , ) ? ) => { vec ! [ $ ( :: std :: string :: ToString :: to_string ( & $ arg ) ) , *
+] } ; } pub struct Tracer { pub log : Vec < String > , } impl Tracer { pub fn write ( & mut self ,
+msg : & str , args : Vec < String > ) { self . log . push ( :: alloc :: __export :: must_use ( { ::
+alloc :: fmt :: format ( format_args ! ( "{0}:{1:?}" , msg , args ) ) } ) ) ; } } pub struct State {
+pub tracer : Option < RefCell < Tracer >> , } macro_rules ! trace_write { ( $ state : expr , $ msg :
+expr $ ( , $ arg : expr ) * $ ( , ) ? ) => { if let Some ( tracer ) = & $ state . tracer { tracer .
+borrow_mut ( ) . write ( $ msg , args ! [ $ ( $ arg ) , * ] ) ; } } ; } fn main ( ) { let state =
+State { tracer : Some ( RefCell :: new ( Tracer { log : Vec :: new ( ) } ) ) } ; if let Some (
+tracer ) = & state . tracer { tracer . borrow_mut ( ) . write ( "resolve" , :: alloc :: boxed ::
+box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
+:: Box :: new_uninit ( ) , [ :: std :: string :: ToString :: to_string ( & "a.ts" ) , :: std ::
+string :: ToString :: to_string ( & 2 ) ] ) ) ) ; } ; if let Some ( tracer ) = & state . tracer {
+tracer . borrow_mut ( ) . write ( "done" , :: alloc :: vec :: Vec :: new ( ) ) ; } ; let quiet =
+State { tracer : None } ; if let Some ( tracer ) = & quiet . tracer { tracer . borrow_mut ( ) .
+write ( "never" , :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
+write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ :: std :: string :: ToString ::
+to_string ( & 1 ) ] ) ) ) ; } ; if let Some ( t ) = & state . tracer { { :: std :: io :: _print (
+format_args ! ( "log={0:?}\n" , t . borrow ( ) . log ) ) ; } ; } }

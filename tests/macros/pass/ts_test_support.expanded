@@ -1,0 +1,33 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; pub mod support { pub mod vfstest { pub struct MapFile ( pub String ) ; # [
+automatically_derived ] impl :: core :: clone :: Clone for MapFile { # [ inline ] fn clone ( & self
+) -> MapFile { MapFile ( :: core :: clone :: Clone :: clone ( & self . 0 ) ) } } # [
+automatically_derived ] impl :: core :: fmt :: Debug for MapFile { # [ inline ] fn fmt ( & self , f
+: & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_tuple_field1_finish ( f , "MapFile" , && self . 0 ) } } # [ automatically_derived ] impl ::
+core :: marker :: StructuralPartialEq for MapFile { } # [ automatically_derived ] impl :: core ::
+cmp :: PartialEq for MapFile { # [ inline ] fn eq ( & self , other : & MapFile ) -> bool { self . 0
+== other . 0 } } impl From < & str > for MapFile { fn from ( s : & str ) -> Self { MapFile ( s .
+to_string ( ) ) } } impl From < String > for MapFile { fn from ( s : String ) -> Self { MapFile ( s
+) } } } pub mod runner { pub type FileMap = std :: collections :: BTreeMap < String , super ::
+vfstest :: MapFile > ; } } use support :: runner :: FileMap ; use support :: vfstest :: MapFile ;
+macro_rules ! files { ( $ ( $ path : expr => $ value : expr ) , * $ ( , ) ? ) => { { # [ allow (
+unused_mut ) ] let mut files = FileMap :: new ( ) ; $ ( files . insert ( String :: from ( $ path ) ,
+MapFile :: from ( $ value ) ) ; ) * files } } ; } macro_rules ! file_map { ( $ ( $ path : expr => $
+value : expr ) , * $ ( , ) ? ) => { { # [ allow ( unused_mut ) ] let mut files = $ crate :: support
+:: runner :: FileMap :: new ( ) ; $ ( files . insert ( :: std :: string :: String :: from ( $ path )
+, $ crate :: support :: vfstest :: MapFile :: from ( $ value ) , ) ; ) * files } } ; } macro_rules !
+args { ( $ ( $ arg : expr ) , * $ ( , ) ? ) => { :: std :: vec ! [ $ ( :: std :: string :: String ::
+from ( $ arg ) ) , * ] } ; } fn main ( ) { let a = { # [ allow ( unused_mut ) ] let mut files =
+FileMap :: new ( ) ; files . insert ( String :: from ( "/src/a.ts" ) , MapFile :: from ( "aaa" ) ) ;
+files . insert ( String :: from ( "/src/b.ts" ) , MapFile :: from ( "bbb" ) ) ; files } ; let keys :
+Vec < & String > = a . keys ( ) . collect ( ) ; { :: std :: io :: _print ( format_args ! (
+"files={0} keys={1:?}\n" , a . len ( ) , keys ) ) ; } ; let b = { # [ allow ( unused_mut ) ] let mut
+files = crate :: support :: runner :: FileMap :: new ( ) ; files . insert ( :: std :: string ::
+String :: from ( "/x.ts" ) , crate :: support :: vfstest :: MapFile :: from ( "x" ) ) ; files } ; {
+:: std :: io :: _print ( format_args ! ( "file_map={0} first={1}\n" , b . len ( ) , b . values ( ) .
+next ( ) . unwrap ( ) . 0 ) ) ; } ; let argv : Vec < String > = :: alloc :: boxed ::
+box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
+:: Box :: new_uninit ( ) , [ :: std :: string :: String :: from ( "--build" ) , :: std :: string ::
+String :: from ( "proj" ) ] ) ) ; { :: std :: io :: _print ( format_args ! ( "args={0:?}\n" , argv )
+) ; } ; }

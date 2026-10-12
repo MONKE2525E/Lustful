@@ -1,0 +1,28 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; use std :: cell :: RefCell ; use std :: collections :: HashMap ; pub struct Cache (
+RefCell < HashMap < u32 , String >> ) ; # [ automatically_derived ] impl :: core :: default ::
+Default for Cache { # [ inline ] fn default ( ) -> Cache { Cache ( :: core :: default :: Default ::
+default ( ) ) } } impl Cache { pub fn get ( & self , k : & u32 ) -> Option < String > { self . 0 .
+borrow ( ) . get ( k ) . cloned ( ) } pub fn insert ( & self , k : u32 , v : String ) { self . 0 .
+borrow_mut ( ) . insert ( k , v ) ; } } pub struct Links { pub by_node : Cache , pub by_name : Cache
+, } # [ automatically_derived ] impl :: core :: default :: Default for Links { # [ inline ] fn
+default ( ) -> Links { Links { by_node : :: core :: default :: Default :: default ( ) , by_name : ::
+core :: default :: Default :: default ( ) , } } } pub struct TypeParser { links_store : Links , pub
+computes : RefCell < u32 > , } impl TypeParser { pub fn links ( & self ) -> & Links { & self .
+links_store } pub fn label ( & self , node : u32 ) -> String { { let key = node ; if let Some (
+value ) = self . links ( ) . by_node . get ( & key ) { value . clone ( ) } else { let value = { *
+self . computes . borrow_mut ( ) += 1 ; :: alloc :: __export :: must_use ( { :: alloc :: fmt ::
+format ( format_args ! ( "node-{0}" , node ) ) } ) } ; self . links ( ) . by_node . insert ( key ,
+value . clone ( ) ) ; value } } } pub fn titled ( & self , node : u32 ) -> String { { let key = node
+; if let Some ( value ) = self . links ( ) . by_name . get ( & key ) { value . clone ( ) } else {
+let value = 'compute : { * self . computes . borrow_mut ( ) += 1 ; break 'compute :: alloc ::
+__export :: must_use ( { :: alloc :: fmt :: format ( format_args ! ( "title-{0}" , node ) ) } ) ; }
+; self . links ( ) . by_name . insert ( key , value . clone ( ) ) ; value } } } } # [ macro_export ]
+# [ doc ( hidden ) ] macro_rules ! effect_cached { ( $ tp : expr , $ field : ident , $ key : expr ,
+$ compute : expr ) => { { let key = $ key ; if let Some ( value ) = $ tp . links ( ) . $ field . get
+( & key ) { value . clone ( ) } else { let value = $ compute ; $ tp . links ( ) . $ field . insert (
+key , value . clone ( ) ) ; value } } } ; } pub use crate :: effect_cached as cached ; fn main ( ) {
+let tp = TypeParser { links_store : Links :: default ( ) , computes : RefCell :: new ( 0 ) , } ; {
+:: std :: io :: _print ( format_args ! ( "{0} {1} {2}\n" , tp . label ( 4 ) , tp . label ( 4 ) , tp
+. label ( 5 ) ) ) ; } ; { :: std :: io :: _print ( format_args ! ( "{0} computes={1}\n" , tp .
+titled ( 4 ) , tp . computes . borrow ( ) ) ) ; } ; }

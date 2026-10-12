@@ -1,0 +1,87 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; pub enum LinkSlot { Arena ( usize ) , } # [ automatically_derived ] # [ doc (
+hidden ) ] unsafe impl :: core :: clone :: TrivialClone for LinkSlot { } # [ automatically_derived ]
+impl :: core :: clone :: Clone for LinkSlot { # [ inline ] fn clone ( & self ) -> LinkSlot { let _ :
+:: core :: clone :: AssertParamIsClone < usize > ; * self } } # [ automatically_derived ] impl ::
+core :: marker :: Copy for LinkSlot { } # [ automatically_derived ] impl :: core :: marker ::
+StructuralPartialEq for LinkSlot { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq
+for LinkSlot { # [ inline ] fn eq ( & self , other : & LinkSlot ) -> bool { match ( self , other ) {
+( LinkSlot :: Arena ( __self_0 ) , LinkSlot :: Arena ( __arg1_0 ) ) => __self_0 == __arg1_0 , } } }
+# [ automatically_derived ] impl :: core :: fmt :: Debug for LinkSlot { # [ inline ] fn fmt ( & self
+, f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { match self { LinkSlot ::
+Arena ( __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "Arena" , &
+__self_0 ) , } } } pub trait LinkKey { fn link_slot ( self ) -> LinkSlot ; } macro_rules ! handle {
+( $ ( # [ $ meta : meta ] ) * $ name : ident ) => { $ ( # [ $ meta ] ) * # [ derive ( Clone , Copy ,
+Default , Eq , Hash , Ord , PartialEq , PartialOrd , Debug ) ] pub struct $ name ( pub u32 ) ; impl
+$ name { pub const NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self ) -> bool {
+self . 0 == 0 } # [ must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } # [ must_use
+] pub const fn index ( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn get ( self
+) -> Option < Self > { if self . 0 == 0 { None } else { Some ( self ) } } } } ; } macro_rules !
+arena_link_key { ( $ ( $ name : ident ) , * ) => { $ ( impl LinkKey for $ name { # [ inline ] fn
+link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( ) ) } } ) * } ; } # [
+macro_export ] macro_rules ! args { ( $ ( $ arg : expr ) , * $ ( , ) ? ) => { vec ! [ $ ( :: std ::
+string :: ToString :: to_string ( & $ arg ) ) , * ] } ; } pub struct NodeId ( pub u32 ) ; # [
+automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for NodeId
+{ } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeId { # [ inline ] fn clone (
+& self ) -> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
+automatically_derived ] impl :: core :: marker :: Copy for NodeId { } # [ automatically_derived ]
+impl :: core :: default :: Default for NodeId { # [ inline ] fn default ( ) -> NodeId { NodeId ( ::
+core :: default :: Default :: default ( ) ) } } # [ automatically_derived ] impl :: core :: cmp ::
+Eq for NodeId { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( &
+self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; } } # [ automatically_derived ] impl ::
+core :: hash :: Hash for NodeId { # [ inline ] fn hash < __H : :: core :: hash :: Hasher > ( & self
+, state : & mut __H ) { :: core :: hash :: Hash :: hash ( & self . 0 , state ) } } # [
+automatically_derived ] impl :: core :: cmp :: Ord for NodeId { # [ inline ] fn cmp ( & self , other
+: & NodeId ) -> :: core :: cmp :: Ordering { :: core :: cmp :: Ord :: cmp ( & self . 0 , & other . 0
+) } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeId { } # [
+automatically_derived ] impl :: core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self ,
+other : & NodeId ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core ::
+cmp :: PartialOrd for NodeId { # [ inline ] fn partial_cmp ( & self , other : & NodeId ) -> :: core
+:: option :: Option < :: core :: cmp :: Ordering > { :: core :: option :: Option :: Some ( :: core
+:: cmp :: Ord :: cmp ( self , other ) ) } } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for NodeId { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core ::
+fmt :: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "NodeId" , && self .
+0 ) } } impl NodeId { pub const NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self
+) -> bool { self . 0 == 0 } # [ must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } #
+[ must_use ] pub const fn index ( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn
+get ( self ) -> Option < Self > { if self . 0 == 0 { None } else { Some ( self ) } } } # [ doc =
+r" A documented handle, as ts-rust writes them." ] pub struct SymbolId ( pub u32 ) ; # [
+automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
+SymbolId { } # [ automatically_derived ] impl :: core :: clone :: Clone for SymbolId { # [ inline ]
+fn clone ( & self ) -> SymbolId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self }
+} # [ automatically_derived ] impl :: core :: marker :: Copy for SymbolId { } # [
+automatically_derived ] impl :: core :: default :: Default for SymbolId { # [ inline ] fn default (
+) -> SymbolId { SymbolId ( :: core :: default :: Default :: default ( ) ) } } # [
+automatically_derived ] impl :: core :: cmp :: Eq for SymbolId { # [ inline ] # [ doc ( hidden ) ] #
+[ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq
+< u32 > ; } } # [ automatically_derived ] impl :: core :: hash :: Hash for SymbolId { # [ inline ]
+fn hash < __H : :: core :: hash :: Hasher > ( & self , state : & mut __H ) { :: core :: hash :: Hash
+:: hash ( & self . 0 , state ) } } # [ automatically_derived ] impl :: core :: cmp :: Ord for
+SymbolId { # [ inline ] fn cmp ( & self , other : & SymbolId ) -> :: core :: cmp :: Ordering { ::
+core :: cmp :: Ord :: cmp ( & self . 0 , & other . 0 ) } } # [ automatically_derived ] impl :: core
+:: marker :: StructuralPartialEq for SymbolId { } # [ automatically_derived ] impl :: core :: cmp ::
+PartialEq for SymbolId { # [ inline ] fn eq ( & self , other : & SymbolId ) -> bool { self . 0 ==
+other . 0 } } # [ automatically_derived ] impl :: core :: cmp :: PartialOrd for SymbolId { # [
+inline ] fn partial_cmp ( & self , other : & SymbolId ) -> :: core :: option :: Option < :: core ::
+cmp :: Ordering > { :: core :: option :: Option :: Some ( :: core :: cmp :: Ord :: cmp ( self ,
+other ) ) } } # [ automatically_derived ] impl :: core :: fmt :: Debug for SymbolId { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_tuple_field1_finish ( f , "SymbolId" , && self . 0 ) } } impl SymbolId {
+pub const NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self ) -> bool { self . 0
+== 0 } # [ must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } # [ must_use ] pub
+const fn index ( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn get ( self ) ->
+Option < Self > { if self . 0 == 0 { None } else { Some ( self ) } } } impl LinkKey for NodeId { # [
+inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( ) ) } } impl LinkKey
+for SymbolId { # [ inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( )
+) } } fn main ( ) { let nil = NodeId :: NIL ; let some = NodeId ( 7 ) ; { :: std :: io :: _print (
+format_args ! ( "nil={0} some={1} index={2} get={3:?}\n" , nil . is_nil ( ) , some . is_some ( ) ,
+some . index ( ) , some . get ( ) ) ) ; } ; { :: std :: io :: _print ( format_args ! (
+"slot={0:?} ord={1}\n" , some . link_slot ( ) , NodeId ( 3 ) < NodeId ( 7 ) ) ) ; } ; let words :
+Vec < String > = :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
+write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ :: std :: string :: ToString ::
+to_string ( & "alpha" ) , :: std :: string :: ToString :: to_string ( & 42 ) , :: std :: string ::
+ToString :: to_string ( & true ) ] ) ) ; { :: std :: io :: _print ( format_args ! (
+"args={1:?} empty={0:?}\n" , :: alloc :: vec :: Vec :: new ( ) as Vec < String > , words ) ) ; } ; {
+:: std :: io :: _print ( format_args ! ( "path={0:?}\n" , :: alloc :: boxed ::
+box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
+:: Box :: new_uninit ( ) , [ :: std :: string :: ToString :: to_string ( & "x" ) ] ) ) ) ) ; } ; }

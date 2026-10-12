@@ -1,0 +1,8 @@
+cfg any=false all=true
+included fn=42 const=from include
+include_str='hello locale' bytes_eq=true
+env=hello42
+option_env=Some("hello42") missing=None
+concat=a1b
+stringify=some tokens here
+line delta=1 column>0=true file ends=true module=sem_cfg_builtins

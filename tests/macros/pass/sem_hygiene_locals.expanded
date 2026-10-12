@@ -1,0 +1,14 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; macro_rules ! with_tmp { ( $ e : expr ) => { { let tmp = 100 ; tmp + $ e } } ; }
+macro_rules ! set_var { ( $ name : ident , $ v : expr ) => { $ name = $ v } ; } macro_rules !
+count_to { ( $ n : expr ) => { { let mut acc = 0 ; 'done : loop { acc += 1 ; if acc >= $ n { break
+'done ; } } acc } } ; } macro_rules ! shadow_inside { ( ) => { { let value = 1 ; value } } ; } fn
+main ( ) { let tmp = 5 ; let r = { let tmp = 100 ; tmp + tmp } ; { :: std :: io :: _print (
+format_args ! ( "tmp kept={0} macro tmp plus caller tmp={1}\n" , tmp , r ) ) ; } ; let mut target =
+0 ; target = 42 ; { :: std :: io :: _print ( format_args ! ( "passed ident assigned={0}\n" , target
+) ) ; } ; let mut outer_rounds = 0 ; 'done : loop { outer_rounds += 1 ; let inner = { let mut acc =
+0 ; 'done : loop { acc += 1 ; if acc >= 3 { break 'done ; } } acc } ; { :: std :: io :: _print (
+format_args ! ( "inner count={0}\n" , inner ) ) ; } ; if outer_rounds == 2 { break 'done ; } } { ::
+std :: io :: _print ( format_args ! ( "outer rounds={0}\n" , outer_rounds ) ) ; } ; let value = 9 ;
+{ :: std :: io :: _print ( format_args ! ( "shadow inside={0} caller={1}\n" , { let value = 1 ;
+value } , value ) ) ; } ; }

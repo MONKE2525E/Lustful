@@ -1,0 +1,7 @@
+pat/block=70
+stmt=42
+item=3 4 vis=5
+path=42
+lifetime label=9
+nested=[[1, 2], [3]]
+plus rep=6

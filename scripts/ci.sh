@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The full local gate, same on a dev box and in GitHub Actions:
 #   1. build (pinned tcc if needed, then cargo build --release)
-#   2. differential tests against rustc
+#   2. differential tests against rustc, plus the macro corpus (rustc mode)
 #   3. differential tests under ASan/UBSan (SANITIZE=1)
 #   4. fuzzers, when present (scripts/fuzz-*.sh; other work adds them)
 #   5. benchmark smoke: compare.sh at a tiny size + run.py --quick
@@ -36,6 +36,9 @@ scripts/check-codes.sh
 
 step "difftest"
 scripts/difftest.sh
+
+step "macro corpus"
+scripts/test-macros.sh
 
 if [ -e scripts/test-client.sh ]; then
   step "client tests"

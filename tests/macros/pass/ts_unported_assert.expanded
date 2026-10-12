@@ -1,0 +1,23 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; pub mod core { pub fn record_unported ( name : & str ) { { :: std :: io :: _print (
+format_args ! ( "recorded:{0}\n" , name ) ) ; } ; } } pub mod gostd { pub mod debug { pub fn
+assert_failed ( msg : Option < std :: fmt :: Arguments < '_ >> ) -> ! { match msg { Some ( m ) => {
+:: core :: panicking :: panic_fmt ( format_args ! ( "assertion failed: {0}" , m ) ) ; } None => { ::
+core :: panicking :: panic_fmt ( format_args ! ( "assertion failed" ) ) ; } } } } } # [ macro_export
+] macro_rules ! unported { ( $ go_name : expr ) => { { $ crate :: core :: record_unported ( $
+go_name ) ; panic ! ( "unported Go code: {}" , $ go_name ) } } ; } # [ macro_export ] macro_rules !
+go_assert { ( $ cond : expr $ ( , ) ? ) => { if ! $ cond { $ crate :: gostd :: debug ::
+assert_failed ( None ) } } ; ( $ cond : expr , $ ( $ arg : tt ) + ) => { if ! $ cond { $ crate ::
+gostd :: debug :: assert_failed ( Some ( format_args ! ( $ ( $ arg ) + ) ) ) } } ; } fn panic_text (
+f : impl FnOnce ( ) + std :: panic :: UnwindSafe ) -> String { std :: panic :: set_hook ( Box :: new
+( | _ | { } ) ) ; match std :: panic :: catch_unwind ( f ) { Ok ( ( ) ) => "no panic" . to_string (
+) , Err ( e ) => { if let Some ( s ) = e . downcast_ref :: < String > ( ) { s . clone ( ) } else if
+let Some ( s ) = e . downcast_ref :: < & str > ( ) { s . to_string ( ) } else { "unknown" .
+to_string ( ) } } } } fn main ( ) { if ! ( 1 + 1 == 2 ) { crate :: gostd :: debug :: assert_failed (
+None ) } ; if ! true { crate :: gostd :: debug :: assert_failed ( Some ( format_args ! (
+"unused {0}" , 9 ) ) ) } ; { :: std :: io :: _print ( format_args ! ( "assert-true ok\n" ) ) ; } ; {
+:: std :: io :: _print ( format_args ! ( "assert-false: {0}\n" , panic_text ( || if ! ( 1 == 2 ) {
+crate :: gostd :: debug :: assert_failed ( Some ( format_args ! ( "one is not {0}" , 2 ) ) ) } ) ) )
+; } ; { :: std :: io :: _print ( format_args ! ( "unported: {0}\n" , panic_text ( || { { crate ::
+core :: record_unported ( "checker.go:Foo" ) ; { :: core :: panicking :: panic_fmt ( format_args ! (
+"unported Go code: {0}" , "checker.go:Foo" ) ) ; } } ; } ) ) ) ; } ; }
