@@ -7,6 +7,7 @@ use crate::diag::{Diag, Span, not_yet, unsupported};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
 use crate::ty::defs::{DefKind as DefsKind, Vis};
+use crate::ty::lang::ShippedCrate;
 use crate::ty::*;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,6 +86,17 @@ pub struct Program<'a> {
     pub fn_defs: Vec<DefId>,
     /// The `LocalDefId` of a function by its stable hash (section 1.7).
     pub def_by_hash: HashMap<DefPathHash, LocalDefId>,
+    /// Source std fns routed into this compile by the std loader (S5):
+    /// full Rust path segments to the local fn that carries the body.
+    /// Empty unless the driver spliced std source in. Filled by the
+    /// driver after collection, from the loader's decl table.
+    pub std_fns: Vec<(Vec<Sym>, LocalDefId)>,
+    /// Byte ranges `(lo, hi)` of the root file that belong to a shipped
+    /// library crate, with the crate. Spliced std source sits after the
+    /// user file, so user spans never fall in a range: this is the
+    /// provenance intrinsic privilege keys on (section 3.1 item 1).
+    /// Empty when no std source was spliced. Filled by the driver.
+    pub shipped_ranges: Vec<(u32, u32, ShippedCrate)>,
 }
 
 impl<'a> Program<'a> {
@@ -123,6 +135,25 @@ impl<'a> Program<'a> {
     #[allow(dead_code)] // See `def_of_adt`.
     pub fn adt_by_def(&self, def: DefId) -> Option<AdtId> {
         self.defs.local_adt(def)
+    }
+    /// The shipped crate a span's source belongs to, if any. Only spans
+    /// in spliced shipped source answer; every user span gets None.
+    pub fn shipped_crate_at(&self, span: Span) -> Option<ShippedCrate> {
+        if span.file != crate::diag::FileId(0) {
+            return None;
+        }
+        self.shipped_ranges.iter().find(|(lo, hi, _)| span.lo >= *lo && span.lo < *hi).map(|(_, _, k)| *k)
+    }
+    /// The shipped crate that defines function `f`, if it is a shipped
+    /// (spliced std) fn. Codegen runs its intrinsic privilege check
+    /// against this, as the second line behind check (section 3.2).
+    pub fn fn_shipped_crate(&self, f: LocalDefId) -> Option<ShippedCrate> {
+        self.shipped_crate_at(self.fn_info(f).def.name_span)
+    }
+    /// The local fn a shipped std path (for example
+    /// `std::process::exit`) was routed to in this compile, if any.
+    pub fn std_fn_for_path(&self, path: &[Sym]) -> Option<LocalDefId> {
+        self.std_fns.iter().find(|(p, _)| p.as_slice() == path).map(|(_, f)| *f)
     }
 }
 
@@ -184,6 +215,7 @@ pub fn resolve_ty(
     let span = ast.ty_span(id);
     match ast.ty(id) {
         TyExpr::Unit => Ok(UNIT),
+        TyExpr::Never => Ok(NEVER),
         TyExpr::Ref { mutable, inner, .. } => {
             let inner = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
             Ok(tys.mk_ref(*mutable, inner))
@@ -285,6 +317,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         stable_crate: crate_ids.stable,
         fn_defs: Vec::new(),
         def_by_hash: HashMap::default(),
+        std_fns: Vec::new(),
+        shipped_ranges: Vec::new(),
     };
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their

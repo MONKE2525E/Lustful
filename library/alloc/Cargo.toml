@@ -1,0 +1,5 @@
+# Lust shipped crate (docs/ARCH.md section 3.1). See library/core/Cargo.toml.
+[package]
+name = "alloc"
+version = "0.0.1"
+edition = "2024"

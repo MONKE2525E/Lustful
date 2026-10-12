@@ -57,7 +57,9 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0614](L0614.md) | traits and generics are not supported yet |
 | [L0621](L0621.md) | associated items are not supported yet |
 | [L0632](L0632.md) | const and static items are not supported yet |
+| [L0640](L0640.md) | this std item is declared but not yet implemented |
 | [L0641](L0641.md) | this literal or std form is not supported yet |
+| [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0810](L0810.md) | extern blocks are not supported yet |
 | [L0820](L0820.md) | this syntax form is not supported yet |

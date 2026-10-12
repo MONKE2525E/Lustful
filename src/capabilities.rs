@@ -2,7 +2,8 @@
 //
 // Where the compiler has a table, this output is generated from that table so it cannot drift:
 // integer types from `IntTy::ALL`, std methods from the `Builtin` enum (an exhaustive match maps
-// each builtin to its type and name), macros from `MacroKind`, operators from `BinOp::symbol`,
+// each builtin to its type and name), std free functions from `Builtin` plus the source std
+// registry (`ty::lang::STD_FNS`, S5), macros from `MacroKind`, operators from `BinOp::symbol`,
 // and error codes from the explain docs. The rejected list names the same feature strings as the
 // `unsupported(...)` call sites; scripts/agentkit-test.sh greps those call sites and checks that
 // every one appears here.
@@ -11,6 +12,7 @@ use crate::check::Builtin;
 use crate::diag;
 use crate::explain;
 use crate::intern::{Interner, Known, Sym};
+use crate::ty::lang;
 use crate::ty::{IntTy, TyKind};
 
 /// Every `Builtin` variant. `builtin_info` matches exhaustively, so a new builtin cannot be
@@ -361,7 +363,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("unions", "L0602"),
     ("extern function types", "L0602"),
     ("raw pointer types", "L0602"),
-    ("the never type `!`", "L0602"),
     ("inferred types (`_`)", "L0602"),
     ("this type form", "L0602"),
 ];
@@ -378,6 +379,7 @@ const TYPES: &[&str] = &[
     "bool",
     "char",
     "() unit",
+    "! never",
     "String",
     "&str",
     "Vec<T>",
@@ -428,10 +430,10 @@ const EXPRESSIONS: &[&str] = &[
 const DERIVES: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq (accepted, no effect yet)", "Hash (accepted, no effect yet)"];
 
 /// Grouped std surface: type name to sorted method or associated-function names.
-fn grouped(want: Call) -> Vec<(&'static str, Vec<String>)> {
+fn grouped(want: Call) -> Vec<(String, Vec<String>)> {
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let mut groups: Vec<(&'static str, Vec<String>)> = Vec::new();
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for &b in ALL_BUILTINS {
         let (types, names, call) = builtin_info(b, &known);
         if call != want {
@@ -441,7 +443,7 @@ fn grouped(want: Call) -> Vec<(&'static str, Vec<String>)> {
             let entry = match groups.iter_mut().find(|(g, _)| g == t) {
                 Some(e) => e,
                 None => {
-                    groups.push((t, Vec::new()));
+                    groups.push((t.to_string(), Vec::new()));
                     groups.last_mut().expect("just pushed")
                 }
             };
@@ -468,7 +470,7 @@ fn json_str_arr(items: &[&str]) -> String {
     json_arr(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
 }
 
-fn json_groups(groups: &[(&str, Vec<String>)]) -> String {
+fn json_groups(groups: &[(String, Vec<String>)]) -> String {
     let parts: Vec<String> = groups.iter().map(|(t, names)| format!("{}:{}", diag::json_str(t), json_arr(names))).collect();
     format!("{{{}}}", parts.join(","))
 }
@@ -522,7 +524,22 @@ pub fn run(args: &[String]) -> i32 {
         .collect();
     let methods = grouped(Call::Method);
     let associated = grouped(Call::Associated);
-    let functions = grouped(Call::Function);
+    let mut functions = grouped(Call::Function);
+    // Source std fns join the free-function list from their registry
+    // rows, so the output cannot drift from the loader (S5).
+    for def in lang::STD_FNS.iter().filter(|d| d.implemented) {
+        let key = def.path[..def.path.len() - 1].join("::");
+        let name = def.path[def.path.len() - 1].to_string();
+        match functions.iter_mut().find(|(g, _)| *g == key) {
+            Some(e) => {
+                if !e.1.contains(&name) {
+                    e.1.push(name);
+                    e.1.sort();
+                }
+            }
+            None => functions.push((key, vec![name])),
+        }
+    }
     let codes = explain::codes();
 
     if json {

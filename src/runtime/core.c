@@ -131,6 +131,11 @@ void lust_write(int to_stderr, lust_String *s) LUST_BODY({
 
 void lust_flush(void) LUST_BODY({ fflush(stdout); })
 
+/* The `exit` intrinsic behind std::process::exit: lust print output is
+   buffered in stdio, so flush before the libc exit. Destructors do not
+   run, as in Rust. */
+void lust_exit(int32_t code) LUST_BODY({ fflush(stdout); exit(code); })
+
 /* ---------- Vec ---------- */
 
 void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem) LUST_BODY({

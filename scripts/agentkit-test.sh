@@ -109,7 +109,7 @@ root = pathlib.Path(sys.argv[2])
 assert cap["schema"] == 1 and cap["kind"] == "capabilities"
 assert "push" in cap["methods"]["Vec<T>"] and "unwrap" in cap["methods"]["Option<T>"]
 assert cap["associated_functions"]["String"] == ["from", "new", "with_capacity"]
-assert cap["functions"] == {"std::env": ["args"]}
+assert cap["functions"] == {"std::env": ["args"], "std::process": ["exit"]}
 assert len(cap["integer_types"]) == 10
 # Every literal at an unsupported(...) call site is named in the rejected list.
 features = [r["feature"] for r in cap["rejected"]]
@@ -137,7 +137,7 @@ assert len(re.findall(r"^\s+[A-Z]\w+,", macro_body, re.M)) == len(cap["macros"])
 # Rejected codes are all documented codes.
 codes = {c["code"] for c in cap["diagnostics"]["codes"]}
 assert all(r["code"] in codes for r in cap["rejected"])
-assert len(codes) == 53
+assert len(codes) == 55
 PYEOF
 check cap-content $? "see the python assert above"
 "$lust" capabilities | grep -q "methods on Vec<T>"; check cap-human $? "human output must list methods"

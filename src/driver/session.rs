@@ -101,6 +101,11 @@ pub struct Session {
     pub(crate) key: SessionKey,
     pub(crate) front: Front,
     pub(crate) caches: Caches,
+    /// The checked shipped std (S5), loaded at most once per session:
+    /// std is immutable inside a session (docs/ARCH.md section 3.8).
+    /// `None` until a request can mention a source std fn, so a session
+    /// that never routes one never pays for the load.
+    pub(crate) std_cache: Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
 }
 
 impl Session {
@@ -141,6 +146,7 @@ impl Session {
                 persistent,
                 overlays: Default::default(),
             },
+            std_cache: None,
         }
     }
     pub fn obj_dir(&self) -> &Path {

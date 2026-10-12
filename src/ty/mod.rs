@@ -12,6 +12,7 @@
 // now reach the types through the compat helpers on `TyIntern` (`vec_elem`, `is_string_ty`,
 // and kin), never by matching on a builtin `TyKind` case.
 pub mod defs;
+pub mod lang;
 pub use defs::{DefData, Defs, SigData};
 
 use crate::def::{CrateId, DefId, StableCrateHash};

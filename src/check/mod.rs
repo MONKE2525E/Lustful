@@ -8,6 +8,7 @@ use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stm
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, not_yet, unsupported};
 use crate::intern::Sym;
+use crate::ty::lang;
 use crate::ty::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +115,10 @@ pub enum Res {
     Index {
         derefs: u8,
     },
+    /// A `core::intrinsics::<name>` call that passed the privilege check.
+    /// The payload is the intrinsic's registry id (`ty::lang::INTRINSICS`).
+    /// Only spliced shipped-library source can produce this resolution.
+    Intrinsic(u32),
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -1165,11 +1170,76 @@ impl<'p, 'a> Ctx<'p, 'a> {
         ERROR
     }
 
+    /// Resolves a `core::intrinsics::<name>` path. Order is fixed: the
+    /// name must exist in the registry, the call site's crate must be on
+    /// the row's privilege list, and codegen must implement the row.
+    /// A user call site never has a shipped crate, so it stops at the
+    /// privilege test with L0642 (docs/ARCH.md sections 3.1 and 3.2).
+    fn resolve_intrinsic(&mut self, name: Sym, span: Span) -> Option<Res> {
+        let text = self.name(name).to_string();
+        let Some(id) = lang::intrinsic_by_name(&text) else {
+            self.err(
+                "L0104",
+                span,
+                format!("no intrinsic `core::intrinsics::{text}`"),
+                "Intrinsics are a closed registry (src/ty/lang.rs). Call a public std item instead.",
+            );
+            return None;
+        };
+        let def = lang::intrinsic(id);
+        if !def.allows(self.p.shipped_crate_at(span)) {
+            self.err(
+                "L0642",
+                span,
+                format!("intrinsic `core::intrinsics::{text}` can only be called from lust's shipped library crates"),
+                "Call the public std item that wraps it instead.",
+            );
+            return None;
+        }
+        if !def.implemented {
+            self.err(
+                "L0640",
+                span,
+                format!("intrinsic `core::intrinsics::{text}` is declared but not yet implemented"),
+                "Implement the registry row and its runtime hook first (docs/ARCH.md section 3.2).",
+            );
+            return None;
+        }
+        Some(Res::Intrinsic(id))
+    }
+
     /// Resolves `Type::item` and `std::env::args`. Reports an error and returns None on failure.
     fn resolve_assoc(&mut self, segs: &[ast::PathSeg], span: Span) -> Option<Res> {
         let p = self.p;
         let k = p.known;
         let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
+        if names.len() == 3 && names[0] == k.core && names[1] == k.intrinsics {
+            return self.resolve_intrinsic(names[2], span);
+        }
+        // Shipped source std fns (the `STD_FNS` registry). A declared row
+        // with no body yet rejects with L0640; an implemented row routes
+        // to the spliced body the loader put in this program. If std was
+        // not loaded (the driver trigger missed this spelling), the path
+        // falls through to the module-path reject below, never an accept.
+        if names[0] == k.std {
+            for def in lang::STD_FNS {
+                if def.path.len() == names.len() && def.path.iter().zip(&names).all(|(s, n)| *s == self.name(*n)) {
+                    if !def.implemented {
+                        self.err(
+                            "L0640",
+                            span,
+                            format!("`{}` is declared but not yet implemented in lust std", def.path.join("::")),
+                            "Use a std item lust implements today, or write the behavior in your own code.",
+                        );
+                        return None;
+                    }
+                    if let Some(f) = p.std_fn_for_path(&names) {
+                        return Some(Res::Fn(f));
+                    }
+                    break;
+                }
+            }
+        }
         if names == [k.std, k.env, k.args] {
             return Some(Res::Builtin(Builtin::EnvArgs));
         }
@@ -1324,6 +1394,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 self.check_args(&params, args, span);
                 ret
+            }
+            Res::Intrinsic(id) => {
+                let def = lang::intrinsic(id);
+                let params: Vec<Ty> = def.params.iter().map(|s| s.resolve(&mut self.tys)).collect();
+                self.check_args(&params, args, span);
+                def.ret.resolve(&mut self.tys)
             }
             _ => ERROR,
         }

@@ -409,6 +409,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         Builtin::VecNew | Builtin::VecWithCapacity => Rvalue::VecLit(self.peel_vec(ty), Vec::new()),
                         _ => Rvalue::Builtin(b, ops),
                     },
+                    Res::Intrinsic(id) => Rvalue::Intrinsic(id, ops),
                     _ => return,
                 };
                 match dest {

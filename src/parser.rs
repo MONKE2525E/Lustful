@@ -1045,7 +1045,13 @@ impl<'a> Parser<'a> {
             Tok::Dyn => Err(not_yet(C_TY, start, "`dyn Trait` types")),
             Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
             Tok::Star => Err(not_yet(C_TY, start, "raw pointer types")),
-            Tok::Bang => Err(not_yet(C_TY, start, "the never type `!`")),
+            Tok::Bang => {
+                // The never type: its AST shape is `TyExpr::Never` (S3b) and
+                // check already unifies it. Its parser lands with S5 because
+                // the first source std fn (`std::process::exit`) returns it.
+                self.bump();
+                Ok(self.push_ty(TyExpr::Never, start.to(self.prev_span())))
+            }
             Tok::Underscore => Err(not_yet(C_TY, start, "inferred types (`_`)")),
             Tok::Unsafe => Err(unsafe_error(start)),
             Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),

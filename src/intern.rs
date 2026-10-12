@@ -114,6 +114,8 @@ macro_rules! known_syms {
 
 known_syms!(
     std,
+    core,
+    intrinsics,
     env,
     args,
     String,

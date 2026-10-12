@@ -93,6 +93,11 @@ pub enum Rvalue {
     StringAdd(Operand, Operand),
     Format(Vec<FmtPart>),
     Discriminant(Place),
+    /// A call to a registry intrinsic by id (`ty::lang::INTRINSICS`).
+    /// One node for the whole family: codegen emits the row's C symbol
+    /// with the row's signature. Added by S5; never delete a Builtin
+    /// case in its favor this wave (docs/ARCH.md section 9.2 S5).
+    Intrinsic(u32, Vec<Operand>),
 }
 
 #[derive(Clone, Debug)]
