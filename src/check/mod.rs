@@ -5809,7 +5809,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         match self.tys.kind(self.resolve(t)) {
-            TyKind::Infer(v) => !v.is_int(),
+            TyKind::Infer(v) => !v.is_int() && !v.is_float(),
             TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_unbound_var(e),
             TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_var(e)),
             TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.has_unbound_var(e))),
