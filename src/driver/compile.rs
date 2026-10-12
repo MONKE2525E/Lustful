@@ -1123,10 +1123,32 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Resolver routing (W-RESOLVE): a manifest-selected crate, or a root
     // file that mentions modules, imports, cfg, or const/static/type
     // items, compiles through the outline worklist (full rebuild per
-    // request for now). Routing is sticky per session (see Front).
-    let use_resolver = front.resolved_crate
-        || req.session.krate.manifest_path.is_some()
-        || crate::resolve::worklist::needs_resolve(&src, &front.interner);
+    // request for now). Routing follows the current text, never just the
+    // session's past: a fresh session routes by these same two facts, so
+    // a warm session that stayed on the worklist after an edit removed
+    // the trigger would answer through a different front end than a cold
+    // compile for the same bytes (the two front ends order expansion and
+    // parse errors differently; fuzz realish seed 107, iter 585). When
+    // the route falls back, drop the resolver-built front state (merged
+    // AST, synthetic chunk, spliced source): the chunk path must never
+    // reuse it, and with `env_hash` cleared the request rebuilds in full
+    // mode, which resets the caches in `slot_update`.
+    let wants_resolver =
+        req.session.krate.manifest_path.is_some() || crate::resolve::worklist::needs_resolve(&src, &front.interner);
+    if front.resolved_crate && !wants_resolver {
+        front.ast = Ast::default();
+        front.env_hash = None;
+        front.items.clear();
+        front.fn_loc.clear();
+        front.fn_slot.clear();
+        front.slot_hash.clear();
+        front.chunks.clear();
+        front.src.clear();
+        front.map = SourceMap::default();
+        front.resolved_crate = false;
+        front.resolved_crate_ids = None;
+    }
+    let use_resolver = front.resolved_crate || wants_resolver;
 
     // Source std (S5): if this file can mention a source std fn, load the
     // checked shipped library (once per session) and splice its fns after
@@ -2013,5 +2035,36 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
         let r = compile(&req, &mut s);
         assert_eq!(r.code, 2);
         assert!(r.stderr.contains("unsupported target"), "{}", r.stderr);
+    }
+
+    /// Resolver routing follows the current text: after a `static` item
+    /// routes one compile through the worklist, deleting it must route
+    /// the next compile through the chunk path again, exactly as a fresh
+    /// session would, and the answers must match. Sticky routing made a
+    /// warm session answer through the other front end for the same
+    /// bytes (fuzz realish seed 107, iter 585).
+    #[test]
+    fn resolver_routing_unsticks_when_trigger_goes() {
+        let dir = std::env::temp_dir().join(format!("lust-unstick-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("route.rs");
+        let key = crate::protocol::SessionKey::synthetic(&file, false);
+        let req = req_for(key.clone());
+        let mut s = Session::new(dir.join("obj"), false, key.clone());
+        std::fs::write(&file, "static S: i64 = 1;\nfn main() { println!(\"{}\", S); }\n").unwrap();
+        let r = compile(&req, &mut s);
+        assert_eq!(r.code, 0, "primer: {}", r.stderr);
+        assert!(s.front.resolved_crate, "the static item routes through the resolver");
+        std::fs::write(&file, "fn main() { println!(\"{}\", xformat!(\"{}\", 1)); }\n").unwrap();
+        let warm = compile(&req, &mut s);
+        assert!(!s.front.resolved_crate, "routing falls back when the trigger is gone");
+        let mut fresh = Session::new(dir.join("obj2"), false, key);
+        let cold = compile(&req, &mut fresh);
+        assert_eq!(warm.code, 1);
+        assert_eq!(warm.code, cold.code);
+        assert_eq!(warm.stderr, cold.stderr);
+        assert!(warm.stderr.contains("L0802"), "{}", warm.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

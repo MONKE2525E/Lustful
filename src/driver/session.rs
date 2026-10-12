@@ -67,9 +67,11 @@ pub(crate) struct Front {
     pub(crate) map: SourceMap,
     /// The chunk-boundary mask (see `split_items`). Fixed for the session, so boundaries are too.
     pub(crate) split_mask: Option<u64>,
-    /// True once this session compiled through the resolver (W-RESOLVE):
-    /// routing is sticky, because the resolver path keeps a merged
-    /// multi-file AST the chunk path must never try to reuse.
+    /// True while this session's front state was built by the resolver
+    /// (W-RESOLVE): a merged multi-file AST the chunk path must never
+    /// try to reuse. Routing itself follows the current text (see
+    /// `compile`): when a request no longer routes to the resolver,
+    /// the state is dropped and this flag clears with it.
     pub(crate) resolved_crate: bool,
     /// The Cargo-graph crate identity for the in-flight resolver
     /// compile, handed from `resolved_setup` to the shared tail for one
