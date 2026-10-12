@@ -93,6 +93,7 @@ pub fn serve(sock: &Path) -> ! {
             timings: false,
             debug: false,
             emit_c: None,
+            max_errors: 20,
             file: file.clone(),
         };
         let session = sessions.entry(file).or_insert_with(|| Session::new(base.join("0"), true));

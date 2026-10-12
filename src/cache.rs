@@ -120,7 +120,16 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     let cmd: &[u8] = if req.cmd == Cmd::Check { b"check" } else { b"build" };
     let flags = [req.json as u8, req.debug as u8];
     let (a, b) = hash128(
-        &[&id.0.to_le_bytes(), &id.1.to_le_bytes(), target.as_bytes(), cmd, &flags, req.file.to_string_lossy().as_bytes(), src],
+        &[
+            &id.0.to_le_bytes(),
+            &id.1.to_le_bytes(),
+            target.as_bytes(),
+            cmd,
+            &flags,
+            &req.max_errors.to_le_bytes(),
+            req.file.to_string_lossy().as_bytes(),
+            src,
+        ],
         13,
     );
     format!("{a:016x}{b:016x}")
@@ -275,7 +284,7 @@ mod tests {
     use super::*;
 
     fn req(cmd: Cmd, json: bool, debug: bool) -> Request {
-        Request { cmd, file: "/tmp/x/main.rs".into(), out: "/tmp/x/main".into(), json, timings: false, debug, emit_c: None }
+        Request { cmd, file: "/tmp/x/main.rs".into(), out: "/tmp/x/main".into(), json, timings: false, debug, emit_c: None, max_errors: 20 }
     }
 
     /// Each key input named in the module docs must change the key on its own.
@@ -288,6 +297,9 @@ mod tests {
         assert_ne!(base, request_key(id, &req(Cmd::Check, true, false), b"fn main() {}"), "json flag");
         assert_ne!(base, request_key(id, &req(Cmd::Check, false, true), b"fn main() {}"), "debug flag");
         assert_ne!(base, request_key((9, 2), &req(Cmd::Check, false, false), b"fn main() {}"), "compiler id");
+        let mut other = req(Cmd::Check, false, false);
+        other.max_errors = 3;
+        assert_ne!(base, request_key(id, &other, b"fn main() {}"), "max errors");
         let mut other = req(Cmd::Check, false, false);
         other.file = "/tmp/y/main.rs".into();
         assert_ne!(base, request_key(id, &other, b"fn main() {}"), "source path");
