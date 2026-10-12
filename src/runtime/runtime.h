@@ -16,6 +16,13 @@ void abort(void);
 #define LUST_BODY(...) ;
 #endif
 
+/* 128-bit integers. tcc has no __int128 (spike K3-13), so codegen uses a
+   two-word struct; _Alignas on the first member gives the type the
+   16-byte alignment Rust u128/i128 have (spike K3-21), which a type-level
+   aligned attribute cannot do in tcc. `lo` is the low word. Size 16. */
+typedef struct { _Alignas(16) uint64_t lo; uint64_t hi; } lust_u128;
+typedef struct { _Alignas(16) uint64_t lo; uint64_t hi; } lust_i128;
+
 typedef struct { uint8_t *ptr; uint64_t len; } lust_str;
 typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
 typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;

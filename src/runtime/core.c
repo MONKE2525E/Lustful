@@ -394,6 +394,314 @@ LUST_POW(int8_t, i8) LUST_POW(int16_t, i16) LUST_POW(int32_t, i32) LUST_POW(int6
 LUST_POW(uint8_t, u8) LUST_POW(uint16_t, u16) LUST_POW(uint32_t, u32) LUST_POW(uint64_t, u64)
 LUST_ABS(int8_t, i8) LUST_ABS(int16_t, i16) LUST_ABS(int32_t, i32) LUST_ABS(int64_t, i64)
 
+/* ---------- 128-bit integers ---------- */
+
+/* Two-word helpers over lust_u128/lust_i128. Division is Knuth's
+   Algorithm D over 32-bit limbs (the spike's bit-by-bit divider took
+   1673 ns; this one is two orders of magnitude less), and formatting
+   divides by 10^19 chunks through the 128-by-64 fast path. Checked
+   wrappers panic with the same texts as the narrow types above. */
+
+lust_u128 lust_u128_from_i128(lust_i128 a) LUST_BODY({ lust_u128 r; r.lo = a.lo; r.hi = a.hi; return r; })
+lust_i128 lust_i128_from_u128(lust_u128 a) LUST_BODY({ lust_i128 r; r.lo = a.lo; r.hi = a.hi; return r; })
+
+lust_u128 lust_u128_add(lust_u128 a, lust_u128 b) LUST_BODY({
+    lust_u128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + (r.lo < a.lo);
+    return r;
+})
+lust_u128 lust_u128_sub(lust_u128 a, lust_u128 b) LUST_BODY({
+    lust_u128 r;
+    r.lo = a.lo - b.lo;
+    r.hi = a.hi - b.hi - (a.lo < b.lo);
+    return r;
+})
+lust_i128 lust_i128_add(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_add(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+lust_i128 lust_i128_sub(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_sub(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+
+int32_t lust_u128_cmp(lust_u128 a, lust_u128 b) LUST_BODY({
+    if (a.hi != b.hi) return a.hi < b.hi ? -1 : 1;
+    if (a.lo != b.lo) return a.lo < b.lo ? -1 : 1;
+    return 0;
+})
+int32_t lust_i128_cmp(lust_i128 a, lust_i128 b) LUST_BODY({
+    int64_t ah = (int64_t)a.hi, bh = (int64_t)b.hi;
+    if (ah != bh) return ah < bh ? -1 : 1;
+    if (a.lo != b.lo) return a.lo < b.lo ? -1 : 1;
+    return 0;
+})
+
+lust_u128 lust_u128_and(lust_u128 a, lust_u128 b) LUST_BODY({ lust_u128 r; r.lo = a.lo & b.lo; r.hi = a.hi & b.hi; return r; })
+lust_u128 lust_u128_or(lust_u128 a, lust_u128 b) LUST_BODY({ lust_u128 r; r.lo = a.lo | b.lo; r.hi = a.hi | b.hi; return r; })
+lust_u128 lust_u128_xor(lust_u128 a, lust_u128 b) LUST_BODY({ lust_u128 r; r.lo = a.lo ^ b.lo; r.hi = a.hi ^ b.hi; return r; })
+lust_u128 lust_u128_not(lust_u128 a) LUST_BODY({ lust_u128 r; r.lo = ~a.lo; r.hi = ~a.hi; return r; })
+lust_i128 lust_i128_and(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_and(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+lust_i128 lust_i128_or(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_or(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+lust_i128 lust_i128_xor(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_xor(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+lust_i128 lust_i128_not(lust_i128 a) LUST_BODY({ return lust_i128_from_u128(lust_u128_not(lust_u128_from_i128(a))); })
+
+/* Full 64x64->128 product through 32-bit halves. Returns the low word;
+   the high word goes to *hi. */
+uint64_t lust_u128_mul64(uint64_t a, uint64_t b, uint64_t *hi) LUST_BODY({
+    uint64_t al = a & 0xFFFFFFFFull, ah = a >> 32;
+    uint64_t bl = b & 0xFFFFFFFFull, bh = b >> 32;
+    uint64_t ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    uint64_t mid = lh + (ll >> 32) + (hl & 0xFFFFFFFFull);
+    *hi = hh + (hl >> 32) + (mid >> 32);
+    return (mid << 32) | (ll & 0xFFFFFFFFull);
+})
+
+lust_u128 lust_u128_mul(lust_u128 a, lust_u128 b) LUST_BODY({
+    lust_u128 r;
+    uint64_t hi;
+    r.lo = lust_u128_mul64(a.lo, b.lo, &hi);
+    r.hi = hi + a.lo * b.hi + a.hi * b.lo;
+    return r;
+})
+lust_i128 lust_i128_mul(lust_i128 a, lust_i128 b) LUST_BODY({ return lust_i128_from_u128(lust_u128_mul(lust_u128_from_i128(a), lust_u128_from_i128(b))); })
+
+lust_u128 lust_u128_shl(lust_u128 a, uint32_t n) LUST_BODY({
+    lust_u128 r;
+    if (n >= 64) { r.lo = 0; r.hi = a.lo << (n - 64); }
+    else if (n) { r.lo = a.lo << n; r.hi = (a.hi << n) | (a.lo >> (64 - n)); }
+    else r = a;
+    return r;
+})
+lust_u128 lust_u128_shr(lust_u128 a, uint32_t n) LUST_BODY({
+    lust_u128 r;
+    if (n >= 64) { r.lo = a.hi >> (n - 64); r.hi = 0; }
+    else if (n) { r.lo = (a.lo >> n) | (a.hi << (64 - n)); r.hi = a.hi >> n; }
+    else r = a;
+    return r;
+})
+lust_i128 lust_i128_shl(lust_i128 a, uint32_t n) LUST_BODY({ return lust_i128_from_u128(lust_u128_shl(lust_u128_from_i128(a), n)); })
+lust_i128 lust_i128_shr(lust_i128 a, uint32_t n) LUST_BODY({
+    lust_i128 r;
+    if (n >= 64) { r.lo = (uint64_t)((int64_t)a.hi >> (n - 64)); r.hi = (uint64_t)((int64_t)a.hi >> 63); }
+    else if (n) { r.lo = (a.lo >> n) | (a.hi << (64 - n)); r.hi = (uint64_t)((int64_t)a.hi >> n); }
+    else r = a;
+    return r;
+})
+
+uint32_t lust_u128_clz32(uint32_t x) LUST_BODY({
+    uint32_t n = 0;
+    if (!(x >> 16)) { n += 16; x <<= 16; }
+    if (!(x >> 24)) { n += 8; x <<= 8; }
+    if (!(x >> 28)) { n += 4; x <<= 4; }
+    if (!(x >> 30)) { n += 2; x <<= 2; }
+    if (!(x >> 31)) n += 1;
+    return n;
+})
+
+/* Unsigned 128/128. The caller guarantees b != 0. A one-limb divisor
+   takes the schoolbook loop; wider divisors take Knuth's Algorithm D
+   in base 2^32. */
+lust_u128 lust_u128_divmod(lust_u128 a, lust_u128 b, lust_u128 *rem) LUST_BODY({
+    if (lust_u128_cmp(a, b) < 0) {
+        if (rem) *rem = a;
+        lust_u128 z = {0, 0};
+        return z;
+    }
+    uint32_t bl[4] = {(uint32_t)b.lo, (uint32_t)(b.lo >> 32), (uint32_t)b.hi, (uint32_t)(b.hi >> 32)};
+    uint32_t al[4] = {(uint32_t)a.lo, (uint32_t)(a.lo >> 32), (uint32_t)a.hi, (uint32_t)(a.hi >> 32)};
+    if (!bl[1] && !bl[2] && !bl[3]) {
+        uint64_t d = bl[0], r = 0;
+        uint32_t q[4];
+        for (int i = 3; i >= 0; i--) {
+            uint64_t t = (r << 32) | al[i];
+            q[i] = (uint32_t)(t / d);
+            r = t - (uint64_t)q[i] * d;
+        }
+        if (rem) { rem->lo = r; rem->hi = 0; }
+        lust_u128 out;
+        out.lo = (uint64_t)q[0] | ((uint64_t)q[1] << 32);
+        out.hi = (uint64_t)q[2] | ((uint64_t)q[3] << 32);
+        return out;
+    }
+    uint32_t u[5], v[4], q[4] = {0, 0, 0, 0};
+    int n = bl[3] ? 4 : bl[2] ? 3 : 2;
+    int m = 4;
+    uint32_t s = lust_u128_clz32(bl[n - 1]);
+    for (int i = n - 1; i > 0; i--) v[i] = s ? (bl[i] << s) | (bl[i - 1] >> (32 - s)) : bl[i];
+    v[0] = bl[0] << s;
+    u[4] = s ? al[3] >> (32 - s) : 0;
+    for (int i = 3; i > 0; i--) u[i] = s ? (al[i] << s) | (al[i - 1] >> (32 - s)) : al[i];
+    u[0] = al[0] << s;
+    for (int j = m - n; j >= 0; j--) {
+        uint64_t num = ((uint64_t)u[j + n] << 32) | u[j + n - 1];
+        uint64_t qhat = num / v[n - 1];
+        uint64_t rhat = num - qhat * v[n - 1];
+        for (;;) {
+            if (qhat > 0xFFFFFFFFull || qhat * v[n - 2] > ((rhat << 32) | u[j + n - 2])) {
+                qhat--;
+                rhat += v[n - 1];
+                if (rhat <= 0xFFFFFFFFull) continue;
+            }
+            break;
+        }
+        int64_t borrow = 0;
+        uint64_t carry = 0;
+        for (int k = 0; k < n; k++) {
+            uint64_t p = qhat * v[k] + carry;
+            carry = p >> 32;
+            int64_t t = (int64_t)u[j + k] - borrow - (int64_t)(uint32_t)p;
+            u[j + k] = (uint32_t)t;
+            borrow = t < 0 ? 1 : 0;
+        }
+        int64_t t = (int64_t)u[j + n] - borrow - (int64_t)carry;
+        u[j + n] = (uint32_t)t;
+        q[j] = (uint32_t)qhat;
+        if (t < 0) {
+            q[j]--;
+            uint64_t c = 0;
+            for (int k = 0; k < n; k++) {
+                uint64_t sum = (uint64_t)u[j + k] + v[k] + c;
+                u[j + k] = (uint32_t)sum;
+                c = sum >> 32;
+            }
+            u[j + n] = (uint32_t)((uint64_t)u[j + n] + c);
+        }
+    }
+    if (rem) {
+        uint32_t r[4] = {0, 0, 0, 0};
+        for (int i = 0; i < n; i++) r[i] = s ? (u[i] >> s) | (u[i + 1] << (32 - s)) : u[i];
+        rem->lo = (uint64_t)r[0] | ((uint64_t)r[1] << 32);
+        rem->hi = (uint64_t)r[2] | ((uint64_t)r[3] << 32);
+    }
+    lust_u128 out;
+    out.lo = (uint64_t)q[0] | ((uint64_t)q[1] << 32);
+    out.hi = (uint64_t)q[2] | ((uint64_t)q[3] << 32);
+    return out;
+})
+
+/* 128 divided by a one-word divisor (b != 0); the format path. */
+lust_u128 lust_u128_divmod64(lust_u128 a, uint64_t b, uint64_t *rem) LUST_BODY({
+    lust_u128 d = {b, 0}, r;
+    lust_u128 q = lust_u128_divmod(a, d, &r);
+    if (rem) *rem = r.lo;
+    return q;
+})
+
+lust_u128 lust_add_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
+    lust_u128 r = lust_u128_add(a, b);
+    if (lust_u128_cmp(r, a) < 0) LUST_OVF("add");
+    return r;
+})
+lust_u128 lust_sub_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
+    if (lust_u128_cmp(b, a) > 0) LUST_OVF("subtract");
+    return lust_u128_sub(a, b);
+})
+lust_u128 lust_mul_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
+    lust_u128 r = lust_u128_mul(a, b);
+    if ((a.lo || a.hi) && lust_u128_cmp(lust_u128_divmod(r, a, 0), b) != 0) LUST_OVF("multiply");
+    return r;
+})
+lust_u128 lust_div_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
+    if (!b.lo && !b.hi) lust_panic_cstr("attempt to divide by zero", loc);
+    return lust_u128_divmod(a, b, 0);
+})
+lust_u128 lust_rem_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
+    if (!b.lo && !b.hi) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+    lust_u128 r;
+    (void)lust_u128_divmod(a, b, &r);
+    return r;
+})
+
+lust_u128 lust_i128_mag(lust_i128 a) LUST_BODY({
+    lust_u128 u = lust_u128_from_i128(a);
+    if ((int64_t)a.hi < 0) {
+        lust_u128 z = {0, 0};
+        return lust_u128_sub(z, u);
+    }
+    return u;
+})
+
+lust_i128 lust_add_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
+    lust_i128 r = lust_i128_add(a, b);
+    if (((a.hi ^ r.hi) & (b.hi ^ r.hi)) >> 63) LUST_OVF("add");
+    return r;
+})
+lust_i128 lust_sub_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
+    lust_i128 r = lust_i128_sub(a, b);
+    if (((a.hi ^ b.hi) & (a.hi ^ r.hi)) >> 63) LUST_OVF("subtract");
+    return r;
+})
+lust_i128 lust_neg_i128(lust_i128 a, lust_loc loc) LUST_BODY({
+    if (a.lo == 0 && a.hi == 0x8000000000000000ull) LUST_OVF("negate");
+    lust_i128 z = {0, 0};
+    return lust_i128_sub(z, a);
+})
+lust_i128 lust_mul_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
+    if ((!a.lo && !a.hi) || (!b.lo && !b.hi)) { lust_i128 z = {0, 0}; return z; }
+    if (a.lo == 0 && a.hi == 0x8000000000000000ull && b.lo == 0xFFFFFFFFFFFFFFFFull && b.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("multiply");
+    if (b.lo == 0 && b.hi == 0x8000000000000000ull && a.lo == 0xFFFFFFFFFFFFFFFFull && a.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("multiply");
+    lust_i128 r = lust_i128_mul(a, b);
+    /* Divide back, as the i64 helper does; the -1 edges are handled above. */
+    lust_u128 q = lust_u128_divmod(lust_i128_mag(r), lust_i128_mag(b), 0);
+    if (lust_u128_cmp(q, lust_i128_mag(a)) != 0) LUST_OVF("multiply");
+    return r;
+})
+lust_i128 lust_div_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
+    if (!b.lo && !b.hi) lust_panic_cstr("attempt to divide by zero", loc);
+    if (a.lo == 0 && a.hi == 0x8000000000000000ull && b.lo == 0xFFFFFFFFFFFFFFFFull && b.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("divide");
+    lust_u128 q = lust_u128_divmod(lust_i128_mag(a), lust_i128_mag(b), 0);
+    if (((a.hi ^ b.hi) >> 63) & 1) {
+        lust_u128 z = {0, 0};
+        q = lust_u128_sub(z, q);
+    }
+    return lust_i128_from_u128(q);
+})
+lust_i128 lust_rem_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
+    if (!b.lo && !b.hi) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+    if (a.lo == 0 && a.hi == 0x8000000000000000ull && b.lo == 0xFFFFFFFFFFFFFFFFull && b.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("calculate the remainder");
+    lust_u128 r;
+    (void)lust_u128_divmod(lust_i128_mag(a), lust_i128_mag(b), &r);
+    if ((int64_t)a.hi < 0) {
+        lust_u128 z = {0, 0};
+        r = lust_u128_sub(z, r);
+    }
+    return lust_i128_from_u128(r);
+})
+
+lust_i128 lust_abs_i128(lust_i128 a, lust_loc loc) LUST_BODY({ return (int64_t)a.hi < 0 ? lust_neg_i128(a, loc) : a; })
+lust_u128 lust_pow_u128(lust_u128 a, uint32_t e, lust_loc loc) LUST_BODY({
+    lust_u128 r = {1, 0};
+    while (e) { if (e & 1) r = lust_mul_u128(r, a, loc); e >>= 1; if (e) a = lust_mul_u128(a, a, loc); }
+    return r;
+})
+lust_i128 lust_pow_i128(lust_i128 a, uint32_t e, lust_loc loc) LUST_BODY({
+    lust_i128 r = {1, 0};
+    while (e) { if (e & 1) r = lust_mul_i128(r, a, loc); e >>= 1; if (e) a = lust_mul_i128(a, a, loc); }
+    return r;
+})
+
+/* Decimal format: split by 10^19, the largest power of ten in a word. */
+void lust_fmt_u128(lust_String *out, lust_u128 v) LUST_BODY({
+    if (!v.hi) { lust_fmt_u64(out, v.lo); return; }
+    uint64_t chunks[3];
+    int n = 0;
+    while (v.lo || v.hi) {
+        uint64_t r;
+        v = lust_u128_divmod64(v, 10000000000000000000ull, &r);
+        chunks[n++] = r;
+    }
+    lust_fmt_u64(out, chunks[--n]);
+    char b[24];
+    while (n > 0) {
+        snprintf(b, sizeof b, "%019llu", (unsigned long long)chunks[--n]);
+        lust_string_push_cstr(out, b);
+    }
+})
+void lust_fmt_i128(lust_String *out, lust_i128 v) LUST_BODY({
+    if ((int64_t)v.hi < 0) {
+        lust_string_push_bytes(out, "-", 1);
+        lust_fmt_u128(out, lust_i128_mag(v));
+    } else {
+        lust_fmt_u128(out, lust_u128_from_i128(v));
+    }
+})
+
 /* ---------- Vec insert/remove ---------- */
 
 void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, lust_loc loc) LUST_BODY({

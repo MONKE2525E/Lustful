@@ -89,10 +89,14 @@ fn int_c(i: IntTy) -> &'static str {
         IntTy::U16 => "uint16_t",
         IntTy::U32 => "uint32_t",
         IntTy::U64 | IntTy::Usize => "uint64_t",
-        // Unreachable today: no source type can name these yet (see `IntTy`).
-        IntTy::I128 => "__int128",
-        IntTy::U128 => "unsigned __int128",
+        // tcc has no __int128: the runtime's two-word structs (runtime.h).
+        IntTy::I128 => "lust_i128",
+        IntTy::U128 => "lust_u128",
     }
+}
+
+fn is128(i: IntTy) -> bool {
+    matches!(i, IntTy::I128 | IntTy::U128)
 }
 
 /// Suffix of the runtime's checked-math helpers for this type.
@@ -106,7 +110,6 @@ fn int_fn(i: IntTy) -> &'static str {
         IntTy::U16 => "u16",
         IntTy::U32 => "u32",
         IntTy::U64 | IntTy::Usize => "u64",
-        // Unreachable today; the runtime helpers land with 128-bit support.
         IntTy::I128 => "i128",
         IntTy::U128 => "u128",
     }
@@ -460,7 +463,15 @@ impl FnGen<'_, '_, '_> {
             }
             Operand::Const(c) => match c {
                 Const::Int(v, it) => {
-                    let lit = if *v < (1 << 31) { v.to_string() } else { format!("(({}){}ULL)", int_c(*it), v) };
+                    // IR consts carry 64 bits today, so a 128-bit literal
+                    // is a zero-extended word pair until consts widen.
+                    let lit = if is128(*it) {
+                        format!("(({}){{{}ULL, 0}})", int_c(*it), v)
+                    } else if *v < (1 << 31) {
+                        v.to_string()
+                    } else {
+                        format!("(({}){}ULL)", int_c(*it), v)
+                    };
                     (lit, CTy::Int(*it))
                 }
                 Const::Bool(b) => ((*b as u8).to_string(), CTy::Bool),
@@ -683,14 +694,30 @@ impl FnGen<'_, '_, '_> {
                 match (op, &at) {
                     (UnOp::Neg, CTy::Int(i)) => format!("lust_neg_{}({a}, {loc})", int_fn(*i)),
                     (UnOp::Not, CTy::Bool) => format!("(!{a})"),
+                    (UnOp::Not, CTy::Int(i)) if is128(*i) => format!("lust_{}_not({a})", int_fn(*i)),
                     (UnOp::Not, CTy::Int(i)) => format!("(({})~{a})", int_c(*i)),
                     _ => panic!("bad unary op"),
                 }
             }
             Rvalue::Cast(o, to) => {
-                let (a, _) = self.operand(o, loc, post);
+                let (a, from) = self.operand(o, loc, post);
                 let to = cty(&self.body.tys, *to);
-                format!("(({}){a})", ctype(&to))
+                // Casts to or from a 128-bit struct value are not C casts.
+                match (&from, &to) {
+                    (CTy::Int(fi), CTy::Int(ti)) if is128(*fi) && is128(*ti) => {
+                        if fi == ti { a } else { format!("lust_{}_from_{}({a})", int_fn(*ti), int_fn(*fi)) }
+                    }
+                    (CTy::Int(fi), _) if is128(*fi) => format!("(({})(({a}).lo))", ctype(&to)),
+                    (_, CTy::Int(ti)) if is128(*ti) => {
+                        let signed = matches!(&from, CTy::Int(si) if si.signed());
+                        if signed {
+                            format!("(({}){{(uint64_t)(int64_t)({a}), (uint64_t)((int64_t)({a}) >> 63)}})", int_c(*ti))
+                        } else {
+                            format!("(({}){{(uint64_t)({a}), 0}})", int_c(*ti))
+                        }
+                    }
+                    _ => format!("(({}){a})", ctype(&to)),
+                }
             }
             Rvalue::Opt(ty, op) => {
                 let ct = ctype(&cty(&self.body.tys, *ty));
@@ -818,6 +845,38 @@ impl FnGen<'_, '_, '_> {
 
     fn bin(&mut self, op: BinOp, a: &str, at: &CTy, b: &str, bt: &CTy, loc: &str) -> String {
         use BinOp::*;
+        // 128-bit values are C structs: no C operators apply, so every
+        // operation is a runtime helper call.
+        if let CTy::Int(i) = at
+            && is128(*i)
+        {
+            let f = int_fn(*i);
+            if op.is_cmp() {
+                return format!("(lust_{f}_cmp({a}, {b}) {} 0)", op.symbol());
+            }
+            return match op {
+                Add => format!("lust_add_{f}({a}, {b}, {loc})"),
+                Sub => format!("lust_sub_{f}({a}, {b}, {loc})"),
+                Mul => format!("lust_mul_{f}({a}, {b}, {loc})"),
+                Div => format!("lust_div_{f}({a}, {b}, {loc})"),
+                Rem => format!("lust_rem_{f}({a}, {b}, {loc})"),
+                BitAnd => format!("lust_{f}_and({a}, {b})"),
+                BitOr => format!("lust_{f}_or({a}, {b})"),
+                BitXor => format!("lust_{f}_xor({a}, {b})"),
+                Shl | Shr => {
+                    let amount = match bt {
+                        CTy::Int(bi) if is128(*bi) => format!("({b}).lo"),
+                        CTy::Int(bi) if bi.signed() => format!("(uint64_t)(int64_t)({b})"),
+                        _ => format!("(uint64_t)({b})"),
+                    };
+                    let dir = if op == Shl { "left" } else { "right" };
+                    let sh = format!("lust_shift_amount({amount}, 128, \"{dir}\", {loc})");
+                    let how = if op == Shl { "shl" } else { "shr" };
+                    format!("lust_{f}_{how}({a}, {sh})")
+                }
+                _ => unreachable!(),
+            };
+        }
         if op.is_cmp() {
             return format!("({a} {} {b})", op.symbol());
         }
@@ -834,6 +893,7 @@ impl FnGen<'_, '_, '_> {
                     BitAnd | BitOr | BitXor => format!("(({c})({a} {} {b}))", op.symbol()),
                     Shl | Shr => {
                         let amount = match bt {
+                            CTy::Int(bi) if is128(*bi) => format!("({b}).lo"),
                             CTy::Int(bi) if bi.signed() => format!("(uint64_t)(int64_t)({b})"),
                             _ => format!("(uint64_t)({b})"),
                         };
@@ -875,6 +935,7 @@ impl FnGen<'_, '_, '_> {
     fn eq_expr(&mut self, t: &CTy, a: &str, b: &str) -> String {
         match t {
             CTy::Unit => "1".into(),
+            CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
             CTy::Bool | CTy::Char | CTy::Int(_) => format!("(*{a} == *{b})"),
             _ => {
                 self.want(Glue::Eq, t);
@@ -989,18 +1050,39 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             B::WrappingAdd | B::WrappingSub | B::WrappingMul => {
-                let c = int_c(int_of(&tys[0]));
-                let op = match b {
-                    B::WrappingAdd => "+",
-                    B::WrappingSub => "-",
-                    _ => "*",
-                };
-                format!("(({c})((uint64_t)({}) {op} (uint64_t)({})))", vals[0], vals[1])
+                let it = int_of(&tys[0]);
+                if is128(it) {
+                    let f = int_fn(it);
+                    let how = match b {
+                        B::WrappingAdd => "add",
+                        B::WrappingSub => "sub",
+                        _ => "mul",
+                    };
+                    format!("lust_{f}_{how}({}, {})", vals[0], vals[1])
+                } else {
+                    let c = int_c(it);
+                    let op = match b {
+                        B::WrappingAdd => "+",
+                        B::WrappingSub => "-",
+                        _ => "*",
+                    };
+                    format!("(({c})((uint64_t)({}) {op} (uint64_t)({})))", vals[0], vals[1])
+                }
             }
             B::Abs => format!("lust_abs_{}({}, {loc})", int_fn(int_of(&tys[0])), vals[0]),
             B::Pow => format!("lust_pow_{}({}, {}, {loc})", int_fn(int_of(&tys[0])), vals[0], vals[1]),
-            B::Min => format!("({0} < {1} ? {0} : {1})", vals[0], vals[1]),
-            B::Max => format!("({0} > {1} ? {0} : {1})", vals[0], vals[1]),
+            B::Min | B::Max => {
+                let it = int_of(&tys[0]);
+                if is128(it) {
+                    let f = int_fn(it);
+                    let rel = if b == B::Min { "<" } else { ">" };
+                    format!("(lust_{f}_cmp({0}, {1}) {rel} 0 ? {0} : {1})", vals[0], vals[1])
+                } else if b == B::Min {
+                    format!("({0} < {1} ? {0} : {1})", vals[0], vals[1])
+                } else {
+                    format!("({0} > {1} ? {0} : {1})", vals[0], vals[1])
+                }
+            }
             B::OptIsSome => format!("(({})->tag == 1)", vals[0]),
             B::OptIsNone => format!("(({})->tag == 0)", vals[0]),
             B::OptUnwrap | B::OptExpect => {
@@ -1187,6 +1269,7 @@ impl FnGen<'_, '_, '_> {
             t = *inner;
         }
         let line = match (&t, debug) {
+            (CTy::Int(i), _) if is128(*i) => format!("lust_fmt_{}(&{out}, {e});", int_fn(*i)),
             (CTy::Int(i), _) if i.signed() => format!("lust_fmt_i64(&{out}, (int64_t){e});"),
             (CTy::Int(_), _) => format!("lust_fmt_u64(&{out}, (uint64_t){e});"),
             (CTy::Bool, _) => format!("lust_fmt_bool(&{out}, {e});"),
@@ -1349,6 +1432,57 @@ fn runtime_source(with_impls: bool) -> String {
     src.replacen("#include \"hash.h\"", &hash, 1)
 }
 
+/// Removes C comments, replacing each with one space (the C meaning of a
+/// comment). String and char literals pass through untouched. The
+/// runtime header is about a third comments by bytes, and every unit
+/// would otherwise make tcc lex them again.
+fn strip_c_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                let quote = b[i];
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != quote {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                out.push_str(&src[start..i]);
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(' ');
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            _ => {
+                let start = i;
+                while i < b.len() && b[i] != b'"' && b[i] != b'\'' && b[i] != b'/' {
+                    i += 1;
+                }
+                if i == start {
+                    i += 1;
+                    out.push('/');
+                } else {
+                    out.push_str(&src[start..i]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do
 /// not make tcc tokenize code that would expand to nothing.
 fn runtime_decls() -> &'static str {
@@ -1391,11 +1525,11 @@ fn runtime_decls() -> &'static str {
         // the system headers behind them. The compiler's predefined types define the same names
         // (tcc and gcc both predefine them; on macOS arm64 tcc's __INT64_TYPE__ is long long,
         // which matches Apple's int64_t). The runtime unit keeps the real includes.
-        out.replacen(
+        strip_c_comments(&out.replacen(
             "#include <stdint.h>\n#include <stddef.h>\n",
             "typedef signed char int8_t; typedef unsigned char uint8_t; typedef short int16_t; typedef unsigned short uint16_t;\ntypedef int int32_t; typedef unsigned int uint32_t;\n#ifdef __INT64_TYPE__\ntypedef __INT64_TYPE__ int64_t; typedef unsigned __INT64_TYPE__ uint64_t;\n#else\ntypedef long long int64_t; typedef unsigned long long uint64_t;\n#endif\n#ifdef __SIZE_TYPE__\ntypedef __SIZE_TYPE__ size_t; typedef __PTRDIFF_TYPE__ ptrdiff_t; typedef __UINTPTR_TYPE__ uintptr_t; typedef __INTPTR_TYPE__ intptr_t;\n#else\ntypedef unsigned long size_t; typedef long ptrdiff_t; typedef unsigned long uintptr_t; typedef long intptr_t;\n#endif\n#define INT64_MIN (-9223372036854775807LL-1)\n#ifndef NULL\n#define NULL ((void*)0)\n#endif\n",
             1,
-        )
+        ))
     })
 }
 
@@ -1788,6 +1922,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
             let eq_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
                     CTy::Unit => "1".into(),
+                    CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
                     CTy::Bool | CTy::Char | CTy::Int(_) => format!("({x} == {y})"),
                     _ => {
                         need(Glue::Eq, t);
@@ -1863,6 +1998,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
             let _ = writeln!(protos, "void dbg_{m}(lust_String *out, {ct} *p);");
             let dbg_of = |t: &CTy, e: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
+                    CTy::Int(i) if is128(*i) => format!("lust_fmt_{}(out, {e});", int_fn(*i)),
                     CTy::Int(i) if i.signed() => format!("lust_fmt_i64(out, (int64_t){e});"),
                     CTy::Int(_) => format!("lust_fmt_u64(out, (uint64_t){e});"),
                     CTy::Bool => format!("lust_fmt_bool(out, {e});"),
