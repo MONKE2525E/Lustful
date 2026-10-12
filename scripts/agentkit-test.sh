@@ -131,13 +131,16 @@ enum_count = len(re.findall(r"^\s+[A-Z]\w+,", enum_body, re.M))
 cap_src = (root / "src/capabilities.rs").read_text()
 list_count = cap_src.count("Builtin::", 0, cap_src.index("];", cap_src.index("ALL_BUILTINS")))
 assert enum_count == list_count, (enum_count, list_count)
-# MacroKind variant count equals the macro list length.
+# MacroKind variant count plus the token-level builtin list equals the
+# macro list length.
 macro_body = re.search(r"pub enum MacroKind \{(.*?)\n\}", src, re.S).group(1)
-assert len(re.findall(r"^\s+[A-Z]\w+,", macro_body, re.M)) == len(cap["macros"])
+token_body = re.search(r"const TOKEN_MACROS: &\[&str\] = &\[(.*?)\];", cap_src, re.S).group(1)
+token_count = len(re.findall(r'"[a-z_]+",', token_body))
+assert len(re.findall(r"^\s+[A-Z]\w+,", macro_body, re.M)) + token_count == len(cap["macros"])
 # Rejected codes are all documented codes.
 codes = {c["code"] for c in cap["diagnostics"]["codes"]}
 assert all(r["code"] in codes for r in cap["rejected"])
-assert len(codes) == 55
+assert len(codes) == 62
 PYEOF
 check cap-content $? "see the python assert above"
 "$lust" capabilities | grep -q "methods on Vec<T>"; check cap-human $? "human output must list methods"

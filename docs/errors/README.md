@@ -46,7 +46,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0310](L0310.md) | value used before it is assigned |
 | [L0311](L0311.md) | cannot move a borrowed value |
 | [L0312](L0312.md) | cannot assign while borrowed |
-| [L0401](L0401.md) | user macros are not supported |
+| [L0401](L0401.md) | this macro call has no expanded form yet |
 | [L0402](L0402.md) | unsupported attribute |
 | [L0403](L0403.md) | cannot derive this trait |
 | [L0404](L0404.md) | `unsafe` is not supported |
@@ -61,6 +61,13 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0641](L0641.md) | this literal or std form is not supported yet |
 | [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
+| [L0801](L0801.md) | macro expansion hit a limit |
+| [L0802](L0802.md) | no macro with this name is in scope |
+| [L0803](L0803.md) | include file not found |
+| [L0805](L0805.md) | local ambiguity in a macro call |
+| [L0806](L0806.md) | this macro call does not fit |
+| [L0807](L0807.md) | this macro definition is not valid |
+| [L0809](L0809.md) | this macro form is not supported yet |
 | [L0810](L0810.md) | extern blocks are not supported yet |
 | [L0820](L0820.md) | this syntax form is not supported yet |
 | [L9001](L9001.md) | feature is not supported yet |

@@ -67,7 +67,11 @@ prints "reserved, not yet emitted".
 | L0721 | Methods and receivers | W-TRAITS-CORE | in use | Method turbofish or typed receiver form is not supported yet (S3b) |
 | L0722-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0722 unsupported receiver type |
 | L0730-L0739 | Regions and drop check | W-BORROW | reserved | L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes |
-| L0801-L0809 | Macros | W-MACRO | reserved | L0801 expansion caps, L0802 unknown macro, L0803 include file not found, L0804 proc-macro dependency, L0805 local ambiguity |
+| L0801-L0803 | Macros | W-MACRO | in use | L0801 expansion caps, L0802 unknown macro, L0803 include file not found |
+| L0804 | Macros | W-MACRO | reserved | L0804 proc-macro dependency |
+| L0805-L0807 | Macros | W-MACRO | in use | L0805 local ambiguity, L0806 invalid macro call or builtin input, L0807 invalid macro definition |
+| L0808 | Macros | W-MACRO | reserved | |
+| L0809 | Macros | W-MACRO | in use | Known macro form lust does not support yet (for example `offset_of!`) |
 | L0810 | Foreign and shim boundary | W-SHIM | in use | Extern block or foreign item is not supported yet (S3b parser reject) |
 | L0811-L0819 | Foreign and shim boundary | W-SHIM | reserved | |
 | L0820 | Core syntax forms | W-CORELANG | in use | Core expression, pattern, or statement form is not supported yet (S3b parser reject; range added by S3b because no Appendix A range covers core syntax) |

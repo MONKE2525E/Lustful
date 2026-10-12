@@ -102,13 +102,13 @@ Release builds go through the real Rust toolchain on the same source, and lust p
 - Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash` (Hash is accepted, but nothing uses it yet).
 - Types: integers (no 128-bit), `bool`, `char`, `String`, `&str`, `Vec<T>`, `Option<T>`, `&T`, `&mut T`.
 - Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns, default binding modes), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.
-- Macros: `println!`, `print!`, `eprintln!`, `eprint!`, `format!` (`{}`, `{:?}`, positional, and captured names), `vec!`, `panic!`, `assert!`, `assert_eq!`, `assert_ne!`, `todo!`, `unreachable!`.
+- Macros: `macro_rules!` definitions and calls (matching, hygiene, textual and `#[macro_export]` scope, in one file), plus built-ins: `println!`, `print!`, `eprintln!`, `eprint!`, `format!` (`{}`, `{:?}`, positional, and captured names), `vec!`, `panic!`, `assert!`/`assert_eq!`/`assert_ne!`, `debug_assert!` family, `matches!`, `concat!`, `stringify!`, `cfg!`, `env!`, `option_env!`, `line!`, `column!`, `file!`, `module_path!`, `include!`, `include_str!`, `compile_error!`, `dbg!`, `write!`/`writeln!`, `todo!`, `unreachable!`, `unimplemented!`.
 - Std: common methods on `String`, `str`, `Vec`, `Option`, `char`, and integers, plus `std::env::args().count()`.
 - Borrow checking: moves, initialization, mutability, NLL-style conflicting borrows with two-phase borrows, dangling references, temporaries dropped while borrowed, and returned references (elision only).
 
 Not yet: generics, traits, closures, iterators beyond `chars()`, `Result` and `?`, `HashMap`, floats, tuples, arrays, slices, modules, `const`, `let`-else, and moving one field out of a struct while keeping the rest. Each one gives error `L9001`.
 
-Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields (`L0201`), and user macros (`L0401`).
+Lust rejects on purpose: lifetime syntax (`L0203`) and references in struct fields (`L0201`).
 
 ## Tests
 

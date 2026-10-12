@@ -161,6 +161,36 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
     }
 }
 
+/// Built-in macros the expander handles at token level (src/expand),
+/// in one place so this list and `is_token_builtin` can be checked
+/// against each other. `offset_of` is the one name not listed here: it
+/// reports L0809 as not supported yet.
+const TOKEN_MACROS: &[&str] = &[
+    "matches",
+    "concat",
+    "stringify",
+    "cfg",
+    "env",
+    "option_env",
+    "line",
+    "column",
+    "file",
+    "module_path",
+    "include",
+    "include_str",
+    "include_bytes",
+    "compile_error",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "write",
+    "writeln",
+    "dbg",
+    "unimplemented",
+    "thread_local",
+    "pin",
+];
+
 /// Every macro kind, in `MacroKind` order. `macro_name` matches exhaustively.
 const ALL_MACROS: &[MacroKind] = &[
     MacroKind::Println,
@@ -209,7 +239,7 @@ fn item_kind_label(k: &ItemKind) -> &'static str {
         ItemKind::Type(_) => "type alias (shape only)",
         ItemKind::Const(_) => "const (shape only)",
         ItemKind::Static(_) => "static (shape only)",
-        ItemKind::MacroRules(_) => "macro_rules (shape only)",
+        ItemKind::MacroRules(_) => "macro_rules",
         ItemKind::ExternCrate(_) => "extern crate (shape only)",
         ItemKind::ExternBlock(_) => "extern block (shape only)",
         ItemKind::Union(_) => "union (shape only)",
@@ -274,7 +304,7 @@ fn pat_label(p: &Pat) -> &'static str {
 const REJECTED: &[(&str, &str)] = &[
     ("references in struct and enum fields", "L0201"),
     ("lifetime names such as 'a", "L0203"),
-    ("user macros (macro_rules! definitions and calls)", "L0401"),
+    ("macro calls with no expanded form yet, such as format_args!", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
     ("known attributes such as cfg, repr, path, and inline (named in the message)", "L0522"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, Hash (named in the message)", "L0403"),
@@ -363,6 +393,7 @@ const ITEMS: &[&str] = &[
     "enum (unit, tuple, and struct variants)",
     "impl (inherent only)",
     "use (parsed, no effect yet)",
+    "macro_rules (definitions and calls, one file)",
 ];
 
 const TYPES: &[&str] = &[
@@ -490,7 +521,8 @@ pub fn run(args: &[String]) -> i32 {
     let known = Known::new(&interner);
     // Supported types only: `IntTy::ALL` also carries the representation-only 128-bit forms.
     let int_types: Vec<String> = IntTy::ALL_SUPPORTED.iter().map(|t| t.name().to_string()).collect();
-    let macros: Vec<String> = ALL_MACROS.iter().map(|&m| format!("{}!", interner.get(macro_name(m, &known)))).collect();
+    let mut macros: Vec<String> = ALL_MACROS.iter().map(|&m| format!("{}!", interner.get(macro_name(m, &known)))).collect();
+    macros.extend(TOKEN_MACROS.iter().map(|m| format!("{m}!")));
     let attributes: Vec<String> =
         [known.derive, known.test, known.allow, known.warn, known.deny].iter().map(|&s| interner.get(s).to_string()).collect();
     let binops: Vec<String> = [
