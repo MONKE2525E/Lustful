@@ -50,6 +50,8 @@ prints "reserved, not yet emitted".
 | L0523-L0529 | cfg and attributes | W-MACRO | reserved | |
 | L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
 | L0532-L0539 | Crate session | W-DRIVER | reserved | |
+| L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
+| L0541-L0549 | Known-value checks | check | reserved | |
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603-L0609 | Types and aliases | W-CORELANG | reserved | |

@@ -11,7 +11,7 @@ use crate::check::collect::*;
 use crate::check::generics::Scope;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Fingerprint, Head, Namespace, Reads, ReceiverForm, SigOf};
-use crate::intern::Sym;
+use crate::intern::{Interner, Sym};
 use crate::traits::solve::{Selection, SolveCx, Solver};
 use crate::ty::defs::DefKind as DefsKind;
 use crate::ty::lang;
@@ -544,6 +544,43 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
+/// A value the overflow lint knows at compile time.
+#[derive(Clone, PartialEq)]
+enum KVal {
+    Int(i128),
+    Bool(bool),
+    Agg(Vec<Option<KVal>>),
+}
+
+type KEnv = Vec<Option<KVal>>;
+
+/// State of the overflow-lint walk: addressed locals, the stack of loop
+/// and labeled-block frames collecting break values, and one operation to
+/// leave alone (the `a = a + 1` form).
+struct KLint {
+    addressed: Vec<bool>,
+    frames: Vec<(Option<Sym>, Vec<Option<KVal>>)>,
+    suppress: Option<(ExprId, u32)>,
+    /// The current path is known to be unreachable (a known branch that
+    /// is taken diverges): the rest of the block is not linted.
+    dead: bool,
+}
+
+/// True when an attribute is `#[allow(<name>)]` (possibly one of several).
+pub fn allow_attr(attr: &ast::Attr, interner: &Interner, name: &str) -> bool {
+    if attr.path.len() != 1 || interner.get(attr.path[0].name) != "allow" {
+        return false;
+    }
+    let ast::AttrInput::List(_, trees) = &attr.input else { return false };
+    fn has(trees: &[crate::lexer::TokenTree], interner: &Interner, name: &str) -> bool {
+        trees.iter().any(|t| match t {
+            crate::lexer::TokenTree::Token(tok) => matches!(tok.tok, crate::lexer::Tok::Ident(s) if interner.get(s) == name),
+            crate::lexer::TokenTree::Delim(_, inner, _) => has(inner, interner, name),
+        })
+    }
+    has(trees, interner, name)
+}
+
 /// The name and binding span of an optional AST label.
 fn label_of(label: &Option<ast::Label>) -> Option<(Sym, Span)> {
     label.map(|l| (l.name, l.span))
@@ -5799,6 +5836,914 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    // ---------- Known-value overflow lint (rustc `arithmetic_overflow`) ----------
+
+    /// The deny-level lint rustc runs over known values, mirrored from its
+    /// MIR const-prop behavior (probed against rustc): an arithmetic
+    /// operation on operands known at compile time that would overflow is
+    /// an error. The pass walks the checked body once, tracking scalar
+    /// locals whose value is known. The tracked set follows the probed
+    /// rules: a local whose address is taken anywhere is never tracked,
+    /// knowledge does not survive a control-flow join for locals assigned
+    /// on either side, a write through a field or index place drops the
+    /// whole aggregate, reads through references and enum payloads are
+    /// unknown, and an operation that stores back into the local it reads
+    /// (`a = a + 1`, `a += 1`) does not fire. `u128` values at or above
+    /// 2^127 are not tracked (they do not fit the i128 values here).
+    fn overflow_lint(&mut self) {
+        let p = self.p;
+        if self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
+            return;
+        }
+        let Some(body) = self.f.def.body else { return };
+        let mut lint = KLint { addressed: vec![false; self.out.locals.len()], frames: Vec::new(), suppress: None, dead: false };
+        // A local whose address is taken anywhere in the body is not tracked.
+        for i in 0..self.out.expr_ty.len() {
+            let e = ExprId(self.out.expr_base + i as u32);
+            match p.ast.expr(e) {
+                Expr::Ref { expr, .. } => {
+                    if let Some(root) = self.k_place_root(*expr) {
+                        lint.addressed[root as usize] = true;
+                    }
+                }
+                Expr::MethodCall { recv, .. } => {
+                    let res = self.out.expr_res[i];
+                    let ar = match res {
+                        Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } => autoref,
+                        _ => Autoref::None,
+                    };
+                    if ar != Autoref::None
+                        && let Some(root) = self.k_place_root(*recv)
+                    {
+                        lint.addressed[root as usize] = true;
+                    }
+                }
+                Expr::Macro { kind, args, .. } => {
+                    // Format arguments are borrowed (as in `macro_expr`).
+                    let borrowed: &[ExprId] = match kind {
+                        ast::MacroKind::AssertEq | ast::MacroKind::AssertNe => &args[..args.len().min(2)],
+                        ast::MacroKind::Vec | ast::MacroKind::Assert => &[],
+                        _ => args,
+                    };
+                    for &a in borrowed {
+                        if matches!(p.ast.expr(a), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. })
+                            && let Some(root) = self.k_place_root(a)
+                        {
+                            lint.addressed[root as usize] = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut env: KEnv = vec![None; self.out.locals.len()];
+        self.k_block(body, &mut env, &mut lint);
+    }
+
+    /// The root local of a place expression, if the place is one.
+    fn k_place_root(&self, e: ExprId) -> Option<u32> {
+        match self.out.expr_res[self.ei(e)] {
+            Res::Local(l) => return Some(l),
+            _ => {}
+        }
+        match self.p.ast.expr(e) {
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => self.k_place_root(*base),
+            _ => None,
+        }
+    }
+
+    /// The mathematical value of an i128 seen at integer type `t`, or None
+    /// for a u128 value that does not fit an i128.
+    fn k_math(&self, v: i128, t: Ty) -> Option<i128> {
+        match self.tys.kind(t) {
+            TyKind::Int(it) => {
+                let bits = it.bits();
+                if it.signed() {
+                    Some(crate::ty::consteval::truncate_to_int(v, it))
+                } else if bits >= 128 {
+                    if v >= 0 { Some(v) } else { None }
+                } else {
+                    Some(v & ((1i128 << bits) - 1))
+                }
+            }
+            _ => Some(v),
+        }
+    }
+
+    /// Wraps an i128 to the range of its integer type (loss is intended:
+    /// the value continues as the wrapped result, as in a wrapping op).
+    fn k_wrap(&self, v: i128, t: Ty) -> Option<i128> {
+        self.k_math(v, t)
+    }
+
+    /// The value range of an integer type, when it fits in i128 values.
+    fn k_range(&self, t: Ty) -> Option<(IntTy, i128, i128)> {
+        match self.tys.kind(t) {
+            TyKind::Int(it) => {
+                let bits = it.bits();
+                if bits >= 128 {
+                    if it.signed() { Some((it, i128::MIN, i128::MAX)) } else { None }
+                } else if it.signed() {
+                    Some((it, -(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
+                } else {
+                    Some((it, 0, (1i128 << bits) - 1))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn k_fire(&mut self, span: Span) {
+        self.err(
+            "L0540",
+            span,
+            "this arithmetic operation will overflow",
+            "Change the values or the type. If the wrap is intended, use a `wrapping_*` operation.",
+        );
+    }
+
+    /// Places whose writes change a tracked local, found by span within
+    /// the given regions (a loop body and its condition).
+    fn k_assigned_in(&self, regions: &[Span]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for i in 0..self.out.expr_ty.len() {
+            let e = ExprId(self.out.expr_base + i as u32);
+            let lhs = match self.p.ast.expr(e) {
+                Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => *lhs,
+                _ => continue,
+            };
+            let sp = self.p.ast.expr_span(e);
+            if regions.iter().any(|r| r.file == sp.file && r.lo <= sp.lo && sp.hi <= r.hi)
+                && let Some(root) = self.k_place_root(lhs)
+                && !out.contains(&root)
+            {
+                out.push(root);
+            }
+        }
+        out
+    }
+
+    /// Records a value for a local, unless its address is taken.
+    fn k_set(env: &mut KEnv, lint: &KLint, local: u32, v: Option<KVal>) {
+        if !lint.addressed.get(local as usize).copied().unwrap_or(false) {
+            env[local as usize] = v;
+        }
+    }
+
+    /// Drops the knowledge of every local assigned in the given regions:
+    /// after a control-flow join, a local assigned on any side is no
+    /// longer known, even if all sides assign the same value.
+    fn k_poison(&self, env: &mut KEnv, regions: &[Span]) {
+        for r in self.k_assigned_in(regions) {
+            env[r as usize] = None;
+        }
+    }
+
+    /// True when a block cannot complete: a statement or its tail has
+    /// type `!` (a return, a panic, a diverging call, a break).
+    fn k_block_diverges(&self, b: ast::BlockId) -> bool {
+        let block = self.p.ast.block(b);
+        let never = |e: ExprId| self.tys.kind(self.out.expr_ty[self.ei(e)]) == TyKind::Never;
+        block.stmts.iter().any(|s| match s {
+            Stmt::Expr { expr, .. } => never(*expr),
+            Stmt::Let { init, .. } => init.is_some_and(|i| never(i)),
+            _ => false,
+        }) || block.tail.is_some_and(never)
+    }
+
+    /// Binds the known value of a scrutinee into a pattern's locals.
+    /// Tuple and struct projections keep their component values; enum
+    /// payload bindings are unknown (the probed rustc behavior).
+    fn k_bind_pat(&mut self, pat: PatId, v: &Option<KVal>, env: &mut KEnv, lint: &KLint) {
+        let p = self.p;
+        let pres = self.out.pat_res[(pat.0 - self.out.pat_base) as usize];
+        match p.ast.pat(pat) {
+            Pat::Binding { .. } => {
+                if let PatRes::Binding { local, mode } = pres {
+                    let val = if mode == BindMode::Move { v.clone() } else { None };
+                    Self::k_set(env, lint, local, val);
+                }
+            }
+            Pat::At { inner, .. } => {
+                if let PatRes::Binding { local, mode } = pres {
+                    let val = if mode == BindMode::Move { v.clone() } else { None };
+                    Self::k_set(env, lint, local, val);
+                }
+                self.k_bind_pat(*inner, v, env, lint);
+            }
+            Pat::Tuple(elems) => {
+                if let Some(KVal::Agg(items)) = v
+                    && let Some(map) = map_tuple_elems(p.ast, elems, items.len())
+                {
+                    for (idx, sub) in map {
+                        self.k_bind_pat(sub, &items[idx].clone(), env, lint);
+                    }
+                } else {
+                    for &sub in elems {
+                        self.k_bind_pat(sub, &None, env, lint);
+                    }
+                }
+            }
+            Pat::TupleStruct { elems, .. } => {
+                let struct_val = match pres {
+                    PatRes::Variant(a, _) if !p.adt(a).is_enum => v.clone(),
+                    _ => None,
+                };
+                match &struct_val {
+                    Some(KVal::Agg(items)) => match map_tuple_elems(p.ast, elems, items.len()) {
+                        Some(map) => {
+                            for (idx, sub) in map {
+                                self.k_bind_pat(sub, &items[idx].clone(), env, lint);
+                            }
+                        }
+                        None => {
+                            for &sub in elems {
+                                self.k_bind_pat(sub, &None, env, lint);
+                            }
+                        }
+                    },
+                    _ => {
+                        for &sub in elems {
+                            self.k_bind_pat(sub, &None, env, lint);
+                        }
+                    }
+                }
+            }
+            Pat::Struct { fields, .. } => {
+                let struct_fields = match pres {
+                    PatRes::Variant(a, var) if !p.adt(a).is_enum => {
+                        Some(p.adt(a).variants[var as usize].fields.iter().map(|f| f.name).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                };
+                for &(fname, sub) in fields {
+                    let slot = match (v, &struct_fields) {
+                        (Some(KVal::Agg(items)), Some(names)) => {
+                            names.iter().position(|&n| n == fname).and_then(|i| items.get(i)).cloned().unwrap_or(None)
+                        }
+                        _ => None,
+                    };
+                    self.k_bind_pat(sub, &slot, env, lint);
+                }
+            }
+            Pat::Slice { prefix, suffix, .. } => {
+                match v {
+                    Some(KVal::Agg(items)) if items.len() >= prefix.len() + suffix.len() => {
+                        for (i, &sub) in prefix.iter().enumerate() {
+                            self.k_bind_pat(sub, &items[i].clone(), env, lint);
+                        }
+                        for (j, &sub) in suffix.iter().enumerate() {
+                            self.k_bind_pat(sub, &items[items.len() - suffix.len() + j].clone(), env, lint);
+                        }
+                    }
+                    _ => {
+                        for &sub in prefix.iter().chain(suffix.iter()) {
+                            self.k_bind_pat(sub, &None, env, lint);
+                        }
+                    }
+                }
+            }
+            Pat::Or(alts) => {
+                for &a in alts {
+                    self.k_bind_pat(a, v, env, lint);
+                }
+            }
+            Pat::Ref { inner, .. } | Pat::Paren(inner) => self.k_bind_pat(*inner, &None, env, lint),
+            _ => {}
+        }
+    }
+
+    fn k_block(&mut self, b: ast::BlockId, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let p = self.p;
+        if lint.dead {
+            return None;
+        }
+        let block = p.ast.block(b);
+        for stmt in &block.stmts {
+            if lint.dead {
+                return None;
+            }
+            let diverges = match stmt {
+                Stmt::Let { pat, init, els, .. } => {
+                    let v = init.map(|i| self.k_expr(i, env, lint)).unwrap_or(None);
+                    self.k_bind_pat(*pat, &v, env, lint);
+                    if let Some(els) = els {
+                        let mut eenv = env.clone();
+                        self.k_block(*els, &mut eenv, lint);
+                    }
+                    init.is_some_and(|i| self.tys.kind(self.out.expr_ty[self.ei(i)]) == TyKind::Never)
+                }
+                Stmt::Expr { expr, .. } => {
+                    self.k_expr(*expr, env, lint);
+                    self.tys.kind(self.out.expr_ty[self.ei(*expr)]) == TyKind::Never
+                }
+                Stmt::Item(_) | Stmt::Macro { .. } => false,
+            };
+            if diverges {
+                return None;
+            }
+        }
+        if lint.dead {
+            return None;
+        }
+        match block.tail {
+            Some(tail) => self.k_expr(tail, env, lint),
+            None => None,
+        }
+    }
+
+    /// A recorded const value as a known value, if it is scalar or an
+    /// aggregate of knowns.
+    fn k_const(&self, cv: &crate::ty::consteval::ConstValue, t: Ty) -> Option<KVal> {
+        use crate::ty::consteval::ConstValue as CV;
+        match cv {
+            CV::Int(v) => self.k_math(*v, t).map(KVal::Int),
+            CV::Bool(b) => Some(KVal::Bool(*b)),
+            CV::Char(c) => Some(KVal::Int(*c as i128)),
+            CV::Aggregate(vals) => Some(KVal::Agg(vals.iter().map(|v| self.k_const(v, ERROR)).collect())),
+            _ => None,
+        }
+    }
+
+    /// Walks one expression, lints overflowing operations with known
+    /// operands, applies assignment effects to `env`, and returns the
+    /// expression's known value when there is one.
+    fn k_expr(&mut self, e: ExprId, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let p = self.p;
+        let span = self.span(e);
+        let ety = self.out.expr_ty[self.ei(e)];
+        if let Some(cv) = &self.out.const_exprs[self.ei(e)] {
+            return self.k_const(cv, ety);
+        }
+        match p.ast.expr(e) {
+            Expr::Int(v, _) => {
+                if *v <= i128::MAX as u128 { Some(KVal::Int(*v as i128)) } else { None }
+            }
+            Expr::Bool(b) => Some(KVal::Bool(*b)),
+            Expr::Char(c) => Some(KVal::Int(*c as i128)),
+            Expr::Path(_) | Expr::SelfValue => match self.out.expr_res[self.ei(e)] {
+                Res::Local(l) => env.get(l as usize).cloned().unwrap_or(None),
+                _ => None,
+            },
+            Expr::Block(b) | Expr::UnsafeBlock(b) => self.k_block(*b, env, lint),
+            Expr::ConstBlock(_) => None,
+            Expr::LabeledBlock { label, body } => {
+                lint.frames.push((Some(label.name), Vec::new()));
+                let v = self.k_block(*body, env, lint);
+                let (_, breaks) = lint.frames.pop().unwrap();
+                match (breaks.len(), v) {
+                    (0, v) => v,
+                    (1, None) => breaks.into_iter().next().unwrap(),
+                    _ => None,
+                }
+            }
+            Expr::If { cond, then, els } => {
+                let cv = self.k_expr(*cond, env, lint);
+                let then_span = p.ast.block(*then).span;
+                let els_span = els.map(|x| self.span(x));
+                if let Some(KVal::Bool(b)) = cv {
+                    // Only the taken side runs (dead-side operations do not
+                    // fire); locals it assigns are still lost at the join,
+                    // and if it diverges, what follows is unreachable.
+                    let saved = lint.dead;
+                    lint.dead = false;
+                    let side_span = if b {
+                        self.k_block(*then, env, lint);
+                        then_span
+                    } else {
+                        match els {
+                            Some(els) => {
+                                self.k_expr(*els, env, lint);
+                                self.span(*els)
+                            }
+                            None => span,
+                        }
+                    };
+                    let side_diverges = lint.dead
+                        || if b {
+                            self.k_block_diverges(*then)
+                        } else {
+                            els.is_some_and(|x| self.tys.kind(self.out.expr_ty[self.ei(x)]) == TyKind::Never)
+                        };
+                    lint.dead = saved || side_diverges;
+                    if els.is_some() || b {
+                        self.k_poison(env, &[side_span]);
+                    }
+                    return None;
+                }
+                let saved = lint.dead;
+                lint.dead = false;
+                let mut tenv = env.clone();
+                self.k_block(*then, &mut tenv, lint);
+                lint.dead = false;
+                if let Some(els) = els {
+                    let mut eenv = env.clone();
+                    self.k_expr(*els, &mut eenv, lint);
+                }
+                lint.dead = saved;
+                match els_span {
+                    Some(es) => self.k_poison(env, &[then_span, es]),
+                    None => self.k_poison(env, &[then_span]),
+                }
+                None
+            }
+            Expr::While { label, cond, body } => {
+                let regions = [self.span(*cond), p.ast.block(*body).span];
+                let poison = self.k_assigned_in(&regions);
+                let mut lenv = env.clone();
+                for &r in &poison {
+                    lenv[r as usize] = None;
+                }
+                let saved = lint.dead;
+                lint.dead = false;
+                let cv = self.k_expr(*cond, &mut lenv, lint);
+                if cv != Some(KVal::Bool(false)) {
+                    lint.dead = false;
+                    lint.frames.push((label.map(|l| l.name), Vec::new()));
+                    self.k_block(*body, &mut lenv, lint);
+                    lint.frames.pop();
+                }
+                lint.dead = saved;
+                for &r in &poison {
+                    env[r as usize] = None;
+                }
+                None
+            }
+            Expr::Loop { label, body } => {
+                let poison = self.k_assigned_in(&[p.ast.block(*body).span]);
+                let mut lenv = env.clone();
+                for &r in &poison {
+                    lenv[r as usize] = None;
+                }
+                let saved = lint.dead;
+                lint.dead = false;
+                lint.frames.push((label.map(|l| l.name), Vec::new()));
+                self.k_block(*body, &mut lenv, lint);
+                let (_, breaks) = lint.frames.pop().unwrap();
+                lint.dead = saved;
+                for &r in &poison {
+                    env[r as usize] = None;
+                }
+                if breaks.len() == 1 { breaks.into_iter().next().unwrap() } else { None }
+            }
+            Expr::For { label, pat, iter, body } => {
+                self.k_expr(*iter, env, lint);
+                let regions = [self.span(*iter), p.ast.block(*body).span];
+                let poison = self.k_assigned_in(&regions);
+                let mut lenv = env.clone();
+                for &r in &poison {
+                    lenv[r as usize] = None;
+                }
+                let saved = lint.dead;
+                lint.dead = false;
+                let none = None;
+                self.k_bind_pat(*pat, &none, &mut lenv, lint);
+                lint.frames.push((label.map(|l| l.name), Vec::new()));
+                self.k_block(*body, &mut lenv, lint);
+                lint.frames.pop();
+                lint.dead = saved;
+                for &r in &poison {
+                    env[r as usize] = None;
+                }
+                None
+            }
+            Expr::Match { scrut, arms } => {
+                let sv = self.k_expr(*scrut, env, lint);
+                let saved = lint.dead;
+                if let Some(arm) = sv.as_ref().and_then(|v| self.k_select_arm(arms, v)) {
+                    // Only this arm runs. With several arms its assignments
+                    // and its value are still lost at the join; a single
+                    // arm is straight-line code.
+                    lint.dead = false;
+                    self.k_bind_pat(arm.pat, &sv, env, lint);
+                    let v = self.k_expr(arm.body, env, lint);
+                    let body_dead = lint.dead || self.tys.kind(self.out.expr_ty[self.ei(arm.body)]) == TyKind::Never;
+                    lint.dead = saved || body_dead;
+                    if arms.len() == 1 {
+                        return v;
+                    }
+                    self.k_poison(env, &[self.span(arm.body)]);
+                    return None;
+                }
+                let mut regions: Vec<Span> = Vec::new();
+                let mut single = None;
+                for arm in arms {
+                    lint.dead = false;
+                    let mut aenv = env.clone();
+                    self.k_bind_pat(arm.pat, &sv, &mut aenv, lint);
+                    if let Some(g) = arm.guard {
+                        self.k_expr(g, &mut aenv, lint);
+                    }
+                    let v = self.k_expr(arm.body, &mut aenv, lint);
+                    regions.push(self.span(arm.body));
+                    single = Some((aenv, v));
+                }
+                lint.dead = saved;
+                if arms.len() == 1
+                    && let Some((aenv, v)) = single
+                {
+                    *env = aenv;
+                    return v;
+                }
+                self.k_poison(env, &regions);
+                None
+            }
+            Expr::Break { label, value } => {
+                let v = value.map(|x| self.k_expr(x, env, lint)).unwrap_or(None);
+                let want = label.map(|l| l.name);
+                if let Some(frame) = lint.frames.iter_mut().rev().find(|(n, _)| want.is_none() || *n == want) {
+                    frame.1.push(v);
+                }
+                None
+            }
+            Expr::Continue(_) => None,
+            Expr::Return(v) => {
+                if let Some(v) = v {
+                    self.k_expr(*v, env, lint);
+                }
+                None
+            }
+            Expr::Let { pat, scrut } => {
+                let v = self.k_expr(*scrut, env, lint);
+                self.k_bind_pat(*pat, &v, env, lint);
+                None
+            }
+            Expr::Call { callee, args } => {
+                self.k_expr(*callee, env, lint);
+                let mut vals = Vec::new();
+                for &a in args {
+                    vals.push(self.k_expr(a, env, lint));
+                }
+                match self.out.expr_res[self.ei(e)] {
+                    Res::DefaultVal => match self.tys.kind(ety) {
+                        TyKind::Int(_) | TyKind::Char => Some(KVal::Int(0)),
+                        TyKind::Bool => Some(KVal::Bool(false)),
+                        _ => None,
+                    },
+                    Res::FromCast => match vals.into_iter().next().flatten() {
+                        Some(KVal::Int(v)) => self.k_wrap(v, ety).map(KVal::Int),
+                        other => other,
+                    },
+                    _ => match self.out.expr_res[self.ei(*callee)] {
+                        Res::ConstUsize(u) => Some(KVal::Int(u as i128)),
+                        Res::Variant(a, _) if !p.adt(a).is_enum => Some(KVal::Agg(vals)),
+                        Res::OptSome => Some(KVal::Agg(vals)),
+                        _ => None,
+                    },
+                }
+            }
+            Expr::MethodCall { recv, args, .. } => {
+                self.k_expr(*recv, env, lint);
+                for &a in args {
+                    self.k_expr(a, env, lint);
+                }
+                None
+            }
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                let bv = self.k_expr(*base, env, lint);
+                match (bv, self.out.expr_res[self.ei(e)]) {
+                    (Some(KVal::Agg(items)), Res::Field { derefs: 0, index }) => {
+                        items.get(index as usize).cloned().unwrap_or(None)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Index { base, index } => {
+                let bv = self.k_expr(*base, env, lint);
+                let iv = self.k_expr(*index, env, lint);
+                match (bv, iv) {
+                    (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => {
+                        items.get(i as usize).cloned().unwrap_or(None)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::StructLit { fields, update, .. } => {
+                let base = update.and_then(|u| self.k_expr(u, env, lint));
+                match self.out.expr_res[self.ei(e)] {
+                    Res::Variant(a, v) if !p.adt(a).is_enum => {
+                        let variant = &p.adt(a).variants[v as usize];
+                        let mut items: Vec<Option<KVal>> = match base {
+                            Some(KVal::Agg(items)) if items.len() == variant.fields.len() => items,
+                            _ => vec![None; variant.fields.len()],
+                        };
+                        for &(fname, _, fe) in fields {
+                            let fv = self.k_expr(fe, env, lint);
+                            if let Some(i) = variant.fields.iter().position(|f| f.name == fname) {
+                                items[i] = fv;
+                            }
+                        }
+                        Some(KVal::Agg(items))
+                    }
+                    _ => {
+                        for &(_, _, fe) in fields {
+                            self.k_expr(fe, env, lint);
+                        }
+                        None
+                    }
+                }
+            }
+            Expr::Tuple(elems) => {
+                let items = elems.iter().map(|&el| self.k_expr(el, env, lint)).collect();
+                Some(KVal::Agg(items))
+            }
+            Expr::Array(elems) => {
+                let items = elems.iter().map(|&el| self.k_expr(el, env, lint)).collect();
+                Some(KVal::Agg(items))
+            }
+            Expr::ArrayRepeat { value, len } => {
+                self.k_expr(*value, env, lint);
+                self.k_expr(*len, env, lint);
+                None
+            }
+            Expr::Range { lo, hi, .. } => {
+                for b in [lo, hi].into_iter().flatten() {
+                    self.k_expr(*b, env, lint);
+                }
+                None
+            }
+            Expr::Ref { expr, .. } => {
+                self.k_expr(*expr, env, lint);
+                None
+            }
+            Expr::Deref(inner) => {
+                self.k_expr(*inner, env, lint);
+                None
+            }
+            Expr::Cast { expr, .. } => {
+                let v = self.k_expr(*expr, env, lint);
+                match (v, self.tys.kind(ety)) {
+                    (Some(KVal::Int(x)), TyKind::Int(_) | TyKind::Char) => self.k_wrap(x, ety).map(KVal::Int),
+                    (Some(KVal::Bool(b)), TyKind::Int(_)) => Some(KVal::Int(b as i128)),
+                    (Some(KVal::Bool(b)), TyKind::Bool) => Some(KVal::Bool(b)),
+                    _ => None,
+                }
+            }
+            Expr::OffsetOf { .. } => match self.out.expr_res[self.ei(e)] {
+                Res::ConstUsize(u) => Some(KVal::Int(u as i128)),
+                _ => None,
+            },
+            Expr::Macro { args, .. } => {
+                for &a in args {
+                    self.k_expr(a, env, lint);
+                }
+                None
+            }
+            Expr::Binary { op, lhs, rhs } => self.k_binary(e, *op, *lhs, *rhs, span, env, lint),
+            Expr::Unary { op, expr } => self.k_unary(e, *op, *expr, span, env, lint),
+            Expr::Assign { lhs, rhs } => {
+                self.k_place_parts(*lhs, env, lint);
+                let whole = if matches!(p.ast.expr(*lhs), Expr::Path(_)) { self.k_place_root(*lhs) } else { None };
+                if let Some(root) = whole
+                    && matches!(p.ast.expr(*rhs), Expr::Binary { .. } | Expr::Unary { .. })
+                {
+                    lint.suppress = Some((*rhs, root));
+                }
+                let v = self.k_expr(*rhs, env, lint);
+                lint.suppress = None;
+                match whole {
+                    Some(root) => Self::k_set(env, lint, root, v),
+                    None => {
+                        if let Some(root) = self.k_place_root(*lhs) {
+                            env[root as usize] = None;
+                        }
+                    }
+                }
+                None
+            }
+            Expr::AssignOp { op, lhs, rhs } => {
+                let root = self.k_place_root(*lhs);
+                let old = if matches!(p.ast.expr(*lhs), Expr::Path(_)) {
+                    root.and_then(|r| env.get(r as usize).cloned().unwrap_or(None))
+                } else {
+                    self.k_place_parts(*lhs, env, lint);
+                    None
+                };
+                let rv = self.k_expr(*rhs, env, lint);
+                // A compound assignment does not fire for its own overflow
+                // (probed), but a bad shift amount still does.
+                if matches!(op, BinOp::Shl | BinOp::Shr)
+                    && let Some(KVal::Int(s)) = rv
+                {
+                    let lt = self.out.expr_ty[self.ei(*lhs)];
+                    if let Some((it, _, _)) = self.k_range(lt) {
+                        if s < 0 || s >= it.bits() as i128 {
+                            self.k_fire(span);
+                        }
+                    }
+                }
+                match root {
+                    Some(r) if matches!(p.ast.expr(*lhs), Expr::Path(_)) => {
+                        let lt = self.out.expr_ty[self.ei(*lhs)];
+                        let nv = match (old, rv) {
+                            (Some(KVal::Int(a)), Some(KVal::Int(b))) => {
+                                self.k_arith(*op, a, b, lt).map(KVal::Int)
+                            }
+                            _ => None,
+                        };
+                        Self::k_set(env, lint, r, nv);
+                    }
+                    Some(r) => env[r as usize] = None,
+                    None => {}
+                }
+                None
+            }
+            Expr::Try(inner) | Expr::Await(inner) => self.k_expr(*inner, env, lint),
+            _ => None,
+        }
+    }
+
+    /// Walks the sub-expressions of an assignment place (indexes and the
+    /// like) so operations inside them are linted.
+    fn k_place_parts(&mut self, e: ExprId, env: &mut KEnv, lint: &mut KLint) {
+        match self.p.ast.expr(e) {
+            Expr::Index { base, index } => {
+                self.k_place_parts(*base, env, lint);
+                self.k_expr(*index, env, lint);
+            }
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.k_place_parts(*base, env, lint),
+            Expr::Deref(inner) => {
+                self.k_expr(*inner, env, lint);
+            }
+            _ => {}
+        }
+    }
+
+    /// The arm a known scrutinee value selects, when a guard-free arm's
+    /// pattern is a literal, a range, or a catch-all.
+    fn k_select_arm<'x>(&self, arms: &'x [ast::Arm], v: &KVal) -> Option<&'x ast::Arm> {
+        let val = match v {
+            KVal::Int(i) => *i,
+            KVal::Bool(b) => *b as i128,
+            _ => return None,
+        };
+        arms.iter().find(|arm| arm.guard.is_none() && self.k_pat_covers(arm.pat, val))
+    }
+
+    fn k_pat_covers(&self, pat: PatId, val: i128) -> bool {
+        match self.p.ast.pat(pat) {
+            Pat::Wild | Pat::Binding { .. } => !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_)),
+            Pat::Lit(l) => match self.p.ast.expr(*l) {
+                Expr::Bool(b) => val == *b as i128,
+                _ => self.const_scalar(*l) == Some(val),
+            },
+            Pat::Range { lo, hi, inclusive } => {
+                let lo_ok = lo.is_none_or(|e| self.const_scalar(e).is_some_and(|x| val >= x));
+                let hi_ok = hi.is_none_or(|e| self.const_scalar(e).is_some_and(|x| if *inclusive { val <= x } else { val < x }));
+                lo_ok && hi_ok
+            }
+            Pat::Or(alts) => alts.iter().any(|&a| self.k_pat_covers(a, val)),
+            Pat::At { inner, .. } | Pat::Paren(inner) => self.k_pat_covers(*inner, val),
+            _ => false,
+        }
+    }
+
+    /// Wrapped arithmetic for continuing a known value (no lint here).
+    fn k_arith(&self, op: BinOp, a: i128, b: i128, t: Ty) -> Option<i128> {
+        let (a, b) = (self.k_math(a, t)?, self.k_math(b, t)?);
+        let r = match op {
+            BinOp::Add => a.checked_add(b)?,
+            BinOp::Sub => a.checked_sub(b)?,
+            BinOp::Mul => a.checked_mul(b)?,
+            BinOp::Div => {
+                if b == 0 { return None; }
+                a.checked_div(b)?
+            }
+            BinOp::Rem => {
+                if b == 0 { return None; }
+                a.checked_rem(b)?
+            }
+            BinOp::BitAnd => a & b,
+            BinOp::BitOr => a | b,
+            BinOp::BitXor => a ^ b,
+            BinOp::Shl => a.checked_shl(u32::try_from(b).ok()?)?,
+            BinOp::Shr => a.checked_shr(u32::try_from(b).ok()?)?,
+            _ => return None,
+        };
+        self.k_wrap(r, t)
+    }
+
+    fn k_binary(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let lv = self.k_expr(lhs, env, lint);
+        // A known short-circuit skips the right side entirely.
+        match (op, &lv) {
+            (BinOp::And, Some(KVal::Bool(false))) => return Some(KVal::Bool(false)),
+            (BinOp::Or, Some(KVal::Bool(true))) => return Some(KVal::Bool(true)),
+            _ => {}
+        }
+        let rv = self.k_expr(rhs, env, lint);
+        if matches!(self.out.expr_res[self.ei(e)], Res::TraitBin { .. }) {
+            return None;
+        }
+        match op {
+            BinOp::And => match (lv, rv) {
+                (Some(KVal::Bool(a)), Some(KVal::Bool(b))) => Some(KVal::Bool(a && b)),
+                _ => None,
+            },
+            BinOp::Or => match (lv, rv) {
+                (Some(KVal::Bool(a)), Some(KVal::Bool(b))) => Some(KVal::Bool(a || b)),
+                _ => None,
+            },
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let ord = match (&lv, &rv) {
+                    (Some(KVal::Int(a)), Some(KVal::Int(b))) => {
+                        let lt = self.out.expr_ty[self.ei(lhs)];
+                        match (self.k_math(*a, lt), self.k_math(*b, lt)) {
+                            (Some(a), Some(b)) => Some(a.cmp(&b)),
+                            _ => None,
+                        }
+                    }
+                    (Some(KVal::Bool(a)), Some(KVal::Bool(b))) => Some(a.cmp(b)),
+                    _ => None,
+                };
+                ord.map(|o| {
+                    KVal::Bool(match op {
+                        BinOp::Eq => o == std::cmp::Ordering::Equal,
+                        BinOp::Ne => o != std::cmp::Ordering::Equal,
+                        BinOp::Lt => o == std::cmp::Ordering::Less,
+                        BinOp::Le => o != std::cmp::Ordering::Greater,
+                        BinOp::Gt => o == std::cmp::Ordering::Greater,
+                        _ => o != std::cmp::Ordering::Less,
+                    })
+                })
+            }
+            BinOp::Shl | BinOp::Shr => {
+                let lt = self.out.expr_ty[self.ei(lhs)];
+                if let (Some((it, _, _)), Some(KVal::Int(s))) = (self.k_range(lt), &rv)
+                    && (*s < 0 || *s >= it.bits() as i128)
+                {
+                    self.k_fire(span);
+                    return None;
+                }
+                match (lv, rv) {
+                    (Some(KVal::Int(a)), Some(KVal::Int(b))) => self.k_arith(op, a, b, lt).map(KVal::Int),
+                    _ => None,
+                }
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let lt = self.out.expr_ty[self.ei(lhs)];
+                let (Some(KVal::Int(a)), Some(KVal::Int(b))) = (lv, rv) else { return None };
+                let Some((_, lo, hi)) = self.k_range(lt) else { return None };
+                let (Some(a), Some(b)) = (self.k_math(a, lt), self.k_math(b, lt)) else { return None };
+                let r = match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    _ => a.checked_mul(b),
+                };
+                let suppressed = lint.suppress == Some((e, u32::MAX)) || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
+                match r {
+                    Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
+                    _ => {
+                        if !suppressed {
+                            self.k_fire(span);
+                        }
+                        None
+                    }
+                }
+            }
+            BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let lt = self.out.expr_ty[self.ei(lhs)];
+                match (lv, rv) {
+                    (Some(KVal::Int(a)), Some(KVal::Int(b))) => self.k_arith(op, a, b, lt).map(KVal::Int),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn k_unary(&mut self, e: ExprId, op: UnOp, inner: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let v = self.k_expr(inner, env, lint);
+        match op {
+            UnOp::Neg => {
+                let Some(KVal::Int(x)) = v else { return None };
+                let t = self.out.expr_ty[self.ei(e)];
+                let Some((_, lo, hi)) = self.k_range(t) else { return None };
+                // A literal under the minus keeps its raw value, so
+                // `-128i8` is the value -128, not a negation overflow.
+                let r = x.checked_neg();
+                match r {
+                    Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
+                    _ => {
+                        let suppressed = matches!(lint.suppress, Some((se, root)) if se == e && self.k_place_root(inner) == Some(root));
+                        if !suppressed {
+                            self.k_fire(span);
+                        }
+                        None
+                    }
+                }
+            }
+            UnOp::Not => match v {
+                Some(KVal::Int(x)) => {
+                    let t = self.out.expr_ty[self.ei(e)];
+                    let x = self.k_math(x, t)?;
+                    self.k_wrap(!x, t).map(KVal::Int)
+                }
+                Some(KVal::Bool(b)) => Some(KVal::Bool(!b)),
+                _ => None,
+            },
+        }
+    }
+
     // ---------- Finish ----------
 
     /// True when the type still holds an unbound non-integer inference
@@ -5861,6 +6806,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             self.out.locals[i].ty = z;
         }
+        self.overflow_lint();
         // Generic call sites become instance requests for mono,
         // with their args zonked into place for lowering.
         for (ei, template, args) in std::mem::take(&mut self.generic_sites) {

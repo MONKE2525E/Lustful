@@ -61,6 +61,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0530](L0530.md) | unsupported edition |
 | [L0531](L0531.md) | unsupported deny-level lint |
 | [L0522](L0522.md) | this attribute is not supported yet |
+| [L0540](L0540.md) | arithmetic operation will overflow |
 | [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
 | [L0610](L0610.md) | type annotations needed |
