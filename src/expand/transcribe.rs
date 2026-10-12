@@ -49,7 +49,7 @@ impl<'a> Tx<'a> {
                         // A repetition.
                         Some(Tt::Delim(Delim::Paren, inner, _)) => {
                             let inner = inner.clone();
-                            let (sep, op, used) = super::match_::rep_tail(trees, i + 2).ok_or_else(|| {
+                            let (sep, op, used) = super::match_::rep_tail(trees, i + 2, true).ok_or_else(|| {
                                 err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`.")
                             })?;
                             if sep.is_some() && op == RepOp::Question {
@@ -63,11 +63,32 @@ impl<'a> Tx<'a> {
                             self.repetition(&inner, sep, op, span, indices, &mut out)?;
                             i += 2 + used;
                         }
+                        Some(Tt::Tok(name_tok)) if name_tok.tok == Tok::Dollar => {
+                            // `$$` is the unstable metavariable escape;
+                            // rustc rejects it on stable.
+                            return Err(err(
+                                C_UNSUPPORTED,
+                                span,
+                                "`$$` metavariable expressions are not supported",
+                                "Capture a `$` as a tt argument and forward it instead.",
+                            ));
+                        }
+                        Some(Tt::Delim(Delim::Brace, _, _)) => {
+                            return Err(err(
+                                C_UNSUPPORTED,
+                                span,
+                                "`${..}` metavariable expressions are not supported",
+                                "Compute the value with a helper macro instead.",
+                            ));
+                        }
                         Some(Tt::Tok(name_tok)) => {
                             i = self.metavar(*name_tok, span, i, indices, &mut out)?;
                         }
                         _ => {
-                            return Err(err(C_DEF, span, "expected a metavariable or repetition after `$`", "Write `$name` or `$(...)*`."));
+                            // A lone `$` is a literal token in rustc's
+                            // transcriber, not an error.
+                            out.push(Tt::Tok(Token { tok: Tok::Dollar, span: self.stamp(span) }));
+                            i += 1;
                         }
                     }
                 }
@@ -102,20 +123,17 @@ impl<'a> Tx<'a> {
             return Ok(i + 2);
         }
         let Some(name) = meta_sym(name_tok.tok, self.interner) else {
-            return Err(err(
-                C_DEF,
-                dollar_span,
-                "expected a metavariable name after `$`",
-                "Write `$name` with a name bound in the matcher.",
-            ));
+            // `$` before a token that cannot name a metavariable is a
+            // literal `$`; the token itself is transcribed next round.
+            out.push(Tt::Tok(Token { tok: Tok::Dollar, span: self.stamp(dollar_span) }));
+            return Ok(i + 1);
         };
         let Some(bind) = self.binds.get(&name) else {
-            return Err(err(
-                C_DEF,
-                name_tok.span,
-                format!("metavariable `{}` is not bound by the matcher", self.interner.get(name)),
-                "Bind it in the matcher, or remove it from the expansion.",
-            ));
+            // An unbound name stays as the tokens `$` and the name in
+            // rustc's transcriber; it is not an error.
+            out.push(Tt::Tok(Token { tok: Tok::Dollar, span: self.stamp(dollar_span) }));
+            out.push(Tt::Tok(Token { tok: name_tok.tok, span: self.stamp(name_tok.span) }));
+            return Ok(i + 2);
         };
         match select(bind, indices) {
             Ok(Some(leaf)) => out.extend(leaf.iter().cloned()),
@@ -288,7 +306,7 @@ pub fn check_template_vars(template: &[Tt], vars: &FxMap<Sym, VarInfo>, interner
                 Tt::Tok(t) if t.tok == Tok::Dollar => {
                     if let Some(Tt::Delim(Delim::Paren, inner, _)) = trees.get(i + 1) {
                         let span = t.span;
-                        let (sep, op, used) = super::match_::rep_tail(trees, i + 2)
+                        let (sep, op, used) = super::match_::rep_tail(trees, i + 2, true)
                             .ok_or_else(|| err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`."))?;
                         if sep.is_some() && op == RepOp::Question {
                             return Err(err(

@@ -844,6 +844,9 @@ pub struct Expander<'a> {
     /// The outside inputs this run read, in read order. The driver
     /// stores them next to the expanded chunk (see `Dep`).
     deps: Vec<Dep>,
+    /// Expansion depth cap for this file: 128, or the crate's
+    /// `#![recursion_limit = "N"]` when the file carries one.
+    recursion_limit: u32,
     total_tokens: usize,
 }
 
@@ -864,6 +867,7 @@ impl<'a> Expander<'a> {
             cur_src: ctx.src.to_string(),
             deps_hash: 0,
             deps: Vec::new(),
+            recursion_limit: 128,
             total_tokens: 0,
         }
     }
@@ -1037,6 +1041,25 @@ pub struct MacroSeed {
     pub import_into: Option<Vec<Sym>>,
 }
 
+/// The crate recursion limit from leading inner attributes
+/// (`#![recursion_limit = "N"]`), default 128. Lust's own expansion
+/// walks the host stack, so the honored value is capped at 2048.
+fn scan_recursion_limit(trees: &[Tt], strings: &[String], interner: &Interner) -> u32 {
+    let mut i = 0;
+    while tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pound) && tok_at(trees, i + 1).map(|t| t.tok) == Some(Tok::Bang) {
+        let Some(Tt::Delim(Delim::Bracket, body, _)) = trees.get(i + 2) else { break };
+        if seg_text(tok_at(body, 0).map_or(Tok::Eof, |t| t.tok), interner).as_deref() == Some("recursion_limit")
+            && tok_at(body, 1).map(|t| t.tok) == Some(Tok::Eq)
+            && let Some(Tok::Str(idx)) = tok_at(body, 2).map(|t| t.tok)
+            && let Ok(n) = strings.get(idx as usize).map_or("", String::as_str).trim().parse::<u32>()
+        {
+            return n.clamp(1, 2048);
+        }
+        i += 3;
+    }
+    128
+}
+
 /// Expands every macro in one lexed file or chunk, returning the
 /// expanded token list. A file that cannot contain macros comes back
 /// unchanged (the same `Lexed`).
@@ -1077,6 +1100,7 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
         st.seed_macro(seed)?;
     }
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
+    st.recursion_limit = scan_recursion_limit(&tts, &st.strings, ctx.interner);
     st.prescan(&tts)?;
     let out = st.expand_list(tts, 0, true, 0)?;
     if std::env::var_os("LUST_EXPAND_STATS").is_some() {
@@ -1524,7 +1548,13 @@ impl<'a> Expander<'a> {
             if let Some(&(_, idx)) = self.textual.iter().rev().find(|(n, _)| *n == last) {
                 return Some(idx);
             }
-            return self.module_imports.get(&(self.module.clone(), last)).copied();
+            if let Some(idx) = self.module_imports.get(&(self.module.clone(), last)).copied() {
+                return Some(idx);
+            }
+            // An exported macro lives in the crate root's macro
+            // namespace, so a plain call in the root module finds it
+            // whatever the textual order.
+            return if self.module.is_empty() { self.exported.get(&last).copied() } else { None };
         }
         // Path forms, resolved against module paths from the crate root.
         let middle: Vec<Sym> = segs[..segs.len() - 1].iter().map(|s| s.sym).collect();
@@ -1536,7 +1566,7 @@ impl<'a> Expander<'a> {
             "self" => {
                 let mut module = self.module.clone();
                 module.extend_from_slice(&middle[1.min(middle.len())..]);
-                by_module(&module)
+                if module.is_empty() { self.exported.get(&last).copied().or_else(|| by_module(&module)) } else { by_module(&module) }
             }
             "super" => {
                 let supers = texts.iter().take_while(|&&t| t == "super").count();
@@ -1565,7 +1595,7 @@ impl<'a> Expander<'a> {
     /// expansion step only, never chased: callers re-walk it.
     pub fn transcribe_call(&mut self, def: &MacroDef, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
         use std::sync::atomic::Ordering;
-        if depth >= 128 {
+        if depth >= self.recursion_limit {
             return Err(err(
                 C_CAP,
                 call.span,
@@ -1837,9 +1867,17 @@ fn starts_item(trees: &[Tt], interner: &Interner) -> bool {
     }
     let trees: &[Tt] = &flat;
     let mut i = 0;
-    // Skip attributes and item qualifiers to the item keyword.
-    while let Some(attr) = attr_at(trees, i, interner) {
-        i = attr.end;
+    // Skip attributes and item qualifiers to the item keyword. An
+    // attribute whose body is a fragment (`#[$m]`) has no readable
+    // path for attr_at; skip its two trees directly.
+    loop {
+        if let Some(attr) = attr_at(trees, i, interner) {
+            i = attr.end;
+        } else if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pound) && matches!(trees.get(i + 1), Some(Tt::Delim(Delim::Bracket, _, _))) {
+            i += 2;
+        } else {
+            break;
+        }
     }
     loop {
         match tok_at(trees, i).map(|t| t.tok) {
@@ -2216,6 +2254,11 @@ impl<'a> Expander<'a> {
         item_list: bool,
         _depth: u32,
     ) -> Result<usize, Diag> {
+        // The expander reads `#![recursion_limit]` itself and the
+        // parser has no form for it, so it is consumed here.
+        if first.inner_attr && first.path == "recursion_limit" {
+            return Ok(first.end);
+        }
         // An inner attribute applies to the enclosing item or crate:
         // nothing for the expander to do with it here.
         if first.inner_attr {
@@ -2397,7 +2440,7 @@ impl<'a> Expander<'a> {
     /// a token builtin through `builtin`, a parser macro through
     /// unchanged with its arguments expanded.
     pub fn expand_call(&mut self, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
-        if depth >= 128 {
+        if depth >= self.recursion_limit {
             return Err(err(
                 C_CAP,
                 call.span,
@@ -2408,16 +2451,6 @@ impl<'a> Expander<'a> {
         if let Some(idx) = self.lookup_macro(&call.segs, call.leading_colon) {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
-        }
-        // Builtin and passthrough macros count toward the recursion
-        // depth too (rustc counts every expansion level).
-        if depth >= 128 {
-            return Err(err(
-                C_CAP,
-                call.span,
-                format!("recursion limit reached while expanding `{}!`", call.path_text()),
-                "Give the macro a base case it can reach.",
-            ));
         }
         let name = call.name_text().to_string();
         let std_prefixed = matches!(call.segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc"));

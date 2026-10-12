@@ -69,7 +69,7 @@ impl<'a> Compile<'a> {
                         // A repetition: `$( inner ) sep? op`.
                         Some(Tt::Delim(Delim::Paren, inner, _)) => {
                             let inner = self.seq(inner, depth + 1)?;
-                            let (sep, op, used) = rep_tail(trees, i + 2).ok_or_else(|| {
+                            let (sep, op, used) = rep_tail(trees, i + 2, false).ok_or_else(|| {
                                 err(
                                     C_DEF,
                                     span,
@@ -98,6 +98,16 @@ impl<'a> Compile<'a> {
                         // transcription-only and never a matcher variable.
                         Some(Tt::Tok(name_tok)) => {
                             if name_tok.tok == Tok::Crate {
+                                if tok_at(trees, i + 2).map(|t| t.tok) != Some(Tok::Colon) {
+                                    // A bare `$crate` in a matcher is the
+                                    // two literal tokens `$` and `crate`.
+                                    let id1 = self.id();
+                                    let id2 = self.id();
+                                    out.push(MNode::Tok(*t, id1));
+                                    out.push(MNode::Tok(*name_tok, id2));
+                                    i += 2;
+                                    continue;
+                                }
                                 return Err(err(
                                     C_DEF,
                                     span,
@@ -179,7 +189,7 @@ impl<'a> Compile<'a> {
 /// an optional single separator token, then `*`, `+`, or `?`.
 /// Returns the separator, the operator, and how many trees were used.
 /// Also used by the transcriber, which reads the same repetition shape.
-pub fn rep_tail(trees: &[Tt], i: usize) -> Option<(Option<Token>, RepOp, usize)> {
+pub fn rep_tail(trees: &[Tt], i: usize, allow_dollar_sep: bool) -> Option<(Option<Token>, RepOp, usize)> {
     fn as_op(tok: Tok) -> Option<RepOp> {
         Some(match tok {
             Tok::Star => RepOp::Star,
@@ -191,8 +201,9 @@ pub fn rep_tail(trees: &[Tt], i: usize) -> Option<(Option<Token>, RepOp, usize)>
     match tok_at(trees, i) {
         Some(t) if as_op(t.tok).is_some() => Some((None, as_op(t.tok).unwrap(), 1)),
         Some(sep) => {
-            // `$` cannot be a separator, and the operator must follow.
-            if sep.tok == Tok::Dollar {
+            // `$` cannot be a matcher separator (it can be one in a
+            // transcriber), and the operator must follow.
+            if sep.tok == Tok::Dollar && !allow_dollar_sep {
                 return None;
             }
             let op = as_op(tok_at(trees, i + 1)?.tok)?;
