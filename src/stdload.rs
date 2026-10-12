@@ -145,7 +145,12 @@ fn check_file(file: &SourceFile, text: &str) -> Result<(CheckedFile, Vec<(String
     let (clean, marks) = scan_lang_attrs(text, file.rel)?;
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let lexed = lexer::lex(&clean, FileId(0), 0, &interner).map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
+    let lexed = lexer::lex(&clean, FileId(0), 0, &interner)
+        .and_then(|l| {
+            let ctx = crate::expand::ExpandCtx::for_file(&interner, &known, std::path::Path::new(file.rel), &clean, false);
+            crate::expand::expand_lexed(l, &ctx)
+        })
+        .map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
     let ast = parser::parse(&lexed, &interner, &known).map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
     let ids = CrateIds { local: LOCAL_CRATE, stable: file.krate.stable_hash() };
     let mut program = collect::collect(&ast, &interner, &known, ids)

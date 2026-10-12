@@ -185,7 +185,10 @@ pub fn run(args: &[String]) -> i32 {
     map.add_file(&path, &src);
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let lexed = match lexer::lex(&src, FileId(0), 0, &interner) {
+    let lexed = match lexer::lex(&src, FileId(0), 0, &interner).and_then(|l| {
+        let ctx = crate::expand::ExpandCtx::for_file(&interner, &known, std::path::Path::new(&path), &src, true);
+        crate::expand::expand_lexed(l, &ctx)
+    }) {
         Ok(l) => l,
         Err(d) => return fail_build(diag::render(&mut [d], &map, &src, opts.json, opts.max_errors), 0),
     };

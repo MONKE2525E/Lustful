@@ -19,6 +19,7 @@ use crate::cgen::{self, FnOut, GlueSet};
 use crate::check::collect::{self, LocalDefId};
 use crate::def::{self, CrateIds, DiskDefId, StableCrateHash};
 use crate::diag::{self, Diag, FileId, LineIndex, SourceMap};
+use crate::expand;
 use crate::intern::{FxMap, Interner, Sym};
 use crate::lexer;
 use crate::scan;
@@ -31,6 +32,15 @@ use std::time::Instant;
 /// The session's one source file in its source map. A crate is one file today, so every
 /// span the lexer makes in this pipeline names it (docs/ARCH.md section 9.2, S1).
 const ROOT_FILE: FileId = FileId(0);
+
+/// Runs macro expansion over one lexed chunk or file (for W-RESOLVE: this
+/// is the spot that moves into the 6.1 outline worklist). Expansion is a
+/// no-op for files with no macro definitions or non-parser macro calls,
+/// so macro-free files keep the current path bit for bit.
+fn expand_tokens(front: &Front, lexed: lexer::Lexed, file: &std::path::Path, src: &str, test: bool) -> Result<lexer::Lexed, Diag> {
+    let ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
+    expand::expand_lexed(lexed, &ctx)
+}
 
 /// Wall time per stage.
 struct Timer {
@@ -818,7 +828,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Some(m) => m,
         None => {
             let headers = item_headers(&src);
-            let m = split_mask(src.len(), headers.len(), cores);
+            // A file with macro definitions lexes as one chunk for now:
+            // expansion is per chunk, and a def must be in the chunk that
+            // uses it until the 6.1 worklist owns crate-level expansion.
+            let m = if src.contains("macro_rules") { (1 << 24) - 1 } else { split_mask(src.len(), headers.len(), cores) };
             fresh_headers = Some(headers);
             front.split_mask = Some(m);
             m
@@ -894,17 +907,25 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut reused: Vec<Option<Chunk>> =
         kept_front.into_iter().map(Some).chain(middle.iter().map(|_| None)).chain(kept_back.into_iter().map(Some)).collect();
     let need: Vec<usize> = (0..ranges.len()).filter(|&i| reused[i].is_none()).collect();
+    let test_mode = req.harness || req.session.krate.test;
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
-        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).map(|l| {
-            let sc = scan::scan(&l);
-            (l, sc)
-        })
+        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)).map(
+            |l| {
+                let sc = scan::scan(&l);
+                (l, sc)
+            },
+        )
     });
+    // A macro error in a chunk is the answer, not a lexing fallback.
+    if let Some(Err(d)) = fresh.iter().find(|l| matches!(l, Err(d) if d.code.starts_with("L08"))) {
+        let mut d = d.clone();
+        return errors(std::slice::from_mut(&mut d), &map, &src, req);
+    }
     if fresh.iter().any(|l| l.is_err()) {
         // A chunk cut a comment or string the scanner did not see, or the text is bad: lex the
         // whole file. Its error is the answer; if it lexes, compile as one chunk. Never panic.
-        match lexer::lex(&src, ROOT_FILE, 0, &front.interner) {
+        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok(whole) => {
                 let sc = scan::scan(&whole);
@@ -1051,13 +1072,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             Ast::concat(parsed.into_iter().map(|p| p.unwrap()).collect())
         } else {
             // Re-parse serially for an exact error.
-            let whole = match lexer::lex(&src, ROOT_FILE, 0, &front.interner) {
-                Ok(w) => w,
-                Err(mut d) => {
-                    front.env_hash = None;
-                    return errors(std::slice::from_mut(&mut d), &map, &src, req);
-                }
-            };
+            let whole =
+                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
+                    Ok(w) => w,
+                    Err(mut d) => {
+                        front.env_hash = None;
+                        return errors(std::slice::from_mut(&mut d), &map, &src, req);
+                    }
+                };
             match parser::parse(&whole, &front.interner, &front.known) {
                 Ok(a) => a,
                 Err(d) => {

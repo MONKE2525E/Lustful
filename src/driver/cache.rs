@@ -171,6 +171,15 @@ pub struct Cache {
     id: (u64, u64),
 }
 
+/// True when the source mentions a macro whose result depends on data
+/// outside the source bytes (`env!`, `option_env!`, the `include!`
+/// family): such a request never enters this cache, since its key
+/// cannot see env vars or included files (added for W-MACRO).
+fn src_reads_outside(src: &[u8]) -> bool {
+    const NEEDLES: &[&[u8]] = &[b"env!", b"option_env!", b"include!", b"include_str!", b"include_bytes!"];
+    NEEDLES.iter().any(|n| src.windows(n.len()).any(|w| w == *n))
+}
+
 impl Cache {
     /// Opens the cache for `src_file`. None when turned off or the dir cannot be made.
     pub fn open(src_file: &Path) -> Option<Cache> {
@@ -245,6 +254,9 @@ impl Cache {
     /// The caller gives the source bytes it read, so the file is read once per process.
     /// A stored `--timings` text never exists; a hit with timings gets one fresh line.
     pub fn lookup(&self, req: &Request, src: &[u8], start: Instant) -> Option<Response> {
+        if src_reads_outside(src) {
+            return None;
+        }
         let key = request_key(self.id, req, src);
         let bytes = std::fs::read(self.entry_path(&key, "")).ok()?;
         let mut resp = decode_response(&bytes)?;
@@ -264,7 +276,7 @@ impl Cache {
     /// A successful response keeps no stderr: its only stderr text is `--timings` output,
     /// which must not replay. After the write, oldest entries are evicted past the cap.
     pub fn store(&self, req: &Request, src: &[u8], resp: &Response) {
-        if resp.code == 3 {
+        if resp.code == 3 || src_reads_outside(src) {
             return;
         }
         let key = request_key(self.id, req, src);
