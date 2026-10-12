@@ -152,6 +152,59 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     Ok((body, ranges.0, ranges.1))
 }
 
+/// Fragment probes for macro matching (src/expand, ARCH 6.2): each returns
+/// true when `toks` parses as exactly one fragment of the named kind with
+/// this parser. `toks` has no final `Eof`; one is added. String-literal
+/// tokens in `toks` index into `strings`, as in a `Lexed`.
+fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &Known, f: impl FnOnce(&mut Parser) -> bool) -> bool {
+    let mut v: Vec<Token> = toks.to_vec();
+    let end = toks.last().map_or(Span::default(), |t| t.span);
+    v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
+    let mut ast = Ast::default();
+    ast.strings = strings.to_vec();
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0 };
+    f(&mut p)
+}
+
+/// True when `toks` is exactly one expression.
+pub fn probe_expr(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
+    probe_with(toks, strings, interner, known, |p| p.expr().is_ok() && p.peek() == Tok::Eof)
+}
+
+/// True when `toks` is exactly one type.
+pub fn probe_ty(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
+    probe_with(toks, strings, interner, known, |p| p.ty().is_ok() && p.peek() == Tok::Eof)
+}
+
+/// True when `toks` is exactly one pattern.
+pub fn probe_pat(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
+    probe_with(toks, strings, interner, known, |p| p.pattern().is_ok() && p.peek() == Tok::Eof)
+}
+
+/// True when `toks` (braces included) is exactly one block.
+pub fn probe_block(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
+    probe_with(toks, strings, interner, known, |p| p.block().is_ok() && p.peek() == Tok::Eof)
+}
+
+/// True when `toks` is exactly one statement: wrapped in a block it parses
+/// as one statement (an expression statement without `;` becomes the block
+/// tail, which still counts as the one statement rustc's `stmt` fragment
+/// accepts). A trailing `;` in `toks` is the caller's to include or not.
+pub fn probe_stmt(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
+    let span = toks.first().map_or(Span::default(), |t| t.span);
+    let mut wrapped = Vec::with_capacity(toks.len() + 2);
+    wrapped.push(Token { tok: Tok::LBrace, span });
+    wrapped.extend_from_slice(toks);
+    wrapped.push(Token { tok: Tok::RBrace, span });
+    probe_with(&wrapped, strings, interner, known, |p| match p.block() {
+        Ok(b) if p.peek() == Tok::Eof => {
+            let block = p.ast.block(b);
+            block.stmts.len() + usize::from(block.tail.is_some()) == 1
+        }
+        _ => false,
+    })
+}
+
 /// Converts a flat token slice into nested token trees. Unbalanced input
 /// nests on a best-effort basis; attribute contents are stored, not checked.
 fn token_trees(toks: &[Token]) -> Vec<TokenTree> {
@@ -1098,14 +1151,16 @@ impl<'a> Parser<'a> {
                 return Err(self.reject(C_CORE, "variadic parameters"));
             }
             let mutable = self.eat(Tok::Mut);
-            let (pname, _) = match self.peek() {
+            let (pname, pspan) = match self.peek() {
                 Tok::Ident(_) => self.ident()?,
                 Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
                 _ => return Err(not_yet(C_CORE, start, "patterns in parameters")),
             };
             self.expect(Tok::Colon, "`:`")?;
             let ty = self.ty()?;
-            params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: start.to(self.prev_span()) });
+            // The span starts at the name, not at `mut`: hygiene reads the
+            // name token's context as the binding's context (ARCH 6.3).
+            params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: pspan.to(self.prev_span()) });
             if !self.eat(Tok::Comma) {
                 break;
             }
@@ -2676,7 +2731,7 @@ fn macro_error(span: Span) -> Diag {
     Diag::new(
         "L0401",
         span,
-        "user macros are not supported",
-        "Write a function. Lust has built-in println!, print!, eprintln!, format!, vec!, panic!, assert!, assert_eq!, assert_ne!, todo!, and unreachable!.",
+        "this macro call has no expanded form yet",
+        "User macros and most built-in macros expand before parsing. This form (such as format_args!) has no expanded form in the subset yet.",
     )
 }
