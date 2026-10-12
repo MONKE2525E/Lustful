@@ -170,6 +170,10 @@ pub struct Program<'a> {
     /// The generic tables (traits, templates, instances) built by
     /// `check::generics` during collection and finished by mono.
     pub gx: GenTables<'a>,
+    /// False when no later request replays body read sets (a one-shot
+    /// process): body checks then use a sink that records nothing. Set by
+    /// the driver after collection.
+    pub record_reads: bool,
 }
 
 impl<'a> Program<'a> {
@@ -1100,6 +1104,7 @@ pub fn collect_with_order<'a>(
         shipped_ranges: Vec::new(),
         resolved: None,
         gx: GenTables::default(),
+        record_reads: true,
     };
     p.gx.walk_instances = walk_instances;
     // The builtin Adt defs join the table with their one type param where they take

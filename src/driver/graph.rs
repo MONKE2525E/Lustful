@@ -200,6 +200,10 @@ pub struct Read {
 #[derive(Clone, Debug, Default)]
 pub struct Reads {
     map: FxMap<ReadKey, Read>,
+    /// Set for a sink whose reads nobody will replay (a one-shot process
+    /// exits after this compile): it records nothing and computes no
+    /// fingerprints.
+    off: bool,
 }
 
 impl Reads {
@@ -208,8 +212,16 @@ impl Reads {
         Reads::default()
     }
 
+    /// A sink that records nothing (see `off`).
+    pub fn off() -> Reads {
+        Reads { map: FxMap::default(), off: true }
+    }
+
     /// Records one read. The first record of a key wins.
     pub fn record(&mut self, key: ReadKey, fingerprint: Fingerprint, failed: bool) {
+        if self.off {
+            return;
+        }
         self.map.entry(key).or_insert(Read { fingerprint, failed });
     }
 
@@ -217,6 +229,9 @@ impl Reads {
     /// a body that asks the same question a hundred times pays for the
     /// fingerprint once.
     pub fn record_with(&mut self, key: ReadKey, failed: bool, fingerprint: impl FnOnce() -> Fingerprint) {
+        if self.off {
+            return;
+        }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
             v.insert(Read { fingerprint: fingerprint(), failed });
         }
@@ -1017,6 +1032,9 @@ impl<'a> Program<'a> {
     /// written-type `Binding` read only names the outermost path, so
     /// `[S; 2]` or `(S, u8)` would otherwise record nothing for `S`.
     pub fn record_layout_reads(&self, reads: &mut Reads, tys: &impl TyIntern, t: Ty) {
+        if reads.off {
+            return;
+        }
         let mut defs = Vec::new();
         collect_adt_defs(self, tys, t, &mut defs);
         for def in defs {

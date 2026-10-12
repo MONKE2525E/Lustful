@@ -523,7 +523,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             trait_picks: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
-            reads: Reads::new(),
+            reads: if p.record_reads { Reads::new() } else { Reads::off() },
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),

@@ -2030,6 +2030,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if let Some(tables) = resolved_tables {
         program.resolved = Some(Box::new(tables));
     }
+    // Read sets serve the next request's dirty walk; a one-shot process
+    // has none, so its body checks skip recording and fingerprinting.
+    program.record_reads = caches.persistent;
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
@@ -2229,6 +2232,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             })
             .collect();
     }
+    // A one-shot check needs no IR after borrowck: dropping each body on
+    // its worker lets the allocator reuse the memory for the next body,
+    // instead of touching fresh pages for every function.
+    let keep_bodies = req.cmd == Cmd::Build || caches.persistent;
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
         let (checked, mut errs) = check::check_fn(&program, f);
@@ -2237,7 +2244,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         let body = lower::lower(&program, f, checked);
         errs.extend(borrowck::borrowck(&program, &body));
-        (Some(body), errs)
+        (keep_bodies.then_some(body), errs)
     });
     let mut diags: Vec<Diag> = Vec::new();
     for (k, &i) in work.iter().enumerate() {
@@ -2253,7 +2260,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // record of that read. `slot_update` already keeps a fn whose
         // own signature item changed out of the reuse candidates; the
         // read keeps the walk itself honest about the same edge.
-        if results[k].1.is_empty()
+        if caches.persistent
+            && results[k].1.is_empty()
             && let Some(body) = &results[k].0
             && caches.slot_reads.get(slot(i)).is_some()
         {
