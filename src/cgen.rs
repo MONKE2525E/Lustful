@@ -6,7 +6,7 @@ use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
 use crate::ir::*;
 use crate::ty::lang::{self, SigTy};
-use crate::ty::layout::{self, EnumTag, Layout, Niche};
+use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind};
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -343,8 +343,8 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                         }
                         variants.push(fields);
                     }
-                    let discs: Vec<i128> = (0..adt.variants.len() as i128).collect();
-                    match layout::enum_layout(&variants, &discs, layout::Repr::default()) {
+                    let discs: Vec<i128> = adt.variants.iter().map(|v| v.disc).collect();
+                    match layout::enum_layout(&variants, &discs, adt.repr) {
                         Ok(l) if enum_is_exact(&l, adt.variants.len()) => Some(l),
                         _ => None,
                     }
@@ -353,7 +353,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     for f in &adt.variants[0].fields {
                         fields.push(go(p, &cty(&p.tys, f.ty), seen)?);
                     }
-                    layout::struct_layout(&fields, layout::Repr::default()).ok()
+                    layout::struct_layout(&fields, adt.repr).ok()
                 };
                 seen.remove(a);
                 r
@@ -386,14 +386,42 @@ fn zero_lit(p: &Program, t: &CTy) -> String {
     if c_layout(p, t).is_some_and(|l| l.size == 0) { format!("(({ct}){{}})") } else { format!("(({ct}){{0}})") }
 }
 
+/// The discriminant values of an enum or Option CTy, in variant order.
+fn adt_discs(p: &Program, t: &CTy) -> Vec<i128> {
+    match t {
+        CTy::Option(_) => vec![0, 1],
+        CTy::Adt(a) => p.adt(*a).variants.iter().map(|v| v.disc).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// True when every discriminant equals its variant index, so a stored
+/// tag value reads back as the index with no mapping.
+fn discs_sequential(discs: &[i128]) -> bool {
+    discs.iter().enumerate().all(|(i, &d)| d == i as i128)
+}
+
+/// A C literal for one discriminant value, cast to the tag type. The
+/// layout path only stores values that fit an 8 byte tag.
+fn disc_lit(disc: i128, size: u64, signed: bool) -> String {
+    let ct = tag_c_type(size, signed);
+    if disc < 0 {
+        if disc == i64::MIN as i128 { format!("(({ct})(-9223372036854775807LL - 1))") } else { format!("(({ct})({disc}LL))") }
+    } else {
+        format!("(({ct})({}ULL))", disc as u128)
+    }
+}
+
 /// The C expression that reads the variant index of an enum or Option
-/// value at the pointer expression `ptr`. Explicit tags read inline;
-/// only niche-filled enums go through the generated `disc_` helper.
+/// value at the pointer expression `ptr`. The layout path stores the
+/// discriminant value in the tag: sequential discriminants read
+/// inline, the rest go through the generated `disc_` mapping helper.
+/// Legacy types store the variant index in `tag` directly.
 fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
     match c_layout(p, t) {
         Some(l) => match l.enum_tag {
-            Some(EnumTag::Explicit { .. }) => format!("(({ptr})->u._tag)"),
-            Some(EnumTag::NicheFilled { .. }) => format!("disc_{}({ptr})", mangle(t)),
+            Some(EnumTag::Explicit { .. }) if discs_sequential(&adt_discs(p, t)) => format!("(({ptr})->u._tag)"),
+            Some(EnumTag::Explicit { .. }) | Some(EnumTag::NicheFilled { .. }) => format!("disc_{}({ptr})", mangle(t)),
             _ => "0".into(),
         },
         None => format!("({ptr})->tag"),
@@ -417,7 +445,7 @@ fn variant_field(p: &Program, t: &CTy, e: &str, vi: usize, fi: usize) -> String 
 fn disc_set(p: &Program, t: &CTy, e: &str, vi: usize) -> String {
     let Some(l) = c_layout(p, t) else { return format!("{e}.tag = {vi};") };
     match l.enum_tag {
-        Some(EnumTag::Explicit { .. }) => format!("{e}.u._tag = {vi};"),
+        Some(EnumTag::Explicit { size, signed }) => format!("{e}.u._tag = {};", disc_lit(adt_discs(p, t)[vi], size, signed)),
         Some(EnumTag::NicheFilled { variant, niche }) => {
             if vi == variant {
                 String::new()
@@ -968,8 +996,8 @@ impl FnGen<'_, '_, '_> {
                 }
             },
             Some(l) => match l.enum_tag {
-                Some(EnumTag::Explicit { .. }) => {
-                    let mut init = format!("._tag = {variant}");
+                Some(EnumTag::Explicit { size, signed }) => {
+                    let mut init = format!("._tag = {}", disc_lit(adt_discs(self.p, t)[variant], size, signed));
                     if !fields.is_empty() {
                         init.push_str(", ");
                         init.push_str(&fields.join(", "));
@@ -1063,6 +1091,55 @@ impl FnGen<'_, '_, '_> {
                         }
                     }
                     (CTy::Int(fi), _) if is128(*fi) => format!("(({})(({a}).lo))", ctype(&to)),
+                    (CTy::Adt(aid), CTy::Int(ti)) => {
+                        // A fieldless enum cast to an integer gives its
+                        // discriminant value. Layout types store the value
+                        // in the tag, so read it back; legacy types store
+                        // the variant index, so map index to value.
+                        let adt = self.p.adt(*aid);
+                        let ct = ctype(&to);
+                        let raw = match c_layout(self.p, &from) {
+                            Some(l) => match l.enum_tag {
+                                Some(EnumTag::Explicit { signed, .. }) => Some((format!("(({a}).u._tag)"), signed)),
+                                _ => {
+                                    let d = adt.variants.first().map_or(0, |v| v.disc);
+                                    Some((disc_lit(d, 8, d < 0), d < 0))
+                                }
+                            },
+                            None => None,
+                        };
+                        match raw {
+                            Some((raw, raw_signed)) => {
+                                if is128(*ti) {
+                                    if raw_signed {
+                                        format!("(({}){{(uint64_t)(int64_t)({raw}), (uint64_t)((int64_t)({raw}) >> 63)}})", int_c(*ti))
+                                    } else {
+                                        format!("(({}){{(uint64_t)({raw}), 0}})", int_c(*ti))
+                                    }
+                                } else {
+                                    format!("(({ct})({raw}))")
+                                }
+                            }
+                            None => {
+                                let t = self.tmp();
+                                let zero = if is128(*ti) { "{0, 0}" } else { "0" };
+                                let _ = write!(self.out, "    {ct} {t} = {zero};\n    switch ({a}.tag) {{");
+                                for (vi, v) in adt.variants.iter().enumerate() {
+                                    let lit = if is128(*ti) {
+                                        let bits = v.disc as u128;
+                                        format!("(({ct}){{{}ULL, {}ULL}})", bits as u64, (bits >> 64) as u64)
+                                    } else if v.disc < 0 {
+                                        format!("(({ct})((int64_t){}))", v.disc)
+                                    } else {
+                                        format!("(({ct})((uint64_t){}ull))", v.disc as u128)
+                                    };
+                                    let _ = write!(self.out, " case {vi}: {t} = {lit}; break;");
+                                }
+                                let _ = writeln!(self.out, " }}");
+                                t
+                            }
+                        }
+                    }
                     (_, CTy::Int(ti)) if is128(*ti) => {
                         let signed = matches!(&from, CTy::Int(si) if si.signed());
                         if signed {
@@ -1070,24 +1147,6 @@ impl FnGen<'_, '_, '_> {
                         } else {
                             format!("(({}){{(uint64_t)({a}), 0}})", int_c(*ti))
                         }
-                    }
-                    (CTy::Adt(aid), CTy::Int(_)) => {
-                        // A fieldless enum cast to an integer gives its
-                        // discriminant: map the internal tag index to the value.
-                        let adt = self.p.adt(*aid);
-                        let ct = ctype(&to);
-                        let t = self.tmp();
-                        let _ = write!(self.out, "    {ct} {t} = 0;\n    switch ({a}.tag) {{");
-                        for (vi, v) in adt.variants.iter().enumerate() {
-                            let lit = if v.disc < 0 {
-                                format!("(({ct})((int64_t){}))", v.disc)
-                            } else {
-                                format!("(({ct})((uint64_t){}ull))", v.disc as u128)
-                            };
-                            let _ = write!(self.out, " case {vi}: {t} = {lit}; break;");
-                        }
-                        let _ = writeln!(self.out, " }}");
-                        t
                     }
                     _ => format!("(({}){a})", ctype(&to)),
                 }
@@ -2182,6 +2241,16 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
     layout_assert(out, &ct, l);
     let m = mangle(t);
     match l.enum_tag {
+        Some(EnumTag::Explicit { size, signed }) => {
+            let discs = adt_discs(p, t);
+            if !discs_sequential(&discs) {
+                let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ switch (p->u._tag) {{");
+                for (vi, &d) in discs.iter().enumerate() {
+                    let _ = write!(out, " case {}: return {vi};", disc_lit(d, size, signed));
+                }
+                let _ = writeln!(out, " default: return 0; }} }}");
+            }
+        }
         Some(EnumTag::NicheFilled { variant, niche }) => {
             let others: Vec<usize> = (0..variants.len()).filter(|&i| i != variant).collect();
             let start = niche.start as u64;
@@ -2293,6 +2362,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 let adt = p.adt(*a);
                 let an = a.0;
                 let _ = writeln!(out, "/* {} */", p.name(adt.name));
+                let packed = adt.repr.kind == ReprKind::Packed;
+                if packed {
+                    out.push_str("#pragma pack(push, 1)\n");
+                }
                 let layout = c_layout(p, t);
                 if adt.is_enum {
                     match layout {
@@ -2322,7 +2395,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                     match layout {
                         Some(l) => {
                             let v = &adt.variants[0];
-                            if v.fields.is_empty() {
+                            if v.fields.is_empty() && l.align > 1 {
+                                let _ = writeln!(out, "struct A{an} {{ _Alignas({}) uint8_t _z[0]; }};", l.align);
+                            } else if v.fields.is_empty() {
                                 let _ = writeln!(out, "struct A{an} {{ }};");
                             } else {
                                 let fields: Vec<(String, Layout, u64)> = v
@@ -2345,6 +2420,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                             let _ = writeln!(out, "struct A{an} {{ {f}}};");
                         }
                     }
+                }
+                if packed {
+                    out.push_str("#pragma pack(pop)\n");
                 }
             }
             _ => {}
