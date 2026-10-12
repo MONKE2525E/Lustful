@@ -52,6 +52,14 @@ impl<'a> Tx<'a> {
                             let (sep, op, used) = super::match_::rep_tail(trees, i + 2).ok_or_else(|| {
                                 err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`.")
                             })?;
+                            if sep.is_some() && op == RepOp::Question {
+                                return Err(err(
+                                    C_DEF,
+                                    span,
+                                    "the `?` repetition operator does not take a separator",
+                                    "Drop the separator, or use `*` for a separated repetition.",
+                                ));
+                            }
                             self.repetition(&inner, sep, op, span, indices, &mut out)?;
                             i += 2 + used;
                         }
@@ -258,36 +266,38 @@ fn collect_vars(trees: &[Tt], interner: &Interner, out: &mut Vec<Sym>) {
     }
 }
 
-/// Checks a template at definition time: every metavariable it uses
-/// must be bound by the matcher (`$crate` is always available).
+/// Checks a template at definition time: only the repetition shapes
+/// rustc validates when the definition is read (a repetition needs its
+/// operator, and `?` takes no separator). A lone `$`, an unbound name,
+/// and other bad `$` shapes are not definition errors in rustc;
+/// `transcribe` reports them if the arm ever expands.
 pub fn check_template_vars(template: &[Tt], vars: &FxMap<Sym, VarInfo>, interner: &Interner) -> Result<(), Diag> {
-    fn go(trees: &[Tt], vars: &FxMap<Sym, VarInfo>, interner: &Interner) -> Result<(), Diag> {
+    let _ = (vars, interner);
+    fn go(trees: &[Tt]) -> Result<(), Diag> {
         let mut i = 0;
         while i < trees.len() {
             match &trees[i] {
-                Tt::Tok(t) if t.tok == Tok::Dollar => match trees.get(i + 1) {
-                    Some(Tt::Tok(name_tok)) => {
-                        if let Some(s) = meta_sym(name_tok.tok, interner)
-                            && name_tok.tok != Tok::Crate
-                            && !vars.contains_key(&s)
-                        {
+                Tt::Tok(t) if t.tok == Tok::Dollar => {
+                    if let Some(Tt::Delim(Delim::Paren, inner, _)) = trees.get(i + 1) {
+                        let span = t.span;
+                        let (sep, op, used) = super::match_::rep_tail(trees, i + 2)
+                            .ok_or_else(|| err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`."))?;
+                        if sep.is_some() && op == RepOp::Question {
                             return Err(err(
                                 C_DEF,
-                                name_tok.span,
-                                format!("metavariable `{}` is not bound by the matcher", interner.get(s)),
-                                "Bind it in the matcher, or remove it from the expansion.",
+                                span,
+                                "the `?` repetition operator does not take a separator",
+                                "Drop the separator, or use `*` for a separated repetition.",
                             ));
                         }
-                        i += 2;
+                        go(inner)?;
+                        i += 2 + used;
+                    } else {
+                        i += 1;
                     }
-                    Some(Tt::Delim(Delim::Paren, inner, _)) => {
-                        go(inner, vars, interner)?;
-                        i += 2;
-                    }
-                    _ => i += 1,
-                },
+                }
                 Tt::Delim(_, inner, _) => {
-                    go(inner, vars, interner)?;
+                    go(inner)?;
                     i += 1;
                 }
                 _ => i += 1,
@@ -295,5 +305,5 @@ pub fn check_template_vars(template: &[Tt], vars: &FxMap<Sym, VarInfo>, interner
         }
         Ok(())
     }
-    go(template, vars, interner)
+    go(template)
 }

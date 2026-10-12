@@ -1344,6 +1344,18 @@ impl<'a> Expander<'a> {
             let mut matcher = match_::Matcher::new(self.ctx.interner, self.ctx.known, &self.strings, call.span);
             let matches = match_::match_arm(&mut matcher, &arm.nodes, &call.inner)?;
             if matches.is_empty() {
+                // A fragment parser that began and failed is rustc's
+                // hard error: the call fails here instead of falling
+                // through to a later arm that token-matches the input.
+                if matcher.hard_fail {
+                    return Err(err(
+                        C_CALL,
+                        call.span,
+                        format!("a fragment in this call to `{}!` does not parse", def.name_text),
+                        "Check the call tokens against the fragment kinds in the macro's rules.",
+                    )
+                    .with_label(def.def_span, "the macro is defined here"));
+                }
                 continue;
             }
             let ambiguous = matcher.ambiguous() || {
@@ -2311,6 +2323,59 @@ mod tests {
         assert_eq!(amb.unwrap_err().code, C_AMBIG);
         let follow = expand_src(&interner, &known, "macro_rules! m { ($e:expr +) => { $e } }\nfn main() {}");
         assert_eq!(follow.unwrap_err().code, C_DEF);
+    }
+
+    /// A fragment parse that began and failed is a hard error, even
+    /// when a later arm token-matches the input (rustc does not fall
+    /// through). With the token arm first, the same call expands.
+    #[test]
+    fn fragment_hard_failure_stops_arm_search() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let hard = expand_src(&interner, &known, "macro_rules! m { ($e:expr ;) => { 1 }; (1 +) => { 2 } }\nfn main() { let _ = m!(1 +); }");
+        assert_eq!(hard.unwrap_err().code, C_CALL);
+        let first =
+            expand_src(&interner, &known, "macro_rules! m { (1 +) => { 2 }; ($e:expr ;) => { 1 } }\nfn main() { let _ = m!(1 +); }");
+        assert!(first.expect("token arm first wins").iter().any(|t| t == "2"));
+        // A fragment that cannot begin on the first token kills only
+        // its own arm, so the next arm still gets its try.
+        let soft = expand_src(&interner, &known, "macro_rules! m { ($e:expr) => { 1 }; (+) => { 2 } }\nfn main() { let _ = m!(+); }");
+        assert!(soft.expect("soft fragment failure falls through").iter().any(|t| t == "2"));
+    }
+
+    /// Edition 2024 follow sets, separator rules, and empty repetitions
+    /// are definition errors; an unbound template name is not.
+    #[test]
+    fn definition_checks_match_rustc() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        for src in [
+            "macro_rules! m { ($p:pat |) => { 0 } }\nfn main() {}",
+            "macro_rules! m { ($t:ty >=) => { 0 } }\nfn main() {}",
+            "macro_rules! m { ($($i:ident),?) => { 1 } }\nfn main() {}",
+            "macro_rules! m { ($($i:ident),*) => { $($i),? } }\nfn main() {}",
+            "macro_rules! m { ($($v:vis)*) => { 1 } }\nfn main() {}",
+        ] {
+            assert_eq!(expand_src(&interner, &known, src).unwrap_err().code, C_DEF, "src: {src}");
+        }
+        let unbound = expand_src(&interner, &known, "macro_rules! m { () => { $y } }\nfn main() {}");
+        assert!(unbound.is_ok(), "an uncalled arm's unbound name is not a definition error");
+    }
+
+    /// Fragment validation does not care that the template only
+    /// stringifies the fragment: token soup inside a group is not an
+    /// expr, and byte string patterns distinguish their bytes.
+    #[test]
+    fn invalid_fragments_do_not_bind() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let soup =
+            expand_src(&interner, &known, "macro_rules! m { ($e:expr) => { stringify!($e) } }\nfn main() { let _s = m!((1 2, 3)); }");
+        assert_eq!(soup.unwrap_err().code, C_CALL);
+        let bytes =
+            expand_src(&interner, &known, "macro_rules! m { (b\"a\") => { 1 }; ($t:tt) => { 2 } }\nfn main() { let _ = m!(b\"b\"); }")
+                .expect("tt arm takes the other byte string");
+        assert!(bytes.iter().any(|t| t == "2"), "tokens: {bytes:?}");
     }
 
     /// stringify! keeps the source's own spacing between tokens.
