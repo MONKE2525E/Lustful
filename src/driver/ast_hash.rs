@@ -49,12 +49,6 @@ pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
         items.push(scan);
         bodies.extend(bs);
     }
-    // Nested fns follow the top-level fns, in stmt item order (collect's order).
-    for item in &ast.stmt_items {
-        if let ItemKind::Fn(f) = &item.kind {
-            bodies.push(body_scan(ast, f));
-        }
-    }
     AstScans { items, bodies }
 }
 

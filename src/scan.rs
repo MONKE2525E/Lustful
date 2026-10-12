@@ -9,8 +9,6 @@ use std::hash::{Hash, Hasher};
 
 pub struct FnScan {
     pub body_hash: u64,
-    /// True for a fn nested inside another fn's body (a body item).
-    pub nested: bool,
     /// Byte offset of the `fn` keyword.
     pub fn_offset: u32,
     /// Token range of the body, from `{` to `}` inclusive, within the chunk's tokens.
@@ -69,10 +67,6 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     let mut items = Vec::new();
     let mut fns = Vec::new();
     let mut body_idents = Vec::new();
-    // Nested fns ride after all top-level fns, in encounter order,
-    // matching collect's LocalDefId order (W-CORELANG body items).
-    let mut nested_fns: Vec<FnScan> = Vec::new();
-    let mut nested_idents: Vec<Vec<Sym>> = Vec::new();
     let mut depth = 0usize;
     let mut impl_pending = false;
     let mut in_impl = false;
@@ -97,46 +91,6 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             let mut body = FxHasher::default();
             let mut idents = Vec::new();
             while k < toks.len() {
-                // A nested fn item: record its body as its own scan. The
-                // outer walk continues over its tokens, so deeper nesting
-                // records too and the outer hash still covers everything.
-                if toks[k].tok == Tok::Fn && k > j {
-                    let mut j2 = k;
-                    while j2 < toks.len() && toks[j2].tok != Tok::LBrace && toks[j2].tok != Tok::Eof {
-                        j2 += 1;
-                    }
-                    if j2 < toks.len() && toks[j2].tok == Tok::LBrace {
-                        let mut k2 = j2;
-                        let mut d2 = 0usize;
-                        let mut nbody = FxHasher::default();
-                        let mut nidents: Vec<Sym> = Vec::new();
-                        while k2 < toks.len() {
-                            match toks[k2].tok {
-                                Tok::LBrace => d2 += 1,
-                                Tok::RBrace => d2 -= 1,
-                                Tok::Ident(s2) => nidents.push(s2),
-                                Tok::Eof => break,
-                                _ => {}
-                            }
-                            hash_tok(&mut nbody, &toks[k2].tok, &lexed.strings);
-                            if d2 == 0 {
-                                break;
-                            }
-                            k2 += 1;
-                        }
-                        if d2 == 0 {
-                            nidents.sort_unstable();
-                            nidents.dedup();
-                            nested_fns.push(FnScan {
-                                body_hash: nbody.finish(),
-                                nested: true,
-                                fn_offset: toks[k].span.lo,
-                                body: j2..k2 + 1,
-                            });
-                            nested_idents.push(nidents);
-                        }
-                    }
-                }
                 match toks[k].tok {
                     Tok::LBrace => d += 1,
                     Tok::RBrace => d -= 1,
@@ -153,7 +107,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             if d != 0 {
                 complete = false;
             }
-            fns.push(FnScan { body_hash: body.finish(), nested: false, fn_offset: toks[i].span.lo, body: j..k + 1 });
+            fns.push(FnScan { body_hash: body.finish(), fn_offset: toks[i].span.lo, body: j..k + 1 });
             idents.sort_unstable();
             idents.dedup();
             body_idents.push(idents);
@@ -198,8 +152,6 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
         complete = false;
     }
     let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending;
-    fns.extend(nested_fns);
-    body_idents.extend(nested_idents);
     ChunkScan { fns, items, body_idents, ends_at_boundary }
 }
 

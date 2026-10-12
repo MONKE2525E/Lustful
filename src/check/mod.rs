@@ -4,7 +4,7 @@
 pub mod collect;
 pub mod obligations;
 
-use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
+use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
@@ -162,8 +162,6 @@ pub enum PatRes {
     None,
     /// A const item used as a pattern, by index into `Program::consts`.
     ConstItem(u32),
-    /// A body-local const used as a pattern, by index into `Program::body_consts`.
-    BodyConst(u32),
     Binding {
         local: u32,
         mode: BindMode,
@@ -255,9 +253,6 @@ struct Ctx<'p, 'a> {
     /// not bind a caller ident of the same name, and an ident the caller
     /// passes in keeps the caller's context (ARCH 6.3).
     scopes: Vec<((Sym, CtxtId), u32)>,
-    /// Items declared in enclosing blocks, keyed like locals by name and
-    /// hygiene context, holding stmt item indexes.
-    item_scopes: Vec<Vec<((Sym, CtxtId), u32)>>,
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
@@ -295,28 +290,12 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             reads: Reads::new(),
         },
         scopes: Vec::new(),
-        item_scopes: Vec::new(),
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
         self_ty: f.owner.map(|a| p.tys.get_adt_ty(a).expect("ADT types are interned during collection")),
         obl: obligations::Obligations::new(),
     };
-    if let Some(sibs) = p.fn_siblings.get(&fid) {
-        let layer: Vec<((Sym, CtxtId), u32)> = sibs
-            .iter()
-            .filter_map(|&si| {
-                let name = match &p.ast.stmt_items[si as usize].kind {
-                    ItemKind::Fn(d) => Some((d.name, d.name_span.ctxt)),
-                    ItemKind::Const(c) => c.name.map(|n| (n, c.name_span.ctxt)),
-                    ItemKind::Static(st) => Some((st.name, st.name_span.ctxt)),
-                    _ => None,
-                };
-                name.map(|n| (n, si))
-            })
-            .collect();
-        cx.item_scopes.push(layer);
-    }
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
         let l = cx.add_local(p.known.self_value, f.params[0], sp.mutable, sp.span);
@@ -460,18 +439,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
     // Cross-item reads go through the section 8.2 query functions on
     // `Program`, which record into this body's read set. Bodies ask in
     // their own module (the root in single-file programs).
-    /// The body item a name denotes in the enclosing blocks, innermost first.
-    fn body_item_of(&self, name: Sym, ctxt: CtxtId) -> Option<crate::check::collect::BodyItem> {
-        for layer in self.item_scopes.iter().rev() {
-            for &(n, idx) in layer.iter().rev() {
-                if n == (name, ctxt) {
-                    return self.p.body_items.get(&idx).copied();
-                }
-            }
-        }
-        None
-    }
-
     fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
         let p = self.p;
         let module = self.module;
@@ -801,22 +768,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn block(&mut self, b: ast::BlockId, expected: Option<Ty>) -> Ty {
         let block = self.p.ast.block(b);
         let scope = self.scopes.len();
-        {
-            let mut layer: Vec<((Sym, CtxtId), u32)> = Vec::new();
-            for stmt in &block.stmts {
-                if let Stmt::Item(idx) = stmt {
-                    if let Some(name) = match &self.p.ast.stmt_items[*idx as usize].kind {
-                        ItemKind::Fn(d) => Some((d.name, d.name_span.ctxt)),
-                        ItemKind::Const(c) => c.name.map(|n| (n, c.name_span.ctxt)),
-                        ItemKind::Static(st) => Some((st.name, st.name_span.ctxt)),
-                        _ => None,
-                    } {
-                        layer.push((name, *idx));
-                    }
-                }
-            }
-            self.item_scopes.push(layer);
-        }
         let mut diverges = false;
         for stmt in &block.stmts {
             match stmt {
@@ -895,7 +846,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             None => UNIT,
         };
         self.scopes.truncate(scope);
-        self.item_scopes.pop();
         t
     }
 
@@ -1762,35 +1712,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }
-            match self.body_item_of(name, span.ctxt) {
-                Some(crate::check::collect::BodyItem::Fn(f)) => {
-                    self.set_res(e, Res::Fn(f));
-                    return ERROR;
-                }
-                Some(crate::check::collect::BodyItem::Const(ci)) => {
-                    let c = &p.body_consts[ci as usize];
-                    let (v, t) = (c.value.clone(), c.ty);
-                    let i = self.ei(e);
-                    self.out.const_exprs[i] = Some(v);
-                    return self.deep(t);
-                }
-                Some(crate::check::collect::BodyItem::Static(idx)) => {
-                    let st = &p.statics[idx as usize];
-                    if st.mutable {
-                        self.err(
-                            "L0404",
-                            span,
-                            "reading a mutable static requires `unsafe`, which is not supported",
-                            "Make the static immutable, or read it through a const.",
-                        );
-                        return ERROR;
-                    }
-                    let t = st.ty;
-                    self.set_res(e, Res::Static(idx));
-                    return self.deep(t);
-                }
-                None => {}
-            }
             // One value-namespace binding read covers the fn and constructor
             // cases below. The prelude `None` keeps its place between them,
             // as before: it is a prelude name, not a module binding.
@@ -2088,31 +2009,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0114", span, "this value is not a function", "Closures are not supported yet. Call a named function.");
                     return ERROR;
                 }
-                match self.body_item_of(name, self.span(callee).ctxt) {
-                    Some(crate::check::collect::BodyItem::Fn(f)) => Res::Fn(f),
-                    _ => match self.binding_fn(name) {
-                        Some(f) => Res::Fn(f),
-                        None if name == p.known.Some => Res::OptSome,
-                        None if matches!(self.name(name), "size_of" | "align_of") && !segs[0].type_args().is_empty() => {
-                            let align = self.name(name) == "align_of";
-                            self.layout_query(&segs[0], align, span)
-                        }
-                        None => match self.tuple_struct_ctor(name) {
-                            Some(a) => Res::Variant(a, 0),
-                            None => {
-                                let cs = self.span(callee);
-                                self.err(
-                                    "L0101",
-                                    cs,
-                                    format!("cannot find function `{}`", self.name(name)),
-                                    "Check the spelling, or define the function.",
-                                );
-                                for &a in args {
-                                    self.expr(a, None);
-                                }
-                                return ERROR;
+                match self.binding_fn(name) {
+                    Some(f) => Res::Fn(f),
+                    None if name == p.known.Some => Res::OptSome,
+                    None if matches!(self.name(name), "size_of" | "align_of") && !segs[0].type_args().is_empty() => {
+                        let align = self.name(name) == "align_of";
+                        self.layout_query(&segs[0], align, span)
+                    }
+                    None => match self.tuple_struct_ctor(name) {
+                        Some(a) => Res::Variant(a, 0),
+                        None => {
+                            let cs = self.span(callee);
+                            self.err(
+                                "L0101",
+                                cs,
+                                format!("cannot find function `{}`", self.name(name)),
+                                "Check the spelling, or define the function.",
+                            );
+                            for &a in args {
+                                self.expr(a, None);
                             }
-                        },
+                            return ERROR;
+                        }
                     },
                 }
             }
@@ -2940,28 +2858,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // A plain name that resolves to a const item is a const pattern, not
         // a binding (unless a local binding shadows the name).
-        if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
-            && self.lookup(*name, span.ctxt).is_none()
-            && let Some(crate::check::collect::BodyItem::Const(ci)) = self.body_item_of(*name, span.ctxt)
-        {
-            let c = &p.body_consts[ci as usize];
-            if !matches!(
-                c.value,
-                crate::ty::consteval::ConstValue::Int(_)
-                    | crate::ty::consteval::ConstValue::Bool(_)
-                    | crate::ty::consteval::ConstValue::Char(_)
-            ) {
-                self.errs.push(unsupported(span, "non-scalar const patterns"));
-                return;
-            }
-            let ct = c.ty;
-            if !self.unify(ct, t) {
-                self.mismatch(span, t, ct);
-                return;
-            }
-            self.out.pat_res[pi] = PatRes::BodyConst(ci);
-            return;
-        }
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
             && let Some(&idx) = p.const_names.get(name)

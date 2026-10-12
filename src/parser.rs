@@ -1820,69 +1820,6 @@ impl<'a> Parser<'a> {
         self.nest(|p| p.block_inner())
     }
 
-    /// True when the statement ahead (past attributes and visibility) opens
-    /// with an item keyword. `use` keeps its dedicated path below, and a
-    /// `const {` block is an expression, not an item.
-    fn at_body_item(&self) -> bool {
-        let mut j = self.pos;
-        loop {
-            if self.toks.get(j).map(|t| t.tok) != Some(Tok::Pound) {
-                break;
-            }
-            j += 1;
-            if self.toks.get(j).map(|t| t.tok) == Some(Tok::Bang) {
-                j += 1;
-            }
-            if self.toks.get(j).map(|t| t.tok) != Some(Tok::LBracket) {
-                return false;
-            }
-            let mut depth = 0usize;
-            while let Some(t) = self.toks.get(j) {
-                match t.tok {
-                    Tok::LBracket => depth += 1,
-                    Tok::RBracket => {
-                        depth -= 1;
-                        j += 1;
-                        if depth == 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    Tok::Eof => return false,
-                    _ => {}
-                }
-                j += 1;
-            }
-        }
-        if self.toks.get(j).map(|t| t.tok) == Some(Tok::Pub) {
-            j += 1;
-            if self.toks.get(j).map(|t| t.tok) == Some(Tok::LParen) {
-                let mut depth = 0usize;
-                while let Some(t) = self.toks.get(j) {
-                    match t.tok {
-                        Tok::LParen => depth += 1,
-                        Tok::RParen => {
-                            depth -= 1;
-                            j += 1;
-                            if depth == 0 {
-                                break;
-                            }
-                            continue;
-                        }
-                        Tok::Eof => return false,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-            }
-        }
-        match self.toks.get(j).map(|t| t.tok) {
-            Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Mod | Tok::Trait | Tok::Static | Tok::Type | Tok::Extern) => true,
-            Some(Tok::Const) => self.toks.get(j + 1).map(|t| t.tok) != Some(Tok::LBrace),
-            _ => false,
-        }
-    }
-
     fn block_inner(&mut self) -> PResult<BlockId> {
         let start = self.expect(Tok::LBrace, "`{`")?;
         let mut stmts = Vec::new();
@@ -1892,20 +1829,6 @@ impl<'a> Parser<'a> {
                 return Err(syntax(self.span(), "expected `}`, found end of file"));
             }
             if self.eat(Tok::Semi) {
-                continue;
-            }
-            // An item inside a function body parses with the item parser
-            // (which reads its own attributes); the resolver and checker
-            // bind it for the rest of the block.
-            if self.at_body_item() {
-                match self.item()? {
-                    Some(item) => {
-                        let idx = self.ast.stmt_items.len() as u32;
-                        self.ast.stmt_items.push(item);
-                        stmts.push(Stmt::Item(idx));
-                    }
-                    None => return Err(syntax(self.span(), "expected an item")),
-                }
                 continue;
             }
             // Statement attributes: parsed here so a `#[cfg]` on a statement
