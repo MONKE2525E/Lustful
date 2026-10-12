@@ -563,6 +563,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
                     }
                     self.access(dest, Access::Write, span, &live);
+                    self.check_store_into_param_ref(dest.local, &new_holds, st, span);
                     st.maybe_init.insert(l);
                     st.maybe_uninit.remove(l);
                     st.maybe_moved.remove(l);
@@ -571,6 +572,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.check_init(dest, span, st);
                     self.check_mutability(dest, span, st, false);
                     self.access(dest, Access::Write, span, &live);
+                    self.check_store_into_param_ref(dest.local, &new_holds, st, span);
                     st.holds[dest.local as usize].union(&new_holds);
                 }
             }
@@ -608,6 +610,34 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             };
         }
         t
+    }
+
+    /// A reference that comes from a parameter must keep borrowing from parameters.
+    /// Storing a borrow of a local value into such a place is an error even if the
+    /// place is never read again (`v = &mut Vec::new()` for `v: &mut Vec<_>`), because
+    /// the signature ties the place's reference to the caller's lifetime.
+    fn check_store_into_param_ref(&mut self, root: Local, new_holds: &BitSet, st: &State, span: Span) {
+        if !self.report {
+            return;
+        }
+        if !st.holds[root as usize].iter().any(|li| self.loans[li].synthetic) {
+            return;
+        }
+        for li in new_holds.iter() {
+            let loan = &self.loans[li];
+            if loan.synthetic || loan.place.proj.contains(&Proj::Deref) {
+                continue;
+            }
+            let name = self.local_name(loan.place.local);
+            let dest = self.local_name(root);
+            self.err(
+                "L0306",
+                span,
+                format!("{name} does not live long enough: it is borrowed into {dest}, which borrows from a parameter"),
+                "Borrow from a parameter instead, or store an owned value (for example `*dest = value`).",
+            );
+            return;
+        }
     }
 
     fn holds_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
