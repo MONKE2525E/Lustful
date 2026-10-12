@@ -1976,6 +1976,52 @@ impl GlueSet {
         shared_changed
     }
 
+    /// Regenerates every reached key's definition from the current
+    /// program and replaces the stored text where it differs. A derived
+    /// impl (Debug, Clone, Eq, Drop glue) is generated from the Adt's
+    /// field and variant types, but its key is only the Adt id: a field
+    /// type edit keeps the key, so `add` alone would keep the old text
+    /// (a stale Debug body, or C that names a field the new layout form
+    /// does not have). The driver calls this when type definitions may
+    /// have changed. Returns (shared unit content changed, any existing
+    /// definition changed); new keys are added as in `add`. Comparing
+    /// the generated text is exact by construction: no second
+    /// fingerprint of what `glue_def` reads to keep in sync.
+    pub fn refresh<'k>(&mut self, p: &Program, keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
+        let mut pending: Vec<(Glue, CTy)> = keys.cloned().collect();
+        let mut seen: HashSet<(Glue, CTy)> = HashSet::new();
+        let mut shared_changed = false;
+        let mut regenerated = false;
+        while let Some(g) = pending.pop() {
+            if !seen.insert(g.clone()) {
+                continue;
+            }
+            let mut more = Vec::new();
+            let mut proto = String::new();
+            let mut def = String::new();
+            glue_def(p, &g.0, &g.1, &mut proto, &mut def, &mut more);
+            let is_new = !self.protos.contains_key(&g);
+            let changed = is_new
+                || self.def_map.get(&g) != Some(&def)
+                || self.protos.get(&g) != Some(&proto)
+                || self.deps.get(&g) != Some(&more);
+            if changed {
+                regenerated |= !is_new;
+                shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
+                self.def_map.insert(g.clone(), def);
+                self.deps.insert(g.clone(), more.clone());
+                self.protos.insert(g, proto);
+            }
+            pending.extend(more);
+        }
+        if regenerated {
+            // `defs` is the pre-hybrid concatenation; rebuild it from the
+            // per-key map. Order does not matter: prototypes precede it.
+            self.defs = self.def_map.values().cloned().collect();
+        }
+        (shared_changed, regenerated)
+    }
+
     /// The glue keys a set of direct needs reaches, deps included.
     fn closure<'a>(&'a self, roots: impl Iterator<Item = &'a (Glue, CTy)>) -> HashSet<&'a (Glue, CTy)> {
         let mut seen = HashSet::new();
