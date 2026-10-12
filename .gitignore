@@ -7,3 +7,4 @@
 .lust-daemon.sock.lock
 /tests/cargo-proj/target
 /tests/cargo-proj/Cargo.lock
+__pycache__/
