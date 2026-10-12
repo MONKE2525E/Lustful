@@ -816,7 +816,12 @@ fn slot_update(
     });
     let mut changed = Vec::new();
     let mut mention_only = Vec::new();
-    for i in 0..fn_count {
+    // The token scan and the Ast can disagree on the fn count for
+    // unusual shapes (an impl inside a body, which collect rejects
+    // with its own diagnostic): never index past either list here.
+    // `collect` runs next and gives the real answer; the tail's
+    // count guard catches any remaining disagreement.
+    for i in 0..fn_count.min(front.fn_loc.len()) {
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
