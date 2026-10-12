@@ -10,7 +10,7 @@
 //   lust daemon            serve warm, incremental compiles for this directory
 //   lust port scan ...     gap report for a Rust crate (execs `lust-port`)
 //
-// Autostart: `LUST_NO_DAEMON=1` turns it off. The daemon detaches into its own session,
+// Autostart: `LUST_NO_DAEMON=1` turns the daemon off entirely (no use, no start). The daemon detaches into its own session,
 // logs to `daemon.log` in the cache dir, and exits after `LUST_DAEMON_IDLE` (default 30m).
 #[path = "protocol.rs"]
 mod protocol;
@@ -137,7 +137,11 @@ fn main() {
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args: run_args }) => {
             let sock = protocol::socket_path();
-            if let Some(resp) = protocol::request(&sock, &req) {
+            // LUST_NO_DAEMON means "do not use a daemon at all": neither
+            // start one nor send work to a live one.
+            if !env_on("LUST_NO_DAEMON")
+                && let Some(resp) = protocol::request(&sock, &req)
+            {
                 protocol::finish(resp, run, &req.out, &run_args);
             }
             // No daemon answered: start one for the next command, answer this one cold.
