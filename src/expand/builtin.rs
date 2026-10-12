@@ -427,6 +427,7 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
             text.push(' ');
         }
         text.push_str(&piece.text);
+        prev = Some(piece);
     }
     text
 }
