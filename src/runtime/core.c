@@ -68,7 +68,10 @@ void *lust_ptr_offset(void *ptr, uint64_t offset) LUST_BODY({ return (char *)ptr
 
 /* ---------- Strings ---------- */
 
-lust_String lust_string_new(void) LUST_BODY({ lust_String s = {0, 0, 0}; return s; })
+/* Empty buffers hold the dangling aligned pointer, never null, as in
+   Rust: that is what makes the pointer-word niche of String and Vec
+   valid (an empty value's pointer word is never a niche tag value). */
+lust_String lust_string_new(void) LUST_BODY({ lust_String s = {(uint8_t *)(uintptr_t)1, 0, 0}; return s; })
 
 /* String capacity follows the Vec<u8> RawVec rules below: minimum
    capacity 8, then max(cap * 2, len + extra) on the amortized path and
@@ -90,7 +93,7 @@ void lust_string_reserve_exact(lust_String *s, uint64_t extra) LUST_BODY({
 })
 
 lust_String lust_string_with_capacity(uint64_t n) LUST_BODY({
-    lust_String s = {0, 0, 0};
+    lust_String s = {(uint8_t *)(uintptr_t)1, 0, 0};
     if (n) { s.ptr = lust_alloc(n, 1); s.cap = n; }
     return s;
 })
@@ -124,7 +127,7 @@ lust_String lust_string_from(lust_str x) LUST_BODY({
 
 lust_str lust_string_as_str(lust_String *s) LUST_BODY({ lust_str r; r.ptr = s->ptr; r.len = s->len; return r; })
 lust_String lust_string_clone(lust_String *s) LUST_BODY({ return lust_string_from(lust_string_as_str(s)); })
-void lust_string_drop(lust_String *s) LUST_BODY({ free(s->ptr); })
+void lust_string_drop(lust_String *s) LUST_BODY({ lust_dealloc(s->ptr, s->cap, 1); })
 
 int lust_str_cmp(lust_str a, lust_str b) LUST_BODY({
     uint64_t n = a.len < b.len ? a.len : b.len;
@@ -232,7 +235,7 @@ void lust_write(int to_stderr, lust_String *s) LUST_BODY({
     FILE *f = to_stderr ? stderr : stdout;
     if (s->len) fwrite(s->ptr, 1, s->len, f);
     if (to_stderr) fflush(stderr);
-    free(s->ptr);
+    lust_dealloc(s->ptr, s->cap, 1);
 })
 
 void lust_flush(void) LUST_BODY({ fflush(stdout); })
@@ -289,7 +292,7 @@ void lust_vec_reserve_exact(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t
 })
 
 lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem, uint64_t align) LUST_BODY({
-    lust_Vec v = {0, 0, 0};
+    lust_Vec v = {(void *)(uintptr_t)(align ? align : 1), 0, 0};
     if (!elem) { lust_vec_set_zst(&v, align); return v; }
     if (n) {
         if (n > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();

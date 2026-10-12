@@ -327,12 +327,10 @@ fn enum_is_exact(l: &Layout, variants: usize) -> bool {
 ///
 /// The layout is computed over CTy, not over `Ty`, so glue types that
 /// never existed as a semantic type (an Option of a reference, say) get
-/// one too. Two niches are stripped against the engine in ty/layout.rs:
-/// the fat-pointer data word and the String/Vec pointer word, because
-/// the runtime produces null there for empty values today, so a
-/// niche-filled outer enum could not tell a valid empty value from the
-/// tag value. Options over those stay tagged (and oversized) until the
-/// runtime uses dangling pointers for empty buffers.
+/// one too. The fat-pointer and String/Vec pointer niches are sound
+/// because empty buffers and empty slices always carry the dangling
+/// aligned pointer (see lust_string_new and lust_vec_with_capacity),
+/// never null.
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
     fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> Option<Layout> {
         match t {
@@ -342,12 +340,21 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Int(i) => Some(layout::int_layout(*i)),
             CTy::Float(f) => Some(layout::float_layout(*f)),
             CTy::FnPtr(..) => Some(layout::ptr_layout()),
-            CTy::Str => Some(plain_layout(16, 8)),
-            CTy::String | CTy::Vec(_) | CTy::Chars => Some(plain_layout(24, 8)),
+            CTy::Str => Some(layout::fat_ptr_layout()),
+            CTy::String | CTy::Vec(_) => {
+                // (ptr, len, cap) in runtime order; the pointer word is
+                // never null (empty buffers dangle), so it is a niche.
+                layout::struct_layout(
+                    &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)],
+                    layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
+                )
+                .ok()
+            }
+            CTy::Chars => Some(plain_layout(24, 8)),
             CTy::Args => Some(plain_layout(8, 8)),
-            CTy::Ref(inner) if **inner == CTy::Str => Some(plain_layout(16, 8)),
+            CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
-            CTy::Slice(_) => Some(plain_layout(16, 8)),
+            CTy::Slice(_) => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::struct_layout(&fields?, layout::Repr::default()).ok()
@@ -2852,10 +2859,12 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                         need(Glue::Drop, e);
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) drop_{}(&(({}*)p->ptr)[i]);", mangle(e), ctype(e));
                     }
-                    // A zero-sized element never allocates; its pointer is
-                    // the dangling aligned address, not a heap block.
+                    // An empty Vec never allocates; its pointer is the
+                    // dangling aligned address, not a heap block. The
+                    // zero-sized element form reports cap as usize::MAX,
+                    // so that case is decided here, not at run time.
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
-                        body.push_str("  free(p->ptr);\n");
+                        body.push_str("  if (p->cap) free(p->ptr);\n");
                     }
                 }
                 CTy::Option(e) => {
