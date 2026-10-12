@@ -2142,11 +2142,47 @@ impl<'a> Parser<'a> {
         self.expr_ctx(false)
     }
 
+    /// A closure: `move |params| -> Ret body`. Parameters are
+    /// single patterns (no top-level `|` alternation, as in Rust);
+    /// attributes on parameters are not parsed yet and fall out
+    /// as a syntax error. The body is a full expression.
+    fn closure_expr(&mut self, start: Span) -> PResult<ExprId> {
+        let is_move = self.eat(Tok::Move);
+        let mut params: Vec<ClosureParam> = Vec::new();
+        if !self.eat(Tok::OrOr) {
+            self.expect(Tok::Pipe, "`|`")?;
+            loop {
+                if self.eat(Tok::Pipe) {
+                    break;
+                }
+                let pstart = self.span();
+                let pat = self.pattern_one()?;
+                let ty = if self.eat(Tok::Colon) { Some(self.ty()?) } else { None };
+                let span = pstart.to(self.prev_span());
+                params.push(ClosureParam { pat, ty, attrs: Vec::new(), span });
+                if self.eat(Tok::Pipe) {
+                    break;
+                }
+                self.expect(Tok::Comma, "`,` or `|`")?;
+            }
+        }
+        let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+        let body = self.expr()?;
+        let span = start.to(self.prev_span());
+        Ok(self.push_expr(Expr::Closure { is_move, is_async: false, params, ret, body }, span))
+    }
+
     /// `no_struct` is set in `if`, `while`, `match`, and `for` heads, where `{` starts the body.
     fn expr_ctx(&mut self, no_struct: bool) -> PResult<ExprId> {
         let start = self.span();
         if matches!(self.peek(), Tok::Pipe | Tok::OrOr | Tok::Move) {
-            return Err(not_yet(C_CORE, start, "closures"));
+            // A closure head is not a struct-less head expression
+            // either: `if |x| .. { }` stays rejected, as in Rust
+            // without parentheses.
+            if no_struct {
+                return Err(not_yet(C_CORE, start, "closures"));
+            }
+            return self.closure_expr(start);
         }
         // Assignment is right-associative and lowest.
         let lhs = self.range_expr(no_struct)?;
