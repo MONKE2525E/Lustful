@@ -10,7 +10,7 @@ use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stm
 use crate::check::collect::*;
 use crate::check::generics::Scope;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
-use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
+use crate::driver::graph::{BindingRes, Fingerprint, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
 use crate::traits::solve::{Selection, SolveCx, Solver};
 use crate::ty::defs::DefKind as DefsKind;
@@ -2317,6 +2317,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::OffsetOf { ty, fields } => {
                 let t = self.resolve_written(*ty);
                 let mut cur = self.deep(t);
+                // The offset is baked into this body as a constant; the
+                // layout fingerprint hashes field types deeply, so one
+                // read set over the root type covers the field walk.
+                p.record_layout_reads(&mut self.out.reads, &self.tys, cur);
                 let mut off: u64 = 0;
                 let mut bad = false;
                 for &ffield in fields {
@@ -2803,6 +2807,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let t = self.resolve_written(args[0]);
         let p: &Program<'_> = self.p;
         let t = self.deep(t);
+        // The answer is baked into this body as a constant. Record a
+        // layout read for every Adt in the type: the written-type
+        // binding read only names an outermost path, so a compound
+        // type (`[S; 2]`, `(S, u8)`) would record nothing for `S`.
+        p.record_layout_reads(&mut self.out.reads, &self.tys, t);
         match crate::ty::layout::layout_of_ty(&self.tys, p, t) {
             Ok(l) => Res::ConstUsize(if align { l.align } else { l.size }),
             Err(()) => {
@@ -3661,6 +3670,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let target = if path.len() == 1 {
             let n = path[0].name;
+            // The flat type table answers below; the binding query is the
+            // recorded read of that answer (ARCH 8.2).
+            if n != p.known.self_type {
+                self.binding(Namespace::Type, n);
+            }
             let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
             a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32))
         } else {
@@ -4089,11 +4103,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         // A plain name that resolves to a const item is a const pattern, not
-        // a binding (unless a local binding shadows the name).
+        // a binding (unless a local binding shadows the name). The pattern
+        // consumes the const's value, so record its `Sig` read (the
+        // fingerprint folds the evaluated value): a value edit must
+        // recheck this body (ARCH 8.2), like a const in an expression.
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
             && let Some(&idx) = p.const_names.get(name)
         {
+            if let Some(&def) = p.const_defs.get(idx as usize) {
+                let _ = p.sig_of(&mut self.out.reads, def);
+            }
             let c = &p.consts[idx as usize];
             if !matches!(
                 c.value,
@@ -4202,6 +4222,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Path(segs) | Pat::TupleStruct { path: segs, .. } | Pat::Struct { path: segs, .. } => {
                 let target = if segs.len() == 1 {
                     let n = segs[0].name;
+                    // The flat type table answers below; the binding query
+                    // is the recorded read of that answer (ARCH 8.2).
+                    if n != p.known.self_type {
+                        self.binding(Namespace::Type, n);
+                    }
                     let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
                     a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0))
                 } else {
@@ -4979,12 +5004,28 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         self.cx.name(s)
     }
     fn const_item(&mut self, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
-        let &i = self.cx.p.const_names.get(&name)?;
-        let c = &self.cx.p.consts[i as usize];
-        Some((c.value.clone(), c.ty))
+        // A const read inside body const evaluation consumes the value:
+        // record the const's `Sig` read (its fingerprint folds the
+        // value), as `path_expr` does for a plain expression use.
+        let p = self.cx.p;
+        let &i = p.const_names.get(&name)?;
+        let out = {
+            let c = &p.consts[i as usize];
+            (c.value.clone(), c.ty)
+        };
+        if let Some(&def) = p.const_defs.get(i as usize) {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        Some(out)
     }
     fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
-        self.cx.p.static_names.get(&name).map(|&i| (i, self.cx.p.statics[i as usize].ty))
+        let p = self.cx.p;
+        let &i = p.static_names.get(&name)?;
+        let ty = p.statics[i as usize].ty;
+        if let Some(&def) = p.static_defs.get(i as usize) {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        Some((i, ty))
     }
     fn call_target(&mut self, callee: ExprId) -> crate::ty::consteval::CallTarget {
         use crate::ty::consteval::{CallTarget, ConstFnBody};
@@ -5025,6 +5066,14 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
                 return CallTarget::NonConst;
             }
             let Some(body) = info.def.body else { return CallTarget::NonConst };
+            // The evaluator is about to run this const fn's body and bake
+            // the result into the body being checked: that body depends
+            // on the const fn's body, not only its signature. A `Checked`
+            // read records the edge; its replay never matches, so the
+            // reader rechecks whenever it is a walk candidate. Nested
+            // const calls inside the evaluated body come back here and
+            // record their own edges, so the dependency is transitive.
+            self.cx.out.reads.record_checked(p.def_id(f), Fingerprint(0));
             if info.self_kind.is_some() {
                 return CallTarget::Unknown;
             }
@@ -5073,6 +5122,10 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
         let p: &Program<'_> = self.cx.p;
         let t = self.cx.deep(t);
+        // A layout answer inside body const evaluation (`size_of` in a
+        // const block or array length) is baked into the body: record
+        // the layout reads, as `layout_query` does.
+        p.record_layout_reads(&mut self.cx.out.reads, &self.cx.tys, t);
         crate::ty::layout::layout_of_ty(&self.cx.tys, p, t).ok()
     }
     fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
