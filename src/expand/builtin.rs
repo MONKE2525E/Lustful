@@ -77,19 +77,34 @@ impl CfgEnv {
         if !self.facts.is_empty() {
             return self.facts.iter().any(|(n, v)| n == name && v.as_deref() == value);
         }
+        // The host target as `rustc --print cfg -C panic=abort` prints it
+        // for x86_64/aarch64 Linux: lust builds with panic=abort and for the
+        // host, so these are the facts a cfg in user code sees.
         match (name, value) {
             ("test", None) => self.test,
             ("debug_assertions", None) => self.debug_assertions,
             ("unix", None) => true,
             ("windows", None) => false,
+            ("panic", Some("abort")) => true,
+            ("panic", Some(_)) => false,
             ("target_family", Some("unix")) => true,
             ("target_family", Some(_)) => false,
             ("target_os", Some("linux")) => true,
             ("target_os", Some(_)) => false,
             ("target_arch", Some(v)) => v == std::env::consts::ARCH,
             ("target_pointer_width", Some("64")) => true,
+            ("target_pointer_width", Some(_)) => false,
             ("target_endian", Some("little")) => true,
+            ("target_endian", Some(_)) => false,
             ("target_env", Some("gnu")) => true,
+            ("target_env", Some(_)) => false,
+            ("target_abi", Some("")) => true,
+            ("target_abi", Some(_)) => false,
+            ("target_vendor", Some("unknown")) => true,
+            ("target_vendor", Some(_)) => false,
+            ("target_has_atomic", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
+            ("target_has_atomic_primitive_alignment", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
+            ("target_feature", Some(v)) => std::env::consts::ARCH == "x86_64" && matches!(v, "fxsr" | "sse" | "sse2"),
             ("feature", Some(_)) => false,
             _ => false,
         }
@@ -423,20 +438,35 @@ fn expect_args(name: &str, call: &Call, n: usize) -> Result<(), Diag> {
     }
 }
 
+/// The text one numeric literal stands for in `concat!`: rustc prints the
+/// value with no suffix. Integers print in decimal; floats keep their
+/// written digits (`1e3` stays `1e3`, `2.0` stays `2.0`) minus the suffix
+/// and digit separators.
+fn concat_number(st: &Expander, tok: Tok) -> Option<String> {
+    match tok {
+        Tok::Int(v, _) => Some(v.to_string()),
+        Tok::Float(i) => {
+            let text = st.strings.get(i as usize)?;
+            let text = text.strip_suffix("f32").or_else(|| text.strip_suffix("f64")).unwrap_or(text);
+            Some(text.replace('_', ""))
+        }
+        _ => None,
+    }
+}
+
 /// The text one `concat!` argument stands for, when it is a literal.
 fn concat_value(st: &Expander, trees: &[Tt]) -> Option<String> {
     let trees = unwrap_frag(trees);
     if let [Tt::Tok(neg), Tt::Tok(num)] = trees
         && neg.tok == Tok::Minus
-        && matches!(num.tok, Tok::Int(..) | Tok::Float(_))
     {
-        return Some(format!("-{}", tok_text(&num.tok, &st.strings, st.ctx.interner)));
+        return concat_number(st, num.tok).map(|n| format!("-{n}"));
     }
     let [Tt::Tok(t)] = trees else { return None };
     Some(match t.tok {
         Tok::Str(i) => st.strings.get(i as usize)?.clone(),
         Tok::Char(c) => c.to_string(),
-        Tok::Int(..) | Tok::Float(_) => tok_text(&t.tok, &st.strings, st.ctx.interner),
+        Tok::Int(..) | Tok::Float(_) => concat_number(st, t.tok)?,
         Tok::True => "true".to_string(),
         Tok::False => "false".to_string(),
         _ => return None,
