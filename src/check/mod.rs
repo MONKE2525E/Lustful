@@ -2,6 +2,8 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod collect;
+#[allow(dead_code)] // Wired into collect and check as generic support lands in increments.
+pub mod generics;
 pub mod obligations;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};

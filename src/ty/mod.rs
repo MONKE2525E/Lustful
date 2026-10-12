@@ -661,14 +661,27 @@ pub trait TyIntern {
         let a = self.intern_args(args);
         self.intern(TyKind::Adt(def, a))
     }
-    /// The type of a registered user Adt with no generic args (today's user types).
+    /// The full applied type of a registered user Adt: for a
+    /// monomorphized instance that is `Adt(def, concrete args)`,
+    /// for a plain Adt `Adt(def, EMPTY_ARGS)`.
     fn adt_ty(&mut self, local: AdtId) -> Ty {
+        if let Some(t) = self.full_adt_ty_of(local) {
+            return t;
+        }
         let def = self.def_of_local_adt(local).expect("user ADT defs are registered during collection");
         self.intern(TyKind::Adt(def, EMPTY_ARGS))
     }
     /// The already-interned type of a registered user Adt, if any. Never interns.
     fn get_adt_ty(&self, local: AdtId) -> Option<Ty> {
+        if let Some(t) = self.full_adt_ty_of(local) {
+            return Some(t);
+        }
         self.get(TyKind::Adt(self.def_of_local_adt(local)?, EMPTY_ARGS))
+    }
+    /// The registered full type of a session-local Adt, if the
+    /// store keeps one (the global store does; overlays read it).
+    fn full_adt_ty_of(&self, _local: AdtId) -> Option<Ty> {
+        None
     }
     /// `Vec<elem>` as an Adt application of the builtin def. Implemented per store
     /// over a one-entry application cache: these two applications are by far the
@@ -709,14 +722,28 @@ pub trait TyIntern {
     fn option_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Option)).then(|| self.adt_first_ty_arg(t)).flatten()
     }
+    /// The session-local index of a monomorphized Adt instance
+    /// (`Bag<u8>` next to `Bag<u16>`), registered by mono when it
+    /// materializes the instance's `AdtDef`. None when this store
+    /// has no instance registry or the instance is not made yet.
+    fn local_adt_instance(&self, _def: DefId, _args: ArgsId) -> Option<AdtId> {
+        None
+    }
     /// The session-local index of a user Adt type. None for builtin Adts and
     /// non-Adt types; builtin checks must run first where both can appear.
     /// The builtin sentinel crate answers without a table lookup, which keeps
-    /// this at the old closed-kind match cost on builtin receivers.
+    /// this at the old closed-kind match cost on builtin receivers. A
+    /// generic application answers with its materialized instance
+    /// when mono has made one, and with the template otherwise.
     fn local_adt(&self, t: Ty) -> Option<AdtId> {
-        let (def, _) = self.adt_parts(t)?;
+        let (def, args) = self.adt_parts(t)?;
         if def.krate == BUILTIN_CRATE {
             return None;
+        }
+        if args != EMPTY_ARGS
+            && let Some(inst) = self.local_adt_instance(def, args)
+        {
+            return Some(inst);
         }
         self.local_adt_of(def)
     }
@@ -825,6 +852,14 @@ pub struct GlobalTys {
     adt1: FxMap<(DefId, Ty), Ty>,
     adt_locals: FxMap<DefId, AdtId>,
     adt_defs: Vec<DefId>,
+    /// Materialized generic instances: (template def, concrete args)
+    /// to the instance's session-local index. Filled by mono during
+    /// collection; body overlays read it through the global store.
+    adt_instances: FxMap<(DefId, ArgsId), AdtId>,
+    /// The full applied type of each session-local Adt, in index
+    /// order where registered: `Adt(def, args)` with the instance's
+    /// args, not always `EMPTY_ARGS`.
+    adt_full_tys: Vec<Option<Ty>>,
 }
 
 impl GlobalTys {
@@ -849,6 +884,8 @@ impl GlobalTys {
             adt1: FxMap::default(),
             adt_locals: FxMap::default(),
             adt_defs: Vec::new(),
+            adt_instances: FxMap::default(),
+            adt_full_tys: Vec::new(),
         };
         // The intern calls must stay out of the assertions: `debug_assert_eq!`
         // drops its arguments in release builds, which would skip the interning.
@@ -884,6 +921,29 @@ impl GlobalTys {
             self.adt_defs.resize(i + 1, DefId::PLACEHOLDER);
         }
         self.adt_defs[i] = def;
+        if i >= self.adt_full_tys.len() {
+            self.adt_full_tys.resize(i + 1, None);
+        }
+        let t = self.intern(TyKind::Adt(def, EMPTY_ARGS));
+        self.adt_full_tys[i] = Some(t);
+    }
+    /// Records one materialized generic Adt instance: its applied
+    /// type (already interned) and its session-local index. The
+    /// template's own registration stays untouched, so the template
+    /// and every instance coexist in the compat tables.
+    pub fn register_adt_instance(&mut self, def: DefId, args: ArgsId, local: AdtId) -> Ty {
+        let t = self.intern(TyKind::Adt(def, args));
+        self.adt_instances.insert((def, args), local);
+        let i = local.0 as usize;
+        if i >= self.adt_full_tys.len() {
+            self.adt_full_tys.resize(i + 1, None);
+        }
+        self.adt_full_tys[i] = Some(t);
+        t
+    }
+    /// The full applied type of a session-local Adt, if registered.
+    pub fn full_adt_ty(&self, local: AdtId) -> Option<Ty> {
+        self.adt_full_tys.get(local.0 as usize).copied().flatten()
     }
 }
 
@@ -969,6 +1029,12 @@ impl TyIntern for GlobalTys {
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.adt_defs.get(local.0 as usize).copied().filter(|d| *d != DefId::PLACEHOLDER)
+    }
+    fn local_adt_instance(&self, def: DefId, args: ArgsId) -> Option<AdtId> {
+        self.adt_instances.get(&(def, args)).copied()
+    }
+    fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
+        self.full_adt_ty(local)
     }
 }
 
@@ -1128,6 +1194,12 @@ impl TyIntern for Tys<'_> {
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.global.def_of_local_adt(local)
+    }
+    fn local_adt_instance(&self, def: DefId, args: ArgsId) -> Option<AdtId> {
+        self.global.local_adt_instance(def, args)
+    }
+    fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
+        self.global.full_adt_ty(local)
     }
 }
 

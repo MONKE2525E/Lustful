@@ -157,6 +157,10 @@ pub enum DefKind {
     Static = 7,
     TypeAlias = 8,
     Module = 9,
+    // Added at the end for W-TRAITS-CORE (wave A): trait and
+    // associated-item defs. Existing hashes do not move.
+    Trait = 10,
+    Assoc = 11,
 }
 
 impl DefKind {
@@ -172,6 +176,8 @@ impl DefKind {
             DefKind::Static => "static",
             DefKind::TypeAlias => "type",
             DefKind::Module => "mod",
+            DefKind::Trait => "trait",
+            DefKind::Assoc => "assoc",
         }
     }
 }
