@@ -242,6 +242,8 @@ pub enum Res {
         into_iter: LocalDefId,
         next: LocalDefId,
     },
+    /// A call through a function pointer value in the callee expression.
+    Indirect,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -1226,6 +1228,93 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The `fn(params) -> ret` pointer type for a signature.
+    fn fn_ptr_ty(&mut self, params: &[Ty], ret: Ty) -> Ty {
+        let inputs = self.tys.intern_tys(params);
+        let sig = self.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig {
+            inputs,
+            output: ret,
+            is_unsafe: false,
+            extern_c: false,
+        }));
+        self.tys.intern(TyKind::FnPtr(sig))
+    }
+
+    /// The zero-sized fn-item type of a plain (non-generic) fn used as a
+    /// value. Generic fns as values are not supported yet.
+    fn fn_value_ty(&mut self, f: LocalDefId, span: Span) -> Ty {
+        if matches!(self.p.gx.fn_templates.get(f.0 as usize), Some(Some(_))) {
+            self.errs.push(not_yet("L0614", span, "generic functions as values"));
+            return ERROR;
+        }
+        self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS))
+    }
+
+    /// The callable-item type of a tuple struct or tuple variant
+    /// constructor used as a value. It is an `FnDef` over the Adt def
+    /// with the variant index as a const argument, so a later call
+    /// through the value can decode which constructor it is. Generic
+    /// Adts as values are not supported yet.
+    fn ctor_value_ty(&mut self, a: AdtId, v: u32, span: Span) -> Ty {
+        if !self.p.gx.adt_generics[a.0 as usize].params.is_empty() {
+            self.errs.push(not_yet("L0614", span, "generic constructors as values"));
+            return ERROR;
+        }
+        let c = self.tys.intern_const(ConstKind::Int(v as u128));
+        let args = self.tys.intern_args(&[GenericArg::Const(c)]);
+        self.tys.intern(TyKind::FnDef(self.p.def_of_adt(a), args))
+    }
+
+    /// The variant a constructor `FnDef` type names, from its const arg.
+    fn ctor_variant(&self, args: ArgsId) -> u32 {
+        match self.tys.args(args).first() {
+            Some(GenericArg::Const(c)) => match self.tys.const_kind(*c) {
+                ConstKind::Int(v) => v as u32,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// The (params, return) signature of a callable type: a fn pointer,
+    /// a fn item, or a constructor item.
+    fn callable_sig(&mut self, t: Ty) -> Option<(Vec<Ty>, Ty)> {
+        let p = self.p;
+        match self.kind(t) {
+            TyKind::FnPtr(sig) => {
+                let s = self.tys.sig(sig).value;
+                Some((self.tys.tys_of(s.inputs).to_vec(), s.output))
+            }
+            TyKind::FnDef(def, args) => {
+                if let Some(a) = p.adt_by_def(def) {
+                    let v = self.ctor_variant(args);
+                    let variant = &p.adt(a).variants[v as usize];
+                    let params = variant.fields.iter().map(|f| f.ty).collect();
+                    Some((params, self.tys.adt_ty(a)))
+                } else {
+                    let f = p.local_def(def.hash)?;
+                    match p.sig_of(&mut self.out.reads, def) {
+                        SigOf::Fn(info) => Some((info.params.clone(), info.ret)),
+                        _ => {
+                            let _ = f;
+                            None
+                        }
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// True when `t` is a plain fn's item type (not a constructor), so it
+    /// coerces to a function pointer backed by a slot trampoline.
+    fn is_fn_item(&self, t: Ty) -> bool {
+        match self.kind(t) {
+            TyKind::FnDef(def, _) => self.p.adt_by_def(def).is_none(),
+            _ => false,
+        }
+    }
+
     /// The free fn a value binding names, if it names one.
     fn binding_fn(&mut self, name: Sym) -> Option<LocalDefId> {
         match self.binding(Namespace::Value, name) {
@@ -2140,8 +2229,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 Coerce::SliceFromVec(em.is_mut())
             }
+            // A plain fn item coerces to a function pointer with the
+            // same signature (the value materializes as its trampoline).
+            (TyKind::FnDef(..), TyKind::FnPtr(_))
+                if self.is_fn_item(found)
+                    && self
+                        .callable_sig(found)
+                        .is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(expected)) =>
+            {
+                // The expression now has the pointer type, so lowering
+                // materializes the trampoline value for it.
+                if let Some(e) = e {
+                    self.set(e, expected);
+                }
+                Coerce::None
+            }
             _ => {
                 if !self.unify(found, expected) {
+                    if self.coerce_deep(found, expected, e) {
+                        // The whole value now has the expected type; the
+                        // inner coercions recorded on its parts build it.
+                        if let Some(e) = e {
+                            self.set(e, expected);
+                        }
+                        return true;
+                    }
                     self.mismatch(span, expected, found);
                     return false;
                 }
@@ -2154,6 +2266,91 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         true
     }
+    /// Structural equality with inference variables as wildcards.
+    fn ty_matchish(&self, a: Ty, b: Ty) -> bool {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        if a == b {
+            return true;
+        }
+        match (self.tys.kind(a), self.tys.kind(b)) {
+            (TyKind::Infer(_), _) | (_, TyKind::Infer(_)) => true,
+            (TyKind::Ref(_, _, x), TyKind::Ref(_, _, y)) => self.ty_matchish(x, y),
+            (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => self.ty_matchish(x, y),
+            (TyKind::Tuple(xs), TyKind::Tuple(ys)) => {
+                let (xs, ys) = (self.tys.tys_of(xs), self.tys.tys_of(ys));
+                xs.len() == ys.len() && xs.iter().zip(ys).all(|(&x, &y)| self.ty_matchish(x, y))
+            }
+            (TyKind::Adt(d, x), TyKind::Adt(e, y)) => {
+                d == e
+                    && self.tys.args(x).len() == self.tys.args(y).len()
+                    && self.tys.args(x).iter().zip(self.tys.args(y)).all(|(x, y)| match (x, y) {
+                        (GenericArg::Ty(x), GenericArg::Ty(y)) => self.ty_matchish(*x, *y),
+                        _ => x == y,
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// True when a reference coercion (unsize to a slice, `&String` to
+    /// `&str`, `&mut` to `&`) takes `f` to `e`. Pure: no unification.
+    fn ref_coercible(&self, f: Ty, e: Ty) -> bool {
+        let (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y)) = (self.kind(f), self.kind(e)) else { return false };
+        if em.is_mut() && !fm.is_mut() {
+            return false;
+        }
+        match self.kind(y) {
+            TyKind::Slice(ye) => match self.kind(x) {
+                TyKind::Array(xe, _) | TyKind::Slice(xe) => self.ty_matchish(xe, ye),
+                _ => self.tys.vec_elem(self.resolve(x)).is_some_and(|xe| self.ty_matchish(xe, ye)),
+            },
+            TyKind::Str => self.tys.is_string_ty(self.resolve(x)),
+            _ => self.ty_matchish(x, y),
+        }
+    }
+
+    /// Coercion inside an aggregate value whose producer is in hand: a
+    /// tuple literal, or a one-argument variant call such as `Some(&v)`
+    /// where `&[u8]` is wanted. The inner coercions record on the inner
+    /// expressions, so lowering applies them while building the value.
+    /// Other shapes keep the plain type-mismatch error.
+    fn coerce_deep(&mut self, found: Ty, expected: Ty, e: Option<ExprId>) -> bool {
+        let Some(e) = e else { return false };
+        let span = self.span(e);
+        match (self.kind(found), self.kind(expected)) {
+            (TyKind::Tuple(xs), TyKind::Tuple(ys)) => {
+                let Expr::Tuple(elems) = self.p.ast.expr(e) else { return false };
+                let (xs, ys) = (self.tys.tys_of(xs).to_vec(), self.tys.tys_of(ys).to_vec());
+                if xs.len() != ys.len() || elems.len() != xs.len() {
+                    return false;
+                }
+                if !xs.iter().zip(&ys).all(|(&x, &y)| self.ty_matchish(x, y) || self.ref_coercible(x, y)) {
+                    return false;
+                }
+                elems.iter().zip(xs.iter().zip(&ys)).all(|(&el, (&x, &y))| self.coerce_at(x, y, span, Some(el)))
+            }
+            (TyKind::Adt(df, af), TyKind::Adt(de, ae)) if df == de => {
+                let (fa, ea) = (self.tys.args(af).to_vec(), self.tys.args(ae).to_vec());
+                if fa.len() != ea.len() || fa.len() != 1 {
+                    return false;
+                }
+                let (Some(x), Some(y)) = (fa[0].as_ty(), ea[0].as_ty()) else { return false };
+                if !self.ref_coercible(x, y) {
+                    return false;
+                }
+                // The producer must be a one-argument variant call
+                // (`Some(..)`), whose argument carries the coercion.
+                let Expr::Call { args, .. } = self.p.ast.expr(e) else { return false };
+                if args.len() != 1 || !matches!(self.out.expr_res[self.ei(e)], Res::Variant(..) | Res::OptSome) {
+                    return false;
+                }
+                let inner_found = self.out.expr_ty[self.ei(args[0])];
+                self.coerce_at(inner_found, y, span, Some(args[0]))
+            }
+            _ => false,
+        }
+    }
+
     fn coerce_expr(&mut self, e: ExprId, found: Ty, expected: Ty) -> bool {
         let span = self.span(e);
         self.coerce_at(found, expected, span, Some(e))
@@ -3169,6 +3366,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     (None, Some(&first)) => {
                         let el = self.expr(first, None);
+                        // An array of plain fn items holds function
+                        // pointers: retag the first element too when any
+                        // element is a different fn item.
+                        let elt = self.resolve(el);
+                        let el = if elems.len() > 1 && self.is_fn_item(elt) {
+                            match self.callable_sig(elt) {
+                                Some((params, ret)) => {
+                                    let fp = self.fn_ptr_ty(&params, ret);
+                                    self.set(first, fp);
+                                    fp
+                                }
+                                None => el,
+                            }
+                        } else {
+                            el
+                        };
                         for &el_e in &elems[1..] {
                             self.expect_expr(el_e, el);
                         }
@@ -3373,6 +3586,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if self.kind(b) == TyKind::Never {
             return a;
         }
+        // Two plain fn items (or an item and a pointer) with one
+        // signature join as a function pointer.
+        if self.is_fn_item(a) || self.is_fn_item(b) || matches!(self.kind(a), TyKind::FnPtr(_)) {
+            if let (Some(sa), Some(sb)) = (self.callable_sig(a), self.callable_sig(b))
+                && sa == sb
+            {
+                let fp = self.fn_ptr_ty(&sa.0, sa.1);
+                if let Some(be) = be {
+                    self.coerce_expr(be, b, fp);
+                }
+                return fp;
+            }
+        }
         if let Some(be) = be {
             if self.coerce_expr(be, b, a) {
                 return a;
@@ -3549,7 +3775,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && let Some(f) = p.local_def(def.hash)
             {
                 self.set_res(e, Res::Fn(f));
-                return ERROR;
+                return self.fn_value_ty(f, span);
             }
             if let BindingRes::Def(def) = bound {
                 match p.binding_kind(def) {
@@ -3592,13 +3818,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let BindingRes::Def(def) = bound
                 && let Some(a) = p.adt_by_def(def)
             {
-                let unit = match p.sig_of(&mut self.out.reads, def) {
-                    SigOf::Adt(adt) => !adt.is_enum && adt.variants[0].shape == VariantShape::Unit,
-                    _ => false,
+                let shape = match p.sig_of(&mut self.out.reads, def) {
+                    SigOf::Adt(adt) if !adt.is_enum => Some(adt.variants[0].shape),
+                    _ => None,
                 };
-                if unit {
-                    self.set_res(e, Res::Variant(a, 0));
-                    return self.tys.adt_ty(a);
+                match shape {
+                    Some(VariantShape::Unit) => {
+                        self.set_res(e, Res::Variant(a, 0));
+                        return self.tys.adt_ty(a);
+                    }
+                    Some(VariantShape::Tuple) => {
+                        self.set_res(e, Res::Variant(a, 0));
+                        return self.ctor_value_ty(a, 0, span);
+                    }
+                    _ => {}
                 }
             }
             self.err(
@@ -3705,6 +3938,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if variant.shape == VariantShape::Unit {
                     return self.tys.adt_ty(a);
                 }
+                if variant.shape == VariantShape::Tuple {
+                    return self.ctor_value_ty(a, v, span);
+                }
+            }
+            if let Res::Fn(f) = r {
+                return self.fn_value_ty(f, span);
             }
             return ERROR;
         }
@@ -4063,6 +4302,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => false,
         };
         let ct = self.expr(callee, None);
+        let mut peeled = self.resolve(ct);
+        if let TyKind::Ref(_, _, inner) = self.kind(peeled) {
+            peeled = self.resolve(inner);
+        }
+        // Function pointers and fn or constructor items call through
+        // any value shape, not only the simple closure forms above.
+        if let Some(r) = self.callable_res(peeled) {
+            if let Res::Variant(a, _) = r
+                && !p.adt(a).is_enum
+            {
+                self.check_ctor_vis(a, span);
+            }
+            let Some((params, ret)) = self.callable_sig(peeled) else { return ERROR };
+            self.set_res(e, r);
+            self.check_args(&params, args, span);
+            return ret;
+        }
         if !simple {
             for &a in args {
                 self.expr(a, None);
@@ -4167,6 +4423,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The call resolution for a callable value's type: a fn pointer
+    /// calls indirectly, a fn item calls its fn directly, and a
+    /// constructor item builds its variant.
+    fn callable_res(&mut self, ct: Ty) -> Option<Res> {
+        match self.kind(ct) {
+            TyKind::FnPtr(_) => Some(Res::Indirect),
+            TyKind::FnDef(def, cargs) => match self.p.adt_by_def(def) {
+                Some(a) => Some(Res::Variant(a, self.ctor_variant(cargs))),
+                None => self.p.local_def(def.hash).map(Res::Fn),
+            },
+            _ => None,
+        }
+    }
+
     fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
         let p = self.p;
         // A callee that names a local (or is not a path at all)
@@ -4178,6 +4448,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         if is_value {
             return self.value_call(e, callee, args, span);
+        }
+        // `std::mem::size_of_val(&value)`: the size of the value's type.
+        if let Expr::Path(segs) = p.ast.expr(callee) {
+            let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
+            let is_sov = matches!(names.as_slice(), ["size_of_val"] | ["mem", "size_of_val"])
+                || matches!(names.as_slice(), ["std" | "core", "mem", "size_of_val"]);
+            if is_sov {
+                if args.len() != 1 {
+                    self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one reference.");
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
+                let at = self.expr(args[0], None);
+                let at = self.deep(at);
+                let inner = match self.kind(at) {
+                    TyKind::Ref(_, _, inner) => inner,
+                    _ => {
+                        let tn = self.tn(at);
+                        self.err("L0110", span, format!("`size_of_val` takes a reference, found `{tn}`"), "Pass `&value`.");
+                        return ERROR;
+                    }
+                };
+                let inner = self.deep(inner);
+                p.record_layout_reads(&mut self.out.reads, &self.tys, inner);
+                return match crate::ty::layout::layout_of_ty(&self.tys, p, inner) {
+                    Ok(l) => {
+                        self.set_res(e, Res::ConstUsize(l.size));
+                        USIZE
+                    }
+                    Err(()) => {
+                        self.err(
+                            "L0652",
+                            span,
+                            format!("unsupported layout form: `{}`", self.tn(inner)),
+                            "Use a type inside the supported layout grammar.",
+                        );
+                        ERROR
+                    }
+                };
+            }
         }
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {
@@ -4208,6 +4520,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             }
                         },
                     },
+                }
                 }
             }
             Expr::QPath { self_ty, trait_path, segs } => {
@@ -4262,11 +4575,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             _ => {
-                self.err("L0114", span, "only named functions can be called", "Closures and function values are not supported yet.");
-                return ERROR;
+                let ct = self.expr(callee, None);
+                match self.callable_res(ct) {
+                    Some(r) => r,
+                    None => {
+                        self.err("L0114", span, "only named functions can be called", "Closures are not supported yet. Call a named function or a function pointer.");
+                        return ERROR;
+                    }
+                }
             }
         };
-        self.set_res(callee, res);
+        // An indirect call's callee is a value expression with a
+        // resolution of its own (a local, an index): keep it.
+        if res != Res::Indirect {
+            self.set_res(callee, res);
+        }
         self.set_res(e, res);
         if res == Res::OptSome {
             if args.len() != 1 {
@@ -4319,6 +4642,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
                     self.check_args(&params, args, span);
                     self.tys.mk_adt(adef, &gen_args)
+                }
+            }
+            Res::Indirect => {
+                let ct = self.out.expr_ty[self.ei(callee)];
+                match self.callable_sig(ct) {
+                    Some((params, ret)) => {
+                        self.check_args(&params, args, span);
+                        ret
+                    }
+                    None => ERROR,
                 }
             }
             Res::Builtin(b) => {
