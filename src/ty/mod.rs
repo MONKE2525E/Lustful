@@ -638,16 +638,13 @@ pub trait TyIntern {
     fn get_adt_ty(&self, local: AdtId) -> Option<Ty> {
         self.get(TyKind::Adt(self.def_of_local_adt(local)?, EMPTY_ARGS))
     }
-    /// `Vec<elem>` as an Adt application of the builtin def.
-    fn mk_vec(&mut self, elem: Ty) -> Ty {
-        let def = self.builtins().vec;
-        self.mk_adt(def, &[GenericArg::Ty(elem)])
-    }
-    /// `Option<elem>` as an Adt application of the builtin def.
-    fn mk_option(&mut self, elem: Ty) -> Ty {
-        let def = self.builtins().option;
-        self.mk_adt(def, &[GenericArg::Ty(elem)])
-    }
+    /// `Vec<elem>` as an Adt application of the builtin def. Implemented per store
+    /// over a one-entry application cache: these two applications are by far the
+    /// most common in signatures, and the cache keeps them at one map probe
+    /// instead of an arg-slice intern plus a kind intern.
+    fn mk_vec(&mut self, elem: Ty) -> Ty;
+    /// `Option<elem>` as an Adt application of the builtin def. See `mk_vec`.
+    fn mk_option(&mut self, elem: Ty) -> Ty;
     /// The `(def, args)` of an Adt type, builtin or user.
     fn adt_parts(&self, t: Ty) -> Option<(DefId, ArgsId)> {
         match self.kind(t) {
@@ -792,6 +789,8 @@ pub struct GlobalTys {
     bounds: Arena<DynBounds, BoundsId>,
     bindings_a: Arena<Box<[(DefId, GenericArg)]>, BindingsId>,
     builtins: BuiltinDefs,
+    /// One-argument Adt applications by (def, elem): the `mk_vec`/`mk_option` cache.
+    adt1: FxMap<(DefId, Ty), Ty>,
     adt_locals: FxMap<DefId, AdtId>,
     adt_defs: Vec<DefId>,
 }
@@ -815,6 +814,7 @@ impl GlobalTys {
             bounds: Arena::default(),
             bindings_a: Arena::default(),
             builtins,
+            adt1: FxMap::default(),
             adt_locals: FxMap::default(),
             adt_defs: Vec::new(),
         };
@@ -914,6 +914,24 @@ impl TyIntern for GlobalTys {
     fn builtins(&self) -> BuiltinDefs {
         self.builtins
     }
+    fn mk_vec(&mut self, elem: Ty) -> Ty {
+        let def = self.builtins.vec;
+        if let Some(&t) = self.adt1.get(&(def, elem)) {
+            return t;
+        }
+        let t = self.mk_adt(def, &[GenericArg::Ty(elem)]);
+        self.adt1.insert((def, elem), t);
+        t
+    }
+    fn mk_option(&mut self, elem: Ty) -> Ty {
+        let def = self.builtins.option;
+        if let Some(&t) = self.adt1.get(&(def, elem)) {
+            return t;
+        }
+        let t = self.mk_adt(def, &[GenericArg::Ty(elem)]);
+        self.adt1.insert((def, elem), t);
+        t
+    }
     fn local_adt_of(&self, def: DefId) -> Option<AdtId> {
         self.adt_locals.get(&def).copied()
     }
@@ -936,6 +954,8 @@ pub struct Tys<'g> {
     sigs: Arena<Binder<FnSig>, SigId>,
     bounds: Arena<DynBounds, BoundsId>,
     bindings_a: Arena<Box<[(DefId, GenericArg)]>, BindingsId>,
+    /// Body-local `mk_vec`/`mk_option` cache; global hits are read from `global`.
+    adt1: FxMap<(DefId, Ty), Ty>,
 }
 
 impl<'g> Tys<'g> {
@@ -950,7 +970,22 @@ impl<'g> Tys<'g> {
             sigs: Arena::default(),
             bounds: Arena::default(),
             bindings_a: Arena::default(),
+            adt1: FxMap::default(),
         }
+    }
+
+    /// One-argument Adt application through the caches: global entries first
+    /// (read-only), then this body's, then a fresh intern recorded locally.
+    fn mk_adt1(&mut self, def: DefId, elem: Ty) -> Ty {
+        if let Some(&t) = self.global.adt1.get(&(def, elem)) {
+            return t;
+        }
+        if let Some(&t) = self.adt1.get(&(def, elem)) {
+            return t;
+        }
+        let t = self.mk_adt(def, &[GenericArg::Ty(elem)]);
+        self.adt1.insert((def, elem), t);
+        t
     }
 }
 
@@ -1047,6 +1082,14 @@ impl TyIntern for Tys<'_> {
     }
     fn builtins(&self) -> BuiltinDefs {
         self.global.builtins
+    }
+    fn mk_vec(&mut self, elem: Ty) -> Ty {
+        let def = self.global.builtins.vec;
+        self.mk_adt1(def, elem)
+    }
+    fn mk_option(&mut self, elem: Ty) -> Ty {
+        let def = self.global.builtins.option;
+        self.mk_adt1(def, elem)
     }
     fn local_adt_of(&self, def: DefId) -> Option<AdtId> {
         self.global.local_adt_of(def)

@@ -424,14 +424,28 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let d = adt.derives;
         for v in &adt.variants {
             for f in &v.fields {
-                let checks = [
-                    (d.clone, has_clone(&p, &p.tys, f.ty), "Clone"),
-                    (d.copy, is_copy(&p, &p.tys, f.ty), "Copy"),
-                    (d.partial_eq, has_eq(&p, &p.tys, f.ty), "PartialEq"),
-                    (d.debug, has_debug(&p, &p.tys, f.ty), "Debug"),
-                ];
-                for (wanted, ok, name) in checks {
-                    if wanted && !ok {
+                // Each query runs only for a derive the type asks for: the queries
+                // are pure, so skipping the others changes no result.
+                let mut checks: [(bool, &str); 4] = [(true, ""); 4];
+                let mut n_checks = 0;
+                if d.clone {
+                    checks[n_checks] = (has_clone(&p, &p.tys, f.ty), "Clone");
+                    n_checks += 1;
+                }
+                if d.copy {
+                    checks[n_checks] = (is_copy(&p, &p.tys, f.ty), "Copy");
+                    n_checks += 1;
+                }
+                if d.partial_eq {
+                    checks[n_checks] = (has_eq(&p, &p.tys, f.ty), "PartialEq");
+                    n_checks += 1;
+                }
+                if d.debug {
+                    checks[n_checks] = (has_debug(&p, &p.tys, f.ty), "Debug");
+                    n_checks += 1;
+                }
+                for &(ok, name) in &checks[..n_checks] {
+                    if !ok {
                         errs.push(Diag::new(
                             "L0112",
                             adt.span,
