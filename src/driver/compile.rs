@@ -645,6 +645,12 @@ fn slot_update(
             if body_same && caches.ok[slot] && mentions && !own_sig_changed {
                 mention_only.push(i);
             } else {
+                // Same rule as the bodies-only path: `slot_hash` advances
+                // below before the check runs, so clear the passing mark
+                // now. An early return between here and the check loop
+                // (a collect error, say) then leaves the function dirty,
+                // never unchanged-and-passing with an unchecked body.
+                caches.ok[slot] = false;
                 caches.has_out[slot] = false;
                 caches.slot_reads[slot] = None;
             }
@@ -1015,6 +1021,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let toks = &chunk.lexed.tokens[f.body.clone()];
             let slot = front.fn_slot[i] as usize;
             front.slot_hash[slot] = f.body_hash;
+            // The hash now names a body that has not been checked yet, so
+            // the old passing mark must go with it: if a later body in
+            // this loop fails to parse, the early return below must not
+            // leave this function looking unchanged and passing (fuzz
+            // seed 29, iter 562). The check loop rewrites `ok` for every
+            // changed function it reaches.
+            caches.ok[slot] = false;
             caches.has_out[slot] = false;
             if let Some(r) = caches.slot_reads.get_mut(slot) {
                 *r = None;
