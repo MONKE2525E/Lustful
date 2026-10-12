@@ -399,6 +399,19 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Unit => Operand::Const(Const::Unit),
             _ if self.is_place_expr(e) => {
                 let p = self.place(e);
+                // An index expression reads through the `Index` trait in
+                // Rust, so moving its (non-Copy) value out is moving out
+                // of a reference and an error (E0507/E0508). Route the
+                // read through a shared borrow temporary so the borrow
+                // checker reports exactly that. Pattern bindings project
+                // indexes directly and are not affected.
+                if matches!(self.p.ast.expr(e), Expr::Index { .. }) && !is_copy(self.p, &self.body.tys, ty) {
+                    let span = self.span(e);
+                    let rt = self.ref_ty(false, ty);
+                    let tmp = self.temp(rt);
+                    self.assign(Place::local(tmp), Rvalue::Ref(false, p), span);
+                    return self.operand_from(Place::local(tmp).deref(), ty);
+                }
                 self.operand_from(p, ty)
             }
             _ => {
@@ -479,7 +492,17 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
                 let pl = self.place(e);
                 if let Some(d) = dest {
-                    let op = self.operand_from(pl, ty);
+                    // Index reads go through the `Index` trait (see
+                    // `operand_raw`): a non-Copy move out of one is a
+                    // move out of a reference.
+                    let op = if matches!(p.ast.expr(e), Expr::Index { .. }) && !is_copy(self.p, &self.body.tys, ty) {
+                        let rt = self.ref_ty(false, ty);
+                        let tmp = self.temp(rt);
+                        self.assign(Place::local(tmp), Rvalue::Ref(false, pl), span);
+                        self.operand_from(Place::local(tmp).deref(), ty)
+                    } else {
+                        self.operand_from(pl, ty)
+                    };
                     self.assign(d.clone(), Rvalue::Use(op), span);
                 }
             }
@@ -965,6 +988,29 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.pop_scope(block.span);
     }
 
+    /// True when binding this pattern moves a non-Copy part out of the
+    /// matched value (so the pattern consumes the value as a whole).
+    fn pat_moves_value(&self, pat: PatId) -> bool {
+        let p = self.p;
+        if let PatRes::Binding { local, mode } = self.ck.pat_res(pat)
+            && mode == BindMode::Move
+            && !is_copy(self.p, &self.body.tys, self.ck.locals[local as usize].ty)
+        {
+            return true;
+        }
+        match p.ast.pat(pat) {
+            Pat::Tuple(elems) | Pat::TupleStruct { elems, .. } => elems.iter().any(|&e| self.pat_moves_value(e)),
+            Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.pat_moves_value(s)),
+            Pat::Slice { prefix, middle, suffix } => {
+                prefix.iter().chain(suffix.iter()).any(|&e| self.pat_moves_value(e))
+                    || middle.is_some_and(|m| self.pat_moves_value(m))
+            }
+            Pat::Or(alts) => alts.iter().any(|&a| self.pat_moves_value(a)),
+            Pat::Ref { inner, .. } | Pat::At { inner, .. } | Pat::Paren(inner) => self.pat_moves_value(*inner),
+            _ => false,
+        }
+    }
+
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>, span: Span) {
         let p = self.p;
         match (p.ast.pat(pat), self.ck.pat_res(pat)) {
@@ -1027,18 +1073,32 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             _ => {
-                // A destructuring `let`: evaluate the initializer into a
-                // temporary, then bind the pattern out of it. The temporary
-                // stays in scope (before the bindings) so fields the pattern
-                // does not move still drop at scope exit.
+                // A destructuring `let` whose bindings only copy or borrow
+                // binds directly out of a place initializer, so the value
+                // is not moved at all. A pattern that moves a part consumes
+                // the whole value (the unbound rest drops with it), so it
+                // goes through a temporary: the initializer moves there
+                // once, stays in scope before the bindings, and fields the
+                // pattern does not move still drop at scope exit.
                 if let Some(init) = init {
-                    let tty = self.ty(init);
-                    let t = self.new_local(tty, true, None);
-                    self.scopes.push(Vec::new());
-                    self.expr_into(init, Some(&Place::local(t)));
-                    self.pop_scope(span);
-                    self.scopes.last_mut().unwrap().push(t);
-                    self.bind_pat(pat, Place::local(t));
+                    if self.is_place_expr(init) && !self.pat_moves_value(pat) {
+                        self.scopes.push(Vec::new());
+                        let pl = self.place(init);
+                        // Move the place's own temporaries (index values
+                        // and the like) into the block scope without
+                        // dropping them: the projections name them.
+                        let temps = self.scopes.pop().unwrap();
+                        self.scopes.last_mut().unwrap().extend(temps);
+                        self.bind_pat(pat, pl);
+                    } else {
+                        let tty = self.ty(init);
+                        let t = self.new_local(tty, true, None);
+                        self.scopes.push(Vec::new());
+                        self.expr_into(init, Some(&Place::local(t)));
+                        self.pop_scope(span);
+                        self.scopes.last_mut().unwrap().push(t);
+                        self.bind_pat(pat, Place::local(t));
+                    }
                 }
             }
         }
@@ -1347,6 +1407,51 @@ impl<'p, 'a> Lower<'p, 'a> {
             let m = matches!(self.kind(it_ty), TyKind::Ref(_, Mut::Mut, _));
             let vref = self.temp(it_ty);
             self.expr_into(iter, Some(&Place::local(vref)));
+            // By-value iteration over an array of non-Copy elements moves
+            // each element out once. A dynamic index loop cannot express
+            // that to the borrow checker, so small arrays unroll: one
+            // copy of the body per element, each moving its own const
+            // index. Larger non-Copy arrays keep the index loop and are
+            // rejected by the borrow checker for now.
+            if by_value_array && !is_copy(self.p, &self.body.tys, item_ty) {
+                let n = match self.kind(it_ty) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => Some(n as usize),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(n) = n.filter(|&n| n <= 32) {
+                    let heads: Vec<Bb> = (0..n).map(|_| self.new_block()).collect();
+                    self.goto(heads.first().copied().unwrap_or(exit), span);
+                    for (i, &hb) in heads.iter().enumerate() {
+                        self.cur = hb;
+                        let idx = self.const_usize(i as u64, span);
+                        let elem = Place::local(vref).project(Proj::Index(idx));
+                        let op = self.operand_from(elem, item_ty);
+                        self.assign(Place::local(item), Rvalue::Use(op), span);
+                        let next = heads.get(i + 1).copied().unwrap_or(exit);
+                        self.scopes.push(Vec::new());
+                        self.bind_pat(pat, Place::local(item));
+                        self.loops.push(LoopInfo {
+                            break_bb: exit,
+                            continue_bb: next,
+                            dest: None,
+                            depth: self.scopes.len() - 1,
+                            label: label.map(|l| (l.name, l.span)),
+                            is_block: false,
+                        });
+                        self.block_into(body, None);
+                        self.loops.pop();
+                        self.pop_scope(span);
+                        self.goto(next, span);
+                    }
+                    self.cur = exit;
+                    self.pop_scope(span);
+                    self.unit(dest, span);
+                    return;
+                }
+            }
             let len = self.temp(USIZE);
             if by_value_array {
                 let n = match self.kind(it_ty) {
@@ -1410,7 +1515,19 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn match_into(&mut self, scrut: ExprId, arms: &[ast::Arm], dest: Option<&Place>, span: Span) {
         // Temporaries in the scrutinee live until the end of the match.
         self.scopes.push(Vec::new());
-        let sp = self.place(scrut);
+        let mut sp = self.place(scrut);
+        // An arm that moves a part out consumes the whole scrutinee
+        // value: move it into a temporary first so the place it came
+        // from is spent, as with a destructuring `let`.
+        if arms.iter().any(|a| self.pat_moves_value(a.pat)) {
+            let ty = self.ty(scrut);
+            if !matches!(self.kind(ty), TyKind::Ref(..)) {
+                let t = self.temp(ty);
+                let op = self.operand_from(sp, ty);
+                self.assign(Place::local(t), Rvalue::Use(op), span);
+                sp = Place::local(t);
+            }
+        }
         let end = self.new_block();
         for arm in arms {
             let next = self.new_block();
