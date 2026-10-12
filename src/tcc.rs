@@ -253,7 +253,13 @@ pub struct MemRun {
 /// In capture mode the child's stdout and stderr go to pipes and come back in the result
 /// (for a daemon, whose own stdout is not the user's terminal). Otherwise the child inherits
 /// our stdout and stderr. On non-Unix targets this always returns Err.
-pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[String], capture: bool, debug: bool) -> Result<MemRun, String> {
+pub fn run_in_memory(
+    units: &[(PathBuf, String)],
+    runtime_obj: &Path,
+    argv: &[String],
+    capture: bool,
+    debug: bool,
+) -> Result<MemRun, String> {
     #[cfg(not(unix))]
     {
         let _ = (units, runtime_obj, argv, capture, debug);
