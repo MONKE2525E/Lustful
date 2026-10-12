@@ -20,12 +20,14 @@ pub(crate) struct Front {
     pub(crate) ast: Ast,
     /// `None` until the first successful parse.
     pub(crate) env_hash: Option<u64>,
-    /// Hash of the Adt item name sequence (structs, enums, unions in
-    /// Ast order) at the last parse. `collect` numbers Adts in that
-    /// order, and cached outputs (`FnOut::types`, the glue set) carry
-    /// those session-local Adt ids: if the sequence changes, cached
-    /// output is not reusable and a full rebuild must clear it. A pure
-    /// field or layout edit keeps the sequence and may preserve it.
+    /// Hash of the Adt and static item name sequence (structs,
+    /// enums, unions, statics in Ast order) at the last parse.
+    /// `collect` numbers Adts and statics in that order, and cached
+    /// outputs (`FnOut::types`, the glue set, `lust_static_<n>`
+    /// names in emitted C) carry those session-local indices: if the
+    /// sequence changes, cached output is not reusable and a full
+    /// rebuild must clear it. A pure field or layout edit keeps the
+    /// sequence and may preserve it.
     pub(crate) adt_seq_fp: u64,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
@@ -113,14 +115,19 @@ pub(crate) struct Caches {
     /// targets), collected from the IR at codegen. A unit's used-slots
     /// hash (section 4.2) is computed over the union for its slots.
     pub(crate) slot_used: Vec<Vec<u32>>,
-    /// Per-slot instance fingerprint for unit keys: a hash of the slot's
-    /// generated C code, set exactly when its `FnOut` is. It must be
-    /// stable across sessions, so it cannot be the scan body hash:
-    /// `scan::hash_tok` hashes `Sym` ids, which follow interning order
-    /// and change across daemon restarts. The emitted code text is
-    /// stable (names and slot numbers, no session ids). Mono replaces
-    /// this with its IR fingerprint in wave B.
+    /// Per-slot instance fingerprint for unit keys: the IR
+    /// fingerprint of the slot's lowered body (`ir_cache`), set
+    /// exactly when its `FnOut` is. Stable across sessions and slot
+    /// assignments (stable def identities, structural types, relative
+    /// locations), so a unit's object key needs no C text: a slot
+    /// change rekeys through the used-slots hash and the C is
+    /// re-emitted from `slot_ir`.
     pub(crate) slot_fp: Vec<u64>,
+    /// The cached IR body per slot, in the translatable form of
+    /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
+    /// read when a slot renumber makes its C stale and the C must be
+    /// re-emitted without a front-end redo.
+    pub(crate) slot_ir: Vec<Option<super::ir_cache::CachedBody>>,
     pub(crate) glue: GlueSet,
     /// Fingerprint of the statics the last built glue unit was
     /// generated from (`graph::statics_fingerprint`). A build whose
@@ -214,6 +221,7 @@ impl Session {
                 slot_reads: Vec::new(),
                 slot_used: Vec::new(),
                 slot_fp: Vec::new(),
+                slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,
                 glue_stale: false,

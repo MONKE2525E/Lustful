@@ -23,6 +23,8 @@
 #   7. resolver-path incremental: body, type, import, and new-file
 #      edits in a multi-file crate recheck only the bodies whose
 #      recorded reads changed, with matching program output.
+#   8. slot compaction: renumbered survivors re-emit C from cached
+#      IR (reemitted counter) with correct output.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -292,6 +294,37 @@ def case_multi_incremental():
     d.kill()
 
 
+def case_compaction_reemit():
+    # 8. Slot compaction re-emits C from cached IR (section 4.2):
+    # delete most fns and edit a type in the same step (full mode,
+    # dead slots past the compaction threshold). Survivors renumber;
+    # their C re-emits from cached IR instead of rechecking, and the
+    # program still prints the right answer.
+    work = tempfile.mkdtemp(prefix="lust-driver-compact-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    fillers = [f"fn filler{i}() -> i64 {{ {i} }}" for i in range(100)]
+    head = "struct S { x: i64 }\nfn keep(a: i64) -> i64 { a + 1 }\n"
+    main = 'fn main() { let s = S { x: 40 }; println!("{}", keep(s.x) + keep(1)); }\n'
+    # Fillers first, so the survivors' slots actually move when the
+    # dead fillers compact away.
+    open(src, "w").write("\n".join(fillers) + "\n" + head + main)
+    d.start()
+    _, prog = d.build(src, out)
+    check("compaction cold output", prog.stdout.strip() == "43", prog.stdout)
+    # Full-mode edit: type change plus deleting 95 of 100 fillers.
+    keep = "\n".join(fillers[:5])
+    open(src, "w").write("struct S { x: i64, y: i64 }\nfn keep(a: i64) -> i64 { a + 1 }\n" + keep + "\n" +
+                         'fn main() { let s = S { x: 40, y: 1 }; println!("{}", keep(s.x) + keep(1) + s.y); }\n')
+    st = parse_stats(d.run(["check", src]).stderr)
+    check("compaction edit is full mode", st.get("mode") == "full", str(st))
+    st, prog = d.build(src, out)
+    check("compaction re-emits from cached IR", (st.get("reemitted") or 0) >= 1, str(st))
+    check("compaction output", prog.stdout.strip() == "44", prog.stdout)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -299,6 +332,7 @@ def main():
     case_reads_reuse()
     case_graph_refresh_and_std()
     case_multi_incremental()
+    case_compaction_reemit()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

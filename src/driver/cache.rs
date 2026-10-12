@@ -3,11 +3,13 @@
 //     An unchanged file with the same flags replays the stored response in a few
 //     milliseconds: about 4 ms for check and 8 ms for build on the dev box.
 //   - Per-C-unit objects (`unit-*`): a unit's compiled object keyed by compiler id,
-//     debug flag, the section 4.2 unit key (instance fingerprints + used-slots hash),
-//     and the emitted C text. The C text is a function of the unit-key inputs and is
-//     already generated, so folding it in refines the 4.2 key and stays sound while
-//     there is no cached mono IR to re-emit from. A restarted daemon reuses objects
-//     for every unit whose key held; only changed units go through tcc.
+//     debug flag, and the section 4.2 unit key (IR instance fingerprints + used-slots
+//     hash, plus the driver's glue and header-type fold). Keyed units do not key on
+//     C text: the text is a function of the IR and the used slots, so a slot change
+//     rekeys, misses, and re-emits C from cached IR with no front-end redo. Units
+//     with no instance key (main, runtime, glue; key 0) still fold their C text in.
+//     A restarted daemon reuses objects for every unit whose key held; only changed
+//     units go through tcc.
 //   - The slot manifest per final bin (`slots-*`): DiskDefId to slot, so a restarted
 //     daemon recovers the same slot assignment in any crate load order (8.4).
 //
@@ -207,13 +209,15 @@ impl Cache {
         self.dir.join(format!("req-{key}{ext}"))
     }
 
-    /// The disk key of one C unit's object: compiler id, debug flag, the
-    /// 4.2 unit key (0 when the caller has no instance key for the unit,
-    /// as for the runtime and main units), and the C text. See the
-    /// module docs for why the text is in the key.
+    /// The disk key of one C unit's object: compiler id, debug flag,
+    /// and the 4.2 unit key. A keyed unit (fn and table units) keys on
+    /// that alone: its C is a function of the key inputs. An unkeyed
+    /// unit (key 0: main, runtime, glue) has no instance identity, so
+    /// its C text stays in the key. See the module docs.
     fn unit_key(&self, unit: UnitKey, c_text: &str, debug: bool) -> String {
+        let text: &[u8] = if unit.0 == 0 { c_text.as_bytes() } else { b"unit-v2" };
         let (a, b) =
-            hash128(&[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), c_text.as_bytes()], 29);
+            hash128(&[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), text], 29);
         format!("{a:016x}{b:016x}")
     }
 
@@ -457,7 +461,15 @@ mod tests {
         let cache = Cache { dir: dir.clone(), id: (3, 4) };
         let base = cache.unit_key(UnitKey(9), "int f(void);", false);
         assert_ne!(base, cache.unit_key(UnitKey(10), "int f(void);", false), "unit key (used slots / instances)");
-        assert_ne!(base, cache.unit_key(UnitKey(9), "int g(void);", false), "C text");
+        // A keyed unit does not key on C text: the text is a function
+        // of the IR fingerprints and used slots in the unit key, so a
+        // slot change rekeys through the used-slots hash alone.
+        assert_eq!(base, cache.unit_key(UnitKey(9), "int g(void);", false), "keyed unit ignores C text");
+        assert_ne!(
+            cache.unit_key(UnitKey(0), "int f(void);", false),
+            cache.unit_key(UnitKey(0), "int g(void);", false),
+            "unkeyed unit still keys on C text"
+        );
         assert_ne!(base, cache.unit_key(UnitKey(9), "int f(void);", true), "debug flag");
         assert_ne!(base, Cache { dir: dir.clone(), id: (5, 4) }.unit_key(UnitKey(9), "int f(void);", false), "compiler id");
         let obj = dir.join("made.o");

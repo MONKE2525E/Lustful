@@ -3,6 +3,7 @@
 // public paths (`driver::Session`, `driver::compile`, `driver::cache::Cache`) stay
 // stable when items move between these files.
 mod ast_hash;
+mod ir_cache;
 pub mod buildscript;
 pub mod cache;
 mod compile;

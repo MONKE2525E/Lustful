@@ -287,7 +287,7 @@ fn def_crate_hash(p: &Program, def: DefId) -> u64 {
 }
 
 /// Hashes one def by its stable identity: crate hash, then def path hash.
-fn hash_def(h: &mut FxHasher, p: &Program, def: DefId) {
+pub(crate) fn hash_def_pub(h: &mut FxHasher, p: &Program, def: DefId) {
     def_crate_hash(p, def).hash(h);
     def.hash.0.hash(h);
 }
@@ -337,12 +337,12 @@ fn hash_args(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, args: ArgsId) {
 }
 
 fn hash_trait_ref(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, tr: &TraitRef) {
-    hash_def(h, p, tr.def);
+    hash_def_pub(h, p, tr.def);
     hash_args(h, p, tys, tr.args);
     let bindings = tys.bindings(tr.bindings);
     (bindings.len() as u64).hash(h);
     for (assoc, arg) in bindings {
-        hash_def(h, p, *assoc);
+        hash_def_pub(h, p, *assoc);
         match arg {
             GenericArg::Ty(t) => hash_ty(h, p, tys, *t),
             GenericArg::Lifetime(r) => hash_region(h, *r),
@@ -394,7 +394,7 @@ fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
         }
         TyKind::Adt(def, args) => {
             13u8.hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
             hash_args(h, p, tys, args);
         }
         TyKind::FnPtr(sig) => {
@@ -409,12 +409,12 @@ fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
         }
         TyKind::FnDef(def, args) => {
             15u8.hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
             hash_args(h, p, tys, args);
         }
         TyKind::Closure(def, args) => {
             16u8.hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
             hash_args(h, p, tys, args);
         }
         TyKind::Dyn(bounds, r) => {
@@ -437,13 +437,13 @@ fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
         }
         TyKind::Opaque(def, args) => {
             18u8.hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
             hash_args(h, p, tys, args);
         }
         TyKind::Param(i) => (19u8, i.0).hash(h),
         TyKind::Projection(assoc, args) => {
             20u8.hash(h);
-            hash_def(h, p, assoc.0);
+            hash_def_pub(h, p, assoc.0);
             hash_args(h, p, tys, args);
         }
         // A body-local inference variable has no stable content; signatures
@@ -519,14 +519,14 @@ fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId
 /// (field types, copy-ness, glue) without a separate recorded read for
 /// each one. `seen` is the cycle stack of Adt defs currently being
 /// folded (a recursive type folds its def hash only on the cycle).
-fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<DefId>) {
+pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<DefId>) {
     hash_ty(h, p, tys, t);
     let mut defs = Vec::new();
     collect_adt_defs(p, tys, t, &mut defs);
     for def in defs {
         if seen.contains(&def) {
             "layout-cycle".hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
             continue;
         }
         seen.push(def);
@@ -544,7 +544,7 @@ fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, seen:
 /// the compiler, never by a user edit.
 fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<DefId>) {
     "adt-layout-v1".hash(h);
-    hash_def(h, p, def);
+    hash_def_pub(h, p, def);
     let Some(a) = p.adt_by_def(def) else { return };
     let adt = p.adt(a);
     adt.is_enum.hash(h);
@@ -584,7 +584,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
 /// `hash_adt_layout`), so an edit that changes a type's methods or a
 /// field's visibility does not dirty layout readers, and a field edit
 /// dirties them even when no signature that names the type changed text.
-fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+pub(crate) fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
     "layout-v1".hash(&mut h);
     let mut seen = vec![def];
@@ -605,7 +605,7 @@ fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
     match res {
         BindingRes::Def(def) => {
             0u8.hash(&mut h);
-            hash_def(&mut h, p, def);
+            hash_def_pub(&mut h, p, def);
             sig_fingerprint(p, def).0.hash(&mut h);
         }
         BindingRes::Ambiguous => 1u8.hash(&mut h),
@@ -620,7 +620,7 @@ fn hash_head(h: &mut FxHasher, p: &Program, head: Head) {
     match head {
         Head::Adt(def) => {
             0u8.hash(h);
-            hash_def(h, p, def);
+            hash_def_pub(h, p, def);
         }
         Head::Int(i) => (1u8, i.name()).hash(h),
         Head::Float(f) => (2u8, f.name()).hash(h),
@@ -650,10 +650,10 @@ fn method_set_fingerprint(p: &Program, key: &MethodSetKey, set: &MethodSet) -> F
     "method-set-v3".hash(&mut h);
     (set.candidates.len() as u64).hash(&mut h);
     for c in &set.candidates {
-        hash_def(&mut h, p, c.def);
+        hash_def_pub(&mut h, p, c.def);
         sig_fingerprint(p, c.def).0.hash(&mut h);
         match c.trait_ {
-            Some(t) => hash_def(&mut h, p, t),
+            Some(t) => hash_def_pub(&mut h, p, t),
             None => 0u64.hash(&mut h),
         }
     }
@@ -678,7 +678,7 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
     defs.sort_unstable();
     let mut h = FxHasher::default();
     "impl-set-v2".hash(&mut h);
-    hash_def(&mut h, p, key.trait_);
+    hash_def_pub(&mut h, p, key.trait_);
     hash_head(&mut h, p, key.head);
     (defs.len() as u64).hash(&mut h);
     for d in defs {
@@ -752,7 +752,7 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
     "sig-v2".hash(&mut h);
-    hash_def(&mut h, p, def);
+    hash_def_pub(&mut h, p, def);
     let mut seen: Vec<DefId> = Vec::new();
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
         let f = p.fn_info(local);
@@ -1317,10 +1317,9 @@ const SLOT_MANIFEST_INSTANCE_MAGIC: &[u8; 4] = b"LSI1";
 /// instance fingerprints (sorted; membership, not order) plus its
 /// used-slots hash, never the whole manifest, so one new reachable
 /// instance reuses unrelated units' objects. The table unit alone keys
-/// on the full manifest hash. Today's driver also folds the emitted C
-/// text into its disk object key (the text is a function of these
-/// inputs and is already generated); mono will key on this alone when
-/// it can re-emit C from cached IR.
+/// on the full manifest hash. The driver keys disk objects on this
+/// alone for keyed units (plus its glue and header-type fold): C is
+/// re-emitted from cached IR when a used slot moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UnitKey(pub u64);
 
@@ -1338,11 +1337,14 @@ pub fn unit_key(instances: &[Fingerprint], used_slots: u64) -> UnitKey {
     UnitKey(h.finish())
 }
 
-/// The table unit's key: the full slot manifest hash. See `UnitKey`.
-pub fn table_unit_key(manifest: &SlotManifest) -> UnitKey {
+/// The table unit's key: the full slot manifest hash plus the table
+/// capacity and fn-unit count its C prints. See `UnitKey`.
+pub fn table_unit_key(manifest: &SlotManifest, table_cap: usize, fn_units: usize) -> UnitKey {
     let mut h = FxHasher::default();
-    "cunit-table-v1".hash(&mut h);
+    "cunit-table-v2".hash(&mut h);
     manifest.manifest_hash().hash(&mut h);
+    (table_cap as u64).hash(&mut h);
+    (fn_units as u64).hash(&mut h);
     UnitKey(h.finish())
 }
 
@@ -1881,11 +1883,11 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         let fps = [Fingerprint(100), Fingerprint(200)];
         let used_before = back.used_slots_hash(&[key(30), key(20)]).unwrap();
         let unit_before = unit_key(&fps, used_before);
-        let table_before = table_unit_key(&back);
+        let table_before = table_unit_key(&back, 128, 2);
         assert_eq!(back.assign(key(99)), 3);
         assert_eq!(back.used_slots_hash(&[key(30), key(20)]), Some(used_before), "used slots unchanged");
         assert_eq!(unit_key(&fps, used_before), unit_before, "unrelated unit object is reused");
-        assert_ne!(table_unit_key(&back), table_before, "only the table unit rebuilds");
+        assert_ne!(table_unit_key(&back, 128, 2), table_before, "only the table unit rebuilds");
         // A used-slot change (the same instance at a different slot, as a
         // compacting renumber would do) moves the unit key even with the
         // same instance fingerprints: C re-emit, no front-end redo.

@@ -102,13 +102,14 @@ struct Stats {
     unit_cache_hits: usize,
     table_rebuilt: bool,
     instances: usize,
+    reemitted: usize,
 }
 
 impl Stats {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-stats: mode={} fns={} rechecked={} reused={} invalidated={} c_bytes={} dirty_units={} units_compiled={} unit_cache_hits={} table_rebuilt={} instances={}",
+            "lust-stats: mode={} fns={} rechecked={} reused={} invalidated={} c_bytes={} dirty_units={} units_compiled={} unit_cache_hits={} table_rebuilt={} instances={} reemitted={}",
             self.mode,
             self.fns,
             self.rechecked,
@@ -120,6 +121,7 @@ impl Stats {
             self.unit_cache_hits,
             self.table_rebuilt as u8,
             self.instances,
+            self.reemitted,
         );
     }
 }
@@ -548,14 +550,26 @@ fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Resp
     r
 }
 
-/// The Adt name sequence hash of one Ast (see `Front::adt_seq_fp`).
+/// FxHash of one source file's current text in the map: the guard
+/// under which cached IR spans stay valid (`ir_cache::CachedBody`).
+fn file_text_hash(map: &SourceMap, file: FileId) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    std::hash::Hash::hash(map.text(file).unwrap_or(""), &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+/// The Adt and static name sequence hash of one Ast (see
+/// `Front::adt_seq_fp`): collect numbers Adts and statics in item
+/// order, and cached output carries those indices (CTy in glue and
+/// type sets, `lust_static_<n>` names in emitted C).
 fn adt_seq_fp(ast: &Ast) -> u64 {
     let mut h = crate::intern::FxHasher::default();
     for item in &ast.items {
         let name = match &item.kind {
-            ItemKind::Struct(s) => Some(s.name),
-            ItemKind::Enum(e) => Some(e.name),
-            ItemKind::Union(u) => Some(u.name),
+            ItemKind::Struct(s) => Some((0u8, s.name)),
+            ItemKind::Enum(e) => Some((1u8, e.name)),
+            ItemKind::Union(u) => Some((2u8, u.name)),
+            ItemKind::Static(s) => Some((3u8, s.name)),
             _ => None,
         };
         if let Some(n) = name {
@@ -614,8 +628,47 @@ fn slot_update(
     front.items = item_scans;
     let compact = front.slot_of.len() > fn_count * 2 + 64;
     // Full mode may keep the caches (and let the dirty walk pick the
-    // work set) only when slot numbers and Adt ids are both stable.
-    let full_walk = changed_names.is_none() && had_env && adt_seq_same && !compact;
+    // work set) only when Adt and static ids are stable. Slot
+    // compaction renumbers, but per-slot state remaps by stable
+    // identity below and C re-emits from cached IR in the tail, so
+    // it preserves too.
+    let full_walk = changed_names.is_none() && had_env && adt_seq_same;
+    // Per-slot state taken out for a compaction remap, keyed back in
+    // by stable identity after assignment.
+    struct SlotVecs {
+        ok: Vec<bool>,
+        out: Vec<FnOut>,
+        has_out: Vec<bool>,
+        reads: Vec<Option<crate::driver::graph::Reads>>,
+        used: Vec<Vec<u32>>,
+        fp: Vec<u64>,
+        ir: Vec<Option<super::ir_cache::CachedBody>>,
+        hash: Vec<u64>,
+        head: Vec<u64>,
+    }
+    let mut remap: Option<(FxMap<DiskDefId, u32>, SlotVecs)> = None;
+    if full_walk && compact {
+        let old = SlotVecs {
+            ok: std::mem::take(&mut caches.ok),
+            out: std::mem::take(&mut caches.out),
+            has_out: std::mem::take(&mut caches.has_out),
+            reads: std::mem::take(&mut caches.slot_reads),
+            used: std::mem::take(&mut caches.slot_used),
+            fp: std::mem::take(&mut caches.slot_fp),
+            ir: std::mem::take(&mut caches.slot_ir),
+            hash: std::mem::take(&mut front.slot_hash),
+            head: std::mem::take(&mut front.slot_head),
+        };
+        remap = Some((front.slot_of.clone(), old));
+        front.slot_of.clear();
+        front.slot_paths.clear();
+        front.slot_manifest_stored = 0;
+        // The base relinks under the new numbers; renumbered C is
+        // re-emitted from cached IR in the tail (or rechecked when no
+        // IR is cached), never reused as-is.
+        caches.objects = None;
+        caches.overlays.clear();
+    }
     if changed_names.is_none() && !full_walk {
         // Full rebuild: fresh caches, but slots stay append-only (section
         // 4.2): existing fns keep the slots the manifest gave them, a
@@ -635,6 +688,7 @@ fn slot_update(
         caches.slot_reads.clear();
         caches.slot_used.clear();
         caches.slot_fp.clear();
+        caches.slot_ir.clear();
         front.slot_hash.clear();
         front.slot_head.clear();
         caches.glue = GlueSet::default();
@@ -689,8 +743,30 @@ fn slot_update(
     caches.slot_reads.resize_with(n_slots, || None);
     caches.slot_used.resize_with(n_slots, Vec::new);
     caches.slot_fp.resize(n_slots, 0);
+    caches.slot_ir.resize_with(n_slots, || None);
     front.slot_hash.resize(n_slots, 0);
     front.slot_head.resize(n_slots, 0);
+    // Compaction remap: move each live fn's per-slot state from its
+    // old slot to its new one, by stable identity.
+    if let Some((old_map, mut old)) = remap {
+        for (i, k) in keys.iter().enumerate() {
+            let Some(&old_slot) = old_map.get(&k.disk) else { continue };
+            let old_slot = old_slot as usize;
+            let new_slot = front.fn_slot[i] as usize;
+            if old_slot >= old.ok.len() {
+                continue;
+            }
+            caches.ok[new_slot] = old.ok[old_slot];
+            caches.has_out[new_slot] = old.has_out[old_slot];
+            caches.out[new_slot] = std::mem::take(&mut old.out[old_slot]);
+            caches.slot_reads[new_slot] = old.reads[old_slot].take();
+            caches.slot_used[new_slot] = std::mem::take(&mut old.used[old_slot]);
+            caches.slot_fp[new_slot] = old.fp[old_slot];
+            caches.slot_ir[new_slot] = old.ir[old_slot].take();
+            front.slot_hash[new_slot] = old.hash[old_slot];
+            front.slot_head[new_slot] = old.head[old_slot];
+        }
+    }
     // Every fn's head hash at this parse (see `Front::slot_head`), and
     // whether it is a const fn (its body feeds const evaluation, so a
     // body edit can move values other items baked in).
@@ -713,6 +789,7 @@ fn slot_update(
         caches.slot_reads[slot] = None;
         caches.slot_used[slot].clear();
         caches.slot_fp[slot] = 0;
+        caches.slot_ir[slot] = None;
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
     // function's name (only possible in the "signatures" case). A function in the last
@@ -1617,6 +1694,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.out.resize_with(n_slots, FnOut::default);
         caches.slot_reads.resize_with(n_slots, || None);
         caches.slot_used.resize_with(n_slots, Vec::new);
+        caches.slot_fp.resize(n_slots, 0);
+        caches.slot_ir.resize_with(n_slots, || None);
         front.slot_hash.resize(n_slots, 0);
         for i in 0..program.fns.len() {
             if !matches!(
@@ -1690,9 +1769,54 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         t.lap("reads dirty walk");
     }
 
-    // Front end for the functions that need it. A build also needs IR for functions with no C yet.
+    // Slot-moved C re-emit (section 4.2): a reused fn whose own slot
+    // or a used slot moved since its C was emitted (a compaction
+    // renumber) re-emits C from its cached IR, with no recheck. The
+    // rebuilt body must reproduce the cached IR fingerprint, and its
+    // file text must stand (spans); anything else falls back to a
+    // recheck through the ordinary work set.
     let slot = |i: usize| front.fn_slot[i] as usize;
+    let mut reemit: Vec<(usize, ir::Body)> = Vec::new();
+    let mut reemit_failed: Vec<usize> = Vec::new();
+    if req.cmd == Cmd::Build && !program.gx.has_generics {
+        let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
+        for i in 0..program.fns.len() {
+            if changed.contains(&i) {
+                continue;
+            }
+            let s = slot(i);
+            if !caches.has_out[s] {
+                continue;
+            }
+            let Some(Some(cached)) = caches.slot_ir.get(s) else { continue };
+            let moved = cached.slot_at_gen != s as u32
+                || cached.used_at_gen.iter().any(|(disk, at_gen)| front.slot_of.get(disk) != Some(at_gen));
+            if !moved {
+                continue;
+            }
+            let file = program.fn_info(LocalDefId(i as u32)).def.name_span.file;
+            let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
+            let rebuilt = if fh == cached.file_hash {
+                super::ir_cache::rebuild(&program, cached, LocalDefId(i as u32))
+            } else {
+                None
+            };
+            match rebuilt {
+                Some(body) if super::ir_cache::ir_fingerprint(&program, &body, &map, scan_of(front, i).1) == cached.ir_fp => {
+                    reemit.push((i, body))
+                }
+                _ => reemit_failed.push(i),
+            }
+        }
+        if !reemit.is_empty() || !reemit_failed.is_empty() {
+            t.lap("ir re-emit rebuild");
+        }
+    }
+    let reemitted = reemit.len();
+
+    // Front end for the functions that need it. A build also needs IR for functions with no C yet.
     let mut work = changed.clone();
+    work.extend(reemit_failed.iter().copied());
     if req.cmd == Cmd::Build {
         work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
     }
@@ -1791,39 +1915,55 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         return resp;
     }
 
-    // Codegen for the work set.
-    let bodies: Vec<(usize, ir::Body)> = work.iter().copied().zip(results).filter_map(|(i, r)| r.0.map(|b| (i, b))).collect();
-    let outs = par_map(&bodies, |(i, b)| {
-        // An instance's lines and body span are its template's.
-        let scan_i = program.gx.instances.get(&LocalDefId(*i as u32)).and_then(|info| info.template_local).map_or(*i, |t| t.0 as usize);
-        let line_base = if scan_i < fn_count { scan_of(front, scan_i).1 } else { 0 };
-        cgen::gen_fn(&program, b, &map, line_base, &front.fn_slot)
-    });
+    // Codegen for the work set, plus any slot-moved re-emits rebuilt
+    // from cached IR above.
+    let mut bodies: Vec<(usize, ir::Body)> = work.iter().copied().zip(results).filter_map(|(i, r)| r.0.map(|b| (i, b))).collect();
+    bodies.extend(reemit);
+    // An instance's lines and body span are its template's.
+    let line_base_of = |front: &Front, i: usize| -> u32 {
+        let scan_i = program.gx.instances.get(&LocalDefId(i as u32)).and_then(|info| info.template_local).map_or(i, |t| t.0 as usize);
+        if scan_i < fn_count { scan_of(front, scan_i).1 } else { 0 }
+    };
+    let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot));
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
+    let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
     for ((i, body), out) in bodies.iter().zip(outs) {
-        // Stable instance fingerprint: hash the emitted code (see
-        // `Caches::slot_fp` for why not the scan body hash).
-        if let Some(fp) = caches.slot_fp.get_mut(slot(*i)) {
-            let mut h = crate::intern::FxHasher::default();
-            std::hash::Hash::hash(&out.code, &mut h);
-            *fp = std::hash::Hasher::finish(&h);
+        let s = slot(*i);
+        // Instance fingerprint: the lowered IR (see `Caches::slot_fp`),
+        // never the emitted C (which prints slot numbers; those ride
+        // in the used-slots hash instead).
+        let base_line = line_base_of(front, *i);
+        let fp = super::ir_cache::ir_fingerprint(&program, body, &map, base_line);
+        if let Some(x) = caches.slot_fp.get_mut(s) {
+            *x = fp;
         }
-        caches.out[slot(*i)] = out;
-        caches.has_out[slot(*i)] = true;
-        dirty_groups[slot(*i) / caches.per_unit] = true;
+        caches.out[s] = out;
+        caches.has_out[s] = true;
+        dirty_groups[s / caches.per_unit] = true;
         // The slots this fn's C references: itself (its register store)
-        // plus every `Fn` call target (printed as `lust_fns[slot]`).
-        // The unit's used-slots hash is built from these (section 4.2).
-        if let Some(used) = caches.slot_used.get_mut(slot(*i)) {
-            used.clear();
-            used.push(slot(*i) as u32);
-            for block in &body.blocks {
-                if let ir::Terminator::Call { target: ir::CallTarget::Fn(f), .. } = &block.term {
-                    used.push(front.fn_slot[f.0 as usize]);
-                }
+        // plus every direct call target and fn-pointer value (printed
+        // as `lust_fns[slot]` / `lust_tramps[slot]`). The unit's
+        // used-slots hash is built from these (section 4.2); the disk
+        // pairs are the next renumber's re-emit trigger.
+        let targets = super::ir_cache::used_disk_targets(&program, body);
+        let mut used_slots = vec![s as u32];
+        let mut used_pairs: Vec<(DiskDefId, u32)> = Vec::with_capacity(targets.len());
+        for d in &targets {
+            if let Some(l) = program.local_def(d.hash).filter(|l| program.disk_id(*l) == *d) {
+                let ts = front.fn_slot[l.0 as usize];
+                used_slots.push(ts);
+                used_pairs.push((*d, ts));
             }
+        }
+        if let Some(used) = caches.slot_used.get_mut(s) {
+            *used = used_slots;
+        }
+        let file = program.fn_info(LocalDefId(*i as u32)).def.name_span.file;
+        let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
+        if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
+            *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
         }
     }
     // Derived glue (Debug, Clone, Eq, Drop) is keyed by Adt id but
@@ -1981,18 +2121,80 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     // Per-unit object identity (section 4.2): each fn unit keys on its
-    // instances' fingerprints (today: stable per-fn C fingerprints, one
-    // instance per fn) plus its used-slots hash; the table unit keys on
-    // the full slot
-    // manifest. The disk object cache folds the C text in as well (see
-    // cache.rs), so a hit is exactly as sound as recompiling. Adding one
-    // reachable fn changes no unrelated unit's key: its object is copied
-    // from disk and tcc never sees it.
+    // instances' IR fingerprints (one instance per fn today) plus its
+    // used-slots hash; the table unit keys on the full slot manifest.
+    // The disk object cache keys on that alone for keyed units (see
+    // cache.rs): C text is a function of the IR and the used slots,
+    // so a hit is exactly as sound as recompiling, and a slot change
+    // misses and re-emits. Adding one reachable fn changes no
+    // unrelated unit's key: its object is copied from disk and tcc
+    // never sees it.
     let manifest = crate::driver::graph::SlotManifest::from_disk_slots(&front.slot_of);
+    // The stable hash of one C type for unit keys: Adts by def plus
+    // layout fingerprint (the unit header prints their definitions),
+    // everything else structural.
+    fn cty_fp(p: &collect::Program, c: &cgen::CTy) -> u64 {
+        fn inner(h: &mut crate::intern::FxHasher, p: &collect::Program, c: &cgen::CTy) {
+            use std::hash::Hash;
+            match c {
+                cgen::CTy::Unit => 0u8.hash(h),
+                cgen::CTy::Bool => 1u8.hash(h),
+                cgen::CTy::Char => 2u8.hash(h),
+                cgen::CTy::Int(i) => (3u8, i.name()).hash(h),
+                cgen::CTy::Str => 4u8.hash(h),
+                cgen::CTy::String => 5u8.hash(h),
+                cgen::CTy::Vec(x) => {
+                    6u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Option(x) => {
+                    7u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Ref(x) => {
+                    8u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Adt(a) => {
+                    9u8.hash(h);
+                    crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
+                }
+                cgen::CTy::Args => 10u8.hash(h),
+                cgen::CTy::Chars => 11u8.hash(h),
+                cgen::CTy::Tuple(ts) => {
+                    12u8.hash(h);
+                    (ts.len() as u64).hash(h);
+                    for t in ts {
+                        inner(h, p, t);
+                    }
+                }
+                cgen::CTy::Array(x, n) => {
+                    (13u8, n).hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Slice(x) => {
+                    14u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Float(f) => (15u8, f.name()).hash(h),
+                cgen::CTy::FnPtr(inputs, out) => {
+                    16u8.hash(h);
+                    (inputs.len() as u64).hash(h);
+                    for t in inputs {
+                        inner(h, p, t);
+                    }
+                    inner(h, p, out);
+                }
+            }
+        }
+        let mut h = crate::intern::FxHasher::default();
+        inner(&mut h, p, c);
+        std::hash::Hasher::finish(&h)
+    }
     let unit_key_of = |u: usize| -> crate::driver::graph::UnitKey {
         use crate::driver::graph::{Fingerprint, used_slots_hash};
         match u {
-            3 => crate::driver::graph::table_unit_key(&manifest),
+            3 => crate::driver::graph::table_unit_key(&manifest, caches.table_cap, fn_units.len()),
             g if g >= FIRST_FN_UNIT => {
                 let range = &groups[g - FIRST_FN_UNIT];
                 let instances: Vec<Fingerprint> =
@@ -2007,7 +2209,34 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         }
                     }
                 }
-                crate::driver::graph::unit_key(&instances, used_slots_hash(&pairs))
+                let base = crate::driver::graph::unit_key(&instances, used_slots_hash(&pairs));
+                // Glue placement and header types are unit C inputs
+                // the instance fingerprints do not cover: which glue
+                // this unit carries statically (versus the shared
+                // glue unit), and the layouts of the C types its
+                // header declares. Fold both into the key.
+                let mut extra: Vec<(u64, u64, bool)> = Vec::new();
+                for s in range.clone() {
+                    let Some(out) = caches.out.get(s) else { continue };
+                    for (g, c) in &out.glue {
+                        let shared = caches.glue.shared.as_ref().is_none_or(|set| set.contains(&(g.clone(), c.clone())));
+                        let mut gh = crate::intern::FxHasher::default();
+                        std::hash::Hash::hash(&std::mem::discriminant(g), &mut gh);
+                        extra.push((std::hash::Hasher::finish(&gh), cty_fp(&program, c), shared));
+                    }
+                    for c in &out.types {
+                        extra.push((u64::MAX, cty_fp(&program, c), false));
+                    }
+                }
+                extra.sort_unstable();
+                extra.dedup();
+                let mut h = crate::intern::FxHasher::default();
+                std::hash::Hash::hash(&"cunit-glue-v1", &mut h);
+                std::hash::Hash::hash(&base.0, &mut h);
+                for e in extra {
+                    std::hash::Hash::hash(&e, &mut h);
+                }
+                crate::driver::graph::UnitKey(std::hash::Hasher::finish(&h))
             }
             _ => crate::driver::graph::UnitKey(0),
         }
@@ -2091,6 +2320,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             unit_cache_hits: unit_hits,
             table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
             instances: front.fn_slot.len(),
+            reemitted,
         }
         .render(&mut resp.stderr);
     }
