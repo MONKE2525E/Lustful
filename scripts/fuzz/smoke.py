@@ -317,6 +317,33 @@ fn grown() -> i64 { 1 }
               rc1 == 0 and rc2 == 1 and rcw == 1 and r.returncode == 1
               and "L0101" in errw and errw == r.stderr,
               f"rc1={rc1} rc2={rc2} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+
+        # 11. Regression (fuzz realish seed 107, iter 585): resolver routing
+        # must not stay sticky after the trigger item is deleted. Step 1
+        # routes to the resolver (a `static` item) and fails with the
+        # struct syntax error. Step 2 deletes the static and breaks a
+        # macro name. A fresh session compiles step 2 through the chunk
+        # front end and reports the unknown macro (L0802) first; the
+        # sticky warm session kept the resolver front end and reported
+        # the syntax error. Both sides must answer the same, byte for byte.
+        rt = os.path.join(work, "route.rs")
+        open(rt, "w").write('static S: i64 = 1;\nstruct P {\n    fn f() {}\n}\nfn main() { println!("{}", format!("{}", S)); }\n')
+        rc1, _, _ = run_lust(["check", rt])
+        open(rt, "w").write('struct P {\n    fn f() {}\n}\nfn main() { println!("{}", xformat!("{}", 1)); }\n')
+        rcw, _, errw = run_lust(["check", rt])
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        r = subprocess.run([LUST, "check", rt], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("resolver routing unsticks when the trigger goes (realish seed 107 iter 585)",
+              rc1 == 1 and rcw == 1 and r.returncode == 1
+              and "L0802" in errw and errw == r.stderr,
+              f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+        # The route fall-back drops resolver-built session state; the
+        # session must still build and run the fixed program after it.
+        open(rt, "w").write('fn main() { println!("route {}", 40 + 2); }\n')
+        rc, out, err = run_lust(["run", rt, "-o", os.path.join(work, "rt.bin")])
+        check("session builds after the route fall-back",
+              rc == 0 and out == "route 42\n", f"rc={rc} out={out!r} err={err!r}")
     finally:
         daemon.terminate()
         log.close()
