@@ -3875,7 +3875,11 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     collect_closures(p, errs);
     add_synthetic_impls(p);
     let is_local = |d: DefId| d.krate == p.krate;
-    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &is_local);
+    let lang = p.gx.lang;
+    let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];
+    // No fundamental Adts exist yet (`Box` and `Pin` are not
+    // supported types); the reference wrappers are structural.
+    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &by_construction, &is_local);
     for (_, later) in pairs {
         let rec = p.gx.index.get(later);
         let trait_name = p.gx.index.trait_record(rec.trait_def).map_or("?", |r| p.name(r.name));
@@ -3897,7 +3901,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
                 else {
                     continue;
                 };
-                if p.gx.index.inherent_pair_overlaps(&mut p.tys, pat_a, &gen_a, pat_b, &gen_b, &[], &is_local) {
+                if p.gx.index.inherent_pair_overlaps(&mut p.tys, pat_a, &gen_a, pat_b, &gen_b, &[], &by_construction, &is_local) {
                     inherent_dups.push(b);
                 }
             }
