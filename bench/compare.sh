@@ -33,6 +33,9 @@ reps=${REPS:-3}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/samples"
+# lust must compile cold in this script: no daemon autostart, no disk cache.
+# (Warm numbers live in bench/realish/agent_loop.py and bench/run.py.)
+export LUST_NO_DAEMON=1 LUST_NO_CACHE=1 LUST_DAEMON_SOCKET="$work/no-daemon.sock"
 base_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
 
 # now_ns: nanoseconds since epoch. GNU date has %N; BSD date (macOS) does not,

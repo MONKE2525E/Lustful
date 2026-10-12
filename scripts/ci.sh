@@ -34,6 +34,11 @@ cargo build --release
 step "difftest"
 scripts/difftest.sh
 
+if [ -e scripts/test-client.sh ]; then
+  step "client tests"
+  scripts/test-client.sh
+fi
+
 if [ "${CI_SANITIZE:-1}" = 1 ]; then
   step "difftest (sanitize)"
   SANITIZE=1 scripts/difftest.sh

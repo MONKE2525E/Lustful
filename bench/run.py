@@ -6,8 +6,8 @@ Rows:
   - fresh cold check/build on bench/real, the 31k warehouse crate, the 48k
     generated crate (lust in a fresh process with no daemon; rustc gets the
     best median of {default, -Z threads=8}, debuginfo=0 for both sides)
-  - cached cold check/build on the same corpora (rustc with a primed
-    incremental cache and no source change; lust as a second cold process)
+  - cached cold check/build on the same corpora (new process, no edit since
+    a priming compile: rustc incremental cache vs lust disk cache)
   - warm edit loop: bench/realish/agent_loop.py totals (lust daemon vs
     rustc incremental, 12 edits on the 31k crate)
   - 8-core row: fresh cold build of the 48k crate under `taskset -c 0-7`
@@ -89,8 +89,16 @@ def lust_cmd(kind, src, out):
 
 
 def cold_env(work):
-    # Point the client at a socket that never exists: it must compile cold.
-    return dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "no-daemon.sock"))
+    # A truly cold lust compile: socket that never exists, daemon autostart
+    # off, whole-request disk cache off.
+    return dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "no-daemon.sock"),
+                LUST_NO_DAEMON="1", LUST_NO_CACHE="1")
+
+
+def disk_cache_env(cache_dir):
+    # Cold process, daemon off, but the on-disk request cache is on and kept
+    # in cache_dir: the lust counterpart of a primed rustc incremental cache.
+    return dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=cache_dir)
 
 
 class Suite:
@@ -151,20 +159,22 @@ class Suite:
         self.row(label, corpus, lines, op, best, got[f"rustc:{best}"], got["lust"])
 
     def cached_cold(self, label, corpus, src, lines, op):
-        """Cached cold: rustc incremental cache primed (untimed), no edit since.
-        lust: a second cold process (its cache is the OS page cache)."""
+        """Cached cold: new process, no edit since a priming compile.
+        rustc uses its primed incremental cache; lust uses its primed
+        whole-request disk cache (daemon off in both cases)."""
         inc = os.path.join(self.work, f"inc-{corpus}-{op}")
         out_r = os.path.join(self.work, f"{corpus}-{op}-inc")
         cmd, env = rustc_cmd("threads8", op, src, out_r, inc_dir=inc)
         r = subprocess.run(cmd, cwd=self.work, env=env, capture_output=True, text=True)
         assert r.returncode == 0, f"{corpus}: rustc prime failed\n{r.stderr[:2000]}"
-        jobs = [
-            ("rustc:inc", cmd, env),
-            ("lust", lust_cmd(op, src, os.path.join(self.work, f"{corpus}-{op}-lust2")), cold_env(self.work)),
-        ]
+        lcmd = lust_cmd(op, src, os.path.join(self.work, f"{corpus}-{op}-lust2"))
+        lenv = disk_cache_env(os.path.join(self.work, f"lustcache-{corpus}-{op}"))
+        r = subprocess.run(lcmd, cwd=self.work, env=lenv, capture_output=True, text=True)
+        assert r.returncode == 0, f"{corpus}: lust prime failed\n{r.stderr[:2000]}"
+        jobs = [("rustc:inc", cmd, env), ("lust", lcmd, lenv)]
         got = interleave(jobs, self.reps, self.work)
         self.row(label, corpus, lines, op, "threads8+inc", got["rustc:inc"], got["lust"],
-                 notes="rustc cache primed, no edit; lust repeat cold process")
+                 notes="caches primed, no edit; new process, daemon off")
 
 
 def gen_file(args):
