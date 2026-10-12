@@ -23,11 +23,11 @@ pub(crate) struct AstScans {
     pub bodies: Vec<(u64, Vec<Sym>)>,
 }
 
-/// Scans one merged Ast. See the module docs.
+/// Scans one merged Ast. Item and body hashing are read-only walks,
+/// so they run in parallel across items (one pass produces each
+/// item's scan and its fns' body scans). See the module docs.
 pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
-    let mut items = Vec::with_capacity(ast.items.len());
-    let mut bodies = Vec::new();
-    for item in &ast.items {
+    let per_item = super::compile::par_map(&ast.items, |item| {
         let mut w = Walker { ast, idents: None };
         let mut h = FxHasher::default();
         w.item(&mut h, item, false);
@@ -35,16 +35,19 @@ pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
             ItemKind::Fn(f) => Some(f.name),
             _ => None,
         };
-        items.push(scan::ItemScan { hash: h.finish(), fn_name });
-        match &item.kind {
-            ItemKind::Fn(f) => bodies.push(body_scan(ast, f)),
-            ItemKind::Impl(imp) => {
-                for f in &imp.fns {
-                    bodies.push(body_scan(ast, f));
-                }
-            }
-            _ => {}
-        }
+        let scan = scan::ItemScan { hash: h.finish(), fn_name };
+        let bodies: Vec<(u64, Vec<Sym>)> = match &item.kind {
+            ItemKind::Fn(f) => vec![body_scan(ast, f)],
+            ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f)).collect(),
+            _ => Vec::new(),
+        };
+        (scan, bodies)
+    });
+    let mut items = Vec::with_capacity(per_item.len());
+    let mut bodies = Vec::new();
+    for (scan, bs) in per_item {
+        items.push(scan);
+        bodies.extend(bs);
     }
     AstScans { items, bodies }
 }

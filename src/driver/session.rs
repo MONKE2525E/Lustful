@@ -77,6 +77,10 @@ pub(crate) struct Front {
     /// compile, handed from `resolved_setup` to the shared tail for one
     /// request (taken there, so it never outlives its request).
     pub(crate) resolved_crate_ids: Option<CrateIds>,
+    /// Per-file resolver front-end cache (raw and expanded token
+    /// streams plus outlines), kept across requests in this crate
+    /// session. Unused until the session first takes the resolver path.
+    pub(crate) resolve_cache: crate::resolve::worklist::ResolveCache,
 }
 
 pub(crate) struct Chunk {
@@ -186,6 +190,7 @@ impl Session {
                 split_mask: None,
                 resolved_crate: false,
                 resolved_crate_ids: None,
+                resolve_cache: crate::resolve::worklist::ResolveCache::new(),
             },
             caches: Caches {
                 ok: Vec::new(),

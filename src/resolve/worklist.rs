@@ -290,8 +290,183 @@ fn make_map(seen: &[(PathBuf, String, FileId)]) -> (SourceMap, String) {
     (map, all)
 }
 
+/// Per-file front-end cache for one crate session (W-DRIVER phase 2):
+/// the raw and expanded token streams and the outline of every file
+/// whose text is unchanged since the last request. An edit to one
+/// file re-lexes and re-expands only that file; parsing still reruns
+/// per file (the Ast is not cloneable today), in parallel across
+/// files, and the path rewrite pass runs in parallel too. Entries key
+/// on canonical path plus module (the same file can serve two
+/// modules) and carry the `FileId` their spans were lexed with: a
+/// file set change that renumbers files misses cleanly instead of
+/// reusing spans that name the wrong file. The cfg environment
+/// fingerprints the whole cache: expansion answers depend on it.
+/// Decided with W-RESOLVE through the `iface:` commit that added
+/// `resolve_crate_cached`.
+#[derive(Default)]
+pub struct ResolveCache {
+    env_fp: u64,
+    files: FxMap<String, CachedFile>,
+}
+
+struct CachedFile {
+    text_hash: u64,
+    file_id: FileId,
+    /// The raw (unexpanded) token stream. Discovery outlines it and
+    /// reads cfg strings from it; the parse phase starts from it.
+    raw: Option<lexer::Lexed>,
+    /// The outline scanned from `raw`.
+    outline: Option<scan::Outline>,
+    /// The expanded token stream the parser consumes (cfg-name
+    /// checking and expansion already applied to `raw`).
+    expanded: Option<lexer::Lexed>,
+}
+
+/// True when a file's expansion can read data outside its own text
+/// (`env!`, the `include!` family): its expanded stream must never be
+/// cached across requests, because the outside data can change while
+/// the text stands. The raw stream is only lexing and stays cacheable.
+fn reads_outside(text: &str) -> bool {
+    const NEEDLES: &[&str] = &["env!", "option_env!", "include!", "include_str!", "include_bytes!"];
+    NEEDLES.iter().any(|n| text.contains(n))
+}
+
+/// Clones a lexed token stream (tokens are `Copy`; the string table
+/// clones its strings).
+fn clone_lexed(l: &lexer::Lexed) -> lexer::Lexed {
+    lexer::Lexed { tokens: l.tokens.clone(), strings: l.strings.clone() }
+}
+
+/// The cfg-environment fingerprint a cache's entries were built under.
+fn env_fingerprint(input: &CrateInput) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    "resolve-cache-env-v1".hash(&mut h);
+    for f in &input.env.flags {
+        f.hash(&mut h);
+    }
+    for (n, v) in &input.env.pairs {
+        n.hash(&mut h);
+        v.hash(&mut h);
+    }
+    for f in &input.env.features {
+        f.hash(&mut h);
+    }
+    for n in &input.env.custom_names {
+        n.hash(&mut h);
+    }
+    input.env.allow_lust_dev.hash(&mut h);
+    input.crate_ids.stable.0.hash(&mut h);
+    h.finish()
+}
+
+impl ResolveCache {
+    /// An empty cache.
+    pub fn new() -> ResolveCache {
+        ResolveCache::default()
+    }
+
+    /// Drops every entry when the cfg environment changed.
+    fn begin(&mut self, input: &CrateInput) {
+        let fp = env_fingerprint(input);
+        if self.env_fp != fp {
+            self.env_fp = fp;
+            self.files.clear();
+        }
+    }
+
+    fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
+        let e = self.files.entry(key.to_string()).or_insert_with(|| CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None });
+        if e.text_hash != text_hash || e.file_id != file_id {
+            *e = CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None };
+        }
+        e
+    }
+
+    /// The cached raw token stream for one file, cloned out, when
+    /// its text and file id stand.
+    fn raw(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
+        self.entry(key, text_hash, file_id).raw.as_ref().map(clone_lexed)
+    }
+
+    fn put_raw(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
+        self.entry(key, text_hash, file_id).raw = Some(clone_lexed(lexed));
+    }
+
+    /// The cached outline for one file, when its text and file id stand.
+    fn outline(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<scan::Outline> {
+        self.entry(key, text_hash, file_id).outline.clone()
+    }
+
+    fn put_outline(&mut self, key: &str, text_hash: u64, file_id: FileId, outline: scan::Outline) {
+        self.entry(key, text_hash, file_id).outline = Some(outline);
+    }
+
+    /// The cached expanded token stream for one file, cloned out.
+    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
+        self.entry(key, text_hash, file_id).expanded.as_ref().map(clone_lexed)
+    }
+
+    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
+        self.entry(key, text_hash, file_id).expanded = Some(clone_lexed(lexed));
+    }
+}
+
+/// Runs `f` for each item on all cores, results in input order. The
+/// worklist's own copy of the driver's batching rule (small batches
+/// over one atomic counter), kept here so resolve does not depend on
+/// the driver's private helpers.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let n = std::env::var("LUST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores).min(items.len().max(1));
+    if n <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let batch = (items.len() / (n * 8)).clamp(1, 16);
+    let chunks: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let start = next.fetch_add(batch, Ordering::Relaxed);
+                        if start >= items.len() {
+                            break;
+                        }
+                        let end = (start + batch).min(items.len());
+                        out.extend(items[start..end].iter().enumerate().map(|(k, item)| (start + k, f(item))));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut all: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    for chunk in chunks {
+        for (i, r) in chunk {
+            all[i] = Some(r);
+        }
+    }
+    all.into_iter().map(|r| r.unwrap()).collect()
+}
+
 /// Runs the outline worklist for one crate. See the file header.
 pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> Result<ResolvedCrate, ResolveError> {
+    resolve_crate_cached(input, interner, known, &mut ResolveCache::new())
+}
+
+/// `resolve_crate` with a caller-kept per-file cache (the daemon's
+/// crate session holds one across requests). See `ResolveCache`.
+pub fn resolve_crate_cached(
+    input: &CrateInput,
+    interner: &Interner,
+    known: &Known,
+    cache: &mut ResolveCache,
+) -> Result<ResolvedCrate, ResolveError> {
+    cache.begin(input);
     let crate_sym = interner.intern(&input.crate_name);
     let mut tables = ResolvedTables::new(crate_sym);
     // The extern prelude: std, core, alloc, then the direct dependencies.
@@ -316,7 +491,8 @@ pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> 
     let mut next_file = 0u32;
     while let Some((path, text, module, is_root)) = queue.pop() {
         let canon = modules::canonical_string(&path);
-        let file_id = *file_ids.entry(format!("{}#{}", canon, module.0)).or_insert_with(|| {
+        let file_key = format!("{}#{}", canon, module.0);
+        let file_id = *file_ids.entry(file_key.clone()).or_insert_with(|| {
             let id = FileId(next_file);
             next_file += 1;
             id
@@ -325,15 +501,31 @@ pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> 
         if !seen.iter().any(|(_, _, f)| *f == file_id) {
             seen.push((path.clone(), text.clone(), file_id));
         }
-        let lexed = match lexer::lex(&text, file_id, 0, interner) {
-            Ok(l) => l,
-            Err(d) => {
-                diags.push(d);
-                files.push((path, text, module));
-                continue;
+        // Raw tokens from the per-file cache when the text stands:
+        // an unchanged file is not lexed again for discovery.
+        let text_hash = hash_str(&text);
+        let lexed = match cache.raw(&file_key, text_hash, file_id) {
+            Some(l) => l,
+            None => match lexer::lex(&text, file_id, 0, interner) {
+                Ok(l) => {
+                    cache.put_raw(&file_key, text_hash, file_id, &l);
+                    l
+                }
+                Err(d) => {
+                    diags.push(d);
+                    files.push((path, text, module));
+                    continue;
+                }
+            },
+        };
+        let outline = match cache.outline(&file_key, text_hash, file_id) {
+            Some(o) => o,
+            None => {
+                let o = scan::outline(&lexed, interner);
+                cache.put_outline(&file_key, text_hash, file_id, o.clone());
+                o
             }
         };
-        let outline = scan::outline(&lexed, interner);
         // Inline module skeleton, keyed by name path from this file's module.
         let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
         inline_modules.insert(Vec::new(), module);
@@ -422,35 +614,85 @@ pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> 
     // The source map, in FileId order, with every file's text.
     files.sort_by_key(|(p, _, m)| file_ids[&format!("{}#{}", modules::canonical_string(p), m.0)].0);
     let (map, all_text) = make_map(&seen);
-    let mut works: Vec<FileWork> = Vec::new();
-    for (path, text, module) in files {
-        let canon = modules::canonical_string(&path);
-        let file_id = file_ids[&format!("{canon}#{}", module.0)];
-        let lexed = match lexer::lex(&text, file_id, 0, interner) {
-            Ok(l) => l,
-            Err(d) => return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] }),
+    // Lex, expand, and parse every file, in parallel. Token streams
+    // come from the per-file cache when the text stands: an expanded
+    // hit goes straight to the parser, a raw hit skips only the lex.
+    // Cache reads happen before the parallel phase and writes after
+    // it, so the cache itself needs no locking. The first error in
+    // file order is the answer, as in the serial form.
+    struct FileJob {
+        path: PathBuf,
+        text: String,
+        module: ModuleId,
+        file_id: FileId,
+        key: String,
+        text_hash: u64,
+        raw: Option<lexer::Lexed>,
+        expanded: Option<lexer::Lexed>,
+    }
+    let jobs: Vec<FileJob> = files
+        .into_iter()
+        .map(|(path, text, module)| {
+            let canon = modules::canonical_string(&path);
+            let key = format!("{canon}#{}", module.0);
+            let file_id = file_ids[&key];
+            let text_hash = hash_str(&text);
+            let expanded = if reads_outside(&text) { None } else { cache.expanded(&key, text_hash, file_id) };
+            let raw = if expanded.is_some() { None } else { cache.raw(&key, text_hash, file_id) };
+            FileJob { path, text, module, file_id, key, text_hash, raw, expanded }
+        })
+        .collect();
+    // (work, raw to store, expanded to store) per file.
+    let parsed = par_map(&jobs, |job| -> Result<(FileWork, Option<lexer::Lexed>, Option<lexer::Lexed>), Diag> {
+        let (lexed, store_raw, store_expanded) = match &job.expanded {
+            Some(l) => (clone_lexed(l), None, None),
+            None => {
+                let (raw, store_raw) = match &job.raw {
+                    Some(l) => (clone_lexed(l), None),
+                    None => {
+                        let raw = lexer::lex(&job.text, job.file_id, 0, interner)?;
+                        let store = clone_lexed(&raw);
+                        (raw, Some(store))
+                    }
+                };
+                check_cfg_names(&raw, &input.env, interner)?;
+                // Expansion (6.1 step 4), per file at lex time, with
+                // the crate cfg environment as expander facts.
+                let ects = crate::expand::ExpandCtx {
+                    interner,
+                    known,
+                    file_path: job.path.to_string_lossy().to_string(),
+                    src: &job.text,
+                    cfg: expand_cfg(&input.env),
+                };
+                let lexed = crate::expand::expand_lexed(raw, &ects)?;
+                let store = clone_lexed(&lexed);
+                (lexed, store_raw, Some(store))
+            }
         };
-        if let Err(d) = check_cfg_names(&lexed, &input.env, interner) {
-            return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] });
+        let ast = parser::parse(&lexed, interner, known)?;
+        Ok((
+            FileWork { path: job.path.clone(), text: job.text.clone(), file_id: job.file_id, ast, module: job.module },
+            store_raw,
+            store_expanded,
+        ))
+    });
+    let mut works: Vec<FileWork> = Vec::with_capacity(jobs.len());
+    for (job, r) in jobs.iter().zip(parsed) {
+        match r {
+            Ok((w, store_raw, store_expanded)) => {
+                if let Some(l) = &store_raw {
+                    cache.put_raw(&job.key, job.text_hash, job.file_id, l);
+                }
+                if let Some(l) = &store_expanded
+                    && !reads_outside(&job.text)
+                {
+                    cache.put_expanded(&job.key, job.text_hash, job.file_id, l);
+                }
+                works.push(w);
+            }
+            Err(d) => return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] }),
         }
-        // Expansion (6.1 step 4), per file at lex time, with the crate
-        // cfg environment as expander facts.
-        let ects = crate::expand::ExpandCtx {
-            interner,
-            known,
-            file_path: path.to_string_lossy().to_string(),
-            src: &text,
-            cfg: expand_cfg(&input.env),
-        };
-        let lexed = match crate::expand::expand_lexed(lexed, &ects) {
-            Ok(l) => l,
-            Err(d) => return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] }),
-        };
-        let ast = match parser::parse(&lexed, interner, known) {
-            Ok(a) => a,
-            Err(d) => return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: vec![d] }),
-        };
-        works.push(FileWork { path, text, file_id, ast, module });
     }
     // The module of every item list, by (file, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
@@ -502,14 +744,43 @@ pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> 
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, &mut tables);
     }
 
-    // ---- Rewrite paths to flat names, checking visibility.
-    let mut rw = Rewrite { tables: &tables, interner, list_module, diags: Vec::new() };
-    for (fi, w) in works.iter_mut().enumerate() {
-        let module = w.module;
-        rw.file_items(&mut w.ast, fi, module, &[]);
-    }
-    if !rw.diags.is_empty() {
-        return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: rw.diags });
+    // ---- Rewrite paths to flat names, checking visibility. The
+    // tables are frozen at this point and each file's Ast is its own,
+    // so the pass runs in parallel across files; diagnostics merge
+    // back in file order.
+    let rw_diags = {
+        fn rewrite_chunk(
+            works: &mut [FileWork],
+            base: usize,
+            depth: u32,
+            tables: &ResolvedTables,
+            interner: &Interner,
+            list_module: &FxMap<ItemListKey, ModuleId>,
+        ) -> Vec<Diag> {
+            if works.len() <= 1 || depth == 0 {
+                let mut rw = Rewrite { tables, interner, list_module, diags: Vec::new() };
+                for (i, w) in works.iter_mut().enumerate() {
+                    let module = w.module;
+                    rw.file_items(&mut w.ast, base + i, module, &[]);
+                }
+                return rw.diags;
+            }
+            let mid = works.len() / 2;
+            let (left, right) = works.split_at_mut(mid);
+            std::thread::scope(|s| {
+                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module));
+                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module);
+                let mut diags = handle.join().unwrap();
+                diags.append(&mut right_diags);
+                diags
+            })
+        }
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let depth = (usize::BITS - cores.leading_zeros()).min(5);
+        rewrite_chunk(&mut works, 0, depth, &tables, interner, list_module)
+    };
+    if !rw_diags.is_empty() {
+        return Err(ResolveError { map: map.clone(), all_text: all_text.clone(), needs_std, diags: rw_diags });
     }
 
     // ---- Flatten: inline module bodies splice into top-level items;
@@ -1904,6 +2175,46 @@ mod tests {
         let interner: &'static Interner = Box::leak(Box::new(interner));
         let known: &'static Known = Box::leak(Box::new(known));
         resolve_crate(&input, interner, known)
+    }
+
+    /// The per-file cache is transparent: a second resolve with the
+    /// same cache (one shared interner, as in a daemon session) gives
+    /// the same crate, an edit to one file is seen, and deleting a
+    /// module file still errors instead of serving the cached stream.
+    #[test]
+    fn resolve_cache_is_transparent() {
+        let dir = std::env::temp_dir().join(format!("lust-worklist-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "mod a;\nmod b;\nfn main() { println!(\"{}\", a::v() + b::v()); }").unwrap();
+        std::fs::write(dir.join("a.rs"), "pub fn v() -> i64 { 1 }").unwrap();
+        std::fs::write(dir.join("b.rs"), "pub fn v() -> i64 { 2 }").unwrap();
+        let interner: &'static Interner = Box::leak(Box::new(Interner::default()));
+        let known: &'static Known = Box::leak(Box::new(Known::new(interner)));
+        let input = |dir: &std::path::Path| CrateInput {
+            root_path: dir.join("main.rs"),
+            root_text: std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:cachetest", "bin", "cachetest", false) },
+            crate_name: "cachetest".into(),
+            externs: Vec::new(),
+        };
+        let mut cache = ResolveCache::new();
+        let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");
+        let second = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("cached resolves");
+        assert_eq!(first.fn_lines, second.fn_lines);
+        assert_eq!(first.body_hashes, second.body_hashes);
+        assert_eq!(first.structure_hash, second.structure_hash);
+        assert_eq!(first.ast.items.len(), second.ast.items.len());
+        // An edit to one file changes exactly its body hash.
+        std::fs::write(dir.join("b.rs"), "pub fn v() -> i64 { 3 }").unwrap();
+        let third = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("edited resolves");
+        let changed: Vec<usize> = (0..first.body_hashes.len()).filter(|&i| first.body_hashes[i] != third.body_hashes[i]).collect();
+        assert_eq!(changed.len(), 1, "only the edited file's fn rehashes");
+        // A deleted module file is an error, never a cached stream.
+        std::fs::remove_file(dir.join("b.rs")).unwrap();
+        assert!(resolve_crate_cached(&input(&dir), interner, known, &mut cache).is_err(), "missing file errors");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The same file in two crates gets two DefIds (section 1.2): AST

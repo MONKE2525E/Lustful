@@ -962,7 +962,7 @@ fn resolved_setup(
             crate_name: crate_name.clone(),
             externs: externs.clone(),
         };
-        match worklist::resolve_crate(&input, &front.interner, &front.known) {
+        match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {
                 if r.needs_std && !spliced {
                     let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
