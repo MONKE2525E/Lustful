@@ -220,7 +220,7 @@ pub fn rep_tail(trees: &[Tt], i: usize, allow_dollar_sep: bool) -> Option<(Optio
 fn follow_ok(kind: FragKind, tok: Tok) -> bool {
     use Tok::*;
     match kind {
-        FragKind::Expr | FragKind::Stmt => matches!(tok, FatArrow | Comma | Semi),
+        FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt => matches!(tok, FatArrow | Comma | Semi),
         // `>>` lexes as two `Gt` tokens here, so `Gt` covers both.
         FragKind::Ty | FragKind::Path => {
             matches!(tok, FatArrow | Comma | Semi | Eq | Pipe | Colon | Gt | LBracket | LBrace | As | Where)
@@ -300,7 +300,17 @@ fn vis_follow_ok(tok: Tok) -> bool {
 
 /// Kinds whose follow set is restricted (see `follow_ok`).
 fn restricted(kind: FragKind) -> bool {
-    matches!(kind, FragKind::Expr | FragKind::Stmt | FragKind::Ty | FragKind::Path | FragKind::Pat | FragKind::PatParam | FragKind::Vis)
+    matches!(
+        kind,
+        FragKind::Expr
+            | FragKind::Expr2021
+            | FragKind::Stmt
+            | FragKind::Ty
+            | FragKind::Path
+            | FragKind::Pat
+            | FragKind::PatParam
+            | FragKind::Vis
+    )
 }
 
 /// Whether a fragment of kind `next` may start right after a fragment of
@@ -937,6 +947,8 @@ fn can_forward(from: FragKind, to: FragKind) -> bool {
     if from == to || to == Tt {
         return true;
     }
+    let from = if from == Expr2021 { Expr } else { from };
+    let to = if to == Expr2021 { Expr } else { to };
     matches!(
         (from, to),
         (Expr, Pat | PatParam | Stmt)
@@ -956,6 +968,7 @@ fn parsed_kind(kind: FragKind) -> bool {
     matches!(
         kind,
         FragKind::Expr
+            | FragKind::Expr2021
             | FragKind::Ty
             | FragKind::Pat
             | FragKind::PatParam
@@ -985,7 +998,7 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
     }
     match tree {
         Tt::Delim(d, _, _) => match kind {
-            FragKind::Expr | FragKind::Stmt => true,
+            FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt => true,
             FragKind::Ty | FragKind::Pat | FragKind::PatParam => *d != Delim::Brace,
             FragKind::Block => *d == Delim::Brace,
             _ => false,
@@ -1036,6 +1049,9 @@ fn can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool {
             );
             match kind {
                 FragKind::Expr => expr_start,
+                // The 2021 expression grammar has no `_` expression
+                // and no const blocks, so neither begins its parser.
+                FragKind::Expr2021 => expr_start && !matches!(t.tok, Tok::Underscore | Tok::Const),
                 FragKind::Stmt => expr_start || matches!(t.tok, Let | Semi),
                 FragKind::Ty => matches!(
                     t.tok,
@@ -1100,11 +1116,12 @@ fn can_continue(kind: FragKind, tree: Option<&Tt>) -> bool {
     let Some(tree) = tree else { return false };
     match tree {
         Tt::Delim(_, _, _) => {
-            matches!(kind, FragKind::Expr | FragKind::Stmt) || kind == FragKind::Path && matches!(tree, Tt::Delim(Delim::Paren, _, _))
+            matches!(kind, FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt)
+                || kind == FragKind::Path && matches!(tree, Tt::Delim(Delim::Paren, _, _))
         }
         Tt::Frag(_, _, _) => false,
         Tt::Tok(t) => match kind {
-            FragKind::Expr | FragKind::Stmt => matches!(
+            FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt => matches!(
                 t.tok,
                 Plus | Minus
                     | Star
@@ -1290,13 +1307,20 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             ends.dedup();
             ends
         }
-        FragKind::Expr => {
+        FragKind::Expr | FragKind::Expr2021 => {
             // One greedy parse, the way rustc's fragment parser runs:
             // flatten the rest of the input once and ask the parser
             // where one expression ends, instead of probing every
             // candidate end (which is cubic on long repetitions).
             m.step()?;
-            if matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore) {
+            if kind == FragKind::Expr2021
+                && (matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore)
+                    && !matches!(input.get(pos + 1), Some(Tt::Tok(t)) if t.tok == Tok::Eq)
+                    || tok_at(input, pos).map(|t| t.tok) == Some(Tok::Const)
+                        && matches!(input.get(pos + 1), Some(Tt::Delim(Delim::Brace, _, _))))
+            {
+                vec![]
+            } else if kind == FragKind::Expr && matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore) {
                 vec![pos + 1]
             } else {
                 let (flat, bounds) = probe_flatten_bounded(m, kind, &input[pos..]);
@@ -1341,7 +1365,10 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
         note_hard_fail(m, kind, input, pos, &ends);
         // Parsed fragments are greedy (see the fn comment). Item and
         // block ends are boundary shapes, not parses to shorten.
-        if matches!(kind, FragKind::Expr | FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt | FragKind::Path) {
+        if matches!(
+            kind,
+            FragKind::Expr | FragKind::Expr2021 | FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt | FragKind::Path
+        ) {
             if let Some(&g) = ends.iter().max() {
                 ends = vec![g];
             }

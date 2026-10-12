@@ -37,12 +37,13 @@ pub fn err(code: &'static str, span: Span, message: impl Into<String>, fix: impl
 }
 
 /// A macro fragment kind, as written after `$name:` in a matcher.
-/// `expr_2021` reads as `Expr`: all lust source is edition 2024 today, and
-/// the definition's edition is carried in the expansion cache key (6.2,
-/// 6.5), so the kind set can split later without reshaping matches.
+/// `expr` and `expr_2021` are distinct kinds: the 2024 expression
+/// grammar adds the `_` expression and const blocks, which an
+/// `expr_2021` fragment must not match (ARCH 6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FragKind {
     Expr,
+    Expr2021,
     Ident,
     Ty,
     Pat,
@@ -62,7 +63,8 @@ impl FragKind {
     /// The kind a matcher name stands for, or None for an unknown name.
     pub fn from_name(name: &str) -> Option<FragKind> {
         Some(match name {
-            "expr" | "expr_2021" => FragKind::Expr,
+            "expr" => FragKind::Expr,
+            "expr_2021" => FragKind::Expr2021,
             "ident" => FragKind::Ident,
             "ty" => FragKind::Ty,
             "pat" => FragKind::Pat,
@@ -83,6 +85,7 @@ impl FragKind {
     pub fn name(self) -> &'static str {
         match self {
             FragKind::Expr => "expr",
+            FragKind::Expr2021 => "expr_2021",
             FragKind::Ident => "ident",
             FragKind::Ty => "ty",
             FragKind::Pat => "pat",
@@ -467,9 +470,7 @@ pub fn tok_matches(pattern: &Tok, input: &Tok, strings: &[String]) -> bool {
         | (Tok::Float(a), Tok::Float(b))
         | (Tok::DocStr(a), Tok::DocStr(b))
         | (Tok::ByteStr(a), Tok::ByteStr(b))
-        | (Tok::ByteChar(a), Tok::ByteChar(b)) => {
-            strings.get(*a as usize) == strings.get(*b as usize)
-        }
+        | (Tok::ByteChar(a), Tok::ByteChar(b)) => strings.get(*a as usize) == strings.get(*b as usize),
         _ => pattern == input,
     }
 }
@@ -1246,7 +1247,9 @@ fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
                 flatten_final(inner, out);
                 out.push(Token { tok: Tok::RParen, span: *span });
             }
-            Tt::Frag(FragKind::Expr, inner, span) if count_tokens(inner) > 1 && !atomic_shaped(inner) => {
+            Tt::Frag(k, inner, span)
+                if matches!(k, FragKind::Expr | FragKind::Expr2021) && count_tokens(inner) > 1 && !atomic_shaped(inner) =>
+            {
                 out.push(Token { tok: Tok::LParen, span: *span });
                 flatten_final(inner, out);
                 out.push(Token { tok: Tok::RParen, span: *span });

@@ -407,7 +407,7 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
             _ => {}
         }
         match prev.kind {
-            Kind::Tok(Tok::Dot) => return false,
+            Kind::Tok(Tok::Dot | Tok::Dollar) => return false,
             Kind::Open(Delim::Paren | Delim::Bracket) => return false,
             _ => {}
         }
