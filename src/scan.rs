@@ -100,7 +100,8 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                 // A nested fn item: record its body as its own scan. The
                 // outer walk continues over its tokens, so deeper nesting
                 // records too and the outer hash still covers everything.
-                if toks[k].tok == Tok::Fn && k > j {
+                // A name must follow: a `fn(...)` pointer type is not an item.
+                if toks[k].tok == Tok::Fn && k > j && matches!(toks.get(k + 1).map(|t| t.tok), Some(Tok::Ident(_))) {
                     let mut j2 = k;
                     while j2 < toks.len() && toks[j2].tok != Tok::LBrace && toks[j2].tok != Tok::Eof {
                         j2 += 1;
@@ -198,8 +199,19 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
         complete = false;
     }
     let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending;
-    fns.extend(nested_fns);
-    body_idents.extend(nested_idents);
+    // Collect's order is the parser's `stmt_items` order, which is body
+    // completion order: a fn nested inside a nested fn is pushed before
+    // its enclosing fn. Encounter order here is the reverse for that
+    // shape, so order the nested scans by body end to match. The driver
+    // joins this list to LocalDefIds positionally; a swap makes a warm
+    // edit reparse and reuse the wrong bodies (fuzz seeds 42 and 7 on
+    // the first nested-items landing).
+    let mut nested_pairs: Vec<(FnScan, Vec<Sym>)> = nested_fns.into_iter().zip(nested_idents).collect();
+    nested_pairs.sort_by_key(|(f, _)| f.body.end);
+    for (f, idents) in nested_pairs {
+        fns.push(f);
+        body_idents.push(idents);
+    }
     ChunkScan { fns, items, body_idents, ends_at_boundary }
 }
 
@@ -552,5 +564,39 @@ fn main() { println!(\"{}\", 1); }
         let src = "fn f() { let mod_name = 1; println!(\"{}\", mod_name); }\nstruct S;\nimpl S { fn m(&self) {} }\n";
         let (o, _) = scan_outline(src);
         assert!(o.mods.is_empty() && o.uses.is_empty() && o.macros.is_empty());
+    }
+
+    // The driver's fn table joins scan order to collect's LocalDefId order
+    // positionally, so the scan's nested fns must be in the same order as
+    // the parser's `stmt_items` fns, also for a fn nested inside a nested fn.
+    #[test]
+    fn scan_nested_fn_order_matches_parser() {
+        let src = "fn main() {\n    fn a() -> i32 {\n        fn b() -> i32 { 10 }\n        b() + 1\n    }\n    fn c() -> i32 { 100 }\n    println!(\"{}\", a() + c());\n}\n";
+        let interner = Interner::default();
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let known = crate::intern::Known::new(&interner);
+        let ast = crate::parser::parse(&lexed, &interner, &known).unwrap();
+        let parser_order: Vec<&str> = ast
+            .stmt_items
+            .iter()
+            .filter_map(|it| match &it.kind {
+                crate::ast::ItemKind::Fn(d) => Some(interner.get(d.name)),
+                _ => None,
+            })
+            .collect();
+        let scanned = scan(&lexed);
+        let scan_order: Vec<&str> = scanned
+            .fns
+            .iter()
+            .filter(|f| f.nested)
+            .map(|f| {
+                let pos = lexed.tokens.iter().position(|t| t.span.lo == f.fn_offset).unwrap();
+                match lexed.tokens[pos + 1].tok {
+                    Tok::Ident(s) => interner.get(s),
+                    _ => "?",
+                }
+            })
+            .collect();
+        assert_eq!(scan_order, parser_order, "scan nested order must match parser stmt_items order");
     }
 }

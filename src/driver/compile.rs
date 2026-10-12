@@ -1566,10 +1566,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // `Sig` fingerprints fold the new values.
         let const_fn_changed = changed.iter().any(|&i| {
             let (item, sub) = front.fn_loc[i];
-            let def = match (&front.ast.items[item].kind, sub) {
-                (ItemKind::Fn(d), None) => d,
-                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
-                _ => unreachable!("fn_loc out of date"),
+            let def = match (item != usize::MAX, sub) {
+                (false, Some(k)) => match &front.ast.stmt_items[k].kind {
+                    ItemKind::Fn(d) => d,
+                    _ => unreachable!("fn_loc out of date"),
+                },
+                _ => match (&front.ast.items[item].kind, sub) {
+                    (ItemKind::Fn(d), None) => d,
+                    (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+                    _ => unreachable!("fn_loc out of date"),
+                },
             };
             def.qual.is_const
         });

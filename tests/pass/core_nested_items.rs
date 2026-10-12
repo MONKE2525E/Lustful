@@ -20,7 +20,21 @@ fn shadow() -> i64 {
     }
 }
 
+fn deep() -> i64 {
+    fn a() -> i64 {
+        fn b() -> i64 {
+            10
+        }
+        b() + 1
+    }
+    fn c() -> i64 {
+        100
+    }
+    a() + c()
+}
+
 fn main() {
+    println!("{}", deep());
     println!("{}", outer());
     println!("{}", shadow());
     fn local(x: i64) -> i64 {
