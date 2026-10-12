@@ -1,0 +1,3 @@
+bits=3 both=true name=true empty=true debug=NodeFlags(0x3)
+without=2 union=3 not_empty=true
+kind=79 default=0 eq=true

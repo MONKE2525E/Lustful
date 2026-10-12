@@ -1,0 +1,11 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; pub mod hidden { pub fn secret_value ( ) -> i32 { 77 } } # [ macro_use ] pub mod
+defs { pub fn helper ( ) -> i32 { 1 } macro_rules ! call_helper { ( ) => { helper ( ) } ; }
+macro_rules ! make_item { ( ) => { pub fn generated ( ) -> i32 { 55 } } ; } pub ( crate ) use
+call_helper ; pub ( crate ) use make_item ; } # [ macro_export ] macro_rules ! crate_secret { ( ) =>
+{ $ crate :: hidden :: secret_value ( ) } ; } pub mod caller { pub fn helper ( ) -> i32 { 2 } pub fn
+generated ( ) -> i32 { 55 } pub fn run ( ) -> ( i32 , i32 , i32 ) { ( helper ( ) , generated ( ) ,
+crate :: hidden :: secret_value ( ) ) } } fn main ( ) { let ( h , g , s ) = caller :: run ( ) ; { ::
+std :: io :: _print ( format_args ! ( "call-site helper={0} generated item={1} crate secret={2}\n" ,
+h , g , s ) ) ; } ; { :: std :: io :: _print ( format_args ! ( "def-site helper still={0}\n" , defs
+:: helper ( ) ) ) ; } ; }

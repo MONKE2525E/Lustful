@@ -1,0 +1,4 @@
+assert-true ok
+assert-false: assertion failed: one is not 2
+recorded:checker.go:Foo
+unported: unported Go code: checker.go:Foo

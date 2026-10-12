@@ -1,0 +1,43 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; use std :: rc :: Rc ; pub mod ast { use std :: ops :: Deref ; use std :: rc :: Rc ;
+pub struct GoFile { pub info : i32 , pub items : Vec < i32 > , } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for GoFile { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
+( f , "GoFile" , "info" , & self . info , "items" , && self . items ) } } pub struct FileVersion {
+file : GoFile , } impl FileVersion { pub fn go_file ( & self ) -> & GoFile { & self . file } } pub
+type VersionPin = Rc < FileVersion > ; pub enum FileRef < T : ? Sized + 'static > { Static ( &
+'static T ) , Pinned { version : VersionPin , key : usize , get : fn ( & FileVersion , usize ) -> &
+T , } , } impl < T : ? Sized + 'static > Deref for FileRef < T > { type Target = T ; fn deref ( &
+self ) -> & T { match self { FileRef :: Static ( v ) => v , FileRef :: Pinned { version , key , get
+} => get ( & * * version , * key ) , } } } impl < T : ? Sized + 'static > Clone for FileRef < T > {
+fn clone ( & self ) -> Self { match self { FileRef :: Static ( v ) => FileRef :: Static ( v ) ,
+FileRef :: Pinned { version , key , get } => FileRef :: Pinned { version : Rc :: clone ( version ) ,
+key : * key , get : * get , } , } } } pub fn go_file ( file : usize ) -> FileRef < GoFile > { if
+file == 0 { static F : std :: sync :: OnceLock < GoFile > = std :: sync :: OnceLock :: new ( ) ;
+FileRef :: Static ( F . get_or_init ( || GoFile { info : 10 , items : :: alloc :: boxed ::
+box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
+:: Box :: new_uninit ( ) , [ 5 , 6 , 7 ] ) ) , } ) ) } else { FileRef :: Pinned { version : Rc ::
+new ( FileVersion { file : GoFile { info : 20 , items : :: alloc :: boxed ::
+box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed
+:: Box :: new_uninit ( ) , [ 8 , 9 ] ) ) , } , } ) , key : 0 , get : | v , _k | v . go_file ( ) , }
+} } pub mod file_version { macro_rules ! go_file_ref { ( $ file : expr , $ key : expr , | $ g :
+ident , $ k : ident | $ part : expr ) => { { let key : usize = $ key ; match $ crate :: ast ::
+go_file ( $ file ) { $ crate :: ast :: FileRef :: Static ( $ g ) => { let $ k = key ; $ crate :: ast
+:: FileRef :: Static ( & $ part ) } $ crate :: ast :: FileRef :: Pinned { version , .. } => $ crate
+:: ast :: FileRef :: Pinned { version , key , get : | version , $ k | { let $ g = version . go_file
+( ) ; & $ part } , } , } } } ; } pub ( crate ) use go_file_ref ; } } fn main ( ) { let info = { let
+key : usize = 0usize ; match crate :: ast :: go_file ( 0usize ) { crate :: ast :: FileRef :: Static
+( g ) => { let _k = key ; crate :: ast :: FileRef :: Static ( & g . info ) } crate :: ast :: FileRef
+:: Pinned { version , .. } => crate :: ast :: FileRef :: Pinned { version , key , get : | version ,
+_k | { let g = version . go_file ( ) ; & g . info } , } , } } ; { :: std :: io :: _print (
+format_args ! ( "static info={0}\n" , * info ) ) ; } ; let item = { let key : usize = 2usize ; match
+crate :: ast :: go_file ( 0usize ) { crate :: ast :: FileRef :: Static ( g ) => { let k = key ;
+crate :: ast :: FileRef :: Static ( & g . items [ k ] ) } crate :: ast :: FileRef :: Pinned {
+version , .. } => crate :: ast :: FileRef :: Pinned { version , key , get : | version , k | { let g
+= version . go_file ( ) ; & g . items [ k ] } , } , } } ; { :: std :: io :: _print ( format_args ! (
+"static item={0}\n" , * item ) ) ; } ; let pinned = { let key : usize = 1usize ; match crate :: ast
+:: go_file ( 1usize ) { crate :: ast :: FileRef :: Static ( g ) => { let k = key ; crate :: ast ::
+FileRef :: Static ( & g . items [ k ] ) } crate :: ast :: FileRef :: Pinned { version , .. } =>
+crate :: ast :: FileRef :: Pinned { version , key , get : | version , k | { let g = version .
+go_file ( ) ; & g . items [ k ] } , } , } } ; { :: std :: io :: _print ( format_args ! (
+"pinned item={0}\n" , * pinned ) ) ; } ; }

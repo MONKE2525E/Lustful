@@ -1,0 +1,3 @@
+merged=Opts { out_dir: "", strict: true, target: "es2022" }
+subst=/proj/src plain.js
+take=/proj/src ''

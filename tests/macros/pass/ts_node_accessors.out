@@ -1,0 +1,9 @@
+name fd=5 vd=6 in=5
+init vd=9 fd=0
+postfix md=14 question pd=Some(13) qdot=12
+mods bits=3 in_bits=3 store_bits=3
+params=2 typeargs=1 typeargs_nil=true
+locals fd=true vd=false rank=1 0
+children name=Some(6) other=Some((1, 0)) typed=Some((4, 4)) no_tyargs=true
+has_kind special=true generic=true token=true
+nil name=0 init=0

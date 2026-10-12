@@ -1,0 +1,4 @@
+nil=true some=true index=7 get=Some(NodeId(7))
+slot=Arena(7) ord=true
+args=["alpha", "42", "true"] empty=[]
+path=["x"]

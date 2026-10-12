@@ -1,0 +1,3 @@
+pair=Some(Pair(PairData { left: 3, right: 4 }))
+named=Some(Named(NameData { text: "s9", flags: 1 }))
+bad=None

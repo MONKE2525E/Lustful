@@ -1,0 +1,78 @@
+# The ts-rust macro_rules! names this corpus must cover, one per line.
+# Source: `lust port scan` over /home/theo/.t3/projects/ts-rust reports
+# 80 definitions under these 70 names (ARCH 6.5). The count here was
+# checked against a direct scan of that tree when the corpus was
+# built. If ts-rust gains or loses a macro, rescan, update this file,
+# and add or drop the fixture in the same change.
+# `cached` is not a definition: it is `pub use crate::effect_cached
+# as cached`, exercised by the effect_cached fixture.
+arena_link_key
+args
+arithmetic
+bundled_lib
+by_data
+child_test
+core_int_json
+data_accessor
+data_is_variant
+e
+effect_cached
+el
+expression_arms
+file_map
+files
+go_assert
+go_comparable_by_value
+go_enum
+go_file_ref
+go_flags
+handle
+handle_json
+impl_es_transformer
+initializer_arms
+initializer_data_accessor
+kind_lacks_data
+l
+list_by_data
+list_of
+locale_data
+locals_container_variants
+m
+match_data
+merge_fields
+modifiers_accessor
+modifiers_of
+modifiers_variants
+n
+name_arms
+name_data_accessor
+o
+ol
+os_child_test
+other_column_match
+own_question_token_accessor
+p
+payload_codec
+pl
+pm
+po
+pol
+postfix_arms
+postfix_token_data_accessor
+preds
+pref_field
+proto_json
+push_comment
+question_arms
+sel_field
+source_file_field
+store_node_modifier_bits_fn
+substitute_string_fields
+take
+trace_write
+type_arguments_arms
+type_arms
+unported
+variant_has_kind
+with_data
+with_function_like_data

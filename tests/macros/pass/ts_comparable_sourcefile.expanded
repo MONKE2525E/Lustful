@@ -1,0 +1,21 @@
+# ! [ feature ( prelude_import ) ] extern crate std ; # [ prelude_import ] use std :: prelude ::
+rust_2024 :: * ; pub trait GoComparable { fn go_eq ( & self , other : & Self ) -> bool ; }
+macro_rules ! go_comparable_by_value { ( $ ( $ t : ty ) , * $ ( , ) ? ) => { $ ( impl GoComparable
+for $ t { fn go_eq ( & self , other : & Self ) -> bool { self == other } } ) * } ; } impl
+GoComparable for u32 { fn go_eq ( & self , other : & Self ) -> bool { self == other } } impl
+GoComparable for bool { fn go_eq ( & self , other : & Self ) -> bool { self == other } } impl
+GoComparable for char { fn go_eq ( & self , other : & Self ) -> bool { self == other } } pub struct
+Info { pub name : String , pub version : u32 , } pub struct File { pub name : String , pub version :
+u32 , } pub enum SourceFileFields { Published ( Info ) , Parsed ( File ) , } macro_rules !
+source_file_field { ( $ fields : expr , $ field : ident ) => { match $ fields { SourceFileFields ::
+Published ( info ) => & info . $ field , SourceFileFields :: Parsed ( file ) => & file . $ field , }
+} ; } fn main ( ) { { :: std :: io :: _print ( format_args ! ( "eq={0} ne={1}\n" , 7u32 . go_eq ( &
+7 ) , true . go_eq ( & false ) ) ) ; } ; let a = SourceFileFields :: Published ( Info { name :
+"a.ts" . into ( ) , version : 3 } ) ; let b = SourceFileFields :: Parsed ( File { name : "b.ts" .
+into ( ) , version : 5 } ) ; { :: std :: io :: _print ( format_args ! ( "{0}:{1} {2}:{3}\n" , match
+& a { SourceFileFields :: Published ( info ) => & info . name , SourceFileFields :: Parsed ( file )
+=> & file . name , } , match & a { SourceFileFields :: Published ( info ) => & info . version ,
+SourceFileFields :: Parsed ( file ) => & file . version , } , match & b { SourceFileFields ::
+Published ( info ) => & info . name , SourceFileFields :: Parsed ( file ) => & file . name , } ,
+match & b { SourceFileFields :: Published ( info ) => & info . version , SourceFileFields :: Parsed
+( file ) => & file . version , } ) ) ; } ; }

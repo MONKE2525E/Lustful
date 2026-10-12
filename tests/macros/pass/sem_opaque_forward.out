@@ -1,0 +1,4 @@
+direct=3 forwarded=4
+ty direct=split forwarded=whole
+ident=matched-special matched-ident
+tt=two

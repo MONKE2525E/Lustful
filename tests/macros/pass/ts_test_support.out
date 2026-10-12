@@ -1,0 +1,3 @@
+files=2 keys=["/src/a.ts", "/src/b.ts"]
+file_map=1 first=x
+args=["--build", "proj"]
