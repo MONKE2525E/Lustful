@@ -122,6 +122,21 @@ pub(crate) struct Caches {
     /// this with its IR fingerprint in wave B.
     pub(crate) slot_fp: Vec<u64>,
     pub(crate) glue: GlueSet,
+    /// Fingerprint of the statics the last built glue unit was
+    /// generated from (`graph::statics_fingerprint`). A build whose
+    /// current statics differ must rebuild the glue unit, whatever
+    /// edit mode the current request is in: a `check` request consumes
+    /// the edit that moved a static's value (slot hashes advance), so
+    /// the following `build` request sees no change to react to. This
+    /// fingerprint is the built-state record that survives that gap.
+    /// Zero means no build yet.
+    pub(crate) statics_fp: u64,
+    /// A compile since the last build saw a full-mode edit or a const
+    /// fn edit, so derived glue text may be stale. Set by any compile
+    /// (check requests included), cleared by the build that refreshes
+    /// the glue. Same reason as `statics_fp`: the edit and the build
+    /// that must react to it are usually different requests.
+    pub(crate) glue_stale: bool,
     /// Slots per function unit. Fixed until the next full rebuild, so units stay stable.
     pub(crate) per_unit: usize,
     /// Slot capacity of `lust_fns` in libbase.so, and how many function units it has.
@@ -200,6 +215,8 @@ impl Session {
                 slot_used: Vec::new(),
                 slot_fp: Vec::new(),
                 glue: GlueSet::default(),
+                statics_fp: 0,
+                glue_stale: false,
                 per_unit: 16,
                 table_cap: 0,
                 base_units: 0,

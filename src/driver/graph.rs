@@ -810,6 +810,24 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// The fingerprint of the program's statics as the glue unit emits
+/// them: each static's `Sig` fingerprint (deep type plus evaluated
+/// value) in definition order. The driver stores the fingerprint of
+/// the statics last built into a glue unit and rebuilds that unit
+/// when a later build's statics differ. This must be a built-state
+/// comparison, not an edit trigger: a `check` request consumes the
+/// edit that moved a value, and the following `build` request sees
+/// an unchanged file.
+pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
+    let mut h = FxHasher::default();
+    "statics-v1".hash(&mut h);
+    (p.static_defs.len() as u64).hash(&mut h);
+    for &def in &p.static_defs {
+        sig_fingerprint(p, def).0.hash(&mut h);
+    }
+    h.finish()
+}
+
 // ---------- Query functions (section 8.2) ----------
 
 /// The signature payload a `sig_of` query returns. Fn and Adt payloads still
@@ -1755,6 +1773,53 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_ne!(a, changed, "value edit moves the const sig");
         let same = const_fp("const MAX: i64 = 1 + 2;\nfn main() { println!(\"{}\", MAX); }\n");
         assert_eq!(a, same, "same value, same fingerprint");
+    }
+
+    /// A const used as a pattern records its `Sig` read: a value edit
+    /// dirties the matching body, an unrelated const edit does not.
+    /// (Review B2: the pattern path used to read the flat const table
+    /// with no recorded read, so a warm daemon kept the old value.)
+    #[test]
+    fn pattern_const_read_dirties_on_value_edit() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let src = "const K: i64 = 3;\nconst U: i64 = 9;\nfn main() { let x: i64 = 3; println!(\"{}\", match x { K => 1, _ => 0 }); }\n";
+        let reads = main_reads(&interner, &known, src);
+        assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
+        let edited = src.replace("const K: i64 = 3;", "const K: i64 = 4;");
+        assert!(dirty_in(&interner, &known, &edited, &reads) >= 1, "pattern const value edit dirties");
+        let unrelated = src.replace("const U: i64 = 9;", "const U: i64 = 10;");
+        assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "unrelated const edit stays clean");
+    }
+
+    /// A const fn body evaluated while checking a body records a
+    /// `Checked` read, whose replay never matches: the reader
+    /// rechecks whenever it is a walk candidate, even against the
+    /// same program. That is the transitive edge from a body to the
+    /// const fn bodies it evaluates (review B1, body-local half).
+    #[test]
+    fn const_block_call_records_checked_read() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let src = "const fn k() -> i64 { 3 }\nfn main() { let x = const { k() }; println!(\"{}\", x); }\n";
+        let reads = main_reads(&interner, &known, src);
+        assert!(reads.keys().any(|k| matches!(k, ReadKey::Checked(_))), "a Checked read is recorded");
+        assert!(dirty_in(&interner, &known, src, &reads) >= 1, "Checked reads always dirty (sentinel replay)");
+    }
+
+    /// `size_of` over a compound type records a layout read for the
+    /// Adt inside it: a field edit dirties the body even though the
+    /// written type's outermost path is not the Adt.
+    #[test]
+    fn size_of_compound_type_records_layout_read() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let src = "struct S { a: u8 }\nfn main() { println!(\"{}\", std::mem::size_of::<[S; 2]>()); }\n";
+        let reads = main_reads(&interner, &known, src);
+        assert!(reads.keys().any(|k| matches!(k, ReadKey::Layout(_))), "a Layout read is recorded");
+        assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
+        let edited = src.replace("struct S { a: u8 }", "struct S { a: u64 }");
+        assert!(dirty_in(&interner, &known, &edited, &reads) >= 1, "field edit dirties through the layout read");
     }
 
     /// A builtin method probe records the probe itself: two different

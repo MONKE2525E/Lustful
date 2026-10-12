@@ -1633,6 +1633,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("collect");
+    // A full-mode edit or a const fn edit can move what derived glue
+    // was generated from. Record that now, for whatever build comes
+    // next: this request may be check-only, and the build request
+    // after it sees an unchanged file in bodies mode. The build that
+    // refreshes the glue clears the flag (see the glue step below).
+    if mode == "full" || const_fn_changed {
+        caches.glue_stale = true;
+    }
 
     // Read-set dirty walk (section 8.3 step 5): a candidate whose
     // recorded reads all still match this program keeps its last
@@ -1820,22 +1828,28 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     // Derived glue (Debug, Clone, Eq, Drop) is keyed by Adt id but
     // generated from field and variant types, and the glue unit also
-    // holds the statics. When type definitions may have moved (full
-    // mode) or a const fn edit may have moved values and layouts
-    // (array lengths, discriminants), regenerate every live glue
-    // definition and compare text: a changed definition forces a
-    // fresh base so fn units that carry static copies reassemble too.
-    // A const fn edit also forces the glue unit itself, whose statics
-    // may hold new values even when no glue definition changed.
-    let glue_changed = if mode == "full" || const_fn_changed {
+    // holds the statics. Regenerate every live glue definition and
+    // compare text when a compile since the last build saw a
+    // full-mode or const fn edit (`glue_stale`, set above), or this
+    // build will reassemble a fresh base anyway (`objects` mismatch:
+    // first build, a carried-over non-fn change, an error reset). A
+    // changed definition forces a fresh base so fn units that carry
+    // static copies reassemble too. The statics compare against the
+    // fingerprint last built into the glue unit, so a value edit
+    // consumed by an earlier check request still rebuilds it here.
+    let statics_fp = crate::driver::graph::statics_fingerprint(&program);
+    let statics_changed = caches.statics_fp != statics_fp;
+    caches.statics_fp = statics_fp;
+    let glue_changed = if caches.glue_stale || caches.objects != Some(req.debug) {
+        caches.glue_stale = false;
         let (shared_changed, regenerated) =
             caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()));
         if regenerated {
             caches.objects = None;
         }
-        shared_changed || regenerated || const_fn_changed
+        shared_changed || regenerated || statics_changed
     } else {
-        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()))
+        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter())) || statics_changed
     };
     t.lap("codegen (par)");
 
