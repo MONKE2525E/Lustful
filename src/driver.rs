@@ -752,6 +752,39 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("assemble C units (par)");
+    // `lust run` of a small program (one function unit, fresh base): compile in memory and run
+    // it there, with no object files, link, or exec. The runtime comes from a cached object.
+    // libtcc compiles serially, so bigger programs keep the parallel file-based path below.
+    // Any setup failure falls back to that path (user code has not run yet). A debug run also
+    // keeps the file path, so a debugger sees a real binary.
+    if let Some(run_args) = &req.run_args
+        && fresh_base
+        && groups.len() == 1
+        && !req.debug
+        && let Ok(runtime_obj) = crate::tcc::cached_runtime_object(&cgen::runtime_unit(), req.debug)
+    {
+        let mem_units: Vec<(PathBuf, String)> = units.iter().filter(|(o, _)| *o != base_obj(2)).cloned().collect();
+        let mut argv = vec![req.out.to_string_lossy().into_owned()];
+        argv.extend(run_args.iter().cloned());
+        if let Ok(run) = crate::tcc::run_in_memory(&mem_units, &runtime_obj, &argv, caches.persistent, req.debug) {
+            t.lap("tcc compile + run (memory)");
+            resp.code = run.code;
+            resp.ran = true;
+            resp.stdout = run.stdout;
+            if req.timings {
+                let kb = mem_units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
+                let _ = writeln!(resp.stderr, "lust run {path}: exit {} ({} functions, {kb} KB of C, in memory)", run.code, program.fns.len());
+                t.render(&mut resp.stderr);
+            }
+            resp.stderr.push_str(&run.stderr);
+            if leak_at_exit {
+                std::mem::forget(bodies);
+                std::mem::forget(units);
+                std::mem::forget(program);
+            }
+            return resp;
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| crate::tcc::compile_units(&units, req.debug)) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };

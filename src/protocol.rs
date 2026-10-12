@@ -28,6 +28,11 @@ pub struct Request {
     pub emit_c: Option<PathBuf>,
     /// Cap on shown diagnostics (0 means no cap). See `diag::render`.
     pub max_errors: usize,
+    /// For `lust run`: the program's arguments (without argv[0]), so a one-shot compile can
+    /// run a small program in memory instead of building a file. The daemon wire format does
+    /// not carry this (decode sets None): a daemon build still writes the executable and the
+    /// client runs it.
+    pub run_args: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -35,6 +40,8 @@ pub struct Response {
     pub stdout: String,
     pub stderr: String,
     pub code: i32,
+    /// The program already ran in memory; `code` is its exit code. Do not run `out` again.
+    pub ran: bool,
 }
 
 pub enum Invocation {
@@ -113,6 +120,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug });
     }
     let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
+    let run = cmd == "run";
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
         file: abs(&file),
@@ -122,8 +130,9 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         debug,
         emit_c: emit_c.map(|p| abs(&p)),
         max_errors,
+        run_args: if run { Some(run_args.clone()) } else { None },
     };
-    Some(Invocation::Compile { req, run: cmd == "run", args: run_args })
+    Some(Invocation::Compile { req, run, args: run_args })
 }
 
 /// The daemon socket for the current directory. The name holds the compiler build hash, so a rebuilt
@@ -155,6 +164,7 @@ pub fn decode(line: &str) -> Option<Request> {
         debug: f[5] == "1",
         emit_c: if f[6].is_empty() { None } else { Some(f[6].into()) },
         max_errors: if f.len() == 8 { f[7].parse().ok()? } else { 20 },
+        run_args: None,
     })
 }
 
@@ -181,6 +191,7 @@ pub fn request(sock: &Path, req: &Request) -> Option<Response> {
         code: nums[0] as i32,
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
+        ran: false,
     })
 }
 
@@ -189,7 +200,8 @@ pub fn finish(resp: Response, run: bool, out: &Path, args: &[String]) -> ! {
     print!("{}", resp.stdout);
     eprint!("{}", resp.stderr);
     let _ = std::io::stdout().flush();
-    if resp.code != 0 || !run {
+    let _ = std::io::stderr().flush();
+    if resp.ran || resp.code != 0 || !run {
         std::process::exit(resp.code);
     }
     let status = std::process::Command::new(out).args(args).status().expect("cannot run the program");
