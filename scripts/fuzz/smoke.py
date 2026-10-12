@@ -275,6 +275,29 @@ fn grown() -> i64 { 1 }
 
         # 9. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
+
+        # 9. Regression (fuzz seed 29, iter 562): a bodies-only edit whose
+        # later function has a body syntax error must not mark the earlier
+        # changed bodies as up to date. Step 2 changes `label` to a body
+        # with a check error and breaks `main`'s body syntax, so the
+        # compile stops at the syntax error. Step 3 only fixes `main`;
+        # the daemon must still report `label`'s error, like cold does.
+        # The bug: step 2 stored `label`'s new body hash while `ok` stayed
+        # true from step 1, so step 3 never rechecked it.
+        pz = os.path.join(work, "poison.rs")
+        open(pz, "w").write('fn label() -> i64 { 1 }\nfn main() { println!("{}", label()); }\n')
+        rc1, _, _ = run_lust(["check", pz])
+        open(pz, "w").write('fn label() -> i64 { x }\nfn main() { println!("{}", label());\n')
+        rc2, _, _ = run_lust(["check", pz])
+        open(pz, "w").write('fn label() -> i64 { x }\nfn main() { println!("{}", label()); }\n')
+        rcw, _, errw = run_lust(["check", pz])
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        r = subprocess.run([LUST, "check", pz], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("syntax-error edit does not poison earlier bodies (seed 29 iter 562)",
+              rc1 == 0 and rc2 == 1 and rcw == 1 and r.returncode == 1
+              and "L0101" in errw and errw == r.stderr,
+              f"rc1={rc1} rc2={rc2} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
     finally:
         daemon.terminate()
         log.close()
