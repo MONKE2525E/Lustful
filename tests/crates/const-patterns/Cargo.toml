@@ -1,0 +1,5 @@
+# Const patterns across crates: a free const and an associated
+# const from a path dependency used as patterns in the dependent.
+[workspace]
+members = ["base", "app"]
+resolver = "2"

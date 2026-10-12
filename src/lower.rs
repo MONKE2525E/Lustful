@@ -1564,16 +1564,6 @@ impl<'p, 'a> Lower<'p, 'a> {
             b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
             this.cur = ok;
         };
-        if let PatRes::AssocConst(adt, item) = self.ck.pat_res(pat) {
-            let v = p.assoc_consts[&(adt, item)].1.clone();
-            let op = self.const_operand(&v, ty, span);
-            if matches!(v, crate::ty::consteval::ConstValue::Str(_)) {
-                branch(self, Rvalue::StrCmp(BinOp::Eq, Operand::Copy(place), op));
-            } else {
-                branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op));
-            }
-            return;
-        }
         match p.ast.pat(pat) {
             Pat::Wild | Pat::Binding { .. } => {}
             Pat::Lit(l) => {

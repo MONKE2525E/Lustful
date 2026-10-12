@@ -288,10 +288,6 @@ pub enum PatRes {
     Variant(AdtId, u32),
     /// `Some(..)` (true) or `None` (false).
     Opt(bool),
-    /// An associated const pattern (`Self::A`, `Type::A`): compare
-    /// the scrutinee against the scalar value in
-    /// `Program::assoc_consts` (W-RESOLVE phase 2).
-    AssocConst(AdtId, Sym),
 }
 
 pub struct LocalInfo {
@@ -3546,6 +3542,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ty;
             }
         }
+        // Associated consts of inherent impls (Self::A, Type::A) read
+        // as their evaluated value, like free consts.
+        if let Some((adt, item)) = self.assoc_const_key(segs)
+            && let Some(&idx) = p.assoc_const_names.get(&(adt, item))
+        {
+            let c = &p.consts[idx as usize];
+            let (v, t) = (c.value.clone(), c.ty);
+            let i = self.ei(e);
+            self.out.const_exprs[i] = Some(v);
+            return self.deep(t);
+        }
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
             if let Res::Variant(a, v) = r {
@@ -5507,14 +5514,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         if let Some((adt, item)) = self.assoc_const_key(segs) {
-            let (cty, val) = match p.assoc_consts.get(&(adt, item)) {
-                Some(&(cty, ref val)) => (cty, val.clone()),
+            match p.assoc_const_names.get(&(adt, item)) {
+                Some(&idx) => {
+                    self.const_item_pat(pi, idx, t, span, in_match);
+                    return true;
+                }
                 None => return false,
-            };
-            if self.check_const_value(cty, &val, t, span, in_match) {
-                self.out.pat_res[pi] = PatRes::AssocConst(adt, item);
             }
-            return true;
         }
         false
     }
@@ -5538,12 +5544,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some((adt, item))
     }
 
-    /// The (type, value) of an associated const named by a two-segment
-    /// path, for expression reads.
-    fn assoc_const(&mut self, segs: &[ast::PathSeg], _span: Span) -> Option<(Ty, crate::ty::consteval::ConstValue)> {
-        let (adt, item) = self.assoc_const_key(segs)?;
-        self.p.assoc_consts.get(&(adt, item)).map(|&(ty, ref v)| (ty, v.clone()))
-    }
 
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
         self.pattern_mode(pat, t, BindMode::Move, in_match);
@@ -6297,7 +6297,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (PatRes::Variant(a, _), _) if p.adt(a).is_enum => {
                     return (0..p.adt(a).variants.len()).all(|v| self.covers_variant(&flat, a, v as u32));
                 }
-                (_, Pat::Lit(_)) | (PatRes::ConstItem(_), _) | (PatRes::AssocConst(..), _)
+                (_, Pat::Lit(_)) | (PatRes::ConstItem(_), _)
                     if matches!(self.kind(self.out.pat_ty[(x.0 - self.out.pat_base) as usize]), TyKind::Bool) =>
                 {
                     let (mut t, mut f) = (false, false);
@@ -6561,11 +6561,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             PatRes::ConstItem(idx) => match self.p.consts[idx as usize].value {
                 crate::ty::consteval::ConstValue::Bool(true) => *t = true,
                 crate::ty::consteval::ConstValue::Bool(false) => *f = true,
-                _ => {}
-            },
-            PatRes::AssocConst(adt, item) => match self.p.assoc_consts.get(&(adt, item)) {
-                Some((_, crate::ty::consteval::ConstValue::Bool(true))) => *t = true,
-                Some((_, crate::ty::consteval::ConstValue::Bool(false))) => *f = true,
                 _ => {}
             },
             _ => {}

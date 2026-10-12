@@ -102,9 +102,10 @@ pub struct Program<'a> {
     pub const_defs: Vec<DefId>,
     /// Each static item's stable identity, in `statics` order.
     pub static_defs: Vec<DefId>,
-    /// Scalar associated consts of inherent impls, by (Adt, name).
-    /// Filled by the assoc const pass in `collect` (W-RESOLVE phase 2).
-    pub assoc_consts: HashMap<(AdtId, Sym), (Ty, crate::ty::consteval::ConstValue)>,
+    /// Associated consts of inherent impls: (Adt, name) to an index
+    /// into `consts`. They are const items like free consts, but not
+    /// in `const_names`: a plain name must never find them.
+    pub assoc_const_names: HashMap<(AdtId, Sym), u32>,
     /// Evaluated static items, and name to index. Codegen emits these as
     /// static data in the glue unit.
     pub statics: Vec<StaticItem>,
@@ -916,7 +917,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         adts: Vec::new(),
         fns: Vec::new(),
         consts: Vec::new(),
-        assoc_consts: HashMap::default(),
+        assoc_const_names: HashMap::default(),
         const_names: HashMap::default(),
         const_defs: Vec::new(),
         static_defs: Vec::new(),
@@ -1627,14 +1628,9 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         &method_ids,
                         &mut errs,
                     );
-                } else {
-                    // Inherent associated consts need the const
-                    // evaluator's value path, which is not in this
-                    // wave; they keep the old reject.
-                    for ac in &imp.consts {
-                        errs.push(not_yet("L0621", ac.name_span, "associated consts and types"));
-                    }
                 }
+                // Inherent associated consts are evaluated by
+                // eval_assoc_consts below (W-RESOLVE phase 2).
             }
             _ => {}
         }
@@ -1650,6 +1646,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
     // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
     // so one bad item reports once; collection fails anyway on the error.
     eval_const_items(&mut p, &mut errs);
+    eval_assoc_consts(&mut p, &mut errs);
 
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }
@@ -1765,6 +1762,99 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
         .into_iter()
         .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit }))
         .collect();
+}
+
+/// Registers and evaluates the associated consts of inherent impls
+/// (W-RESOLVE phase 2, on the merged evaluator). They become const
+/// items with child defs under their impl, found through
+/// `assoc_const_names` only: initializers read free consts through
+/// the same context fallback as other const items, never other
+/// associated consts by plain name (Rust requires `Self::` there).
+fn eval_assoc_consts<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
+    let ast = p.ast;
+    let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
+    let mut owners: Vec<(AdtId, DefId, Sym)> = Vec::new();
+    // Impl ordinals must match the fn pass exactly (same iteration,
+    // same owner test), so child hashes name the same impl.
+    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    for item in &ast.items {
+        let ItemKind::Impl(imp) = &item.kind else { continue };
+        if imp.is_negative || imp.trait_ref.is_some() {
+            // The fn pass still consumes an ordinal for these (its
+            // header is the self type's first segment, counted before
+            // any continue), then handles or rejects them itself.
+            let header = match ast.ty(imp.self_ty) {
+                TyExpr::Path(segs) if !segs.is_empty() => p.interner.get(segs[0].name).to_string(),
+                _ => "<error>".to_string(),
+            };
+            let o = impl_ordinals.get(&header).copied().unwrap_or(0);
+            impl_ordinals.insert(header, o + 1);
+            continue;
+        }
+        let header = match ast.ty(imp.self_ty) {
+            TyExpr::Path(segs) if !segs.is_empty() => p.interner.get(segs[0].name).to_string(),
+            _ => "<error>".to_string(),
+        };
+        let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
+        impl_ordinals.insert(header.clone(), ordinal + 1);
+        let owner = match ast.ty(imp.self_ty) {
+            TyExpr::Path(segs) if segs.len() == 1 => p.type_names.get(&segs[0].name).copied(),
+            _ => None,
+        };
+        let Some(owner) = owner else { continue };
+        if imp.consts.is_empty() {
+            continue;
+        }
+        let parent_hash = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
+        let impl_def = DefId { krate: p.krate, hash: parent_hash };
+        let self_ty = p.tys.adt_ty(owner);
+        for c in &imp.consts {
+            if owners.iter().any(|&(o, _, n)| o == owner && n == c.name) || p.methods.contains_key(&(owner, c.name)) {
+                errs.push(Diag::new(
+                    "L0106",
+                    c.name_span,
+                    format!("`{}` is defined more than once", p.interner.get(c.name)),
+                    "Rename one of the definitions.",
+                ));
+                continue;
+            }
+            let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, c.ty, Some(self_ty)) {
+                Ok(t) => t,
+                Err(d) => {
+                    errs.push(d);
+                    continue;
+                }
+            };
+            let Some(value) = c.default else {
+                errs.push(not_yet("L0632", c.name_span, "associated consts without a value"));
+                continue;
+            };
+            owners.push((owner, impl_def, c.name));
+            pending.push((
+                PendingConst { name: Some(c.name), ty, expr: value, span: c.span, is_static: None, static_idx: 0 },
+                PendingState::Todo,
+            ));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let n = pending.len();
+    let mut cx = CollectCx { p, pending, by_name: HashMap::default(), errs };
+    for i in 0..n {
+        cx.eval_pending(i);
+    }
+    let CollectCx { p, pending, .. } = cx;
+    for ((item, state), (owner, impl_def, name)) in pending.into_iter().zip(owners) {
+        let PendingState::Done(value) = state else { continue };
+        let idx = p.consts.len() as u32;
+        let hash = crate::def::child_hash(impl_def.hash, crate::def::DefKind::Const, p.interner.get(name), 0);
+        let def = DefId { krate: p.krate, hash };
+        p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(impl_def), name, Vis::Priv, item.span));
+        p.const_defs.push(def);
+        p.consts.push(ConstItem { name, ty: item.ty, value });
+        p.assoc_const_names.insert((owner, name), idx);
+    }
 }
 
 /// The const evaluator's context over the collected tables.

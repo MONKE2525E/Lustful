@@ -2676,6 +2676,9 @@ fn collect_assoc_vis(ast: &Ast, items: &[Item], module: ModuleId, interner: &Int
                         for f in &imp.fns {
                             entry.insert(f.name, (vis_from_ast(&f.vis, interner), module));
                         }
+                        for c in &imp.consts {
+                            entry.insert(c.name, (vis_from_ast(&c.vis, interner), module));
+                        }
                     }
                 }
             }

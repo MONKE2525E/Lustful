@@ -1399,6 +1399,9 @@ impl<'a> Parser<'a> {
     /// One associated const in a trait or an impl:
     /// `const NAME: Ty = value;` (the value is optional in a trait).
     fn assoc_const(&mut self) -> PResult<AssocConstDef> {
+        // Scalar associated consts in inherent impls are supported
+        // (collect evaluates them); trait definitions still defer
+        // their own L0614, and trait impls defer in `impl_def`.
         let start = self.expect(Tok::Const, "`const`")?;
         let (name, name_span) = self.ident()?;
         self.expect(Tok::Colon, "`:`")?;
@@ -1505,7 +1508,11 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Type if trait_ref.is_some() => types.push(self.assoc_type()?),
                 Tok::Type => return Err(self.reject(C_ASSOC, "associated types in inherent impls")),
-                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
+                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => {
+                    let mut def = self.assoc_const()?;
+                    def.vis = vis;
+                    consts.push(def);
+                }
                 Tok::Const if self.peek_at(1) == Tok::Fn => {
                     self.bump();
                     let mut def = self.fn_def()?;

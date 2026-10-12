@@ -1,4 +1,3 @@
-// expect: L0621
 struct S;
 
 impl S {
