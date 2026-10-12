@@ -106,7 +106,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             if d != 0 {
                 complete = false;
             }
-            fns.push(FnScan { body_hash: body.finish(), fn_offset: toks[i].span.start, body: j..k + 1 });
+            fns.push(FnScan { body_hash: body.finish(), fn_offset: toks[i].span.lo, body: j..k + 1 });
             idents.sort_unstable();
             idents.dedup();
             body_idents.push(idents);

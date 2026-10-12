@@ -3,7 +3,7 @@
 use crate::ast::{BinOp, UnOp};
 use crate::check::Builtin;
 use crate::check::collect::*;
-use crate::diag::{LineIndex, Span};
+use crate::diag::{SourceMap, Span};
 use crate::ir::*;
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
@@ -195,7 +195,7 @@ struct FnGen<'b, 'p, 'a> {
     glue: HashSet<(Glue, CTy)>,
     local_cty: Vec<CTy>,
     local_drop: Vec<bool>,
-    lines: &'b LineIndex,
+    map: &'b SourceMap,
     /// Types in the signatures of called functions, needed for the call casts.
     sig_types: HashSet<CTy>,
     /// Line of the function's `fn` keyword. Locations are stored relative to it, so the C for
@@ -222,9 +222,9 @@ fn fn_sig(p: &Program, f: FnId, slot: u32) -> String {
     format!("{} f{slot}({})", ctype(&cty(&p.tys, info.ret)), params)
 }
 
-/// Generates C for one function body. `base_line` is the line of its `fn` keyword; `slots` maps
-/// every FnId to its slot in `lust_fns`.
-pub fn gen_fn(p: &Program, body: &Body, lines: &LineIndex, base_line: u32, slots: &[u32]) -> FnOut {
+/// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
+/// file that defines it; `slots` maps every FnId to its slot in `lust_fns`.
+pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
     let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
     let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
     let mut g = FnGen {
@@ -234,7 +234,7 @@ pub fn gen_fn(p: &Program, body: &Body, lines: &LineIndex, base_line: u32, slots
         glue: HashSet::new(),
         local_cty,
         local_drop,
-        lines,
+        map,
         sig_types: HashSet::new(),
         base_line,
         slots,
@@ -253,8 +253,10 @@ pub fn gen_fn(p: &Program, body: &Body, lines: &LineIndex, base_line: u32, slots
 
 impl FnGen<'_, '_, '_> {
     /// A packed source location, relative to the function's first line. See `lust_loc`.
+    /// The runtime prints one file path for the whole program (`lust_file`), so the packed
+    /// value carries line and column only; an expanded span reports at its call site.
     fn loc(&self, span: Span) -> String {
-        let (l, c) = self.lines.line_col(span.start);
+        let (l, c) = self.map.line_col(self.map.call_site(span));
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
         let slot = self.slots[self.body.fn_id.0 as usize] as u64;
         format!("{}u", (slot << 32) | (rel << 12) | c.min(0xFFF) as u64)

@@ -5,6 +5,7 @@
 // concrete edits, and the hash of the exact bytes that were checked. Output is bounded: exact
 // duplicates are suppressed and at most `max_errors` diagnostics are shown, followed by an
 // explicit truncation record. Truncation never changes the exit status.
+use crate::intern::Sym;
 use std::fmt::Write;
 
 /// The version of the JSON diagnostic schema.
@@ -14,18 +15,52 @@ pub const SCHEMA: u32 = 1;
 #[allow(dead_code)]
 pub const DEFAULT_MAX_ERRORS: usize = 20;
 
+/// One source file in a session's source map. Session-local: a `FileId` must never enter a
+/// disk cache key (disk forms use the path; see docs/ARCH.md sections 1.2 and 8.4). Ids are
+/// assigned at crate load in sorted canonical path order, then append-only. Today a crate
+/// is one file, so every span in it has `FileId(0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileId(pub u32);
+
+/// The expansion context of a span: which macro expansion (if any) produced its tokens.
+/// `CtxtId(0)` is the root context (ordinary source). `CtxtId(n)` for n > 0 names entry
+/// n - 1 of the source map's expansion table. Session-local, like `FileId`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CtxtId(pub u32);
+
+impl CtxtId {
+    /// The root context: tokens that come from no macro expansion.
+    pub const ROOT: CtxtId = CtxtId(0);
+}
+
+/// A byte range in one source file, plus the expansion context of its tokens.
+/// `lo` and `hi` are byte offsets in `file`. Four u32 fields, so `Span` stays small and
+/// `Copy`. The default span (file 0, bytes 0..0, root context) is the dummy span for
+/// synthetic nodes and for diagnostics that name no source position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
-    pub start: u32,
-    pub end: u32,
+    pub file: FileId,
+    pub lo: u32,
+    pub hi: u32,
+    pub ctxt: CtxtId,
 }
 
 impl Span {
-    pub fn new(start: u32, end: u32) -> Span {
-        Span { start, end }
+    /// A root-context span over bytes `lo..hi` in `file`. The lexer is the main caller.
+    pub fn new(file: FileId, lo: u32, hi: u32) -> Span {
+        Span { file, lo, hi, ctxt: CtxtId::ROOT }
     }
+    /// The smallest span that covers both spans. Both spans must be in the same file. The
+    /// result keeps the left span's context: name resolution reads the contexts of the
+    /// spans that were combined, never of this cover span (docs/ARCH.md section 6.3).
     pub fn to(self, other: Span) -> Span {
-        Span { start: self.start.min(other.start), end: self.end.max(other.end) }
+        debug_assert_eq!(self.file, other.file, "Span::to across files");
+        Span { file: self.file, lo: self.lo.min(other.lo), hi: self.hi.max(other.hi), ctxt: self.ctxt }
+    }
+    /// This span moved by `delta` bytes within the same file. The driver uses it when an
+    /// edit shifts the kept suffix of a file; file and context do not change.
+    pub fn shifted(self, delta: i64) -> Span {
+        Span { lo: (self.lo as i64 + delta) as u32, hi: (self.hi as i64 + delta) as u32, ..self }
     }
 }
 
@@ -126,21 +161,104 @@ impl LineIndex {
     }
 }
 
+/// One macro expansion: the call site that produced a context, and the context the call
+/// itself was in. The chain of these records (through `parent` and each `call_span`) maps
+/// an expanded span back to ordinary source. No expansion exists until macro support
+/// lands; the record shape is fixed now so `Span` does not change again. The macro def's
+/// `DefId` (docs/ARCH.md section 6.3) takes the name's place when defs land.
+#[allow(dead_code)] // `macro_name` and `parent` are first read by macro expansion and its diagnostics.
+#[derive(Clone)]
+pub struct Expansion {
+    pub macro_name: Sym,
+    pub call_span: Span,
+    pub parent: CtxtId,
+}
+
+/// One file known to a source map: its path (as diagnostics print it) and its line index.
+/// The map does not own source text; the session keeps the text (the driver's `Front::src`).
+#[derive(Clone)]
+struct SourceFile {
+    path: String,
+    lines: LineIndex,
+}
+
+/// The session's source map: every file's path and line index, plus the expansion table
+/// that `CtxtId`s index into. Owned by the compile session. A stage that needs a path or a
+/// line for a span asks the map. Today a crate has one file, so the map holds one entry.
+#[derive(Clone, Default)]
+pub struct SourceMap {
+    files: Vec<SourceFile>,
+    expansions: Vec<Expansion>,
+}
+
+impl SourceMap {
+    /// Adds a file and returns its id. Files are append-only: an id, once given, names the
+    /// same file for the rest of the session.
+    pub fn add_file(&mut self, path: &str, src: &str) -> FileId {
+        let id = FileId(self.files.len() as u32);
+        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src) });
+        id
+    }
+    /// Replaces a file's path and line index. The driver uses this for the session's one
+    /// file on each request: the path comes from the request, and the index is spliced
+    /// from the last request's index, so it arrives ready-made.
+    pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex) {
+        self.files[file.0 as usize] = SourceFile { path: path.to_string(), lines };
+    }
+    /// True when no file has been added yet (a fresh session).
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+    /// The path diagnostics print for `file`.
+    pub fn path(&self, file: FileId) -> &str {
+        &self.files[file.0 as usize].path
+    }
+    /// The line index of `file` (the driver splices it on an edit; see `LineIndex::splice`).
+    pub fn lines(&self, file: FileId) -> &LineIndex {
+        &self.files[file.0 as usize].lines
+    }
+    /// 1-based line and column of a span's first byte.
+    pub fn line_col(&self, span: Span) -> (u32, u32) {
+        self.lines(span.file).line_col(span.lo)
+    }
+    /// 1-based line and column of byte `offset` in `file`.
+    pub fn line_col_at(&self, file: FileId, offset: u32) -> (u32, u32) {
+        self.lines(file).line_col(offset)
+    }
+    /// The ordinary-source span an expanded span reports at: follow expansion call sites
+    /// out to the root context. Diagnostics and panic locations use the call site
+    /// (docs/ARCH.md section 6.3). With no expansions this is the span itself.
+    pub fn call_site(&self, span: Span) -> Span {
+        let mut span = span;
+        while span.ctxt != CtxtId::ROOT {
+            span = self.expansions[(span.ctxt.0 - 1) as usize].call_span;
+        }
+        span
+    }
+    /// Records one expansion and returns the context id for its tokens.
+    #[allow(dead_code)] // First caller is macro expansion; the table exists now so ctxt ids have their final meaning.
+    pub fn add_expansion(&mut self, exp: Expansion) -> CtxtId {
+        self.expansions.push(exp);
+        CtxtId(self.expansions.len() as u32)
+    }
+}
+
 /// A span as a JSON object: byte range plus 1-based line and column of both ends.
-fn span_json(index: &LineIndex, span: Span) -> String {
-    let (line, col) = index.line_col(span.start);
-    let (end_line, end_col) = index.line_col(span.end);
+fn span_json(map: &SourceMap, span: Span) -> String {
+    let (line, col) = map.line_col(span);
+    let (end_line, end_col) = map.line_col_at(span.file, span.hi);
     format!(
         "{{\"start\":{},\"end\":{},\"line\":{},\"col\":{},\"end_line\":{},\"end_col\":{}}}",
-        span.start, span.end, line, col, end_line, end_col
+        span.lo, span.hi, line, col, end_line, end_col
     )
 }
 
 /// Appends the source line for `span` and a caret line under it, with an optional note.
-fn push_snippet(out: &mut String, src: &str, index: &LineIndex, span: Span, note: Option<&str>) {
-    let (line, col) = index.line_col(span.start);
+/// `src` is the text of `span`'s file (today the map's one file; see `render`).
+fn push_snippet(out: &mut String, src: &str, map: &SourceMap, span: Span, note: Option<&str>) {
+    let (line, col) = map.line_col(span);
     let text = src.lines().nth(line as usize - 1).unwrap_or("");
-    let width = (span.end.saturating_sub(span.start)).max(1) as usize;
+    let width = (span.hi.saturating_sub(span.lo)).max(1) as usize;
     let width = width.min(text.len().saturating_sub(col as usize - 1).max(1));
     let _ = writeln!(out, "   | {text}");
     match note {
@@ -155,11 +273,15 @@ fn push_snippet(out: &mut String, src: &str, index: &LineIndex, span: Span, note
 
 /// Renders diagnostics, sorted by position, as human text or JSON lines.
 ///
+/// Paths and line numbers come from `map`; an expanded span reports at its call site.
+/// `src` is the text of the map's first file (today a crate has one file): snippets and
+/// the source hash read it.
+///
 /// At most `max_errors` distinct diagnostics are shown (0 means no cap). Repeated diagnostics
 /// with the same code and span (cascade duplicates of one root error) are suppressed. When
 /// anything is suppressed or omitted, an explicit truncation record is emitted last.
-pub fn render(diags: &mut [Diag], path: &str, src: &str, json: bool, max_errors: usize) -> String {
-    diags.sort_by(|a, b| (a.span.start, a.span.end, a.code).cmp(&(b.span.start, b.span.end, b.code)));
+pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_errors: usize) -> String {
+    diags.sort_by(|a, b| (a.span.file, a.span.lo, a.span.hi, a.code).cmp(&(b.span.file, b.span.lo, b.span.hi, b.code)));
     let mut uniq: Vec<&Diag> = Vec::with_capacity(diags.len());
     for d in diags.iter() {
         match uniq.last() {
@@ -171,24 +293,26 @@ pub fn render(diags: &mut [Diag], path: &str, src: &str, json: bool, max_errors:
     let duplicates = diags.len() - total;
     let shown = if max_errors == 0 { total } else { total.min(max_errors) };
     let omitted = total - shown;
-    let index = LineIndex::new(src);
     let hash = source_hash(src);
     let mut out = String::new();
     for d in uniq.iter().take(shown) {
-        let (line, col) = index.line_col(d.span.start);
+        let span = map.call_site(d.span);
+        let path = map.path(span.file);
+        let (line, col) = map.line_col(span);
         if json {
             let mut labels = String::new();
             for (i, l) in d.labels.iter().enumerate() {
                 if i > 0 {
                     labels.push(',');
                 }
-                let (ll, lc) = index.line_col(l.span.start);
-                let (el, ec) = index.line_col(l.span.end);
+                let ls = map.call_site(l.span);
+                let (ll, lc) = map.line_col(ls);
+                let (el, ec) = map.line_col_at(ls.file, ls.hi);
                 let _ = write!(
                     labels,
                     "{{\"start\":{},\"end\":{},\"line\":{},\"col\":{},\"end_line\":{},\"end_col\":{},\"label\":{}}}",
-                    l.span.start,
-                    l.span.end,
+                    ls.lo,
+                    ls.hi,
                     ll,
                     lc,
                     el,
@@ -219,7 +343,7 @@ pub fn render(diags: &mut [Diag], path: &str, src: &str, json: bool, max_errors:
                 json_str(&d.message),
                 json_str(path),
                 json_str(&hash),
-                span_json(&index, d.span),
+                span_json(map, span),
                 labels,
                 json_str(&d.fix),
                 edits
@@ -227,22 +351,26 @@ pub fn render(diags: &mut [Diag], path: &str, src: &str, json: bool, max_errors:
         } else {
             let _ = writeln!(out, "error[{}]: {}", d.code, d.message);
             let _ = writeln!(out, "  --> {path}:{line}:{col}");
-            push_snippet(&mut out, src, &index, d.span, None);
+            push_snippet(&mut out, src, map, span, None);
             for l in &d.labels {
-                let (ll, lc) = index.line_col(l.span.start);
-                let _ = writeln!(out, "  ::: {path}:{ll}:{lc}");
-                push_snippet(&mut out, src, &index, l.span, Some(&l.text));
+                let ls = map.call_site(l.span);
+                let (ll, lc) = map.line_col(ls);
+                let lpath = map.path(ls.file);
+                let _ = writeln!(out, "  ::: {lpath}:{ll}:{lc}");
+                push_snippet(&mut out, src, map, ls, Some(&l.text));
             }
             let _ = writeln!(out, "   = fix: {}\n", d.fix);
         }
     }
     if omitted > 0 || duplicates > 0 {
         if json {
+            // The record names one file: the first diagnostic's (the one file, today).
+            let first_path = uniq.first().map_or("", |d| map.path(map.call_site(d.span).file));
             let _ = writeln!(
                 out,
                 "{{\"schema\":{},\"kind\":\"truncated\",\"file\":{},\"source_hash\":{},\"shown\":{},\"total\":{},\"omitted\":{},\"duplicates_suppressed\":{},\"max_errors\":{}}}",
                 SCHEMA,
-                json_str(path),
+                json_str(first_path),
                 json_str(&hash),
                 shown,
                 total,
@@ -281,4 +409,55 @@ pub(crate) fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spans name a file and a context; shifting moves bytes only; `to` covers both spans.
+    #[test]
+    fn span_fields_and_shift() {
+        let s = Span::new(FileId(3), 10, 20);
+        assert_eq!((s.file, s.lo, s.hi, s.ctxt), (FileId(3), 10, 20, CtxtId::ROOT));
+        let moved = s.shifted(-4);
+        assert_eq!((moved.file, moved.lo, moved.hi, moved.ctxt), (FileId(3), 6, 16, CtxtId::ROOT));
+        let cover = Span::new(FileId(3), 15, 30).to(s);
+        assert_eq!((cover.file, cover.lo, cover.hi), (FileId(3), 10, 30));
+        assert_eq!(std::mem::size_of::<Span>(), 16);
+    }
+
+    /// Two files keep separate paths and line indexes. An expanded span reports at the
+    /// outermost call site through the expansion chain.
+    #[test]
+    fn map_files_and_call_site() {
+        let mut map = SourceMap::default();
+        let a = map.add_file("a.rs", "aa\nbb\ncc\n");
+        let b = map.add_file("b.rs", "x\nyyy\n");
+        assert_eq!((a, b), (FileId(0), FileId(1)));
+        assert_eq!(map.path(b), "b.rs");
+        assert_eq!(map.line_col(Span::new(a, 4, 5)), (2, 2));
+        assert_eq!(map.line_col(Span::new(b, 3, 4)), (2, 2));
+
+        let outer_call = Span::new(a, 0, 2);
+        let c1 = map.add_expansion(Expansion { macro_name: Sym(0), call_span: outer_call, parent: CtxtId::ROOT });
+        let inner_call = Span { file: b, lo: 2, hi: 3, ctxt: c1 };
+        let c2 = map.add_expansion(Expansion { macro_name: Sym(0), call_span: inner_call, parent: c1 });
+        assert_eq!((c1, c2), (CtxtId(1), CtxtId(2)));
+        let inner = Span { file: b, lo: 4, hi: 5, ctxt: c2 };
+        assert_eq!(map.call_site(inner), outer_call);
+        assert_eq!(map.call_site(outer_call), outer_call);
+    }
+
+    /// JSON diagnostics take `file` and line numbers from the span's file in the map.
+    #[test]
+    fn render_json_uses_span_file() {
+        let mut map = SourceMap::default();
+        map.add_file("a.rs", "aa\n");
+        let b = map.add_file("b.rs", "x\nyyy\n");
+        let mut ds = [Diag::new("L0001", Span::new(b, 3, 4), "bad", "Fix it.")];
+        let out = render(&mut ds, &map, "aa\n", true, 20);
+        assert!(out.contains(r#""file":"b.rs""#), "{out}");
+        assert!(out.contains(r#""span":{"start":3,"end":4,"line":2,"col":2,"end_line":2,"end_col":3}"#), "{out}");
+    }
 }

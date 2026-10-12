@@ -13,7 +13,7 @@ use super::{Cmd, Request, Response};
 use crate::ast::{Ast, ItemKind};
 use crate::cgen::{self, FnOut, GlueSet};
 use crate::check::collect::{self, FnId};
-use crate::diag::{self, Diag, LineIndex};
+use crate::diag::{self, Diag, FileId, LineIndex, SourceMap};
 use crate::intern::{FxMap, Sym};
 use crate::lexer;
 use crate::scan;
@@ -22,6 +22,10 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// The session's one source file in its source map. A crate is one file today, so every
+/// span the lexer makes in this pipeline names it (docs/ARCH.md section 9.2, S1).
+const ROOT_FILE: FileId = FileId(0);
 
 /// Wall time per stage.
 struct Timer {
@@ -298,20 +302,19 @@ fn chunk_end_ok(c: &Chunk) -> bool {
     c.scan.ends_at_boundary && (c.text.ends_with('\n') || chunk_ends_clean(&c.text))
 }
 
-/// Shifts every AST span at or after old offset `lo` by `delta` bytes. After an edit, the kept
-/// suffix chunks keep their text at a new offset; their items in `front.ast` still carry old
-/// spans. Spans the parser stored for an item lie within that item's chunk, so shifting by range
-/// moves exactly the suffix items' spans. Runs before anything new is parsed in this compile, so
-/// every span in the AST is still in old coordinates.
-fn shift_ast_spans(front: &mut Front, lo: usize, delta: i64) {
+/// Shifts every AST span in file `file` at or after old offset `lo` by `delta` bytes. After an
+/// edit, the kept suffix chunks keep their text at a new offset; their items in `front.ast`
+/// still carry old spans. Spans the parser stored for an item lie within that item's chunk,
+/// so shifting by range moves exactly the suffix items' spans. Runs before anything new is
+/// parsed in this compile, so every span in the AST is still in old coordinates.
+fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
     if delta == 0 {
         return;
     }
     let lo = lo as u32;
     let mut sh = |s: &mut diag::Span| {
-        if s.start >= lo {
-            s.start = (s.start as i64 + delta) as u32;
-            s.end = (s.end as i64 + delta) as u32;
+        if s.file == file && s.lo >= lo {
+            *s = s.shifted(delta);
         }
     };
     let ast = &mut front.ast;
@@ -432,14 +435,15 @@ fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
     (p, q)
 }
 
-fn errors(diags: &mut [Diag], path: &str, src: &str, req: &Request) -> Response {
+fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Response {
     let json = req.json;
-    let text = diag::render(diags, path, src, json, req.max_errors);
+    let text = diag::render(diags, map, src, json, req.max_errors);
     let mut r = Response { code: 1, ..Default::default() };
     if json {
         r.stdout = text;
     } else {
         r.stderr = text;
+        let path = map.path(ROOT_FILE);
         let _ = writeln!(r.stderr, "error: could not compile `{path}` due to {} previous error(s)", diags.len());
     }
     r
@@ -651,7 +655,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         kept_back.remove(0);
     };
-    let lines = if old_len == 0 { LineIndex::new(&src) } else { front.lines.splice(&src, region_start, region_end_old, region_end) };
+    // The source map for this request: the session's one file under the request's path,
+    // its line index spliced from the last request's index when there is one.
+    let mut map = front.map.clone();
+    if map.is_empty() {
+        map.add_file(&path, &src);
+    } else {
+        let lines =
+            if old_len == 0 { LineIndex::new(&src) } else { map.lines(ROOT_FILE).splice(&src, region_start, region_end_old, region_end) };
+        map.set_file(ROOT_FILE, &path, lines);
+    }
     let mut ranges: Vec<(usize, usize)> = kept_front.iter().map(|c| (c.start, c.start + c.text.len())).collect();
     let headers = if region_start == 0 && region_end == src.len() { fresh_headers.as_deref() } else { None };
     let middle =
@@ -663,7 +676,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let need: Vec<usize> = (0..ranges.len()).filter(|&i| reused[i].is_none()).collect();
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
-        lexer::lex(&src[a..b], a as u32, &front.interner).map(|l| {
+        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).map(|l| {
             let sc = scan::scan(&l);
             (l, sc)
         })
@@ -671,8 +684,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if fresh.iter().any(|l| l.is_err()) {
         // A chunk cut a comment or string the scanner did not see, or the text is bad: lex the
         // whole file. Its error is the answer; if it lexes, compile as one chunk. Never panic.
-        match lexer::lex(&src, 0, &front.interner) {
-            Err(mut d) => return errors(std::slice::from_mut(&mut d), &path, &src, req),
+        match lexer::lex(&src, ROOT_FILE, 0, &front.interner) {
+            Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok(whole) => {
                 let sc = scan::scan(&whole);
                 front.chunks = vec![Chunk { start: 0, text: src.clone(), lexed: whole, lexed_start: 0, scan: sc, items: None }];
@@ -692,8 +705,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                             f.fn_offset = (f.fn_offset as i64 + delta) as u32;
                         }
                         for t in &mut c.lexed.tokens {
-                            t.span.start = (t.span.start as i64 + delta) as u32;
-                            t.span.end = (t.span.end as i64 + delta) as u32;
+                            t.span = t.span.shifted(delta);
                         }
                         c.lexed_start = a;
                     }
@@ -712,7 +724,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The kept suffix moved by `delta`: put its AST spans (still in old coordinates, nothing new
     // parsed yet) at their new positions.
     if old_len > 0 {
-        shift_ast_spans(front, region_end_old, delta);
+        shift_ast_spans(front, ROOT_FILE, region_end_old, delta);
     }
     let item_scans: Vec<scan::ItemScan> = front.chunks.iter().flat_map(|c| c.scan.items.iter().copied()).collect();
     let env = scan::env_hash(item_scans.iter());
@@ -722,11 +734,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.chunks.iter().enumerate().flat_map(|(c, ch)| (0..ch.scan.fns.len()).map(move |k| (c, k))).collect();
     let scan_of = |front: &Front, i: usize| -> (u64, u32) {
         let f = &front.chunks[fn_at[i].0].scan.fns[fn_at[i].1];
-        (f.body_hash, lines.line_col(f.fn_offset).0)
+        (f.body_hash, map.line_col_at(ROOT_FILE, f.fn_offset).0)
     };
     t.lap(if need.len() == ranges.len() { "lex+scan (par)" } else { "lex+scan changed chunks" });
     front.src.clone_from(&src);
-    front.lines = lines.clone();
+    front.map = map.clone();
 
     // Which rule applies (see the top of this file).
     let bodies_only = front.env_hash == Some(env) && front.fn_slot.len() == fn_count;
@@ -768,7 +780,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 Err(d) => {
                     caches.ok[slot] = false;
-                    return errors(&mut [d], &path, &src, req);
+                    return errors(&mut [d], &map, &src, req);
                 }
             }
         }
@@ -781,7 +793,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let parsed = par_map(&todo, |&i| parser::parse(&front.chunks[i].lexed, &front.interner, &front.known));
         if let Some(Err(d)) = parsed.iter().find(|p| p.is_err()) {
             let d = d.clone();
-            return errors(&mut [d], &path, &src, req);
+            return errors(&mut [d], &map, &src, req);
         }
         let mut new_asts: FxMap<usize, Ast> = todo.iter().copied().zip(parsed.into_iter().map(|p| p.unwrap())).collect();
         let mut old_items: Vec<Option<crate::ast::Item>> = std::mem::take(&mut front.ast.items).into_iter().map(Some).collect();
@@ -809,18 +821,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             Ast::concat(parsed.into_iter().map(|p| p.unwrap()).collect())
         } else {
             // Re-parse serially for an exact error.
-            let whole = match lexer::lex(&src, 0, &front.interner) {
+            let whole = match lexer::lex(&src, ROOT_FILE, 0, &front.interner) {
                 Ok(w) => w,
                 Err(mut d) => {
                     front.env_hash = None;
-                    return errors(std::slice::from_mut(&mut d), &path, &src, req);
+                    return errors(std::slice::from_mut(&mut d), &map, &src, req);
                 }
             };
             match parser::parse(&whole, &front.interner, &front.known) {
                 Ok(a) => a,
                 Err(d) => {
                     front.env_hash = None;
-                    return errors(&mut [d], &path, &src, req);
+                    return errors(&mut [d], &map, &src, req);
                 }
             }
         };
@@ -832,7 +844,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
-            return errors(&mut ds, &path, &src, req);
+            return errors(&mut ds, &map, &src, req);
         }
     };
     if program.fns.len() != fn_count {
@@ -874,7 +886,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // so leak them on every return below and let the OS reclaim the memory at exit.
     let leak_at_exit = !caches.persistent;
     if !diags.is_empty() {
-        let resp = errors(&mut diags, &path, &src, req);
+        let resp = errors(&mut diags, &map, &src, req);
         if leak_at_exit {
             std::mem::forget(results);
             std::mem::forget(program);
@@ -896,7 +908,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Codegen for the work set.
     let bodies: Vec<(usize, ir::Body)> = work.iter().copied().zip(results).filter_map(|(i, r)| r.0.map(|b| (i, b))).collect();
-    let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &lines, scan_of(front, *i).1, &front.fn_slot));
+    let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, scan_of(front, *i).1, &front.fn_slot));
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
@@ -966,7 +978,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, &path, &slot_lines, &registered),
+        0 => cgen::main_unit(main_slot, map.path(ROOT_FILE), &slot_lines, &registered),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
@@ -982,7 +994,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &path, &slot_lines, &[]) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, map.path(ROOT_FILE), &slot_lines, &[]) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }

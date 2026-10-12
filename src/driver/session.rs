@@ -4,7 +4,7 @@
 // session once. The pipeline itself is in compile.rs.
 use crate::ast::Ast;
 use crate::cgen::{FnOut, GlueSet};
-use crate::diag::LineIndex;
+use crate::diag::SourceMap;
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::lexer::Lexed;
 use crate::scan;
@@ -29,9 +29,11 @@ pub(crate) struct Front {
     pub(crate) slot_hash: Vec<u64>,
     /// Lexed and scanned chunks from the last request, reused when their text is unchanged.
     pub(crate) chunks: Vec<Chunk>,
-    /// The source and line index of the last request, to find what an edit changed.
+    /// The source text of the last request, to find what an edit changed.
     pub(crate) src: String,
-    pub(crate) lines: LineIndex,
+    /// The session's source map: each file's path and line index. One file per session
+    /// today, always `FileId(0)`; spans in the AST name it.
+    pub(crate) map: SourceMap,
     /// The chunk-boundary mask (see `split_items`). Fixed for the session, so boundaries are too.
     pub(crate) split_mask: Option<u64>,
 }
@@ -101,7 +103,7 @@ impl Session {
                 slot_hash: Vec::new(),
                 chunks: Vec::new(),
                 src: String::new(),
-                lines: LineIndex::new(""),
+                map: SourceMap::default(),
                 split_mask: None,
             },
             caches: Caches {

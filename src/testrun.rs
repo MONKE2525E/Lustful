@@ -11,7 +11,7 @@
 // any test fails or times out, 2 for bad arguments or an unreadable file. A skipped or filtered
 // test is never reported as a pass; it is counted in `filtered_out`.
 use crate::ast::{ItemKind, TyExpr};
-use crate::diag::{self, Diag};
+use crate::diag::{self, Diag, FileId, SourceMap};
 use crate::driver::{self, Cmd, Request};
 use crate::intern::{Interner, Known};
 use crate::{lexer, parser};
@@ -179,16 +179,19 @@ pub fn run(args: &[String]) -> i32 {
         101
     };
 
-    // Parse once to find the tests, their names, and the user's `main` (if any).
+    // Parse once to find the tests, their names, and the user's `main` (if any). This
+    // one-shot parse has its own source map with the user file as file 0.
+    let mut map = SourceMap::default();
+    map.add_file(&path, &src);
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let lexed = match lexer::lex(&src, 0, &interner) {
+    let lexed = match lexer::lex(&src, FileId(0), 0, &interner) {
         Ok(l) => l,
-        Err(d) => return fail_build(diag::render(&mut [d], &path, &src, opts.json, opts.max_errors), 0),
+        Err(d) => return fail_build(diag::render(&mut [d], &map, &src, opts.json, opts.max_errors), 0),
     };
     let ast = match parser::parse(&lexed, &interner, &known) {
         Ok(a) => a,
-        Err(d) => return fail_build(diag::render(&mut [d], &path, &src, opts.json, opts.max_errors), 0),
+        Err(d) => return fail_build(diag::render(&mut [d], &map, &src, opts.json, opts.max_errors), 0),
     };
     let mut tests: Vec<String> = Vec::new();
     let mut fn_names: Vec<String> = Vec::new();
@@ -227,7 +230,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     if !bad.is_empty() {
-        return fail_build(diag::render(&mut bad, &path, &src, opts.json, opts.max_errors), 0);
+        return fail_build(diag::render(&mut bad, &map, &src, opts.json, opts.max_errors), 0);
     }
     let selected: Vec<String> = match &opts.filter {
         Some(f) => tests.iter().filter(|n| n.contains(f.as_str())).cloned().collect(),
@@ -289,7 +292,7 @@ pub fn run(args: &[String]) -> i32 {
             .iter()
             .find(|c| !fn_names.iter().any(|n| n == *c))
             .expect("no free name for the user main");
-        harness.replace_range(span.start as usize..span.end as usize, replacement);
+        harness.replace_range(span.lo as usize..span.hi as usize, replacement);
     }
     harness.push_str("\nfn main() {\n    let n = std::env::args().count();\n    if n == 1 {\n");
     for t in &selected {

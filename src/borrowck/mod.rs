@@ -152,7 +152,7 @@ struct Ck<'b, 'p, 'a> {
     preds: Vec<Vec<u32>>,
     live_out_stmt: Vec<Vec<BitSet>>,
     errs: Vec<Diag>,
-    seen: HashSet<(&'static str, u32, u32)>,
+    seen: HashSet<(&'static str, Span)>,
     report: bool,
     /// Loans that flow into a return value or behind a parameter reference. Their region
     /// must outlive a parameter lifetime, and rustc's NLL treats such a region as live at
@@ -265,7 +265,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     /// Reports an error with labeled secondary spans (where a borrow starts, where it is used).
     fn err_labeled(&mut self, code: &'static str, span: Span, msg: String, fix: &str, labels: Vec<(Span, &'static str)>) {
-        if self.report && self.seen.insert((code, span.start, span.end)) {
+        if self.report && self.seen.insert((code, span)) {
             let mut d = Diag::new(code, span, msg, fix);
             for (s, text) in labels {
                 if s != span && s != Span::default() {
@@ -369,11 +369,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                 }
             }
-            loan.last_use = uses
-                .iter()
-                .filter(|&&(l, s)| s.start > loan.span.start && holders_set.contains(&l))
-                .map(|&(_, s)| s)
-                .max_by_key(|s| s.start);
+            loan.last_use =
+                uses.iter().filter(|&&(l, s)| s.lo > loan.span.lo && holders_set.contains(&l)).map(|&(_, s)| s).max_by_key(|s| s.lo);
         }
     }
 
@@ -955,7 +952,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 "cannot move out of a Vec index".into(),
                 "Borrow the element with `&v[i]`, or clone it with `v[i].clone()`.",
             );
-        } else if self.report && self.seen.insert(("L9001", span.start, span.end)) {
+        } else if self.report && self.seen.insert(("L9001", span)) {
             let mut d = unsupported(span, "moving a field out of a struct or enum");
             d.fix = "Clone the field with `.clone()`, or match on a reference (`match &value`) and borrow it.".into();
             self.errs.push(d);

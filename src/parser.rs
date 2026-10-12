@@ -49,7 +49,7 @@ pub type ParsedBody = (BlockId, (u32, u32), (u32, u32));
 pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner: &Interner, known: &Known) -> PResult<ParsedBody> {
     let mut toks = tokens.to_vec();
     let end = tokens.last().map_or(Span::default(), |t| t.span);
-    toks.push(Token { tok: Tok::Eof, span: Span::new(end.end, end.end) });
+    toks.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
     let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0 };
@@ -228,13 +228,20 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// True when the token after the current one starts where the current one ends, in
+    /// the same file: the two were lexed as one punctuator with no space between them.
+    fn next_touches(&self) -> bool {
+        let a = self.toks[self.pos].span;
+        let b = self.toks[self.pos + 1].span;
+        a.file == b.file && a.hi == b.lo
+    }
     /// True if the next two tokens are `>` `>` with no space, which means a right shift.
     fn at_shr(&self) -> bool {
-        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Gt && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
+        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Gt && self.next_touches()
     }
     /// True at a `>>=`: lexed as `>` followed by `>=`, touching.
     fn at_shr_assign(&self) -> bool {
-        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Ge && self.toks[self.pos].span.end == self.toks[self.pos + 1].span.start
+        self.peek() == Tok::Gt && self.peek_at(1) == Tok::Ge && self.next_touches()
     }
 
     /// Runs `f` one nesting level deeper, or errors past `MAX_DEPTH`.

@@ -1,5 +1,5 @@
 // Lexer: turns source bytes into a flat token list. Identifiers are interned here.
-use crate::diag::{Diag, Span};
+use crate::diag::{Diag, FileId, Span};
 use crate::intern::{FxMap, Interner, Sym};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,16 +215,18 @@ fn suffix(s: &str) -> Option<Option<IntSuffix>> {
     }))
 }
 
-/// Lexes `src`, which starts at byte `base` of the file. Stops at the first error.
-pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
+/// Lexes `src`, which starts at byte `base` of file `file`. Every token span names that
+/// file with the root context. Stops at the first error.
+pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
     let b = src.as_bytes();
     let mut tokens = Vec::with_capacity(src.len() / 4);
     let mut strings = Vec::new();
     let mut i = 0usize;
     // Local cache in front of the shared interner, so repeated names skip its lock.
     let mut cache: FxMap<&str, Sym> = FxMap::default();
-    let err =
-        |start: usize, end: usize, msg: &str| Diag::new("L0001", Span::new(base + start as u32, base + end as u32), msg, "Fix the syntax.");
+    let err = |start: usize, end: usize, msg: &str| {
+        Diag::new("L0001", Span::new(file, base + start as u32, base + end as u32), msg, "Fix the syntax.")
+    };
     while i < b.len() {
         let c = b[i];
         let start = i;
@@ -275,7 +277,7 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
                 if raw_ident_invalid(name) {
                     return Err(Diag::new(
                         "L0001",
-                        Span::new(base + start as u32, base + i as u32),
+                        Span::new(file, base + start as u32, base + i as u32),
                         format!("`r#{name}` is not a valid identifier"),
                         "Use a different name. `self`, `Self`, `super`, `crate`, and `_` cannot be raw identifiers.",
                     ));
@@ -410,10 +412,10 @@ pub fn lex(src: &str, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
             i += n;
             t
         };
-        tokens.push(Token { tok, span: Span::new(base + start as u32, base + i as u32) });
+        tokens.push(Token { tok, span: Span::new(file, base + start as u32, base + i as u32) });
     }
     let end = base + b.len() as u32;
-    tokens.push(Token { tok: Tok::Eof, span: Span::new(end, end) });
+    tokens.push(Token { tok: Tok::Eof, span: Span::new(file, end, end) });
     Ok(Lexed { tokens, strings })
 }
 
