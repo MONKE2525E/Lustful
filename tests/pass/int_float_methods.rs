@@ -1,0 +1,30 @@
+fn main() {
+    println!("{} {} {}", i32::MIN.wrapping_div(-1), i32::MIN.wrapping_rem(-1), 5u8.wrapping_neg());
+    println!("{} {}", 1u32.wrapping_shl(33), (-8i32).wrapping_shr(33));
+    println!("{:?} {:?}", 1u8.checked_shl(8), 1u8.checked_shl(7));
+    println!("{:?} {:?}", i8::MIN.checked_abs(), 0u8.checked_neg());
+    println!("{} {}", i8::MIN.saturating_abs(), i8::MIN.saturating_neg());
+    println!("{} {}", 200u8.saturating_pow(2), (-3i8).saturating_pow(3));
+    println!("{:?} {:?}", 250u8.overflowing_add(10), 1u32.overflowing_shl(33));
+    println!("{:?} {:?}", i32::MIN.overflowing_neg(), 5u8.overflowing_neg());
+    println!("{} {} {}", (-7i32).div_euclid(3), (-7i32).rem_euclid(3), 7i32.div_euclid(-3));
+    println!("{} {} {}", 0x12345678u32.rotate_right(8), 0x1234u16.reverse_bits(), (-1i16).leading_ones());
+    println!("{} {} {}", 16u32.is_power_of_two(), 0u32.is_power_of_two(), (-3i64).is_negative());
+    println!("{} {}", 255u8.count_zeros(), 1u128.trailing_zeros());
+    println!("{} {}", (1u128 << 100).count_ones(), (1u128 << 100).leading_zeros());
+    println!("{} {}", 0x123456789abcdef0u128.swap_bytes(), 3u128.reverse_bits() >> 126);
+    println!("{} {}", (1u128 << 127).rotate_left(1), (1i128).signum());
+    println!("{} {}", 2.0f64.max(-0.0), 0.0f64.min(-0.0));
+    println!("{} {}", (1.5f64).powi(-7), (2.5f32).powi(-3));
+    println!("{} {} {}", 'é'.len_utf8(), 'a'.len_utf16(), '\u{10000}'.len_utf16());
+    println!("{} {} {}", 'g'.is_ascii_hexdigit(), '!'.is_ascii_punctuation(), 'x'.is_digit(16));
+    println!("{} {}", 2.5f64.to_string(), 0.1f32.to_string());
+    println!("{} {}", f32::from_bits(0x3f800000), 1.0f32.to_bits());
+    println!("{:?}", 10u32.checked_pow(10));
+    println!("{}", 10u32.wrapping_pow(10));
+    println!("{} {}", (255u8).saturating_add(1), (0u8).saturating_sub(1));
+    println!("{}", 2u64.checked_pow(63).unwrap());
+    println!("{} {}", 1.5f64.copysign(-2.0), (-1.5f64).fract());
+    println!("{} {}", (9.0f64).sqrt(), (2.0f32).ln());
+    println!("{}", (100.0f64).log(10.0));
+}

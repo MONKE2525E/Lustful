@@ -1676,6 +1676,96 @@ impl FnGen<'_, '_, '_> {
                     format!("(({c})((uint64_t)({}) {op} (uint64_t)({})))", vals[0], vals[1])
                 }
             }
+            B::WrappingDiv
+            | B::WrappingRem
+            | B::WrappingNeg
+            | B::WrappingPow
+            | B::WrappingShl
+            | B::WrappingShr
+            | B::WrappingAbs
+            | B::CheckedAdd
+            | B::CheckedSub
+            | B::CheckedMul
+            | B::CheckedDiv
+            | B::CheckedRem
+            | B::CheckedNeg
+            | B::CheckedAbs
+            | B::CheckedPow
+            | B::CheckedShl
+            | B::CheckedShr
+            | B::SaturatingAdd
+            | B::SaturatingSub
+            | B::SaturatingMul
+            | B::SaturatingDiv
+            | B::SaturatingNeg
+            | B::SaturatingAbs
+            | B::SaturatingPow
+            | B::OverflowingAdd
+            | B::OverflowingSub
+            | B::OverflowingMul
+            | B::OverflowingDiv
+            | B::OverflowingRem
+            | B::OverflowingNeg
+            | B::OverflowingAbs
+            | B::OverflowingPow
+            | B::OverflowingShl
+            | B::OverflowingShr
+            | B::CountOnes
+            | B::CountZeros
+            | B::LeadingZeros
+            | B::TrailingZeros
+            | B::LeadingOnes
+            | B::TrailingOnes
+            | B::RotateLeft
+            | B::RotateRight
+            | B::SwapBytes
+            | B::ReverseBits
+            | B::DivEuclid
+            | B::RemEuclid
+            | B::Signum
+            | B::IsPositive
+            | B::IsNegative
+            | B::IsPowerOfTwo => self.int_method_c(b, &vals, &tys, loc),
+            B::FloatSqrt
+            | B::FloatPowi
+            | B::FloatPowf
+            | B::FloatExp
+            | B::FloatLn
+            | B::FloatLog
+            | B::FloatLog2
+            | B::FloatLog10
+            | B::FloatMulAdd
+            | B::FloatFloor
+            | B::FloatCeil
+            | B::FloatRound
+            | B::FloatTrunc
+            | B::FloatFract
+            | B::FloatAbs
+            | B::FloatSignum
+            | B::FloatRecip
+            | B::FloatMin
+            | B::FloatMax
+            | B::FloatIsNan
+            | B::FloatIsInfinite
+            | B::FloatIsFinite
+            | B::FloatIsSignPositive
+            | B::FloatIsSignNegative
+            | B::FloatToBits
+            | B::FloatCopysign
+            | B::F32FromBits
+            | B::F64FromBits => self.float_method_c(b, &vals, &tys),
+            B::CharLenUtf8 => format!("((uint64_t)({0} < 0x80u ? 1 : {0} < 0x800u ? 2 : {0} < 0x10000u ? 3 : 4))", vals[0]),
+            B::CharLenUtf16 => format!("((uint64_t)({0} < 0x10000u ? 1 : 2))", vals[0]),
+            B::CharIsAscii => format!("(*{0} < 128u)", vals[0]),
+            B::CharIsAsciiPunctuation => {
+                format!("(((*{0} >= 33u && *{0} <= 47u) || (*{0} >= 58u && *{0} <= 64u) || (*{0} >= 91u && *{0} <= 96u) || (*{0} >= 123u && *{0} <= 126u)))", vals[0])
+            }
+            B::CharIsAsciiGraphic => format!("(*{0} >= 33u && *{0} <= 126u)", vals[0]),
+            B::CharIsAsciiHexdigit => {
+                format!("(((*{0} >= '0' && *{0} <= '9') || ((*{0} | 32) >= 'a' && (*{0} | 32) <= 'f')))", vals[0])
+            }
+            B::CharIsAsciiControl => format!("(*{0} < 32u || *{0} == 127u)", vals[0]),
+            B::CharIsDigitRadix => format!("(lust_digit({0}, {1}, {loc}) != 0xFFFFFFFFu)", vals[0], vals[1]),
             B::Abs => format!("lust_abs_{}({}, {loc})", int_fn(int_of(&tys[0])), vals[0]),
             B::Pow => format!("lust_pow_{}({}, {}, {loc})", int_fn(int_of(&tys[0])), vals[0], vals[1]),
             B::Min | B::Max => {
@@ -1862,6 +1952,479 @@ impl FnGen<'_, '_, '_> {
     }
 
     // ---------- Formatting ----------
+
+    /// The C for one inherent integer method (see the family arms in
+    /// `builtin`). Widths up to 64 run through the generic word ops in
+    /// core.c; 128-bit values use the two-word helpers for the subset
+    /// the checker lets through.
+    fn int_method_c(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> String {
+        use Builtin as B;
+        use std::fmt::Write as _;
+        let it = match &tys[0] {
+            CTy::Int(i) => *i,
+            _ => IntTy::I64,
+        };
+        if is128(it) {
+            return self.int128_method_c(b, vals, it, loc);
+        }
+        let bits = it.bits();
+        let sgn = it.signed();
+        let ct = int_c(it);
+        let a = &vals[0];
+        let ua = format!("((uint64_t)({a}))");
+        let ub = if vals.len() > 1 { format!("((uint64_t)({}))", vals[1]) } else { String::new() };
+        let mask = if bits >= 64 { "~0ull".to_string() } else { format!("((1ull << {bits}) - 1ull)") };
+        let masked_a = format!("({ua} & {mask})");
+        let div0 = |b: Builtin| -> &'static str {
+            if matches!(b, B::WrappingRem | B::CheckedRem | B::SaturatingDiv) {
+                "attempt to calculate the remainder with a divisor of zero"
+            } else {
+                "attempt to divide by zero"
+            }
+        };
+        // A checked_op call into fresh (out, rc) temporaries. Returns
+        // the statement text; rc is 1 ok, 0 overflow, -1 div by zero.
+        let checked_call = |this: &mut Self, a64: &str, b64: &str, op: i32| -> (String, String) {
+            let (o, rc) = (this.tmp(), this.tmp());
+            let _ = write!(
+                this.out,
+                "    uint64_t {o}; int {rc} = lust_checked_op({a64}, {b64}, {bits}, {}, {op}, &{o});\n",
+                sgn as i32
+            );
+            (o, rc)
+        };
+        match b {
+            B::WrappingDiv | B::WrappingRem => {
+                let op = if b == B::WrappingDiv { 3 } else { 4 };
+                let (o, rc) = checked_call(self, &ua, &ub, op);
+                let msg = div0(b);
+                let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{msg}\", {loc});");
+                format!("(({ct}){o})")
+            }
+            B::WrappingNeg => format!("(({ct})((0ull - {ua}) & {mask}))"),
+            B::WrappingAbs => format!("(({a} < 0 ? ({ct})((0ull - {ua}) & {mask}) : {a}))"),
+            B::WrappingPow => format!("(({ct})lust_wrapping_pow({ua}, {}, {bits}))", vals[1]),
+            B::WrappingShl => format!("(({ct})(({masked_a} << ({} & {})) & {mask}))", vals[1], bits - 1),
+            B::WrappingShr => {
+                if sgn {
+                    format!("(({ct})(((int64_t)({a}) >> ({} & {})) & (int64_t){mask}))", vals[1], bits - 1)
+                } else {
+                    format!("(({ct})({masked_a} >> ({} & {})))", vals[1], bits - 1)
+                }
+            }
+            B::CheckedAdd | B::CheckedSub | B::CheckedMul | B::CheckedDiv | B::CheckedRem => {
+                let op = match b {
+                    B::CheckedAdd => 0,
+                    B::CheckedSub => 1,
+                    B::CheckedMul => 2,
+                    B::CheckedDiv => 3,
+                    _ => 4,
+                };
+                let (o, rc) = checked_call(self, &ua, &ub, op);
+                self.int_option_c(&format!("(({ct}){o})"), &format!("{rc} == 1"), it)
+            }
+            B::CheckedNeg => {
+                let (o, rc) = checked_call(self, "0ull", &ua, 1);
+                self.int_option_c(&format!("(({ct}){o})"), &format!("{rc} == 1"), it)
+            }
+            B::CheckedAbs => {
+                let x = self.tmp();
+                let _ = writeln!(self.out, "    {ct} {x} = {a};");
+                let (o, rc) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {o}; int {rc} = {x} >= 0 ? ({o} = (uint64_t){x}, 1) : lust_checked_op(0ull, (uint64_t){x}, {bits}, {}, 1, &{o});",
+                    sgn as i32
+                );
+                self.int_option_c(&format!("(({ct}){o})"), &format!("{rc} == 1"), it)
+            }
+            B::CheckedPow => {
+                let (o, rc) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});",
+                    vals[1],
+                    sgn as i32
+                );
+                self.int_option_c(&format!("(({ct}){o})"), &format!("{rc} == 1"), it)
+            }
+            B::CheckedShl | B::CheckedShr => {
+                let amt = &vals[1];
+                let r = if b == B::CheckedShl {
+                    format!("(({ct})(({masked_a} << ({amt} & 63u)) & {mask}))")
+                } else if sgn {
+                    format!("(({ct})(((int64_t)({a}) >> ({amt} & 63u)) & (int64_t){mask}))")
+                } else {
+                    format!("(({ct})({masked_a} >> ({amt} & 63u)))")
+                };
+                self.int_option_c(&r, &format!("{amt} < {bits}u"), it)
+            }
+            _ => self.int_method_c2(b, vals, it, loc),
+        }
+    }
+
+    /// An Option<int> value holding `expr` when `cond` holds, else None.
+    fn int_option_c(&mut self, expr: &str, cond: &str, it: IntTy) -> String {
+        use std::fmt::Write as _;
+        let opt = CTy::Option(Box::new(CTy::Int(it)));
+        let ot = ctype(&opt);
+        let t = self.tmp();
+        let field = variant_field(self.p, &opt, &t, 1, 0);
+        let some = disc_set(self.p, &opt, &t, 1);
+        let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+        let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+        let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {expr};{some} }}");
+        t
+    }
+
+    /// The saturating, overflowing, and bit inspection families.
+    fn int_method_c2(&mut self, b: Builtin, vals: &[String], it: IntTy, loc: &str) -> String {
+        use Builtin as B;
+        use std::fmt::Write as _;
+        let bits = it.bits();
+        let sgn = it.signed();
+        let ct = int_c(it);
+        let a = &vals[0];
+        let ua = format!("((uint64_t)({a}))");
+        let ub = if vals.len() > 1 { format!("((uint64_t)({}))", vals[1]) } else { String::new() };
+        let mask: String = if bits >= 64 { "~0ull".into() } else { format!("((1ull << {bits}) - 1ull)") };
+        let masked_a = format!("({ua} & {mask})");
+        let max_lit = if sgn {
+            if bits >= 64 { format!("(({ct})0x7FFFFFFFFFFFFFFFll)") } else { format!("(({ct}){}ll)", (1i128 << (bits - 1)) - 1) }
+        } else if bits >= 64 {
+            format!("(({ct})~0ull)")
+        } else {
+            format!("(({ct}){}ull)", (1u128 << bits) - 1)
+        };
+        let min_lit = if sgn {
+            if bits >= 64 { format!("(({ct})(-9223372036854775807ll - 1))") } else { format!("(({ct}){}ll)", -(1i128 << (bits - 1))) }
+        } else {
+            format!("(({ct})0)")
+        };
+        let sa = format!("((int64_t)({a}))");
+        let sb = if vals.len() > 1 { format!("((int64_t)({}))", vals[1]) } else { String::new() };
+        let sat_op = |b: Builtin| -> Option<i32> {
+            Some(match b {
+                B::SaturatingAdd | B::OverflowingAdd => 0,
+                B::SaturatingSub | B::OverflowingSub => 1,
+                B::SaturatingMul | B::OverflowingMul => 2,
+                B::SaturatingDiv | B::OverflowingDiv => 3,
+                B::OverflowingRem => 4,
+                _ => return None,
+            })
+        };
+        if let Some(op) = sat_op(b) {
+            let (o, rc) = (self.tmp(), self.tmp());
+            let _ = writeln!(
+                self.out,
+                "    uint64_t {o}; int {rc} = lust_checked_op({ua}, {ub}, {bits}, {}, {op}, &{o});",
+                sgn as i32
+            );
+            let div0msg = if op == 4 {
+                "attempt to calculate the remainder with a divisor of zero"
+            } else {
+                "attempt to divide by zero"
+            };
+            let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{div0msg}\", {loc});");
+            if matches!(b, B::SaturatingAdd | B::SaturatingSub | B::SaturatingMul | B::SaturatingDiv) {
+                // Clamp to the endpoint the true result passes.
+                let clamp = if !sgn {
+                    if op == 1 { min_lit.clone() } else { max_lit.clone() }
+                } else {
+                    match op {
+                        0 | 1 => format!("({sa} >= 0 ? {max_lit} : {min_lit})"),
+                        2 => format!("((({sa} < 0) != ({sb} < 0)) ? {min_lit} : {max_lit})"),
+                        _ => max_lit.clone(),
+                    }
+                };
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {ct} {t} = {rc} == 1 ? ({ct}){o} : {clamp};");
+                return t;
+            }
+            // Overflowing: (wrapping result, overflowed).
+            let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+            let tt = ctype(&tup);
+            let t = self.tmp();
+            let _ = writeln!(self.out, "    {tt} {t}; {t}.f0 = ({ct}){o}; {t}.f1 = {rc} == 0;");
+            return t;
+        }
+        match b {
+            B::SaturatingNeg | B::SaturatingAbs => {
+                let x = self.tmp();
+                let _ = writeln!(self.out, "    {ct} {x} = {a};");
+                let t = self.tmp();
+                let inner = if b == B::SaturatingNeg {
+                    format!("{x} == {min_lit} ? {max_lit} : -{x}")
+                } else {
+                    format!("{x} == {min_lit} ? {max_lit} : ({x} < 0 ? -{x} : {x})")
+                };
+                let _ = writeln!(self.out, "    {ct} {t} = {inner};");
+                t
+            }
+            B::OverflowingNeg | B::OverflowingAbs => {
+                let (o, rc) = (self.tmp(), self.tmp());
+                if b == B::OverflowingNeg {
+                    let _ = writeln!(
+                        self.out,
+                        "    uint64_t {o}; int {rc} = lust_checked_op(0ull, {ua}, {bits}, {}, 1, &{o});",
+                        sgn as i32
+                    );
+                } else {
+                    let x = self.tmp();
+                    let _ = writeln!(self.out, "    {ct} {x} = {a};");
+                    let _ = writeln!(
+                        self.out,
+                        "    uint64_t {o}; int {rc} = {x} >= 0 ? ({o} = (uint64_t){x}, 1) : lust_checked_op(0ull, (uint64_t){x}, {bits}, {}, 1, &{o});",
+                        sgn as i32
+                    );
+                }
+                let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+                let tt = ctype(&tup);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {tt} {t}; {t}.f0 = ({ct}){o}; {t}.f1 = {rc} == 0;");
+                t
+            }
+            B::SaturatingPow | B::OverflowingPow => {
+                let (o, rc) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});",
+                    vals[1],
+                    sgn as i32
+                );
+                if b == B::SaturatingPow {
+                    let clamp = if sgn {
+                        format!("(({sa} < 0 && ({} & 1u)) ? {min_lit} : {max_lit})", vals[1])
+                    } else {
+                        max_lit.clone()
+                    };
+                    let t = self.tmp();
+                    let _ = writeln!(self.out, "    {ct} {t} = {rc} == 1 ? ({ct}){o} : {clamp};");
+                    t
+                } else {
+                    let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+                    let tt = ctype(&tup);
+                    let t = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    {tt} {t}; {t}.f0 = ({ct})lust_wrapping_pow({ua}, {}, {bits}); {t}.f1 = {rc} == 0;",
+                        vals[1]
+                    );
+                    t
+                }
+            }
+            B::OverflowingShl | B::OverflowingShr => {
+                let amt = &vals[1];
+                let r = if b == B::OverflowingShl {
+                    format!("(({ct})(({masked_a} << ({amt} & {})) & {mask}))", bits - 1)
+                } else if sgn {
+                    format!("(({ct})(((int64_t)({a}) >> ({amt} & {})) & (int64_t){mask}))", bits - 1)
+                } else {
+                    format!("(({ct})({masked_a} >> ({amt} & {})))", bits - 1)
+                };
+                let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+                let tt = ctype(&tup);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {tt} {t}; {t}.f0 = {r}; {t}.f1 = {amt} >= {bits}u;");
+                t
+            }
+            B::CountOnes => format!("lust_count_ones64({masked_a})"),
+            B::CountZeros => format!("({bits}u - lust_count_ones64({masked_a}))"),
+            B::LeadingZeros => format!("lust_leading_zeros64({masked_a}, {bits})"),
+            B::TrailingZeros => format!("lust_trailing_zeros64({masked_a}, {bits})"),
+            B::LeadingOnes => format!("lust_leading_zeros64((~{ua}) & {mask}, {bits})"),
+            B::TrailingOnes => format!("lust_trailing_zeros64((~{ua}) & {mask}, {bits})"),
+            B::RotateLeft | B::RotateRight => {
+                let (x, n) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    uint64_t {x} = {masked_a}; uint32_t {n} = {} & {};", vals[1], bits - 1);
+                if b == B::RotateLeft {
+                    format!("(({ct})((({x} << {n}) | ({x} >> (({bits} - {n}) & {}))) & {mask}))", bits - 1)
+                } else {
+                    format!("(({ct})((({x} >> {n}) | ({x} << (({bits} - {n}) & {}))) & {mask}))", bits - 1)
+                }
+            }
+            B::SwapBytes => {
+                let (x, r, i) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {x} = {masked_a}, {r} = 0; for (uint32_t {i} = 0; {i} < {bits} / 8; {i}++) {r} = ({r} << 8) | (({x} >> (8 * {i})) & 0xFFull);"
+                );
+                format!("(({ct}){r})")
+            }
+            B::ReverseBits => {
+                let (x, r, i) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {x} = {masked_a}, {r} = 0; for (uint32_t {i} = 0; {i} < {bits}; {i}++) {r} |= (({x} >> {i}) & 1ull) << ({bits} - 1 - {i});"
+                );
+                format!("(({ct}){r})")
+            }
+            B::DivEuclid => format!("(({ct})lust_div_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
+            B::RemEuclid => format!("(({ct})lust_rem_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
+            B::Signum => format!("(({ct})(({a} > 0) - ({a} < 0)))"),
+            B::IsPositive => format!("({a} > 0)"),
+            B::IsNegative => format!("({a} < 0)"),
+            B::IsPowerOfTwo => format!("({masked_a} != 0 && ({masked_a} & ({masked_a} - 1)) == 0)"),
+            _ => "0".into(),
+        }
+    }
+
+    /// The 128-bit subset of the integer methods (the checker keeps
+    /// the checked, saturating, and overflowing families out for now).
+    fn int128_method_c(&mut self, b: Builtin, vals: &[String], it: IntTy, loc: &str) -> String {
+        use Builtin as B;
+        use std::fmt::Write as _;
+        let _ = loc;
+        let ct = int_c(it);
+        let f = int_fn(it);
+        let a = &vals[0];
+        let x = self.tmp();
+        let _ = writeln!(self.out, "    {ct} {x} = {a};");
+        // A uint64 byte swap of the word `w`, as an expression.
+        fn bswap(w: &str) -> String {
+            let mut parts = Vec::new();
+            for i in 0..8 {
+                parts.push(format!("(({w} >> {}) & 0xFFull) << {}", 8 * i, 56 - 8 * i));
+            }
+            format!("({})", parts.join(" | "))
+        }
+        match b {
+            B::WrappingNeg => format!("lust_{f}_sub((({ct}){{0, 0}}), {x})"),
+            B::WrappingShl => format!("lust_{f}_shl({x}, {} & 127u)", vals[1]),
+            B::WrappingShr => format!("lust_{f}_shr({x}, {} & 127u)", vals[1]),
+            B::WrappingAbs => {
+                let t = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    {ct} {t} = (int64_t){x}.hi < 0 ? lust_{f}_sub((({ct}){{0, 0}}), {x}) : {x};"
+                );
+                t
+            }
+            B::CountOnes => format!("(lust_count_ones64({x}.lo) + lust_count_ones64({x}.hi))"),
+            B::CountZeros => format!("(128u - lust_count_ones64({x}.lo) - lust_count_ones64({x}.hi))"),
+            B::LeadingZeros => format!("({x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64))"),
+            B::TrailingZeros => format!("({x}.lo != 0 ? lust_trailing_zeros64({x}.lo, 64) : 64u + lust_trailing_zeros64({x}.hi, 64))"),
+            B::LeadingOnes => format!("({x}.hi != ~0ull ? lust_leading_zeros64(~{x}.hi, 64) : 64u + lust_leading_zeros64(~{x}.lo, 64))"),
+            B::TrailingOnes => format!("({x}.lo != ~0ull ? lust_trailing_zeros64(~{x}.lo, 64) : 64u + lust_trailing_zeros64(~{x}.hi, 64))"),
+            B::RotateLeft | B::RotateRight => {
+                let n = self.tmp();
+                let _ = writeln!(self.out, "    uint32_t {n} = {} & 127u;", vals[1]);
+                let t = self.tmp();
+                let (o1, o2) = if b == B::RotateLeft { ("shl", "shr") } else { ("shr", "shl") };
+                if it.signed() {
+                    let _ = writeln!(
+                        self.out,
+                        "    {ct} {t} = lust_i128_from_u128(lust_u128_or(lust_u128_from_i128(lust_{f}_{o1}({x}, {n})), lust_u128_from_i128(lust_{f}_{o2}({x}, (128u - {n}) & 127u))));"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "    {ct} {t} = lust_u128_or(lust_{f}_{o1}({x}, {n}), lust_{f}_{o2}({x}, (128u - {n}) & 127u));"
+                    );
+                }
+                t
+            }
+            B::SwapBytes => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {ct} {t}; {t}.lo = {}; {t}.hi = {};", bswap(&format!("{x}.hi")), bswap(&format!("{x}.lo")));
+                t
+            }
+            B::ReverseBits => {
+                let (r, i) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {ct} {r} = {{0, 0}}; for (uint32_t {i} = 0; {i} < 64; {i}++) {{ {r}.hi |= (({x}.lo >> {i}) & 1ull) << (63 - {i}); {r}.lo |= (({x}.hi >> {i}) & 1ull) << (63 - {i}); }}"
+                );
+                r
+            }
+            B::Signum => {
+                let (t, c) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {ct} {t} = {{0, 0}}; int32_t {c} = lust_i128_cmp({x}, {t}); {t}.lo = (uint64_t)(int64_t){c}; {t}.hi = (uint64_t)((int64_t){c} >> 63);"
+                );
+                t
+            }
+            B::IsPositive => format!("((int64_t){x}.hi > 0 || ({x}.hi == 0 && {x}.lo != 0))"),
+            B::IsNegative => format!("((int64_t){x}.hi < 0)"),
+            B::IsPowerOfTwo => format!("(lust_count_ones64({x}.lo) + lust_count_ones64({x}.hi) == 1)"),
+            _ => "0".into(),
+        }
+    }
+
+    /// The C for one inherent float method: mostly the libm call Rust
+    /// lowers to, with lust wrappers where Rust's semantics differ.
+    fn float_method_c(&mut self, b: Builtin, vals: &[String], tys: &[CTy]) -> String {
+        use Builtin as B;
+        if matches!(b, B::F32FromBits | B::F64FromBits) {
+            return if b == B::F64FromBits {
+                format!("lust_f64_from_bits_of({})", vals[0])
+            } else {
+                format!("lust_f32_from_bits_of({})", vals[0])
+            };
+        }
+        let f = match &tys[0] {
+            CTy::Float(f) => *f,
+            _ => FloatTy::F64,
+        };
+        let a = &vals[0];
+        let suf = if f == FloatTy::F32 { "f" } else { "" };
+        let w = if f == FloatTy::F32 { "f32" } else { "f64" };
+        let ct = ctype(&tys[0]);
+        match b {
+            B::FloatSqrt => format!("sqrt{suf}({a})"),
+            B::FloatPowi => format!("lust_{w}_powi({a}, {})", vals[1]),
+            B::FloatPowf => format!("pow{suf}({a}, {})", vals[1]),
+            B::FloatExp => format!("exp{suf}({a})"),
+            B::FloatLn => format!("log{suf}({a})"),
+            B::FloatLog => format!("(log{suf}({a}) / log{suf}({}))", vals[1]),
+            B::FloatLog2 => format!("log2{suf}({a})"),
+            B::FloatLog10 => format!("log10{suf}({a})"),
+            B::FloatMulAdd => format!("fma{suf}({a}, {}, {})", vals[1], vals[2]),
+            B::FloatFloor => format!("floor{suf}({a})"),
+            B::FloatCeil => format!("ceil{suf}({a})"),
+            B::FloatRound => format!("round{suf}({a})"),
+            B::FloatTrunc => format!("trunc{suf}({a})"),
+            B::FloatFract => format!("(({a}) - trunc{suf}({a}))"),
+            B::FloatAbs => format!("fabs{suf}({a})"),
+            B::FloatSignum => format!("lust_{w}_signum({a})"),
+            B::FloatRecip => format!("((({ct})1) / ({a}))"),
+            B::FloatMin => format!("lust_{w}_min({a}, {})", vals[1]),
+            B::FloatMax => format!("lust_{w}_max({a}, {})", vals[1]),
+            B::FloatCopysign => format!("copysign{suf}({a}, {})", vals[1]),
+            B::FloatIsNan => format!("({a} != {a})"),
+            B::FloatIsInfinite => {
+                if f == FloatTy::F32 {
+                    format!("((lust_f32_to_bits({a}) & 0x7FFFFFFFul) == 0x7F800000ul)")
+                } else {
+                    format!("((lust_f64_to_bits({a}) & 0x7FFFFFFFFFFFFFFFull) == 0x7FF0000000000000ull)")
+                }
+            }
+            B::FloatIsFinite => {
+                if f == FloatTy::F32 {
+                    format!("((lust_f32_to_bits({a}) & 0x7FFFFFFFul) < 0x7F800000ul)")
+                } else {
+                    format!("((lust_f64_to_bits({a}) & 0x7FFFFFFFFFFFFFFFull) < 0x7FF0000000000000ull)")
+                }
+            }
+            B::FloatIsSignPositive => {
+                if f == FloatTy::F32 {
+                    format!("((lust_f32_to_bits({a}) >> 31) == 0)")
+                } else {
+                    format!("((lust_f64_to_bits({a}) >> 63) == 0)")
+                }
+            }
+            B::FloatIsSignNegative => {
+                if f == FloatTy::F32 {
+                    format!("((lust_f32_to_bits({a}) >> 31) == 1)")
+                } else {
+                    format!("((lust_f64_to_bits({a}) >> 63) == 1)")
+                }
+            }
+            B::FloatToBits => format!("lust_{w}_to_bits({a})"),
+            _ => "0".into(),
+        }
+    }
 
     fn format(&mut self, parts: &[FmtPart], loc: &str, post: &mut Vec<String>) -> String {
         let s = self.tmp();

@@ -1148,6 +1148,26 @@ impl Evaluator {
         args: &[ExprId],
         span: Span,
     ) -> Result<TypedValue, Diag> {
+        // `f64::from_bits(n)` and `f32::from_bits(n)` are const fns.
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && segs.len() == 2
+            && cx.sym_text(segs[1].name) == "from_bits"
+            && args.len() == 1
+        {
+            let f = match cx.sym_text(segs[0].name) {
+                "f64" => Some((FloatTy::F64, super::int(IntTy::U64))),
+                "f32" => Some((FloatTy::F32, super::int(IntTy::U32))),
+                _ => None,
+            };
+            if let Some((f, arg_ty)) = f {
+                let (v, _) = self.value(cx, env, args[0], Some(arg_ty))?;
+                let ConstValue::Int(i) = v else { return Err(outside(span, "this `from_bits` argument")) };
+                let bits = i as u128 as u64;
+                let bits = if f == FloatTy::F32 { bits & 0xFFFF_FFFF } else { bits };
+                let t = cx.tys().float_ty(f);
+                return Ok((ConstValue::Float(bits, f), t));
+            }
+        }
         match cx.call_target(callee) {
             CallTarget::SizeOf(t) => {
                 let l = cx.layout(t).ok_or_else(|| {

@@ -106,6 +106,51 @@ float lust_fmod_f32(float, float);
 float lust_f64_to_f32(double v);
 double lust_f32_to_f64(float v);
 
+
+/* The libm entry points the float methods call: Rust lowers these
+   methods to the same libm calls on this platform. The powi, min,
+   max, and signum wrappers are lust's (Rust-specific semantics);
+   they are defined in float.c. */
+double sqrt(double);
+float sqrtf(float);
+double pow(double, double);
+float powf(float, float);
+double exp(double);
+float expf(float);
+double log(double);
+float logf(float);
+double log2(double);
+float log2f(float);
+double log10(double);
+float log10f(float);
+double floor(double);
+float floorf(float);
+double ceil(double);
+float ceilf(float);
+double round(double);
+float roundf(float);
+double trunc(double);
+float truncf(float);
+double fma(double, double, double);
+float fmaf(float, float, float);
+double fabs(double);
+float fabsf(float);
+double copysign(double, double);
+float copysignf(float, float);
+
+double lust_f64_powi(double a, int32_t e);
+float lust_f32_powi(float a, int32_t e);
+double lust_f64_min(double a, double b);
+double lust_f64_max(double a, double b);
+float lust_f32_min(float a, float b);
+float lust_f32_max(float a, float b);
+double lust_f64_signum(double a);
+float lust_f32_signum(float a);
+uint64_t lust_f64_to_bits(double v);
+uint32_t lust_f32_to_bits(float v);
+double lust_f64_from_bits_of(uint64_t b);
+float lust_f32_from_bits_of(uint32_t b);
+
 #ifdef LUST_IMPL
 #include "float.c"
 #endif

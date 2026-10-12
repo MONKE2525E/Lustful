@@ -513,6 +513,201 @@ LUST_POW(int8_t, i8) LUST_POW(int16_t, i16) LUST_POW(int32_t, i32) LUST_POW(int6
 LUST_POW(uint8_t, u8) LUST_POW(uint16_t, u16) LUST_POW(uint32_t, u32) LUST_POW(uint64_t, u64)
 LUST_ABS(int8_t, i8) LUST_ABS(int16_t, i16) LUST_ABS(int32_t, i32) LUST_ABS(int64_t, i64)
 
+/* ---------- Checked, saturating, and bit ops on 64-bit words ----------
+   One generic form for the checked_* and overflowing_* methods:
+   operands arrive masked to the operand width (sign bits above the
+   width are the caller's to mask off first), the result leaves
+   masked the same way. Returns 1 on success, 0 on overflow (the
+   wrapping result is still in *out), and -1 for division by zero.
+   Ops: 0 add, 1 sub, 2 mul, 3 div, 4 rem. */
+
+static uint64_t lust_mask64(unsigned bits) LUST_BODY({
+    return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull);
+})
+static int64_t lust_sext64(uint64_t v, unsigned bits) LUST_BODY({
+    if (bits >= 64) return (int64_t)v;
+    if (v & (1ull << (bits - 1))) return (int64_t)(v | ~lust_mask64(bits));
+    return (int64_t)v;
+})
+
+int lust_checked_op(uint64_t a, uint64_t b, unsigned bits, int is_signed, int op, uint64_t *out) LUST_BODY({
+    uint64_t mask = lust_mask64(bits);
+    a &= mask;
+    b &= mask;
+    if (is_signed) {
+        int64_t sa = lust_sext64(a, bits), sb = lust_sext64(b, bits);
+        int64_t minv = bits >= 64 ? INT64_MIN : -(1ll << (bits - 1));
+        int64_t maxv = bits >= 64 ? INT64_MAX : ((1ll << (bits - 1)) - 1);
+        int64_t r = 0;
+        int ok = 1;
+        switch (op) {
+            case 0:
+                r = (int64_t)((uint64_t)sa + (uint64_t)sb);
+                ok = bits < 64 ? (r >= minv && r <= maxv) : !(((sa ^ r) & (sb ^ r)) < 0);
+                break;
+            case 1:
+                r = (int64_t)((uint64_t)sa - (uint64_t)sb);
+                ok = bits < 64 ? (r >= minv && r <= maxv) : !(((sa ^ sb) & (sa ^ r)) < 0);
+                break;
+            case 2:
+                r = (int64_t)((uint64_t)sa * (uint64_t)sb);
+                if (bits < 64) {
+                    ok = (r >= minv && r <= maxv);
+                } else if (sa == 0 || sb == 0) {
+                    ok = 1;
+                } else if ((sa == -1 && sb == INT64_MIN) || (sb == -1 && sa == INT64_MIN)) {
+                    ok = 0;
+                } else {
+                    ok = (r / sb == sa);
+                }
+                break;
+            case 3:
+            case 4:
+                if (sb == 0) return -1;
+                if (sa == minv && sb == -1) {
+                    *out = (op == 3 ? (uint64_t)sa : 0ull) & mask;
+                    return 0;
+                }
+                r = op == 3 ? sa / sb : sa % sb;
+                break;
+            default:
+                return 0;
+        }
+        *out = (uint64_t)r & mask;
+        return ok;
+    }
+    {
+        uint64_t r = 0;
+        int ok = 1;
+        switch (op) {
+            case 0:
+                r = a + b;
+                ok = bits < 64 ? (r <= mask) : (r >= a);
+                break;
+            case 1:
+                r = a - b;
+                ok = (a >= b);
+                break;
+            case 2:
+                r = a * b;
+                ok = bits < 64 ? (r <= mask) : (a == 0 || r / a == b);
+                break;
+            case 3:
+                if (b == 0) return -1;
+                r = a / b;
+                break;
+            case 4:
+                if (b == 0) return -1;
+                r = a % b;
+                break;
+            default:
+                return 0;
+        }
+        *out = r & mask;
+        return ok;
+    }
+})
+
+/* checked_pow on the same representation: squaring loop, and the
+   final unused square is not computed, as in core. */
+int lust_checked_pow(uint64_t a, uint32_t e, unsigned bits, int is_signed, uint64_t *out) LUST_BODY({
+    uint64_t r = 1, x = a & lust_mask64(bits), t;
+    while (e) {
+        if (e & 1) {
+            if (!lust_checked_op(r, x, bits, is_signed, 2, &t)) {
+                *out = t;
+                return 0;
+            }
+            r = t;
+        }
+        e >>= 1;
+        if (!e) break;
+        if (!lust_checked_op(x, x, bits, is_signed, 2, &t)) {
+            *out = t;
+            return 0;
+        }
+        x = t;
+    }
+    *out = r;
+    return 1;
+})
+
+/* wrapping_pow on the same representation: no checks at all. */
+uint64_t lust_wrapping_pow(uint64_t a, uint32_t e, unsigned bits) LUST_BODY({
+    uint64_t mask = lust_mask64(bits);
+    uint64_t r = 1, x = a & mask;
+    while (e) {
+        if (e & 1) r = (r * x) & mask;
+        e >>= 1;
+        if (!e) break;
+        x = (x * x) & mask;
+    }
+    return r & mask;
+})
+
+/* Euclid division: the quotient rounds toward negative infinity,
+   the remainder is never negative. Both panic exactly as the plain
+   operators do for a zero divisor and for MIN / -1. */
+uint64_t lust_div_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, lust_loc loc) LUST_BODY({
+    uint64_t mask = lust_mask64(bits);
+    a &= mask;
+    b &= mask;
+    if (!is_signed) {
+        if (b == 0) lust_panic_cstr("attempt to divide by zero", loc);
+        return a / b;
+    }
+    {
+        int64_t sa = lust_sext64(a, bits), sb = lust_sext64(b, bits);
+        int64_t minv = bits >= 64 ? INT64_MIN : -(1ll << (bits - 1));
+        int64_t q;
+        if (sb == 0) lust_panic_cstr("attempt to divide by zero", loc);
+        if (sa == minv && sb == -1) LUST_OVF("divide");
+        q = sa / sb;
+        if (sa % sb < 0) q += sb > 0 ? -1 : 1;
+        return (uint64_t)q & mask;
+    }
+})
+uint64_t lust_rem_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, lust_loc loc) LUST_BODY({
+    uint64_t mask = lust_mask64(bits);
+    a &= mask;
+    b &= mask;
+    if (!is_signed) {
+        if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+        return a % b;
+    }
+    {
+        int64_t sa = lust_sext64(a, bits), sb = lust_sext64(b, bits);
+        int64_t minv = bits >= 64 ? INT64_MIN : -(1ll << (bits - 1));
+        int64_t r;
+        if (sb == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+        if (sa == minv && sb == -1) LUST_OVF("calculate the remainder");
+        r = sa % sb;
+        if (r < 0) r += sb > 0 ? sb : -sb;
+        return (uint64_t)r & mask;
+    }
+})
+
+uint32_t lust_count_ones64(uint64_t v) LUST_BODY({
+    v = v - ((v >> 1) & 0x5555555555555555ull);
+    v = (v & 0x3333333333333333ull) + ((v >> 2) & 0x3333333333333333ull);
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return (uint32_t)((v * 0x0101010101010101ull) >> 56);
+})
+uint32_t lust_leading_zeros64(uint64_t v, unsigned bits) LUST_BODY({
+    uint32_t n = 0;
+    int i;
+    if (v == 0) return bits;
+    for (i = 63; i >= 0 && !((v >> i) & 1ull); i--) n++;
+    return n - (64 - bits);
+})
+uint32_t lust_trailing_zeros64(uint64_t v, unsigned bits) LUST_BODY({
+    uint32_t n = 0;
+    unsigned i;
+    if (v == 0) return bits;
+    for (i = 0; i < bits && !((v >> i) & 1ull); i++) n++;
+    return n;
+})
+
 /* ---------- 128-bit integers ---------- */
 
 /* Two-word helpers over lust_u128/lust_i128. Division is Knuth's

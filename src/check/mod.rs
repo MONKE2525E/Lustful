@@ -49,6 +49,92 @@ pub enum Builtin {
     WrappingAdd,
     WrappingSub,
     WrappingMul,
+    WrappingDiv,
+    WrappingRem,
+    WrappingNeg,
+    WrappingPow,
+    WrappingShl,
+    WrappingShr,
+    WrappingAbs,
+    CheckedAdd,
+    CheckedSub,
+    CheckedMul,
+    CheckedDiv,
+    CheckedRem,
+    CheckedNeg,
+    CheckedAbs,
+    CheckedPow,
+    CheckedShl,
+    CheckedShr,
+    SaturatingAdd,
+    SaturatingSub,
+    SaturatingMul,
+    SaturatingDiv,
+    SaturatingNeg,
+    SaturatingAbs,
+    SaturatingPow,
+    OverflowingAdd,
+    OverflowingSub,
+    OverflowingMul,
+    OverflowingDiv,
+    OverflowingRem,
+    OverflowingNeg,
+    OverflowingAbs,
+    OverflowingPow,
+    OverflowingShl,
+    OverflowingShr,
+    CountOnes,
+    CountZeros,
+    LeadingZeros,
+    TrailingZeros,
+    LeadingOnes,
+    TrailingOnes,
+    RotateLeft,
+    RotateRight,
+    SwapBytes,
+    ReverseBits,
+    DivEuclid,
+    RemEuclid,
+    Signum,
+    IsPositive,
+    IsNegative,
+    IsPowerOfTwo,
+    FloatSqrt,
+    FloatPowi,
+    FloatPowf,
+    FloatExp,
+    FloatLn,
+    FloatLog,
+    FloatLog2,
+    FloatLog10,
+    FloatMulAdd,
+    FloatFloor,
+    FloatCeil,
+    FloatRound,
+    FloatTrunc,
+    FloatFract,
+    FloatAbs,
+    FloatSignum,
+    FloatRecip,
+    FloatMin,
+    FloatMax,
+    FloatIsNan,
+    FloatIsInfinite,
+    FloatIsFinite,
+    FloatIsSignPositive,
+    FloatIsSignNegative,
+    FloatToBits,
+    FloatCopysign,
+    F32FromBits,
+    F64FromBits,
+    CharLenUtf8,
+    CharLenUtf16,
+    CharIsAscii,
+    CharIsAsciiPunctuation,
+    CharIsAsciiGraphic,
+    CharIsAsciiHexdigit,
+    CharIsAsciiControl,
+    CharIsDigitRadix,
     Abs,
     Pow,
     Min,
@@ -2842,6 +2928,58 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return ERROR;
         }
+        // Float associated consts: `f64::NAN`, `f32::EPSILON`,
+        // `std::f64::consts::PI`, and kin.
+        {
+            let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
+            let assoc = match names.as_slice() {
+                [t, item] => Some((*t, *item, false)),
+                [pre, t, c, item] if matches!(*pre, "std" | "core") && *c == "consts" => Some((*t, *item, true)),
+                _ => None,
+            };
+            if let Some((ty_name, item, module)) = assoc {
+                let f = match ty_name {
+                    "f32" => Some(FloatTy::F32),
+                    "f64" => Some(FloatTy::F64),
+                    _ => None,
+                };
+                if let Some(f) = f {
+                    use crate::ty::consteval::ConstValue;
+                    if module {
+                        if let Some(bits) = crate::ty::consteval::float_consts_value(f, item) {
+                            let i = self.ei(e);
+                            self.out.const_exprs[i] = Some(ConstValue::Float(bits, f));
+                            return self.tys.float_ty(f);
+                        }
+                    } else if let Some((v, int_ty)) = crate::ty::consteval::primitive_float_assoc(f, item) {
+                        let i = self.ei(e);
+                        return match int_ty {
+                            Some(it) => {
+                                self.out.const_exprs[i] = Some(ConstValue::Int(v as i64 as i128));
+                                int(it)
+                            }
+                            None => {
+                                self.out.const_exprs[i] = Some(ConstValue::Float(v, f));
+                                self.tys.float_ty(f)
+                            }
+                        };
+                    }
+                }
+            }
+        }
+        // Char associated consts.
+        if segs.len() == 2 && segs[0].name == p.known.char {
+            let c = match self.name(segs[1].name) {
+                "MAX" => Some(char::MAX),
+                "MIN" => Some(char::MIN),
+                _ => None,
+            };
+            if let Some(c) = c {
+                let i = self.ei(e);
+                self.out.const_exprs[i] = Some(crate::ty::consteval::ConstValue::Char(c));
+                return CHAR;
+            }
+        }
         // Primitive associated consts: `i64::MAX`, `u32::BITS`, and kin.
         if segs.len() == 2
             && let Some(it) = p.known.int_ty(segs[0].name)
@@ -2961,6 +3099,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         {
             let align = self.name(names[2]) == "align_of";
             return Some(self.layout_query(&segs[2], align, span));
+        }
+        if names.len() == 2 && names[1] == k.from_bits {
+            if names[0] == k.f64 {
+                return Some(Res::Builtin(Builtin::F64FromBits));
+            }
+            if names[0] == k.f32 {
+                return Some(Res::Builtin(Builtin::F32FromBits));
+            }
         }
         if segs.len() != 2 {
             self.errs.push(not_yet("L0505", span, "module paths"));
@@ -3358,6 +3504,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::StringFrom => (vec![REF_STR], STRING),
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
                     Builtin::EnvArgs => (vec![], ARGS),
+                    Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
+                    Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {
                             Expr::Path(segs) => segs[0].type_args(),
@@ -3653,32 +3801,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if name == k.to_digit {
                     let o = self.tys.mk_option(int(IntTy::U32));
                     Some((B::CharToDigit, Autoref::None, vec![int(IntTy::U32)], o))
+                } else if name == k.is_digit {
+                    Some((B::CharIsDigitRadix, Autoref::None, vec![int(IntTy::U32)], BOOL))
+                } else if name == k.len_utf8 {
+                    Some((B::CharLenUtf8, Autoref::None, vec![], USIZE))
+                } else if name == k.len_utf16 {
+                    Some((B::CharLenUtf16, Autoref::None, vec![], USIZE))
+                } else if name == k.is_ascii {
+                    Some((B::CharIsAscii, Autoref::Ref, vec![], BOOL))
+                } else if name == k.is_ascii_punctuation {
+                    Some((B::CharIsAsciiPunctuation, Autoref::Ref, vec![], BOOL))
+                } else if name == k.is_ascii_graphic {
+                    Some((B::CharIsAsciiGraphic, Autoref::Ref, vec![], BOOL))
+                } else if name == k.is_ascii_hexdigit {
+                    Some((B::CharIsAsciiHexdigit, Autoref::Ref, vec![], BOOL))
+                } else if name == k.is_ascii_control {
+                    Some((B::CharIsAsciiControl, Autoref::Ref, vec![], BOOL))
                 } else {
                     None
                 }
             }
-            (None, TyKind::Int(i)) => {
-                let t = base;
-                if name == k.wrapping_add {
-                    Some((B::WrappingAdd, Autoref::None, vec![t], t))
-                } else if name == k.wrapping_sub {
-                    Some((B::WrappingSub, Autoref::None, vec![t], t))
-                } else if name == k.wrapping_mul {
-                    Some((B::WrappingMul, Autoref::None, vec![t], t))
-                } else if name == k.abs && i.signed() {
-                    Some((B::Abs, Autoref::None, vec![], t))
-                } else if name == k.pow {
-                    Some((B::Pow, Autoref::None, vec![int(IntTy::U32)], t))
-                } else if name == k.min {
-                    Some((B::Min, Autoref::None, vec![t], t))
-                } else if name == k.max {
-                    Some((B::Max, Autoref::None, vec![t], t))
-                } else if name == k.to_string {
-                    Some((B::ToString, Autoref::Ref, vec![], STRING))
-                } else {
-                    None
-                }
-            }
+            (None, TyKind::Int(i)) => self.int_method(name, base, i),
+            (None, TyKind::Float(f)) => self.float_method(name, base, f),
+            // A float of unknown width: float-returning methods return
+            // the variable itself, so a later use can still settle it.
+            (None, k2) if k2.is_float_infer() => self.float_method(name, base, FloatTy::F64),
             (None, TyKind::Bool | TyKind::Char) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
             (Some(BuiltinTy::Args), _) if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),
             // Trait methods work on an integer of unknown type; inherent ones (pow, abs) do not.
@@ -3729,6 +3876,319 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ERROR
             }
         }
+    }
+
+    /// Inherent integer methods (`checked_add`, `count_ones`, and kin).
+    /// All take the receiver by value. The 128-bit checked, saturating,
+    /// and overflowing families (plus euclid division) are not
+    /// implemented yet and answer None, like a missing method.
+    fn int_method(&mut self, name: Sym, t: Ty, i: IntTy) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+        use Builtin as B;
+        let k = self.p.known;
+        let s = i.signed();
+        let w128 = i.bits() >= 128;
+        let u32t = int(IntTy::U32);
+        let bin = |b: Builtin| Some((b, Autoref::None, vec![t], t));
+        let chk = |b: Builtin, cx: &mut Self| {
+            let o = cx.tys.mk_option(t);
+            Some((b, Autoref::None, vec![t], o))
+        };
+        let ovf = |b: Builtin, cx: &mut Self| {
+            let ts = cx.tys.intern_tys(&[t, BOOL]);
+            let tt = cx.tys.intern(TyKind::Tuple(ts));
+            Some((b, Autoref::None, vec![t], tt))
+        };
+        let sh = |b: Builtin| Some((b, Autoref::None, vec![u32t], t));
+        let un = |b: Builtin| Some((b, Autoref::None, vec![], t));
+        let n = name;
+        // The families that stay within the value (wrapping and plain).
+        if n == k.wrapping_add {
+            return bin(B::WrappingAdd);
+        }
+        if n == k.wrapping_sub {
+            return bin(B::WrappingSub);
+        }
+        if n == k.wrapping_mul {
+            return bin(B::WrappingMul);
+        }
+        if n == k.wrapping_div && !w128 {
+            return bin(B::WrappingDiv);
+        }
+        if n == k.wrapping_rem && !w128 {
+            return bin(B::WrappingRem);
+        }
+        if n == k.wrapping_neg {
+            return un(B::WrappingNeg);
+        }
+        if n == k.wrapping_pow && !w128 {
+            return sh(B::WrappingPow);
+        }
+        if n == k.wrapping_shl {
+            return sh(B::WrappingShl);
+        }
+        if n == k.wrapping_shr {
+            return sh(B::WrappingShr);
+        }
+        if n == k.wrapping_abs && s {
+            return un(B::WrappingAbs);
+        }
+        if n == k.abs && s {
+            return un(B::Abs);
+        }
+        if n == k.pow {
+            return sh(B::Pow);
+        }
+        if n == k.min {
+            return bin(B::Min);
+        }
+        if n == k.max {
+            return bin(B::Max);
+        }
+        if n == k.div_euclid && !w128 {
+            return bin(B::DivEuclid);
+        }
+        if n == k.rem_euclid && !w128 {
+            return bin(B::RemEuclid);
+        }
+        if n == k.signum && s {
+            return un(B::Signum);
+        }
+        if n == k.is_positive && s {
+            return Some((B::IsPositive, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_negative && s {
+            return Some((B::IsNegative, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_power_of_two && !s {
+            return Some((B::IsPowerOfTwo, Autoref::None, vec![], BOOL));
+        }
+        if n == k.count_ones {
+            return Some((B::CountOnes, Autoref::None, vec![], u32t));
+        }
+        if n == k.count_zeros {
+            return Some((B::CountZeros, Autoref::None, vec![], u32t));
+        }
+        if n == k.leading_zeros {
+            return Some((B::LeadingZeros, Autoref::None, vec![], u32t));
+        }
+        if n == k.trailing_zeros {
+            return Some((B::TrailingZeros, Autoref::None, vec![], u32t));
+        }
+        if n == k.leading_ones {
+            return Some((B::LeadingOnes, Autoref::None, vec![], u32t));
+        }
+        if n == k.trailing_ones {
+            return Some((B::TrailingOnes, Autoref::None, vec![], u32t));
+        }
+        if n == k.rotate_left {
+            return sh(B::RotateLeft);
+        }
+        if n == k.rotate_right {
+            return sh(B::RotateRight);
+        }
+        if n == k.swap_bytes {
+            return un(B::SwapBytes);
+        }
+        if n == k.reverse_bits {
+            return un(B::ReverseBits);
+        }
+        if n == k.to_string {
+            return Some((B::ToString, Autoref::Ref, vec![], STRING));
+        }
+        if w128 {
+            return None;
+        }
+        // Checked, saturating, and overflowing families (64-bit and below).
+        if n == k.checked_add {
+            return chk(B::CheckedAdd, self);
+        }
+        if n == k.checked_sub {
+            return chk(B::CheckedSub, self);
+        }
+        if n == k.checked_mul {
+            return chk(B::CheckedMul, self);
+        }
+        if n == k.checked_div {
+            return chk(B::CheckedDiv, self);
+        }
+        if n == k.checked_rem {
+            return chk(B::CheckedRem, self);
+        }
+        if n == k.checked_neg {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedNeg, Autoref::None, vec![], o));
+        }
+        if n == k.checked_abs && s {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedAbs, Autoref::None, vec![], o));
+        }
+        if n == k.checked_pow {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedPow, Autoref::None, vec![u32t], o));
+        }
+        if n == k.checked_shl {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedShl, Autoref::None, vec![u32t], o));
+        }
+        if n == k.checked_shr {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedShr, Autoref::None, vec![u32t], o));
+        }
+        if n == k.saturating_add {
+            return bin(B::SaturatingAdd);
+        }
+        if n == k.saturating_sub {
+            return bin(B::SaturatingSub);
+        }
+        if n == k.saturating_mul {
+            return bin(B::SaturatingMul);
+        }
+        if n == k.saturating_div {
+            return bin(B::SaturatingDiv);
+        }
+        if n == k.saturating_neg && s {
+            return un(B::SaturatingNeg);
+        }
+        if n == k.saturating_abs && s {
+            return un(B::SaturatingAbs);
+        }
+        if n == k.saturating_pow {
+            return sh(B::SaturatingPow);
+        }
+        if n == k.overflowing_add {
+            return ovf(B::OverflowingAdd, self);
+        }
+        if n == k.overflowing_sub {
+            return ovf(B::OverflowingSub, self);
+        }
+        if n == k.overflowing_mul {
+            return ovf(B::OverflowingMul, self);
+        }
+        if n == k.overflowing_div {
+            return ovf(B::OverflowingDiv, self);
+        }
+        if n == k.overflowing_rem {
+            return ovf(B::OverflowingRem, self);
+        }
+        if n == k.overflowing_neg {
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::OverflowingNeg, Autoref::None, vec![], tt));
+        }
+        if n == k.overflowing_abs && s {
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::OverflowingAbs, Autoref::None, vec![], tt));
+        }
+        if n == k.overflowing_pow {
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::OverflowingPow, Autoref::None, vec![u32t], tt));
+        }
+        if n == k.overflowing_shl {
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::OverflowingShl, Autoref::None, vec![u32t], tt));
+        }
+        if n == k.overflowing_shr {
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::OverflowingShr, Autoref::None, vec![u32t], tt));
+        }
+        None
+    }
+
+    /// Inherent float methods (`sqrt`, `powi`, `to_bits`, and kin).
+    /// `t` is the receiver type (a float variable for an unsuffixed
+    /// literal), `f` its width when known (f64 for a variable).
+    fn float_method(&mut self, name: Sym, t: Ty, f: FloatTy) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+        use Builtin as B;
+        let k = self.p.known;
+        let un = |b: Builtin| Some((b, Autoref::None, vec![], t));
+        let n = name;
+        if n == k.sqrt {
+            return un(B::FloatSqrt);
+        }
+        if n == k.abs {
+            return un(B::FloatAbs);
+        }
+        if n == k.floor {
+            return un(B::FloatFloor);
+        }
+        if n == k.ceil {
+            return un(B::FloatCeil);
+        }
+        if n == k.round {
+            return un(B::FloatRound);
+        }
+        if n == k.trunc {
+            return un(B::FloatTrunc);
+        }
+        if n == k.fract {
+            return un(B::FloatFract);
+        }
+        if n == k.signum {
+            return un(B::FloatSignum);
+        }
+        if n == k.recip {
+            return un(B::FloatRecip);
+        }
+        if n == k.exp {
+            return un(B::FloatExp);
+        }
+        if n == k.ln {
+            return un(B::FloatLn);
+        }
+        if n == k.log2 {
+            return un(B::FloatLog2);
+        }
+        if n == k.log10 {
+            return un(B::FloatLog10);
+        }
+        if n == k.powi {
+            return Some((B::FloatPowi, Autoref::None, vec![int(IntTy::I32)], t));
+        }
+        if n == k.powf {
+            return Some((B::FloatPowf, Autoref::None, vec![t], t));
+        }
+        if n == k.log {
+            return Some((B::FloatLog, Autoref::None, vec![t], t));
+        }
+        if n == k.mul_add {
+            return Some((B::FloatMulAdd, Autoref::None, vec![t, t], t));
+        }
+        if n == k.min {
+            return Some((B::FloatMin, Autoref::None, vec![t], t));
+        }
+        if n == k.max {
+            return Some((B::FloatMax, Autoref::None, vec![t], t));
+        }
+        if n == k.copysign {
+            return Some((B::FloatCopysign, Autoref::None, vec![t], t));
+        }
+        if n == k.is_nan {
+            return Some((B::FloatIsNan, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_infinite {
+            return Some((B::FloatIsInfinite, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_finite {
+            return Some((B::FloatIsFinite, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_sign_positive {
+            return Some((B::FloatIsSignPositive, Autoref::None, vec![], BOOL));
+        }
+        if n == k.is_sign_negative {
+            return Some((B::FloatIsSignNegative, Autoref::None, vec![], BOOL));
+        }
+        if n == k.to_bits {
+            let bt = int(if f == FloatTy::F32 { IntTy::U32 } else { IntTy::U64 });
+            return Some((B::FloatToBits, Autoref::None, vec![], bt));
+        }
+        if n == k.to_string {
+            return Some((B::ToString, Autoref::Ref, vec![], STRING));
+        }
+        None
     }
 
     /// For `String == &str` style comparisons between different string types: the deref counts

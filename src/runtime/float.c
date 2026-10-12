@@ -1499,3 +1499,81 @@ double lust_f32_to_f64(float v) {
     }
 }
 
+
+/* ---------- Float methods ---------- */
+
+/* The libm entry points the float methods call. Rust lowers these
+   methods to the same libm calls on this platform, so the results
+   match bit for bit. Declarations live in float.h for all units;
+   only the powi, min, max, and signum wrappers below are ours: their
+   semantics are Rust-specific (reciprocal order, NaN choice, signed
+   zeros), so a plain libm call would not match. */
+
+double lust_f64_powi(double a, int32_t e) {
+    uint32_t n = e < 0 ? (uint32_t)(-(int64_t)e) : (uint32_t)e;
+    double r = 1.0, x = a;
+    while (n) {
+        if (n & 1) r *= x;
+        n >>= 1;
+        if (!n) break;
+        x *= x;
+    }
+    return e < 0 ? 1.0 / r : r;
+}
+float lust_f32_powi(float a, int32_t e) {
+    uint32_t n = e < 0 ? (uint32_t)(-(int64_t)e) : (uint32_t)e;
+    float r = 1.0f, x = a;
+    while (n) {
+        if (n & 1) r *= x;
+        n >>= 1;
+        if (!n) break;
+        x *= x;
+    }
+    return e < 0 ? 1.0f / r : r;
+}
+
+/* f64::min and f64::max: a NaN operand yields the other operand,
+   and equal operands yield the second one (so the zero sign of the
+   second operand wins). */
+double lust_f64_min(double a, double b) {
+    if (a < b) return a;
+    if (b < a) return b;
+    if (a == b) return b;
+    return a == a ? a : b;
+}
+double lust_f64_max(double a, double b) {
+    if (a > b) return a;
+    if (b > a) return b;
+    if (a == b) return b;
+    return a == a ? a : b;
+}
+float lust_f32_min(float a, float b) {
+    if (a < b) return a;
+    if (b < a) return b;
+    if (a == b) return b;
+    return a == a ? a : b;
+}
+float lust_f32_max(float a, float b) {
+    if (a > b) return a;
+    if (b > a) return b;
+    if (a == b) return b;
+    return a == a ? a : b;
+}
+
+double lust_f64_signum(double a) {
+    if (a > 0) return 1.0;
+    if (a < 0) return -1.0;
+    if (a == 0) return lust_f64_bits(a) >> 63 ? -1.0 : 1.0;
+    return a;
+}
+float lust_f32_signum(float a) {
+    if (a > 0) return 1.0f;
+    if (a < 0) return -1.0f;
+    if (a == 0) return lust_f32_bits(a) >> 31 ? -1.0f : 1.0f;
+    return a;
+}
+
+uint64_t lust_f64_to_bits(double v) { return lust_f64_bits(v); }
+uint32_t lust_f32_to_bits(float v) { return lust_f32_bits(v); }
+double lust_f64_from_bits_of(uint64_t b) { return lust_f64_from_bits(b); }
+float lust_f32_from_bits_of(uint32_t b) { return lust_f32_from_bits(b); }

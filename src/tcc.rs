@@ -164,8 +164,14 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
 }
 
 fn link_objects(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
+    // The float methods call libm (sqrt, pow, exp, log, floor, ...),
+    // the same entry points rustc lowers them to on this platform.
+    let libm = CString::new("m").unwrap();
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
+        if tcc_add_library(tcc.s, libm.as_ptr()) != 0 {
+            return Err(tcc.fail("load libm"));
+        }
         for o in objs {
             if tcc_add_file(tcc.s, cstr(o).as_ptr()) != 0 {
                 return Err(tcc.fail("load an object file"));
