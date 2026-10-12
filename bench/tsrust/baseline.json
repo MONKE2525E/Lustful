@@ -1,0 +1,46 @@
+{
+  "source": "Copied by hand from /tmp/lust-ts/baseline/BASELINE.md (measured 2026-10-12). Rerun is opt-in: see README.md in this directory. Do not edit numbers here without a rerun.",
+  "ts_rust_commit": "b11b618a",
+  "scope": "cargo check/build of -p ts_goport (lib + 9 bins), 785730 lines of Rust in 1028 files, plus goport_util, goport_lsproto, 93 external packages",
+  "machine": "24 cores (AMD EPYC 7B13), 125 GiB RAM, target dir on tmpfs, load 1.5-3.5 unless noted",
+  "toolchains": "stable rustc 1.99.0 default; nightly-2026-06-17 for -Z threads and Cranelift; 1.93.0 for the goport profile",
+  "rows": [
+    {"id": "cold-check-crate-only", "op": "check", "label": "Cold check, crate only", "rustc_config": "nightly -Z threads=8 -C debuginfo=0, incremental off", "rustc_s": 29.0, "target_100x_ms": 290, "lust_s": null, "lust_note": "lust cannot build a cargo workspace yet"},
+    {"id": "cold-check-fresh", "op": "check", "label": "Cold check, fully fresh (deps too)", "rustc_config": "stable, default dev", "rustc_s": 98.3, "target_100x_ms": 983, "lust_s": null, "lust_note": "includes a 52.1 s jemalloc C build; do not count that as a lust win"},
+    {"id": "cold-build-crate-only", "op": "build", "label": "Cold debug build, crate only", "rustc_config": "nightly -Z threads=8 -C debuginfo=0, incremental off", "rustc_s": 43.0, "target_100x_ms": 430, "lust_s": null, "lust_note": "lust cannot build a cargo workspace yet"},
+    {"id": "cold-build-fresh", "op": "build", "label": "Cold debug build, fully fresh", "rustc_config": "stable, default dev", "rustc_s": 161.5, "target_100x_ms": 1615, "lust_s": null, "lust_note": "includes the jemalloc C build"},
+    {"id": "edit-body-check", "op": "check", "label": "Edit loop, body edit, check", "rustc_config": "stable, default dev, incremental on (median of 3)", "rustc_s": 12.1, "target_100x_ms": 121, "lust_s": null, "lust_note": "paired edit e1 in edits.py"},
+    {"id": "edit-body-build", "op": "build", "label": "Edit loop, body edit, build", "rustc_config": "nightly repo config, incremental on", "rustc_s": 20.6, "target_100x_ms": 206, "lust_s": null, "lust_note": "paired edit e1 in edits.py"},
+    {"id": "edit-type-build", "op": "build", "label": "Edit loop, type change, build", "rustc_config": "stable, default dev, incremental on", "rustc_s": 60.2, "target_100x_ms": 602, "lust_s": null, "lust_note": "paired edit e4 in edits.py; lust does a full rebuild on type changes today"},
+    {"id": "edit-mistake-check", "op": "check", "label": "Edit loop, mistake, failed check", "rustc_config": "stable, default dev, incremental on", "rustc_s": 8.8, "target_100x_ms": 88, "lust_s": null, "lust_note": "paired edit e5 in edits.py; check must fail"},
+    {"id": "edit-loop-total", "op": "check+build", "label": "Edit loop, 6 steps total (check+build)", "rustc_config": "stable, default dev", "rustc_s": 232.1, "target_100x_ms": 2320, "lust_s": null, "lust_note": "steps e1, e2, e3, e4, e5, e5fix in edits.py"},
+    {"id": "release-build", "op": "build", "label": "Plain release build, all 9 bins, first build", "rustc_config": "stable, default release", "rustc_s": 155.0, "target_100x_ms": 1550, "lust_s": null, "lust_note": "ship builds stay on rustc until lust has an optimizing backend"},
+    {"id": "goport-build", "op": "build", "label": "Goport profile build, one bin (tsgo)", "rustc_config": "1.93.0, fat LTO, 1 codegen unit", "rustc_s": 708.0, "target_100x_ms": 7100, "lust_s": null, "lust_note": "12-minute build; reruns of run.sh skip this row"}
+  ],
+  "edit_loop_detail": [
+    {"edit": "e1", "label": "Body edit: rewrite body of token_is_identifier_or_keyword", "check_s": 11.9, "build_s": 22.7},
+    {"edit": "e1-revert", "label": "Revert edit 1", "check_s": 12.4, "build_s": 23.0},
+    {"edit": "e1-again", "label": "Apply edit 1 again", "check_s": 12.1, "build_s": 22.0},
+    {"edit": "e2", "label": "New fn: add a helper next to the edited fn", "check_s": 13.9, "build_s": 32.0, "note": "ran at load 11; build likely high by some seconds"},
+    {"edit": "e3", "label": "Signature: add a bool parameter to is_syntactic_default, fix 1 call site", "check_s": 12.6, "build_s": 26.2},
+    {"edit": "e4", "label": "Type change: ExhaustiveState(pub u8) to pub u16", "check_s": 13.6, "build_s": 60.2},
+    {"edit": "e5", "label": "Mistake: compare u16 with &str (check must fail)", "check_s": 8.8, "build_s": null},
+    {"edit": "e5fix", "label": "Fix the mistake", "check_s": 10.9, "build_s": 19.4}
+  ],
+  "fast_configs_crate_only": [
+    {"config": "Stable 1.99, default dev (debuginfo 2, incremental on, 256 CGUs)", "check_s": 63.3, "build_s": 127.0},
+    {"config": "Stable, -C debuginfo=0, incremental off", "check_s": 55.0, "build_s": 86.1},
+    {"config": "Stable + RUSTC_BOOTSTRAP=1, -Z threads=8 -C debuginfo=0", "check_s": 34.4, "build_s": null},
+    {"config": "Nightly, -Z threads=8 -C debuginfo=0, incremental on", "check_s": 30.6, "build_s": 52.4},
+    {"config": "Nightly, -Z threads=8 -C debuginfo=0, incremental off", "check_s": 29.0, "build_s": 43.0},
+    {"config": "Nightly, -Z threads=16 -C debuginfo=0", "check_s": 29.2, "build_s": null},
+    {"config": "Nightly best + 16 codegen units", "check_s": null, "build_s": 44.8},
+    {"config": "Nightly, Cranelift backend, -Z threads=8 -C debuginfo=0, incremental off", "check_s": null, "build_s": 53.8}
+  ],
+  "runtime_workload": {
+    "note": "tsgo on a generated 480-module TypeScript project, median of 5",
+    "goport_profile_s": 0.37,
+    "plain_release_s": 0.39,
+    "debug_s": 6.59
+  }
+}
