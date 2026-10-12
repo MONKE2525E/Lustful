@@ -17,6 +17,7 @@ const C_TRAIT: &str = "L0614"; // traits, generics, and where clauses
 const C_ASSOC: &str = "L0621"; // associated items and qualified paths
 const C_CONST: &str = "L0632"; // const and static items, const generics
 const C_LIT: &str = "L0641"; // float and byte literals, other std-surface syntax
+#[allow(dead_code)] // Typed receivers parse now; collect rejects them until method resolution lands.
 const C_METHOD: &str = "L0721"; // method and receiver forms
 const C_EXTERN: &str = "L0810"; // extern blocks and foreign items
 const C_CORE: &str = "L0820"; // core expression, pattern, and statement forms
@@ -41,6 +42,14 @@ pub struct Parser<'a> {
     str_base: u32,
     /// Current nesting depth, capped so pathological input cannot overflow the stack.
     depth: u32,
+    /// The first form (by span) that parses into AST v2 shapes but
+    /// later stages do not support yet. The parser builds those
+    /// shapes (generics, traits, and kin, for W-TRAITS-CORE) and
+    /// records the reject the parser used to emit on sight, so the
+    /// error a user sees is still the first one in the file, with
+    /// its old code. `parse` returns it after the parse, or in
+    /// place of a later hard error.
+    deferred: Option<Diag>,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -49,18 +58,24 @@ const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0 };
+    let mut p = Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None };
     p.ast.strings = lexed.strings.clone();
     while p.peek() != Tok::Eof {
         let before = p.pos;
-        let item = p.item()?;
+        let item = match p.item() {
+            Ok(item) => item,
+            Err(hard) => return Err(p.earlier(hard)),
+        };
         if let Some(item) = item {
             p.ast.items.push(item);
         }
         // No parse loop may spin in place on bad input: each round must consume a token.
         if p.pos == before {
-            return Err(syntax(p.span(), format!("expected an item, found {}", tok_name(p.peek()))));
+            return Err(p.earlier(syntax(p.span(), format!("expected an item, found {}", tok_name(p.peek())))));
         }
+    }
+    if let Some(d) = p.deferred.take() {
+        return Err(d);
     }
     Ok(p.ast)
 }
@@ -123,12 +138,18 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     toks.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
-    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0 };
+    let mut p = Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
+    let deferred = p.deferred.take();
     *ast = p.ast;
-    Ok((body?, ranges.0, ranges.1))
+    let body = match (body, deferred) {
+        (Err(hard), Some(d)) if d.span.lo <= hard.span.lo => return Err(d),
+        (Ok(_), Some(d)) => return Err(d),
+        (body, _) => body?,
+    };
+    Ok((body, ranges.0, ranges.1))
 }
 
 /// Converts a flat token slice into nested token trees. Unbalanced input
@@ -344,6 +365,23 @@ impl<'a> Parser<'a> {
     /// The rejection for an AST v2 form that starts at the current token.
     fn reject(&self, code: &'static str, what: &str) -> Diag {
         not_yet(code, self.span(), what)
+    }
+
+    /// Records the reject for a form the parser builds but later
+    /// stages do not support yet, keeping the earliest by span.
+    /// See the `deferred` field.
+    fn defer(&mut self, d: Diag) {
+        if self.deferred.as_ref().is_none_or(|old| d.span.lo < old.span.lo) {
+            self.deferred = Some(d);
+        }
+    }
+
+    /// The earlier of the deferred reject and a hard parse error.
+    fn earlier(&mut self, hard: Diag) -> Diag {
+        match self.deferred.take() {
+            Some(d) if d.span.lo <= hard.span.lo => d,
+            _ => hard,
+        }
     }
 
     /// True when the current token is the identifier `name` (for weak keywords
@@ -670,13 +708,15 @@ impl<'a> Parser<'a> {
             }
             Tok::Struct if !has_qual => ItemKind::Struct(self.struct_def(derives)?),
             Tok::Enum if !has_qual => ItemKind::Enum(self.enum_def(derives)?),
-            Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => {
-                return Err(not_yet(C_TRAIT, start, "trait impls"));
-            }
-            Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def()?),
+            Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => ItemKind::Impl(self.impl_def(true)?),
+            Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def(false)?),
             Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
             Tok::Eof if derives.is_empty() && !has_qual => return Ok(None),
-            Tok::Trait => return Err(not_yet(C_TRAIT, start, "trait definitions")),
+            Tok::Trait if !qual.is_const && !qual.is_async && qual.abi.is_none() => {
+                let mut def = self.trait_def()?;
+                def.is_unsafe = qual.is_unsafe;
+                ItemKind::Trait(def)
+            }
             Tok::Mod => return Err(not_yet(C_MOD, start, "modules")),
             Tok::Static => return Err(not_yet(C_CONST, start, "const and static items")),
             Tok::Type => return Err(not_yet(C_TY, start, "type aliases")),
@@ -789,41 +829,264 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    fn no_generics(&mut self, what: &str) -> PResult<()> {
-        if self.peek() == Tok::Lt {
-            if matches!(self.peek_at(1), Tok::Lifetime(_)) {
-                return Err(lifetime_error(self.toks[self.pos + 1].span));
-            }
-            return Err(not_yet(C_TRAIT, self.span(), &format!("generic {what}")));
+    /// One written lifetime ('a, 'static, '_) at the current token.
+    fn lifetime_here(&mut self) -> PResult<Lifetime> {
+        match self.peek() {
+            Tok::Lifetime(name) => Ok(Lifetime { name, span: self.bump().span }),
+            t => Err(syntax(self.span(), format!("expected a lifetime, found {}", tok_name(t)))),
         }
-        Ok(())
+    }
+
+    /// Generic parameters as written: `<..>`, or empty when absent.
+    /// Additive parser work for W-CORELANG (the AST owner) on behalf
+    /// of W-TRAITS-CORE: the shapes are the frozen AST v2 ones, and
+    /// collect still rejects every generic form until generic
+    /// collect lands, so accepted programs do not change. Lifetime
+    /// parameters keep the old L0203 reject where `allow_lifetimes`
+    /// is false (fns, structs, enums); impls and traits record them.
+    fn generics(&mut self, what: &str, allow_lifetimes: bool) -> PResult<Generics> {
+        let start = self.span();
+        if !self.eat(Tok::Lt) {
+            return Ok(Generics { params: Vec::new(), span: start });
+        }
+        // The reject this syntax used to get on sight (see the
+        // `deferred` field): a leading lifetime named lifetimes,
+        // anything else named generics.
+        if matches!(self.peek(), Tok::Lifetime(_)) {
+            let d = lifetime_error(self.span());
+            self.defer(d);
+        } else {
+            let d = not_yet(C_TRAIT, start, &format!("generic {what}"));
+            self.defer(d);
+        }
+        let mut params = Vec::new();
+        loop {
+            if self.eat(Tok::Gt) {
+                break;
+            }
+            let pattrs = self.part_attributes()?;
+            match self.peek() {
+                Tok::Lifetime(_) => {
+                    if !allow_lifetimes {
+                        return Err(lifetime_error(self.span()));
+                    }
+                    let lt = self.lifetime_here()?;
+                    let mut bounds = Vec::new();
+                    if self.eat(Tok::Colon) {
+                        loop {
+                            bounds.push(self.lifetime_here()?);
+                            if !self.eat(Tok::Plus) {
+                                break;
+                            }
+                            if !matches!(self.peek(), Tok::Lifetime(_)) {
+                                break;
+                            }
+                        }
+                    }
+                    params.push(GenericParam::Lifetime { lt, bounds, attrs: pattrs.attrs });
+                }
+                Tok::Const => {
+                    self.bump();
+                    let (name, span) = self.ident()?;
+                    self.expect(Tok::Colon, "`:`")?;
+                    let ty = self.ty()?;
+                    let default = if self.eat(Tok::Eq) { Some(self.const_arg_expr()?) } else { None };
+                    params.push(GenericParam::Const { name, span, ty, default, attrs: pattrs.attrs });
+                }
+                Tok::Ident(_) => {
+                    let (name, span) = self.ident()?;
+                    let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
+                    let default = if self.eat(Tok::Eq) { Some(self.ty()?) } else { None };
+                    params.push(GenericParam::Type { name, span, bounds, default, attrs: pattrs.attrs });
+                }
+                t => return Err(syntax(self.span(), format!("expected a generic parameter, found {}", tok_name(t)))),
+            }
+            if !self.eat(Tok::Comma) {
+                self.expect(Tok::Gt, "`>`")?;
+                break;
+            }
+        }
+        Ok(Generics { params, span: start.to(self.prev_span()) })
+    }
+
+    /// A `for<'a, ..>` binder in a bound, or empty when absent.
+    fn opt_binder(&mut self) -> PResult<Vec<Lifetime>> {
+        if self.peek() != Tok::For {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        self.expect(Tok::Lt, "`<`")?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat(Tok::Gt) {
+                break;
+            }
+            out.push(self.lifetime_here()?);
+            if !self.eat(Tok::Comma) {
+                self.expect(Tok::Gt, "`>`")?;
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A trait path as written in a bound or impl header, with
+    /// parenthesized sugar (`Fn(A) -> B`) attached to its last
+    /// segment when present.
+    fn trait_path(&mut self) -> PResult<Vec<PathSeg>> {
+        let mut path = self.path(true)?;
+        if self.peek() == Tok::LParen {
+            self.bump();
+            let mut inputs = Vec::new();
+            while self.peek() != Tok::RParen {
+                inputs.push(self.ty()?);
+                if !self.eat(Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen, "`)`")?;
+            let output = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+            if let Some(last) = path.last_mut() {
+                last.args = GenericArgs::Parenthesized { inputs, output };
+            }
+        }
+        Ok(path)
+    }
+
+    /// One bound: a trait bound (optionally `for<..>`-bound and
+    /// `?`-relaxed) or a lifetime bound.
+    fn trait_bound(&mut self) -> PResult<TraitBound> {
+        let binder = self.opt_binder()?;
+        let maybe = self.eat(Tok::Question);
+        if matches!(self.peek(), Tok::Lifetime(_)) && binder.is_empty() && !maybe {
+            return Ok(TraitBound::Lifetime(self.lifetime_here()?));
+        }
+        // The legacy `~const` and `async` bound modifiers are not
+        // in the subset; plain paths and `?Trait` are.
+        let path = self.trait_path()?;
+        Ok(TraitBound::Trait { binder, trait_ref: TraitRefExpr { path }, maybe })
+    }
+
+    /// A `+`-separated bound list, at least one bound. A trailing
+    /// `+` before the list's terminator ends the list.
+    fn bounds(&mut self) -> PResult<Vec<TraitBound>> {
+        let mut out = Vec::new();
+        loop {
+            out.push(self.trait_bound()?);
+            if !self.eat(Tok::Plus) {
+                break;
+            }
+            if matches!(self.peek(), Tok::Comma | Tok::Gt | Tok::LBrace | Tok::Semi | Tok::RParen | Tok::Eq) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A `where` clause as written, or empty when absent.
+    fn where_clause(&mut self) -> PResult<WhereClause> {
+        let start = self.span();
+        if !self.eat(Tok::Where) {
+            return Ok(WhereClause { preds: Vec::new(), span: start });
+        }
+        let d = not_yet(C_TRAIT, start, "where clauses");
+        self.defer(d);
+        let mut preds = Vec::new();
+        loop {
+            if matches!(self.peek(), Tok::LBrace | Tok::Semi) {
+                break;
+            }
+            if matches!(self.peek(), Tok::Lifetime(_)) {
+                let lt = self.lifetime_here()?;
+                self.expect(Tok::Colon, "`:`")?;
+                let mut bounds = Vec::new();
+                loop {
+                    bounds.push(self.lifetime_here()?);
+                    if !self.eat(Tok::Plus) {
+                        break;
+                    }
+                    if !matches!(self.peek(), Tok::Lifetime(_)) {
+                        break;
+                    }
+                }
+                preds.push(WherePred::Lifetime { lt, bounds });
+            } else {
+                let binder = self.opt_binder()?;
+                let ty = self.ty()?;
+                self.expect(Tok::Colon, "`:`")?;
+                let bounds = self.bounds()?;
+                preds.push(WherePred::Type { binder, ty, bounds });
+            }
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(WhereClause { preds, span: start.to(self.prev_span()) })
     }
 
     fn fn_def(&mut self) -> PResult<FnDef> {
+        self.fn_def_inner(false)
+    }
+
+    /// A fn definition. With `sig_only`, a trailing `;` instead of a
+    /// body is a bodyless declaration (a trait method signature).
+    fn fn_def_inner(&mut self, sig_only: bool) -> PResult<FnDef> {
         self.expect(Tok::Fn, "`fn`")?;
         let (name, name_span) = self.ident()?;
-        self.no_generics("functions")?;
+        let generics = self.generics("functions", false)?;
         self.expect(Tok::LParen, "`(`")?;
         let mut self_param = None;
         let mut params = Vec::new();
-        // `self`, `mut self`, `&self`, `&mut self`.
+        // `self`, `mut self`, `&self`, `&mut self`, the same with a
+        // written lifetime, and typed receivers (`self: Rc<Self>`).
         let s = self.span();
-        let self_form = match (self.peek(), self.peek_at(1), self.peek_at(2)) {
-            (Tok::SelfLower, _, _) => Some((SelfKind::Value, false, 1)),
-            (Tok::Mut, Tok::SelfLower, _) => Some((SelfKind::Value, true, 2)),
-            (Tok::Amp, Tok::SelfLower, _) => Some((SelfKind::Ref, false, 2)),
-            (Tok::Amp, Tok::Mut, Tok::SelfLower) => Some((SelfKind::RefMut, false, 3)),
-            (Tok::Amp, Tok::Lifetime(_), _) => return Err(lifetime_error(self.toks[self.pos + 1].span)),
-            _ => None,
+        let typed_self = (self.peek() == Tok::SelfLower && self.peek_at(1) == Tok::Colon)
+            || (self.peek() == Tok::Mut && self.peek_at(1) == Tok::SelfLower && self.peek_at(2) == Tok::Colon);
+        if typed_self {
+            let d = not_yet(C_METHOD, s, "typed `self` parameters");
+            self.defer(d);
+            let mutable = self.eat(Tok::Mut);
+            self.bump(); // `self`
+            self.bump(); // `:`
+            let ty = self.ty()?;
+            self_param = Some(SelfParam {
+                kind: SelfKind::Typed,
+                mutable,
+                lifetime: None,
+                ty: Some(ty),
+                attrs: Vec::new(),
+                span: s.to(self.prev_span()),
+            });
+            if !self.eat(Tok::Comma) && self.peek() != Tok::RParen {
+                return Err(syntax(self.span(), "expected `,` or `)`"));
+            }
+        }
+        let self_form = if typed_self {
+            None
+        } else {
+            match (self.peek(), self.peek_at(1), self.peek_at(2), self.peek_at(3)) {
+                (Tok::SelfLower, _, _, _) => Some((SelfKind::Value, false, 1, None)),
+                (Tok::Mut, Tok::SelfLower, _, _) => Some((SelfKind::Value, true, 2, None)),
+                (Tok::Amp, Tok::SelfLower, _, _) => Some((SelfKind::Ref, false, 2, None)),
+                (Tok::Amp, Tok::Mut, Tok::SelfLower, _) => Some((SelfKind::RefMut, false, 3, None)),
+                (Tok::Amp, Tok::Lifetime(lt), Tok::SelfLower, _) => {
+                    Some((SelfKind::Ref, false, 3, Some(Lifetime { name: lt, span: self.toks[self.pos + 1].span })))
+                }
+                (Tok::Amp, Tok::Lifetime(lt), Tok::Mut, Tok::SelfLower) => {
+                    Some((SelfKind::RefMut, false, 4, Some(Lifetime { name: lt, span: self.toks[self.pos + 1].span })))
+                }
+                _ => None,
+            }
         };
-        if let Some((kind, mutable, n)) = self_form {
+        if let Some((kind, mutable, n, lifetime)) = self_form {
+            if let Some(lt) = lifetime {
+                let d = lifetime_error(lt.span);
+                self.defer(d);
+            }
             for _ in 0..n {
                 self.bump();
             }
-            self_param = Some(SelfParam { kind, mutable, lifetime: None, ty: None, attrs: Vec::new(), span: s.to(self.prev_span()) });
-            if self.peek() == Tok::Colon {
-                return Err(self.reject(C_METHOD, "typed `self` parameters"));
-            }
+            self_param = Some(SelfParam { kind, mutable, lifetime, ty: None, attrs: Vec::new(), span: s.to(self.prev_span()) });
             if !self.eat(Tok::Comma) && self.peek() != Tok::RParen {
                 return Err(syntax(self.span(), "expected `,` or `)`"));
             }
@@ -849,11 +1112,9 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::RParen, "`)`")?;
         let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
-        if self.peek() == Tok::Where {
-            return Err(self.reject(C_TRAIT, "where clauses"));
-        }
+        let where_clause = self.where_clause()?;
         let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
-        let body = self.block()?;
+        let body = if sig_only && self.eat(Tok::Semi) { None } else { Some(self.block()?) };
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
         Ok(FnDef {
@@ -863,13 +1124,13 @@ impl<'a> Parser<'a> {
             vis: Vis::Private,
             attrs: Vec::new(),
             qual: FnQual::default(),
-            generics: Generics::default(),
+            generics,
             self_param,
             params,
             variadic: false,
             ret,
-            where_clause: WhereClause::default(),
-            body: Some(body),
+            where_clause,
+            body,
             exprs,
             pats,
         })
@@ -913,10 +1174,11 @@ impl<'a> Parser<'a> {
     fn struct_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<StructDef> {
         self.expect(Tok::Struct, "`struct`")?;
         let (name, name_span) = self.ident()?;
-        self.no_generics("structs")?;
-        if self.peek() == Tok::Where {
-            return Err(self.reject(C_TRAIT, "where clauses"));
-        }
+        let generics = self.generics("structs", false)?;
+        // The where clause sits before the fields (named struct)
+        // or before the `;` (unit struct). Tuple structs put it
+        // after the fields; they still reject below.
+        let where_clause = self.where_clause()?;
         let fields = match self.peek() {
             Tok::Semi => {
                 self.bump();
@@ -930,16 +1192,14 @@ impl<'a> Parser<'a> {
             }
             _ => VariantFields::Struct(self.fields()?),
         };
-        Ok(StructDef { name, name_span, generics: Generics::default(), fields, where_clause: WhereClause::default(), derives })
+        Ok(StructDef { name, name_span, generics, fields, where_clause, derives })
     }
 
     fn enum_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<EnumDef> {
         self.expect(Tok::Enum, "`enum`")?;
         let (name, name_span) = self.ident()?;
-        self.no_generics("enums")?;
-        if self.peek() == Tok::Where {
-            return Err(self.reject(C_TRAIT, "where clauses"));
-        }
+        let generics = self.generics("enums", false)?;
+        let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
         while self.peek() != Tok::RBrace {
@@ -960,59 +1220,158 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(EnumDef { name, name_span, generics: Generics::default(), variants, where_clause: WhereClause::default(), derives })
+        Ok(EnumDef { name, name_span, generics, variants, where_clause, derives })
     }
 
-    fn impl_def(&mut self) -> PResult<ImplDef> {
-        let start = self.expect(Tok::Impl, "`impl`")?;
-        if self.peek() == Tok::Bang {
-            return Err(self.reject(C_TRAIT, "trait impls"));
-        }
-        self.no_generics("impls")?;
-        let self_ty = self.ty()?;
-        if self.peek() == Tok::For {
-            return Err(self.reject(C_TRAIT, "trait impls"));
-        }
-        if self.peek() == Tok::Where {
-            return Err(self.reject(C_TRAIT, "where clauses"));
-        }
+    /// One associated type in a trait or an impl:
+    /// `type Name<..>: Bounds = Default;` (parts optional by context;
+    /// collect checks which parts each context requires).
+    fn assoc_type(&mut self) -> PResult<AssocTypeDef> {
+        let start = self.expect(Tok::Type, "`type`")?;
+        let d = not_yet(C_ASSOC, start, "associated consts and types");
+        self.defer(d);
+        let (name, name_span) = self.ident()?;
+        let generics = self.generics("associated types", true)?;
+        let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
+        let where_clause = self.where_clause()?;
+        let default = if self.eat(Tok::Eq) { Some(self.ty()?) } else { None };
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(AssocTypeDef {
+            name,
+            name_span,
+            vis: Vis::Private,
+            attrs: Vec::new(),
+            generics,
+            bounds,
+            where_clause,
+            default,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// One associated const in a trait or an impl:
+    /// `const NAME: Ty = value;` (the value is optional in a trait).
+    fn assoc_const(&mut self) -> PResult<AssocConstDef> {
+        let start = self.expect(Tok::Const, "`const`")?;
+        let d = not_yet(C_ASSOC, start, "associated consts and types");
+        self.defer(d);
+        let (name, name_span) = self.ident()?;
+        self.expect(Tok::Colon, "`:`")?;
+        let ty = self.ty()?;
+        let default = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        self.expect(Tok::Semi, "`;`")?;
+        Ok(AssocConstDef { name, name_span, vis: Vis::Private, attrs: Vec::new(), ty, default, span: start.to(self.prev_span()) })
+    }
+
+    /// A trait definition: supertrait bounds, a where clause, and
+    /// method signatures (with optional default bodies), associated
+    /// types, and associated consts.
+    fn trait_def(&mut self) -> PResult<TraitDef> {
+        let start = self.expect(Tok::Trait, "`trait`")?;
+        let d = not_yet(C_TRAIT, start, "trait definitions");
+        self.defer(d);
+        let (name, name_span) = self.ident()?;
+        let generics = self.generics("traits", true)?;
+        let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
+        let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut fns = Vec::new();
+        let mut consts = Vec::new();
+        let mut types = Vec::new();
+        while self.peek() != Tok::RBrace {
+            let parsed = self.attributes()?;
+            let vis = self.vis()?;
+            match self.peek() {
+                Tok::Fn => {
+                    let mut def = self.fn_def_inner(true)?;
+                    def.vis = vis;
+                    def.attrs = parsed.attrs;
+                    fns.push(def);
+                }
+                Tok::Type => types.push(self.assoc_type()?),
+                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
+                Tok::Const => return Err(self.reject(C_CONST, "const functions")),
+                Tok::Unsafe => return Err(unsafe_error(self.span())),
+                Tok::Async => return Err(async_error(self.span())),
+                Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
+                t => return Err(syntax(self.span(), format!("expected a trait item, found {}", tok_name(t)))),
+            }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        Ok(TraitDef {
+            name,
+            name_span,
+            is_unsafe: false,
+            is_auto: false,
+            generics,
+            bounds,
+            where_clause,
+            fns,
+            consts,
+            types,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// An inherent or trait impl. The header before the `{` is
+    /// either a Self type or `TraitRef for SelfType`: a path is
+    /// parsed once, and a following `for` makes it the trait ref.
+    fn impl_def(&mut self, is_unsafe: bool) -> PResult<ImplDef> {
+        let start = self.expect(Tok::Impl, "`impl`")?;
+        let generics = self.generics("impls", true)?;
+        let is_negative = self.eat(Tok::Bang);
+        let (trait_ref, self_ty) = if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper) {
+            let header_start = self.span();
+            let path = self.trait_path()?;
+            if self.eat(Tok::For) {
+                let self_ty = self.ty()?;
+                (Some(TraitRefExpr { path }), self_ty)
+            } else if is_negative {
+                return Err(syntax(header_start, "expected `for` after the trait in a negative impl"));
+            } else {
+                let span = header_start.to(self.prev_span());
+                (None, self.push_ty(TyExpr::Path(path), span))
+            }
+        } else {
+            let self_ty = self.ty()?;
+            if self.peek() == Tok::For {
+                return Err(syntax(self.span(), "expected a trait path before `for` in an impl"));
+            }
+            (None, self_ty)
+        };
+        if trait_ref.is_some() || is_negative {
+            let d = not_yet(C_TRAIT, start, "trait impls");
+            self.defer(d);
+        }
+        let where_clause = self.where_clause()?;
+        self.expect(Tok::LBrace, "`{`")?;
+        let mut fns = Vec::new();
+        let mut consts = Vec::new();
+        let mut types = Vec::new();
         while self.peek() != Tok::RBrace {
             let parsed = self.attributes()?;
             let vis = self.vis()?;
             let is_test = parsed.is_test;
             match self.peek() {
-                Tok::Fn => {}
-                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => {
-                    return Err(self.reject(C_ASSOC, "associated consts and types"));
+                Tok::Fn => {
+                    let mut def = self.fn_def()?;
+                    def.is_test = is_test;
+                    def.vis = vis;
+                    def.attrs = parsed.attrs;
+                    fns.push(def);
                 }
+                Tok::Type if trait_ref.is_some() => types.push(self.assoc_type()?),
+                Tok::Type => return Err(self.reject(C_ASSOC, "associated types in inherent impls")),
+                Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
-                Tok::Type => return Err(self.reject(C_ASSOC, "associated consts and types")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),
                 Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
-                _ => return Err(self.reject(C_ASSOC, "associated consts and types")),
+                t => return Err(syntax(self.span(), format!("expected an impl item, found {}", tok_name(t)))),
             }
-            let mut def = self.fn_def()?;
-            def.is_test = is_test;
-            def.vis = vis;
-            def.attrs = parsed.attrs;
-            fns.push(def);
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(ImplDef {
-            generics: Generics::default(),
-            is_unsafe: false,
-            is_negative: false,
-            trait_ref: None,
-            self_ty,
-            where_clause: WhereClause::default(),
-            fns,
-            consts: Vec::new(),
-            types: Vec::new(),
-            span: start,
-        })
+        Ok(ImplDef { generics, is_unsafe, is_negative, trait_ref, self_ty, where_clause, fns, consts, types, span: start })
     }
 
     // ---------- Types ----------
@@ -1026,13 +1385,21 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Amp | Tok::AndAnd => {
                 let double = self.bump().tok == Tok::AndAnd;
-                if matches!(self.peek(), Tok::Lifetime(_)) {
-                    return Err(lifetime_error(self.span()));
-                }
+                // Written lifetimes are recorded; regions are erased
+                // in this milestone, and collect decides which
+                // written forms the subset accepts.
+                let lifetime = if matches!(self.peek(), Tok::Lifetime(_)) {
+                    let lt = self.lifetime_here()?;
+                    let d = lifetime_error(lt.span);
+                    self.defer(d);
+                    Some(lt)
+                } else {
+                    None
+                };
                 let mutable = self.eat(Tok::Mut);
                 let inner = self.ty()?;
                 let span = start.to(self.prev_span());
-                let mut t = self.push_ty(TyExpr::Ref { lifetime: None, mutable, inner }, span);
+                let mut t = self.push_ty(TyExpr::Ref { lifetime, mutable, inner }, span);
                 if double {
                     t = self.push_ty(TyExpr::Ref { lifetime: None, mutable: false, inner: t }, span);
                 }
@@ -1067,10 +1434,45 @@ impl<'a> Parser<'a> {
                     Ok(self.push_ty(TyExpr::Slice(inner), start.to(self.prev_span())))
                 }
             }
-            Tok::Impl => Err(not_yet(C_TY, start, "`impl Trait` types")),
-            Tok::Dyn => Err(not_yet(C_TY, start, "`dyn Trait` types")),
+            Tok::Impl => {
+                self.bump();
+                let d = not_yet(C_TY, start, "`impl Trait` types");
+                self.defer(d);
+                let bounds = self.bounds()?;
+                Ok(self.push_ty(TyExpr::ImplTrait { bounds }, start.to(self.prev_span())))
+            }
+            Tok::Dyn => {
+                self.bump();
+                let d = not_yet(C_TY, start, "`dyn Trait` types");
+                self.defer(d);
+                let binder = self.opt_binder()?;
+                let mut bounds = self.bounds()?;
+                // A trailing lifetime bound is the dyn lifetime.
+                let lifetime = match bounds.last() {
+                    Some(TraitBound::Lifetime(lt)) if bounds.len() > 1 => {
+                        let lt = *lt;
+                        bounds.pop();
+                        Some(lt)
+                    }
+                    _ => None,
+                };
+                Ok(self.push_ty(TyExpr::Dyn { binder, bounds, lifetime }, start.to(self.prev_span())))
+            }
             Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
-            Tok::Star => Err(not_yet(C_TY, start, "raw pointer types")),
+            Tok::Star => {
+                self.bump();
+                let d = not_yet(C_TY, start, "raw pointer types");
+                self.defer(d);
+                let mutable = if self.eat(Tok::Mut) {
+                    true
+                } else if self.eat(Tok::Const) {
+                    false
+                } else {
+                    return Err(syntax(self.span(), "expected `const` or `mut` after `*` in a raw pointer type"));
+                };
+                let inner = self.ty()?;
+                Ok(self.push_ty(TyExpr::Ptr { mutable, inner }, start.to(self.prev_span())))
+            }
             Tok::Bang => {
                 // The never type: its AST shape is `TyExpr::Never` (S3b) and
                 // check already unifies it. Its parser lands with S5 because
@@ -1078,10 +1480,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(self.push_ty(TyExpr::Never, start.to(self.prev_span())))
             }
-            Tok::Underscore => Err(not_yet(C_TY, start, "inferred types (`_`)")),
+            Tok::Underscore => {
+                self.bump();
+                let d = not_yet(C_TY, start, "inferred types (`_`)");
+                self.defer(d);
+                Ok(self.push_ty(TyExpr::Infer, start.to(self.prev_span())))
+            }
             Tok::Unsafe => Err(unsafe_error(start)),
             Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),
-            Tok::Lt => Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::Lt => {
+                let d = not_yet(C_ASSOC, start, "qualified paths");
+                self.defer(d);
+                let (self_ty, trait_path, segs) = self.qpath_parts()?;
+                Ok(self.push_ty(TyExpr::QPath { self_ty, trait_path, segs }, start.to(self.prev_span())))
+            }
             Tok::For => {
                 if self.peek_at(1) == Tok::Lt && matches!(self.peek_at(2), Tok::Lifetime(_)) {
                     Err(lifetime_error(self.toks[self.pos + 2].span))
@@ -1097,20 +1509,70 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Angle generic arguments, starting at the `<` and eating through the
-    /// matching `>`. Type arguments parse as before; lifetime, const, and
-    /// binding arguments reject with their own codes.
+    /// The parts of a qualified path, current token at `<`:
+    /// `<SelfTy as Trait>::Segs`, or `<SelfTy>::Segs` with an empty
+    /// trait path. Shared by type and expression position.
+    fn qpath_parts(&mut self) -> PResult<(TyId, Vec<PathSeg>, Vec<PathSeg>)> {
+        let d = not_yet(C_ASSOC, self.span(), "qualified paths");
+        self.defer(d);
+        self.expect(Tok::Lt, "`<`")?;
+        let self_ty = self.ty()?;
+        let trait_path = if self.eat(Tok::As) { self.trait_path()? } else { Vec::new() };
+        self.expect(Tok::Gt, "`>`")?;
+        self.expect(Tok::PathSep, "`::`")?;
+        let segs = self.path(true)?;
+        Ok((self_ty, trait_path, segs))
+    }
+
+    /// A const generic argument expression: a literal, a path to a
+    /// const item or parameter, a negated literal, or a braced
+    /// block. Anything that would need an operator must be braced,
+    /// as in Rust, so `>` is never eaten as a comparison here.
+    fn const_arg_expr(&mut self) -> PResult<ExprId> {
+        match self.peek() {
+            Tok::Minus => self.prefix(false),
+            Tok::LBrace => self.block_like_expr(),
+            Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false),
+            _ => Err(self.reject(C_CONST, "const generic arguments in this form")),
+        }
+    }
+
+    /// Angle generic arguments, starting at the `<` and eating through
+    /// the matching `>`: types, lifetimes (still rejected, L0203),
+    /// consts, and associated bindings (`Item = u8`, `Item: Clone`).
     fn generic_args(&mut self) -> PResult<Vec<GenericArg>> {
         self.expect(Tok::Lt, "`<`")?;
         let mut args = Vec::new();
         while self.peek() != Tok::Gt {
             match self.peek() {
                 Tok::Lifetime(_) => return Err(lifetime_error(self.span())),
-                Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
-                    return Err(self.reject(C_CONST, "const generic arguments"));
+                Tok::Ident(name) if self.peek_at(1) == Tok::Eq => {
+                    let span = self.span();
+                    let d = not_yet(C_ASSOC, span, "associated bindings in generic arguments");
+                    self.defer(d);
+                    self.bump();
+                    self.bump();
+                    let kind = match self.peek() {
+                        Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
+                            BindingKind::EqConst(self.const_arg_expr()?)
+                        }
+                        _ => BindingKind::EqTy(self.ty()?),
+                    };
+                    args.push(GenericArg::Binding { name, span, kind });
                 }
-                Tok::Ident(_) if self.peek_at(1) == Tok::Eq || self.peek_at(1) == Tok::Colon => {
-                    return Err(self.reject(C_ASSOC, "associated bindings in generic arguments"));
+                Tok::Ident(name) if self.peek_at(1) == Tok::Colon => {
+                    let span = self.span();
+                    let d = not_yet(C_ASSOC, span, "associated bindings in generic arguments");
+                    self.defer(d);
+                    self.bump();
+                    self.bump();
+                    let bounds = self.bounds()?;
+                    args.push(GenericArg::Binding { name, span, kind: BindingKind::Constraint(bounds) });
+                }
+                Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
+                    let d = not_yet(C_CONST, self.span(), "const generic arguments");
+                    self.defer(d);
+                    args.push(GenericArg::Const(self.const_arg_expr()?));
                 }
                 _ => args.push(GenericArg::Type(self.ty()?)),
             }
@@ -1278,7 +1740,10 @@ impl<'a> Parser<'a> {
             }
             Tok::DotDot | Tok::DotDotEq => return Err(not_yet(C_CORE, start, "half-open range patterns")),
             Tok::Float(_) | Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "float and byte literals")),
-            Tok::Lt => return Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::Lt => {
+                let (self_ty, trait_path, segs) = self.qpath_parts()?;
+                Pat::QPath { self_ty, trait_path, segs }
+            }
             Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(start)),
             Tok::Ident(_) | Tok::SelfUpper => {
                 let path = self.path(false)?;
@@ -1881,7 +2346,10 @@ impl<'a> Parser<'a> {
             Tok::Async => return Err(async_error(start)),
             Tok::Const => return Err(not_yet(C_CONST, start, "inline const blocks")),
             Tok::Let => return Err(not_yet(C_CORE, start, "let chains")),
-            Tok::Lt => return Err(not_yet(C_ASSOC, start, "qualified paths")),
+            Tok::Lt => {
+                let (self_ty, trait_path, segs) = self.qpath_parts()?;
+                Expr::QPath { self_ty, trait_path, segs }
+            }
             Tok::Underscore => return Err(not_yet(C_CORE, start, "inferred expressions (`_`)")),
             Tok::Ident(_) | Tok::SelfUpper => {
                 if self.peek_at(1) == Tok::Bang {
