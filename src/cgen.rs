@@ -1987,7 +1987,7 @@ impl GlueSet {
     /// definition changed); new keys are added as in `add`. Comparing
     /// the generated text is exact by construction: no second
     /// fingerprint of what `glue_def` reads to keep in sync.
-    pub fn refresh<'k>(&mut self, p: &Program, keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
+    pub fn refresh<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
         let mut pending: Vec<(Glue, CTy)> = keys.cloned().collect();
         let mut seen: HashSet<(Glue, CTy)> = HashSet::new();
         let mut shared_changed = false;
@@ -1999,7 +1999,7 @@ impl GlueSet {
             let mut more = Vec::new();
             let mut proto = String::new();
             let mut def = String::new();
-            glue_def(p, &g.0, &g.1, &mut proto, &mut def, &mut more);
+            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
             let is_new = !self.protos.contains_key(&g);
             let changed = is_new
                 || self.def_map.get(&g) != Some(&def)

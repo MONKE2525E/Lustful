@@ -3,7 +3,10 @@
 //
 // Incremental rules, from cheapest to most expensive:
 //   1. Only function bodies changed (same environment hash: all tokens outside bodies): re-parse,
-//      re-check, and re-generate only those functions.
+//      re-check, and re-generate only those functions. One exception: a changed const fn body can
+//      move const and static values, array lengths, and discriminants that unchanged bodies baked
+//      in, so then every unchanged passing body joins the read-set dirty walk (rule 2's mechanism)
+//      and the glue unit (which holds the statics) rebuilds.
 //   2. Only top-level functions were added, removed, or changed signature (all other items the
 //      same): re-parse the file, but re-check and re-generate only the changed functions and the
 //      bodies that mention their names. A changed function always rechecks: its body is checked
@@ -571,9 +574,13 @@ fn nonfn_items_changed(old: &[scan::ItemScan], new: &[scan::ItemScan]) -> bool {
 
 /// After a parse that was not "bodies only": update item tables, assign slots by
 /// stable def hash, and pick the functions to re-check. Returns (changed,
-/// mention_only): changed local ids as indexes, plus the subset the read-set
+/// mention_only, const_fn_changed): changed local ids as indexes, plus the subset the read-set
 /// dirty walk may still reuse after collect (body hash equal, last check
-/// passed, own signature item unchanged). In signatures mode the candidates
+/// passed, own signature item unchanged), plus whether a const fn's body or
+/// signature changed. A const fn change can move const and static values,
+/// array lengths, and discriminants that other items baked in, so every
+/// unchanged passing body becomes a walk candidate then, as in full mode;
+/// the caller also rebuilds the glue unit (it holds the statics). In signatures mode the candidates
 /// are the bodies that mention a changed name; in full mode every unchanged
 /// passing body is a candidate and the walk decides from its recorded reads
 /// (Binding, MethodSet, ImplSet, Sig, Layout; Sig fingerprints hash named
@@ -595,7 +602,7 @@ fn slot_update(
     crate_ids: CrateIds,
     scan_of: &dyn Fn(&Front, usize) -> (u64, u32),
     t: &mut Timer,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
+) -> Result<(Vec<usize>, Vec<usize>, bool), String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
     let had_env = front.env_hash.is_some();
@@ -684,8 +691,10 @@ fn slot_update(
     caches.slot_fp.resize(n_slots, 0);
     front.slot_hash.resize(n_slots, 0);
     front.slot_head.resize(n_slots, 0);
-    // Every fn's head hash at this parse (see `Front::slot_head`).
-    let heads: Vec<u64> = front
+    // Every fn's head hash at this parse (see `Front::slot_head`), and
+    // whether it is a const fn (its body feeds const evaluation, so a
+    // body edit can move values other items baked in).
+    let (heads, is_const): (Vec<u64>, Vec<bool>) = front
         .fn_loc
         .iter()
         .map(|&(item, sub)| {
@@ -694,7 +703,7 @@ fn slot_update(
                 (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
                 _ => unreachable!("fn_loc out of date"),
             };
-            super::ast_hash::fn_head_hash(&front.ast, f)
+            (super::ast_hash::fn_head_hash(&front.ast, f), f.qual.is_const)
         })
         .collect();
     for slot in (0..n_slots).filter(|&s| !live[s]) {
@@ -716,6 +725,18 @@ fn slot_update(
     // not cover the signature tokens, so no recorded read set can prove the old result
     // stands. It rechecks like a body change.
     let names = changed_names.unwrap_or_default();
+    // A const fn whose body hash or signature item changed: its old
+    // results may sit inside const and static values, array lengths,
+    // and discriminants across the crate. Collect re-evaluates those
+    // items, and their new values ride in `Sig` and `Layout`
+    // fingerprints; making every unchanged passing body a candidate
+    // lets the dirty walk find the readers. (A brand-new const fn also
+    // sets this: one needless walk, no wrong reuse.)
+    let const_fn_changed = (0..fn_count).any(|i| {
+        is_const[i]
+            && (front.slot_hash.get(front.fn_slot[i] as usize).copied().unwrap_or(0) != scan_of(front, i).0
+                || (keys[i].free && names.contains(&keys[i].name)))
+    });
     let mut changed = Vec::new();
     let mut mention_only = Vec::new();
     for i in 0..fn_count {
@@ -730,8 +751,8 @@ fn slot_update(
         // own head creates. The stored hash advances with the body
         // hash below, before the check runs, under the same rule.
         let head_same = front.slot_head[slot] == heads[i];
-        if full_walk && body_same && head_same && caches.ok[slot] {
-            // Full-mode candidate: the body is unchanged and passed
+        if (full_walk || const_fn_changed) && body_same && head_same && caches.ok[slot] {
+            // Full-mode (or const-fn-edit) candidate: the body is unchanged and passed
             // before, so only its recorded reads can dirty it. It
             // stays in `changed` (the walk in `compile` removes the
             // clean ones) and keeps its passing mark and C until the
@@ -759,7 +780,7 @@ fn slot_update(
         }
     }
     t.lap(if names.is_empty() { "parse (par)" } else { "parse changed chunks" });
-    Ok((changed, mention_only))
+    Ok((changed, mention_only, const_fn_changed))
 }
 
 /// Function names whose signature changed, or that were added or removed, if those are the only
@@ -883,8 +904,8 @@ fn splice_std(
 /// bodies/signatures/full mode split as the single-file path picks
 /// the slot update, and the shared tail's read-set dirty walk reuses
 /// every body whose recorded reads still match. Returns the tail
-/// tuple (map, changed, mention-only, fn count, mode, fn lines, body
-/// hashes, tables).
+/// tuple (map, changed, mention-only, const-fn-changed, fn count,
+/// mode, fn lines, body hashes, tables).
 #[allow(clippy::too_many_arguments)]
 fn resolved_setup(
     req: &Request,
@@ -896,7 +917,7 @@ fn resolved_setup(
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
     t: &mut Timer,
-) -> Result<(SourceMap, Vec<usize>, Vec<usize>, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
+) -> Result<(SourceMap, Vec<usize>, Vec<usize>, bool, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
     use crate::resolve::cargo::{self, GraphRequest};
     use crate::resolve::cfg::CfgEnv;
     use crate::resolve::worklist::{self, CrateInput};
@@ -1057,14 +1078,15 @@ fn resolved_setup(
     let lines = fn_lines.clone();
     let hashes = body_hashes.clone();
     let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
-    let (changed, mention_only) = match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, t) {
-        Ok(c) => c,
-        Err(e) => {
-            front.env_hash = None;
-            return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
-        }
-    };
-    Ok((map, changed, mention_only, fn_count, mode, fn_lines, body_hashes, Some(tables)))
+    let (changed, mention_only, const_fn_changed) =
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, t) {
+            Ok(c) => c,
+            Err(e) => {
+                front.env_hash = None;
+                return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
+            }
+        };
+    Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
 
 pub fn compile(req: &Request, session: &mut Session) -> Response {
@@ -1171,7 +1193,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
 
     // Both front ends produce the same locals for the shared tail.
-    let (map, mut changed, mention_only, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
+    let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
         match resolved_setup(req, front, caches, std_cache, &src, crate_ids, &mut std_ranges, &mut std_routes, &mut t) {
             Ok(x) => x,
             Err(resp) => return resp,
@@ -1366,8 +1388,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         "full"
     };
 
-    let (changed, mention_only): (Vec<usize>, Vec<usize>) = if bodies_only {
-        let changed: Vec<usize> = (0..fn_count)
+    let (changed, mention_only, const_fn_changed): (Vec<usize>, Vec<usize>, bool) = if bodies_only {
+        let mut changed: Vec<usize> = (0..fn_count)
             .filter(|&i| {
                 let slot = front.fn_slot[i] as usize;
                 front.slot_hash[slot] != scan_of(front, i).0 || !caches.ok[slot]
@@ -1410,7 +1432,31 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         t.lap("parse changed bodies");
-        (changed, Vec::new())
+        // A changed const fn body can move const and static values,
+        // array lengths, and discriminants that unchanged bodies baked
+        // in. Make every unchanged passing body a dirty-walk candidate,
+        // as `slot_update` does in the other modes: the walk replays
+        // their recorded reads against the re-collected program, whose
+        // `Sig` fingerprints fold the new values.
+        let const_fn_changed = changed.iter().any(|&i| {
+            let (item, sub) = front.fn_loc[i];
+            let def = match (&front.ast.items[item].kind, sub) {
+                (ItemKind::Fn(d), None) => d,
+                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+                _ => unreachable!("fn_loc out of date"),
+            };
+            def.qual.is_const
+        });
+        let mut mention_only = Vec::new();
+        if const_fn_changed {
+            for i in 0..fn_count {
+                if !changed.contains(&i) && caches.ok[front.fn_slot[i] as usize] {
+                    mention_only.push(i);
+                    changed.push(i);
+                }
+            }
+        }
+        (changed, mention_only, const_fn_changed)
     } else if changed_names.is_some() {
         // Only top-level functions changed: parse just the chunks with new text, and splice their
         // items between the unchanged chunks' items.
@@ -1480,7 +1526,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     let fn_lines_all: Vec<u32> = (0..fn_count).map(|i| scan_of(front, i).1).collect();
     let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
-    (map, changed, mention_only, fn_count, mode, fn_lines_all, body_hashes_all, None)
+    (map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, None)
     };
     let scan_of = |front: &Front, i: usize| {
         let _ = front;
@@ -1772,7 +1818,25 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
     }
-    let glue_changed = caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()));
+    // Derived glue (Debug, Clone, Eq, Drop) is keyed by Adt id but
+    // generated from field and variant types, and the glue unit also
+    // holds the statics. When type definitions may have moved (full
+    // mode) or a const fn edit may have moved values and layouts
+    // (array lengths, discriminants), regenerate every live glue
+    // definition and compare text: a changed definition forces a
+    // fresh base so fn units that carry static copies reassemble too.
+    // A const fn edit also forces the glue unit itself, whose statics
+    // may hold new values even when no glue definition changed.
+    let glue_changed = if mode == "full" || const_fn_changed {
+        let (shared_changed, regenerated) =
+            caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()));
+        if regenerated {
+            caches.objects = None;
+        }
+        shared_changed || regenerated || const_fn_changed
+    } else {
+        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()))
+    };
     t.lap("codegen (par)");
 
     // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4.. = function
