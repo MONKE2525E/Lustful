@@ -20,6 +20,13 @@ pub(crate) struct Front {
     pub(crate) ast: Ast,
     /// `None` until the first successful parse.
     pub(crate) env_hash: Option<u64>,
+    /// Hash of the Adt item name sequence (structs, enums, unions in
+    /// Ast order) at the last parse. `collect` numbers Adts in that
+    /// order, and cached outputs (`FnOut::types`, the glue set) carry
+    /// those session-local Adt ids: if the sequence changes, cached
+    /// output is not reusable and a full rebuild must clear it. A pure
+    /// field or layout edit keeps the sequence and may preserve it.
+    pub(crate) adt_seq_fp: u64,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -84,9 +91,9 @@ pub(crate) struct Caches {
     pub(crate) out: Vec<FnOut>,
     pub(crate) has_out: Vec<bool>,
     /// The read set of the slot's last passing check (docs/ARCH.md
-    /// section 8.2), stored with the result. On a signature-only edit the
-    /// dirty walk (`Program::reads_dirty`) replays these reads against
-    /// the new program; a body whose reads all still match is reused
+    /// section 8.2), stored with the result. On later edits the dirty
+    /// walk (`Program::reads_dirty`) replays these reads against the
+    /// new program; a body whose reads all still match is reused
     /// without a recheck. Session-local only (`Sym` and `DefId` keys are
     /// stable inside one session, never written to disk in this form).
     pub(crate) slot_reads: Vec<Option<crate::driver::graph::Reads>>,
@@ -156,6 +163,7 @@ impl Session {
                 known,
                 ast: Ast::default(),
                 env_hash: None,
+                adt_seq_fp: 0,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),

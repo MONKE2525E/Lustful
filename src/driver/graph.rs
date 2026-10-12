@@ -7,13 +7,14 @@
 // W-TRAITS-CORE, W-MACRO) code against these functions. Today's single-file,
 // single-module resolver sits behind them; W-RESOLVE replaces that resolver
 // with the module tree and import worklist of section 1.3 without changing any
-// caller. S7 was record-only. W-DRIVER (wave A) turns reads into reuse
-// for `Binding` nodes first: `Program::reads_dirty` below recomputes each
-// recorded node's fingerprint in the new program, and compile.rs drops a
-// recheck candidate only when its body is unchanged and every recorded
-// read still matches. Reuse is restricted to signature-only edits (the
-// name-based prefilter in compile.rs still bounds the candidate set, per
-// section 8.2's staging rule); full rebuilds do not reuse yet.
+// caller. S7 was record-only. W-DRIVER (wave A) turned reads into reuse
+// for signature-only edits first; phase 2 extends the same walk to full
+// mode: `Program::reads_dirty` below recomputes each recorded node's
+// fingerprint in the new program, and compile.rs drops a recheck
+// candidate only when its body is unchanged and every recorded read
+// still matches. `Sig` fingerprints hash the layouts of named Adts
+// deeply, and `Layout` has its own fingerprint, so type and impl edits
+// dirty exactly the bodies that read through them.
 //
 // Fingerprints here hash normalized content only: name strings, stable def
 // path hashes, and type structure. They never hash a `Sym`, a `Ty`, an
@@ -456,6 +457,137 @@ fn ty_fingerprint(p: &Program, t: Ty) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// Every Adt def named inside one type, in walk order (duplicates kept;
+/// the caller dedups through its cycle stack). FnDef, Closure, Opaque,
+/// and Projection defs are not Adt layouts and do not appear here: their
+/// content is covered by their own `Sig` nodes when a body reads them.
+fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId>) {
+    fn args(p: &Program, tys: &impl TyIntern, a: ArgsId, out: &mut Vec<DefId>) {
+        for a in tys.args(a) {
+            if let GenericArg::Ty(t) = a {
+                collect_adt_defs(p, tys, *t, out);
+            }
+        }
+    }
+    match tys.kind(t) {
+        TyKind::Adt(def, a) => {
+            out.push(def);
+            args(p, tys, a, out);
+        }
+        TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+            collect_adt_defs(p, tys, inner, out)
+        }
+        TyKind::Tuple(ts) => {
+            for e in tys.tys_of(ts) {
+                collect_adt_defs(p, tys, *e, out);
+            }
+        }
+        TyKind::FnPtr(sig) => {
+            let sig = tys.sig(sig);
+            for e in tys.tys_of(sig.value.inputs) {
+                collect_adt_defs(p, tys, *e, out);
+            }
+            collect_adt_defs(p, tys, sig.value.output, out);
+        }
+        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => args(p, tys, a, out),
+        TyKind::Dyn(bounds, _) => {
+            let b = tys.dyn_bounds(bounds);
+            let mut refs: Vec<&TraitRef> = b.principal.as_ref().map(|pr| &pr.value).into_iter().collect();
+            refs.extend(b.supertraits.iter().map(|st| &st.value));
+            for tr in refs {
+                args(p, tys, tr.args, out);
+                for (_, arg) in tys.bindings(tr.bindings) {
+                    if let GenericArg::Ty(t) = arg {
+                        collect_adt_defs(p, tys, *t, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Hashes one type deeply: the shallow structure (`hash_ty`) plus the
+/// layout fingerprint of every Adt it names, transitively. A signature
+/// that mentions a type only by name must still change when that type's
+/// fields, derives, or discriminants change, because bodies checked
+/// against the signature read those facts through the compat tables
+/// (field types, copy-ness, glue) without a separate recorded read for
+/// each one. `seen` is the cycle stack of Adt defs currently being
+/// folded (a recursive type folds its def hash only on the cycle).
+fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<DefId>) {
+    hash_ty(h, p, tys, t);
+    let mut defs = Vec::new();
+    collect_adt_defs(p, tys, t, &mut defs);
+    for def in defs {
+        if seen.contains(&def) {
+            "layout-cycle".hash(h);
+            hash_def(h, p, def);
+            continue;
+        }
+        seen.push(def);
+        hash_adt_layout(h, p, def, seen);
+        seen.pop();
+    }
+}
+
+/// Folds one Adt's layout-relevant content into `h`: enum-ness, repr,
+/// derives (copy, clone, debug, and equality change what checking and
+/// codegen do with a value, so they are part of this fingerprint, not
+/// only of `Sig`), and per variant its name, shape, discriminant, and
+/// field names and deep field types. Builtin Adts (String, Vec, Option)
+/// and unknown defs fold their def hash only: their layout is fixed by
+/// the compiler, never by a user edit.
+fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<DefId>) {
+    "adt-layout-v1".hash(h);
+    hash_def(h, p, def);
+    let Some(a) = p.adt_by_def(def) else { return };
+    let adt = p.adt(a);
+    adt.is_enum.hash(h);
+    match adt.repr.kind {
+        crate::ty::layout::ReprKind::Default => 0u8.hash(h),
+        crate::ty::layout::ReprKind::C => 1u8.hash(h),
+        crate::ty::layout::ReprKind::Transparent => 2u8.hash(h),
+        crate::ty::layout::ReprKind::Packed => 3u8.hash(h),
+    }
+    adt.repr.int.hash(h);
+    adt.repr.align.hash(h);
+    (adt.derives.debug, adt.derives.clone, adt.derives.copy, adt.derives.partial_eq).hash(h);
+    (adt.variants.len() as u64).hash(h);
+    for v in &adt.variants {
+        p.name(v.name).hash(h);
+        match v.shape {
+            VariantShape::Unit => 0u8.hash(h),
+            VariantShape::Tuple => 1u8.hash(h),
+            VariantShape::Named => 2u8.hash(h),
+        }
+        v.disc.hash(h);
+        (v.fields.len() as u64).hash(h);
+        for (i, fd) in v.fields.iter().enumerate() {
+            // Tuple fields carry a synthetic index `Sym`, not a name.
+            if v.shape == VariantShape::Named {
+                p.name(fd.name).hash(h);
+            } else {
+                (i as u64).hash(h);
+            }
+            hash_ty_deep(h, p, &p.tys, fd.ty, seen);
+        }
+    }
+}
+
+/// The `LayoutOf(adt)` node's fingerprint (section 8.1), separate from
+/// `Sig`: it covers only what layout and value semantics read (see
+/// `hash_adt_layout`), so an edit that changes a type's methods or a
+/// field's visibility does not dirty layout readers, and a field edit
+/// dirties them even when no signature that names the type changed text.
+fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    let mut h = FxHasher::default();
+    "layout-v1".hash(&mut h);
+    let mut seen = vec![def];
+    hash_adt_layout(&mut h, p, def, &mut seen);
+    Fingerprint(h.finish())
+}
+
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved
 /// def in disk form, or ambiguous, or absent). Wave A also folds the
 /// resolved def's `Sig` fingerprint in: read-based reuse must not keep a
@@ -478,12 +610,40 @@ fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// Folds a probe head into a fingerprint. Head payloads hash by stable
+/// content (def disk identity, scalar type name), never by session id.
+fn hash_head(h: &mut FxHasher, p: &Program, head: Head) {
+    match head {
+        Head::Adt(def) => {
+            0u8.hash(h);
+            hash_def(h, p, def);
+        }
+        Head::Int(i) => (1u8, i.name()).hash(h),
+        Head::Float(f) => (2u8, f.name()).hash(h),
+        Head::Bool => 3u8.hash(h),
+        Head::Char => 4u8.hash(h),
+        Head::Str => 5u8.hash(h),
+        Head::Slice => 6u8.hash(h),
+        Head::Array => 7u8.hash(h),
+        Head::Tuple => 8u8.hash(h),
+        Head::Never => 9u8.hash(h),
+        Head::Unit => 10u8.hash(h),
+        Head::Unknown => 11u8.hash(h),
+    }
+}
+
 /// The fingerprint of a `MethodSet` node's candidate list, in probe order.
 /// Candidate `Sig` fingerprints fold in for the same reason as in
-/// `binding_fingerprint`.
-fn method_set_fingerprint(p: &Program, set: &MethodSet) -> Fingerprint {
+/// `binding_fingerprint`. An empty set still folds the probe itself
+/// (head, name, receiver form): builtin method dispatch answers those
+/// probes through the compat path in check, so the probe is the read
+/// on record for the builtin answer. That answer is fixed by the
+/// compiler, and no user edit can add an inherent method to a builtin
+/// or primitive head; when trait candidates join `method_candidates`,
+/// they appear in the set and change this fingerprint by themselves.
+fn method_set_fingerprint(p: &Program, key: &MethodSetKey, set: &MethodSet) -> Fingerprint {
     let mut h = FxHasher::default();
-    "method-set-v2".hash(&mut h);
+    "method-set-v3".hash(&mut h);
     (set.candidates.len() as u64).hash(&mut h);
     for c in &set.candidates {
         hash_def(&mut h, p, c.def);
@@ -493,16 +653,29 @@ fn method_set_fingerprint(p: &Program, set: &MethodSet) -> Fingerprint {
             None => 0u64.hash(&mut h),
         }
     }
+    if set.candidates.is_empty() {
+        "builtin-probe-v1".hash(&mut h);
+        hash_head(&mut h, p, key.head);
+        p.name(key.name).hash(&mut h);
+        match key.form {
+            ReceiverForm::Value => 0u8.hash(&mut h),
+            ReceiverForm::Ref => 1u8.hash(&mut h),
+            ReceiverForm::RefMut => 2u8.hash(&mut h),
+        }
+    }
     Fingerprint(h.finish())
 }
 
-/// The fingerprint of an `ImplSet` bucket: its impl defs, sorted so the
-/// bucket's discovery order does not matter (section 8.1).
-fn impl_set_fingerprint(p: &Program, set: &ImplSet) -> Fingerprint {
+/// The fingerprint of an `ImplSet` bucket: the bucket key (trait and
+/// head) plus its impl defs, sorted so the bucket's discovery order
+/// does not matter (section 8.1).
+fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerprint {
     let mut defs: Vec<(u64, u64)> = set.impls.iter().map(|d| (def_crate_hash(p, *d), d.hash.0)).collect();
     defs.sort_unstable();
     let mut h = FxHasher::default();
-    "impl-set-v1".hash(&mut h);
+    "impl-set-v2".hash(&mut h);
+    hash_def(&mut h, p, key.trait_);
+    hash_head(&mut h, p, key.head);
     (defs.len() as u64).hash(&mut h);
     for d in defs {
         d.hash(&mut h);
@@ -510,19 +683,114 @@ fn impl_set_fingerprint(p: &Program, set: &ImplSet) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// Folds a pattern's structure and bound names into `h`, for the
+/// parameter-pattern part of a fn `Sig` fingerprint. Path segments hash
+/// by name string; literal sub-expressions hash by their discriminant
+/// only (their values cannot bind locals, and a changed literal in a
+/// parameter pattern also changes the item text the driver scans).
+fn hash_pat_bindings(h: &mut FxHasher, p: &Program, pat: crate::ast::PatId) {
+    use crate::ast::Pat;
+    match p.ast.pat(pat) {
+        Pat::Wild => 0u8.hash(h),
+        Pat::Binding { name, mutable, by_ref } => {
+            1u8.hash(h);
+            p.name(*name).hash(h);
+            (mutable, by_ref).hash(h);
+        }
+        Pat::Lit(_) => 2u8.hash(h),
+        Pat::Path(segs) => {
+            3u8.hash(h);
+            for s in segs {
+                p.name(s.name).hash(h);
+            }
+        }
+        Pat::TupleStruct { path, elems } => {
+            4u8.hash(h);
+            for s in path {
+                p.name(s.name).hash(h);
+            }
+            for e in elems {
+                hash_pat_bindings(h, p, *e);
+            }
+        }
+        Pat::Struct { path, fields, rest } => {
+            5u8.hash(h);
+            for s in path {
+                p.name(s.name).hash(h);
+            }
+            for (name, sub) in fields {
+                p.name(*name).hash(h);
+                hash_pat_bindings(h, p, *sub);
+            }
+            rest.hash(h);
+        }
+        Pat::Or(elems) => {
+            6u8.hash(h);
+            for e in elems {
+                hash_pat_bindings(h, p, *e);
+            }
+        }
+        Pat::Range { inclusive, .. } => (7u8, inclusive).hash(h),
+        Pat::Tuple(elems) => {
+            8u8.hash(h);
+            for e in elems {
+                hash_pat_bindings(h, p, *e);
+            }
+        }
+        Pat::Slice { prefix, middle, suffix } => {
+            9u8.hash(h);
+            for e in prefix.iter().chain(middle.iter()).chain(suffix.iter()) {
+                hash_pat_bindings(h, p, *e);
+            }
+        }
+        Pat::Ref { mutable, inner } => {
+            (10u8, mutable).hash(h);
+            hash_pat_bindings(h, p, *inner);
+        }
+        Pat::At { name, mutable, by_ref, inner } => {
+            11u8.hash(h);
+            p.name(*name).hash(h);
+            (mutable, by_ref).hash(h);
+            hash_pat_bindings(h, p, *inner);
+        }
+        Pat::Rest => 12u8.hash(h),
+        Pat::Paren(inner) => {
+            13u8.hash(h);
+            hash_pat_bindings(h, p, *inner);
+        }
+        Pat::QPath { segs, .. } => {
+            14u8.hash(h);
+            for s in segs {
+                p.name(s.name).hash(h);
+            }
+        }
+        Pat::MacroCall(_) => 15u8.hash(h),
+    }
+}
+
 /// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
-/// signature types with defs in stable form. Generics and predicates join
-/// when generic collect fills them (W-TRAITS-CORE); today they are empty for
-/// every user def.
+/// signature types with defs in stable form. Types hash *deeply* (see
+/// `hash_ty_deep`): a field, layout, derive, or discriminant edit to a
+/// named Adt changes every signature that names it, so the dirty walk
+/// rechecks bodies that read the signature. That is what lets the walk
+/// cover type edits, not only signature text edits. Const and static
+/// defs fold their evaluated value in (a value edit that keeps the
+/// value invalidates nothing); type aliases fold their resolved target.
+/// Generics and predicates join when generic collect fills them
+/// (W-TRAITS-CORE); today they are empty for every user def.
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    use crate::check::collect::ConstValue;
     let mut h = FxHasher::default();
-    "sig-v1".hash(&mut h);
+    "sig-v2".hash(&mut h);
     hash_def(&mut h, p, def);
+    let mut seen: Vec<DefId> = Vec::new();
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
         let f = p.fn_info(local);
         0u8.hash(&mut h);
         match f.owner {
-            Some(a) => hash_def(&mut h, p, p.def_of_adt(a)),
+            // A method's signature reads its Self type's layout (field
+            // access through `self`, by-value copies, drop glue).
+            Some(a) => layout_fingerprint(p, p.def_of_adt(a)).0.hash(&mut h),
             None => 0u64.hash(&mut h),
         }
         match f.self_kind {
@@ -534,36 +802,51 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         }
         (f.params.len() as u64).hash(&mut h);
         for t in &f.params {
-            hash_ty(&mut h, p, &p.tys, *t);
+            hash_ty_deep(&mut h, p, &p.tys, *t, &mut seen);
         }
-        hash_ty(&mut h, p, &p.tys, f.ret);
+        // Parameter names and binding patterns bind the body's locals,
+        // so they are part of what the body was checked against: a
+        // rename or a destructuring change must dirty the fn's own
+        // `Sig` read (the driver stores one with every checked body),
+        // or the dirty walk could reuse a body under changed bindings.
+        for param in &f.def.params {
+            p.name(param.name).hash(&mut h);
+            param.mutable.hash(&mut h);
+            match param.pat {
+                Some(pat) => hash_pat_bindings(&mut h, p, pat),
+                None => 0u8.hash(&mut h),
+            }
+        }
+        (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic, f.def.is_test).hash(&mut h);
+        hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
-    } else if let Some(a) = p.adt_by_def(def) {
-        let adt = p.adt(a);
+    } else if p.adt_by_def(def).is_some() {
         1u8.hash(&mut h);
-        adt.is_enum.hash(&mut h);
-        (adt.derives.debug, adt.derives.clone, adt.derives.copy, adt.derives.partial_eq).hash(&mut h);
-        (adt.variants.len() as u64).hash(&mut h);
-        for v in &adt.variants {
-            p.name(v.name).hash(&mut h);
-            match v.shape {
-                VariantShape::Unit => 0u8.hash(&mut h),
-                VariantShape::Tuple => 1u8.hash(&mut h),
-                VariantShape::Named => 2u8.hash(&mut h),
-            }
-            (v.fields.len() as u64).hash(&mut h);
-            for (i, fd) in v.fields.iter().enumerate() {
-                // Tuple fields carry a synthetic index `Sym`, not a name.
-                if v.shape == VariantShape::Named {
-                    p.name(fd.name).hash(&mut h);
-                } else {
-                    (i as u64).hash(&mut h);
+        layout_fingerprint(p, def).0.hash(&mut h);
+    } else if let Some(data) = p.defs.get(def) {
+        2u8.hash(&mut h);
+        // Const, static, and alias payloads live in the compat tables,
+        // keyed by flat name; the def record carries the same name.
+        if let Some((ty, value)) = p.consts.get(&data.name) {
+            0u8.hash(&mut h);
+            hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);
+            match value {
+                ConstValue::Int(v) => (0u8, v).hash(&mut h),
+                ConstValue::Bool(b) => (1u8, b).hash(&mut h),
+                ConstValue::Char(c) => (2u8, c).hash(&mut h),
+                ConstValue::Str(i) => {
+                    3u8.hash(&mut h);
+                    p.ast.strings.get(*i as usize).map_or("", String::as_str).hash(&mut h);
                 }
-                hash_ty(&mut h, p, &p.tys, fd.ty);
             }
+        } else if let Some(ty) = p.aliases.get(&data.name) {
+            1u8.hash(&mut h);
+            hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);
+        } else {
+            p.name(data.name).hash(&mut h);
         }
     } else {
-        2u8.hash(&mut h);
+        3u8.hash(&mut h);
     }
     Fingerprint(h.finish())
 }
@@ -664,12 +947,14 @@ impl<'a> Program<'a> {
     /// Today only inherent user methods exist, at most one per (Adt, name).
     /// Builtin methods on builtin and primitive heads still dispatch through
     /// the compat path in `check` and answer as an empty set here; the read
-    /// is still recorded, with the empty-bucket fingerprint, so the probe is
-    /// on record when source std turns those builtins into real defs.
+    /// is still recorded, with the probe itself in the fingerprint (see
+    /// `method_set_fingerprint`), so the probe is on record when source
+    /// std turns those builtins into real defs.
     pub fn method_set(&self, reads: &mut Reads, head: Head, name: Sym, form: ReceiverForm) -> MethodSet {
         let set = self.method_candidates(head, name, form);
         let failed = set.candidates.is_empty();
-        reads.record_with(ReadKey::MethodSet(MethodSetKey { head, name, form }), failed, || method_set_fingerprint(self, &set));
+        let key = MethodSetKey { head, name, form };
+        reads.record_with(ReadKey::MethodSet(key), failed, || method_set_fingerprint(self, &key, &set));
         set
     }
 
@@ -702,7 +987,8 @@ impl<'a> Program<'a> {
     #[allow(dead_code)] // First caller is the obligation queue (W-TRAITS-CORE, wave A).
     pub fn impl_set(&self, reads: &mut Reads, trait_: DefId, head: Head) -> ImplSet {
         let set = ImplSet::default();
-        reads.record_with(ReadKey::ImplSet(ImplSetKey { trait_, head }), true, || impl_set_fingerprint(self, &set));
+        let key = ImplSetKey { trait_, head };
+        reads.record_with(ReadKey::ImplSet(key), true, || impl_set_fingerprint(self, &key, &set));
         set
     }
 
@@ -723,22 +1009,21 @@ impl<'a> Program<'a> {
         out
     }
 
-    /// The layout fingerprint of one Adt def. There is no layout engine yet
-    /// (cgen lays types out as C types), so until `ty/layout.rs` lands the
-    /// `Layout` node's fingerprint is the Adt's signature fingerprint:
-    /// field Adt layouts fold in through their def hashes inside the field
-    /// type fingerprints. Any field edit that can move a layout changes it.
+    /// The layout fingerprint of one Adt def (`layout_fingerprint`),
+    /// recorded as a `Layout` read. It is separate from the Adt's `Sig`
+    /// fingerprint: a method or visibility edit on the type does not
+    /// move it, and a field, repr, derive, or discriminant edit does.
     #[allow(dead_code)] // First callers are mono instance keys and the layout engine (wave A/B).
     pub fn layout_of(&self, reads: &mut Reads, adt: DefId) -> Option<Fingerprint> {
         let known = self.adt_by_def(adt).is_some() || self.defs.get(adt).is_some();
         if !known {
-            reads.record_with(ReadKey::Layout(adt), true, || sig_fingerprint(self, adt));
+            reads.record_with(ReadKey::Layout(adt), true, || layout_fingerprint(self, adt));
             return None;
         }
         if let Some(r) = reads.get(&ReadKey::Layout(adt)) {
             return Some(r.fingerprint);
         }
-        let fp = sig_fingerprint(self, adt);
+        let fp = layout_fingerprint(self, adt);
         reads.record(ReadKey::Layout(adt), fp, false);
         Some(fp)
     }
@@ -766,11 +1051,11 @@ impl<'a> Program<'a> {
             }
             ReadKey::MethodSet(k) => {
                 let set = self.method_candidates(k.head, k.name, k.form);
-                Read { fingerprint: method_set_fingerprint(self, &set), failed: set.candidates.is_empty() }
+                Read { fingerprint: method_set_fingerprint(self, k, &set), failed: set.candidates.is_empty() }
             }
-            ReadKey::ImplSet(_) => {
+            ReadKey::ImplSet(k) => {
                 let set = ImplSet::default();
-                Read { fingerprint: impl_set_fingerprint(self, &set), failed: true }
+                Read { fingerprint: impl_set_fingerprint(self, k, &set), failed: true }
             }
             ReadKey::Sig(def) => {
                 let known = self.local_def(def.hash).filter(|l| self.def_id(*l) == *def).is_some()
@@ -780,7 +1065,7 @@ impl<'a> Program<'a> {
             }
             ReadKey::Layout(def) => {
                 let known = self.adt_by_def(*def).is_some() || self.defs.get(*def).is_some();
-                Read { fingerprint: sig_fingerprint(self, *def), failed: !known }
+                Read { fingerprint: layout_fingerprint(self, *def), failed: !known }
             }
             ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
         }

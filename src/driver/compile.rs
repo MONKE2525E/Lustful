@@ -9,11 +9,13 @@
 //      bodies that mention their names. A changed function always rechecks: its body is checked
 //      against its own signature, which the body hash does not cover. A mention-only candidate
 //      (own signature unchanged, body unchanged) whose recorded reads all still match the new
-//      program (`Program::reads_dirty`, the section 8.3 step 5 dirty walk for Binding and
-//      MethodSet nodes first) is reused without a recheck: per-name binding reads, method-set
-//      probes, and failed lookups are precise where name mentions are not. Candidates with no
-//      stored reads always recheck.
-//   3. Anything else (a type, an impl, a use changed): full rebuild.
+//      program (`Program::reads_dirty`, the section 8.3 step 5 dirty walk) is reused without a
+//      recheck: per-name binding reads, method-set probes, and failed lookups are precise where
+//      name mentions are not. Candidates with no stored reads always recheck.
+//   3. Anything else (a type, an impl, a use changed): full mode. Every unchanged passing body
+//      is a dirty-walk candidate; only bodies whose recorded reads changed recheck. The caches
+//      clear instead when reuse is not provable (first compile, Adt sequence change, or slot
+//      compaction; see `slot_update`).
 use super::session::{Caches, Chunk, Front, Session};
 use super::{Cmd, Request, Response};
 use crate::ast::{Ast, ItemKind};
@@ -543,13 +545,44 @@ fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Resp
     r
 }
 
+/// The Adt name sequence hash of one Ast (see `Front::adt_seq_fp`).
+fn adt_seq_fp(ast: &Ast) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    for item in &ast.items {
+        let name = match &item.kind {
+            ItemKind::Struct(s) => Some(s.name),
+            ItemKind::Enum(e) => Some(e.name),
+            ItemKind::Union(u) => Some(u.name),
+            _ => None,
+        };
+        if let Some(n) = name {
+            std::hash::Hash::hash(&n, &mut h);
+        }
+    }
+    std::hash::Hasher::finish(&h)
+}
+
+/// True when the non-fn item hash sequence differs between two item
+/// lists (a type, impl, const, or structure edit happened).
+fn nonfn_items_changed(old: &[scan::ItemScan], new: &[scan::ItemScan]) -> bool {
+    let others = |items: &[scan::ItemScan]| items.iter().filter(|i| i.fn_name.is_none()).map(|i| i.hash).collect::<Vec<_>>();
+    others(old) != others(new)
+}
+
 /// After a parse that was not "bodies only": update item tables, assign slots by
 /// stable def hash, and pick the functions to re-check. Returns (changed,
-/// mention_only): changed local ids as indexes, plus the subset that changed
-/// only by mentioning a changed name (body hash equal, last check passed, own
-/// signature item unchanged). Mention-only functions are the candidates the
-/// read-set dirty walk can reuse after collect. The one failure is a def hash
-/// collision (src/def.rs): an internal error the caller turns into a code 3 response.
+/// mention_only): changed local ids as indexes, plus the subset the read-set
+/// dirty walk may still reuse after collect (body hash equal, last check
+/// passed, own signature item unchanged). In signatures mode the candidates
+/// are the bodies that mention a changed name; in full mode every unchanged
+/// passing body is a candidate and the walk decides from its recorded reads
+/// (Binding, MethodSet, ImplSet, Sig, Layout; Sig fingerprints hash named
+/// Adt layouts deeply, so type and impl edits dirty through them). Full
+/// mode falls back to clearing every cache when reuse is not provable: the
+/// first compile, an Adt name-sequence change (cached C and glue carry
+/// session-local Adt ids), or slot compaction (cached C carries slot
+/// numbers). The one failure is a def hash collision (src/def.rs): an
+/// internal error the caller turns into a code 3 response.
 #[allow(clippy::too_many_arguments)]
 fn slot_update(
     front: &mut Front,
@@ -565,9 +598,18 @@ fn slot_update(
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
+    let had_env = front.env_hash.is_some();
+    let adt_seq = adt_seq_fp(&front.ast);
+    let adt_seq_same = had_env && front.adt_seq_fp == adt_seq;
+    front.adt_seq_fp = adt_seq;
+    let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
     front.env_hash = Some(env);
     front.items = item_scans;
-    if changed_names.is_none() {
+    let compact = front.slot_of.len() > fn_count * 2 + 64;
+    // Full mode may keep the caches (and let the dirty walk pick the
+    // work set) only when slot numbers and Adt ids are both stable.
+    let full_walk = changed_names.is_none() && had_env && adt_seq_same && !compact;
+    if changed_names.is_none() && !full_walk {
         // Full rebuild: fresh caches, but slots stay append-only (section
         // 4.2): existing fns keep the slots the manifest gave them, a
         // seeded manifest from a previous daemon included, so slot
@@ -595,6 +637,16 @@ fn slot_update(
         // units, so an edit recompiles little code.
         caches.per_unit =
             if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
+    }
+    if full_walk && nonfn_changed {
+        // A type or impl edit can change the C type definitions and
+        // glue that every unit header carries, even in units whose fns
+        // the walk will reuse. Force a fresh base: all units reassemble
+        // from the preserved per-fn C, and the per-unit disk cache
+        // (whose key includes the C text) serves every unit whose text
+        // did not in fact change, so tcc still sees only the units
+        // whose types moved.
+        caches.objects = None;
     }
     // Assign slots by stable identity, append-only. New functions get new slots;
     // a removed function's slot is emptied. A known hash with a different path
@@ -658,6 +710,19 @@ fn slot_update(
         let own_sig_changed = keys[i].free && names.contains(&keys[i].name);
         let mentions = own_sig_changed || idents.iter().any(|s| names.contains(s));
         let body_same = front.slot_hash[slot] == hash;
+        if full_walk && body_same && caches.ok[slot] {
+            // Full-mode candidate: the body is unchanged and passed
+            // before, so only its recorded reads can dirty it. It
+            // stays in `changed` (the walk in `compile` removes the
+            // clean ones) and keeps its passing mark and C until the
+            // walk decides, exactly like a mention-only candidate.
+            // Its own signature is one of its stored reads (`Sig`
+            // self-read, param names and patterns included), so an
+            // own-signature edit dirties through the walk.
+            mention_only.push(i);
+            changed.push(i);
+            continue;
+        }
         if !body_same || !caches.ok[slot] || mentions {
             if body_same && caches.ok[slot] && mentions && !own_sig_changed {
                 mention_only.push(i);
@@ -794,10 +859,14 @@ fn splice_std(
 
 /// The resolver front end (W-RESOLVE): Cargo graph selection, the
 /// outline worklist, and the session setup the shared tail consumes.
-/// Every request is a full rebuild in this path for now: correctness
-/// first, and the daemon fuzzer's fresh-session guard compares answers,
-/// not speed. Returns the tail tuple (map, changed, mention-only,
-/// fn count, mode, fn lines, body hashes, tables).
+/// The worklist reruns per request (per-file caches inside it are
+/// W-DRIVER phase 2 step B), but checking and codegen are incremental:
+/// the merged Ast is scanned structurally (`ast_hash`), the same
+/// bodies/signatures/full mode split as the single-file path picks
+/// the slot update, and the shared tail's read-set dirty walk reuses
+/// every body whose recorded reads still match. Returns the tail
+/// tuple (map, changed, mention-only, fn count, mode, fn lines, body
+/// hashes, tables).
 #[allow(clippy::too_many_arguments)]
 fn resolved_setup(
     req: &Request,
@@ -901,60 +970,83 @@ fn resolved_setup(
         }
     };
     t.lap("resolve (worklist)");
-    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes, .. } = resolved;
+    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, .. } = resolved;
     let fn_count = fn_lines.len();
     front.ast = ast;
     front.map = map.clone();
     front.src.clone_from(&root_text);
     front.resolved_crate_ids = Some(crate_ids);
-    // One synthetic chunk: the tail's slot update reads body idents and
-    // item scans from chunks; the worklist's per-fn hashes ride in
-    // through `scan_of` below, so the chunk scan carries shape only.
+    // Structural scan of the merged Ast: real per-item hashes (no
+    // bodies), per-fn body hashes, and body identifier sets. The
+    // worklist's module/import structure hash rides in as one extra
+    // non-fn item scan at the end: flattening dropped the `mod` and
+    // `use` items from the Ast, so without it an import-only edit
+    // would look like a body-only edit (or no edit at all).
+    let scans = super::ast_hash::scan_ast(&front.ast);
+    if scans.bodies.len() != fn_count {
+        // The worklist and the Ast scan disagree on the fn list: an
+        // internal error, never a guess at reuse.
+        front.env_hash = None;
+        return Err(Response { stderr: "error: internal: resolver function count mismatch; run again\n".into(), code: 3, ..Default::default() });
+    }
+    let body_hashes: Vec<u64> = scans.bodies.iter().map(|b| b.0).collect();
+    let mut item_scans = scans.items;
+    item_scans.push(scan::ItemScan { hash: structure_hash, fn_name: None });
+    t.lap("ast scan");
+    // One synthetic chunk: the tail's slot update reads body idents
+    // from chunk scans; per-fn hashes and lines ride in through
+    // `scan_of` below.
     let lexed = match lexer::lex(&root_text, ROOT_FILE, 0, &front.interner) {
         Ok(l) => l,
         Err(mut d) => return Err(errors(std::slice::from_mut(&mut d), &map, &root_text, req)),
     };
-    let item_scans: Vec<scan::ItemScan> = front
-        .ast
-        .items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| scan::ItemScan {
-            hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
-            fn_name: match &item.kind {
-                ItemKind::Fn(f) => Some(f.name),
-                _ => None,
-            },
-        })
-        .collect();
-    let n_items = item_scans.len();
+    let n_items = front.ast.items.len();
     front.chunks = vec![Chunk {
         start: 0,
         text: root_text,
         lexed,
         lexed_start: 0,
         scan: scan::ChunkScan {
-            fns: (0..fn_count).map(|_| scan::FnScan { body_hash: 1, fn_offset: 0, body: 0..0 }).collect(),
+            fns: body_hashes.iter().map(|&body_hash| scan::FnScan { body_hash, fn_offset: 0, body: 0..0 }).collect(),
             items: item_scans.clone(),
-            body_idents: vec![Vec::new(); fn_count],
+            body_idents: scans.bodies.into_iter().map(|b| b.1).collect(),
             ends_at_boundary: true,
         },
         items: Some(0..n_items),
     }];
     let env = scan::env_hash(item_scans.iter());
+    // The same mode split as the single-file path. Bodies mode goes
+    // through `slot_update` with no changed names to name: a changed
+    // body hash (or a fn whose last check failed) is exactly its
+    // recheck rule, and the Ast is already freshly parsed here.
+    let bodies_only = front.env_hash == Some(env) && front.fn_slot.len() == fn_count;
+    let changed_names = if bodies_only {
+        Some(Vec::new())
+    } else if front.env_hash.is_none() {
+        None
+    } else {
+        fn_only_changes(&front.items, &item_scans)
+    };
+    let mode = if bodies_only {
+        "bodies"
+    } else if changed_names.is_some() {
+        "signatures"
+    } else {
+        "full"
+    };
     let fn_at: Vec<(usize, usize)> = (0..fn_count).map(|i| (0, i)).collect();
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let lines = fn_lines.clone();
     let hashes = body_hashes.clone();
     let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
-    let (changed, mention_only) = match slot_update(front, caches, item_scans, env, None, &fn_at, cores, crate_ids, &scan_of, t) {
+    let (changed, mention_only) = match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, t) {
         Ok(c) => c,
         Err(e) => {
             front.env_hash = None;
             return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
         }
     };
-    Ok((map, changed, mention_only, fn_count, "full", fn_lines, body_hashes, Some(tables)))
+    Ok((map, changed, mention_only, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
 
 pub fn compile(req: &Request, session: &mut Session) -> Response {
@@ -1408,16 +1500,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     t.lap("collect");
 
-    // Read-set dirty walk (section 8.3 step 5, Binding nodes first): a
-    // mention-only candidate from a signature-only edit whose recorded
-    // reads all still match this program keeps its last passing result
-    // (check state and C). Candidates with no stored reads, or with any
-    // dirty read (a changed binding answer, a moved method candidate, a
-    // failed lookup that now resolves), stay in the work set and lose
-    // their stored C, exactly as before this walk existed.
+    // Read-set dirty walk (section 8.3 step 5): a candidate whose
+    // recorded reads all still match this program keeps its last
+    // passing result (check state and C). Candidates come from
+    // signature-only edits (bodies that mention a changed name) and
+    // from full-mode edits (every unchanged passing body; deep `Sig`
+    // fingerprints carry type and impl edits into the reads that used
+    // them). Candidates with no stored reads, or with any dirty read
+    // (a changed binding answer, a moved method candidate, a failed
+    // lookup that now resolves, a changed layout), stay in the work
+    // set and lose their stored C, exactly as before this walk existed.
     let mut reads_reused = 0usize;
     let mut reads_invalidated = 0usize;
-    if mode == "signatures" && !mention_only.is_empty() {
+    if !mention_only.is_empty() {
         let slot_at = |i: usize| front.fn_slot[i] as usize;
         // Clone the candidate read sets out of the caches so the walk can
         // borrow the program while results land back in the caches.
