@@ -3302,7 +3302,7 @@ mod tests {
                     assign(4, Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(3)), fconst(2.25))),
                     assign(5, Rvalue::Cast(Operand::Copy(Place::local(4)), i64_ty)),
                     assign(6, Rvalue::Bin(BinOp::Rem, Operand::Copy(Place::local(4)), fconst(2.0))),
-                    assign(7, Rvalue::Use(Operand::Const(Const::Int128((1u128 << 100) + 5, IntTy::U128)))),
+                    assign(7, Rvalue::Use(Operand::Const(Const::Int((1u128 << 100) + 5, IntTy::U128)))),
                     assign(8, Rvalue::Ref(false, Place::local(2))),
                     print(8, i64_ty),
                     assign(9, Rvalue::Ref(false, Place::local(5))),
