@@ -259,7 +259,12 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
                 f(value)
             }
         }),
-        Rvalue::Ref(..) | Rvalue::Discriminant(_) | Rvalue::SliceOf(_) | Rvalue::LenOf(_) => {}
+        Rvalue::Ref(..)
+        | Rvalue::Discriminant(_)
+        | Rvalue::SliceOf(_)
+        | Rvalue::LenOf(_)
+        | Rvalue::StaticLoad(_)
+        | Rvalue::StaticRef(_) => {}
         Rvalue::Subslice { lo, hi, .. } => {
             f(lo);
             if let Some(h) = hi {

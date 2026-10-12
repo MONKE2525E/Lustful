@@ -116,6 +116,10 @@ pub enum Rvalue {
     },
     /// The element count of an array, slice, or Vec place (W-CORELANG, wave A).
     LenOf(Place),
+    /// A copy of a static item's value, by index into `Program::statics`.
+    StaticLoad(u32),
+    /// The address of a static item, by index into `Program::statics`.
+    StaticRef(u32),
 }
 
 #[derive(Clone, Debug)]

@@ -753,15 +753,13 @@ impl<'a> Parser<'a> {
         }
         let has_qual = qual.is_const || qual.is_async || qual.is_unsafe || qual.abi.is_some();
         let kind = match self.peek() {
-            Tok::Fn if has_qual => {
+            Tok::Fn if has_qual && !(qual.is_const && !qual.is_async && !qual.is_unsafe && qual.abi.is_none()) => {
                 return Err(if qual.is_async {
                     async_error(start)
                 } else if qual.is_unsafe {
                     unsafe_error(start)
-                } else if qual.abi.is_some() {
-                    not_yet(C_EXTERN, start, "extern functions")
                 } else {
-                    not_yet(C_CONST, start, "const functions")
+                    not_yet(C_EXTERN, start, "extern functions")
                 });
             }
             Tok::Fn => {
@@ -769,6 +767,7 @@ impl<'a> Parser<'a> {
                 def.is_test = parsed.is_test;
                 def.vis = vis.clone();
                 def.attrs = parsed.attrs.clone();
+                def.qual = qual;
                 ItemKind::Fn(def)
             }
             Tok::Struct if !has_qual => ItemKind::Struct(self.struct_def(derives)?),
@@ -1457,6 +1456,14 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Type => types.push(self.assoc_type()?),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
+                Tok::Const if self.peek_at(1) == Tok::Fn => {
+                    self.bump();
+                    let mut def = self.fn_def_inner(true)?;
+                    def.vis = vis;
+                    def.attrs = parsed.attrs;
+                    def.qual.is_const = true;
+                    fns.push(def);
+                }
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),
@@ -1530,6 +1537,15 @@ impl<'a> Parser<'a> {
                 Tok::Type if trait_ref.is_some() => types.push(self.assoc_type()?),
                 Tok::Type => return Err(self.reject(C_ASSOC, "associated types in inherent impls")),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
+                Tok::Const if self.peek_at(1) == Tok::Fn => {
+                    self.bump();
+                    let mut def = self.fn_def()?;
+                    def.is_test = is_test;
+                    def.vis = vis;
+                    def.attrs = parsed.attrs;
+                    def.qual.is_const = true;
+                    fns.push(def);
+                }
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),
@@ -1836,18 +1852,9 @@ impl<'a> Parser<'a> {
             }
             if matches!(
                 self.peek(),
-                Tok::Fn
-                    | Tok::Struct
-                    | Tok::Enum
-                    | Tok::Impl
-                    | Tok::Use
-                    | Tok::Mod
-                    | Tok::Trait
-                    | Tok::Const
-                    | Tok::Static
-                    | Tok::Type
-                    | Tok::Extern
-            ) {
+                Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Mod | Tok::Trait | Tok::Static | Tok::Type | Tok::Extern
+            ) || (self.peek() == Tok::Const && self.peek_at(1) != Tok::LBrace)
+            {
                 return Err(self.reject(C_CORE, "items inside function bodies"));
             }
             if self.peek() == Tok::Let {
@@ -2660,7 +2667,14 @@ impl<'a> Parser<'a> {
             Tok::Pipe | Tok::OrOr | Tok::Move => return Err(not_yet(C_CORE, start, "closures")),
             Tok::Unsafe => return Err(unsafe_error(start)),
             Tok::Async => return Err(async_error(start)),
-            Tok::Const => return Err(not_yet(C_CONST, start, "inline const blocks")),
+            Tok::Const => {
+                self.bump();
+                if self.peek() == Tok::LBrace {
+                    Expr::ConstBlock(self.block()?)
+                } else {
+                    return Err(not_yet(C_CONST, start, "inline const blocks"));
+                }
+            }
             Tok::Let => return Err(not_yet(C_CORE, start, "let chains")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
@@ -2670,6 +2684,12 @@ impl<'a> Parser<'a> {
             Tok::Ident(_) | Tok::SelfUpper => {
                 if self.peek_at(1) == Tok::Bang {
                     return self.macro_call();
+                }
+                if self.at_offset_of_path() {
+                    for _ in 0..6 {
+                        self.bump();
+                    }
+                    return self.offset_of_body(start);
                 }
                 if self.at_path_macro_call() {
                     return Err(macro_error(start));
@@ -2728,6 +2748,37 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(Expr::StructLit { path, fields, update }, start.to(self.prev_span())))
     }
 
+    /// The body of an `offset_of!` call, after the `!`: `(Type, field)`,
+    /// with a nested `a.b` field path allowed.
+    fn offset_of_body(&mut self, start: Span) -> PResult<ExprId> {
+        self.expect(Tok::LParen, "`(`")?;
+        let ty = self.ty()?;
+        self.expect(Tok::Comma, "`,`")?;
+        let (first, _) = self.ident()?;
+        let mut fields = vec![first];
+        while self.eat(Tok::Dot) {
+            let (f, _) = self.ident()?;
+            fields.push(f);
+        }
+        self.eat(Tok::Comma);
+        self.expect(Tok::RParen, "`)`")?;
+        Ok(self.push_expr(Expr::OffsetOf { ty, fields }, start.to(self.prev_span())))
+    }
+
+    /// True at a `std::mem::offset_of!` or `core::mem::offset_of!` path call.
+    fn at_offset_of_path(&self) -> bool {
+        let name_at = |j: usize| match self.toks.get(j).map(|t| t.tok) {
+            Some(Tok::Ident(s)) => Some(self.interner.get(s)),
+            _ => None,
+        };
+        matches!(name_at(self.pos), Some("std" | "core"))
+            && matches!(self.toks.get(self.pos + 1).map(|t| t.tok), Some(Tok::PathSep))
+            && name_at(self.pos + 2) == Some("mem")
+            && matches!(self.toks.get(self.pos + 3).map(|t| t.tok), Some(Tok::PathSep))
+            && name_at(self.pos + 4) == Some("offset_of")
+            && matches!(self.toks.get(self.pos + 5).map(|t| t.tok), Some(Tok::Bang))
+    }
+
     fn macro_call(&mut self) -> PResult<ExprId> {
         let start = self.span();
         let (name, _) = self.ident()?;
@@ -2747,6 +2798,9 @@ impl<'a> Parser<'a> {
             (k.todo, MacroKind::Todo),
             (k.unreachable, MacroKind::Unreachable),
         ];
+        if self.interner.get(name) == "offset_of" {
+            return self.offset_of_body(start);
+        }
         let Some(&(_, kind)) = table.iter().find(|(s, _)| *s == name) else {
             return Err(macro_error(start));
         };

@@ -11,6 +11,7 @@
 // and cgen stay until the minimal generic pipeline passes its gate (ARCH 9.3); those paths
 // now reach the types through the compat helpers on `TyIntern` (`vec_elem`, `is_string_ty`,
 // and kin), never by matching on a builtin `TyKind` case.
+pub mod consteval;
 pub mod defs;
 pub mod lang;
 pub mod layout;

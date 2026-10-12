@@ -921,6 +921,11 @@ pub enum Expr {
     Underscore,
     /// A user macro call in expression position, as raw token trees.
     MacroCall(MacroCall),
+    /// An `offset_of!` query: a type and a field path (W-CORELANG, wave A).
+    OffsetOf {
+        ty: TyId,
+        fields: Vec<Sym>,
+    },
 }
 
 pub enum Pat {
@@ -1439,6 +1444,7 @@ impl Ast {
                     sh.path(segs);
                 }
                 Expr::MacroCall(m) => sh.macro_call(m),
+                Expr::OffsetOf { ty, .. } => *ty = sh.t(*ty),
             }
         }
         for p in &mut o.pats {

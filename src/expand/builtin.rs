@@ -24,6 +24,7 @@ pub fn is_passthrough(name: &str) -> bool {
             | "todo"
             | "unreachable"
             | "format_args"
+            | "offset_of"
     )
 }
 

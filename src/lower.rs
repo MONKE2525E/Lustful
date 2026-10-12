@@ -341,18 +341,6 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
             Expr::Unit => Operand::Const(Const::Unit),
-            Expr::Path(_) if matches!(self.ck.res(e), Res::ConstValue(_)) => match self.ck.res(e) {
-                Res::ConstValue(v) => match v {
-                    ConstValue::Int(x) => match self.kind(ty) {
-                        TyKind::Int(it) => Operand::Const(Const::Int(x, it)),
-                        _ => Operand::Const(Const::Int(x, IntTy::I32)),
-                    },
-                    ConstValue::Bool(b) => Operand::Const(Const::Bool(b)),
-                    ConstValue::Char(c) => Operand::Const(Const::Char(c)),
-                    ConstValue::Str(s) => Operand::Const(Const::Str(s)),
-                },
-                _ => Operand::Const(Const::Unit),
-            },
             _ if self.is_place_expr(e) => {
                 let p = self.place(e);
                 self.operand_from(p, ty)
@@ -405,6 +393,13 @@ impl<'p, 'a> Lower<'p, 'a> {
         let span = self.span(e);
         let p = self.p;
         let ty = self.ty(e);
+        // A value the checker const-evaluated materializes directly.
+        if let Some(cv) = self.ck.const_value(e).cloned() {
+            if let Some(d) = dest {
+                self.const_into(&cv, ty, d, span);
+            }
+            return;
+        }
         match p.ast.expr(e) {
             Expr::Int(..) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => {
                 if let Some(d) = dest {
@@ -421,13 +416,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                     }
                 }
                 Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, Vec::new()), ty, span),
+                Res::Static(idx) => self.set_or_temp(dest, Rvalue::StaticLoad(idx), ty, span),
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
-                Res::ConstValue(_) => {
-                    if let Some(d) = dest {
-                        let op = self.operand_raw(e);
-                        self.assign(d.clone(), Rvalue::Use(op), span);
-                    }
-                }
                 _ => {}
             },
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
@@ -517,6 +507,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.call_into(CallTarget::Builtin(b), ops, d, span);
                     }
                     Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span),
+                    Res::ConstUsize(v) => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), ty, span),
                     Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
                     _ => return,
                 }
@@ -554,6 +545,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Ref { mutable, expr, .. } => {
+                if let Res::Static(idx) = self.ck.res(*expr) {
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::StaticRef(idx), span);
+                    }
+                    return;
+                }
                 if matches!(self.ck.res(*expr), Res::SliceIndex { .. }) {
                     // A slice place is already a fat value in a temporary;
                     // taking its reference moves that value (with its loan),
@@ -710,6 +707,18 @@ impl<'p, 'a> Lower<'p, 'a> {
                     },
                     _ => 0,
                 };
+                if let Some(cv) = self.ck.const_value(*value).cloned() {
+                    // A const element (`[const { .. }; n]`) materializes per slot.
+                    let rv = crate::ty::consteval::ConstValue::Repeat(Box::new(cv), n);
+                    match dest {
+                        Some(d) => self.const_into(&rv, ty, d, span),
+                        None => {
+                            let t = self.temp(ty);
+                            self.const_into(&rv, ty, &Place::local(t), span);
+                        }
+                    }
+                    return;
+                }
                 if n == 0 {
                     // Rust does not evaluate the element for a zero repeat.
                     self.set_or_temp(dest, Rvalue::ArrayAgg(ty, Vec::new()), ty, span);
@@ -719,6 +728,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                 } else {
                     let o = self.operand(*value);
                     self.set_or_temp(dest, Rvalue::ArrayRepeat(ty, o, n), ty, span);
+                }
+            }
+            Expr::OffsetOf { .. } => {
+                if let Res::ConstUsize(v) = self.ck.res(e) {
+                    self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), ty, span);
                 }
             }
             // AST v2 expression forms the parser still rejects.
@@ -1275,6 +1289,17 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             return;
         }
+        if let PatRes::ConstItem(idx) = self.ck.pat_res(pat) {
+            let cv = p.consts[idx as usize].value.clone();
+            let op = self.const_operand(&cv, ty, span);
+            let c = self.temp(BOOL);
+            self.assign(Place::local(c), Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op), span);
+            let ok = self.new_block();
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
+            self.cur = ok;
+            return;
+        }
         let branch = |this: &mut Self, cond: Rvalue| {
             let c = this.temp(BOOL);
             this.assign(Place::local(c), cond, span);
@@ -1648,6 +1673,126 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Panic(parts), span);
                 self.cur = ok;
                 self.unit(dest, span);
+            }
+        }
+    }
+
+    /// An operand for a const value, building aggregates in a temporary.
+    fn const_operand(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, span: Span) -> Operand {
+        use crate::ty::consteval::ConstValue as CV;
+        match v {
+            CV::Int(i) => {
+                let it = match self.kind(ty) {
+                    TyKind::Int(it) => it,
+                    _ => IntTy::I32,
+                };
+                Operand::Const(Const::Int(*i as u128 as u64, it))
+            }
+            CV::Bool(b) => Operand::Const(Const::Bool(*b)),
+            CV::Char(c) => Operand::Const(Const::Char(*c)),
+            CV::Str(i) => Operand::Const(Const::Str(*i)),
+            CV::Unit => Operand::Const(Const::Unit),
+            CV::StaticRef(idx) => {
+                let t = self.temp(ty);
+                self.assign(Place::local(t), Rvalue::StaticRef(*idx), span);
+                Operand::Copy(Place::local(t))
+            }
+            _ => {
+                let t = self.temp(ty);
+                self.const_into(v, ty, &Place::local(t), span);
+                self.operand_from(Place::local(t), ty)
+            }
+        }
+    }
+
+    /// Stores a const value into a place, building it from its parts.
+    fn const_into(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, dest: &Place, span: Span) {
+        use crate::ty::consteval::ConstValue as CV;
+        // An array const value at a slice reference type goes through a
+        // temporary array and a SliceOf, like the coercion path.
+        if let TyKind::Ref(_, _, inner) = self.kind(ty)
+            && let TyKind::Slice(elem) = self.kind(inner)
+            && matches!(v, CV::Aggregate(_) | CV::Repeat(..))
+        {
+            let n = match v {
+                CV::Aggregate(vals) => vals.len() as u128,
+                CV::Repeat(_, n) => *n as u128,
+                _ => unreachable!(),
+            };
+            let c = self.body.tys.intern_const(ConstKind::Int(n));
+            let at = self.body.tys.intern(TyKind::Array(elem, c));
+            let t = self.temp(at);
+            self.const_into(v, at, &Place::local(t), span);
+            self.assign(dest.clone(), Rvalue::SliceOf(Place::local(t)), span);
+            return;
+        }
+        match v {
+            CV::Aggregate(vals) => match self.kind(ty) {
+                TyKind::Tuple(ts) => {
+                    let tys: Vec<Ty> = self.body.tys.tys_of(ts).to_vec();
+                    let ops: Vec<Operand> =
+                        vals.iter().enumerate().map(|(i, x)| self.const_operand(x, tys.get(i).copied().unwrap_or(ERROR), span)).collect();
+                    self.assign(dest.clone(), Rvalue::TupleAgg(ty, ops), span);
+                }
+                TyKind::Array(elem, _) => {
+                    let ops: Vec<Operand> = vals.iter().map(|x| self.const_operand(x, elem, span)).collect();
+                    self.assign(dest.clone(), Rvalue::ArrayAgg(ty, ops), span);
+                }
+                _ => match self.body.tys.local_adt(ty) {
+                    Some(a) => {
+                        let ops: Vec<Operand> = vals
+                            .iter()
+                            .enumerate()
+                            .map(|(i, x)| self.const_operand(x, self.p.adt(a).variants[0].fields[i].ty, span))
+                            .collect();
+                        self.assign(dest.clone(), Rvalue::Aggregate(a, 0, ops), span);
+                    }
+                    None => {
+                        let op = self.const_operand(v, ty, span);
+                        self.assign(dest.clone(), Rvalue::Use(op), span);
+                    }
+                },
+            },
+            CV::Variant(variant, vals) => {
+                if let Some(elem) = self.body.tys.option_elem(ty) {
+                    let op = if *variant == 1 && !vals.is_empty() { Some(self.const_operand(&vals[0], elem, span)) } else { None };
+                    self.assign(dest.clone(), Rvalue::Opt(ty, op), span);
+                } else if let Some(a) = self.body.tys.local_adt(ty) {
+                    let ops: Vec<Operand> = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, x)| self.const_operand(x, self.p.adt(a).variants[*variant as usize].fields[i].ty, span))
+                        .collect();
+                    self.assign(dest.clone(), Rvalue::Aggregate(a, *variant, ops), span);
+                }
+            }
+            CV::Repeat(x, n) => {
+                let elem = match self.kind(ty) {
+                    TyKind::Array(el, _) => el,
+                    _ => ERROR,
+                };
+                if *n > 1 && is_copy(self.p, &self.body.tys, elem) && matches!(**x, CV::Int(_) | CV::Bool(_) | CV::Char(_)) {
+                    let op = self.const_operand(x, elem, span);
+                    self.assign(dest.clone(), Rvalue::ArrayRepeat(ty, op, *n), span);
+                } else {
+                    let ops: Vec<Operand> = (0..*n).map(|_| self.const_operand(x, elem, span)).collect();
+                    self.assign(dest.clone(), Rvalue::ArrayAgg(ty, ops), span);
+                }
+            }
+            CV::Ref(inner) => {
+                let inner_ty = match self.kind(ty) {
+                    TyKind::Ref(_, _, it) => it,
+                    _ => ERROR,
+                };
+                let t = self.temp(inner_ty);
+                self.const_into(inner, inner_ty, &Place::local(t), span);
+                let mutable = matches!(self.kind(ty), TyKind::Ref(_, Mut::Mut, _));
+                self.assign(dest.clone(), Rvalue::Ref(mutable, Place::local(t)), span);
+            }
+            CV::StaticRef(idx) => self.assign(dest.clone(), Rvalue::StaticRef(*idx), span),
+            _ => {
+                let op = self.const_operand(v, ty, span);
+                self.assign(dest.clone(), Rvalue::Use(op), span);
             }
         }
     }

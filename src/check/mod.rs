@@ -127,8 +127,10 @@ pub enum Res {
     SliceIndex {
         derefs: u8,
     },
-    /// A `const` or non-mut `static` scalar, read by value (W-RESOLVE).
-    ConstValue(ConstValue),
+    /// A static item read, by index into `Program::statics` (W-CORELANG).
+    Static(u32),
+    /// A compile-time usize constant: `size_of`, `align_of`, `offset_of!`.
+    ConstUsize(u64),
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -158,6 +160,8 @@ pub enum BindMode {
 #[derive(Clone, Copy, Debug)]
 pub enum PatRes {
     None,
+    /// A const item used as a pattern, by index into `Program::consts`.
+    ConstItem(u32),
     Binding {
         local: u32,
         mode: BindMode,
@@ -180,6 +184,9 @@ pub struct Checked<'g> {
     pub expr_base: u32,
     pub pat_base: u32,
     pub expr_ty: Vec<Ty>,
+    /// The const value of an expression the checker evaluated (a const item
+    /// reference or an inline const block), parallel to `expr_ty`.
+    pub const_exprs: Vec<Option<crate::ty::consteval::ConstValue>>,
     pub expr_res: Vec<Res>,
     pub coerce: Vec<Coerce>,
     pub pat_ty: Vec<Ty>,
@@ -210,6 +217,9 @@ impl Checked<'_> {
     }
     pub fn pat_res(&self, p: PatId) -> PatRes {
         self.pat_res[(p.0 - self.pat_base) as usize]
+    }
+    pub fn const_value(&self, e: ExprId) -> Option<&crate::ty::consteval::ConstValue> {
+        self.const_exprs[(e.0 - self.expr_base) as usize].as_ref()
     }
     pub fn pat_derefs(&self, p: PatId) -> u8 {
         self.pat_derefs[(p.0 - self.pat_base) as usize]
@@ -269,6 +279,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             expr_base: def.exprs.0,
             pat_base: def.pats.0,
             expr_ty: vec![ERROR; n_exprs],
+            const_exprs: vec![None; n_exprs],
             expr_res: vec![Res::None; n_exprs],
             coerce: vec![Coerce::None; n_exprs],
             pat_ty: vec![ERROR; n_pats],
@@ -1346,7 +1357,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let n = crate::check::collect::eval_array_len(p.ast, *len);
                 match n {
                     Some(n) => {
-                        if n > 1 && !is_copy(p, &self.tys, self.resolve(elem)) {
+                        let const_val = self.out.const_exprs[self.ei(*value)].is_some();
+                        if n > 1 && !const_val && !is_copy(p, &self.tys, self.resolve(elem)) {
                             self.err(
                                 "L0110",
                                 span,
@@ -1395,6 +1407,71 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
+            Expr::ConstBlock(_) => {
+                let mut ccx = CheckCx { cx: self };
+                match crate::ty::consteval::eval(&mut ccx, e, expected) {
+                    Ok((v, t)) => {
+                        let i = ccx.cx.ei(e);
+                        ccx.cx.out.const_exprs[i] = Some(v);
+                        t
+                    }
+                    Err(d) => {
+                        ccx.cx.errs.push(d);
+                        ERROR
+                    }
+                }
+            }
+            Expr::OffsetOf { ty, fields } => {
+                let t = self.resolve_written(*ty);
+                let mut cur = self.deep(t);
+                let mut off: u64 = 0;
+                let mut bad = false;
+                for &fname in fields {
+                    let Some(a) = self.tys.local_adt(cur) else {
+                        self.err("L0110", span, "`offset_of!` needs a struct type", "Use a struct with named fields.");
+                        bad = true;
+                        break;
+                    };
+                    if !matches!(
+                        p.adt(a).repr.kind,
+                        crate::ty::layout::ReprKind::C | crate::ty::layout::ReprKind::Packed | crate::ty::layout::ReprKind::Transparent
+                    ) {
+                        self.err(
+                            "L0650",
+                            span,
+                            "`offset_of!` on a default-repr type is not supported",
+                            "Add `#[repr(C)]` to the type, or measure with `size_of`.",
+                        );
+                        bad = true;
+                        break;
+                    }
+                    let Some(i) = p.adt(a).variants[0].fields.iter().position(|f| f.name == fname) else {
+                        self.err("L0103", span, format!("no field `{}` for `offset_of!`", self.name(fname)), "Check the field name.");
+                        bad = true;
+                        break;
+                    };
+                    match crate::ty::layout::layout_of_ty(&self.tys, p, cur) {
+                        Ok(l) => off += l.field_offsets.get(i).copied().unwrap_or(0),
+                        Err(()) => {
+                            self.err(
+                                "L0652",
+                                span,
+                                "unsupported layout form in `offset_of!`",
+                                "Use a type inside the supported layout grammar.",
+                            );
+                            bad = true;
+                            break;
+                        }
+                    }
+                    cur = p.adt(a).variants[0].fields[i].ty;
+                }
+                if bad {
+                    ERROR
+                } else {
+                    self.set_res(e, Res::ConstUsize(off));
+                    USIZE
+                }
+            }
             // AST v2 expression forms the parser still rejects.
             Expr::Float(_)
             | Expr::Closure { .. }
@@ -1404,7 +1481,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | Expr::UnsafeBlock(_)
             | Expr::Let { .. }
             | Expr::QPath { .. }
-            | Expr::ConstBlock(_)
             | Expr::Underscore
             | Expr::MacroCall(_) => ERROR,
         }
@@ -1456,7 +1532,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Assignment into a static is never a plain place write here: an
+    /// immutable static cannot be assigned, and a mutable one needs `unsafe`.
+    fn static_root(&self, e: ExprId) -> Option<u32> {
+        match self.p.ast.expr(e) {
+            Expr::Path(_) => match self.out.expr_res[self.ei(e)] {
+                Res::Static(idx) => Some(idx),
+                _ => None,
+            },
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => self.static_root(*base),
+            _ => None,
+        }
+    }
+
     fn place_check(&mut self, e: ExprId) {
+        if let Some(idx) = self.static_root(e) {
+            let s = self.span(e);
+            if self.p.statics[idx as usize].mutable {
+                self.err(
+                    "L0404",
+                    s,
+                    "writing a mutable static requires `unsafe`, which is not supported",
+                    "Make the static immutable, or use a local variable.",
+                );
+            } else {
+                self.err("L0121", s, "cannot assign to an immutable static", "Statics are read-only; use a variable instead.");
+            }
+            return;
+        }
         let ok = match self.p.ast.expr(e) {
             Expr::Path(segs) => segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)),
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) | Expr::SelfValue => true,
@@ -1526,6 +1629,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Fn(f));
                 return ERROR;
             }
+            if let BindingRes::Def(def) = bound {
+                match p.binding_kind(def) {
+                    Some(DefsKind::Const) => {
+                        if let Some(idx) = p.const_by_def(def) {
+                            let c = &p.consts[idx as usize];
+                            let (v, t) = (c.value.clone(), c.ty);
+                            let i = self.ei(e);
+                            self.out.const_exprs[i] = Some(v);
+                            // The value lives in the global store; rebuild the
+                            // type in this body's overlay so unification sees it.
+                            return self.deep(t);
+                        }
+                    }
+                    Some(DefsKind::Static) => {
+                        if let Some(idx) = p.static_by_def(def) {
+                            let st = &p.statics[idx as usize];
+                            if st.mutable {
+                                self.err(
+                                    "L0404",
+                                    span,
+                                    "reading a mutable static requires `unsafe`, which is not supported",
+                                    "Make the static immutable, or read it through a const.",
+                                );
+                                return ERROR;
+                            }
+                            let t = st.ty;
+                            self.set_res(e, Res::Static(idx));
+                            return self.deep(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if name == p.known.None {
                 self.set_res(e, Res::OptNone);
                 let v = self.new_var(false);
@@ -1542,12 +1678,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.set_res(e, Res::Variant(a, 0));
                     return self.tys.adt_ty(a);
                 }
-            }
-            // A `const` or non-mut `static` scalar reads as its value.
-            // The binding read above already recorded the name.
-            if let Some(&(ty, val)) = p.consts.get(&name) {
-                self.set_res(e, Res::ConstValue(val));
-                return ty;
             }
             self.err(
                 "L0101",
@@ -1643,6 +1773,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if names == [k.std, k.env, k.args] {
             return Some(Res::Builtin(Builtin::EnvArgs));
         }
+        if names.len() == 3
+            && (names[0] == k.std || names[0] == k.core)
+            && self.name(names[1]) == "mem"
+            && matches!(self.name(names[2]), "size_of" | "align_of")
+        {
+            let align = self.name(names[2]) == "align_of";
+            return Some(self.layout_query(&segs[2], align, span));
+        }
         if segs.len() != 2 {
             self.errs.push(not_yet("L0505", span, "module paths"));
             return None;
@@ -1717,6 +1855,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
         None
     }
 
+    /// A `size_of` or `align_of` query on the given turbofish type argument:
+    /// the layout engine answers, or the layout reject fires (ARCH 4.4).
+    fn layout_query(&mut self, seg: &ast::PathSeg, align: bool, span: Span) -> Res {
+        let args = seg.type_args();
+        if args.len() != 1 {
+            self.err("L0105", span, "this function takes one type argument", "Write `size_of::<Type>()`.");
+            return Res::ConstUsize(0);
+        }
+        let t = self.resolve_written(args[0]);
+        let p: &Program<'_> = self.p;
+        let t = self.deep(t);
+        match crate::ty::layout::layout_of_ty(&self.tys, p, t) {
+            Ok(l) => Res::ConstUsize(if align { l.align } else { l.size }),
+            Err(()) => {
+                self.err(
+                    "L0652",
+                    span,
+                    format!("unsupported layout form: `{}`", self.tn(t)),
+                    "Use a type inside the supported layout grammar.",
+                );
+                Res::ConstUsize(0)
+            }
+        }
+    }
+
     fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
         let p = self.p;
         let res = match p.ast.expr(callee) {
@@ -1729,6 +1892,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match self.binding_fn(name) {
                     Some(f) => Res::Fn(f),
                     None if name == p.known.Some => Res::OptSome,
+                    None if matches!(self.name(name), "size_of" | "align_of") && !segs[0].type_args().is_empty() => {
+                        let align = self.name(name) == "align_of";
+                        self.layout_query(&segs[0], align, span)
+                    }
                     None => match self.tuple_struct_ctor(name) {
                         Some(a) => Res::Variant(a, 0),
                         None => {
@@ -1775,6 +1942,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return self.tys.mk_option(t);
         }
         match res {
+            Res::ConstUsize(_) => {
+                if !args.is_empty() {
+                    self.err("L0105", span, "this function takes no arguments", "Write `size_of::<Type>()`.");
+                }
+                USIZE
+            }
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
                 let (params, ret) = match p.sig_of(&mut self.out.reads, p.def_id(f)) {
@@ -2557,6 +2730,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return;
         }
+        // A plain name that resolves to a const item is a const pattern, not
+        // a binding (unless a local binding shadows the name).
+        if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
+            && self.lookup(*name, span.ctxt).is_none()
+            && let Some(&idx) = p.const_names.get(name)
+        {
+            let c = &p.consts[idx as usize];
+            if !matches!(
+                c.value,
+                crate::ty::consteval::ConstValue::Int(_)
+                    | crate::ty::consteval::ConstValue::Bool(_)
+                    | crate::ty::consteval::ConstValue::Char(_)
+            ) {
+                self.errs.push(unsupported(span, "non-scalar const patterns"));
+                return;
+            }
+            let ct = c.ty;
+            if !self.unify(ct, t) {
+                self.mismatch(span, t, ct);
+                return;
+            }
+            self.out.pat_res[pi] = PatRes::ConstItem(idx);
+            return;
+        }
         match p.ast.pat(pat) {
             Pat::Wild => {}
             Pat::Binding { name, mutable, by_ref } => {
@@ -3149,4 +3346,144 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => false,
         }
     }
+}
+
+/// The const evaluator's context over a body being checked: names resolve
+/// through the program tables and the Binding query, as in body checking.
+struct CheckCx<'x, 'p, 'a> {
+    cx: &'x mut Ctx<'p, 'a>,
+}
+
+impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
+    type Tys = Tys<'p>;
+
+    fn tys(&mut self) -> &mut Tys<'p> {
+        &mut self.cx.tys
+    }
+    fn tys_ref(&self) -> &Tys<'p> {
+        &self.cx.tys
+    }
+    fn ast(&self) -> &'a ast::Ast {
+        self.cx.p.ast
+    }
+    fn sym_text(&self, s: Sym) -> &str {
+        self.cx.name(s)
+    }
+    fn const_item(&mut self, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        let &i = self.cx.p.const_names.get(&name)?;
+        let c = &self.cx.p.consts[i as usize];
+        Some((c.value.clone(), c.ty))
+    }
+    fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
+        self.cx.p.static_names.get(&name).map(|&i| (i, self.cx.p.statics[i as usize].ty))
+    }
+    fn call_target(&mut self, callee: ExprId) -> crate::ty::consteval::CallTarget {
+        use crate::ty::consteval::{CallTarget, ConstFnBody};
+        let p = self.cx.p;
+        let ast::Expr::Path(segs) = p.ast.expr(callee) else { return CallTarget::Unknown };
+        let last = segs[segs.len() - 1].name;
+        let ltext = self.cx.name(last).to_string();
+        if matches!(ltext.as_str(), "size_of" | "align_of") {
+            let args = segs[segs.len() - 1].type_args();
+            if args.len() == 1 {
+                let t = self.cx.resolve_written(args[0]);
+                return if ltext == "size_of" { CallTarget::SizeOf(t) } else { CallTarget::AlignOf(t) };
+            }
+            return CallTarget::Unknown;
+        }
+        if segs.len() == 1 && last == p.known.Some {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX), variant: 1, ty: ERROR };
+        }
+        let span = self.cx.span(callee);
+        let fid = if segs.len() == 1 {
+            if self.cx.lookup(last, span.ctxt).is_some() {
+                return CallTarget::Unknown;
+            }
+            self.cx.binding_fn(last)
+        } else {
+            match self.cx.resolve_assoc(segs, span) {
+                Some(Res::Fn(f)) => Some(f),
+                Some(Res::Variant(a, v)) => {
+                    return CallTarget::VariantCtor { adt: a, variant: v, ty: self.cx.tys.adt_ty(a) };
+                }
+                Some(Res::Builtin(_)) => return CallTarget::NonConst,
+                _ => None,
+            }
+        };
+        if let Some(f) = fid {
+            let info = p.fn_info(f);
+            if !info.is_const {
+                return CallTarget::NonConst;
+            }
+            let Some(body) = info.def.body else { return CallTarget::NonConst };
+            if info.self_kind.is_some() {
+                return CallTarget::Unknown;
+            }
+            let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body });
+        }
+        if let Some(a) = self.cx.tuple_struct_ctor(last)
+            && segs.len() == 1
+        {
+            return CallTarget::VariantCtor { adt: a, variant: 0, ty: self.cx.tys.adt_ty(a) };
+        }
+        if segs.len() == 2 && matches!(self.cx.name(segs[0].name), "String" | "Vec") {
+            return CallTarget::NonConst;
+        }
+        CallTarget::Unknown
+    }
+    fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)> {
+        let p = self.cx.p;
+        if segs.len() == 1 && segs[0].name == p.known.None {
+            let elem = expected.and_then(|t| self.cx.tys.option_elem(t)).unwrap_or(ERROR);
+            let ty = self.cx.tys.mk_option(elem);
+            return Some((AdtId(u32::MAX), 0, ty));
+        }
+        let (adt, variant) = variant_of(p, segs)?;
+        if p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {
+            return None;
+        }
+        Some((adt, variant, self.cx.tys.adt_ty(adt)))
+    }
+    fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
+        let (adt, variant) = variant_of(self.cx.p, path)?;
+        Some((adt, variant, self.cx.tys.adt_ty(adt)))
+    }
+    fn pattern_variant(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        variant_of(self.cx.p, segs)
+    }
+    fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)> {
+        if adt.0 == u32::MAX {
+            return Vec::new();
+        }
+        self.cx.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
+    }
+    fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
+        self.cx.resolve_written(t)
+    }
+    fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
+        let p: &Program<'_> = self.cx.p;
+        let t = self.cx.deep(t);
+        crate::ty::layout::layout_of_ty(&self.cx.tys, p, t).ok()
+    }
+    fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
+        self.cx.p.adt(adt).variants[variant as usize].disc
+    }
+}
+
+/// The (Adt, variant) a path denotes in the compat tables.
+fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+    if segs.len() == 1 {
+        let &a = p.type_names.get(&segs[0].name)?;
+        if p.adt(a).is_enum {
+            return None;
+        }
+        return Some((a, 0));
+    }
+    if segs.len() == 2 {
+        let &a = p.type_names.get(&segs[0].name)?;
+        let v = p.adt(a).variants.iter().position(|v| v.name == segs[1].name)?;
+        return Some((a, v as u32));
+    }
+    None
 }

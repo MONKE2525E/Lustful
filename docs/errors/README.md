@@ -65,10 +65,13 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0602](L0602.md) | this type form is not supported yet |
 | [L0614](L0614.md) | traits and generics are not supported yet |
 | [L0621](L0621.md) | associated items are not supported yet |
+| [L0630](L0630.md) | outside the bounded const evaluator |
+| [L0631](L0631.md) | non-const call in a const context |
 | [L0632](L0632.md) | const and static items are not supported yet |
 | [L0640](L0640.md) | this std item is declared but not yet implemented |
 | [L0641](L0641.md) | this literal or std form is not supported yet |
 | [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |
+| [L0650](L0650.md) | `offset_of!` on a default-repr type |
 | [L0651](L0651.md) | reference to a packed field |
 | [L0652](L0652.md) | unsupported layout form |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |

@@ -1270,6 +1270,8 @@ impl FnGen<'_, '_, '_> {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
             }
+            Rvalue::StaticLoad(idx) => format!("lust_static_{idx}"),
+            Rvalue::StaticRef(idx) => format!("(&lust_static_{idx})"),
             Rvalue::LenOf(pl) => {
                 let (e, t) = self.place(pl, loc);
                 match &t {
@@ -2061,6 +2063,9 @@ pub fn table_unit(capacity: usize, fn_units: &[usize]) -> String {
 pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
+    for st in &p.statics {
+        collect_types(&cty(&p.tys, st.ty), &mut types);
+    }
     if let Some(shared) = &g.shared {
         for k in shared {
             collect_types(&k.1, &mut types);
@@ -2074,6 +2079,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         for k in &keys {
             c.push_str(&g.def_map[*k]);
         }
+        c.push_str(&static_defs(p));
         return c;
     }
     for k in g.protos.keys() {
@@ -2086,7 +2092,153 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         c.push_str(proto);
     }
     c.push_str(&g.defs);
+    c.push_str(&static_defs(p));
     c
+}
+
+/// The C initializer for one const value at the given C type. Referenced
+/// aggregates are promoted to file-scope constants first, written to `pre`.
+fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32) -> String {
+    use crate::ty::consteval::ConstValue as CV;
+    match (v, t) {
+        (CV::Int(i), CTy::Int(it)) => {
+            if *i < 0 {
+                format!("(({})((int64_t){i}))", int_c(*it))
+            } else {
+                format!("(({})((uint64_t){}ull))", int_c(*it), *i as u128)
+            }
+        }
+        (CV::Bool(b), _) => (*b as u8).to_string(),
+        (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
+        (CV::Unit, _) => "0".into(),
+        (CV::Str(i), _) => {
+            let s = &p.ast.strings[*i as usize];
+            format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len())
+        }
+        (CV::StaticRef(idx), CTy::Slice(_)) => {
+            let st = &p.statics[*idx as usize];
+            let sct = cty(&p.tys, st.ty);
+            match sct {
+                CTy::Array(_, n) => format!("(({}){{ lust_static_{idx}.v, {n} }})", ctype(t)),
+                _ => format!("(({}){{0}})", ctype(t)),
+            }
+        }
+        (CV::StaticRef(idx), _) => format!("(&lust_static_{idx})"),
+        (CV::Ref(inner), CTy::Slice(el)) => {
+            // A slice over a promoted aggregate.
+            match &**inner {
+                CV::Aggregate(vals) => {
+                    let at = CTy::Array(el.clone(), vals.len() as u64);
+                    let init = const_init(p, inner, &at, pre, counter);
+                    *counter += 1;
+                    let name = format!("lust_promoted_{counter}");
+                    let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+                    format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
+                }
+                _ => format!("(({}){{0}})", ctype(t)),
+            }
+        }
+        (CV::Ref(inner), CTy::Ref(inner_ct)) => {
+            let init = const_init(p, inner, inner_ct, pre, counter);
+            *counter += 1;
+            let name = format!("lust_promoted_{counter}");
+            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(inner_ct));
+            format!("(&{name})")
+        }
+        (CV::Aggregate(vals), CTy::Tuple(es)) => {
+            if vals.is_empty() {
+                format!("(({}){{0}})", ctype(t))
+            } else {
+                let parts: Vec<String> =
+                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter))).collect();
+                format!("(({}){{ {} }})", ctype(t), parts.join(", "))
+            }
+        }
+        (CV::Aggregate(vals), CTy::Array(e, _)) => {
+            if vals.is_empty() {
+                format!("(({}){{0}})", ctype(t))
+            } else {
+                let parts: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+                format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
+            }
+        }
+        (CV::Repeat(x, n), CTy::Array(e, _)) => {
+            if *n == 0 {
+                format!("(({}){{0}})", ctype(t))
+            } else {
+                let one = const_init(p, x, e, pre, counter);
+                let parts: Vec<String> = (0..*n).map(|_| one.clone()).collect();
+                format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
+            }
+        }
+        (CV::Aggregate(vals), CTy::Adt(a)) => {
+            let adt = p.adt(*a);
+            if vals.is_empty() {
+                format!("((A{}){{0}})", a.0)
+            } else {
+                let parts: Vec<String> = vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter)))
+                    .collect();
+                format!("((A{}){{ {} }})", a.0, parts.join(", "))
+            }
+        }
+        (CV::Variant(variant, vals), CTy::Adt(a)) => {
+            let adt = p.adt(*a);
+            if vals.is_empty() {
+                format!("((A{}){{ .tag = {variant} }})", a.0)
+            } else {
+                let parts: Vec<String> = vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| {
+                        format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter))
+                    })
+                    .collect();
+                format!("((A{}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", a.0, parts.join(", "))
+            }
+        }
+        (CV::Variant(variant, vals), CTy::Option(e)) => {
+            let ct = ctype(t);
+            if *variant == 1 && !vals.is_empty() {
+                format!("(({ct}){{ .tag = 1, .v = {} }})", const_init(p, &vals[0], e, pre, counter))
+            } else {
+                format!("(({ct}){{ .tag = 0 }})")
+            }
+        }
+        (CV::Aggregate(vals), CTy::Slice(e)) => {
+            let at = CTy::Array(e.clone(), vals.len() as u64);
+            let init = const_init(p, v, &at, pre, counter);
+            *counter += 1;
+            let name = format!("lust_promoted_{counter}");
+            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+            format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
+        }
+        _ => format!("(({}){{0}})", ctype(t)),
+    }
+}
+
+/// Definitions of the program's statics as C globals (ARCH 2.13 static data).
+fn static_defs(p: &Program) -> String {
+    let mut pre = String::new();
+    let mut out = String::new();
+    let mut counter = 0u32;
+    for (i, st) in p.statics.iter().enumerate() {
+        let ct = cty(&p.tys, st.ty);
+        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter);
+        let _ = writeln!(out, "{} lust_static_{i} = {init};", ctype(&ct));
+    }
+    format!("{pre}{out}")
+}
+
+/// Extern declarations of the statics, for function units.
+fn static_decls(p: &Program) -> String {
+    let mut out = String::new();
+    for (i, st) in p.statics.iter().enumerate() {
+        let _ = writeln!(out, "extern {} lust_static_{i};", ctype(&cty(&p.tys, st.ty)));
+    }
+    out
 }
 
 /// The unit for the slots in `range` (`fns` is indexed by slot; empty slots have no code). Its
@@ -2098,6 +2250,9 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     for f in &fns[range.clone()] {
         types.extend(f.types.iter().cloned());
         seen.extend(f.glue.iter());
+    }
+    for st in &p.statics {
+        collect_types(&cty(&p.tys, st.ty), &mut types);
     }
     // With a frozen shared set, glue that is not shared is static in this unit: walk its deps
     // too, and stop at shared keys (their deps live in the glue unit). Shared keys still need
@@ -2119,6 +2274,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         }
     }
     type_decls(p, &mut c, &types);
+    c.push_str(&static_decls(p));
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     for k in &keys {
@@ -2801,6 +2957,7 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
     match rv {
         Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) => op_has(o),
         Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => place_mentions(p, l),
+        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) => false,
         Rvalue::Subslice { base, lo, hi, .. } => place_mentions(base, l) || op_has(lo) || hi.as_ref().is_some_and(op_has),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op_has(a) || op_has(b)

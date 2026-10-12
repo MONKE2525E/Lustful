@@ -59,14 +59,14 @@ prints "reserved, not yet emitted".
 | L0620 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
 | L0621 | Associated items | W-TRAITS-CORE | in use | Associated item, binding, or qualified path is not supported yet (S3b parser reject) |
 | L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |
-| L0630-L0631 | Const eval | W-CORELANG | reserved | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
+| L0630-L0631 | Const eval | W-CORELANG | in use | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
 | L0632 | Const eval | W-CORELANG | in use | Const or static item, const fn, or const generic form is not supported yet (S3b parser reject) |
 | L0633-L0639 | Const eval | W-CORELANG | reserved | |
 | L0640 | Std surface | W-STD | in use | Std item is declared but not yet implemented (S5) |
 | L0641 | Std surface | W-STD | in use | Float or byte literal, known std type, or format form is not supported yet (S3b) |
 | L0642 | Std surface | W-STD | in use | Intrinsic called from a crate that may not use intrinsics (S5) |
 | L0643-L0649 | Std surface | W-STD | reserved | |
-| L0650 | Layout | W-CORELANG | reserved | `offset_of!` on a default-repr type |
+| L0650 | Layout | W-CORELANG | in use | `offset_of!` on a default-repr type |
 | L0651-L0652 | Layout | W-CORELANG | in use | L0651 reference to a packed field, L0652 unsupported layout form |
 | L0653-L0659 | Layout | W-CORELANG | reserved | |
 | L0701-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | L0701 not dyn compatible (name the offending item) |

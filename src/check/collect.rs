@@ -49,6 +49,21 @@ pub struct AdtDef {
     pub repr: crate::ty::layout::Repr,
 }
 
+/// One evaluated `const` item.
+pub struct ConstItem {
+    pub name: Sym,
+    pub ty: Ty,
+    pub value: crate::ty::consteval::ConstValue,
+}
+
+/// One evaluated `static` item: its value becomes static data (ARCH 2.13).
+pub struct StaticItem {
+    pub name: Sym,
+    pub ty: Ty,
+    pub mutable: bool,
+    pub value: crate::ty::consteval::ConstValue,
+}
+
 pub struct FnInfo<'a> {
     pub name: Sym,
     pub def: &'a ast::FnDef,
@@ -59,6 +74,8 @@ pub struct FnInfo<'a> {
     pub ret: Ty,
     /// For a function that returns a reference: the index of the parameter it borrows from.
     pub ret_borrows_from: Option<usize>,
+    /// True for a `const fn`, callable from const contexts (ARCH 2.13).
+    pub is_const: bool,
 }
 
 /// The old name for the session-local function index. New code uses
@@ -66,19 +83,6 @@ pub struct FnInfo<'a> {
 /// parallel, then goes.
 #[allow(dead_code)]
 pub type FnId = LocalDefId;
-
-/// A scalar constant value from the bounded evaluator (ARCH 2.13's
-/// non-generic form, landed with W-RESOLVE's item collection). Integers
-/// are stored as the low 64 bits of the value in the declared width,
-/// sign-extended by readers that know the type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConstValue {
-    Int(u64),
-    Bool(bool),
-    Char(char),
-    /// Index into the AST string table.
-    Str(u32),
-}
 
 pub struct Program<'a> {
     pub ast: &'a Ast,
@@ -90,11 +94,20 @@ pub struct Program<'a> {
     pub defs: Defs,
     pub adts: Vec<AdtDef>,
     pub fns: Vec<FnInfo<'a>>,
+    /// Evaluated const items, and name to index (ARCH 2.13).
+    pub consts: Vec<ConstItem>,
+    pub const_names: HashMap<Sym, u32>,
+    /// Each const item's stable identity, in `consts` order.
+    pub const_defs: Vec<DefId>,
+    /// Each static item's stable identity, in `statics` order.
+    pub static_defs: Vec<DefId>,
+    /// Evaluated static items, and name to index. Codegen emits these as
+    /// static data in the glue unit.
+    pub statics: Vec<StaticItem>,
+    pub static_names: HashMap<Sym, u32>,
     pub type_names: HashMap<Sym, AdtId>,
     /// Non-generic type aliases by (flat) name, fully resolved.
     pub aliases: HashMap<Sym, Ty>,
-    /// `const` and non-mut `static` scalar values by (flat) name.
-    pub consts: HashMap<Sym, (Ty, ConstValue)>,
     pub fn_names: HashMap<Sym, LocalDefId>,
     pub methods: HashMap<(AdtId, Sym), LocalDefId>,
     pub main: Option<LocalDefId>,
@@ -160,6 +173,14 @@ impl<'a> Program<'a> {
     #[allow(dead_code)] // See `def_of_adt`.
     pub fn adt_by_def(&self, def: DefId) -> Option<AdtId> {
         self.defs.local_adt(def)
+    }
+    /// The index of the const item with this def, if this crate defines it.
+    pub fn const_by_def(&self, def: DefId) -> Option<u32> {
+        self.const_defs.iter().position(|&d| d == def).map(|i| i as u32)
+    }
+    /// The index of the static item with this def, if this crate defines it.
+    pub fn static_by_def(&self, def: DefId) -> Option<u32> {
+        self.static_defs.iter().position(|&d| d == def).map(|i| i as u32)
     }
     /// The shipped crate a span's source belongs to, if any. Only spans
     /// in spliced shipped source answer; every user span gets None.
@@ -529,9 +550,14 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         defs: Defs::new(),
         adts: Vec::new(),
         fns: Vec::new(),
+        consts: Vec::new(),
+        const_names: HashMap::default(),
+        const_defs: Vec::new(),
+        static_defs: Vec::new(),
+        statics: Vec::new(),
+        static_names: HashMap::default(),
         type_names: HashMap::default(),
         aliases: HashMap::default(),
-        consts: HashMap::default(),
         fn_names: HashMap::default(),
         methods: HashMap::default(),
         main: None,
@@ -866,113 +892,6 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
     }
 
-    // `const` and `static` items: the bounded evaluator handles scalar
-    // literals, references to other consts, and integer arithmetic.
-    // Anything else (a call, a mutable static, an aggregate) is L0632.
-    // The evaluated value is part of the item's signature (section 8.1).
-    {
-        // (name, declared ty id, value expr, name span, is_static)
-        let mut todo: Vec<(Sym, ast::TyId, Option<ast::ExprId>, Span, bool)> = Vec::new();
-        for item in &ast.items {
-            match &item.kind {
-                ItemKind::Const(c) => {
-                    if let Some(name) = c.name {
-                        todo.push((name, c.ty, c.value, c.name_span, false));
-                        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Const, interner.get(name), 0);
-                        p.defs
-                            .insert(DefId { krate: p.krate, hash }, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, c.name_span));
-                    } else if let Some(v) = c.value {
-                        // An unnamed const is only an assertion context;
-                        // evaluating anything but `()` there is beyond
-                        // the bounded evaluator.
-                        if !matches!(ast.expr(v), ast::Expr::Unit) {
-                            errs.push(not_yet("L0632", c.name_span, "unnamed consts with a computed value"));
-                        }
-                    }
-                }
-                ItemKind::Static(s) => {
-                    if s.mutable {
-                        errs.push(not_yet("L0632", s.name_span, "mutable statics"));
-                    } else {
-                        todo.push((s.name, s.ty, s.value, s.name_span, true));
-                        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, interner.get(s.name), 0);
-                        p.defs.insert(
-                            DefId { krate: p.krate, hash },
-                            DefData::skeleton(DefsKind::Static, None, s.name, Vis::Priv, s.name_span),
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Evaluate in dependency order by fixpoint (consts are few).
-        let total = todo.len();
-        for _ in 0..=total {
-            if todo.is_empty() {
-                break;
-            }
-            let mut progress = false;
-            let mut first_err: Option<Diag> = None;
-            let mut deferred = false;
-            todo.retain(|(name, ty_id, value, span, _)| {
-                let span = *span;
-                let declared = match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, *ty_id, None) {
-                    Ok(t) => t,
-                    Err(d) => {
-                        if first_err.is_none() {
-                            first_err = Some(d);
-                        }
-                        return false;
-                    }
-                };
-                let Some(v) = value else {
-                    if first_err.is_none() {
-                        first_err = Some(not_yet("L0632", span, "const and static items without a value"));
-                    }
-                    return false;
-                };
-                match eval_const(ast, *v, &p.consts, declared, &p.tys) {
-                    Ok(val) => match check_const_ty(&p, declared, val, span, interner, *name) {
-                        Ok(val) => {
-                            if p.consts.insert(*name, (declared, val)).is_some() {
-                                errs.push(dup(span, interner.get(*name)));
-                            }
-                            progress = true;
-                            false
-                        }
-                        Err(d) => {
-                            if first_err.is_none() {
-                                first_err = Some(d);
-                            }
-                            false
-                        }
-                    },
-                    Err(ConstErr::Defer) => {
-                        deferred = true;
-                        true
-                    }
-                    Err(ConstErr::Fail(d)) => {
-                        if first_err.is_none() {
-                            first_err = Some(d);
-                        }
-                        false
-                    }
-                }
-            });
-            if !progress {
-                if deferred && !todo.is_empty() {
-                    errs.push(not_yet("L0632", todo[0].3, "cyclic consts"));
-                } else if let Some(d) = first_err {
-                    errs.push(d);
-                }
-                break;
-            }
-            if let Some(d) = first_err {
-                errs.push(d);
-            }
-        }
-    }
-
     // Functions and methods. Each gets the stable path hash its caller computed
     // (src/def.rs). Hash collisions are checked by the driver when it assigns
     // slots from the same hashes, before `collect` runs on any new def set;
@@ -1073,6 +992,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             params,
             ret,
             ret_borrows_from,
+            is_const: def.qual.is_const,
         });
         id
     };
@@ -1127,181 +1047,370 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             errs.push(Diag::new("L0110", f.def.name_span, "`main` must take no parameters and return ()", "Write `fn main() { ... }`."));
         }
     }
+    // Const and static items: register names first, then evaluate with the
+    // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
+    // so one bad item reports once; collection fails anyway on the error.
+    eval_const_items(&mut p, &mut errs);
+
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }
 
-/// Why a const initializer did not evaluate: it names a const that is
-/// not evaluated yet (retry next sweep), or it is outside the bounded
-/// evaluator for good.
-enum ConstErr {
-    Defer,
-    Fail(Diag),
+/// One const or static item waiting for evaluation.
+struct PendingConst {
+    name: Option<Sym>,
+    ty: Ty,
+    expr: ast::ExprId,
+    span: Span,
+    /// Some(mutable) for a static, None for a const.
+    is_static: Option<bool>,
+    /// The index in `Program::statics` for a static item.
+    static_idx: u32,
 }
 
-/// The bounded const evaluator for initializers: scalar literals,
-/// references to already-evaluated consts, unary `-`/`!`, and integer
-/// arithmetic in i128. Calls, aggregates, and anything else fail with
-/// L0632 (W-CORELANG's full evaluator widens this in its own wave).
-/// The evaluator's working value: integers stay in i128 so written
-/// magnitudes and negated values never alias through u64 bits.
-#[derive(Clone, Copy)]
-enum EvalVal {
-    Int(i128),
-    Bool(bool),
-    Char(char),
-    Str(u32),
+enum PendingState {
+    Todo,
+    Doing,
+    Done(crate::ty::consteval::ConstValue),
+    Failed,
 }
 
-impl From<ConstValue> for EvalVal {
-    fn from(v: ConstValue) -> EvalVal {
-        match v {
-            ConstValue::Int(x) => EvalVal::Int((x as i64) as i128),
-            ConstValue::Bool(b) => EvalVal::Bool(b),
-            ConstValue::Char(c) => EvalVal::Char(c),
-            ConstValue::Str(s) => EvalVal::Str(s),
+/// Registers and evaluates every const and static item in the crate.
+fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
+    let ast = p.ast;
+    let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
+    let mut by_name: HashMap<Sym, usize> = HashMap::default();
+    let mut static_count = 0u32;
+    for item in &ast.items {
+        let (name, ty_id, value, span, is_static) = match &item.kind {
+            ItemKind::Const(c) => (c.name, c.ty, c.value, c.span, None),
+            ItemKind::Static(s) => (Some(s.name), s.ty, s.value, s.span, Some(s.mutable)),
+            _ => continue,
+        };
+        let Some(value) = value else { continue };
+        let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &mut p.tys, ty_id, None) {
+            Ok(t) => t,
+            Err(d) => {
+                errs.push(d);
+                continue;
+            }
+        };
+        if !is_sized_ty(&p.tys, ty) {
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                format!("the size for values of type `{}` cannot be known", ty_name(p, &p.tys, ty)),
+                "Put the value behind a reference, such as `&[T]` or `&str`.",
+            ));
+            continue;
+        }
+        let static_idx = if is_static.is_some() {
+            let i = static_count;
+            static_count += 1;
+            i
+        } else {
+            0
+        };
+        if let Some(n) = name {
+            if by_name.insert(n, pending.len()).is_some() || p.fn_names.contains_key(&n) {
+                errs.push(Diag::new(
+                    "L0106",
+                    span,
+                    format!("`{}` is defined more than once", p.interner.get(n)),
+                    "Rename one of the definitions.",
+                ));
+            }
+        }
+        pending.push((PendingConst { name, ty, expr: value, span, is_static, static_idx }, PendingState::Todo));
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let n = pending.len();
+    let mut cx = CollectCx { p, pending, by_name, errs };
+    for i in 0..n {
+        cx.eval_pending(i);
+    }
+    // Move the results into the program tables, in item order.
+    let CollectCx { p, pending, .. } = cx;
+    let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
+    for (item, state) in pending {
+        let PendingState::Done(value) = state else { continue };
+        match item.is_static {
+            None => {
+                if let Some(name) = item.name {
+                    let idx = p.consts.len() as u32;
+                    p.const_names.insert(name, idx);
+                    let disamb = p.const_defs.len() as u32;
+                    let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Const, p.interner.get(name), disamb);
+                    let def = DefId { krate: p.krate, hash };
+                    p.defs.insert(def, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, item.span));
+                    p.const_defs.push(def);
+                    p.consts.push(ConstItem { name, ty: item.ty, value });
+                }
+            }
+            Some(mutable) => {
+                let name = item.name.unwrap();
+                let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(name), 0);
+                let def = DefId { krate: p.krate, hash };
+                p.defs.insert(def, DefData::skeleton(DefsKind::Static, None, name, Vis::Priv, item.span));
+                if p.static_defs.len() <= item.static_idx as usize {
+                    p.static_defs.resize(item.static_idx as usize + 1, def);
+                }
+                p.static_defs[item.static_idx as usize] = def;
+                p.static_names.insert(name, item.static_idx);
+                statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value });
+            }
+        }
+    }
+    p.statics = statics
+        .into_iter()
+        .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit }))
+        .collect();
+}
+
+/// The const evaluator's context over the collected tables.
+struct CollectCx<'x, 'a> {
+    p: &'x mut Program<'a>,
+    pending: Vec<(PendingConst, PendingState)>,
+    by_name: HashMap<Sym, usize>,
+    errs: &'x mut Vec<Diag>,
+}
+
+impl CollectCx<'_, '_> {
+    /// Evaluates one pending item, on demand from other items.
+    fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
+        match &self.pending[idx].1 {
+            PendingState::Done(v) => return Some(v.clone()),
+            PendingState::Failed => return None,
+            PendingState::Doing => {
+                let span = self.pending[idx].0.span;
+                self.errs.push(Diag::new(
+                    "L0110",
+                    span,
+                    "const items form a cycle",
+                    "Break the cycle: a const item cannot use its own value.",
+                ));
+                self.pending[idx].1 = PendingState::Failed;
+                return None;
+            }
+            PendingState::Todo => {}
+        }
+        self.pending[idx].1 = PendingState::Doing;
+        let (expr, ty, span) = {
+            let it = &self.pending[idx].0;
+            (it.expr, it.ty, it.span)
+        };
+        match crate::ty::consteval::eval(self, expr, Some(ty)) {
+            Ok((v, vt)) => {
+                let v = match coerce_const_value(self, v, vt, ty, span) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        self.errs.push(d);
+                        self.pending[idx].1 = PendingState::Failed;
+                        return None;
+                    }
+                };
+                self.pending[idx].1 = PendingState::Done(v.clone());
+                Some(v)
+            }
+            Err(d) => {
+                // A name in the message helps when the span is deep inside.
+                self.errs.push(d);
+                self.pending[idx].1 = PendingState::Failed;
+                None
+            }
         }
     }
 }
 
-fn eval_const(
-    ast: &Ast,
-    e: ast::ExprId,
-    consts: &HashMap<Sym, (Ty, ConstValue)>,
-    declared: Ty,
-    tys: &impl TyIntern,
-) -> Result<EvalVal, ConstErr> {
-    let fail = |what: &str| ConstErr::Fail(not_yet("L0632", ast.expr_span(e), what));
-    match ast.expr(e) {
-        ast::Expr::Int(v, _) => Ok(EvalVal::Int(*v as i128)),
-        ast::Expr::Bool(b) => Ok(EvalVal::Bool(*b)),
-        ast::Expr::Char(c) => Ok(EvalVal::Char(*c)),
-        ast::Expr::Str(s) => Ok(EvalVal::Str(*s)),
-        ast::Expr::Path(segs) if segs.len() == 1 => match consts.get(&segs[0].name) {
-            Some((ref_ty, v)) => {
-                // A const reference is type-exact, as in Rust: no
-                // implicit conversion between const item types.
-                if *ref_ty != declared {
-                    return Err(ConstErr::Fail(Diag::new(
-                        "L0110",
-                        ast.expr_span(e),
-                        "this const has a different type than the declared type",
-                        "Change the declared type to match, or write the value directly.",
-                    )));
-                }
-                match v {
-                    // The stored u64 reads back through the declared
-                    // type: unsigned keeps its magnitude, signed
-                    // sign-extends from two's complement.
-                    ConstValue::Int(x) => {
-                        let signed = matches!(tys.kind(declared), TyKind::Int(it) if it.signed());
-                        Ok(EvalVal::Int(if signed { (*x as i64) as i128 } else { *x as i128 }))
-                    }
-                    other => Ok(EvalVal::from(*other)),
-                }
-            }
-            None => Err(ConstErr::Defer),
-        },
-        ast::Expr::Unary { op, expr } => {
-            let v = eval_const(ast, *expr, consts, declared, tys)?;
-            match (op, v) {
-                (ast::UnOp::Neg, EvalVal::Int(x)) => {
-                    Ok(EvalVal::Int(x.checked_neg().ok_or_else(|| fail("this unary operation in a const"))?))
-                }
-                (ast::UnOp::Not, EvalVal::Int(x)) => Ok(EvalVal::Int(!x)),
-                (ast::UnOp::Not, EvalVal::Bool(b)) => Ok(EvalVal::Bool(!b)),
-                _ => Err(fail("this unary operation in a const")),
-            }
-        }
-        ast::Expr::Binary { op, lhs, rhs } => {
-            let (EvalVal::Int(a), EvalVal::Int(b)) =
-                (eval_const(ast, *lhs, consts, declared, tys)?, eval_const(ast, *rhs, consts, declared, tys)?)
-            else {
-                return Err(fail("non-integer arithmetic in a const"));
-            };
-            let r = match op {
-                ast::BinOp::Add => a.checked_add(b),
-                ast::BinOp::Sub => a.checked_sub(b),
-                ast::BinOp::Mul => a.checked_mul(b),
-                ast::BinOp::Div => {
-                    if b == 0 {
-                        return Err(ConstErr::Fail(Diag::new(
-                            "L0632",
-                            ast.expr_span(e),
-                            "division by zero in a const initializer",
-                            "Fix the divisor.",
-                        )));
-                    }
-                    a.checked_div(b)
-                }
-                ast::BinOp::Rem => {
-                    if b == 0 {
-                        return Err(ConstErr::Fail(Diag::new(
-                            "L0632",
-                            ast.expr_span(e),
-                            "remainder by zero in a const initializer",
-                            "Fix the divisor.",
-                        )));
-                    }
-                    a.checked_rem(b)
-                }
-                ast::BinOp::BitAnd => Some(a & b),
-                ast::BinOp::BitOr => Some(a | b),
-                ast::BinOp::BitXor => Some(a ^ b),
-                ast::BinOp::Shl => a.checked_shl(b as u32),
-                ast::BinOp::Shr => a.checked_shr(b as u32),
-                _ => return Err(fail("this operator in a const")),
-            };
-            match r {
-                Some(v) => Ok(EvalVal::Int(v)),
-                None => Err(fail("arithmetic that overflows a const")),
-            }
-        }
-        _ => Err(fail("this const initializer form")),
+/// Accepts an evaluated value for a declared item type: exact type, an
+/// integer that fits, or an aggregate whose shape the evaluator built from
+/// the declared type's own field information.
+fn coerce_const_value(
+    cx: &mut CollectCx<'_, '_>,
+    v: crate::ty::consteval::ConstValue,
+    vt: Ty,
+    ty: Ty,
+    span: Span,
+) -> Result<crate::ty::consteval::ConstValue, Diag> {
+    use crate::ty::consteval::ConstValue;
+    if vt == ty {
+        return Ok(v);
     }
-}
-
-/// Checks an evaluated value against the declared type and stores it
-/// in the public form: the kind must match, and an integer must fit
-/// the declared width (stored as its low 64 bits).
-fn check_const_ty(p: &Program, declared: Ty, val: EvalVal, span: Span, interner: &Interner, name: Sym) -> Result<ConstValue, Diag> {
-    let n = interner.get(name);
-    let mismatch = |want: &str| {
-        Diag::new(
+    match (&v, cx.p.tys.kind(ty)) {
+        (ConstValue::Int(i), TyKind::Int(it)) => {
+            if crate::ty::consteval::truncate_to_int(*i, it) == *i {
+                Ok(v)
+            } else {
+                Err(Diag::new("L0110", span, "integer literal out of range for the declared type", "Change the literal or the type."))
+            }
+        }
+        (ConstValue::Variant(0, vals), _) if vals.is_empty() && cx.p.tys.option_elem(ty).is_some() => Ok(v),
+        (ConstValue::Aggregate(_), TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Adt(..)) => Ok(v),
+        (ConstValue::Variant(..), TyKind::Adt(..)) => Ok(v),
+        (ConstValue::Repeat(..), TyKind::Array(..)) => Ok(v),
+        (ConstValue::Ref(_), TyKind::Ref(..)) => Ok(v),
+        _ => Err(Diag::new(
             "L0110",
             span,
-            format!("`{n}` is declared as {want} but its value is a different kind"),
-            "Change the declared type or the value.",
-        )
-    };
-    match (p.tys.kind(declared), val) {
-        (TyKind::Int(it), EvalVal::Int(v)) => {
-            let bits = it.bits().min(64);
-            let fits = if it.signed() {
-                let min = -(1i128 << (bits - 1));
-                let max = (1i128 << (bits - 1)) - 1;
-                (min..=max).contains(&v)
-            } else {
-                v >= 0 && (bits == 64 || v < (1i128 << bits))
-            };
-            if fits {
-                Ok(ConstValue::Int(v as u64))
-            } else {
-                Err(Diag::new(
-                    "L0118",
-                    span,
-                    format!("the value of `{n}` does not fit in `{}`", it.name()),
-                    "Pick a wider type or a smaller value.",
-                ))
-            }
+            format!("mismatched types: expected `{}`, found `{}`", ty_name(cx.p, &cx.p.tys, ty), ty_name(cx.p, &cx.p.tys, vt)),
+            "Change the value or the declared type.",
+        )),
+    }
+}
+
+impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
+    type Tys = GlobalTys;
+
+    fn tys(&mut self) -> &mut GlobalTys {
+        &mut self.p.tys
+    }
+    fn tys_ref(&self) -> &GlobalTys {
+        &self.p.tys
+    }
+    fn ast(&self) -> &'a Ast {
+        self.p.ast
+    }
+    fn sym_text(&self, s: Sym) -> &str {
+        self.p.interner.get(s)
+    }
+    fn const_item(&mut self, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        if let Some(&i) = self.by_name.get(&name) {
+            let ty = self.pending[i].0.ty;
+            return self.eval_pending(i).map(|v| (v, ty));
         }
-        (TyKind::Bool, EvalVal::Bool(b)) => Ok(ConstValue::Bool(b)),
-        (TyKind::Char, EvalVal::Char(c)) => Ok(ConstValue::Char(c)),
-        (TyKind::Str, EvalVal::Str(s)) => Ok(ConstValue::Str(s)),
-        (TyKind::Ref(_, _, inner), EvalVal::Str(s)) if p.tys.kind(inner) == TyKind::Str => Ok(ConstValue::Str(s)),
-        (TyKind::Int(_), _) => Err(mismatch("an integer")),
-        (TyKind::Bool, _) => Err(mismatch("`bool`")),
-        (TyKind::Char, _) => Err(mismatch("`char`")),
-        _ => Err(not_yet("L0632", span, "consts of this type")),
+        self.p.const_names.get(&name).map(|&i| {
+            let c = &self.p.consts[i as usize];
+            (c.value.clone(), c.ty)
+        })
+    }
+    fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
+        if let Some(&i) = self.by_name.get(&name)
+            && self.pending[i].0.is_static.is_some()
+        {
+            let it = &self.pending[i].0;
+            return Some((it.static_idx, it.ty));
+        }
+        self.p.static_names.get(&name).map(|&i| (i, self.p.statics[i as usize].ty))
+    }
+    fn call_target(&mut self, callee: ast::ExprId) -> crate::ty::consteval::CallTarget {
+        use crate::ty::consteval::{CallTarget, ConstFnBody};
+        let ast::Expr::Path(segs) = self.p.ast.expr(callee) else { return CallTarget::Unknown };
+        let last = segs[segs.len() - 1].name;
+        let ltext = self.p.interner.get(last).to_string();
+        if ltext == "size_of" || ltext == "align_of" {
+            let ok_path = segs.len() == 1
+                || (segs.len() == 3
+                    && matches!(self.p.interner.get(segs[0].name), "std" | "core")
+                    && self.p.interner.get(segs[1].name) == "mem");
+            if ok_path {
+                let args = segs[segs.len() - 1].type_args();
+                if args.len() == 1 {
+                    let t = resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &mut self.p.tys, args[0], None)
+                        .unwrap_or(ERROR);
+                    return if ltext == "size_of" { CallTarget::SizeOf(t) } else { CallTarget::AlignOf(t) };
+                }
+            }
+            return CallTarget::Unknown;
+        }
+        if segs.len() == 1 && last == self.p.known.Some {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX), variant: 1, ty: ERROR };
+        }
+        let fid = if segs.len() == 1 {
+            self.p.fn_names.get(&last).copied()
+        } else if segs.len() == 2 {
+            match self.p.type_names.get(&segs[0].name) {
+                Some(&a) => self.p.methods.get(&(a, last)).copied(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(f) = fid {
+            let info = self.p.fn_info(f);
+            if !info.is_const {
+                return CallTarget::NonConst;
+            }
+            let Some(body) = info.def.body else { return CallTarget::NonConst };
+            let skip = if info.self_kind.is_some() { 1 } else { 0 };
+            if skip == 1 {
+                return CallTarget::Unknown;
+            }
+            let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body });
+        }
+        if let Some((adt, variant, ty)) = self.variant_ctor(segs) {
+            return CallTarget::VariantCtor { adt, variant, ty };
+        }
+        // Known std constructors that are not const fn here report NonConst,
+        // so `static S: String = String::from(..)` gets the right error.
+        if segs.len() == 2 && matches!(self.p.interner.get(segs[0].name), "String" | "Vec") {
+            return CallTarget::NonConst;
+        }
+        CallTarget::Unknown
+    }
+    fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)> {
+        if segs.len() == 1 && segs[0].name == self.p.known.None {
+            let elem = expected.and_then(|t| self.p.tys.option_elem(t)).unwrap_or(ERROR);
+            let ty = self.p.tys.mk_option(elem);
+            return Some((AdtId(u32::MAX), 0, ty));
+        }
+        let (adt, variant) = self.variant_of(segs)?;
+        if self.p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {
+            return None;
+        }
+        Some((adt, variant, self.p.tys.adt_ty(adt)))
+    }
+    fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
+        let (adt, variant) = self.variant_of(path)?;
+        Some((adt, variant, self.p.tys.adt_ty(adt)))
+    }
+    fn pattern_variant(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        self.variant_of(segs)
+    }
+    fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)> {
+        if adt.0 == u32::MAX {
+            return Vec::new();
+        }
+        self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
+    }
+    fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
+        resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &mut self.p.tys, t, None).unwrap_or(ERROR)
+    }
+    fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
+        let p: &Program<'_> = self.p;
+        crate::ty::layout::layout_of_ty(&p.tys, p, t).ok()
+    }
+    fn discriminant(&self, adt: AdtId, variant: u32) -> i128 {
+        self.p.adt(adt).variants[variant as usize].disc
+    }
+}
+
+impl CollectCx<'_, '_> {
+    /// A tuple variant constructor path, for calls in const position.
+    fn variant_ctor(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
+        let (adt, variant) = self.variant_of(segs)?;
+        if self.p.adt(adt).variants[variant as usize].shape != VariantShape::Tuple {
+            return None;
+        }
+        Some((adt, variant, self.p.tys.get_adt_ty(adt).unwrap_or(ERROR)))
+    }
+
+    /// The (Adt, variant) a two-segment path or a struct name denotes.
+    fn variant_of(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        if segs.len() == 1 {
+            let &a = self.p.type_names.get(&segs[0].name)?;
+            if self.p.adt(a).is_enum {
+                return None;
+            }
+            return Some((a, 0));
+        }
+        if segs.len() == 2 {
+            let &a = self.p.type_names.get(&segs[0].name)?;
+            let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[1].name)?;
+            return Some((a, v as u32));
+        }
+        None
     }
 }
 
