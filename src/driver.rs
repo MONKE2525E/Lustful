@@ -400,6 +400,24 @@ impl BoundaryScan {
     }
 }
 
+/// True if lexing `text` from a clean top-level point ends in the normal state (not inside a
+/// comment or string, all depths zero).
+fn chunk_ends_clean(text: &str) -> bool {
+    let mut scan = BoundaryScan::new();
+    scan.feed(text.as_bytes(), 0, None);
+    scan.clean()
+}
+
+/// True if a chunk may be reused in front of other text: it ends at a top-level item boundary
+/// (token scan) and in a clean lex state. The lex test matters for a chunk that ends inside a
+/// `//` comment with no trailing newline: its standalone tokens end there, but in the new text
+/// the comment ends at the next newline and the bytes after it are code again. A chunk that
+/// lexed without error can only end unclean inside a line comment, which a trailing newline
+/// rules out, so the byte scan runs only for chunks without one.
+fn chunk_end_ok(c: &Chunk) -> bool {
+    c.scan.ends_at_boundary && (c.text.ends_with('\n') || chunk_ends_clean(&c.text))
+}
+
 /// Shifts every AST span at or after old offset `lo` by `delta` bytes. After an edit, the kept
 /// suffix chunks keep their text at a new offset; their items in `front.ast` still carry old
 /// spans. Spans the parser stored for an item lie within that item's chunk, so shifting by range
@@ -715,12 +733,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     // A chunk may be reused only if its edges are still top-level item boundaries in the new
-    // text. Its token scan proves the end edge (`ends_at_boundary`): every item the chunk
-    // started is complete. A chunk that ended at the old end of file may end mid-item (a
-    // half-written `fn added`), and then it must not be kept in front of other text. It may
-    // still be kept when it reaches the new end of file, where a cold compile scans it the same
-    // way. Cut the kept front list at the first chunk that fails the test.
-    if let Some(i) = kept_front.iter().position(|c| !c.scan.ends_at_boundary) {
+    // text: `chunk_end_ok` proves the end edge (complete items, clean lex state). A chunk that
+    // ended at the old end of file may end mid-item (a half-written `fn added`) or inside a
+    // `//` comment, and then it must not be kept in front of other text. It may still be kept
+    // when it reaches the new end of file, where a cold compile scans it the same way. Cut the
+    // kept front list at the first chunk that fails the test.
+    if let Some(i) = kept_front.iter().position(|c| !chunk_end_ok(c)) {
         let end = kept_front[i].start + kept_front[i].text.len();
         if end < src.len() {
             kept_front.truncate(i);
@@ -728,7 +746,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     // The same test between kept back chunks: if a non-final back chunk does not end at an item
     // boundary, the next back chunk does not start at one. Drop everything up to it.
-    while let Some(i) = (0..kept_back.len().saturating_sub(1)).find(|&i| !kept_back[i].scan.ends_at_boundary) {
+    while let Some(i) = (0..kept_back.len().saturating_sub(1)).find(|&i| !chunk_end_ok(&kept_back[i])) {
         kept_back.drain(..=i);
     }
     let region_start = kept_front.last().map_or(0, |c| c.start + c.text.len());
