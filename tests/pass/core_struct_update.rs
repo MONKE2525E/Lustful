@@ -1,4 +1,3 @@
-// expect: L0820
 struct S {
     a: i64,
     b: i64,

@@ -259,7 +259,7 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
                 f(value)
             }
         }),
-        Rvalue::Ref(..) | Rvalue::Discriminant(_) | Rvalue::SliceOf(_) => {}
+        Rvalue::Ref(..) | Rvalue::Discriminant(_) | Rvalue::SliceOf(_) | Rvalue::LenOf(_) => {}
         Rvalue::Subslice { lo, hi, .. } => {
             f(lo);
             if let Some(h) = hi {
@@ -391,6 +391,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     // A reborrow of a holder (for example for a method call) also counts as a use.
                     StmtKind::Assign(_, Rvalue::Ref(_, p))
                     | StmtKind::Assign(_, Rvalue::Discriminant(p))
+                    | StmtKind::Assign(_, Rvalue::LenOf(p))
                     | StmtKind::Assign(_, Rvalue::SliceOf(p))
                     | StmtKind::Assign(_, Rvalue::Subslice { base: p, .. }) => uses.push((p.local, s.span)),
                     StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut note),
@@ -497,7 +498,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                 };
                 rvalue_operands(rv, &mut uses);
-                if let Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) = rv {
+                if let Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) = rv {
                     Self::uses_place(live, p);
                 }
                 if let Rvalue::Subslice { base, .. } = rv {
@@ -782,7 +783,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             new_origins.union(&o);
                         }
                     }
-                    Rvalue::Discriminant(place) => {
+                    Rvalue::Discriminant(place) | Rvalue::LenOf(place) => {
                         self.check_init(place, span, st);
                         self.access(place, Access::Read, span, &live);
                     }

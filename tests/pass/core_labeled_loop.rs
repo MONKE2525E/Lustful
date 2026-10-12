@@ -1,4 +1,3 @@
-// expect: L0820
 fn main() {
     let mut n = 0;
     'outer: loop {

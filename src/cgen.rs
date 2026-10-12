@@ -969,6 +969,15 @@ impl FnGen<'_, '_, '_> {
                 let (e, _) = self.place(pl, loc);
                 format!("{e}.tag")
             }
+            Rvalue::LenOf(pl) => {
+                let (e, t) = self.place(pl, loc);
+                match &t {
+                    CTy::Array(_, n) => n.to_string(),
+                    CTy::Slice(_) | CTy::Vec(_) | CTy::String | CTy::Str => format!("{e}.len"),
+                    CTy::Ref(inner) if **inner == CTy::Str => format!("{e}.len"),
+                    _ => format!("({e})->len"),
+                }
+            }
         }
     }
 
@@ -2263,7 +2272,7 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
     let parts_has = |ps: &[FmtPart]| ps.iter().any(|p| matches!(p, FmtPart::Arg { value, .. } if op_has(value)));
     match rv {
         Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) => op_has(o),
-        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) => place_mentions(p, l),
+        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => place_mentions(p, l),
         Rvalue::Subslice { base, lo, hi, .. } => place_mentions(base, l) || op_has(lo) || hi.as_ref().is_some_and(op_has),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op_has(a) || op_has(b)

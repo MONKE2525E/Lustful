@@ -1,7 +1,6 @@
-// expect: L0820
 fn main() {
     let v = vec![1, 2, 3];
-    match v.as_slice() {
+    match &v[..] {
         [first, ..] => println!("{}", first),
         [] => println!("empty"),
     }

@@ -1,8 +1,7 @@
-// expect: L0820
 fn main() {
     let x = 3;
     match x {
-        0..10 => println!("small"),
+        v @ 0..=9 => println!("{}", v),
         _ => println!("big"),
     }
 }

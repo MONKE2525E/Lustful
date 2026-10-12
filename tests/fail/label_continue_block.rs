@@ -1,7 +1,7 @@
-// expect: L0820
+// expect: L0120
 fn main() {
     let x = 'a: {
-        break 'a 3;
+        continue 'a;
     };
     println!("{}", x);
 }

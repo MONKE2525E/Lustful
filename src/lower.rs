@@ -11,6 +11,8 @@ struct LoopInfo {
     continue_bb: Bb,
     dest: Option<Place>,
     depth: usize,
+    label: Option<crate::intern::Sym>,
+    is_block: bool,
 }
 
 struct Lower<'p, 'a> {
@@ -435,7 +437,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 self.goto(end, span);
             }
-            Expr::While { cond, body, .. } => {
+            Expr::While { label, cond, body } => {
                 let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
                 self.goto(head, span);
                 let cl = self.cond(*cond, span);
@@ -443,7 +445,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 b.term = Terminator::If(Operand::Copy(Place::local(cl)), bodyb, exit);
                 b.term_span = span;
                 self.cur = bodyb;
-                self.loops.push(LoopInfo { break_bb: exit, continue_bb: head, dest: None, depth: self.scopes.len() });
+                self.loops.push(LoopInfo {
+                    break_bb: exit,
+                    continue_bb: head,
+                    dest: None,
+                    depth: self.scopes.len(),
+                    label: label.map(|l| l.name),
+                    is_block: false,
+                });
                 self.block_into(*body, None);
                 self.loops.pop();
                 self.goto(head, span);
@@ -452,16 +461,23 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
                 }
             }
-            Expr::Loop { body, .. } => {
+            Expr::Loop { label, body } => {
                 let (head, exit) = (self.new_block(), self.new_block());
                 self.goto(head, span);
-                self.loops.push(LoopInfo { break_bb: exit, continue_bb: head, dest: dest.cloned(), depth: self.scopes.len() });
+                self.loops.push(LoopInfo {
+                    break_bb: exit,
+                    continue_bb: head,
+                    dest: dest.cloned(),
+                    depth: self.scopes.len(),
+                    label: label.map(|l| l.name),
+                    is_block: false,
+                });
                 self.block_into(*body, None);
                 self.loops.pop();
                 self.goto(head, span);
                 self.cur = exit;
             }
-            Expr::For { pat, iter, body, .. } => self.for_loop(*pat, *iter, *body, span, dest),
+            Expr::For { label, pat, iter, body } => self.for_loop(*label, *pat, *iter, *body, span, dest),
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
             Expr::Call { args, .. } => {
                 let res = self.ck.res(e);
@@ -568,7 +584,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 self.unit(dest, span);
             }
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { fields, update, .. } => {
                 let Res::Variant(a, v) = self.ck.res(e) else { return };
                 let n = p.adt(a).variants[v as usize].fields.len();
                 let mut ops: Vec<Option<Operand>> = vec![None; n];
@@ -591,12 +607,27 @@ impl<'p, 'a> Lower<'p, 'a> {
                     };
                     ops[i] = Some(o);
                 }
+                if let Some(u) = update {
+                    // The base is evaluated after the written fields, and the
+                    // fields not written move out of it.
+                    let base = self.place(*u);
+                    for (i, slot) in ops.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            let ft = p.adt(a).variants[v as usize].fields[i].ty;
+                            *slot = Some(self.operand_from(base.project(Proj::Field(i as u32)), ft));
+                        }
+                    }
+                }
                 let ops = ops.into_iter().map(|o| o.unwrap()).collect();
                 self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span);
             }
             Expr::Range { .. } => {}
-            Expr::Break { value: val, .. } => {
-                let li = self.loops.last().unwrap();
+            Expr::Break { label, value: val } => {
+                let ti = match label {
+                    None => self.loops.len() - 1,
+                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)).unwrap_or(self.loops.len() - 1),
+                };
+                let li = &self.loops[ti];
                 let (bb, depth, ld) = (li.break_bb, li.depth, li.dest.clone());
                 if let Some(v) = val {
                     self.expr_into(*v, ld.as_ref());
@@ -604,8 +635,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.exit_to(depth, span);
                 self.terminate(Terminator::Goto(bb), span);
             }
-            Expr::Continue(_) => {
-                let li = self.loops.last().unwrap();
+            Expr::Continue(label) => {
+                let ti = match label {
+                    None => self.loops.iter().rposition(|lp| !lp.is_block).unwrap_or(self.loops.len() - 1),
+                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)).unwrap_or(self.loops.len() - 1),
+                };
+                let li = &self.loops[ti];
                 let (bb, depth) = (li.continue_bb, li.depth);
                 self.exit_to(depth, span);
                 self.terminate(Terminator::Goto(bb), span);
@@ -617,6 +652,20 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 self.exit_to(0, span);
                 self.terminate(Terminator::Return, span);
+            }
+            Expr::LabeledBlock { label, body } => {
+                let exit = self.new_block();
+                self.loops.push(LoopInfo {
+                    break_bb: exit,
+                    continue_bb: exit,
+                    dest: dest.cloned(),
+                    depth: self.scopes.len(),
+                    label: Some(label.name),
+                    is_block: true,
+                });
+                self.block_into(*body, dest);
+                self.loops.pop();
+                self.goto(exit, span);
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_into(e, *kind, args, fmt, *repeat, dest, ty, span),
             Expr::Tuple(elems) => {
@@ -653,7 +702,6 @@ impl<'p, 'a> Lower<'p, 'a> {
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
-            | Expr::LabeledBlock { .. }
             | Expr::Let { .. }
             | Expr::QPath { .. }
             | Expr::ConstBlock(_)
@@ -974,7 +1022,7 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Loops ----------
 
-    fn for_loop(&mut self, pat: PatId, iter: ExprId, body: ast::BlockId, span: Span, dest: Option<&Place>) {
+    fn for_loop(&mut self, label: Option<ast::Label>, pat: PatId, iter: ExprId, body: ast::BlockId, span: Span, dest: Option<&Place>) {
         let p = self.p;
         self.scopes.push(Vec::new());
         let item_ty = self.ck.pat_ty(pat);
@@ -1084,7 +1132,14 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         self.scopes.push(Vec::new());
         self.bind_pat(pat, Place::local(item));
-        self.loops.push(LoopInfo { break_bb: exit, continue_bb: head, dest: None, depth: self.scopes.len() - 1 });
+        self.loops.push(LoopInfo {
+            break_bb: exit,
+            continue_bb: head,
+            dest: None,
+            depth: self.scopes.len() - 1,
+            label: label.map(|l| l.name),
+            is_block: false,
+        });
         self.block_into(body, None);
         self.loops.pop();
         self.pop_scope(span);
@@ -1149,6 +1204,32 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// A usize local holding a constant, for slice pattern indexes.
+    fn const_usize(&mut self, v: u64, span: Span) -> Local {
+        let t = self.temp(USIZE);
+        self.assign(Place::local(t), Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), span);
+        t
+    }
+
+    /// The index local for an element `back` positions from the end of a
+    /// slice or array place.
+    fn slice_back_index(&mut self, place: &Place, back: u64, arr_len: Option<u64>, span: Span) -> Local {
+        match arr_len {
+            Some(n) => self.const_usize(n - back, span),
+            None => {
+                let len = self.temp(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
+                let idx = self.temp(USIZE);
+                self.assign(
+                    Place::local(idx),
+                    Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(back, IntTy::Usize))),
+                    span,
+                );
+                idx
+            }
+        }
+    }
+
     /// Emits tests for `pat` against `place`. Falls through on a match; jumps to `fail` otherwise.
     fn test_pat(&mut self, pat: PatId, place: Place, fail: Bb) {
         let p = self.p;
@@ -1185,15 +1266,41 @@ impl<'p, 'a> Lower<'p, 'a> {
                     branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(place), lit));
                 }
             }
-            Pat::Range { lo, hi, .. } => {
-                // The parser only builds two-bound ranges today.
+            Pat::Range { lo, hi, inclusive } => {
                 if let Some(lo) = lo {
                     let a = self.lit_operand(*lo, ty);
                     branch(self, Rvalue::Bin(BinOp::Ge, Operand::Copy(place.clone()), a));
                 }
                 if let Some(hi) = hi {
                     let b = self.lit_operand(*hi, ty);
-                    branch(self, Rvalue::Bin(BinOp::Le, Operand::Copy(place), b));
+                    let op = if *inclusive { BinOp::Le } else { BinOp::Lt };
+                    branch(self, Rvalue::Bin(op, Operand::Copy(place), b));
+                }
+            }
+            Pat::Slice { prefix, middle, suffix } => {
+                let fixed = (prefix.len() + suffix.len()) as u64;
+                let arr_len = match self.kind(ty) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => Some(n as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if arr_len.is_none() {
+                    // A slice place needs a runtime length test.
+                    let len = self.temp(USIZE);
+                    self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
+                    let op = if middle.is_some() { BinOp::Ge } else { BinOp::Eq };
+                    branch(self, Rvalue::Bin(op, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(fixed, IntTy::Usize))));
+                }
+                for (i, &sub) in prefix.iter().enumerate() {
+                    let idx = self.const_usize(i as u64, span);
+                    self.test_pat(sub, place.project(Proj::Index(idx)), fail);
+                }
+                for (j, &sub) in suffix.iter().enumerate() {
+                    let back = (suffix.len() - j) as u64;
+                    let idx = self.slice_back_index(&place, back, arr_len, span);
+                    self.test_pat(sub, place.project(Proj::Index(idx)), fail);
                 }
             }
             Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
@@ -1236,8 +1343,10 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Pat::Rest => {}
             Pat::Paren(inner) => self.test_pat(*inner, place, fail),
+            Pat::At { inner, .. } => self.test_pat(*inner, place, fail),
+            Pat::Ref { inner, .. } => self.test_pat(*inner, place.deref(), fail),
             // AST v2 pattern forms the parser still rejects.
-            Pat::Slice { .. } | Pat::Ref { .. } | Pat::At { .. } | Pat::QPath { .. } | Pat::MacroCall(_) => {}
+            Pat::Slice { .. } | Pat::QPath { .. } | Pat::MacroCall(_) => {}
         }
     }
 
@@ -1297,6 +1406,107 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             (Pat::Paren(inner), _) => self.bind_pat(*inner, place),
+            (Pat::Slice { prefix, middle, suffix }, _) => {
+                let ty = self.ck.pat_ty(pat);
+                let (elem, arr_len) = match self.kind(ty) {
+                    TyKind::Array(e, c) => {
+                        let n = match self.body.tys.const_kind(c) {
+                            ConstKind::Int(n) => Some(n as u64),
+                            _ => None,
+                        };
+                        (e, n)
+                    }
+                    TyKind::Slice(e) => (e, None),
+                    _ => (ERROR, None),
+                };
+                for (i, &sub) in prefix.iter().enumerate() {
+                    let idx = self.const_usize(i as u64, span);
+                    self.bind_pat(sub, place.project(Proj::Index(idx)));
+                }
+                for (j, &sub) in suffix.iter().enumerate() {
+                    let back = (suffix.len() - j) as u64;
+                    let idx = self.slice_back_index(&place, back, arr_len, span);
+                    self.bind_pat(sub, place.project(Proj::Index(idx)));
+                }
+                if let Some(mid) = middle {
+                    match p.ast.pat(*mid) {
+                        Pat::Rest | Pat::Wild => {}
+                        Pat::Binding { .. } => {
+                            let mid_ty = self.ck.pat_ty(*mid);
+                            if let (Some(n), TyKind::Array(..)) = (arr_len, self.kind(mid_ty)) {
+                                // An owned middle of an array is a smaller array
+                                // built from the element places.
+                                let mut ops = Vec::new();
+                                for i in prefix.len() as u64..(n - suffix.len() as u64) {
+                                    let idx = self.const_usize(i, span);
+                                    ops.push(self.operand_from(place.project(Proj::Index(idx)), elem));
+                                }
+                                let t = self.temp(mid_ty);
+                                self.assign(Place::local(t), Rvalue::ArrayAgg(mid_ty, ops), span);
+                                self.bind_pat(*mid, Place::local(t));
+                            } else {
+                                // A reference middle is a subslice fat value.
+                                let lo = self.const_usize(prefix.len() as u64, span);
+                                let hi = match arr_len {
+                                    Some(n) => Operand::Const(Const::Int(n - suffix.len() as u64, IntTy::Usize)),
+                                    None => {
+                                        let len = self.temp(USIZE);
+                                        self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
+                                        let t = self.temp(USIZE);
+                                        self.assign(
+                                            Place::local(t),
+                                            Rvalue::Bin(
+                                                BinOp::Sub,
+                                                Operand::Copy(Place::local(len)),
+                                                Operand::Const(Const::Int(suffix.len() as u64, IntTy::Usize)),
+                                            ),
+                                            span,
+                                        );
+                                        Operand::Copy(Place::local(t))
+                                    }
+                                };
+                                let mode = match self.ck.pat_res(*mid) {
+                                    PatRes::Binding { mode, .. } => mode,
+                                    _ => BindMode::Move,
+                                };
+                                let mutable = mode == BindMode::Ref(true);
+                                let slice = self.body.tys.intern(TyKind::Slice(elem));
+                                let t = self.temp(slice);
+                                self.assign(
+                                    Place::local(t),
+                                    Rvalue::Subslice {
+                                        base: place,
+                                        lo: Operand::Copy(Place::local(lo)),
+                                        hi: Some(hi),
+                                        inclusive: false,
+                                        mutable,
+                                    },
+                                    span,
+                                );
+                                self.bind_pat(*mid, Place::local(t));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (Pat::Ref { inner, .. }, _) => self.bind_pat(*inner, place.deref()),
+            (Pat::At { inner, .. }, PatRes::Binding { local, mode }) => {
+                // Subpattern bindings first: copying Copy fields out leaves the
+                // whole value movable for the `@` binding, as in Rust. A
+                // moving subpattern then makes the whole move an error.
+                self.bind_pat(*inner, place.clone());
+                let info = &self.ck.locals[local as usize];
+                let (ty, m, name) = (info.ty, info.mutable, p.name(info.name).to_string());
+                let l = self.new_local(ty, m, Some(name));
+                self.local_map[local as usize] = l;
+                let rv = match mode {
+                    BindMode::Move => Rvalue::Use(self.operand_from(place.clone(), self.ck.pat_ty(pat))),
+                    BindMode::Ref(m) => Rvalue::Ref(m, place.clone()),
+                };
+                self.assign(Place::local(l), rv, span);
+                self.scopes.last_mut().unwrap().push(l);
+            }
             _ => {}
         }
     }

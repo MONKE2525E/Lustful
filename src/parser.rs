@@ -1664,9 +1664,10 @@ impl<'a> Parser<'a> {
                 stmts.push(Stmt::Let { pat, ty, init, els: None, attrs: stmt_attrs.attrs, span: s.to(self.prev_span()) });
                 continue;
             }
-            let block_like = matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
+            let labeled = matches!(self.peek(), Tok::Lifetime(_)) && self.peek_at(1) == Tok::Colon;
+            let block_like = labeled || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
             let expr = if block_like {
-                let e = self.block_like_expr()?;
+                let e = if labeled { self.expr()? } else { self.block_like_expr()? };
                 // Allow method calls on a block-like expression, as rustc does.
                 if self.peek() == Tok::Dot || self.peek() == Tok::Question {
                     let e = self.postfix(e)?;
@@ -1711,6 +1712,16 @@ impl<'a> Parser<'a> {
         Ok(self.push_pat(Pat::Or(alts), start.to(self.prev_span())))
     }
 
+    /// True when the token `n` ahead can start a pattern literal.
+    fn at_literal_start_at(&self, n: usize) -> bool {
+        matches!(self.peek_at(n), Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False)
+    }
+
+    /// True when the next token can start a pattern literal.
+    fn at_literal_start(&self) -> bool {
+        matches!(self.peek(), Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False)
+    }
+
     fn pattern_one(&mut self) -> PResult<PatId> {
         let start = self.span();
         let pat = match self.peek() {
@@ -1722,23 +1733,43 @@ impl<'a> Parser<'a> {
                 let by_ref = self.eat(Tok::Ref);
                 let mutable = self.eat(Tok::Mut);
                 let (name, _) = self.ident()?;
-                if self.peek() == Tok::At {
-                    return Err(self.reject(C_CORE, "`@` bindings in patterns"));
+                if self.eat(Tok::At) {
+                    let inner = self.pattern_one()?;
+                    Pat::At { name, mutable, by_ref, inner }
+                } else {
+                    Pat::Binding { name, mutable, by_ref }
                 }
-                Pat::Binding { name, mutable, by_ref }
             }
             Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
                     let hi = self.literal_expr()?;
                     Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: true }
-                } else if self.peek() == Tok::DotDot {
-                    return Err(self.reject(C_CORE, "half-open range patterns"));
+                } else if self.eat(Tok::DotDot) {
+                    if self.at_literal_start() {
+                        let hi = self.literal_expr()?;
+                        Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: false }
+                    } else {
+                        Pat::Range { lo: Some(lo), hi: None, inclusive: false }
+                    }
                 } else {
                     Pat::Lit(lo)
                 }
             }
-            Tok::DotDot | Tok::DotDotEq => return Err(not_yet(C_CORE, start, "half-open range patterns")),
+            Tok::DotDot => {
+                self.bump();
+                if self.at_literal_start() {
+                    let hi = self.literal_expr()?;
+                    Pat::Range { lo: None, hi: Some(hi), inclusive: false }
+                } else {
+                    Pat::Rest
+                }
+            }
+            Tok::DotDotEq => {
+                self.bump();
+                let hi = self.literal_expr()?;
+                Pat::Range { lo: None, hi: Some(hi), inclusive: true }
+            }
             Tok::Float(_) | Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "float and byte literals")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
@@ -1748,65 +1779,71 @@ impl<'a> Parser<'a> {
             Tok::Ident(_) | Tok::SelfUpper => {
                 let path = self.path(false)?;
                 if self.peek() == Tok::At {
-                    return Err(self.reject(C_CORE, "`@` bindings in patterns"));
-                }
-                match self.peek() {
-                    Tok::LParen => {
-                        self.bump();
-                        let mut elems = Vec::new();
-                        while self.peek() != Tok::RParen {
-                            if self.peek() == Tok::DotDot {
-                                let s = self.span();
-                                self.bump();
-                                elems.push(self.push_pat(Pat::Rest, s));
-                            } else {
-                                elems.push(self.pattern()?);
+                    if path.len() != 1 || path[0].has_args() {
+                        return Err(syntax(start, "expected a binding name before `@`"));
+                    }
+                    self.bump();
+                    let inner = self.pattern_one()?;
+                    Pat::At { name: path[0].name, mutable: false, by_ref: false, inner }
+                } else {
+                    match self.peek() {
+                        Tok::LParen => {
+                            self.bump();
+                            let mut elems = Vec::new();
+                            while self.peek() != Tok::RParen {
+                                if self.peek() == Tok::DotDot {
+                                    let s = self.span();
+                                    self.bump();
+                                    elems.push(self.push_pat(Pat::Rest, s));
+                                } else {
+                                    elems.push(self.pattern()?);
+                                }
+                                if !self.eat(Tok::Comma) {
+                                    break;
+                                }
                             }
-                            if !self.eat(Tok::Comma) {
-                                break;
-                            }
+                            self.expect(Tok::RParen, "`)`")?;
+                            Pat::TupleStruct { path, elems }
                         }
-                        self.expect(Tok::RParen, "`)`")?;
-                        Pat::TupleStruct { path, elems }
-                    }
-                    Tok::LBrace => {
-                        self.bump();
-                        let mut fields = Vec::new();
-                        let mut rest = false;
-                        while self.peek() != Tok::RBrace {
-                            if self.eat(Tok::DotDot) {
-                                rest = true;
-                                break;
+                        Tok::LBrace => {
+                            self.bump();
+                            let mut fields = Vec::new();
+                            let mut rest = false;
+                            while self.peek() != Tok::RBrace {
+                                if self.eat(Tok::DotDot) {
+                                    rest = true;
+                                    break;
+                                }
+                                let fstart = self.span();
+                                if matches!(self.peek(), Tok::Int(..)) {
+                                    return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
+                                }
+                                let _fattrs = self.part_attributes()?;
+                                let by_ref = self.eat(Tok::Ref);
+                                let mutable = self.eat(Tok::Mut);
+                                let (fname, fspan) = self.ident()?;
+                                let p = if self.eat(Tok::At) {
+                                    let inner = self.pattern_one()?;
+                                    self.push_pat(Pat::At { name: fname, mutable, by_ref, inner }, fstart.to(self.prev_span()))
+                                } else if !by_ref && !mutable && self.eat(Tok::Colon) {
+                                    self.pattern()?
+                                } else {
+                                    self.push_pat(Pat::Binding { name: fname, mutable, by_ref }, fstart.to(fspan))
+                                };
+                                fields.push((fname, p));
+                                if !self.eat(Tok::Comma) {
+                                    break;
+                                }
                             }
-                            let fstart = self.span();
-                            if matches!(self.peek(), Tok::Int(..)) {
-                                return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
-                            }
-                            let _fattrs = self.part_attributes()?;
-                            let by_ref = self.eat(Tok::Ref);
-                            let mutable = self.eat(Tok::Mut);
-                            let (fname, fspan) = self.ident()?;
-                            if self.peek() == Tok::At {
-                                return Err(self.reject(C_CORE, "`@` bindings in patterns"));
-                            }
-                            let p = if !by_ref && !mutable && self.eat(Tok::Colon) {
-                                self.pattern()?
-                            } else {
-                                self.push_pat(Pat::Binding { name: fname, mutable, by_ref }, fstart.to(fspan))
-                            };
-                            fields.push((fname, p));
-                            if !self.eat(Tok::Comma) {
-                                break;
-                            }
+                            self.expect(Tok::RBrace, "`}`")?;
+                            Pat::Struct { path, fields, rest }
                         }
-                        self.expect(Tok::RBrace, "`}`")?;
-                        Pat::Struct { path, fields, rest }
+                        _ if path.len() == 1 => {
+                            // A lone identifier is a binding. Unit variants need a path such as `Kind::C`.
+                            Pat::Binding { name: path[0].name, mutable: false, by_ref: false }
+                        }
+                        _ => Pat::Path(path),
                     }
-                    _ if path.len() == 1 => {
-                        // A lone identifier is a binding. Unit variants need a path such as `Kind::C`.
-                        Pat::Binding { name: path[0].name, mutable: false, by_ref: false }
-                    }
-                    _ => Pat::Path(path),
                 }
             }
             Tok::LParen => {
@@ -1832,8 +1869,62 @@ impl<'a> Parser<'a> {
                 }
                 Pat::Tuple(elems)
             }
-            Tok::LBracket => return Err(not_yet(C_CORE, start, "slice patterns")),
-            Tok::Amp | Tok::AndAnd => return Err(not_yet(C_CORE, start, "reference patterns")),
+            Tok::LBracket => {
+                self.bump();
+                let mut prefix: Vec<PatId> = Vec::new();
+                let mut middle: Option<PatId> = None;
+                let mut suffix: Vec<PatId> = Vec::new();
+                let mut seen_rest = false;
+                while self.peek() != Tok::RBracket {
+                    if self.peek() == Tok::DotDot && !self.at_literal_start_at(1) {
+                        let s = self.span();
+                        self.bump();
+                        if seen_rest {
+                            return Err(syntax(s, "multiple `..` in a slice pattern"));
+                        }
+                        seen_rest = true;
+                        middle = Some(self.push_pat(Pat::Rest, s));
+                    } else {
+                        let e = self.pattern()?;
+                        // `rest @ ..` binds the middle slice itself.
+                        let at_rest = match self.ast.pat(e) {
+                            Pat::At { name, mutable, by_ref, inner } if matches!(self.ast.pat(*inner), Pat::Rest) => {
+                                Some((*name, *mutable, *by_ref))
+                            }
+                            _ => None,
+                        };
+                        if let Some((name, mutable, by_ref)) = at_rest {
+                            if seen_rest {
+                                return Err(syntax(start, "multiple `..` in a slice pattern"));
+                            }
+                            seen_rest = true;
+                            let espan = self.ast.pat_span(e);
+                            middle = Some(self.push_pat(Pat::Binding { name, mutable, by_ref }, espan));
+                        } else if seen_rest {
+                            suffix.push(e);
+                        } else {
+                            prefix.push(e);
+                        }
+                    }
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::RBracket, "`]`")?;
+                Pat::Slice { prefix, middle, suffix }
+            }
+            Tok::Amp | Tok::AndAnd => {
+                let double = self.bump().tok == Tok::AndAnd;
+                let mutable = self.eat(Tok::Mut);
+                let inner = self.pattern_one()?;
+                let mut pat = Pat::Ref { mutable, inner };
+                if double {
+                    let s = start.to(self.prev_span());
+                    let inner_id = self.push_pat(pat, s);
+                    pat = Pat::Ref { mutable: false, inner: inner_id };
+                }
+                pat
+            }
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected a pattern, found {}", tok_name(t)))),
         };
@@ -2130,22 +2221,29 @@ impl<'a> Parser<'a> {
     }
 
     fn block_like_expr(&mut self) -> PResult<ExprId> {
+        self.block_like_labeled(None)
+    }
+
+    fn block_like_labeled(&mut self, label: Option<Label>) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
-            Tok::LBrace => Expr::Block(self.block()?),
+            Tok::LBrace => match label {
+                Some(label) => Expr::LabeledBlock { label, body: self.block()? },
+                None => Expr::Block(self.block()?),
+            },
             Tok::If => return self.if_expr(),
             Tok::While => {
                 self.bump();
                 if self.eat(Tok::Let) {
-                    return self.while_let(start);
+                    return self.while_let(start, label);
                 }
                 let cond = self.expr_ctx(true)?;
                 let body = self.block()?;
-                Expr::While { label: None, cond, body }
+                Expr::While { label, cond, body }
             }
             Tok::Loop => {
                 self.bump();
-                Expr::Loop { label: None, body: self.block()? }
+                Expr::Loop { label, body: self.block()? }
             }
             Tok::For => {
                 self.bump();
@@ -2153,7 +2251,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::In, "`in`")?;
                 let iter = self.expr_ctx(true)?;
                 let body = self.block()?;
-                Expr::For { label: None, pat, iter, body }
+                Expr::For { label, pat, iter, body }
             }
             Tok::Match => {
                 self.bump();
@@ -2175,6 +2273,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::RBrace, "`}`")?;
                 Expr::Match { scrut, arms }
             }
+            _ if label.is_some() => return Err(syntax(start, "expected a loop or a block after the label")),
             _ => unreachable!(),
         };
         Ok(self.push_expr(e, start.to(self.prev_span())))
@@ -2228,7 +2327,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `while let P = e { body }` becomes `loop { match e { P => { body } _ => break } }`.
-    fn while_let(&mut self, start: Span) -> PResult<ExprId> {
+    fn while_let(&mut self, start: Span, label: Option<Label>) -> PResult<ExprId> {
         let pat = self.pattern()?;
         self.expect(Tok::Eq, "`=`")?;
         let scrut = self.expr_ctx(true)?;
@@ -2241,7 +2340,7 @@ impl<'a> Parser<'a> {
             vec![Arm { attrs: Vec::new(), pat, guard: None, body: body_e }, Arm { attrs: Vec::new(), pat: wild, guard: None, body: brk }];
         let m = self.push_expr(Expr::Match { scrut, arms }, span);
         let block = self.push_block(Block { stmts: vec![Stmt::Expr { expr: m, semi: true }], tail: None, span });
-        Ok(self.push_expr(Expr::Loop { label: None, body: block }, span))
+        Ok(self.push_expr(Expr::Loop { label, body: block }, span))
     }
 
     fn primary(&mut self, no_struct: bool) -> PResult<ExprId> {
@@ -2322,25 +2421,31 @@ impl<'a> Parser<'a> {
             Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace => return self.block_like_expr(),
             Tok::Break => {
                 self.bump();
-                if matches!(self.peek(), Tok::Lifetime(_)) {
-                    return Err(self.reject(C_CORE, "labels"));
-                }
-                let val = if self.can_start_expr() { Some(self.expr()?) } else { None };
-                Expr::Break { label: None, value: val }
+                let label = self.break_label();
+                let val = if label.is_some() || self.can_start_expr() {
+                    if self.can_start_expr() { Some(self.expr()?) } else { None }
+                } else {
+                    None
+                };
+                Expr::Break { label, value: val }
             }
             Tok::Continue => {
                 self.bump();
-                if matches!(self.peek(), Tok::Lifetime(_)) {
-                    return Err(self.reject(C_CORE, "labels"));
-                }
-                Expr::Continue(None)
+                let label = self.break_label();
+                Expr::Continue(label)
             }
             Tok::Return => {
                 self.bump();
                 let val = if self.can_start_expr() { Some(self.expr()?) } else { None };
                 Expr::Return(val)
             }
-            Tok::Lifetime(_) => return Err(not_yet(C_CORE, start, "labels")),
+            Tok::Lifetime(name) => {
+                let span = self.span();
+                self.bump();
+                self.expect(Tok::Colon, "`:` after a label")?;
+                let label = Label { name, span };
+                return self.block_like_labeled(Some(label));
+            }
             Tok::Pipe | Tok::OrOr | Tok::Move => return Err(not_yet(C_CORE, start, "closures")),
             Tok::Unsafe => return Err(unsafe_error(start)),
             Tok::Async => return Err(async_error(start)),
@@ -2370,6 +2475,18 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(e, start.to(self.prev_span())))
     }
 
+    /// An optional label after `break` or `continue` (no colon follows it there).
+    fn break_label(&mut self) -> Option<Label> {
+        match self.peek() {
+            Tok::Lifetime(name) => {
+                let span = self.span();
+                self.bump();
+                Some(Label { name, span })
+            }
+            _ => None,
+        }
+    }
+
     fn can_start_expr(&self) -> bool {
         !matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::RParen | Tok::Comma | Tok::RBracket | Tok::Eof)
     }
@@ -2377,9 +2494,12 @@ impl<'a> Parser<'a> {
     fn struct_lit(&mut self, path: Vec<PathSeg>, start: Span) -> PResult<ExprId> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
+        let mut update = None;
         while self.peek() != Tok::RBrace {
             if self.peek() == Tok::DotDot {
-                return Err(self.reject(C_CORE, "struct update syntax"));
+                self.bump();
+                update = Some(self.expr()?);
+                break;
             }
             let (name, span) = self.ident()?;
             let value = if self.eat(Tok::Colon) {
@@ -2394,7 +2514,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(self.push_expr(Expr::StructLit { path, fields, update: None }, start.to(self.prev_span())))
+        Ok(self.push_expr(Expr::StructLit { path, fields, update }, start.to(self.prev_span())))
     }
 
     fn macro_call(&mut self) -> PResult<ExprId> {

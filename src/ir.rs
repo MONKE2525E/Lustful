@@ -114,6 +114,8 @@ pub enum Rvalue {
         /// True when the slice place is used mutably (`&mut a[..]`, a write).
         mutable: bool,
     },
+    /// The element count of an array, slice, or Vec place (W-CORELANG, wave A).
+    LenOf(Place),
 }
 
 #[derive(Clone, Debug)]

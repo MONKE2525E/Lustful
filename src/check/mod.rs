@@ -220,7 +220,11 @@ struct Var {
 
 struct LoopCtx {
     break_ty: Option<Ty>,
+    /// True when `break` may carry a value (a `loop` or a labeled block).
     is_loop: bool,
+    /// True for a labeled block, which `continue` cannot target.
+    is_block: bool,
+    label: Option<Sym>,
 }
 
 struct Ctx<'p, 'a> {
@@ -311,6 +315,11 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
+/// The name of an optional AST label.
+fn label_of(label: &Option<ast::Label>) -> Option<Sym> {
+    label.map(|l| l.name)
+}
+
 /// Maps written tuple pattern elements to field indexes. At most one `..`
 /// may appear; elements after it count from the end. None on an arity
 /// mismatch or a second `..`. Lowering uses the same mapping.
@@ -873,26 +882,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            Expr::While { cond, body, .. } => {
+            Expr::While { label, cond, body } => {
                 self.expect_expr(*cond, BOOL);
-                self.loops.push(LoopCtx { break_ty: None, is_loop: false });
+                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 self.loops.pop();
                 UNIT
             }
-            Expr::Loop { body, .. } => {
-                self.loops.push(LoopCtx { break_ty: None, is_loop: true });
+            Expr::Loop { label, body } => {
+                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 let l = self.loops.pop().unwrap();
                 l.break_ty.unwrap_or(NEVER)
             }
-            Expr::For { pat, iter, body, .. } => {
+            Expr::For { label, pat, iter, body } => {
                 let item = self.for_iter(*iter);
                 let scope = self.scopes.len();
                 self.pattern(*pat, item, false);
-                self.loops.push(LoopCtx { break_ty: None, is_loop: false });
+                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 self.loops.pop();
@@ -1140,22 +1149,40 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld: 0, rd });
                 UNIT
             }
-            Expr::StructLit { path, fields, .. } => self.struct_lit(e, path, fields, span),
+            Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span),
             Expr::Range { .. } => {
                 self.errs.push(unsupported(span, "ranges outside `for` loops"));
                 ERROR
             }
-            Expr::Break { value: val, .. } => {
-                let Some(lp) = self.loops.last() else {
-                    self.err("L0120", span, "`break` outside of a loop", "Remove the break, or put it inside a loop.");
+            Expr::Break { label, value: val } => {
+                let target = match label {
+                    None => self.loops.len().checked_sub(1),
+                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)),
+                };
+                let Some(ti) = target else {
+                    match label {
+                        Some(l) => {
+                            let n = self.name(l.name).to_string();
+                            self.err("L0120", span, format!("cannot find label `'{n}` in this scope"), "Check the label name.");
+                        }
+                        None => self.err("L0120", span, "`break` outside of a loop", "Remove the break, or put it inside a loop."),
+                    }
+                    if let Some(v) = val {
+                        self.expr(*v, None);
+                    }
                     return NEVER;
                 };
-                let is_loop = lp.is_loop;
-                let prev = lp.break_ty;
+                let is_loop = self.loops[ti].is_loop;
+                let prev = self.loops[ti].break_ty;
                 match val {
                     Some(v) if !is_loop => {
                         self.expr(*v, None);
-                        self.err("L0120", span, "`break` with a value is only allowed in `loop`", "Remove the value, or use `loop`.");
+                        self.err(
+                            "L0120",
+                            span,
+                            "`break` with a value is only allowed in `loop` and labeled blocks",
+                            "Remove the value, or use `loop`.",
+                        );
                     }
                     Some(v) => {
                         let t = self.expr(*v, prev);
@@ -1163,22 +1190,36 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             Some(pt) => {
                                 self.coerce_expr(*v, t, pt);
                             }
-                            None => self.loops.last_mut().unwrap().break_ty = Some(t),
+                            None => self.loops[ti].break_ty = Some(t),
                         }
                     }
                     None if is_loop => match prev {
                         Some(pt) => {
                             self.coerce_at(UNIT, pt, span, None);
                         }
-                        None => self.loops.last_mut().unwrap().break_ty = Some(UNIT),
+                        None => self.loops[ti].break_ty = Some(UNIT),
                     },
                     None => {}
                 }
                 NEVER
             }
-            Expr::Continue(_) => {
-                if self.loops.is_empty() {
-                    self.err("L0120", span, "`continue` outside of a loop", "Remove the continue, or put it inside a loop.");
+            Expr::Continue(label) => {
+                let found = match label {
+                    None => self.loops.iter().rposition(|lp| !lp.is_block),
+                    Some(l) => self.loops.iter().rposition(|lp| lp.label == Some(l.name)),
+                };
+                match found {
+                    None => match label {
+                        Some(l) => {
+                            let n = self.name(l.name).to_string();
+                            self.err("L0120", span, format!("cannot find label `'{n}` in this scope"), "Check the label name.");
+                        }
+                        None => self.err("L0120", span, "`continue` outside of a loop", "Remove the continue, or put it inside a loop."),
+                    },
+                    Some(ti) if self.loops[ti].is_block => {
+                        self.err("L0120", span, "`continue` cannot target a labeled block", "`continue` needs a loop label.");
+                    }
+                    Some(_) => {}
                 }
                 NEVER
             }
@@ -1193,6 +1234,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
                 NEVER
+            }
+            Expr::LabeledBlock { label, body } => {
+                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: true, label: Some(label.name) });
+                let t = self.block(*body, expected);
+                let l = self.loops.pop().unwrap();
+                match l.break_ty {
+                    Some(bt) => self.join(bt, t, None, span),
+                    None => t,
+                }
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_expr(e, *kind, args, fmt, *repeat, span, expected),
             Expr::Tuple(elems) => {
@@ -1297,7 +1347,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
-            | Expr::LabeledBlock { .. }
             | Expr::Let { .. }
             | Expr::QPath { .. }
             | Expr::ConstBlock(_)
@@ -2105,7 +2154,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         result
     }
 
-    fn struct_lit(&mut self, e: ExprId, path: &[ast::PathSeg], fields: &[(Sym, Span, ExprId)], span: Span) -> Ty {
+    fn struct_lit(&mut self, e: ExprId, path: &[ast::PathSeg], fields: &[(Sym, Span, ExprId)], update: Option<ExprId>, span: Span) -> Ty {
         let p = self.p;
         let target = if path.len() == 1 {
             let n = path[0].name;
@@ -2120,6 +2169,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let Some((a, v)) = target else {
             for &(_, _, fe) in fields {
                 self.expr(fe, None);
+            }
+            if let Some(u) = update {
+                self.expr(u, None);
             }
             self.err("L0102", span, "unknown struct", "Check the struct name.");
             return ERROR;
@@ -2146,6 +2198,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
         }
+        // Struct update: the fields not written come from the base value.
+        if let Some(u) = update {
+            if p.adt(a).is_enum {
+                self.expr(u, None);
+                self.err("L0110", span, "functional record update syntax requires a struct", "Set every field of the variant.");
+                return ERROR;
+            }
+            let at = self.tys.adt_ty(a);
+            self.expect_expr(u, at);
+            return at;
+        }
         let missing: Vec<String> =
             variant.fields.iter().zip(&seen).filter(|(_, s)| !**s).map(|(f, _)| self.name(f.name).to_string()).collect();
         if !missing.is_empty() {
@@ -2153,7 +2216,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "L0107",
                 span,
                 format!("missing fields: {}", missing.join(", ")),
-                "Set every field. Struct update syntax is not supported yet.",
+                "Set every field, or fill the rest from another value with `..base`.",
             );
         }
         self.tys.adt_ty(a)
@@ -2325,6 +2388,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
     // ---------- Patterns ----------
 
     /// Checks a pattern against a value of type `t`. Applies default binding modes.
+    /// Records one pattern binding with the local type its mode gives it.
+    fn bind_pattern_local(&mut self, pi: usize, name: Sym, mutable: bool, by_ref: bool, t: Ty, mode: BindMode, span: Span) {
+        let mode = if by_ref { BindMode::Ref(mutable) } else { mode };
+        let lty = match mode {
+            BindMode::Move => t,
+            BindMode::Ref(m) => self.tys.mk_ref(m, t),
+        };
+        let mutable_local = mutable && !by_ref;
+        if mutable_local && mode != BindMode::Move {
+            self.err(
+                "L0122",
+                span,
+                "`mut` binding under a reference is not allowed here",
+                "Remove `mut`, or match on the value instead of a reference.",
+            );
+        }
+        let l = self.add_local(name, lty, mutable_local, span);
+        self.out.pat_res[pi] = PatRes::Binding { local: l, mode };
+    }
+
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
         self.pattern_mode(pat, t, BindMode::Move, in_match);
     }
@@ -2340,7 +2423,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let structural = opt.is_some()
             || matches!(
                 p.ast.pat(pat),
-                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(_) | Pat::Lit(_) | Pat::Range { .. } | Pat::Tuple(_)
+                Pat::TupleStruct { .. }
+                    | Pat::Struct { .. }
+                    | Pat::Path(_)
+                    | Pat::Lit(_)
+                    | Pat::Range { .. }
+                    | Pat::Tuple(_)
+                    | Pat::Slice { .. }
             );
         if structural {
             let mut derefs = 0;
@@ -2375,23 +2464,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match p.ast.pat(pat) {
             Pat::Wild => {}
             Pat::Binding { name, mutable, by_ref } => {
-                let mode = if *by_ref { BindMode::Ref(*mutable) } else { mode };
-                let lty = match mode {
-                    BindMode::Move => t,
-                    BindMode::Ref(m) => self.tys.mk_ref(m, t),
-                };
-                let mutable_local = *mutable && !*by_ref;
-                if mutable_local && mode != BindMode::Move {
-                    self.err(
-                        "L0122",
-                        span,
-                        "`mut` binding under a reference is not allowed here",
-                        "Remove `mut`, or match on the value instead of a reference.",
-                    );
-                }
-                let l = self.add_local(*name, lty, mutable_local, span);
-                self.out.pat_res[pi] = PatRes::Binding { local: l, mode };
+                self.bind_pattern_local(pi, *name, *mutable, *by_ref, t, mode, span);
             }
+            Pat::At { name, mutable, by_ref, inner } => {
+                self.bind_pattern_local(pi, *name, *mutable, *by_ref, t, mode, span);
+                self.pattern_mode(*inner, t, mode, in_match);
+            }
+            Pat::Ref { mutable, inner } => match self.kind(t) {
+                TyKind::Ref(_, m, inner_ty) => {
+                    if *mutable && !m.is_mut() {
+                        self.err(
+                            "L0110",
+                            span,
+                            "pattern requires `&mut`, but the matched type is a shared reference",
+                            "Use `&` in the pattern, or match on a `&mut` value.",
+                        );
+                    }
+                    // An explicit `&` resets the default binding mode inside it.
+                    self.pattern_mode(*inner, inner_ty, BindMode::Move, in_match);
+                }
+                TyKind::Error => self.pattern_mode(*inner, ERROR, mode, in_match),
+                _ => {
+                    let tn = self.tn(t);
+                    self.err(
+                        "L0110",
+                        span,
+                        format!("reference pattern cannot match a value of type `{tn}`"),
+                        "Match on a reference, or remove the `&`.",
+                    );
+                    self.pattern_mode(*inner, ERROR, mode, in_match);
+                }
+            },
             Pat::Lit(l) => {
                 let lt = self.expr(*l, Some(t));
                 if !self.unify(lt, t) {
@@ -2584,11 +2687,98 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            // A bare `..` only appears inside tuple forms, which map it away.
-            Pat::Rest => {}
+            // A bare `..` only appears inside tuple and slice forms, which map
+            // it away before recursing; anywhere else it is a syntax error.
+            Pat::Rest => {
+                self.err("L0110", span, "`..` can only be used in tuple and slice patterns", "Remove the `..`.");
+            }
+            Pat::Slice { prefix, middle, suffix } => {
+                let (elem, arr_len) = match self.kind(t) {
+                    TyKind::Array(elem, c) => {
+                        let n = match self.tys.const_kind(c) {
+                            ConstKind::Int(n) => Some(n as u64),
+                            _ => None,
+                        };
+                        (elem, n)
+                    }
+                    TyKind::Slice(elem) => (elem, None),
+                    TyKind::Error => {
+                        for &sub in prefix.iter().chain(suffix.iter()) {
+                            self.pattern_mode(sub, ERROR, mode, in_match);
+                        }
+                        if let Some(mid) = middle {
+                            if !matches!(p.ast.pat(*mid), Pat::Rest) {
+                                self.pattern_mode(*mid, ERROR, mode, in_match);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        let tn = self.tn(t);
+                        self.err(
+                            "L0110",
+                            span,
+                            format!("slice pattern cannot match a value of type `{tn}`"),
+                            "Match on an array or a slice, for example `&value[..]`.",
+                        );
+                        for &sub in prefix.iter().chain(suffix.iter()) {
+                            self.pattern_mode(sub, ERROR, mode, in_match);
+                        }
+                        return;
+                    }
+                };
+                let fixed = (prefix.len() + suffix.len()) as u64;
+                if let Some(n) = arr_len {
+                    let bad = if middle.is_some() { fixed > n } else { fixed != n };
+                    if bad {
+                        self.err(
+                            "L0110",
+                            span,
+                            format!("pattern requires {fixed} element(s) but the array has {n}"),
+                            "Change the pattern length, or skip the middle with `..`.",
+                        );
+                        return;
+                    }
+                }
+                for &sub in prefix.iter().chain(suffix.iter()) {
+                    self.pattern_mode(sub, elem, mode, in_match);
+                }
+                if let Some(mid) = middle {
+                    match p.ast.pat(*mid) {
+                        Pat::Rest | Pat::Wild => {}
+                        Pat::Binding { by_ref: true, .. } => {
+                            let st = self.tys.intern(TyKind::Slice(elem));
+                            self.pattern_mode(*mid, st, mode, in_match);
+                        }
+                        Pat::Binding { .. } => match (mode, arr_len) {
+                            (BindMode::Move, Some(n)) => {
+                                let c = self.tys.intern_const(ConstKind::Int((n - fixed) as u128));
+                                let at = self.tys.intern(TyKind::Array(elem, c));
+                                self.pattern_mode(*mid, at, BindMode::Move, in_match);
+                            }
+                            (BindMode::Move, None) => {
+                                self.err(
+                                    "L0110",
+                                    span,
+                                    "cannot bind the middle of a slice pattern by value",
+                                    "Match on a reference, or use `ref` for the binding.",
+                                );
+                            }
+                            (BindMode::Ref(_), _) => {
+                                let st = self.tys.intern(TyKind::Slice(elem));
+                                self.pattern_mode(*mid, st, mode, in_match);
+                            }
+                        },
+                        _ => {
+                            let st = self.tys.intern(TyKind::Slice(elem));
+                            self.pattern_mode(*mid, st, mode, in_match);
+                        }
+                    }
+                }
+            }
             Pat::Paren(inner) => self.pattern_mode(*inner, t, mode, in_match),
             // AST v2 pattern forms the parser still rejects.
-            Pat::Slice { .. } | Pat::Ref { .. } | Pat::At { .. } | Pat::QPath { .. } | Pat::MacroCall(_) => {}
+            Pat::QPath { .. } | Pat::MacroCall(_) => {}
         }
     }
 
@@ -2631,8 +2821,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.err("L0115", span, msg, "Add arms for the missing cases, or add a `_ => ...` arm.");
     }
 
+    /// Follows `@`, parenthesized, and reference wrappers to the pattern they
+    /// wrap. For exhaustiveness only: a reference wrapper adds no condition.
+    fn pat_unwrap(&self, mut pat: PatId) -> PatId {
+        loop {
+            match self.p.ast.pat(pat) {
+                Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => pat = *inner,
+                _ => return pat,
+            }
+        }
+    }
+
     fn pres(&self, pat: PatId) -> PatRes {
-        self.out.pat_res[(pat.0 - self.out.pat_base) as usize]
+        // An `@` or parenthesized wrapper takes the resolution of what it wraps
+        // for exhaustiveness, when the wrapped pattern has a variant or
+        // Option resolution of its own.
+        let own = self.out.pat_res[(pat.0 - self.out.pat_base) as usize];
+        match self.p.ast.pat(pat) {
+            Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => match self.pres(*inner) {
+                r @ (PatRes::Variant(..) | PatRes::Opt(_)) => r,
+                _ => own,
+            },
+            _ => own,
+        }
     }
 
     fn flatten_or(&self, pat: PatId, out: &mut Vec<PatId>) {
@@ -2656,7 +2867,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let none = flat.iter().any(|&y| matches!(self.pres(y), PatRes::Opt(false)));
                     let somes: Vec<PatId> = flat
                         .iter()
-                        .filter_map(|&y| match (self.pres(y), p.ast.pat(y)) {
+                        .filter_map(|&y| match (self.pres(y), p.ast.pat(self.pat_unwrap(y))) {
                             (PatRes::Opt(true), Pat::TupleStruct { elems, .. }) => Some(elems[0]),
                             _ => None,
                         })
@@ -2689,7 +2900,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             .filter(|&&y| matches!(self.pres(y), PatRes::Variant(b, w) if b == a && w == v))
             .map(|&y| {
                 let mut row = vec![None; nf];
-                match p.ast.pat(y) {
+                match p.ast.pat(self.pat_unwrap(y)) {
                     Pat::TupleStruct { elems, .. } => elems.iter().enumerate().for_each(|(i, &e)| row[i] = Some(e)),
                     Pat::Struct { fields, .. } => {
                         for &(fname, sub) in fields {
@@ -2736,6 +2947,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Pat::Path(_) => matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum),
             Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
+            Pat::Ref { inner, .. } => self.irrefutable(*inner),
+            Pat::At { inner, .. } => self.irrefutable(*inner),
+            Pat::Slice { prefix, suffix, .. } => {
+                let t = self.out.pat_ty[(pat.0 - self.out.pat_base) as usize];
+                let arr_ok = match self.kind(t) {
+                    TyKind::Array(_, c) => match self.tys.const_kind(c) {
+                        ConstKind::Int(n) => (prefix.len() + suffix.len()) as u128 <= n,
+                        _ => false,
+                    },
+                    _ => prefix.is_empty() && suffix.is_empty(),
+                };
+                arr_ok && prefix.iter().chain(suffix.iter()).all(|&s| self.irrefutable(s))
+            }
             Pat::Paren(inner) => self.irrefutable(*inner),
             Pat::Rest => true,
             _ => false,
