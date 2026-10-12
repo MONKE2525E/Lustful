@@ -1061,63 +1061,13 @@ impl FnGen<'_, '_, '_> {
         }
     }
 
-    /// Builds one enum or Option value. Most shapes are one compound
-    /// literal that designates a single union member (the variant
-    /// struct, whose first member is the explicit tag when there is
-    /// one). A niche-filled enum's non-niche variants need statements:
-    /// zero fill, store the fields, then store the niche tag value.
-    /// Field stores come first so they cannot clobber the niche scalar.
+    /// Builds one enum or Option value as one compound literal that
+    /// designates a single union member: the variant struct, which
+    /// carries the explicit tag or the niche scalar as a member of
+    /// its own, so tag and fields are set by the same designator.
+    /// The same forms serve as constant initializers in `const_init`.
     fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
-        let ct = ctype(t);
-        let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
-        match c_layout(self.p, t) {
-            None => match t {
-                CTy::Option(_) => {
-                    if vals.is_empty() {
-                        format!("(({ct}){{ .tag = 0 }})")
-                    } else {
-                        format!("(({ct}){{ .tag = 1, .v = {} }})", vals[0])
-                    }
-                }
-                _ => {
-                    if fields.is_empty() {
-                        format!("(({ct}){{ .tag = {variant} }})")
-                    } else {
-                        format!("(({ct}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
-                    }
-                }
-            },
-            Some(l) => match l.enum_tag {
-                Some(EnumTag::Explicit { size, signed }) => {
-                    let mut init = format!("._tag = {}", disc_lit(adt_discs(self.p, t)[variant], size, signed));
-                    if !fields.is_empty() {
-                        init.push_str(", ");
-                        init.push_str(&fields.join(", "));
-                    }
-                    format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
-                }
-                Some(EnumTag::NicheFilled { variant: niche_variant, .. }) if variant != niche_variant => {
-                    let tmp = self.tmp();
-                    let _ = writeln!(self.out, "    {ct} {tmp} = {};", zero_lit(self.p, t));
-                    for (i, v) in vals.iter().enumerate() {
-                        let f = variant_field(self.p, t, &tmp, variant, i);
-                        let _ = writeln!(self.out, "    {f} = {v};");
-                    }
-                    let set = disc_set(self.p, t, &tmp, variant);
-                    if !set.is_empty() {
-                        let _ = writeln!(self.out, "    {set}");
-                    }
-                    tmp
-                }
-                _ => {
-                    if fields.is_empty() {
-                        zero_lit(self.p, t)
-                    } else {
-                        format!("(({ct}){{ .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
-                    }
-                }
-            },
-        }
+        variant_lit(self.p, t, variant, vals)
     }
 
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
@@ -2267,6 +2217,61 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     c
 }
 
+/// One enum or Option value as a compound literal from its field value
+/// texts, in field order. Shared by function codegen (`make_variant`)
+/// and constant initializers (`const_init`), whose file-scope globals
+/// need the same single-designator forms.
+fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String {
+    let ct = ctype(t);
+    let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
+    match c_layout(p, t) {
+        None => match t {
+            CTy::Option(_) => {
+                if vals.is_empty() {
+                    format!("(({ct}){{ .tag = 0 }})")
+                } else {
+                    format!("(({ct}){{ .tag = 1, .v = {} }})", vals[0])
+                }
+            }
+            _ => {
+                if fields.is_empty() {
+                    format!("(({ct}){{ .tag = {variant} }})")
+                } else {
+                    format!("(({ct}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
+                }
+            }
+        },
+        Some(l) => match l.enum_tag {
+            Some(EnumTag::Explicit { size, signed }) => {
+                let mut init = format!("._tag = {}", disc_lit(adt_discs(p, t)[variant], size, signed));
+                if !fields.is_empty() {
+                    init.push_str(", ");
+                    init.push_str(&fields.join(", "));
+                }
+                format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
+            }
+            Some(EnumTag::NicheFilled { variant: niche_variant, niche }) if variant != niche_variant => {
+                // The variant struct carries the niche scalar as its
+                // own `_s` member, so one literal sets tag and fields.
+                let k = (0..variant).filter(|&i| i != niche_variant).count() as u128;
+                let mut init = format!("._s = {}ULL", niche.start + k);
+                if !fields.is_empty() {
+                    init.push_str(", ");
+                    init.push_str(&fields.join(", "));
+                }
+                format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
+            }
+            _ => {
+                if fields.is_empty() {
+                    zero_lit(p, t)
+                } else {
+                    format!("(({ct}){{ .u = {{ .v{variant} = {{ {} }} }} }})", fields.join(", "))
+                }
+            }
+        },
+    }
+}
+
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
 fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32) -> String {
@@ -2279,7 +2284,9 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
     use crate::ty::consteval::ConstValue as CV;
     match (v, t) {
         (CV::Int(i), CTy::Int(it)) => {
-            if *i < 0 {
+            if is128(*it) {
+                format!("(({}){{{}ULL, {}ULL}})", int_c(*it), *i as u128 as u64, (*i as u128 >> 64) as u64)
+            } else if *i < 0 {
                 format!("(({})((int64_t){i}))", int_c(*it))
             } else {
                 format!("(({})((uint64_t){}ull))", int_c(*it), *i as u128)
@@ -2297,7 +2304,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let sct = cty(&p.tys, st.ty);
             match sct {
                 CTy::Array(_, n) => format!("(({}){{ lust_static_{idx}.v, {n} }})", ctype(t)),
-                _ => format!("(({}){{0}})", ctype(t)),
+                _ => zero_lit(p, t),
             }
         }
         (CV::StaticRef(idx), _) => format!("(&lust_static_{idx})"),
@@ -2312,7 +2319,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                     let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
                     format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
                 }
-                _ => format!("(({}){{0}})", ctype(t)),
+                _ => zero_lit(p, t),
             }
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
@@ -2324,7 +2331,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Aggregate(vals), CTy::Tuple(es)) => {
             if vals.is_empty() {
-                format!("(({}){{0}})", ctype(t))
+                zero_lit(p, t)
             } else {
                 let parts: Vec<String> =
                     vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter))).collect();
@@ -2333,7 +2340,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Aggregate(vals), CTy::Array(e, _)) => {
             if vals.is_empty() {
-                format!("(({}){{0}})", ctype(t))
+                zero_lit(p, t)
             } else {
                 let parts: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
@@ -2341,7 +2348,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Repeat(x, n), CTy::Array(e, _)) => {
             if *n == 0 {
-                format!("(({}){{0}})", ctype(t))
+                zero_lit(p, t)
             } else {
                 let one = const_init(p, x, e, pre, counter);
                 let parts: Vec<String> = (0..*n).map(|_| one.clone()).collect();
@@ -2351,7 +2358,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Aggregate(vals), CTy::Adt(a)) => {
             let adt = p.adt(*a);
             if vals.is_empty() {
-                format!("((A{}){{0}})", a.0)
+                zero_lit(p, t)
             } else {
                 let parts: Vec<String> = vals
                     .iter()
@@ -2363,69 +2370,16 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Variant(variant, vals), CTy::Adt(a)) => {
             let adt = p.adt(*a);
-            let v = *variant as usize;
-            let parts: Vec<String> = vals
+            let inits: Vec<String> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[v].fields[i].ty), pre, counter)))
+                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter))
                 .collect();
-            match c_layout(p, t) {
-                Some(l) => match l.enum_tag {
-                    Some(EnumTag::Explicit { size, signed }) => {
-                        let mut init = format!("._tag = {}", disc_lit(adt_discs(p, t)[v], size, signed));
-                        if !parts.is_empty() {
-                            init.push_str(", ");
-                            init.push_str(&parts.join(", "));
-                        }
-                        format!("(({}){{ .u = {{ .v{v} = {{ {init} }} }} }})", ctype(t))
-                    }
-                    _ => {
-                        if parts.is_empty() {
-                            format!("(({}){{0}})", ctype(t))
-                        } else {
-                            format!("(({}){{ .u = {{ .v{v} = {{ {} }} }} }})", ctype(t), parts.join(", "))
-                        }
-                    }
-                },
-                None => {
-                    if vals.is_empty() {
-                        format!("((A{}){{ .tag = {variant} }})", a.0)
-                    } else {
-                        format!("((A{}){{ .tag = {variant}, .u = {{ .v{variant} = {{ {} }} }} }})", a.0, parts.join(", "))
-                    }
-                }
-            }
+            variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Option(e)) => {
-            let ct = ctype(t);
-            let parts: Vec<String> =
-                vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, e, pre, counter))).collect();
-            match c_layout(p, t) {
-                Some(l) => match l.enum_tag {
-                    Some(EnumTag::Explicit { size, signed }) => {
-                        let mut init = format!("._tag = {}", disc_lit(*variant as i128, size, signed));
-                        if !parts.is_empty() {
-                            init.push_str(", ");
-                            init.push_str(&parts.join(", "));
-                        }
-                        format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
-                    }
-                    _ => {
-                        if parts.is_empty() {
-                            format!("(({ct}){{0}})")
-                        } else {
-                            format!("(({ct}){{ .u = {{ .v{variant} = {{ {} }} }} }})", parts.join(", "))
-                        }
-                    }
-                },
-                None => {
-                    if *variant == 1 && !vals.is_empty() {
-                        format!("(({ct}){{ .tag = 1, .v = {} }})", const_init(p, &vals[0], e, pre, counter))
-                    } else {
-                        format!("(({ct}){{ .tag = 0 }})")
-                    }
-                }
-            }
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+            variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), vals.len() as u64);
@@ -2435,7 +2389,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
             format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
         }
-        _ => format!("(({}){{0}})", ctype(t)),
+        _ => zero_lit(p, t),
     }
 }
 
@@ -2582,13 +2536,26 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
         Some(EnumTag::Explicit { size, signed }) => Some((size, signed)),
         _ => None,
     };
+    // A niche tag scalar also appears as a member of every non-niche
+    // variant struct (whose fields avoid its bytes by construction),
+    // for the same single-designator reason.
+    let niche = match l.enum_tag {
+        Some(EnumTag::NicheFilled { variant, niche }) => Some((variant, niche)),
+        _ => None,
+    };
     for (vi, v) in variants.iter().enumerate() {
-        if v.is_empty() && explicit.is_none() {
+        let has_synth = explicit.is_some() || niche.is_some_and(|(nv, _)| vi != nv);
+        if v.is_empty() && !has_synth {
             continue;
         }
         let mut fields: Vec<(String, Layout, u64)> = Vec::new();
         if let Some((size, signed)) = explicit {
             fields.push((format!("{} _tag", tag_c_type(size, signed)), plain_layout(size, size), 0));
+        }
+        if let Some((nv, n)) = niche
+            && vi != nv
+        {
+            fields.push((format!("{} _s", tag_c_type(n.scalar_size, false)), plain_layout(n.scalar_size, n.scalar_size), n.offset));
         }
         fields
             .extend(v.iter().enumerate().map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi])));
