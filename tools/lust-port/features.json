@@ -1,0 +1,1257 @@
+{
+ "schema_version": 1,
+ "description": "Maps raw scanner keys (from the syn visitor in src/analyze.rs) to lust feature status. The orchestrator updates status and milestone as lust grows. A later `lust capabilities --json` can feed this file: use --capabilities <file> with the same {features:[{id,status,milestone}]} shape to override entries by id. Patterns are globs: * matches any text, all other characters are literal. First matching feature in file order wins for a raw key, so specific rules come before general ones. primary_keys select which raw keys create a finding; keys select which raw keys block a file in the coverage curve.",
+ "milestones": [
+  {
+   "n": 0,
+   "label": "supported today",
+   "inventory_step": null
+  },
+  {
+   "n": 4,
+   "label": "The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
+   "inventory_step": "1/2/0"
+  },
+  {
+   "n": 5,
+   "label": "Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+   "inventory_step": "3/4/5/6"
+  },
+  {
+   "n": 6,
+   "label": "Lifetimes ('static and '_ first, then lifetime params on user types)",
+   "inventory_step": "7a/7b"
+  },
+  {
+   "n": 7,
+   "label": "Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
+   "inventory_step": "8/9/10"
+  },
+  {
+   "n": 8,
+   "label": "Port ts-rust (checked rewrites, small async state machine for ATA)",
+   "inventory_step": "0"
+  }
+ ],
+ "features": [
+  {
+   "id": "supported.baseline",
+   "title": "Supported baseline (elided refs, core derives, doc/test attrs)",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": null,
+   "root_cause": "supported",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Keys here are accepted by lust today and never block a file.",
+   "primary_keys": [],
+   "keys": [
+    "lt.ref.elided",
+    "lt.ref_pos.*.elided",
+    "attr.derive",
+    "attr.test",
+    "attr.doc",
+    "cfg.test",
+    "derive.Clone",
+    "derive.Debug",
+    "derive.PartialEq",
+    "derive.Copy",
+    "derive.Eq",
+    "derive.Hash",
+    "macro.println",
+    "macro.print",
+    "macro.eprintln",
+    "macro.eprint",
+    "macro.format",
+    "macro.vec",
+    "macro.panic",
+    "macro.assert",
+    "macro.assert_eq",
+    "macro.assert_ne",
+    "macro.todo",
+    "macro.unreachable",
+    "macro.std::println",
+    "macro.std::format",
+    "macro.std::vec",
+    "macro.std::panic"
+   ]
+  },
+  {
+   "id": "macros.user",
+   "title": "User macro_rules! definitions and calls",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "0",
+   "root_cause": "macros",
+   "fix_class": "compiler",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "PLAN milestone 4 adds native macro_rules!. Until then a codemod can expand calls; expansion keeps the same machine code.",
+   "primary_keys": [
+    "macro.user_call",
+    "item.macro_rules"
+   ],
+   "keys": [
+    "macro.user_call",
+    "macro.user_call.*",
+    "item.macro_rules"
+   ]
+  },
+  {
+   "id": "modules.path_attr",
+   "title": "#[path] module attribute",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "0",
+   "root_cause": "modules",
+   "fix_class": "mechanical",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "The scan follows #[path]. Lust modules arrive in milestone 4; a file move is release-safe.",
+   "primary_keys": [
+    "item.mod.path_attr"
+   ],
+   "keys": [
+    "item.mod.path_attr"
+   ]
+  },
+  {
+   "id": "async.await",
+   "title": "async fn, async blocks and .await",
+   "status": "unsupported",
+   "milestone": 8,
+   "inventory_step": "0",
+   "root_cause": "async",
+   "fix_class": "manual",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "No general async executor is planned. Milestone 8b allows a small state machine for ATA in ts-rust.",
+   "primary_keys": [
+    "expr.await",
+    "expr.async",
+    "fn.async",
+    "closure.async"
+   ],
+   "keys": [
+    "expr.await",
+    "expr.async",
+    "fn.async",
+    "closure.async"
+   ]
+  },
+  {
+   "id": "traits.impl_trait_arg",
+   "title": "impl Trait in argument position",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "0",
+   "root_cause": "traits-generics",
+   "fix_class": "mechanical",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "Rewrite to a named type parameter. Same machine code.",
+   "primary_keys": [
+    "type.impl_trait.arg"
+   ],
+   "keys": [
+    "type.impl_trait.arg",
+    "impl_trait.arg*"
+   ]
+  },
+  {
+   "id": "generics.const_param",
+   "title": "Const generic parameters and const type arguments",
+   "status": "unsupported",
+   "milestone": 8,
+   "inventory_step": "0",
+   "root_cause": "traits-generics",
+   "fix_class": "mechanical",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "Not a compiler milestone in PLAN.md. Milestone 8 closes it by a checked rewrite: specialize the few functions by hand (3 in ts-rust).",
+   "primary_keys": [
+    "gen.const_param*",
+    "type.const_arg"
+   ],
+   "keys": [
+    "gen.const_param*",
+    "type.const_arg"
+   ]
+  },
+  {
+   "id": "lifetimes.hrtb",
+   "title": "Explicit for<'a> higher-ranked binders",
+   "status": "unsupported",
+   "milestone": 6,
+   "inventory_step": "0",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "Rank-one binders are part of milestone 6. Rare explicit cases can often drop the binder.",
+   "primary_keys": [
+    "lt.hrtb.*"
+   ],
+   "keys": [
+    "lt.hrtb.*"
+   ]
+  },
+  {
+   "id": "closures.hrtb_bounds",
+   "title": "Implicit higher-ranked Fn(&T) bounds",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "4",
+   "root_cause": "closures",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Fn(&T) sugar makes a for<'a> bound. Covered by general closures in milestone 5.",
+   "primary_keys": [
+    "lt.implicit_hrtb"
+   ],
+   "keys": [
+    "lt.implicit_hrtb",
+    "lt.implicit_hrtb.*"
+   ]
+  },
+  {
+   "id": "threads.send_sync_bounds",
+   "title": "Send and Sync bounds",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "8",
+   "root_cause": "threads-sync",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Auto traits arrive with threads in milestone 7.",
+   "primary_keys": [
+    "bound.std::marker::Send",
+    "bound.std::marker::Sync",
+    "dyn.std::marker::Send",
+    "dyn.std::marker::Sync"
+   ],
+   "keys": [
+    "bound.std::marker::Send",
+    "bound.std::marker::Sync",
+    "dyn.std::marker::Send",
+    "dyn.std::marker::Sync"
+   ]
+  },
+  {
+   "id": "core.drop_impl",
+   "title": "impl Drop",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Drop is in milestone 4, earlier than other trait impls.",
+   "primary_keys": [
+    "impl.trait.std::ops::Drop"
+   ],
+   "keys": [
+    "impl.trait.std::ops::Drop"
+   ]
+  },
+  {
+   "id": "lifetimes.static_anon",
+   "title": "'static and '_ lifetimes, std lifetime carriers",
+   "status": "unsupported",
+   "milestone": 6,
+   "inventory_step": "7a",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "Cheapest big win in PLAN.md: no region inference is needed. '_ in fn signatures can also be deleted by codemod; impl headers cannot.",
+   "primary_keys": [
+    "lt.ref.static",
+    "lt.ref.anon",
+    "lt.path_arg.static",
+    "lt.path_arg.anon",
+    "bound.static",
+    "dyn.lifetime_static",
+    "sig.ret_static"
+   ],
+   "keys": [
+    "lt.ref.static",
+    "lt.ref.anon",
+    "lt.ref_pos.*.static",
+    "lt.ref_pos.*.anon",
+    "lt.path_arg.static",
+    "lt.path_arg.anon",
+    "lt.static_ref_to*",
+    "lt.anon_ref_to*",
+    "lt.field.ref_static",
+    "lt.field.static_lifetime",
+    "sig.anon_lifetime_use",
+    "sig.static_lifetime_use",
+    "sig.ret_static",
+    "bound.static",
+    "dyn.lifetime_static",
+    "lt.carrier.Formatter",
+    "lt.carrier.Cow",
+    "lt.carrier.MutexGuard",
+    "lt.carrier.Arguments",
+    "lt.carrier.Ref",
+    "lt.carrier.RefMut",
+    "lt.carrier.Chars",
+    "lt.carrier.Iter",
+    "lt.carrier.IterMut",
+    "lt.carrier.Location",
+    "lt.carrier.RwLockReadGuard",
+    "lt.carrier.RwLockWriteGuard",
+    "lt.carrier.Scope",
+    "lt.carrier.ScopedJoinHandle",
+    "lt.carrier.Context",
+    "lt.carrier.PanicHookInfo",
+    "lt.carrier.Split",
+    "lt.carrier.Lines",
+    "lt.carrier.CharIndices",
+    "lt.carrier.Drain",
+    "lt.carrier.Entry",
+    "lt.carrier.Values",
+    "lt.carrier.Keys",
+    "lt.carrier.Peekable",
+    "lt.carrier.Bytes",
+    "lt.carrier.Components",
+    "lt.carrier.PhantomData",
+    "lt.carrier.LocalKey",
+    "lt.carrier.Finder"
+   ]
+  },
+  {
+   "id": "lifetimes.named",
+   "title": "Named lifetimes, lifetime params on user types, reference fields",
+   "status": "unsupported",
+   "milestone": 6,
+   "inventory_step": "7b",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Restricted Rust lifetime model in milestone 6. Codemods that change data structures slow the release binary, so do not use them.",
+   "primary_keys": [
+    "lt.ref.named",
+    "lt.path_arg.named",
+    "item.struct.lifetime",
+    "item.enum.lifetime",
+    "impl.lifetime_params",
+    "lt.field.ref",
+    "lt.field.ref_nested",
+    "sig.lifetime_params"
+   ],
+   "keys": [
+    "lt.*",
+    "sig.lifetime_params",
+    "sig.named_lifetime_use",
+    "sig.mentions_lt_type",
+    "sig.ret_named*",
+    "gen.lifetime_param*",
+    "impl.lifetime_params",
+    "item.struct.lifetime",
+    "item.enum.lifetime",
+    "trait.lifetime",
+    "bound.lifetime",
+    "bound.lifetime_outlives",
+    "dyn.lifetime*"
+   ]
+  },
+  {
+   "id": "std.lazy_once_lock",
+   "title": "LazyLock and OnceLock statics",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Part of the milestone 5 std runtime, not threads.",
+   "primary_keys": [
+    "std.type.std::sync::LazyLock",
+    "std.type.std::sync::OnceLock",
+    "std.expr.std::sync::LazyLock*",
+    "std.expr.std::sync::OnceLock*"
+   ],
+   "keys": [
+    "std.type.std::sync::LazyLock*",
+    "std.type.std::sync::OnceLock*",
+    "std.expr.std::sync::LazyLock*",
+    "std.expr.std::sync::OnceLock*"
+   ]
+  },
+  {
+   "id": "panic.recovery",
+   "title": "Panic recovery (catch_unwind, resume_unwind, panic hooks)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "9",
+   "root_cause": "panic",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "Lust aborts on panic today. Milestone 7 adds unwinding with drops.",
+   "primary_keys": [
+    "std.expr.std::panic::*",
+    "std.type.std::panic::*",
+    "std.expr.std::thread::panicking*"
+   ],
+   "keys": [
+    "std.type.std::panic::*",
+    "std.expr.std::panic::*",
+    "std.expr.std::thread::panicking*"
+   ]
+  },
+  {
+   "id": "threads.sync",
+   "title": "Threads and synchronization (Arc, Mutex, atomics, mpsc, thread_local!)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "8",
+   "root_cause": "threads-sync",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Real threads are required; a one-thread rewrite slows the shipped binary.",
+   "primary_keys": [
+    "std.type.std::sync::*",
+    "std.type.std::thread::*",
+    "macro.thread_local"
+   ],
+   "keys": [
+    "std.type.std::sync::*",
+    "std.expr.std::sync::*",
+    "std.type.std::thread::*",
+    "std.expr.std::thread::*",
+    "macro.thread_local",
+    "closure.arg_of.spawn",
+    "closure.arg_of.spawn_scoped",
+    "method.lock"
+   ]
+  },
+  {
+   "id": "cinterop.system",
+   "title": "C interop and system crates (rustix, nix, signal-hook, jemalloc, zlib, local time)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "c-interop",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Cached rustc-built C ABI shims in milestone 7. See dependencies.json for the per-crate decision.",
+   "primary_keys": [
+    "item.foreign_mod",
+    "fn.extern_abi",
+    "type.raw_ptr",
+    "attr.global_allocator",
+    "expr.unsafe"
+   ],
+   "keys": [
+    "ext.type.rustix::*",
+    "ext.expr.rustix::*",
+    "ext.use.rustix::*",
+    "ext.type.nix::*",
+    "ext.expr.nix::*",
+    "ext.use.nix::*",
+    "ext.type.signal_hook::*",
+    "ext.expr.signal_hook::*",
+    "ext.use.signal_hook::*",
+    "ext.type.tikv_jemallocator::*",
+    "ext.expr.tikv_jemallocator::*",
+    "ext.use.tikv_jemallocator::*",
+    "ext.type.tikv_jemalloc_ctl::*",
+    "ext.expr.tikv_jemalloc_ctl::*",
+    "ext.use.tikv_jemalloc_ctl::*",
+    "ext.type.flate2::*",
+    "ext.expr.flate2::*",
+    "ext.use.flate2::*",
+    "ext.type.jiff::*",
+    "ext.expr.jiff::*",
+    "ext.use.jiff::*",
+    "ext.type.lzma_rust2::*",
+    "ext.expr.lzma_rust2::*",
+    "ext.use.lzma_rust2::*",
+    "ext.type.name_to_handle_at::*",
+    "ext.expr.name_to_handle_at::*",
+    "ext.use.name_to_handle_at::*",
+    "ext.type.notify::*",
+    "ext.expr.notify::*",
+    "ext.use.notify::*",
+    "ext.type.miow::*",
+    "ext.expr.miow::*",
+    "ext.use.miow::*",
+    "ext.type.same_file::*",
+    "ext.expr.same_file::*",
+    "ext.use.same_file::*",
+    "ext.type.unicode_normalization::*",
+    "ext.expr.unicode_normalization::*",
+    "ext.use.unicode_normalization::*",
+    "ext.type.libc::*",
+    "ext.expr.libc::*",
+    "ext.use.libc::*",
+    "item.foreign_mod",
+    "fn.extern_abi",
+    "type.raw_ptr",
+    "attr.global_allocator",
+    "expr.unsafe",
+    "attr.unsafe*"
+   ]
+  },
+  {
+   "id": "attrs.cfg",
+   "title": "Attributes and cfg (cfg, cfg_attr, cfg!, inline, repr, must_use, allow)",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "2",
+   "root_cause": "attrs-cfg",
+   "fix_class": "compiler",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "Most attributes only need parse and ignore. cfg must be evaluated. The scanner evaluates cfg for the scan target where it can.",
+   "primary_keys": [
+    "attr.cfg",
+    "attr.cfg_attr",
+    "attr.repr",
+    "macro.cfg"
+   ],
+   "keys": [
+    "attr.*",
+    "cfg.*",
+    "inline.*",
+    "repr.*",
+    "must_use.*",
+    "allow.*",
+    "expect.*",
+    "warn.*",
+    "deny.*",
+    "cfg_attr.*",
+    "macro.cfg"
+   ]
+  },
+  {
+   "id": "dyn.any",
+   "title": "dyn Any and downcast",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "6",
+   "root_cause": "dyn-trait",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Needs type ids in vtables. Part of dyn Trait in milestone 5.",
+   "primary_keys": [
+    "dyn.std::any::Any",
+    "method.downcast_ref",
+    "method.downcast",
+    "method.downcast_mut"
+   ],
+   "keys": [
+    "dyn.std::any::Any",
+    "method.downcast_ref",
+    "method.downcast",
+    "method.downcast_mut",
+    "std.expr.std::any::*",
+    "std.type.std::any::*"
+   ]
+  },
+  {
+   "id": "dyn.trait",
+   "title": "dyn Trait objects and impl Trait returns",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "6",
+   "root_cause": "dyn-trait",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Vtables for Box, Rc, Arc, & and &mut dyn in milestone 5. impl Trait returns need the same work or a manual redesign today.",
+   "primary_keys": [
+    "type.dyn",
+    "type.impl_trait.ret",
+    "type.impl_trait.other"
+   ],
+   "keys": [
+    "type.dyn",
+    "dyn.*",
+    "dyn_in.*",
+    "type.impl_trait.ret",
+    "type.impl_trait.other",
+    "impl_trait.ret*"
+   ]
+  },
+  {
+   "id": "std.rc_refcell",
+   "title": "Rc, Weak, RefCell, Cell, OnceCell and Cow",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 5 std runtime. Rewriting to other data structures would slow the release binary.",
+   "primary_keys": [
+    "std.type.std::rc::*",
+    "std.type.std::cell::*",
+    "std.type.std::borrow::Cow"
+   ],
+   "keys": [
+    "std.type.std::rc::*",
+    "std.expr.std::rc::*",
+    "std.type.std::cell::*",
+    "std.expr.std::cell::*",
+    "std.type.std::borrow::*",
+    "std.expr.std::borrow::*",
+    "nest.*",
+    "method.borrow",
+    "method.borrow_mut",
+    "method.upgrade",
+    "fn.receiver.typed*"
+   ]
+  },
+  {
+   "id": "ext.builtin_crates",
+   "title": "Built-in dependency layer (FxHashMap, IndexMap, SmallVec, memchr, xxh3, ryu-js, BigInt, leak arena)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Compiler adapters bind to the resolved package and version. Iteration order must match where output depends on it. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.rustc_hash::*",
+    "ext.type.indexmap::*",
+    "ext.type.smallvec::*",
+    "ext.type.memchr::*",
+    "ext.type.xxhash_rust::*",
+    "ext.type.bumpalo::*",
+    "ext.type.num_bigint::*",
+    "ext.type.ryu_js::*"
+   ],
+   "keys": [
+    "ext.type.rustc_hash::*",
+    "ext.expr.rustc_hash::*",
+    "ext.use.rustc_hash::*",
+    "ext.type.indexmap::*",
+    "ext.expr.indexmap::*",
+    "ext.use.indexmap::*",
+    "ext.type.smallvec::*",
+    "ext.expr.smallvec::*",
+    "ext.use.smallvec::*",
+    "ext.type.memchr::*",
+    "ext.expr.memchr::*",
+    "ext.use.memchr::*",
+    "ext.type.xxhash_rust::*",
+    "ext.expr.xxhash_rust::*",
+    "ext.use.xxhash_rust::*",
+    "ext.type.bumpalo::*",
+    "ext.expr.bumpalo::*",
+    "ext.use.bumpalo::*",
+    "ext.type.num_bigint::*",
+    "ext.expr.num_bigint::*",
+    "ext.use.num_bigint::*",
+    "ext.type.num_traits::*",
+    "ext.expr.num_traits::*",
+    "ext.use.num_traits::*",
+    "ext.type.ryu_js::*",
+    "ext.expr.ryu_js::*",
+    "ext.use.ryu_js::*",
+    "macro.smallvec::smallvec",
+    "macro.smallvec"
+   ]
+  },
+  {
+   "id": "std.runtime",
+   "title": "Wider std runtime (collections, time, hash, ptr, fmt traits, pin, ffi, os)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 5. Some paths here only need trait support from the same milestone.",
+   "primary_keys": [
+    "std.type.std::time::*",
+    "std.type.std::collections::VecDeque",
+    "std.type.std::collections::BTreeMap",
+    "std.type.std::collections::BTreeSet"
+   ],
+   "keys": [
+    "std.type.std::collections::VecDeque*",
+    "std.expr.std::collections::VecDeque*",
+    "std.type.std::collections::BTreeMap*",
+    "std.expr.std::collections::BTreeMap*",
+    "std.type.std::collections::BTreeSet*",
+    "std.expr.std::collections::BTreeSet*",
+    "std.type.std::time::*",
+    "std.expr.std::time::*",
+    "std.type.std::marker::*",
+    "std.expr.std::marker::*",
+    "std.type.std::hash::*",
+    "std.expr.std::hash::*",
+    "std.type.std::ptr::*",
+    "std.expr.std::ptr::*",
+    "std.type.std::ops::*",
+    "std.expr.std::ops::*",
+    "std.type.std::fmt::*",
+    "std.expr.std::fmt::*",
+    "std.type.std::iter::*",
+    "std.expr.std::iter::*",
+    "std.type.std::task::*",
+    "std.expr.std::task::*",
+    "std.type.std::future::*",
+    "std.expr.std::future::*",
+    "std.type.std::pin::*",
+    "std.expr.std::pin::*",
+    "std.type.std::os::*",
+    "std.expr.std::os::*",
+    "std.type.std::ffi::*",
+    "std.expr.std::ffi::*",
+    "std.type.std::backtrace::*",
+    "std.expr.std::backtrace::*",
+    "std.type.std::hint::*",
+    "std.expr.std::hint::*",
+    "std.type.std::alloc::*",
+    "std.expr.std::alloc::*",
+    "std.type.std::array::*",
+    "std.expr.std::array::*",
+    "std.type.std::clone::*",
+    "std.expr.std::clone::*",
+    "std.type.std::convert::*",
+    "std.expr.std::convert::*",
+    "std.type.std::default::*",
+    "std.expr.std::default::*",
+    "macro.std::mem::offset_of",
+    "macro.std::pin::pin",
+    "macro.offset_of",
+    "macro.pin"
+   ]
+  },
+  {
+   "id": "closures.general",
+   "title": "General closures, fn pointers and fn-valued fields",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "4",
+   "root_cause": "closures",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Stored, moved, passed to user fns, Rc<dyn Fn>. The fused adapters are only a first part.",
+   "primary_keys": [
+    "closure",
+    "type.fn_ptr",
+    "field.fn_value"
+   ],
+   "keys": [
+    "closure",
+    "closure.*",
+    "fn_item.*",
+    "type.fn_ptr",
+    "type.fn_sugar",
+    "field.fn_value",
+    "expr.call.field_fn",
+    "expr.call.other_callee"
+   ]
+  },
+  {
+   "id": "iterators.chains",
+   "title": "Iterator chains, adapters, collect and for over method calls",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "4",
+   "root_cause": "iterators",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Beyond s.chars(). Fused chains with unfused fallback in milestone 5.",
+   "primary_keys": [
+    "iter.chain"
+   ],
+   "keys": [
+    "iter.chain",
+    "iter.chain.*",
+    "collect.*",
+    "for.over.method.*"
+   ]
+  },
+  {
+   "id": "traits.gat",
+   "title": "Generic associated types",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": "3",
+   "root_cause": "traits-generics",
+   "fix_class": "manual",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "GATs are explicitly out of PLAN.md (What we will not do).",
+   "primary_keys": [
+    "impl.gat",
+    "trait.gat"
+   ],
+   "keys": [
+    "impl.gat",
+    "trait.gat"
+   ]
+  },
+  {
+   "id": "traits.generics",
+   "title": "User traits, trait impls, generics, bounds and associated types",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "3",
+   "root_cause": "traits-generics",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Monomorphized generics, associated types and consts, deterministic impl index in milestone 5. Blanket impls are counted here.",
+   "primary_keys": [
+    "item.trait",
+    "item.impl.trait",
+    "fn.generic",
+    "fn.generic_method",
+    "impl.blanket"
+   ],
+   "keys": [
+    "item.trait",
+    "trait.*",
+    "item.impl.trait",
+    "impl.*",
+    "gen.type_param*",
+    "gen.where*",
+    "fn.generic",
+    "fn.generic_method",
+    "fn.kind.trait_impl",
+    "fn.kind.trait_default",
+    "item.struct.generic",
+    "item.enum.generic",
+    "item.type_alias.generic",
+    "bound.*",
+    "type.assoc_projection",
+    "type.qself_projection",
+    "type.assoc_type_binding",
+    "expr.generic_assoc_call",
+    "expr.qself_path"
+   ]
+  },
+  {
+   "id": "modules.imports",
+   "title": "Modules, glob imports and re-exports",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "modules",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust has no modules today. Milestone 4 adds modules with globs and re-exports.",
+   "primary_keys": [
+    "item.mod.file",
+    "item.mod.inline",
+    "use.glob.*",
+    "use.reexport"
+   ],
+   "keys": [
+    "item.mod.*",
+    "use.glob*",
+    "use.glob_path.*",
+    "use.reexport",
+    "use.rename",
+    "use.underscore",
+    "use.group"
+   ]
+  },
+  {
+   "id": "core.items",
+   "title": "const, static, const fn, type aliases, tuple structs, explicit discriminants, nested fns",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4 core items.",
+   "primary_keys": [
+    "item.const.*",
+    "item.static",
+    "item.type_alias",
+    "item.struct.tuple",
+    "enum.discriminant",
+    "fn.kind.nested",
+    "fn.const"
+   ],
+   "keys": [
+    "item.const*",
+    "const.type*",
+    "item.static*",
+    "static.type*",
+    "item.type_alias",
+    "item.struct.tuple",
+    "item.struct.int_newtype",
+    "enum.discriminant",
+    "fn.kind.nested",
+    "fn.const"
+   ]
+  },
+  {
+   "id": "core.tuples_arrays_slices",
+   "title": "Tuples, arrays, slices and range indexing",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4.",
+   "primary_keys": [
+    "expr.tuple",
+    "type.tuple",
+    "expr.array",
+    "type.slice",
+    "expr.index.range"
+   ],
+   "keys": [
+    "expr.tuple",
+    "expr.tuple_field",
+    "expr.array",
+    "expr.array_repeat",
+    "expr.index.range",
+    "type.tuple",
+    "type.array",
+    "type.slice",
+    "type.ref_slice",
+    "type.never",
+    "type.infer",
+    "expr.range.*"
+   ]
+  },
+  {
+   "id": "core.patterns_control",
+   "title": "Labels, struct update, if-let chains, let-else, reference/tuple/slice patterns, const blocks",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4.",
+   "primary_keys": [
+    "expr.let_else",
+    "expr.if_let_chain",
+    "expr.struct_lit.update_syntax",
+    "expr.break_label",
+    "pat.tuple",
+    "pat.deref_ref"
+   ],
+   "keys": [
+    "expr.let_else",
+    "expr.break_label",
+    "expr.labeled_block",
+    "expr.continue_label",
+    "expr.loop_label",
+    "expr.struct_lit.update_syntax",
+    "expr.if_let_chain",
+    "expr.const_block",
+    "pat.tuple",
+    "pat.slice",
+    "pat.slice.rest",
+    "pat.deref_ref",
+    "pat.at_binding",
+    "pat.rest",
+    "pat.const_block",
+    "pat.struct.rest"
+   ]
+  },
+  {
+   "id": "core.result_try",
+   "title": "Result, ? operator and Box",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4. let-else is in core.patterns_control.",
+   "primary_keys": [
+    "expr.try_q",
+    "std.type.std::result::Result",
+    "std.type.std::boxed::Box"
+   ],
+   "keys": [
+    "expr.try_q",
+    "std.type.std::result::*",
+    "std.expr.std::result::*",
+    "std.type.std::boxed::*",
+    "std.expr.std::boxed::*"
+   ]
+  },
+  {
+   "id": "core.std_basics",
+   "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4 names mem, env, fs, io, path and time; time paths are in std.runtime per the inventory steps. Only env::args().count() exists today.",
+   "primary_keys": [
+    "std.type.std::collections::HashMap",
+    "std.type.std::collections::HashSet",
+    "std.expr.std::mem::*"
+   ],
+   "keys": [
+    "std.type.std::mem::*",
+    "std.expr.std::mem::*",
+    "std.type.std::env::*",
+    "std.expr.std::env::*",
+    "std.type.std::process::*",
+    "std.expr.std::process::*",
+    "std.type.std::fs::*",
+    "std.expr.std::fs::*",
+    "std.type.std::io::*",
+    "std.expr.std::io::*",
+    "std.type.std::path::*",
+    "std.expr.std::path::*",
+    "std.type.std::str::*",
+    "std.expr.std::str::*",
+    "std.type.std::cmp::*",
+    "std.expr.std::cmp::*",
+    "std.type.std::char::*",
+    "std.expr.std::char::*",
+    "std.type.std::num::*",
+    "std.expr.std::num::*",
+    "std.type.std::slice::*",
+    "std.expr.std::slice::*",
+    "std.type.std::collections::*",
+    "std.expr.std::collections::*"
+   ]
+  },
+  {
+   "id": "core.numbers_format",
+   "title": "u128/i128, f32/f64, float literals and extended format specs",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Milestone 4 needs exact float printing. Basic {} and {:?} specs work today.",
+   "primary_keys": [
+    "prim.f64",
+    "prim.u128",
+    "lit.float",
+    "fmt.spec.width_prec_align"
+   ],
+   "keys": [
+    "prim.u128",
+    "prim.i128",
+    "prim.f64",
+    "prim.f32",
+    "cast.to.f64",
+    "cast.to.f32",
+    "cast.to.u128",
+    "cast.to.i128",
+    "lit.float",
+    "lit.float.*",
+    "fmt.spec.width_prec_align",
+    "fmt.spec.radix_or_exp",
+    "fmt.spec.debug_pretty"
+   ]
+  },
+  {
+   "id": "core.derives_extra",
+   "title": "Derives Default, PartialOrd and Ord",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "core-syntax",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Clone, Debug, PartialEq, Copy, Eq and Hash work today.",
+   "primary_keys": [
+    "derive.Default",
+    "derive.PartialOrd",
+    "derive.Ord"
+   ],
+   "keys": [
+    "derive.Default",
+    "derive.PartialOrd",
+    "derive.Ord"
+   ]
+  },
+  {
+   "id": "macros.std_missing",
+   "title": "Missing std macros (matches!, debug_assert!, write!, include!, cfg! values and others)",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "macros",
+   "fix_class": "compiler",
+   "release_safe_rewrite": true,
+   "release_impact": "syntax-only",
+   "notes": "About 25 std macro names are needed; lust has 12 today.",
+   "primary_keys": [
+    "macro.matches",
+    "macro.debug_assert",
+    "macro.write",
+    "macro.include_bytes",
+    "macro.vec.repeat"
+   ],
+   "keys": [
+    "macro.matches",
+    "macro.debug_assert",
+    "macro.debug_assert_eq",
+    "macro.debug_assert_ne",
+    "macro.debug_assert_matches",
+    "macro.assert_matches",
+    "macro.write",
+    "macro.writeln",
+    "macro.format_args",
+    "macro.include_bytes",
+    "macro.include_str",
+    "macro.include",
+    "macro.option_env",
+    "macro.env",
+    "macro.concat",
+    "macro.compile_error",
+    "macro.module_path",
+    "macro.vec.repeat",
+    "macro.column",
+    "macro.line",
+    "macro.file",
+    "macro.stringify"
+   ]
+  },
+  {
+   "id": "unsupported.other",
+   "title": "Other constructs with no plan milestone (unions, trait aliases, negative/unsafe/auto traits, variadic, try blocks, box patterns)",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": null,
+   "root_cause": "unsupported",
+   "fix_class": "manual",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "Not in PLAN.md. Needs a human decision per site.",
+   "primary_keys": [
+    "item.union",
+    "item.trait_alias",
+    "item.extern_crate.*",
+    "fn.variadic",
+    "expr.try_block"
+   ],
+   "keys": [
+    "item.union",
+    "item.trait_alias",
+    "item.extern_crate.*",
+    "fn.variadic",
+    "fn.unsafe",
+    "expr.try_block",
+    "pat.box",
+    "pat.verbatim",
+    "type.macro",
+    "trait.auto",
+    "trait.unsafe",
+    "impl.unsafe",
+    "impl.negative",
+    "impl.for_reference",
+    "impl.for_dyn"
+   ]
+  },
+  {
+   "id": "derives.unknown",
+   "title": "Derives other than the lust set",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": null,
+   "root_cause": "unsupported",
+   "fix_class": "manual",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "May be proc-macro derives from other crates. Proc macros stay out of PLAN.md.",
+   "primary_keys": [
+    "derive.*"
+   ],
+   "keys": [
+    "derive.*"
+   ]
+  },
+  {
+   "id": "supported.std_core",
+   "title": "Supported std core paths (Vec, String, Option)",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": null,
+   "root_cause": "supported",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Common methods on these types work today. Method-level gaps that need closures or iterators are counted under those features.",
+   "primary_keys": [],
+   "keys": [
+    "std.type.std::vec::Vec",
+    "std.expr.std::vec::*",
+    "std.type.std::string::String",
+    "std.expr.std::string::*",
+    "std.type.std::option::Option",
+    "std.expr.std::option::*",
+    "std.type.std::borrow::ToOwned"
+   ]
+  },
+  {
+   "id": "ext.unknown_crate",
+   "title": "External crate with no adapter decision yet",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": null,
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "runtime-review",
+   "notes": "Add a decision in dependencies.json and a rule here. Only crates in the scanner EXT list produce ext.* keys; other crates show in the dependency report as unknown.",
+   "primary_keys": [
+    "ext.type.*"
+   ],
+   "keys": [
+    "ext.*"
+   ]
+  },
+  {
+   "id": "std.other",
+   "title": "Other std paths not listed above",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Catch-all so a new std path blocks the file until it gets a precise rule. Add a precise entry when one appears.",
+   "primary_keys": [],
+   "keys": [
+    "std.type.std::*",
+    "std.expr.std::*",
+    "std.use.std::*"
+   ]
+  }
+ ]
+}
