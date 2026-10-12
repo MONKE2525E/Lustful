@@ -242,7 +242,46 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_def(h, p, p.def_id(*f));
             ty(h, *t, seen);
         }
+        Rvalue::MakeDyn { ptr, src, dyn_ty } => {
+            23u8.hash(h);
+            hash_operand(h, p, tys, ptr, seen);
+            ty(h, *src, seen);
+            ty(h, *dyn_ty, seen);
+            // The vtable's entries are part of the emitted C: each
+            // shim's slot (in the used-slots hash) and its signature.
+            if let Some(vid) = crate::check::generics::vtable_for(p, tys, *src, *dyn_ty) {
+                for f in vtable_fns(p, vid) {
+                    hash_def(h, p, p.def_id(f));
+                    let info = p.fn_info(f);
+                    for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
+                        ty(h, t, seen);
+                    }
+                }
+            }
+        }
+        Rvalue::DynUpcast { ptr, path } => {
+            24u8.hash(h);
+            hash_operand(h, p, tys, ptr, seen);
+            path.hash(h);
+        }
     }
+}
+
+/// Every fn a vtable's entries call, its super vtables included.
+fn vtable_fns(p: &Program, vid: u32) -> Vec<LocalDefId> {
+    let mut out = Vec::new();
+    let mut work = vec![vid];
+    let mut seen: Vec<u32> = Vec::new();
+    while let Some(v) = work.pop() {
+        if seen.contains(&v) {
+            continue;
+        }
+        seen.push(v);
+        let vt = &p.gx.vtables[v as usize];
+        out.extend(vt.methods.iter().copied());
+        work.extend(vt.supers.iter().copied());
+    }
+    out
 }
 
 /// A static reference by stable def, never by collect index (indices
@@ -321,6 +360,7 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                     }
                     CallTarget::Intrinsic(i) => (2u8, i).hash(&mut h),
                     CallTarget::Indirect(l) => (3u8, l).hash(&mut h),
+                    CallTarget::Dyn(k) => (4u8, k).hash(&mut h),
                 }
                 (args.len() as u64).hash(&mut h);
                 for a in args {
@@ -345,16 +385,22 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
 /// direct call targets and fn-pointer values (whose C prints the
 /// trampoline slot). Sorted, deduplicated.
 pub(crate) fn used_disk_targets(p: &Program, body: &Body) -> Vec<DiskDefId> {
-    fn rvalue_targets(p: &Program, r: &Rvalue, out: &mut Vec<DiskDefId>) {
+    fn rvalue_targets(p: &Program, tys: &impl TyIntern, r: &Rvalue, out: &mut Vec<DiskDefId>) {
         if let Rvalue::FnValue(f, _) = r {
             out.push(p.disk_id(*f));
+        }
+        // A vtable's method shims print `lust_fns[slot]` for each entry.
+        if let Rvalue::MakeDyn { src, dyn_ty, .. } = r
+            && let Some(vid) = crate::check::generics::vtable_for(p, tys, *src, *dyn_ty)
+        {
+            out.extend(vtable_fns(p, vid).into_iter().map(|f| p.disk_id(f)));
         }
     }
     let mut out = Vec::new();
     for b in &body.blocks {
         for s in &b.stmts {
             if let StmtKind::Assign(_, r) = &s.kind {
-                rvalue_targets(p, r, &mut out);
+                rvalue_targets(p, &body.tys, r, &mut out);
             }
         }
         if let Terminator::Call { target: CallTarget::Fn(f), .. } = &b.term {
@@ -499,6 +545,8 @@ enum CachedRvalue {
     StaticLoad(DefId),
     StaticRef(DefId),
     FnValue(DiskDefId, u32),
+    MakeDyn(CachedOperand, u32, u32),
+    DynUpcast(CachedOperand, Vec<u32>),
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +566,7 @@ enum CachedTarget {
     Builtin(Builtin),
     Intrinsic(u32),
     Indirect(Local),
+    Dyn(u32),
 }
 
 /// Builds `TyTree`s from one body's type store, memoized per `Ty`.
@@ -800,6 +849,8 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::StaticLoad(i) => CachedRvalue::StaticLoad(p.static_defs[*i as usize]),
         Rvalue::StaticRef(i) => CachedRvalue::StaticRef(p.static_defs[*i as usize]),
         Rvalue::FnValue(f, t) => CachedRvalue::FnValue(p.disk_id(*f), b.ty(*t)),
+        Rvalue::MakeDyn { ptr, src, dyn_ty } => CachedRvalue::MakeDyn(cache_operand(b, p, ptr), b.ty(*src), b.ty(*dyn_ty)),
+        Rvalue::DynUpcast { ptr, path } => CachedRvalue::DynUpcast(cache_operand(b, p, ptr), path.clone()),
     }
 }
 
@@ -838,6 +889,7 @@ pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, us
                         CallTarget::Builtin(x) => CachedTarget::Builtin(*x),
                         CallTarget::Intrinsic(i) => CachedTarget::Intrinsic(*i),
                         CallTarget::Indirect(l) => CachedTarget::Indirect(*l),
+                        CallTarget::Dyn(k) => CachedTarget::Dyn(*k),
                     },
                     args: args.iter().map(|a| cache_operand(&mut b, p, a)).collect(),
                     dest: dest.clone(),
@@ -963,6 +1015,10 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             CachedRvalue::StaticLoad(def) => Rvalue::StaticLoad(p.static_by_def(*def)?),
             CachedRvalue::StaticRef(def) => Rvalue::StaticRef(p.static_by_def(*def)?),
             CachedRvalue::FnValue(disk, t) => Rvalue::FnValue(local_of(disk)?, intern.ty(tys, *t)?),
+            CachedRvalue::MakeDyn(o, src, dyn_ty) => {
+                Rvalue::MakeDyn { ptr: operand(intern, tys, strings, o)?, src: intern.ty(tys, *src)?, dyn_ty: intern.ty(tys, *dyn_ty)? }
+            }
+            CachedRvalue::DynUpcast(o, path) => Rvalue::DynUpcast { ptr: operand(intern, tys, strings, o)?, path: path.clone() },
         })
     }
     let mut blocks = Vec::with_capacity(cached.blocks.len());
@@ -992,6 +1048,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
                     CachedTarget::Builtin(x) => CallTarget::Builtin(*x),
                     CachedTarget::Intrinsic(i) => CallTarget::Intrinsic(*i),
                     CachedTarget::Indirect(l) => CallTarget::Indirect(*l),
+                    CachedTarget::Dyn(k) => CallTarget::Dyn(*k),
                 },
                 args: args.iter().map(|a| operand(&mut intern, &mut tys, &strings, a)).collect::<Option<Vec<_>>>()?,
                 dest: dest.clone(),

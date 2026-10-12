@@ -1803,7 +1803,7 @@ fn main() {}
                 if let Terminator::Call { target, unwind, .. } = &b.term {
                     assert!(unwind.is_some(), "every call carries a cleanup edge (W-CORELANG)");
                     match target {
-                        CallTarget::Fn(_) | CallTarget::Indirect(_) => fn_calls += 1,
+                        CallTarget::Fn(_) | CallTarget::Indirect(_) | CallTarget::Dyn(_) => fn_calls += 1,
                         CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => builtin_calls += 1,
                     }
                 }

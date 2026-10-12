@@ -1007,7 +1007,14 @@ pub fn resolve_scoped(
             if let Some(lt) = lifetime {
                 check_lifetime(interner, *lt)?;
             }
-            let inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
+            let mut inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
+            // `&'static dyn Tr` defaults its object lifetime to the
+            // reference's: `&'static (dyn Tr + 'static)` (ARCH 2.8).
+            if lifetime.is_some_and(|lt| interner.get(lt.name) == "static")
+                && let TyKind::Dyn(b, Region::Erased) = tys.kind(inner)
+            {
+                inner = tys.intern(TyKind::Dyn(b, Region::Static));
+            }
             Ok(tys.mk_ref(*mutable, inner))
         }
         TyExpr::Tuple(elems) => {
@@ -1040,7 +1047,7 @@ pub fn resolve_scoped(
             None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
         },
         TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
-        TyExpr::Dyn { bounds, .. } => resolve_dyn(ast, interner, known, cx, tys, scope, bounds, span),
+        TyExpr::Dyn { binder, bounds, lifetime } => resolve_dyn(ast, interner, known, cx, tys, scope, binder, bounds, *lifetime, span),
         TyExpr::FnPtr { qual, inputs, variadic, ret, .. } => {
             if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
                 return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));
@@ -1138,12 +1145,17 @@ fn projection_of(
     Ok(tys.intern(TyKind::Projection(AssocId(assoc), tr.args)))
 }
 
-/// A `dyn` type in signature form. The principal trait ref keeps
-/// its bindings; supertraits come from the index; auto bounds
-/// become the bound bits. Dyn types are not supported yet: the
-/// type is formed to keep resolution going, then rejected with
-/// L0701 (a later wave adds dyn compatibility checks and calls,
-/// ARCH 2.8).
+/// A `dyn` type in signature form (ARCH 2.8). The principal is
+/// existential (`DYN_SELF` in its Self slot), auto bounds become
+/// the bound bits as written, and supertraits stay empty: the
+/// derived sets come from the trait's dyn info, so the same written
+/// type interns the same bounds before and after trait tables are
+/// built. A written `'static` bound is kept as the region (the
+/// coercion site checks it); every other region is erased. Dyn
+/// compatibility errors are `check::object`'s (they need the
+/// trait's methods); this only forms the type and rejects the
+/// forms the subset has no vtable for.
+#[allow(clippy::too_many_arguments)]
 fn resolve_dyn(
     ast: &Ast,
     interner: &Interner,
@@ -1151,16 +1163,30 @@ fn resolve_dyn(
     cx: &ResolveCx,
     tys: &mut impl TyIntern,
     scope: &Scope,
+    binder: &[ast::Lifetime],
     bounds: &[TraitBound],
+    lifetime: Option<ast::Lifetime>,
     span: Span,
 ) -> Result<Ty, Diag> {
     let mut principal: Option<Binder<TraitRef>> = None;
     let mut auto = AutoTraits::default();
+    let mut region = Region::Erased;
+    let mut lifetime_bound = |lt: ast::Lifetime| -> Result<(), Diag> {
+        check_lifetime(interner, lt)?;
+        if interner.get(lt.name) == "static" {
+            region = Region::Static;
+        }
+        Ok(())
+    };
+    if let Some(lt) = lifetime {
+        lifetime_bound(lt)?;
+    }
+    if !binder.is_empty() {
+        return Err(dyn_not_yet(span, "higher-ranked `dyn for<..>` types"));
+    }
     for b in bounds {
         match b {
-            TraitBound::Lifetime(lt) => {
-                check_lifetime(interner, *lt)?;
-            }
+            TraitBound::Lifetime(lt) => lifetime_bound(*lt)?,
             TraitBound::Trait { binder, trait_ref, maybe } => {
                 if *maybe {
                     return Err(not_yet("L0602", span, "`?Trait` bounds on dyn types"));
@@ -1179,37 +1205,40 @@ fn resolve_dyn(
                 if principal.is_some() {
                     return Err(Diag::new("L0110", span, "a dyn type has at most one principal trait", "Keep one trait plus auto traits."));
                 }
-                // The Self of a dyn principal is the dyn type itself;
-                // in signature form it is written with the trait's
-                // own Self parameter. Bindings carry the meaning.
-                let self_param = tys.intern(TyKind::Param(ParamId(0)));
+                if !binder.is_empty() {
+                    return Err(dyn_not_yet(span, "higher-ranked `dyn for<..>` types"));
+                }
+                // Vtables exist for user traits only: a std trait
+                // (`dyn Display`, `dyn Fn(..)`) has no method bodies
+                // the subset can point a vtable at yet.
+                if !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
+                    let name = interner.get(trait_ref.path.last().unwrap().name).to_string();
+                    return Err(dyn_not_yet(span, &format!("`dyn {name}` (a std trait)")));
+                }
                 let seg = trait_ref.path.last().unwrap();
-                let tr = resolve_trait_path_args(ast, interner, known, cx, tys, scope, trait_def, seg, self_param, span)?;
-                principal = Some(Binder { count: binder.len() as u32, value: tr });
+                let tr = resolve_trait_path_args(ast, interner, known, cx, tys, scope, trait_def, seg, DYN_SELF, span)?;
+                if !tys.bindings(tr.bindings).is_empty() {
+                    return Err(dyn_not_yet(span, "associated type bindings in `dyn` types"));
+                }
+                principal = Some(Binder::plain(tr));
             }
         }
     }
-    let supertraits: Vec<Binder<TraitRef>> = match &principal {
-        Some(p) => cx
-            .index
-            .supertraits_of(tys, &p.value)
-            .into_iter()
-            .filter_map(|pred| match pred {
-                Predicate::Trait(b) => Some(b),
-                _ => None,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    // Auto traits a supertrait requires join the bits: a lang
-    // supertrait chain into Send/Sync is visible in the records.
-    let _bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: supertraits.into(), auto });
-    Err(Diag::new(
-        "L0701",
+    if principal.is_none() {
+        return Err(dyn_not_yet(span, "`dyn` types with only auto traits"));
+    }
+    let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
+    Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
+}
+
+/// The reject for a `dyn` form the subset has no vtable for yet.
+pub fn dyn_not_yet(span: Span, what: &str) -> Diag {
+    Diag::new(
+        "L0702",
         span,
-        "trait object types (`dyn Trait`) are not supported yet",
-        "Use a generic parameter or an enum instead.",
-    ))
+        format!("{what} is not supported yet"),
+        "Use `&dyn Trait` or `&mut dyn Trait` with a trait defined in this crate, or use generics.",
+    )
 }
 
 /// A path type: parameters, primitives, builtin Adts, user Adts
@@ -1650,8 +1679,11 @@ pub fn build_trait_generics(
     supertraits: &[TraitBound],
     errs: &mut Vec<Diag>,
 ) -> (Generics, Scope) {
-    let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, &Scope::default(), errs);
     let self_ty = tys.intern(TyKind::Param(ParamId(0)));
+    // `Self` resolves in the trait's own bounds and `where` clauses
+    // (`trait T where Self: Sized`), so the seed scope names it.
+    let seed = Scope { self_ty: Some(self_ty), ..Scope::default() };
+    let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, &seed, errs);
     generics.params.insert(0, ParamDef { name: known.self_type, kind: ParamKind::Type, span: Span::default() });
     scope.self_ty = Some(self_ty);
     // Supertrait bounds are predicates on Self, in source order,
@@ -1846,6 +1878,27 @@ pub struct GenTables<'a> {
     /// (`collect::collect_reuse`): template checks and discovery skip
     /// bodies whose stored results still hold (W-PERF).
     pub reuse: crate::driver::gen_reuse::GenReuse,
+    /// Dyn compatibility and vtable layout per user trait
+    /// (`check::object`), computed when trait tables are done.
+    pub dyn_infos: FxMap<DefId, crate::check::object::DynInfo>,
+    /// The vtables mono made, one per (concrete type, principal
+    /// trait ref), both in the global store (iface: W-CGEN reads
+    /// these to emit vtable statics).
+    pub vtables: Vec<crate::check::object::VtableData>,
+    pub vtable_by_key: FxMap<(Ty, TraitRef), u32>,
+    /// Methods of `impl dyn Trait` blocks, by (the dyn type with an
+    /// erased region, name).
+    pub dyn_inherent: FxMap<(Ty, Sym), LocalDefId>,
+    /// The self type and span of each `impl dyn Trait` block, for
+    /// the dyn type checks.
+    pub dyn_impl_sites: Vec<(Ty, Span)>,
+    /// The abstract stand-ins (opaque Adts) of template params
+    /// written `?Sized`: they answer `Sized` with false, so a
+    /// template cannot unsize or pass on a param that may be `dyn`.
+    pub unsized_opaques: Vec<AdtId>,
+    /// True once mono's materialize pass is done: every vtable a
+    /// concrete body needs exists from then on.
+    pub mono_done: bool,
 }
 
 impl Default for GenTables<'_> {
@@ -1886,6 +1939,13 @@ impl Default for GenTables<'_> {
             trait_method_stubs: FxMap::default(),
             walk_instances: true,
             reuse: Default::default(),
+            dyn_infos: FxMap::default(),
+            vtables: Vec::new(),
+            vtable_by_key: FxMap::default(),
+            dyn_inherent: FxMap::default(),
+            dyn_impl_sites: Vec::new(),
+            unsized_opaques: Vec::new(),
+            mono_done: false,
         }
     }
 }
@@ -3293,7 +3353,9 @@ pub(crate) enum OwnedTy {
     Opaque(DefId, Vec<OwnedArg>),
     Projection(AssocId, Vec<OwnedArg>),
     FnPtr(Binder<FnSig>, Vec<OwnedTy>, Box<OwnedTy>),
-    Dyn(Binder<Vec<OwnedArg>>, Vec<(u32, Vec<OwnedArg>)>, AutoTraits, Region),
+    /// The principal def and args (bindings and supertraits are always
+    /// empty in a dyn type `resolve_dyn` forms), auto bits, region.
+    Dyn(Option<(DefId, Vec<OwnedArg>)>, AutoTraits, Region),
 }
 
 #[derive(Clone)]
@@ -3339,15 +3401,11 @@ fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
         }
         TyKind::Dyn(b, r) => {
             let bounds = src.dyn_bounds(b).clone();
-            let principal: Binder<Vec<OwnedArg>> = match bounds.principal {
-                Some(pr) => Binder { count: pr.count, value: snapshot_args(src, pr.value.args)? },
-                None => Binder { count: 0, value: Vec::new() },
+            let principal = match bounds.principal {
+                Some(pr) => Some((pr.value.def, snapshot_args(src, pr.value.args)?)),
+                None => None,
             };
-            let mut supers = Vec::new();
-            for sup in bounds.supertraits.iter() {
-                supers.push((sup.count, snapshot_args(src, sup.value.args)?));
-            }
-            OwnedTy::Dyn(principal, supers, bounds.auto, r)
+            OwnedTy::Dyn(principal, bounds.auto, r)
         }
         kind => OwnedTy::Leaf(kind),
     })
@@ -3420,15 +3478,13 @@ fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
             let sig = p.tys.intern_sig(Binder { count: b.count, value: FnSig { inputs: inputs_id, output, ..b.value } });
             p.tys.intern(TyKind::FnPtr(sig))
         }
-        OwnedTy::Dyn(principal, supers, auto, r) => {
-            // Dyn bounds from another store lose their bindings
-            // here (only args are snapshotted); dyn types in
-            // instance args are outside this wave's mono subset,
-            // and the principal trait identity is not recoverable
-            // from args alone, so this arm is unreachable in
-            // practice and answers the error type.
-            let _ = (principal, supers, auto, r);
-            ERROR
+        OwnedTy::Dyn(principal, auto, r) => {
+            let principal = principal.as_ref().map(|(def, args)| {
+                let args = build_owned_args(p, args);
+                Binder::plain(TraitRef { def: *def, args, bindings: EMPTY_BINDINGS })
+            });
+            let b = p.tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto: *auto });
+            p.tys.intern(TyKind::Dyn(b, *r))
         }
     }
 }
@@ -3509,8 +3565,86 @@ fn find_global_ty(p: &Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
             let aid = g.get_args(&out)?;
             g.get(TyKind::Projection(d, aid))?
         }
+        TyKind::Dyn(b, r) => {
+            let bounds = src.dyn_bounds(b).clone();
+            let principal = match bounds.principal {
+                Some(pr) => {
+                    let raw: Vec<GenericArg> = src.args(pr.value.args).to_vec();
+                    let mut out: Vec<GenericArg> = Vec::new();
+                    for gg in raw {
+                        out.push(match gg {
+                            GenericArg::Ty(e) => GenericArg::Ty(find_global_ty(p, src, e)?),
+                            GenericArg::Const(c) => match src.const_kind(c) {
+                                ConstKind::Infer(_) => return None,
+                                k => GenericArg::Const(g.consts_get(k)?),
+                            },
+                            other => other,
+                        });
+                    }
+                    Some(Binder { count: pr.count, value: TraitRef { def: pr.value.def, args: g.get_args(&out)?, bindings: EMPTY_BINDINGS } })
+                }
+                None => None,
+            };
+            let gb = g.dyn_bounds_get(&DynBounds { principal, supertraits: Box::new([]), auto: bounds.auto })?;
+            g.get(TyKind::Dyn(gb, r))?
+        }
         kind => g.get(kind)?,
     })
+}
+
+/// The vtable mono made for one unsizing coercion, from body-local
+/// types: the concrete pointee and the target dyn type.
+pub fn vtable_for(p: &Program, src: &dyn TyIntern, concrete: Ty, dyn_ty: Ty) -> Option<u32> {
+    let concrete = find_global_ty(p, src, concrete)?;
+    let dyn_ty = find_global_ty(p, src, dyn_ty)?;
+    let principal = crate::check::object::principal_of(&p.tys, dyn_ty)?;
+    p.gx.vtable_by_key.get(&(concrete, principal)).copied()
+}
+
+/// Selects the impl of one concrete trait ref over the global store,
+/// with its args lifted into the global store. None unless exactly one
+/// impl applies.
+pub(crate) fn select_impl_global(p: &mut Program, tr: TraitRef) -> Option<(crate::traits::ImplId, Vec<GenericArg>)> {
+    let (id, owned) = {
+        let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+        let mut solver = Solver::new();
+        let Selection::Impl { id, args, .. } = solver.select(&mut cx, &p.gx.index, &[], tr) else { return None };
+        let mut owned: Vec<OwnedArg> = Vec::new();
+        for g in args {
+            owned.push(match g {
+                GenericArg::Ty(t) => OwnedArg::Ty(snapshot_ty(&cx.tys, t)?),
+                GenericArg::Const(c) => match cx.tys.const_kind(c) {
+                    ConstKind::Infer(_) => return None,
+                    k => OwnedArg::Const(k),
+                },
+                GenericArg::Lifetime(r) => OwnedArg::Lifetime(r),
+            });
+        }
+        (id, owned)
+    };
+    let args: Vec<GenericArg> = owned
+        .iter()
+        .map(|a| match a {
+            OwnedArg::Ty(t) => GenericArg::Ty(build_owned_ty(p, t)),
+            OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
+            OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
+        })
+        .collect();
+    Some((id, args))
+}
+
+/// The concrete fn for one callable template or plain fn at `args`:
+/// the plain fn itself, or its instance (pushed on `made` when new).
+pub(crate) fn instance_at(p: &mut Program, f: LocalDefId, args: &[GenericArg], made: &mut Vec<LocalDefId>) -> LocalDefId {
+    if p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
+        return f;
+    }
+    let before = p.fns.len();
+    let inst = fn_instance(p, f, args, FnClass::Instance);
+    if inst.0 as usize >= before {
+        made.push(inst);
+    }
+    inst
 }
 
 /// The mono instance for one template and body-local args, as
@@ -4113,6 +4247,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     }
     let mut queue: Vec<LocalDefId> =
         (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Plain)).collect();
+    crate::mono::vtable::eager_vtables(p, &mut queue);
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
     let mut drop_done = 0u32;
@@ -4136,7 +4271,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             // this loop is about to extend. A body whose stored
             // discovery still holds (driver session reuse) replays it.
             let replayed = reuse.discovered(p, fid);
-            let (adt_tys_owned, requests_owned, closures_owned) = if let Some(stored) = replayed {
+            let (adt_tys_owned, requests_owned, closures_owned, vtables_owned) = if let Some(stored) = replayed {
                 stored
             } else {
                 reuse.discovery_checked += 1;
@@ -4146,6 +4281,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
                     if let Some(o) = snapshot_ty(&checked.tys, t) {
                         adt_tys.push(o);
+                    }
+                }
+                let mut vts: Vec<(OwnedTy, OwnedTy)> = Vec::new();
+                for &(src, dyn_ty) in &checked.vtable_requests {
+                    if let (Some(a), Some(b)) = (snapshot_ty(&checked.tys, src), snapshot_ty(&checked.tys, dyn_ty)) {
+                        vts.push((a, b));
                     }
                 }
                 let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
@@ -4176,15 +4317,29 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                     }
                 }
                 if discarded.is_empty() {
-                    reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned);
+                    reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
                 }
-                (adt_tys, reqs, closures_owned)
+                (adt_tys, reqs, closures_owned, vts)
             };
             reuse.note_closures(&closures_owned);
             register_closures(p, fid, closures_owned, FnClass::Closure);
             for owned in &adt_tys_owned {
                 let gt = build_owned_ty(p, owned);
                 ensure_global_adt_instances(p, gt, 0);
+            }
+            // Vtables for this body's unsizing coercions, with the
+            // method instances they point at (ARCH 2.8, 4.2).
+            for (src, dyn_ty) in &vtables_owned {
+                let src = build_owned_ty(p, src);
+                let src = normalize_global(p, src);
+                let dyn_ty = build_owned_ty(p, dyn_ty);
+                let Some(principal) = crate::check::object::principal_of(&p.tys, dyn_ty) else { continue };
+                let mut made: Vec<LocalDefId> = Vec::new();
+                crate::mono::vtable::ensure_vtable(p, src, principal, &mut made);
+                for inst in made {
+                    depths.insert(inst, depth + 1);
+                    next_queue.push(inst);
+                }
             }
             for (template, owned_args) in requests_owned {
                 // `lust check` stops at the template checks (ARCH 4.1):
@@ -4238,6 +4393,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         queue = next_queue;
     }
     p.gx.reuse = reuse;
+    p.gx.mono_done = true;
     errs
 }
 
@@ -4776,6 +4932,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
     add_synthetic_impls(p);
+    // Dyn compatibility needs the finished trait tables; the dyn
+    // type checks over signatures run before mono builds vtables.
+    p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
+    crate::check::object::check_signatures(p, errs);
     check_supertrait_cycles(p, errs);
     check_impl_obligations(p, errs);
     check_copy_impls(p, errs);

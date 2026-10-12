@@ -884,6 +884,98 @@ pub(super) fn plain_inherent_probe(
     Probe::Miss
 }
 
+/// The inherent probe of a dyn step (ARCH 2.8, 2.10): methods of
+/// `impl dyn Trait` blocks and the object candidates (methods of the
+/// principal and its supertraits, which need no import) are both
+/// inherent here, as in rustc, so two of them at one receiver form are
+/// ambiguous (rustc E0034). An object method calls through the vtable.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
+    use crate::check::object::{self, DynRecv};
+    let p = cx.p;
+    let (step, form, derefs) = (probe.self_ty, probe.filter, derefs + probe.extra_derefs);
+    let Some(principal) = object::principal_of(&cx.tys, step) else { return Probe::Miss };
+    let form_of = |k: Option<SelfKind>| match k {
+        Some(SelfKind::Value) | Some(SelfKind::Typed) => Some(ReceiverForm::Value),
+        Some(SelfKind::Ref) => Some(ReceiverForm::Ref),
+        Some(SelfKind::RefMut) => Some(ReceiverForm::RefMut),
+        None => None,
+    };
+    let key = object::erase_dyn_region(&mut cx.tys, step);
+    let inherent = p.gx.dyn_inherent.get(&(key, name)).copied();
+    if let Some(f) = inherent
+        && form_of(p.fn_info(f).self_kind).is_none()
+    {
+        if form == ReceiverForm::Value {
+            cx.err("L0104", name_span, format!("`{}` is an associated function, not a method", cx.name(name)), "Call it as `<dyn Trait>::name(...)`.");
+            return Probe::Failed;
+        }
+        return Probe::Miss;
+    }
+    let inherent = inherent.filter(|&f| form_of(p.fn_info(f).self_kind) == Some(form));
+    let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut cx.tys, principal, name)
+        .into_iter()
+        .filter(|c| match c.call {
+            Ok((_, DynRecv::Ref)) => form == ReceiverForm::Ref,
+            Ok((_, DynRecv::RefMut)) => form == ReceiverForm::RefMut,
+            Err(_) => p.gx.trait_methods.get(&c.def).and_then(|t| form_of(t.self_kind)) == Some(form),
+        })
+        .collect();
+    if inherent.is_some() as usize + cands.len() > 1 {
+        cx.err(
+            "L0720",
+            name_span,
+            format!("multiple applicable items named `{}` are in scope for this `dyn` receiver", cx.name(name)),
+            "Call the method with a fully qualified path, such as `Trait::method(receiver)`.",
+        );
+        for &a in args {
+            cx.expr(a, None);
+        }
+        return Probe::Failed;
+    }
+    if let Some(f) = inherent {
+        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            cx.errs.push(crate::check::generics::dyn_not_yet(name_span, "generic methods in `impl dyn Trait` blocks"));
+            return Probe::Failed;
+        }
+        let (params, ret) = {
+            let info = p.fn_info(f);
+            (info.params.clone(), info.ret)
+        };
+        cx.set_res(e, Res::Method { f, derefs, autoref: probe.autoref });
+        cx.check_args(&params[1.min(params.len())..], args, name_span);
+        return Probe::Hit(ret);
+    }
+    let Some(c) = cands.into_iter().next() else { return Probe::Miss };
+    let slot = match c.call {
+        Ok((slot, _)) => slot,
+        Err(why) => {
+            let tn = cx.tn(step);
+            cx.err(
+                "L0703",
+                name_span,
+                format!("the method `{}` cannot be called on `{tn}`: {why}", cx.name(name)),
+                "Call it on a concrete type, or on a generic parameter bounded by the trait.",
+            );
+            for &a in args {
+                cx.expr(a, None);
+            }
+            return Probe::Failed;
+        }
+    };
+    let Some(tm) = p.gx.trait_methods.get(&c.def) else { return Probe::Miss };
+    let (tparams, tret) = (tm.params.clone(), tm.ret);
+    // The method's signature with Self as the dyn type and the owner
+    // trait's params from the receiver's principal.
+    let mut sargs: Vec<GenericArg> = cx.tys.args(c.owner.args).to_vec();
+    sargs[0] = GenericArg::Ty(step);
+    let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut cx.tys, t, &sargs)).collect();
+    let ret = subst(&mut cx.tys, tret, &sargs);
+    cx.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs, autoref: probe.autoref });
+    cx.check_args(&params[1.min(params.len())..], args, name_span);
+    Probe::Hit(cx.normalize_here(ret))
+}
+
 /// The full generic method search over autoderef steps, in
 /// rustc's receiver-type probe order. Returns Hit/Miss/Failed
 /// like a single probe.
@@ -954,6 +1046,10 @@ pub(super) fn generic_method_search(
         let groups = [by_value, vec![RcvProbe::at(cx, step, ReceiverForm::Ref)], vec![RcvProbe::at(cx, step, ReceiverForm::RefMut)]];
         for group in &groups {
             for &probe in group {
+                match dyn_probe(cx, e, probe, derefs, name, name_span, args) {
+                    Probe::Miss => {}
+                    hit => return hit,
+                }
                 match plain_inherent_probe(cx, e, probe, derefs, name, name_span, args) {
                     Probe::Miss => {}
                     hit => return hit,

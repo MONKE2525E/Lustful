@@ -18,6 +18,8 @@
 // order, roots first) keyed by `InstanceKeyHash`; W-CGEN receives
 // one concrete body per instance exactly as it receives one per
 // non-generic fn today.
+pub mod vtable;
+
 use crate::def::DefId;
 use crate::driver::graph::InstanceKey;
 use crate::intern::FxMap;

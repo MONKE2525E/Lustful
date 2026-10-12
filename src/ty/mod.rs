@@ -454,6 +454,12 @@ pub struct AutoTraits {
 /// A `dyn` bound list: one principal trait ref under its binder (a `dyn for<'a>`
 /// principal keeps count 1, with its associated bindings under the same binder),
 /// the supertrait trait refs in declaration order, and the auto trait bits.
+///
+/// The principal is existential: its Self slot (`args[0]`) holds `DYN_SELF`,
+/// never a `Param`, so a dyn type is closed under substitution of the generics
+/// around it. `resolve_dyn` keeps `supertraits` empty and `auto` as written:
+/// both derived sets come from the trait's dyn info (`check::object`) once trait
+/// tables exist, so one written dyn type always interns to one `BoundsId`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynBounds {
     pub principal: Option<Binder<TraitRef>>,
@@ -522,6 +528,10 @@ impl TyKind {
 }
 
 pub const ERROR: Ty = Ty(0);
+/// The Self slot of an existential dyn principal (see `DynBounds`). It is the
+/// error type, which no code reads as a real Self: callers that need a trait
+/// ref for a dyn value put the dyn type itself in that slot.
+pub const DYN_SELF: Ty = ERROR;
 pub const UNIT: Ty = Ty(1);
 pub const BOOL: Ty = Ty(2);
 pub const CHAR: Ty = Ty(3);
@@ -1037,6 +1047,10 @@ impl GlobalTys {
     /// The already-interned id of one const value, if any.
     pub fn consts_get(&self, k: ConstKind) -> Option<ConstId> {
         self.consts.get_id(&k)
+    }
+    /// The already-interned id of one dyn bound list, if any.
+    pub fn dyn_bounds_get(&self, b: &DynBounds) -> Option<BoundsId> {
+        self.bounds.get_id(b)
     }
     /// The full applied type of a session-local Adt, if registered.
     pub fn full_adt_ty(&self, local: AdtId) -> Option<Ty> {

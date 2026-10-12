@@ -419,7 +419,13 @@ fn successors(t: &Terminator) -> Vec<Bb> {
 /// Calls `f` for every operand read by an rvalue, in evaluation order.
 fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
     match rv {
-        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::Opt(_, Some(o)) | Rvalue::Res(_, _, o) => f(o),
+        Rvalue::Use(o)
+        | Rvalue::Un(_, o)
+        | Rvalue::Cast(o, _)
+        | Rvalue::Opt(_, Some(o))
+        | Rvalue::Res(_, _, o)
+        | Rvalue::MakeDyn { ptr: o, .. }
+        | Rvalue::DynUpcast { ptr: o, .. } => f(o),
         Rvalue::Opt(_, None) => {}
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::Eq { a, b, .. } => {
             f(a);
@@ -1059,8 +1065,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
                         new_holds.insert(loan);
                         new_origins.insert(loan);
-                        // A reborrow through a reference depends on that reference's loans.
-                        if place.proj.contains(&Proj::Deref) {
+                        // A reborrow through a reference depends on that
+                        // reference's loans. So does a borrow of a value
+                        // that holds references (`&r` for `r: &u8`): the
+                        // new reference reaches the same data, so it keeps
+                        // those loans live (rustc: `&'a &'b T` needs
+                        // `'b: 'a`). This is what keeps a `&dyn` made from
+                        // such a value honest.
+                        if place.proj.contains(&Proj::Deref) || self.place_holds_refs(place) {
                             new_holds.union_words(st.holds(place.local as usize));
                             new_origins.union_words(st.origins(place.local as usize));
                         }
@@ -1223,13 +1235,16 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
                 self.flow_into_mut_args(args, st, span);
             }
-            CallTarget::Indirect(callee) => {
+            CallTarget::Indirect(_) | CallTarget::Dyn(_) => {
                 // The callee signature is not a fn the checker can
                 // summarize yet, so treat the call conservatively: the
                 // callee local is read, a reference result may hold any
                 // argument's loans, and loans flow into &mut args. The
-                // IR owner refines this when fn pointers lower.
-                self.operand(&Operand::Copy(Place::local(callee)), span, st, &live);
+                // IR owner refines this when fn pointers lower. A dyn
+                // call's receiver is its first argument, read below.
+                if let CallTarget::Indirect(callee) = target {
+                    self.operand(&Operand::Copy(Place::local(callee)), span, st, &live);
+                }
                 if self.dest_holds_refs(dest) {
                     for o in args {
                         self.holds_of(o, st, &mut new_holds);
@@ -1493,6 +1508,40 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         (path, true)
+    }
+
+    /// True when the value at a place (fields, tuple elements, and Vec
+    /// elements included) can hold a reference. A place whose type this
+    /// cannot follow answers true, the conservative side.
+    fn place_holds_refs(&self, p: &Place) -> bool {
+        let tys = &self.body.tys;
+        let mut t = self.body.locals[p.local as usize].ty;
+        let mut variant = 0usize;
+        for pr in &p.proj {
+            t = match (tys.kind(t), pr) {
+                (TyKind::Ref(_, _, i), Proj::Deref) => i,
+                (_, Proj::Downcast(v)) => {
+                    variant = *v as usize;
+                    continue;
+                }
+                (TyKind::Tuple(ts), Proj::Field(i)) => tys.tys_of(ts)[*i as usize],
+                (TyKind::Adt(..), Proj::Field(i)) => match tys.local_adt(t) {
+                    Some(a) => self.p.adt(a).variants[variant].fields[*i as usize].ty,
+                    None => match tys.option_elem(t) {
+                        Some(e) => e,
+                        None => return true,
+                    },
+                },
+                (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => e,
+                (_, Proj::Index(_)) => match tys.vec_elem(t) {
+                    Some(e) => e,
+                    None => return true,
+                },
+                _ => return true,
+            };
+            variant = 0;
+        }
+        contains_ref(tys, t)
     }
 
     fn operand(&mut self, o: &Operand, span: Span, st: &mut State, live: &BitSet) {

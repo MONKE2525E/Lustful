@@ -76,8 +76,8 @@ prints "reserved, not yet emitted".
 | L0650 | Layout | W-CORELANG | in use | `offset_of!` on a default-repr type |
 | L0651-L0652 | Layout | W-CORELANG | in use | L0651 reference to a packed field, L0652 unsupported layout form |
 | L0653-L0659 | Layout | W-CORELANG | reserved | |
-| L0701 | dyn compatibility | W-TRAITS-CORE | in use | Trait object types are not supported yet (dyn compatibility lands with dyn support) |
-| L0702-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | |
+| L0701-L0705 | dyn compatibility | W-TRAITS-CORE | in use | L0701 not dyn compatible (names the offending item), L0702 dyn form not supported yet, L0703 method cannot be called on a trait object, L0704 impl of a trait the dyn type implements already, L0705 object lifetime bound lust cannot check |
+| L0706-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | |
 | L0710-L0719 | Binders | W-TRAITS-CORE | reserved | L0710 nested higher-ranked binder |
 | L0720 | Methods and receivers | W-TRAITS-CORE | in use | L0720 ambiguous method; plain "no such method" stays L0104 |
 | L0721 | Methods and receivers | W-TRAITS-CORE | in use | Method turbofish or typed receiver form is not supported yet (S3b) |

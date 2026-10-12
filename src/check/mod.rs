@@ -5,6 +5,7 @@ pub mod closure;
 pub mod collect;
 pub mod generics;
 pub mod method;
+pub mod object;
 pub mod obligations;
 pub mod picks;
 
@@ -342,6 +343,16 @@ pub enum Res {
         kind: closure::ClosureKind,
         derefs: u8,
     },
+    /// A method call through a dyn receiver's vtable (ARCH 2.8):
+    /// `owner` is the trait that declares the method (the principal
+    /// or a supertrait, reached by its upcast path) and `slot` the
+    /// method's word index in that trait's vtable.
+    DynMethod {
+        owner: DefId,
+        slot: u32,
+        derefs: u8,
+        autoref: Autoref,
+    },
 }
 
 /// Which scalar comparison a `Res::PrimCmp` call computes. The
@@ -391,6 +402,11 @@ pub enum Coerce {
     /// `&mut T`: this many derefs reach the pointee place, and
     /// the bool is the target mutability.
     BoxToRef(u8, bool),
+    /// An unsizing coercion to a dyn reference (ARCH 2.8): `&T` or
+    /// `&mut T` to `&dyn Tr` (a new fat pointer), or `&dyn Sub` to
+    /// `&dyn Super` (trait upcasting, or dropping auto traits). The
+    /// payload is the target reference type.
+    Unsize(Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +481,9 @@ pub struct Checked<'g> {
     /// Trait picks of a template check (see `picks.rs`), in check
     /// order. Mono stores them for the body's other checks.
     pub trait_picks: Vec<(ExprId, picks::TraitPick)>,
+    /// Vtable requests from unsizing coercions: (concrete pointee
+    /// type, target dyn type), zonked. Mono builds the vtables.
+    pub vtable_requests: Vec<(Ty, Ty)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -600,6 +619,9 @@ struct Ctx<'p, 'a> {
     /// Lowering emits the builtin operator, so the types must turn out
     /// scalar by body end (see `finish`).
     open_binops: Vec<(ExprId, BinOp, Ty)>,
+    /// Unsizing coercion sites, (concrete pointee, dyn type, span)
+    /// before zonking; `finish` turns them into vtable requests.
+    vtable_sites: Vec<(Ty, Ty, Span)>,
 }
 
 /// The module a body checks in: the module of the def that owns
@@ -686,6 +708,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             generic_args: vec![Vec::new(); n_exprs],
             inst_requests: Vec::new(),
             trait_picks: Vec::new(),
+            vtable_requests: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
@@ -724,6 +747,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closure_rets: Vec::new(),
         closure_order: None,
         open_binops: Vec::new(),
+        vtable_sites: Vec::new(),
     };
     if let Some(sibs) = p.fn_siblings.get(&fid) {
         let layer: Vec<((Sym, CtxtId), u32)> = sibs
@@ -1441,9 +1465,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let self_ty = self.deep(self.tys.args(tr.args)[0].as_ty().unwrap_or(ERROR));
         if tr.def == lang.sized {
-            // A general variable may still become `[T]` or `str`
-            // (`f(s)` runs this queue before the argument unifies):
-            // keep the obligation until the variable is known.
+            // A general variable may still become `[T]`, `str`, a dyn
+            // type, or a `?Sized` param's stand-in (`f(s)` runs this
+            // queue before the argument unifies): keep the obligation
+            // until the variable is known.
             if matches!(self.tys.kind(self_ty), TyKind::Infer(v) if !v.is_int() && !v.is_float()) {
                 return Selection::Ambiguous;
             }
@@ -1469,6 +1494,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(true) => return Selection::ParamEvidence(usize::MAX),
                 Some(false) => return Selection::NoImpl,
                 None => {}
+            }
+        }
+        // The object candidate (ARCH 2.8): `dyn P` implements `P` and
+        // every supertrait of `P`, with no impl behind it; calls go
+        // through the vtable.
+        if let Some(pr) = object::principal_of(&self.tys, self_ty) {
+            let want = object::with_self(&mut self.tys, tr, DYN_SELF);
+            let want = TraitRef { bindings: EMPTY_BINDINGS, ..want };
+            let holds = if pr.def == want.def {
+                self.unify_args(pr.args, want.args)
+            } else {
+                object::upcast_path(p, &mut self.tys, pr, want).is_some()
+            };
+            if holds {
+                return Selection::ParamEvidence(usize::MAX);
             }
         }
         let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
@@ -1537,6 +1577,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // template, whose fields are over its own params:
                     // substitute this application's args first.
                     let p = self.p;
+                    // The abstract stand-in of a `?Sized` template param.
+                    if p.gx.unsized_opaques.contains(&a) {
+                        return false;
+                    }
                     let args: Vec<GenericArg> = self.tys.adt_parts(t).map(|(_, a)| self.tys.args(a).to_vec()).unwrap_or_default();
                     let lasts: Vec<Ty> = p.adt(a).variants.iter().filter_map(|v| v.fields.last().map(|f| f.ty)).collect();
                     lasts.into_iter().all(|f| {
@@ -1574,6 +1618,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }))
             }
             TyKind::RawPtr(..) => Some(trait_def == lang.unpin),
+            // A dyn type has the auto traits its bounds name, plus the
+            // ones its principal's supertraits require (ARCH 2.7).
+            TyKind::Dyn(..) => {
+                let a = object::dyn_auto(self.p, &self.tys, t);
+                Some(if trait_def == lang.send {
+                    a.send
+                } else if trait_def == lang.sync {
+                    a.sync
+                } else {
+                    a.unpin
+                })
+            }
             TyKind::Ref(_, m, e) => {
                 seen.push(t);
                 let need = if trait_def == lang.send && !m.is_mut() { lang.sync } else { trait_def };
@@ -2074,6 +2130,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let a = self.rebuild_args(a, zonk);
                 self.tys.intern(TyKind::Opaque(d, a))
             }
+            TyKind::Dyn(b, r) => {
+                let mut bounds = self.tys.dyn_bounds(b).clone();
+                if let Some(pr) = &mut bounds.principal {
+                    pr.value.args = self.rebuild_args(pr.value.args, zonk);
+                }
+                let b = self.tys.intern_dyn_bounds(bounds);
+                self.tys.intern(TyKind::Dyn(b, r))
+            }
             _ => t,
         }
     }
@@ -2169,6 +2233,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::FnDef(d, x), TyKind::FnDef(e, y)) => d == e && self.unify_args(x, y),
             (TyKind::Closure(d, x), TyKind::Closure(e, y)) => d == e && self.unify_args(x, y),
             (TyKind::Opaque(d, x), TyKind::Opaque(e, y)) => d == e && self.unify_args(x, y),
+            // Two dyn types are equal when the principals and the written
+            // auto traits are; regions are erased here, as for references.
+            (TyKind::Dyn(x, _), TyKind::Dyn(y, _)) => {
+                let (bx, by) = (self.tys.dyn_bounds(x).clone(), self.tys.dyn_bounds(y).clone());
+                match (bx.principal, by.principal) {
+                    (Some(px), Some(py)) => bx.auto == by.auto && px.value.def == py.value.def && self.unify_args(px.value.args, py.value.args),
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -2207,6 +2280,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.occurs(v, e)
                 })
             }
+            TyKind::Dyn(b, _) => match self.tys.dyn_bounds(b).principal {
+                Some(pr) => self.tys.args(pr.value.args).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|e| self.occurs(v, e))),
+                None => false,
+            },
             _ => false,
         }
     }
@@ -2265,6 +2342,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
         };
+        // A reference to a dyn type is an unsizing target: rustc commits
+        // to unsizing there and never tries a deref coercion (`&&S` to
+        // `&dyn Tr` needs `&S: Tr`), so neither does this.
+        let dyn_target = matches!(ek, TyKind::Ref(_, _, y) if matches!(self.kind(y), TyKind::Dyn(..)));
         let c = match (fk, ek) {
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
                 if self.kind(s) == TyKind::Str && self.tys.is_string_ty(self.resolve(fbase)) =>
@@ -2297,7 +2378,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Coerce::BoxToRef(fd + 1, em.is_mut())
             }
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, _))
-                if fd > ed && {
+                if !dyn_target && fd > ed && {
                     // An exact structural match wins over a deref
                     // coercion: `&&S` against `&T` binds `T = &S`,
                     // never `T = S` through `*`. rustc coerces only
@@ -2366,6 +2447,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.set(e, expected);
                 }
                 Coerce::None
+            }
+            (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
+                if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
+            {
+                match self.unsize_coercion(x, y, found, expected, span) {
+                    Some(c) => c,
+                    None => return false,
+                }
             }
             _ => {
                 if !self.unify(found, expected) {
@@ -2492,6 +2581,102 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn coerce_expr(&mut self, e: ExprId, found: Ty, expected: Ty) -> bool {
         let span = self.span(e);
         self.coerce_at(found, expected, span, Some(e))
+    }
+
+    /// The Self type of the only impl of `trait_def` for an integer (or
+    /// float) type, if exactly one such impl exists and no blanket impl
+    /// could also take the literal.
+    fn literal_impl_ty(&self, trait_def: DefId, float: bool) -> Option<Ty> {
+        let index = &self.p.gx.index;
+        let mut found: Option<Ty> = None;
+        for &id in index.impls_of_trait(trait_def) {
+            let t = index.get(id).self_ty(&self.p.tys);
+            match self.p.tys.kind(t) {
+                TyKind::Int(_) if !float => {}
+                TyKind::Float(_) if float => {}
+                TyKind::Param(_) => return None,
+                _ => continue,
+            }
+            if found.is_some_and(|f| f != t) {
+                return None;
+            }
+            found = Some(t);
+        }
+        found
+    }
+
+    /// The unsizing coercion from a reference to `x` to a reference to
+    /// the dyn type `y` (ARCH 2.8). A dyn source upcasts (the target
+    /// principal is the source's or a supertrait of it) or drops auto
+    /// traits; a sized source must implement the principal and every
+    /// written auto trait, which are queued as obligations, and becomes
+    /// a vtable request. Reports the error and returns None when the
+    /// coercion cannot apply.
+    fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span) -> Option<Coerce> {
+        let p = self.p;
+        let (mut x, y) = (self.deep(x), self.deep(y));
+        let to = object::principal_of(&self.tys, y)?;
+        // A numeric literal behind the coercion (`&3 as &dyn Tr`): as in
+        // rustc, the one impl of the trait for a type of that kind
+        // decides it, and otherwise the literal falls back to i32 (f64).
+        if let TyKind::Infer(v) = self.tys.kind(x)
+            && (v.is_int() || v.is_float())
+        {
+            let fallback = if v.is_int() { I32 } else { self.tys.float_ty(FloatTy::F64) };
+            let t = self.literal_impl_ty(to.def, v.is_float()).unwrap_or(fallback);
+            self.unify(x, t);
+            x = t;
+        }
+        let want = match self.tys.kind(y) {
+            TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
+            _ => AutoTraits::default(),
+        };
+        if let Some(from) = object::principal_of(&self.tys, x) {
+            let have = object::dyn_auto(p, &self.tys, x);
+            let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
+            let path_ok = if from.def == to.def {
+                self.unify_args(from.args, to.args)
+            } else {
+                object::upcast_path(p, &mut self.tys, from, to).is_some()
+            };
+            if !auto_ok || !path_ok {
+                self.mismatch(span, expected, found);
+                return None;
+            }
+            return Some(Coerce::Unsize(expected));
+        }
+        if !self.sized_ok(x) {
+            let tn = self.tn(x);
+            self.err(
+                "L0110",
+                span,
+                format!("the size for values of type `{tn}` cannot be known, so it cannot become a `dyn` value"),
+                "Only a sized type converts to `&dyn Trait`; pass a reference to a sized value.",
+            );
+            return None;
+        }
+        if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && contains_ref(&self.tys, x) {
+            let tn = self.tn(x);
+            self.err(
+                "L0705",
+                span,
+                format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
+                "Use a type without references here, or drop the `'static` bound from the `dyn` type.",
+            );
+            return None;
+        }
+        let tr = object::with_self(&mut self.tys, to, x);
+        self.obl.push_trait_at(tr, span, 0);
+        let lang = p.gx.lang;
+        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+            if on {
+                let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
+                self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
+            }
+        }
+        let y = object::erase_dyn_region(&mut self.tys, y);
+        self.vtable_sites.push((x, y, span));
+        Some(Coerce::Unsize(expected))
     }
     fn expect_expr(&mut self, e: ExprId, expected: Ty) -> Ty {
         let t = self.expr(e, Some(expected));
@@ -2671,9 +2856,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let span = p.ast.ty_span(t);
         match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
             Ok(t) => {
                 let t = self.instantiate_infers(t);
+                if let Some(d) = object::dyn_type_diag(p, &self.tys, t, span) {
+                    self.errs.push(d);
+                }
                 let t = self.normalize_here(t);
                 // A written type must be well-formed: the
                 // bounds of every local Adt it applies become
@@ -2980,6 +3169,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let t1 = self.block(*then, expected);
                         self.scopes.truncate(scope);
                         let t2 = self.expr(*els, expected.or(Some(t1)));
+                        if let Some(d) = self.dyn_ref_expectation(expected) {
+                            self.coerce_block_tail(*then, t1, d);
+                            self.coerce_expr(*els, t2, d);
+                            return d;
+                        }
                         self.join(t1, t2, Some(*els), span)
                     }
                 }
@@ -3000,6 +3194,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(els) => {
                         let t1 = self.block(*then, expected);
                         let t2 = self.expr(*els, expected.or(Some(t1)));
+                        if let Some(d) = self.dyn_ref_expectation(expected) {
+                            self.coerce_block_tail(*then, t1, d);
+                            self.coerce_expr(*els, t2, d);
+                            return d;
+                        }
                         self.join(t1, t2, Some(*els), span)
                     }
                 }
@@ -3061,6 +3260,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.expect_expr(g, BOOL);
                     }
                     let bt = self.expr(arm.body, expected.or(result));
+                    if let Some(d) = self.dyn_ref_expectation(expected) {
+                        self.coerce_expr(arm.body, bt, d);
+                        result = Some(d);
+                        self.scopes.truncate(scope);
+                        continue;
+                    }
                     result = Some(match result {
                         None => bt,
                         Some(r) => self.join(r, bt, Some(arm.body), self.span(arm.body)),
@@ -3228,6 +3433,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // and `3000000000 as u64` needs no i32 fit first.
                 let exp = if crate::ty::consteval::is_unsuffixed_lit(p.ast, *expr) { Some(target) } else { None };
                 let t = self.expr(*expr, exp);
+                // A cast to a dyn reference is a coercion cast: rustc
+                // allows any coercion through `as` (ARCH 2.8).
+                if matches!(self.kind(target), TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..))) {
+                    self.coerce_expr(*expr, t, target);
+                    return target;
+                }
                 let enum_cast = match self.tys.local_adt(self.resolve(t)) {
                     Some(a) => p.adt(a).is_enum && p.adt(a).variants.iter().all(|v| v.shape == VariantShape::Unit),
                     None => false,
@@ -3864,6 +4075,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let block = self.p.ast.block(b);
         if let Some(tail) = block.tail {
             self.coerce_expr(tail, t, UNIT);
+        }
+    }
+
+    /// The expected type when it is a reference to a dyn type. Branch
+    /// results then coerce to it one by one, as rustc's expectation
+    /// does, instead of joining the branch types first (ARCH 2.8).
+    fn dyn_ref_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
+        let t = self.resolve(expected?);
+        match self.kind(t) {
+            TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Coerces a block's result to `to` at its tail expression.
+    fn coerce_block_tail(&mut self, b: ast::BlockId, t: Ty, to: Ty) {
+        let block = self.p.ast.block(b);
+        match block.tail {
+            Some(tail) => {
+                self.coerce_expr(tail, t, to);
+            }
+            None => {
+                self.coerce_at(t, to, block.span, None);
+            }
         }
     }
 
@@ -10688,6 +10923,27 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
             }
             self.out.locals[i].ty = z;
+        }
+        for i in 0..self.out.coerce.len() {
+            if let Coerce::Unsize(t) = self.out.coerce[i] {
+                let z = self.zonk(t);
+                self.out.coerce[i] = Coerce::Unsize(z);
+            }
+        }
+        for (x, y, span) in std::mem::take(&mut self.vtable_sites) {
+            let (x, y) = (self.zonk(x), self.zonk(y));
+            // After mono, a concrete body's every coercion has its
+            // vtable; a miss is a compiler gap, reported, never emitted.
+            if self.p.gx.mono_done && generics::vtable_for(self.p, &self.tys, x, y).is_none() {
+                let tn = self.tn(x);
+                self.err(
+                    "L0702",
+                    span,
+                    format!("internal: no vtable was built for `{tn}` here, so this `dyn` coercion is not supported yet"),
+                    "Report this; meanwhile, use generics instead of `dyn` here.",
+                );
+            }
+            self.out.vtable_requests.push((x, y));
         }
         self.overflow_lint();
         // Abstract associated const reads (see `abstract_consts`)

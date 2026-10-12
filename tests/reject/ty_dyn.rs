@@ -1,4 +1,4 @@
-// expect: L0701
+// expect: L0702
 fn show(x: &dyn std::fmt::Display) {
     println!("{}", x);
 }

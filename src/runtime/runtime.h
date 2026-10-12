@@ -33,6 +33,10 @@ typedef struct { uint8_t *ptr; uint64_t len; } lust_str;
 typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
 typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;
 typedef struct { uint64_t n; } lust_Args;
+/* `&dyn Trait` and `&mut dyn Trait` (ARCH 2.8): the data pointer and the
+   vtable, an array of words: drop glue, size, align, one super vtable per
+   supertrait, then one entry per method (see src/check/object.rs). */
+typedef struct { void *data; const void *const *vt; } lust_dyn;
 
 /* Program globals, defined in the runtime unit and set by main. */
 extern int lust_argc;

@@ -1981,8 +1981,21 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let mutable = self.eat(Tok::Mut);
+                let bare_bounds = matches!(self.peek(), Tok::Dyn | Tok::Impl);
                 let inner = self.ty()?;
                 let span = start.to(self.prev_span());
+                // rustc E0178: after `&`, a `dyn` or `impl` type takes one
+                // bound; `&dyn A + Send` must be written `&(dyn A + Send)`.
+                if bare_bounds {
+                    let n = match self.ast.ty(inner) {
+                        TyExpr::Dyn { bounds, lifetime, .. } => bounds.len() + usize::from(lifetime.is_some()),
+                        TyExpr::ImplTrait { bounds } => bounds.len(),
+                        _ => 1,
+                    };
+                    if n > 1 {
+                        return Err(syntax(span, "ambiguous `+` in a type: write `&(dyn A + B)`".to_string()));
+                    }
+                }
                 let mut t = self.push_ty(TyExpr::Ref { lifetime, mutable, inner }, span);
                 if double {
                     t = self.push_ty(TyExpr::Ref { lifetime: None, mutable: false, inner: t }, span);

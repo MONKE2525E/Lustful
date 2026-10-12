@@ -2971,6 +2971,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     19u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Dyn => 20u8.hash(h),
             }
         }
         let mut h = crate::intern::FxHasher::default();

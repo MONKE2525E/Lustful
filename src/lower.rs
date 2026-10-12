@@ -422,7 +422,69 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.assign(Place::local(tmp), Rvalue::Ref(m, place.deref()), span);
                 if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
             }
+            Coerce::Unsize(target) => self.unsize(op, ty, target, span),
         }
+    }
+
+    /// The type of `e` after its recorded coercion, for temporaries
+    /// that hold the coerced operand.
+    fn coerced_ty(&self, e: ExprId) -> Ty {
+        match self.ck.coerce(e) {
+            Coerce::StrFromString => REF_STR,
+            Coerce::Unsize(t) => t,
+            _ => self.ty(e),
+        }
+    }
+
+    /// Lowers an unsizing coercion (ARCH 2.8) of the reference `op` (of
+    /// type `found`) to `target`, a dyn reference: a reborrow of the
+    /// source at the target's mutability (so a `&mut` source stays
+    /// usable after, as in rustc), then a new fat pointer for a thin
+    /// source, or an upcast (or a plain copy, when only auto traits
+    /// drop) for a dyn source.
+    fn unsize(&mut self, op: Operand, found: Ty, target: Ty, span: Span) -> Operand {
+        use crate::check::object;
+        let TyKind::Ref(_, tm, dyn_ty) = self.kind(target) else { return op };
+        let m = tm.is_mut();
+        let place = self.op_place(op, found, span);
+        let src = self.peel(found, 1);
+        let rt = self.ref_ty(m, src);
+        let r = self.temp(rt);
+        self.assign(Place::local(r), Rvalue::Ref(m, place.deref()), span);
+        let ptr = if m { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+        let rv = match (object::principal_of(&self.body.tys, src), object::principal_of(&self.body.tys, dyn_ty)) {
+            (Some(from), Some(to)) => {
+                let path = object::upcast_path(self.p, &mut self.body.tys, from, to).unwrap_or_default();
+                if path.is_empty() { Rvalue::Use(ptr) } else { Rvalue::DynUpcast { ptr, path } }
+            }
+            _ => Rvalue::MakeDyn { ptr, src, dyn_ty },
+        };
+        let out = self.temp(target);
+        self.assign(Place::local(out), rv, span);
+        if m { Operand::Move(Place::local(out)) } else { Operand::Copy(Place::local(out)) }
+    }
+
+    /// Points a dyn method call's receiver at the vtable of the trait
+    /// that declares the method: unchanged for a principal method, an
+    /// upcast along the super slots for a supertrait method.
+    fn dyn_receiver(&mut self, recv: Operand, recv_dyn: Ty, mutable: bool, owner: DefId, name: crate::intern::Sym, span: Span) -> Operand {
+        use crate::check::object;
+        let Some(principal) = object::principal_of(&self.body.tys, recv_dyn) else { return recv };
+        if principal.def == owner {
+            return recv;
+        }
+        let cands = object::object_cands(self.p, &mut self.body.tys, principal, name);
+        let Some(c) = cands.into_iter().find(|c| c.owner.def == owner) else { return recv };
+        let path = object::upcast_path(self.p, &mut self.body.tys, principal, c.owner).unwrap_or_default();
+        if path.is_empty() {
+            return recv;
+        }
+        let bounds = self.body.tys.intern_dyn_bounds(DynBounds { principal: Some(Binder::plain(c.owner)), supertraits: Box::new([]), auto: AutoTraits::default() });
+        let owner_dyn = self.body.tys.intern(TyKind::Dyn(bounds, Region::Erased));
+        let rt = self.ref_ty(mutable, owner_dyn);
+        let t = self.temp(rt);
+        self.assign(Place::local(t), Rvalue::DynUpcast { ptr: recv, path }, span);
+        if mutable { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) }
     }
 
     fn op_place(&mut self, op: Operand, ty: Ty, span: Span) -> Place {
@@ -965,8 +1027,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         Operand::Const(_) => o,
                         _ if fresh_temp => o,
                         _ => {
-                            let ft = self.ty(fe);
-                            let ft = if self.ck.coerce(fe) == Coerce::StrFromString { REF_STR } else { ft };
+                            let ft = self.coerced_ty(fe);
                             let t = self.temp(ft);
                             self.assign(Place::local(t), Rvalue::Use(o), span);
                             self.operand_from(Place::local(t), ft)
@@ -1293,7 +1354,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                         BindMode::Move => {
                             // `let x = &temp();` extends the temporary to the enclosing block.
                             if let Expr::Ref { mutable, expr, .. } = p.ast.expr(init)
-                                && matches!(self.ck.coerce(init), Coerce::None | Coerce::SliceFromArray(_) | Coerce::SliceFromVec(_))
+                                && matches!(
+                                    self.ck.coerce(init),
+                                    Coerce::None | Coerce::SliceFromArray(_) | Coerce::SliceFromVec(_) | Coerce::Unsize(_)
+                                )
                                 && !self.is_place_expr(*expr)
                             {
                                 let t = self.ty(*expr);
@@ -1303,6 +1367,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                                 self.expr_into(*expr, Some(&Place::local(tmp)));
                                 if self.ck.coerce(init) == Coerce::None {
                                     self.assign(Place::local(l), Rvalue::Ref(*mutable, Place::local(tmp)), span);
+                                } else if let Coerce::Unsize(target) = self.ck.coerce(init) {
+                                    // `let d: &dyn Tr = &S::new();` extends the
+                                    // temporary too, then unsizes the borrow.
+                                    let rt = self.ref_ty(*mutable, t);
+                                    let r = self.temp(rt);
+                                    self.assign(Place::local(r), Rvalue::Ref(*mutable, Place::local(tmp)), span);
+                                    let op = if *mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+                                    let o = self.unsize(op, rt, target, span);
+                                    self.assign(Place::local(l), Rvalue::Use(o), span);
                                 } else {
                                     self.assign(Place::local(l), Rvalue::SliceOf(Place::local(tmp)), span);
                                 }
@@ -1555,9 +1628,17 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.prim_op_into(e, recv, args, dest, span, kind, derefs);
             return;
         }
+        /// What a method call calls once its receiver is in place.
+        enum Callee {
+            Fn(LocalDefId),
+            Builtin(Builtin),
+            /// Through the vtable: the declaring trait and the slot.
+            Dyn(DefId, u32),
+        }
         let (callee, derefs, autoref) = match self.ck.res(e) {
-            Res::Method { f, derefs, autoref } => (Ok(f), derefs, autoref),
-            Res::BuiltinMethod { b, derefs, autoref } => (Err(b), derefs, autoref),
+            Res::Method { f, derefs, autoref } => (Callee::Fn(f), derefs, autoref),
+            Res::BuiltinMethod { b, derefs, autoref } => (Callee::Builtin(b), derefs, autoref),
+            Res::DynMethod { owner, slot, derefs, autoref } => (Callee::Dyn(owner, slot), derefs, autoref),
             _ => return,
         };
         let recv_ty = self.peel(self.ty(recv), derefs);
@@ -1603,6 +1684,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                             Operand::Copy(pl) if !pl.proj.is_empty() => {
                                 let aty = match self.ck.coerce(a) {
                                     Coerce::Deref(n) => self.peel(self.ty(a), n),
+                                    Coerce::Unsize(t) => t,
                                     _ => self.ty(a),
                                 };
                                 let tt = self.temp(aty);
@@ -1638,8 +1720,26 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
         }
         let target = match callee {
-            Ok(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
-            Err(b) => CallTarget::Builtin(b),
+            Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
+            Callee::Builtin(b) => CallTarget::Builtin(b),
+            Callee::Dyn(owner, slot) => {
+                let Expr::MethodCall { name, .. } = self.p.ast.expr(e) else { return };
+                let r = ops.remove(0);
+                let r = self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, *name, span);
+                ops.insert(0, r);
+                // The call writes a temporary of the method's own return
+                // type: codegen reads the vtable entry's C signature from
+                // its destination, and a `!` method's destination may
+                // have any type.
+                let rt = self.ty(e);
+                let t = self.temp(rt);
+                self.call_into(CallTarget::Dyn(slot), ops, Place::local(t), span);
+                if let Some(d) = dest {
+                    let o = self.operand_from(Place::local(t), rt);
+                    self.assign(d.clone(), Rvalue::Use(o), span);
+                }
+                return;
+            }
         };
         let d = self.call_dest(dest, self.ty(e));
         self.call_into(target, ops, d, span);

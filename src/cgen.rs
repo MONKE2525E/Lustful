@@ -47,6 +47,10 @@ pub enum CTy {
     /// An `Rc<T>`: a pointer to the generated counted header
     /// (`strong`, `weak`, then the value), also never null.
     Rc(Box<CTy>),
+    /// A `&dyn Trait` or `&mut dyn Trait` value, or a dyn place (the
+    /// fat value stands for it, as for slices): the runtime's
+    /// `lust_dyn` (data pointer and vtable, ARCH 2.8).
+    Dyn,
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -103,8 +107,10 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             CTy::Array(Box::new(cty(tys, e)), n)
         }
         TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
+        TyKind::Dyn(..) => CTy::Dyn,
         TyKind::Ref(_, _, e) => match tys.kind(e) {
             TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
+            TyKind::Dyn(..) => CTy::Dyn,
             _ => CTy::Ref(Box::new(cty(tys, e))),
         },
         TyKind::Adt(..) => match tys.builtin_of(t) {
@@ -187,6 +193,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Slice(_) => format!("Sl_{}", mangle(t)),
         CTy::Float(f) => (*f).name().replace("f64", "double").replace("f32", "float"),
         CTy::FnPtr(..) => format!("Fp_{}", mangle(t)),
+        CTy::Dyn => "lust_dyn".into(),
     }
 }
 
@@ -215,6 +222,7 @@ fn mangle(t: &CTy) -> String {
             let ps: String = ps.iter().map(|e| format!("{}_", mangle(e))).collect();
             format!("fp{ps}r{}_", mangle(r))
         }
+        CTy::Dyn => "dyn".into(),
     }
 }
 
@@ -282,7 +290,17 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
 
 fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
+        CTy::Unit
+        | CTy::Bool
+        | CTy::Char
+        | CTy::Int(_)
+        | CTy::Float(_)
+        | CTy::FnPtr(..)
+        | CTy::Ref(_)
+        | CTy::Args
+        | CTy::Chars
+        | CTy::Slice(_)
+        | CTy::Dyn => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
@@ -373,6 +391,12 @@ struct FnGen<'b, 'p, 'a> {
     tmp: u32,
     /// This function's return value uses the out-pointer ABI (`ret_is_large`).
     ret_large: bool,
+    /// Vtable statics this function's unsizing coercions use, by vtable
+    /// id, to their C names. Each function emits its own copies (named
+    /// by its slot), so a unit never defines one twice.
+    vtables: HashMap<u32, String>,
+    /// Vtable statics and their method shims, emitted ahead of the function.
+    prelude: String,
 }
 
 /// A layout with no field or niche detail, for runtime struct types whose
@@ -461,7 +485,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
-            CTy::Slice(_) => Some(layout::fat_ptr_layout()),
+            CTy::Slice(_) | CTy::Dyn => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::tuple_layout(&fields?).ok()
@@ -674,7 +698,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let (es, ea) = go(p, e, seen);
                 (es * (*n).max(1), ea)
             }
-            CTy::Slice(_) => (16, 8),
+            CTy::Slice(_) | CTy::Dyn => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -799,6 +823,8 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         slots,
         tmp: 0,
         ret_large: ret_is_large(p, body.fn_id),
+        vtables: HashMap::new(),
+        prelude: String::new(),
     };
     g.collect_move_paths();
     if g.bad_move {
@@ -807,6 +833,9 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     g.function();
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
+    }
+    if !g.prelude.is_empty() {
+        g.out = std::mem::take(&mut g.prelude) + &g.out;
     }
     g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
     // A `main` returning `Result` gets a Termination entry in its
@@ -1275,8 +1304,8 @@ impl FnGen<'_, '_, '_> {
                     e = format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]");
                     t = *el;
                 }
-                (Proj::Deref, CTy::Slice(_)) => {
-                    // A slice place is represented by its fat value, like `str`.
+                (Proj::Deref, CTy::Slice(_)) | (Proj::Deref, CTy::Dyn) => {
+                    // A slice or dyn place is represented by its fat value, like `str`.
                 }
                 (Proj::Index(l), CTy::Slice(el)) => {
                     e = format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]");
@@ -1483,10 +1512,12 @@ impl FnGen<'_, '_, '_> {
                     CallTarget::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret) == CTy::Unit,
                     CallTarget::Intrinsic(id) => lang::intrinsic(*id).ret == SigTy::Never,
                     CallTarget::Indirect(c) => matches!(&self.local_cty[*c as usize], CTy::FnPtr(_, r) if **r == CTy::Unit),
-                    CallTarget::Builtin(_) => false,
+                    // Lowering gives a dyn call a destination of the
+                    // method's own return type.
+                    CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
                 };
                 self.emit_assign(dest, mentions, &loc, |s, loc, post| {
-                    let v = s.call_value(*target, args, loc, post);
+                    let v = s.call_value(*target, args, &dest_cty, loc, post);
                     if ret_unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
                 });
                 if Some(next.0 as usize) != next_block {
@@ -1514,7 +1545,7 @@ impl FnGen<'_, '_, '_> {
     /// The C text of one call's result value. Every user fn call goes through
     /// `lust_fns`, so a changed function can be swapped in without relinking
     /// its callers.
-    fn call_value(&mut self, target: CallTarget, args: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+    fn call_value(&mut self, target: CallTarget, args: &[Operand], dest_cty: &CTy, loc: &str, post: &mut Vec<String>) -> String {
         match target {
             CallTarget::Fn(f) => {
                 let info = self.p.fn_info(f);
@@ -1536,6 +1567,34 @@ impl FnGen<'_, '_, '_> {
             }
             CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
+            CallTarget::Dyn(k) => {
+                // Through the vtable: entry `k` is a shim whose receiver
+                // is the erased data pointer (see `vtable_shim`). The
+                // return type is the destination's, which lowering made
+                // the method's own.
+                let (r, _) = self.operand(&args[0], loc, post);
+                let rt = self.tmp();
+                let _ = writeln!(self.out, "    lust_dyn {rt} = {r};");
+                let mut vals: Vec<String> = Vec::new();
+                let mut tys: Vec<String> = vec!["void *".into()];
+                for o in &args[1..] {
+                    let (v, t) = self.operand(o, loc, post);
+                    collect_types(&t, &mut self.sig_types);
+                    tys.push(ctype(&t));
+                    vals.push(v);
+                }
+                let ret = dest_cty.clone();
+                collect_types(&ret, &mut self.sig_types);
+                let rc = ctype(&ret);
+                let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
+                if c_size_align(self.p, &ret).0 > 32 {
+                    let t = self.tmp();
+                    let _ = writeln!(self.out, "    {rc} {t}; ((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
+                    t
+                } else {
+                    format!("(({rc} (*)({}))({rt}.vt[{k}]))({rt}.data{pre})", tys.join(", "))
+                }
+            }
             CallTarget::Indirect(callee) => {
                 let ct = self.local_cty[callee as usize].clone();
                 let CTy::FnPtr(_, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
@@ -1574,7 +1633,8 @@ impl FnGen<'_, '_, '_> {
                 let slice_place = matches!(t, CTy::Slice(_))
                     && (matches!(pl.proj.last(), Some(Proj::Deref))
                         || matches!(self.body.tys.kind(self.body.locals[pl.local as usize].ty), TyKind::Slice(_)));
-                if t == CTy::Str || slice_place { e } else { format!("(&{e})") }
+                let dyn_place = t == CTy::Dyn && matches!(pl.proj.last(), Some(Proj::Deref));
+                if t == CTy::Str || slice_place || dyn_place { e } else { format!("(&{e})") }
             }
             Rvalue::SliceOf(pl) => {
                 let (e, t) = self.place(pl, loc);
@@ -1888,7 +1948,93 @@ impl FnGen<'_, '_, '_> {
                     _ => "0".into(),
                 }
             }
+            Rvalue::MakeDyn { ptr, src, dyn_ty } => {
+                let (v, _) = self.operand(ptr, loc, post);
+                let vid = crate::check::generics::vtable_for(self.p, &self.body.tys, *src, *dyn_ty)
+                    .expect("mono builds a vtable for every unsizing coercion in a concrete body");
+                let vt = self.vtable_sym(vid);
+                format!("((lust_dyn){{ (void *)({v}), {vt} }})")
+            }
+            Rvalue::DynUpcast { ptr, path } => {
+                let (v, _) = self.operand(ptr, loc, post);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    lust_dyn {t} = {v};");
+                for k in path {
+                    let _ = writeln!(self.out, "    {t}.vt = (const void *const *){t}.vt[{k}];");
+                }
+                t
+            }
         }
+    }
+
+    /// The C name of vtable `vid` in this function, emitting it (and the
+    /// super vtables it points at) into the prelude on first use. See
+    /// `check::object` for the word layout.
+    fn vtable_sym(&mut self, vid: u32) -> String {
+        if let Some(s) = self.vtables.get(&vid) {
+            return s.clone();
+        }
+        let p = self.p;
+        let vt = p.gx.vtables[vid as usize].clone();
+        let supers: Vec<String> = vt.supers.iter().map(|&s| self.vtable_sym(s)).collect();
+        let fslot = self.slots[self.body.fn_id.0 as usize];
+        let name = format!("vt{fslot}_{vid}");
+        let ct = cty(&p.tys, vt.self_ty);
+        let drop = if needs_drop_c(p, &ct) {
+            self.want(Glue::Drop, &ct);
+            format!("(void *)drop_{}", mangle(&ct))
+        } else {
+            "0".to_string()
+        };
+        let (size, align) = match layout::layout_of_ty(&p.tys, p, vt.self_ty) {
+            Ok(l) => (l.size, l.align),
+            Err(()) => c_size_align(p, &ct),
+        };
+        let mut words = vec![drop, format!("(void *)(uintptr_t){size}"), format!("(void *)(uintptr_t){align}")];
+        words.extend(supers.iter().map(|s| format!("(void *){s}")));
+        for (j, &f) in vt.methods.iter().enumerate() {
+            let shim = self.vtable_shim(&name, j, f);
+            words.push(format!("(void *){shim}"));
+        }
+        let tn = crate::check::object::trait_name(p, vt.principal.def);
+        let _ = writeln!(self.prelude, "/* vtable: {} as {tn} */", ty_name(p, &p.tys, vt.self_ty));
+        let _ = writeln!(self.prelude, "static const void *const {name}[] = {{ {} }};", words.join(", "));
+        self.vtables.insert(vid, name.clone());
+        name
+    }
+
+    /// One vtable method entry: a shim that takes the erased receiver and
+    /// forwards through `lust_fns[slot]`, so the entry never names a body
+    /// an overlay could replace (ARCH 4.5). Its C signature is the
+    /// method's with `void *` for the receiver; dyn call sites cast the
+    /// entry to that shape.
+    fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId) -> String {
+        let p = self.p;
+        let info = p.fn_info(f);
+        for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
+            collect_types(&cty(&p.tys, t), &mut self.sig_types);
+        }
+        let name = format!("{vt_name}_m{j}");
+        let ret = ctype(&cty(&p.tys, info.ret));
+        let cast = fn_ptr_cast(p, f);
+        let slot = self.slots[f.0 as usize];
+        let recv = ctype(&cty(&p.tys, info.params[0]));
+        let mut decls: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for (i, &t) in info.params.iter().enumerate().skip(1) {
+            decls.push(format!("{} a{i}", ctype(&cty(&p.tys, t))));
+            names.push(format!(", a{i}"));
+        }
+        let (decls, names) = (decls.iter().map(|d| format!(", {d}")).collect::<String>(), names.concat());
+        if ret_is_large(p, f) {
+            let _ = writeln!(
+                self.prelude,
+                "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out, ({recv})self{names}); }}"
+            );
+        } else {
+            let _ = writeln!(self.prelude, "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])(({recv})self{names}); }}");
+        }
+        name
     }
 
     fn bin(&mut self, op: BinOp, a: &str, at: &CTy, b: &str, bt: &CTy, loc: &str) -> String {
@@ -5046,7 +5192,13 @@ fn parts_moves<'r>(parts: &'r [FmtPart], out: &mut Vec<&'r Place>) {
 /// both go through it, so a new `Rvalue` variant updates both.
 fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: &mut impl FnMut(&'r Place)) {
     match rv {
-        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::ArrayRepeat(_, o, _) | Rvalue::Res(_, _, o) => op(o),
+        Rvalue::Use(o)
+        | Rvalue::Un(_, o)
+        | Rvalue::Cast(o, _)
+        | Rvalue::ArrayRepeat(_, o, _)
+        | Rvalue::Res(_, _, o)
+        | Rvalue::MakeDyn { ptr: o, .. }
+        | Rvalue::DynUpcast { ptr: o, .. } => op(o),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op(a);
             op(b);

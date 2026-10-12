@@ -129,6 +129,14 @@ pub enum Rvalue {
     /// then yields the slot trampoline address). Proposed by W-CGEN
     /// for W-CORELANG's fn-pointer lowering.
     FnValue(LocalDefId, Ty),
+    /// A dyn reference from a thin one (ARCH 2.8): `ptr` is `&T` or
+    /// `&mut T`, `src` is `T`, and `dyn_ty` the target dyn type. The
+    /// result pairs the data pointer with the vtable of (`src`, the dyn
+    /// principal), which mono built and codegen emits.
+    MakeDyn { ptr: Operand, src: Ty, dyn_ty: Ty },
+    /// Trait upcasting: the same data pointer, with the vtable reached
+    /// by loading each super slot word index in `path` in turn.
+    DynUpcast { ptr: Operand, path: Vec<u32> },
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +175,11 @@ pub enum CallTarget {
     /// The local's type is the `FnPtr` signature; `args` are the call
     /// arguments only. Proposed by W-CGEN for W-CORELANG.
     Indirect(Local),
+    /// A call through a vtable (ARCH 2.8): `args[0]` is the dyn
+    /// receiver (`&dyn Tr` or `&mut dyn Tr`, a fat pointer), and the
+    /// payload is the method's word index in that receiver's vtable.
+    /// The callee gets the data pointer, then `args[1..]`.
+    Dyn(u32),
 }
 
 #[derive(Clone, Debug)]

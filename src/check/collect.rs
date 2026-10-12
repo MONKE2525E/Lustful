@@ -2035,7 +2035,14 @@ pub fn collect_reuse<'a>(
                         }
                     }
                 }
-                if trait_ref.is_none() && owner.is_none() {
+                // `impl dyn Trait { .. }`: inherent methods on a dyn
+                // type, found by the dyn receiver probe (check/method.rs).
+                let dyn_self = trait_ref.is_none() && matches!(p.tys.kind(self_pat), TyKind::Dyn(..));
+                if dyn_self {
+                    p.gx.has_generics = true;
+                    p.gx.dyn_impl_sites.push((self_pat, ast.ty_span(imp.self_ty)));
+                }
+                if trait_ref.is_none() && owner.is_none() && !dyn_self {
                     errs.push(Diag::new(
                         "L0102",
                         ast.ty_span(imp.self_ty),
@@ -2065,6 +2072,12 @@ pub fn collect_reuse<'a>(
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
                     let id = add_fn(&mut p, def, owner, Some(self_pat), Some(impl_def), &parent_gen, hash, &mut errs);
                     method_ids.push(id);
+                    if dyn_self {
+                        let key = (crate::check::object::erase_dyn_region(&mut p.tys, self_pat), def.name);
+                        if p.gx.dyn_inherent.insert(key, id).is_some() {
+                            errs.push(dup(def.name_span, interner.get(def.name)));
+                        }
+                    }
                     if trait_ref.is_none() {
                         // Inherent methods join the compat method
                         // table under the *template* Adt; instances

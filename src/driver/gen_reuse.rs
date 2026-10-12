@@ -49,8 +49,8 @@ struct TemplateEntry {
 }
 
 /// One clean discovery check: the Adt types the body names, its
-/// instance requests (template def, owned args), and its closures, in
-/// check order.
+/// instance requests (template def, owned args), its closures, and its
+/// vtable requests (concrete type, dyn type), in check order.
 struct DiscoveryEntry {
     src: u64,
     env: u64,
@@ -58,11 +58,13 @@ struct DiscoveryEntry {
     adt_tys: Vec<OwnedTy>,
     requests: Vec<(DefId, Vec<OwnedArg>)>,
     closures: Vec<OwnedClosure>,
+    vtables: Vec<(OwnedTy, OwnedTy)>,
 }
 
 /// What one stored discovery check replays: Adt types, requests with
-/// templates as this program's local ids, and closures to register.
-pub(crate) type Discovered = (Vec<OwnedTy>, Vec<(LocalDefId, Vec<OwnedArg>)>, Vec<OwnedClosure>);
+/// templates as this program's local ids, closures to register, and
+/// vtable requests.
+pub(crate) type Discovered = (Vec<OwnedTy>, Vec<(LocalDefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>);
 
 /// The session's generic reuse cache. `collect_reuse` moves it into
 /// `GenTables::reuse` for one collect and back out after.
@@ -300,7 +302,7 @@ impl GenReuse {
         }
         e.env = self.env;
         self.discovery_reused += 1;
-        Some((e.adt_tys.clone(), requests, e.closures.clone()))
+        Some((e.adt_tys.clone(), requests, e.closures.clone(), e.vtables.clone()))
     }
 
     /// Stores the output of one clean discovery check of fn `f`.
@@ -313,6 +315,7 @@ impl GenReuse {
         adt_tys: &[OwnedTy],
         requests: &[(LocalDefId, Vec<OwnedArg>)],
         closures: &[OwnedClosure],
+        vtables: &[(OwnedTy, OwnedTy)],
     ) {
         if !self.on {
             return;
@@ -320,7 +323,15 @@ impl GenReuse {
         let Some(src) = self.src_of(p, f) else { return };
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
         let reads = with_own_sig(p, f, reads);
-        let entry = DiscoveryEntry { src, env: self.env, reads, adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec() };
+        let entry = DiscoveryEntry {
+            src,
+            env: self.env,
+            reads,
+            adt_tys: adt_tys.to_vec(),
+            requests,
+            closures: closures.to_vec(),
+            vtables: vtables.to_vec(),
+        };
         self.discovery.insert(p.def_id(f), entry);
     }
 }
@@ -385,13 +396,14 @@ fn hash_owned_ty(h: &mut FxHasher, t: &OwnedTy) {
             }
             hash_owned_ty(h, output);
         }
-        OwnedTy::Dyn(principal, supers, auto, r) => {
-            (12u8, principal.count, auto, r).hash(h);
-            hash_owned_args(h, &principal.value);
-            (supers.len() as u64).hash(h);
-            for (count, args) in supers {
-                count.hash(h);
-                hash_owned_args(h, args);
+        OwnedTy::Dyn(principal, auto, r) => {
+            (12u8, auto, r).hash(h);
+            match principal {
+                Some((d, a)) => {
+                    (1u8, d).hash(h);
+                    hash_owned_args(h, a);
+                }
+                None => 0u8.hash(h),
             }
         }
     }
