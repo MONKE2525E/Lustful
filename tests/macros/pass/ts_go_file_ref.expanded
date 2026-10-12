@@ -13,23 +13,20 @@ version , * key ) , } } } impl < T : ? Sized + 'static > Clone for FileRef < T >
 version , key , get } => FileRef :: Pinned { version : Rc :: clone ( version ) , key : * key , get :
 * get , } , } } } pub fn go_file ( file : usize ) -> FileRef < GoFile > { if file == 0 { static F :
 std :: sync :: OnceLock < GoFile > = std :: sync :: OnceLock :: new ( ) ; FileRef :: Static ( F .
-get_or_init ( || GoFile { info : 10 , items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe (
-:: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ 5 , 6
-, 7 ] ) ) , } ) ) } else { FileRef :: Pinned { version : Rc :: new ( FileVersion { file : GoFile {
-info : 20 , items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
-write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ 8 , 9 ] ) ) , } , } ) , key : 0
-, get : | v , _k | v . go_file ( ) , } } } pub mod file_version { pub ( crate ) use go_file_ref ; }
-} fn main ( ) { let info = { let key : usize = 0usize ; match crate :: ast :: go_file ( 0usize ) {
-crate :: ast :: FileRef :: Static ( g ) => { let _k = key ; crate :: ast :: FileRef :: Static ( & g
-. info ) } crate :: ast :: FileRef :: Pinned { version , .. } => crate :: ast :: FileRef :: Pinned {
-version , key , get : | version , _k | { let g = version . go_file ( ) ; & g . info } , } , } } ;
-println ! ( "static info={0}" , * info ) ; let item = { let key : usize = 2usize ; match crate ::
-ast :: go_file ( 0usize ) { crate :: ast :: FileRef :: Static ( g ) => { let k = key ; crate :: ast
-:: FileRef :: Static ( & g . items [ k ] ) } crate :: ast :: FileRef :: Pinned { version , .. } =>
-crate :: ast :: FileRef :: Pinned { version , key , get : | version , k | { let g = version .
-go_file ( ) ; & g . items [ k ] } , } , } } ; println ! ( "static item={0}" , * item ) ; let pinned
-= { let key : usize = 1usize ; match crate :: ast :: go_file ( 1usize ) { crate :: ast :: FileRef ::
-Static ( g ) => { let k = key ; crate :: ast :: FileRef :: Static ( & g . items [ k ] ) } crate ::
-ast :: FileRef :: Pinned { version , .. } => crate :: ast :: FileRef :: Pinned { version , key , get
-: | version , k | { let g = version . go_file ( ) ; & g . items [ k ] } , } , } } ; println ! (
-"pinned item={0}" , * pinned ) ; }
+get_or_init ( || GoFile { info : 10 , items : vec ! [ 5 , 6 , 7 ] , } ) ) } else { FileRef :: Pinned
+{ version : Rc :: new ( FileVersion { file : GoFile { info : 20 , items : vec ! [ 8 , 9 ] , } , } )
+, key : 0 , get : | v , _k | v . go_file ( ) , } } } pub mod file_version { pub ( crate ) use
+go_file_ref ; } } fn main ( ) { let info = { let key : usize = 0usize ; match crate :: ast ::
+go_file ( 0usize ) { crate :: ast :: FileRef :: Static ( g ) => { let _k = key ; crate :: ast ::
+FileRef :: Static ( & g . info ) } crate :: ast :: FileRef :: Pinned { version , .. } => crate ::
+ast :: FileRef :: Pinned { version , key , get : | version , _k | { let g = version . go_file ( ) ;
+& g . info } , } , } } ; println ! ( "static info={0}" , * info ) ; let item = { let key : usize =
+2usize ; match crate :: ast :: go_file ( 0usize ) { crate :: ast :: FileRef :: Static ( g ) => { let
+k = key ; crate :: ast :: FileRef :: Static ( & g . items [ k ] ) } crate :: ast :: FileRef ::
+Pinned { version , .. } => crate :: ast :: FileRef :: Pinned { version , key , get : | version , k |
+{ let g = version . go_file ( ) ; & g . items [ k ] } , } , } } ; println ! ( "static item={0}" , *
+item ) ; let pinned = { let key : usize = 1usize ; match crate :: ast :: go_file ( 1usize ) { crate
+:: ast :: FileRef :: Static ( g ) => { let k = key ; crate :: ast :: FileRef :: Static ( & g . items
+[ k ] ) } crate :: ast :: FileRef :: Pinned { version , .. } => crate :: ast :: FileRef :: Pinned {
+version , key , get : | version , k | { let g = version . go_file ( ) ; & g . items [ k ] } , } , }
+} ; println ! ( "pinned item={0}" , * pinned ) ; }

@@ -1710,63 +1710,61 @@ map_or ( SyntaxKind :: Unknown , NodeData :: kind ) } } fn registry ( ) -> & 'st
 Mutex < Vec < & 'static NodeData >> { static REG : std :: sync :: OnceLock < std :: sync :: Mutex <
 Vec < & 'static NodeData >> > = std :: sync :: OnceLock :: new ( ) ; REG . get_or_init ( || { let
 nil : & 'static NodeData = Box :: leak ( Box :: new ( NodeData :: Identifier ( Box :: default ( ) )
-) ) ; std :: sync :: Mutex :: new ( :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc
-:: intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ nil ] ) ) ) } )
-} pub fn register ( file : usize , data : NodeData ) -> Node { let leaked : & 'static NodeData = Box
-:: leak ( Box :: new ( data ) ) ; let mut reg = registry ( ) . lock ( ) . unwrap ( ) ; let id = reg
-. len ( ) as u32 ; reg . push ( leaked ) ; Node { file : file as u32 , id } } pub fn static_ast_node
-( n : Node ) -> Option < & 'static NodeData > { registry ( ) . lock ( ) . unwrap ( ) . get ( n . id
-as usize ) . copied ( ) } pub fn frozen_store_kind ( n : Node ) -> Option < SyntaxKind > { if n .
-is_nil ( ) { return Some ( SyntaxKind :: Unknown ) ; } static_ast_node ( n ) . map ( NodeData ::
-kind ) } pub fn is_data_of ( d : & NodeData , n : Node ) -> bool { static_ast_node ( n ) .
-is_some_and ( | data | std :: ptr :: eq ( d , data ) ) } pub fn opt ( file : usize , id : Option <
-crate :: astdata :: NodeId > ) -> Node { match id { Some ( id ) => Node :: new ( file , id ) , None
-=> Node :: NIL , } } pub fn req ( file : usize , id : crate :: astdata :: NodeId ) -> Node { Node ::
-new ( file , id ) } pub fn some_opt ( file : usize , id : Option < crate :: astdata :: NodeId > ) ->
-Option < Node > { id . map ( | i | req ( file , i ) ) } pub fn some_req ( file : usize , id : crate
-:: astdata :: NodeId ) -> Option < Node > { Some ( req ( file , id ) ) } pub fn mods ( file : usize
-, m : & 'static Option < crate :: astdata :: ModifierList > ) -> ModifierList { ModifierList ::
-from_ts ( file , m . as_ref ( ) ) } pub struct NodeList { file : u32 , list : Option < & 'static
-crate :: astdata :: NodeList > , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl ::
-core :: clone :: TrivialClone for NodeList { } # [ automatically_derived ] impl :: core :: clone ::
-Clone for NodeList { # [ inline ] fn clone ( & self ) -> NodeList { let _ : :: core :: clone ::
-AssertParamIsClone < u32 > ; let _ : :: core :: clone :: AssertParamIsClone < Option < & 'static
-crate :: astdata :: NodeList >> ; * self } } # [ automatically_derived ] impl :: core :: marker ::
-Copy for NodeList { } # [ automatically_derived ] impl :: core :: fmt :: Debug for NodeList { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "NodeList" , "file" , & self . file ,
-"list" , && self . list ) } } # [ automatically_derived ] impl :: core :: marker ::
-StructuralPartialEq for NodeList { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq
-for NodeList { # [ inline ] fn eq ( & self , other : & NodeList ) -> bool { self . file == other .
-file && self . list == other . list } } # [ automatically_derived ] impl :: core :: cmp :: Eq for
-NodeList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self
-) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; let _ : :: core :: cmp :: AssertParamIsEq <
-Option < & 'static crate :: astdata :: NodeList >> ; } } impl NodeList { pub const NIL : NodeList =
-NodeList { file : 0 , list : None } ; pub fn from_ts ( file : usize , list : Option < & 'static
-crate :: astdata :: NodeList > ) -> Self { match list { Some ( list ) => NodeList { file : file as
-u32 , list : Some ( list ) } , None => Self :: NIL , } } pub fn len ( self ) -> usize { self . list
-. map_or ( 0 , | l | l . items . len ( ) ) } pub fn is_nil ( self ) -> bool { self . list . is_none
-( ) } pub fn nodes ( self ) -> Vec < Node > { self . list . map_or_else ( Vec :: new , | l | l .
-items . iter ( ) . map ( | i | Node :: new ( self . file as usize , * i ) ) . collect ( ) ) } } pub
-struct ModifierList { file : u32 , list : Option < & 'static crate :: astdata :: ModifierList > , }
-# [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
-ModifierList { } # [ automatically_derived ] impl :: core :: clone :: Clone for ModifierList { # [
-inline ] fn clone ( & self ) -> ModifierList { let _ : :: core :: clone :: AssertParamIsClone < u32
-> ; let _ : :: core :: clone :: AssertParamIsClone < Option < & 'static crate :: astdata ::
-ModifierList >> ; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy for
-ModifierList { } # [ automatically_derived ] impl :: core :: fmt :: Debug for ModifierList { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ModifierList" , "file" , & self . file
-, "list" , && self . list ) } } # [ automatically_derived ] impl :: core :: marker ::
-StructuralPartialEq for ModifierList { } # [ automatically_derived ] impl :: core :: cmp ::
-PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : & ModifierList ) -> bool { self .
-file == other . file && self . list == other . list } } # [ automatically_derived ] impl :: core ::
-cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
-assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; let _ : ::
-core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata :: ModifierList >> ; } } impl
-ModifierList { pub const NIL : ModifierList = ModifierList { file : 0 , list : None } ; pub fn
+) ) ; std :: sync :: Mutex :: new ( vec ! [ nil ] ) } ) } pub fn register ( file : usize , data :
+NodeData ) -> Node { let leaked : & 'static NodeData = Box :: leak ( Box :: new ( data ) ) ; let mut
+reg = registry ( ) . lock ( ) . unwrap ( ) ; let id = reg . len ( ) as u32 ; reg . push ( leaked ) ;
+Node { file : file as u32 , id } } pub fn static_ast_node ( n : Node ) -> Option < & 'static
+NodeData > { registry ( ) . lock ( ) . unwrap ( ) . get ( n . id as usize ) . copied ( ) } pub fn
+frozen_store_kind ( n : Node ) -> Option < SyntaxKind > { if n . is_nil ( ) { return Some (
+SyntaxKind :: Unknown ) ; } static_ast_node ( n ) . map ( NodeData :: kind ) } pub fn is_data_of ( d
+: & NodeData , n : Node ) -> bool { static_ast_node ( n ) . is_some_and ( | data | std :: ptr :: eq
+( d , data ) ) } pub fn opt ( file : usize , id : Option < crate :: astdata :: NodeId > ) -> Node {
+match id { Some ( id ) => Node :: new ( file , id ) , None => Node :: NIL , } } pub fn req ( file :
+usize , id : crate :: astdata :: NodeId ) -> Node { Node :: new ( file , id ) } pub fn some_opt (
+file : usize , id : Option < crate :: astdata :: NodeId > ) -> Option < Node > { id . map ( | i |
+req ( file , i ) ) } pub fn some_req ( file : usize , id : crate :: astdata :: NodeId ) -> Option <
+Node > { Some ( req ( file , id ) ) } pub fn mods ( file : usize , m : & 'static Option < crate ::
+astdata :: ModifierList > ) -> ModifierList { ModifierList :: from_ts ( file , m . as_ref ( ) ) }
+pub struct NodeList { file : u32 , list : Option < & 'static crate :: astdata :: NodeList > , } # [
+automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
+NodeList { } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeList { # [ inline ]
+fn clone ( & self ) -> NodeList { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; let _ :
+:: core :: clone :: AssertParamIsClone < Option < & 'static crate :: astdata :: NodeList >> ; * self
+} } # [ automatically_derived ] impl :: core :: marker :: Copy for NodeList { } # [
+automatically_derived ] impl :: core :: fmt :: Debug for NodeList { # [ inline ] fn fmt ( & self , f
+: & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_struct_field2_finish ( f , "NodeList" , "file" , & self . file , "list" , && self . list ) } }
+# [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for NodeList { } # [
+automatically_derived ] impl :: core :: cmp :: PartialEq for NodeList { # [ inline ] fn eq ( & self
+, other : & NodeList ) -> bool { self . file == other . file && self . list == other . list } } # [
+automatically_derived ] impl :: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc ( hidden ) ] #
+[ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq
+< u32 > ; let _ : :: core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata ::
+NodeList >> ; } } impl NodeList { pub const NIL : NodeList = NodeList { file : 0 , list : None } ;
+pub fn from_ts ( file : usize , list : Option < & 'static crate :: astdata :: NodeList > ) -> Self {
+match list { Some ( list ) => NodeList { file : file as u32 , list : Some ( list ) } None => Self ::
+NIL , } } pub fn len ( self ) -> usize { self . list . map_or ( 0 , | l | l . items . len ( ) ) }
+pub fn is_nil ( self ) -> bool { self . list . is_none ( ) } pub fn nodes ( self ) -> Vec < Node > {
+self . list . map_or_else ( Vec :: new , | l | l . items . iter ( ) . map ( | i | Node :: new ( self
+. file as usize , * i ) ) . collect ( ) ) } } pub struct ModifierList { file : u32 , list : Option <
+& 'static crate :: astdata :: ModifierList > , } # [ automatically_derived ] # [ doc ( hidden ) ]
+unsafe impl :: core :: clone :: TrivialClone for ModifierList { } # [ automatically_derived ] impl
+:: core :: clone :: Clone for ModifierList { # [ inline ] fn clone ( & self ) -> ModifierList { let
+_ : :: core :: clone :: AssertParamIsClone < u32 > ; let _ : :: core :: clone :: AssertParamIsClone
+< Option < & 'static crate :: astdata :: ModifierList >> ; * self } } # [ automatically_derived ]
+impl :: core :: marker :: Copy for ModifierList { } # [ automatically_derived ] impl :: core :: fmt
+:: Debug for ModifierList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
+-> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
+"ModifierList" , "file" , & self . file , "list" , && self . list ) } } # [ automatically_derived ]
+impl :: core :: marker :: StructuralPartialEq for ModifierList { } # [ automatically_derived ] impl
+:: core :: cmp :: PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : & ModifierList
+) -> bool { self . file == other . file && self . list == other . list } } # [ automatically_derived
+] impl :: core :: cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off
+) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; let _ :
+:: core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata :: ModifierList >> ; } }
+impl ModifierList { pub const NIL : ModifierList = ModifierList { file : 0 , list : None } ; pub fn
 from_ts ( file : usize , list : Option < & 'static crate :: astdata :: ModifierList > ) -> Self {
-match list { Some ( list ) => ModifierList { file : file as u32 , list : Some ( list ) } , None =>
+match list { Some ( list ) => ModifierList { file : file as u32 , list : Some ( list ) } None =>
 Self :: NIL , } } pub fn bits ( self ) -> u32 { self . list . map_or ( 0 , | l | l . flags . 0 ) } }
 pub struct DataList < 'a > { pub file : usize , pub list : Option < & 'a crate :: astdata ::
 NodeList > , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core :: clone
@@ -1839,25 +1837,20 @@ main ( ) { let qn = NodeData :: QualifiedName ( Box :: new ( QualifiedNameData {
 right : id ( 2 ) , .. Default :: default ( ) } ) ) ; let mut w = Recorder { seen : Vec :: new ( ) }
 ; walk_children ( & qn , & mut w ) ; let fd = NodeData :: FunctionDeclaration ( Box :: new (
 FunctionDeclarationData { name : Some ( id ( 5 ) ) , parameters : crate :: astdata :: NodeList {
-items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
-write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ id ( 7 ) , id ( 8 ) ] ) ) , } ,
-modifiers : Some ( crate :: astdata :: ModifierList { list : crate :: astdata :: NodeList :: default
-( ) , flags : crate :: astdata :: ModFlags ( 3 ) , } ) , .. Default :: default ( ) } ) ) ;
-walk_children ( & fd , & mut w ) ; let call = NodeData :: CallExpression ( Box :: new (
-CallExpressionData { expression : id ( 9 ) , type_arguments : Some ( crate :: astdata :: NodeList {
-items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
-write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ id ( 1 ) ] ) ) , } ) , ..
-Default :: default ( ) } ) ) ; walk_children ( & call , & mut w ) ; println ! ( "walk={0:?}" , w .
-seen ) ; let n0 = Node :: new ( 0 , id ( 0 ) ) ; let bin = NodeData :: BinaryExpression ( Box :: new
-( BinaryExpressionData { left : id ( 3 ) , right : id ( 4 ) , .. Default :: default ( ) } ) ) ; let
-vd = NodeData :: VariableDeclaration ( Box :: new ( VariableDeclarationData { name : id ( 5 ) ,
-initializer : Some ( id ( 6 ) ) , .. Default :: default ( ) } ) ) ; let tr = NodeData ::
-TypeReferenceNode ( Box :: new ( TypeReferenceNodeData { type_name : id ( 2 ) , type_arguments :
-Some ( crate :: astdata :: NodeList { items : :: alloc :: boxed :: box_assume_init_into_vec_unsafe (
-:: alloc :: intrinsics :: write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ id ( 1
-) , id ( 2 ) , id ( 3 ) ] ) ) , } ) , .. Default :: default ( ) } ) ) ; let pd = NodeData ::
-ParameterDeclaration ( Box :: new ( ParameterDeclarationData { name : id ( 1 ) , initializer : Some
-( id ( 10 ) ) , .. Default :: default ( ) } ) ) ; println ! (
+items : vec ! [ id ( 7 ) , id ( 8 ) ] , } , modifiers : Some ( crate :: astdata :: ModifierList {
+list : crate :: astdata :: NodeList :: default ( ) , flags : crate :: astdata :: ModFlags ( 3 ) , }
+) , .. Default :: default ( ) } ) ) ; walk_children ( & fd , & mut w ) ; let call = NodeData ::
+CallExpression ( Box :: new ( CallExpressionData { expression : id ( 9 ) , type_arguments : Some (
+crate :: astdata :: NodeList { items : vec ! [ id ( 1 ) ] , } ) , .. Default :: default ( ) } ) ) ;
+walk_children ( & call , & mut w ) ; println ! ( "walk={0:?}" , w . seen ) ; let n0 = Node :: new (
+0 , id ( 0 ) ) ; let bin = NodeData :: BinaryExpression ( Box :: new ( BinaryExpressionData { left :
+id ( 3 ) , right : id ( 4 ) , .. Default :: default ( ) } ) ) ; let vd = NodeData ::
+VariableDeclaration ( Box :: new ( VariableDeclarationData { name : id ( 5 ) , initializer : Some (
+id ( 6 ) ) , .. Default :: default ( ) } ) ) ; let tr = NodeData :: TypeReferenceNode ( Box :: new (
+TypeReferenceNodeData { type_name : id ( 2 ) , type_arguments : Some ( crate :: astdata :: NodeList
+{ items : vec ! [ id ( 1 ) , id ( 2 ) , id ( 3 ) ] , } ) , .. Default :: default ( ) } ) ) ; let pd
+= NodeData :: ParameterDeclaration ( Box :: new ( ParameterDeclarationData { name : id ( 1 ) ,
+initializer : Some ( id ( 10 ) ) , .. Default :: default ( ) } ) ) ; println ! (
 "facts bin={0} vd={1} fd={2} call={3} tr={4} pd={5}" , facts_of_data ( n0 , & bin ) , facts_of_data
 ( n0 , & vd ) , facts_of_data ( n0 , & fd ) , facts_of_data ( n0 , & call ) , facts_of_data ( n0 , &
 tr ) , facts_of_data ( n0 , & pd ) ) ; }

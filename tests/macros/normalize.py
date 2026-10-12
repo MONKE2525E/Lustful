@@ -17,9 +17,9 @@ user macro expansion, not pretty-printing:
 - rustc's injected prelude header is dropped.
 - `macro_rules!` definitions are dropped (rustc prints them in the
   expansion, lust consumes them).
-- rustc's `println!` and `format!` expansions (`_print`/`_eprint`
-  and the alloc format wrapper around `format_args!`) map back to
-  `println!` and `format!`.
+- rustc's `println!`, `format!`, and list-form `vec!` expansions
+  (the `_print`/`_eprint`, alloc format, and alloc boxed forms)
+  map back to the written macro calls.
 - Format strings are positionalized (`{}` and `{name}` captures
   become `{0}`, `{1}` with captures appended as arguments), which is
   the form rustc prints and lust keeps as written.
@@ -207,6 +207,25 @@ def drop_macro_rules(toks):
                 and is_ident(toks[i + 2]) and toks[i + 3] in OPEN):
             end = group_end(toks, i + 3)
             if end is not None:
+                # Attributes on the definition (`#[macro_export]` and
+                # friends) belong to it and go with it: pop any
+                # trailing `# [ ... ]` runs already emitted.
+                j = len(out)
+                while j >= 2 and out[j - 1] == "]":
+                    # Find this attribute's opening `# [` by depth.
+                    depth, k = 0, j - 1
+                    while k >= 0:
+                        if out[k] == "]":
+                            depth += 1
+                        elif out[k] == "[":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k -= 1
+                    if k < 1 or out[k - 1] != "#":
+                        break
+                    j = k - 1
+                del out[j:]
                 i = end + 1 if end < len(toks) and toks[end] == ";" else end
                 continue
         out.append(toks[i])
@@ -402,13 +421,66 @@ def unwrap_parens(toks):
         toks = out
     return toks
 
+
+def map_alloc_vec(toks):
+    """rustc's list-form `vec!` expansion back to `vec ! [ ... ]`."""
+    prefix = ["::", "alloc", "::", "boxed", "::", "box_assume_init_into_vec_unsafe", "(",
+              "::", "alloc", "::", "intrinsics", "::", "write_box_via_move", "(",
+              "::", "alloc", "::", "boxed", "::", "Box", "::", "new_uninit", "(", ")", ","]
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i:i + len(prefix)] == prefix and toks[i + len(prefix):i + len(prefix) + 1] == ["["]:
+            end = group_end(toks, i + len(prefix))
+            if end is not None and toks[end:end + 2] == [")", ")"]:
+                inner = map_alloc_vec(toks[i + len(prefix) + 1:end - 1])
+                out += ["vec", "!", "["] + inner + ["]"]
+                i = end + 2
+                continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def drop_arm_commas(toks):
+    """Drop the optional comma after a block-bodied match arm.
+
+    Source may write `pat => { ... }, next => ...`; rustc's pretty
+    printer drops that comma while lust prints the template token.
+    A comma right after `}` is dropped only when an arm head (`=>`
+    at the same depth) follows before any statement end.
+    """
+    out = []
+    for i, tok in enumerate(toks):
+        if tok == "," and out and out[-1] == "}":
+            depth, j, drop = 0, i + 1, False
+            while j < len(toks):
+                t = toks[j]
+                if t in OPEN:
+                    depth += 1
+                elif t in CLOSE:
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and t == "=>":
+                    drop = True
+                    break
+                elif depth == 0 and t in (";", ","):
+                    break
+                j += 1
+            if drop:
+                continue
+        out.append(tok)
+    return out
+
 def canonicalize(toks):
     toks = strip_prelude(toks)
     toks = drop_macro_rules(toks)
     toks = map_alloc_format(toks)
+    toks = map_alloc_vec(toks)
     toks = map_print(toks)
     toks = positionalize_calls(toks)
     toks = unwrap_parens(toks)
+    toks = drop_arm_commas(toks)
     return toks
 
 

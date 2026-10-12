@@ -1121,7 +1121,7 @@ fn resolved_setup(
         }
     };
     t.lap("resolve (worklist)");
-    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, .. } = resolved;
+    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, .. } = resolved;
     let fn_count = fn_lines.len();
     front.ast = ast;
     front.map = map.clone();
@@ -1164,7 +1164,7 @@ fn resolved_setup(
             ends_at_boundary: true,
         },
         items: Some(0..n_items),
-        expand_deps: Vec::new(),
+        expand_deps,
     }];
     let env = scan::env_hash(item_scans.iter());
     // The same mode split as the single-file path. Bodies mode goes

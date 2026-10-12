@@ -1099,20 +1099,57 @@ pub fn run_expand(args: &[String]) -> i32 {
     }
 }
 
+/// True when a tree sequence already reads as one atomic operand in a
+/// flat token stream, so precedence parens around it would only add
+/// noise: a single tree, a place or call shape (`a.b`, `f(x)`,
+/// `vec![x]`, `a[i]`), or a block-like expression head.
+fn atomic_shaped(trees: &[Tt]) -> bool {
+    if trees.len() == 1 {
+        return true;
+    }
+    if matches!(trees.first(), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Match | Tok::If | Tok::Loop | Tok::While | Tok::For)) {
+        return true;
+    }
+    fn place_tok(tok: Tok) -> bool {
+        matches!(
+            tok,
+            Tok::Ident(_)
+                | Tok::SelfUpper
+                | Tok::SelfLower
+                | Tok::Crate
+                | Tok::Super
+                | Tok::Dot
+                | Tok::PathSep
+                | Tok::Int(..)
+                | Tok::Bang
+                | Tok::Lt
+                | Tok::Gt
+                | Tok::Comma
+                | Tok::Lifetime(_)
+        )
+    }
+    // A call or index shape: place tokens, then one trailing group.
+    if let Some((last, head)) = trees.split_last()
+        && matches!(last, Tt::Delim(_, _, _))
+        && !head.is_empty()
+        && head.iter().all(|t| matches!(t, Tt::Tok(tok) if place_tok(tok.tok)) || matches!(t, Tt::Delim(Delim::Bracket, _, _)))
+    {
+        return true;
+    }
+    trees.iter().all(|t| match t {
+        Tt::Tok(tok) => matches!(tok.tok, Tok::Ident(_) | Tok::SelfUpper | Tok::SelfLower | Tok::Dot | Tok::PathSep | Tok::Int(..)),
+        Tt::Delim(Delim::Bracket, _, _) => true,
+        _ => false,
+    })
+}
+
 /// Flattens expanded trees for the parser. An expression fragment with
 /// more than one token gets parens, so forwarding one into a larger
 /// expression keeps its rustc atomic shape in the flat token stream.
 fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
-    fn place_shaped(trees: &[Tt]) -> bool {
-        trees.iter().all(|t| match t {
-            Tt::Tok(tok) => matches!(tok.tok, Tok::Ident(_) | Tok::SelfUpper | Tok::SelfLower | Tok::Dot | Tok::PathSep | Tok::Int(..)),
-            Tt::Delim(Delim::Bracket, _, _) => true,
-            _ => false,
-        })
-    }
     for tree in trees {
         match tree {
-            Tt::Frag(FragKind::Expr, inner, span) if count_tokens(inner) > 1 && !place_shaped(inner) => {
+            Tt::Frag(FragKind::Expr, inner, span) if count_tokens(inner) > 1 && !atomic_shaped(inner) => {
                 out.push(Token { tok: Tok::LParen, span: *span });
                 flatten_final(inner, out);
                 out.push(Token { tok: Tok::RParen, span: *span });
@@ -2305,6 +2342,19 @@ fn should_wrap(expanded: &[Tt], prev_out: &[Tt], next_tok: Option<Tok>, next_tre
     // After `:` in a let or field, or inside `< ... >`, the expansion is
     // most often a type; parens would make it a tuple/paren type shape.
     if matches!(prev_out.last(), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Colon | Tok::Lt | Tok::As)) {
+        return false;
+    }
+    // One atomic operand (a call, a place, a block-like head) binds as
+    // tightly as the macro call did, so it needs no parens.
+    if atomic_shaped(expanded) {
+        return false;
+    }
+    // A whole comma piece (a call argument, an array element) parses as
+    // one expression in place; parens only matter when the expansion
+    // itself would split the piece with a top-level comma.
+    let piece_start = prev_out.is_empty() || matches!(prev_out.last(), Some(Tt::Tok(t)) if t.tok == Tok::Comma);
+    let piece_end = next_tree.is_none() || next_tok == Some(Tok::Comma);
+    if piece_start && piece_end && !expanded.iter().any(|t| t.is_tok(Tok::Comma)) {
         return false;
     }
     // A path-shaped expansion directly before a `{ }` group is most

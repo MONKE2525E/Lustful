@@ -17,7 +17,5 @@ files } ; let keys : Vec < & String > = a . keys ( ) . collect ( ) ; println ! (
 crate :: support :: runner :: FileMap :: new ( ) ; files . insert ( :: std :: string :: String ::
 from ( "/x.ts" ) , crate :: support :: vfstest :: MapFile :: from ( "x" ) ) ; files } ; println ! (
 "file_map={0} first={1}" , b . len ( ) , b . values ( ) . next ( ) . unwrap ( ) . 0 ) ; let argv :
-Vec < String > = :: alloc :: boxed :: box_assume_init_into_vec_unsafe ( :: alloc :: intrinsics ::
-write_box_via_move ( :: alloc :: boxed :: Box :: new_uninit ( ) , [ :: std :: string :: String ::
-from ( "--build" ) , :: std :: string :: String :: from ( "proj" ) ] ) ) ; println ! ( "args={0:?}"
-, argv ) ; }
+Vec < String > = vec ! [ :: std :: string :: String :: from ( "--build" ) , :: std :: string ::
+String :: from ( "proj" ) ] ; println ! ( "args={0:?}" , argv ) ; }

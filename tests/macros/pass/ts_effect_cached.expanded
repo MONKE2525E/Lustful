@@ -15,7 +15,7 @@ value . clone ( ) ) ; value } } } pub fn titled ( & self , node : u32 ) -> Strin
 ; if let Some ( value ) = self . links ( ) . by_name . get ( & key ) { value . clone ( ) } else {
 let value = 'compute : { * self . computes . borrow_mut ( ) += 1 ; break 'compute format ! (
 "title-{0}" , node ) ; } ; self . links ( ) . by_name . insert ( key , value . clone ( ) ) ; value }
-} } } # [ macro_export ] # [ doc ( hidden ) ] pub use crate :: effect_cached as cached ; fn main ( )
-{ let tp = TypeParser { links_store : Links :: default ( ) , computes : RefCell :: new ( 0 ) , } ;
-println ! ( "{0} {1} {2}" , tp . label ( 4 ) , tp . label ( 4 ) , tp . label ( 5 ) ) ; println ! (
-"{0} computes={1}" , tp . titled ( 4 ) , tp . computes . borrow ( ) ) ; }
+} } } pub use crate :: effect_cached as cached ; fn main ( ) { let tp = TypeParser { links_store :
+Links :: default ( ) , computes : RefCell :: new ( 0 ) , } ; println ! ( "{0} {1} {2}" , tp . label
+( 4 ) , tp . label ( 4 ) , tp . label ( 5 ) ) ; println ! ( "{0} computes={1}" , tp . titled ( 4 ) ,
+tp . computes . borrow ( ) ) ; }

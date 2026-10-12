@@ -86,6 +86,9 @@ pub struct ResolvedCrate {
     /// The driver owns std splicing: when it did not splice and this is
     /// set, it splices and resolves once more.
     pub needs_std: bool,
+    /// Outside inputs expansion read across the crate's files (added
+    /// for W-MACRO; see `expand::Dep`).
+    pub expand_deps: Vec<crate::expand::Dep>,
 }
 
 /// A failed resolution: the source map and combined text for rendering,
@@ -541,6 +544,8 @@ struct CrateOut {
     seen: Vec<(PathBuf, String, FileId)>,
     needs_std: bool,
     exported_macros: Vec<OwnedMacroSource>,
+    /// The outside inputs this crate's last expansion round read.
+    expand_deps: Vec<crate::expand::Dep>,
 }
 
 /// One crate's failed resolution inside a session.
@@ -719,6 +724,7 @@ pub fn resolve_crate_cached(
     let mut nested_modules: Vec<ModuleId> = Vec::new();
     let mut structure_hash = 0u64;
     let mut exported_of: FxMap<usize, Vec<OwnedMacroSource>> = FxMap::default();
+    let mut expand_deps: Vec<crate::expand::Dep> = Vec::new();
     for &j in &order {
         let dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
             .deps
@@ -742,6 +748,7 @@ pub fn resolve_crate_cached(
                     structure_hash = h.finish();
                 }
                 tables.fn_module.extend(out.fn_module);
+                expand_deps.extend(out.expand_deps);
                 exported_of.insert(j, out.exported_macros);
                 chunks.push(out.ast);
             }
@@ -758,7 +765,7 @@ pub fn resolve_crate_cached(
     tables.fn_module.extend(nested_modules);
     let (map, all_text) = make_map(&all_seen);
     let ast = Ast::concat(chunks);
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std })
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -1781,6 +1788,8 @@ fn resolve_one(
     // environment the outlines now prove, then look for module edges
     // the expansions generated; repeat until a round adds no file.
     let mut expanded: Vec<Option<lexer::Lexed>> = Vec::new();
+    // Outside inputs the latest round's expansion of each file read.
+    let mut file_deps: Vec<Vec<crate::expand::Dep>> = Vec::new();
     let mut menv = MacroEnv {
         seeds: Vec::new(),
         own: Vec::new(),
@@ -1801,10 +1810,10 @@ fn resolve_one(
         // landing); the first error in disc order is the answer.
         let module_paths: Vec<Vec<Sym>> = discs.iter().map(|d| tables.modules[d.module.0 as usize].path.clone()).collect();
         let indices: Vec<usize> = (0..discs.len()).collect();
-        let results = par_map(&indices, |&di| -> Result<Option<lexer::Lexed>, Diag> {
+        let results = par_map(&indices, |&di| -> Result<(Option<lexer::Lexed>, Vec<crate::expand::Dep>), Diag> {
             let (orig, text, path) = match &discs[di].lexed {
                 Some(l) => (l.clone(), discs[di].text.clone(), discs[di].path.clone()),
-                None => return Ok(None),
+                None => return Ok((None, Vec::new())),
             };
             let ects = crate::expand::ExpandCtx {
                 interner,
@@ -1819,11 +1828,15 @@ fn resolve_one(
                 Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
                 _ => menv.seeds.clone(),
             };
-            crate::expand::expand_lexed_seeded(spliced, &ects, &seeds).map(Some)
+            crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds).map(|(l, deps)| (Some(l), deps))
         });
+        file_deps.resize_with(discs.len(), Vec::new);
         for (di, r) in results.into_iter().enumerate() {
             match r {
-                Ok(l) => expanded[di] = l,
+                Ok((l, deps)) => {
+                    expanded[di] = l;
+                    file_deps[di] = deps;
+                }
                 Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
             }
         }
@@ -2030,6 +2043,7 @@ fn resolve_one(
         seen,
         needs_std,
         exported_macros: menv.exported_sources(),
+        expand_deps: file_deps.into_iter().flatten().collect(),
     })
 }
 

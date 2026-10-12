@@ -2,15 +2,15 @@ pub mod core { pub fn record_unported ( name : & str ) { println ! ( "recorded:{
 pub mod gostd { pub mod debug { pub fn assert_failed ( msg : Option < std :: fmt :: Arguments < '_
 >> ) -> ! { match msg { Some ( m ) => { :: core :: panicking :: panic_fmt ( format_args ! (
 "assertion failed: {0}" , m ) ) ; } None => { :: core :: panicking :: panic_fmt ( format_args ! (
-"assertion failed" ) ) ; } } } } } # [ macro_export ] # [ macro_export ] fn panic_text ( f : impl
-FnOnce ( ) + std :: panic :: UnwindSafe ) -> String { std :: panic :: set_hook ( Box :: new ( | _ |
-{ } ) ) ; match std :: panic :: catch_unwind ( f ) { Ok ( ) => "no panic" . to_string ( ) , Err ( e
-) => { if let Some ( s ) = e . downcast_ref :: < String > ( ) { s . clone ( ) } else if let Some ( s
-) = e . downcast_ref :: < & str > ( ) { s . to_string ( ) } else { "unknown" . to_string ( ) } } } }
-fn main ( ) { if ! ( 1 + 1 == 2 ) { crate :: gostd :: debug :: assert_failed ( None ) } ; if ! true
-{ crate :: gostd :: debug :: assert_failed ( Some ( format_args ! ( "unused {0}" , 9 ) ) ) } ;
-println ! ( "assert-true ok" ) ; println ! ( "assert-false: {0}" , panic_text ( || if ! ( 1 == 2 ) {
-crate :: gostd :: debug :: assert_failed ( Some ( format_args ! ( "one is not {0}" , 2 ) ) ) } ) ) ;
-println ! ( "unported: {0}" , panic_text ( || { { crate :: core :: record_unported (
-"checker.go:Foo" ) ; { :: core :: panicking :: panic_fmt ( format_args ! ( "unported Go code: {0}" ,
-"checker.go:Foo" ) ) ; } } ; } ) ) ; }
+"assertion failed" ) ) ; } } } } } fn panic_text ( f : impl FnOnce ( ) + std :: panic :: UnwindSafe
+) -> String { std :: panic :: set_hook ( Box :: new ( | _ | { } ) ) ; match std :: panic ::
+catch_unwind ( f ) { Ok ( ) => "no panic" . to_string ( ) , Err ( e ) => { if let Some ( s ) = e .
+downcast_ref :: < String > ( ) { s . clone ( ) } else if let Some ( s ) = e . downcast_ref :: < &
+str > ( ) { s . to_string ( ) } else { "unknown" . to_string ( ) } } } } fn main ( ) { if ! ( 1 + 1
+== 2 ) { crate :: gostd :: debug :: assert_failed ( None ) } ; if ! true { crate :: gostd :: debug
+:: assert_failed ( Some ( format_args ! ( "unused {0}" , 9 ) ) ) } ; println ! ( "assert-true ok" )
+; println ! ( "assert-false: {0}" , panic_text ( || if ! ( 1 == 2 ) { crate :: gostd :: debug ::
+assert_failed ( Some ( format_args ! ( "one is not {0}" , 2 ) ) ) } ) ) ; println ! (
+"unported: {0}" , panic_text ( || { { crate :: core :: record_unported ( "checker.go:Foo" ) ; { ::
+core :: panicking :: panic_fmt ( format_args ! ( "unported Go code: {0}" , "checker.go:Foo" ) ) ; }
+} ; } ) ) ; }
