@@ -1,0 +1,12 @@
+# Tiny Cargo project used by scripts/test-client.sh to test the release handoff.
+# The test script copies it to a temp dir before building. The empty [workspace]
+# keeps it independent of the lust package above it.
+[package]
+name = "tinyproj"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[profile.fast]
+inherits = "release"
