@@ -6,6 +6,7 @@ use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
 use crate::ir::*;
 use crate::ty::lang::{self, SigTy};
+use crate::ty::layout::{self, EnumTag, Layout, Niche};
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -267,13 +268,166 @@ struct FnGen<'b, 'p, 'a> {
     ret_large: bool,
 }
 
-/// Size and alignment of a CTy as the emitted C types lay it out:
-/// declaration order, natural alignment, a uint32 tag first in enums
-/// and Options. This mirrors `type_decls`, not the Rust layout engine
-/// (that arrives with W-CORELANG and will own both). Used only for
-/// the return-ABI threshold below, so it must match the C structs
-/// this file emits, nothing else.
-fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
+/// A layout with no field or niche detail, for runtime struct types whose
+/// C form is fixed in runtime.h (`lust_String`, `lust_Vec`, and kin).
+fn plain_layout(size: u64, align: u64) -> Layout {
+    Layout { size, align, field_offsets: Vec::new(), variant_offsets: Vec::new(), niche: None, enum_tag: None }
+}
+
+/// True when `type_decls` can emit an enum of this layout with the exact
+/// Rust size: the tag or niche scalar fits a C integer of at most 8 bytes,
+/// and niche tag values do not wrap the scalar range.
+fn enum_is_exact(l: &Layout, variants: usize) -> bool {
+    match l.enum_tag {
+        Some(EnumTag::Explicit { size, .. }) => size <= 8,
+        Some(EnumTag::NicheFilled { niche, .. }) => {
+            matches!(niche.scalar_size, 1 | 2 | 4 | 8)
+                && niche.start <= u64::MAX as u128
+                && niche.start + variants.saturating_sub(1) as u128 <= (1u128 << (niche.scalar_size * 8))
+        }
+        Some(EnumTag::None) => variants == 1,
+        None => false,
+    }
+}
+
+/// The Rust layout of a CTy, when this file can emit a C type of exactly
+/// that size, alignment, and field offsets. `None` means the type keeps
+/// the legacy declaration-order emission below, with its old (wrong)
+/// sizes: today that is aggregates with a direct `()` field (the C form
+/// of `CTy::Unit` is one byte, not zero), by-value cycles, and enum
+/// shapes `enum_is_exact` rejects. Every `Some` result is checked in the
+/// emitted C by _Static_assert on sizeof and _Alignof (see `type_decls`).
+///
+/// The layout is computed over CTy, not over `Ty`, so glue types that
+/// never existed as a semantic type (an Option of a reference, say) get
+/// one too. Two niches are stripped against the engine in ty/layout.rs:
+/// the fat-pointer data word and the String/Vec pointer word, because
+/// the runtime produces null there for empty values today, so a
+/// niche-filled outer enum could not tell a valid empty value from the
+/// tag value. Options over those stay tagged (and oversized) until the
+/// runtime uses dangling pointers for empty buffers.
+fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
+    fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> Option<Layout> {
+        match t {
+            CTy::Unit => None,
+            CTy::Bool => Some(layout::bool_layout()),
+            CTy::Char => Some(layout::char_layout()),
+            CTy::Int(i) => Some(layout::int_layout(*i)),
+            CTy::Str => Some(plain_layout(16, 8)),
+            CTy::String | CTy::Vec(_) | CTy::Chars => Some(plain_layout(24, 8)),
+            CTy::Args => Some(plain_layout(8, 8)),
+            CTy::Ref(inner) if **inner == CTy::Str => Some(plain_layout(16, 8)),
+            CTy::Ref(_) => Some(layout::ptr_layout()),
+            CTy::Slice(_) => Some(plain_layout(16, 8)),
+            CTy::Tuple(es) => {
+                let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
+                layout::struct_layout(&fields?, layout::Repr::default()).ok()
+            }
+            CTy::Array(e, 0) => Some(plain_layout(0, go(p, e, seen).map_or(1, |l| l.align))),
+            CTy::Array(e, n) => layout::array_layout(&go(p, e, seen)?, *n).ok(),
+            CTy::Option(e) => {
+                let l = layout::enum_layout(&[vec![], vec![go(p, e, seen)?]], &[0, 1], layout::Repr::default()).ok()?;
+                enum_is_exact(&l, 2).then_some(l)
+            }
+            CTy::Adt(a) => {
+                if !seen.insert(*a) {
+                    return None;
+                }
+                let adt = p.adt(*a);
+                let r = if adt.is_enum {
+                    let mut variants = Vec::with_capacity(adt.variants.len());
+                    for v in &adt.variants {
+                        let mut fields = Vec::with_capacity(v.fields.len());
+                        for f in &v.fields {
+                            fields.push(go(p, &cty(&p.tys, f.ty), seen)?);
+                        }
+                        variants.push(fields);
+                    }
+                    let discs: Vec<i128> = (0..adt.variants.len() as i128).collect();
+                    match layout::enum_layout(&variants, &discs, layout::Repr::default()) {
+                        Ok(l) if enum_is_exact(&l, adt.variants.len()) => Some(l),
+                        _ => None,
+                    }
+                } else {
+                    let mut fields = Vec::with_capacity(adt.variants[0].fields.len());
+                    for f in &adt.variants[0].fields {
+                        fields.push(go(p, &cty(&p.tys, f.ty), seen)?);
+                    }
+                    layout::struct_layout(&fields, layout::Repr::default()).ok()
+                };
+                seen.remove(a);
+                r
+            }
+        }
+    }
+    go(p, t, &mut HashSet::new())
+}
+
+/// C integer type for an explicit enum tag or a niche scalar of `size`
+/// bytes. Niche scalars are read and written as unsigned bit patterns.
+fn tag_c_type(size: u64, signed: bool) -> &'static str {
+    match (size, signed) {
+        (1, false) => "uint8_t",
+        (1, true) => "int8_t",
+        (2, false) => "uint16_t",
+        (2, true) => "int16_t",
+        (4, false) => "uint32_t",
+        (4, true) => "int32_t",
+        (_, false) => "uint64_t",
+        (_, true) => "int64_t",
+    }
+}
+
+/// A zero compound literal of type `t`, in value position. Types the
+/// layout path emits at size 0 take the `{}` form, since tcc rejects
+/// `{0}` for an empty struct.
+fn zero_lit(p: &Program, t: &CTy) -> String {
+    let ct = ctype(t);
+    if c_layout(p, t).is_some_and(|l| l.size == 0) { format!("(({ct}){{}})") } else { format!("(({ct}){{0}})") }
+}
+
+/// The C expression that reads the variant index of an enum or Option
+/// value at the pointer expression `ptr`.
+fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
+    if c_layout(p, t).is_some() { format!("disc_{}({ptr})", mangle(t)) } else { format!("({ptr})->tag") }
+}
+
+/// The C field access for field `fi` of variant `vi` in the enum or
+/// Option value expression `e`. Only Options differ between the layout
+/// and legacy shapes; Adt enums keep `.u.v{vi}.f{fi}` in both.
+fn variant_field(p: &Program, t: &CTy, e: &str, vi: usize, fi: usize) -> String {
+    match t {
+        CTy::Option(_) if c_layout(p, t).is_none() => format!("{e}.v"),
+        _ => format!("{e}.u.v{vi}.f{fi}"),
+    }
+}
+
+/// A C statement (no trailing newline) that stores variant `vi`'s
+/// discriminant into the enum or Option value expression `e`. Empty
+/// when the variant is the niche variant (its payload writes the niche
+/// scalar) or the enum stores no tag.
+fn disc_set(p: &Program, t: &CTy, e: &str, vi: usize) -> String {
+    let Some(l) = c_layout(p, t) else { return format!("{e}.tag = {vi};") };
+    match l.enum_tag {
+        Some(EnumTag::Explicit { .. }) => format!("{e}.u._tag = {vi};"),
+        Some(EnumTag::NicheFilled { variant, niche }) => {
+            if vi == variant {
+                String::new()
+            } else {
+                let k = (0..vi).filter(|&i| i != variant).count() as u128;
+                format!("{e}.u._n._s = {}ULL;", niche.start + k)
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Size and alignment of a CTy as the emitted C types lay it out under
+/// the legacy emission: declaration order, natural alignment, a uint32
+/// tag first in enums and Options. Used for the types `c_layout`
+/// rejects, and only for the return-ABI threshold below, so it must
+/// match the legacy C structs this file emits, nothing else.
+fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
     fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> (u64, u64) {
         fn align_up(x: u64, a: u64) -> u64 {
             (x + a - 1) / a * a
@@ -355,6 +509,15 @@ fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
         }
     }
     go(p, t, &mut HashSet::new())
+}
+
+/// Size and alignment of a CTy as the emitted C types lay it out: the
+/// Rust layout when `c_layout` is exact, the legacy layout otherwise.
+fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
+    match c_layout(p, t) {
+        Some(l) => (l.size, l.align),
+        None => c_size_align_legacy(p, t),
+    }
 }
 
 /// Returns over 32 bytes go through a hidden out-pointer (ARCH 4.5);
@@ -524,7 +687,7 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Downcast(_), CTy::Option(_)) => {}
                 (Proj::Field(_), CTy::Option(inner)) => {
-                    e = format!("{e}.v");
+                    e = variant_field(self.p, &t, &e, 1, 0);
                     t = *inner;
                 }
                 (Proj::Downcast(v), _) => variant = Some(*v),
@@ -566,7 +729,7 @@ impl FnGen<'_, '_, '_> {
                         // Moving one field out (a partial move, or an enum payload). Zero the
                         // field so the local's later drop skips it (a zero `String` or `Vec`
                         // drops as a no-op) but still drops every other field.
-                        post.push(format!("{e} = ({}){{0}};", ctype(&t)));
+                        post.push(format!("{e} = {};", zero_lit(self.p, &t)));
                     }
                 }
                 (e, t)
@@ -774,6 +937,25 @@ impl FnGen<'_, '_, '_> {
         }
     }
 
+    /// Builds one enum or Option value in a fresh temporary: zero fill,
+    /// store the variant's fields, then store the discriminant. Field
+    /// stores come first so a niche-filled variant's own payload write
+    /// is the last write to the niche scalar, and the other variants'
+    /// field stores cannot clobber the niche tag value.
+    fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
+        let tmp = self.tmp();
+        let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(t), zero_lit(self.p, t));
+        for (i, v) in vals.iter().enumerate() {
+            let f = variant_field(self.p, t, &tmp, variant, i);
+            let _ = writeln!(self.out, "    {f} = {v};");
+        }
+        let set = disc_set(self.p, t, &tmp, variant);
+        if !set.is_empty() {
+            let _ = writeln!(self.out, "    {set}");
+        }
+        tmp
+    }
+
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
         match rv {
             Rvalue::Use(o) => self.operand(o, loc, post).0,
@@ -867,28 +1049,24 @@ impl FnGen<'_, '_, '_> {
                 }
             }
             Rvalue::Opt(ty, op) => {
-                let ct = ctype(&cty(&self.body.tys, *ty));
+                let t = cty(&self.body.tys, *ty);
                 match op {
                     Some(o) => {
                         let (v, _) = self.operand(o, loc, post);
-                        format!("(({ct}){{ .tag = 1, .v = {v} }})")
+                        self.make_variant(&t, 1, &[v])
                     }
-                    None => format!("(({ct}){{ .tag = 0 }})"),
+                    None => self.make_variant(&t, 0, &[]),
                 }
             }
             Rvalue::Aggregate(a, v, ops) => {
                 let adt = self.p.adt(*a);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-                let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
                 if adt.is_enum {
-                    if fields.is_empty() {
-                        format!("((A{}){{ .tag = {v} }})", a.0)
-                    } else {
-                        format!("((A{}){{ .tag = {v}, .u = {{ .v{v} = {{ {} }} }} }})", a.0, fields.join(", "))
-                    }
-                } else if fields.is_empty() {
-                    format!("((A{}){{0}})", a.0)
+                    self.make_variant(&CTy::Adt(*a), *v as usize, &vals)
+                } else if vals.is_empty() {
+                    zero_lit(self.p, &CTy::Adt(*a))
                 } else {
+                    let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
                     format!("((A{}){{ {} }})", a.0, fields.join(", "))
                 }
             }
@@ -955,19 +1133,21 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             Rvalue::TupleAgg(ty, ops) => {
-                let ct = ctype(&cty(&self.body.tys, *ty));
+                let t = cty(&self.body.tys, *ty);
+                let ct = ctype(&t);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
                 if vals.is_empty() {
-                    format!("(({ct}){{0}})")
+                    zero_lit(self.p, &t)
                 } else {
                     let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
                     format!("(({ct}){{ {} }})", fields.join(", "))
                 }
             }
             Rvalue::ArrayAgg(ty, ops) => {
-                let ct = ctype(&cty(&self.body.tys, *ty));
+                let t = cty(&self.body.tys, *ty);
+                let ct = ctype(&t);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-                if vals.is_empty() { format!("(({ct}){{0}})") } else { format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", ")) }
+                if vals.is_empty() { zero_lit(self.p, &t) } else { format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", ")) }
             }
             Rvalue::ArrayRepeat(ty, o, n) => {
                 let at = cty(&self.body.tys, *ty);
@@ -984,8 +1164,8 @@ impl FnGen<'_, '_, '_> {
             }
             Rvalue::Format(parts) => self.format(parts, loc, post),
             Rvalue::Discriminant(pl) => {
-                let (e, _) = self.place(pl, loc);
-                format!("{e}.tag")
+                let (e, t) = self.place(pl, loc);
+                disc_call(self.p, &t, &format!("(&{e})"))
             }
             Rvalue::LenOf(pl) => {
                 let (e, t) = self.place(pl, loc);
@@ -1239,29 +1419,37 @@ impl FnGen<'_, '_, '_> {
                     format!("({0} > {1} ? {0} : {1})", vals[0], vals[1])
                 }
             }
-            B::OptIsSome => format!("(({})->tag == 1)", vals[0]),
-            B::OptIsNone => format!("(({})->tag == 0)", vals[0]),
+            B::OptIsSome | B::OptIsNone => {
+                let ot = match &tys[0] {
+                    CTy::Ref(inner) => (**inner).clone(),
+                    t => t.clone(),
+                };
+                let want = if b == B::OptIsSome { 1 } else { 0 };
+                format!("({} == {want})", disc_call(self.p, &ot, &vals[0]))
+            }
             B::OptUnwrap | B::OptExpect => {
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {} {t} = {};", ctype(&tys[0]), vals[0]);
+                let disc = disc_call(self.p, &tys[0], &format!("(&{t})"));
                 if b == B::OptUnwrap {
                     let _ =
-                        writeln!(self.out, "    if (!{t}.tag) lust_panic_cstr(\"called `Option::unwrap()` on a `None` value\", {loc});");
+                        writeln!(self.out, "    if (!{disc}) lust_panic_cstr(\"called `Option::unwrap()` on a `None` value\", {loc});");
                 } else {
-                    let _ = writeln!(self.out, "    if (!{t}.tag) lust_panic_str({}, {loc});", vals[1]);
+                    let _ = writeln!(self.out, "    if (!{disc}) lust_panic_str({}, {loc});", vals[1]);
                 }
-                format!("{t}.v")
+                variant_field(self.p, &tys[0], &t, 1, 0)
             }
             B::OptUnwrapOr => {
                 let CTy::Option(inner) = &tys[0] else { unreachable!() };
                 let (t, d) = (self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {} {t} = {};\n    {} {d} = {};", ctype(&tys[0]), vals[0], ctype(inner), vals[1]);
+                let disc = disc_call(self.p, &tys[0], &format!("(&{t})"));
                 if needs_drop_c(self.p, inner) {
                     // The unused default is dropped, as in Rust.
                     self.want(Glue::Drop, inner);
-                    let _ = writeln!(self.out, "    if ({t}.tag) drop_{}(&{d});", mangle(inner));
+                    let _ = writeln!(self.out, "    if ({disc}) drop_{}(&{d});", mangle(inner));
                 }
-                format!("({t}.tag ? {t}.v : {d})")
+                format!("({disc} ? {} : {d})", variant_field(self.p, &tys[0], &t, 1, 0))
             }
             B::VecPop | B::VecGet | B::VecFirst | B::VecLast => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
@@ -1278,10 +1466,11 @@ impl FnGen<'_, '_, '_> {
                     B::VecFirst => (format!("{v}->len > 0"), "0".into()),
                     _ => (format!("{v}->len > 0"), format!("{v}->len - 1")),
                 };
-                let _ = writeln!(
-                    self.out,
-                    "    {ot} {t}; {t}.tag = 0;\n    if ({cond}) {{ {t}.tag = 1; {t}.v = {r}(({et}*){v}->ptr)[{idx}]; }}"
-                );
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}(({et}*){v}->ptr)[{idx}];{some} }}");
                 t
             }
             B::VecContains => {
@@ -1365,11 +1554,13 @@ impl FnGen<'_, '_, '_> {
             B::CharsNext => {
                 let t = self.tmp();
                 let it = &vals[0];
-                let ot = ctype(&CTy::Option(Box::new(CTy::Char)));
-                let _ = writeln!(
-                    self.out,
-                    "    {ot} {t}; {t}.tag = {it}->pos < {it}->s.len;\n    if ({t}.tag) {t}.v = lust_utf8_next({it}->s.ptr, &{it}->pos);"
-                );
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    if ({it}->pos < {it}->s.len) {{ {field} = lust_utf8_next({it}->s.ptr, &{it}->pos);{some} }}");
                 t
             }
             B::CharsCount => format!("lust_chars_count({})", vals[0]),
@@ -1382,11 +1573,16 @@ impl FnGen<'_, '_, '_> {
             B::CharToUppercase => format!("((*{0} >= 'a' && *{0} <= 'z') ? *{0} - 32 : *{0})", vals[0]),
             B::CharToLowercase => format!("((*{0} >= 'A' && *{0} <= 'Z') ? *{0} + 32 : *{0})", vals[0]),
             B::CharToDigit => {
-                let ot = ctype(&CTy::Option(Box::new(CTy::Int(IntTy::U32))));
+                let opt = CTy::Option(Box::new(CTy::Int(IntTy::U32)));
+                let ot = ctype(&opt);
                 let t = self.tmp();
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let _ = writeln!(
                     self.out,
-                    "    {ot} {t}; {t}.tag = 0;\n    {{ uint32_t d = lust_digit({}, {}, {loc}); if (d != 0xFFFFFFFFu) {{ {t}.tag = 1; {t}.v = d; }} }}",
+                    "    {{ uint32_t d = lust_digit({}, {}, {loc}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
                     vals[0], vals[1]
                 );
                 t
@@ -1844,6 +2040,118 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     c
 }
 
+/// The members of one C struct for fields at layout offsets: fields in
+/// offset order with explicit padding byte arrays between them, so the
+/// C offsets equal the layout offsets no matter what the C compiler
+/// would pick on its own. `fields` holds (declaration, field layout,
+/// offset) per field; `total` pads to the full size when given.
+fn layout_members(fields: &[(String, Layout, u64)], total: Option<u64>, struct_align: u64) -> String {
+    let mut order: Vec<usize> = (0..fields.len()).collect();
+    order.sort_by(|&a, &b| fields[a].2.cmp(&fields[b].2).then(fields[b].1.align.cmp(&fields[a].1.align)).then(a.cmp(&b)));
+    let mut members: Vec<String> = Vec::new();
+    let mut cur = 0u64;
+    let mut pad = 0u32;
+    for &i in &order {
+        let (decl, fl, off) = &fields[i];
+        if *off > cur {
+            members.push(format!("uint8_t _p{pad}[{}]", off - cur));
+            pad += 1;
+            cur = *off;
+        }
+        members.push(decl.clone());
+        cur = cur.max(off + fl.size);
+    }
+    if let Some(sz) = total
+        && sz > cur
+    {
+        members.push(format!("uint8_t _p{pad}[{}]", sz - cur));
+    }
+    let natural = fields.iter().map(|f| f.1.align).max().unwrap_or(1);
+    if struct_align > natural && !members.is_empty() {
+        members[0] = format!("_Alignas({struct_align}) {}", members[0]);
+    }
+    members.iter().map(|m| format!("{m}; ")).collect()
+}
+
+/// The compile-time layout proof for one emitted type: the C sizeof and
+/// _Alignof must equal the layout the type was emitted from.
+fn layout_assert(out: &mut String, ct: &str, l: &Layout) {
+    let _ = writeln!(out, "_Static_assert(sizeof({ct}) == {}, \"lust layout size\");", l.size);
+    let _ = writeln!(out, "_Static_assert(_Alignof({ct}) == {}, \"lust layout align\");", l.align);
+}
+
+/// One field's layout for `layout_members`, for a parent whose own
+/// `c_layout` is already exact. A miss here means the parent check and
+/// this one disagree; size 0 keeps the C layout assert as the failure.
+fn field_layout(p: &Program, t: &CTy) -> Layout {
+    c_layout(p, t).unwrap_or_else(|| plain_layout(0, 1))
+}
+
+/// Emits one layout-exact enum type (an Adt enum or an Option) plus its
+/// `disc_<mangle>` reader. The shape is one union: a struct per variant
+/// with fields at their absolute layout offsets, the tag scalar or a
+/// niche view struct, and a size member that pins the total size and
+/// alignment. `opener` is the declaration up to the opening brace.
+fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants: &[Vec<CTy>], l: &Layout) {
+    let ct = ctype(t);
+    let _ = write!(out, "{opener} {{ union {{ ");
+    for (vi, v) in variants.iter().enumerate() {
+        if v.is_empty() {
+            continue;
+        }
+        let fields: Vec<(String, Layout, u64)> = v
+            .iter()
+            .enumerate()
+            .map(|(fi, ft)| (format!("{} f{fi}", ctype(ft)), field_layout(p, ft), l.variant_offsets[vi][fi]))
+            .collect();
+        let _ = write!(out, "struct {{ {}}} v{vi}; ", layout_members(&fields, None, 1));
+    }
+    match l.enum_tag {
+        Some(EnumTag::Explicit { size, signed }) => {
+            let _ = write!(out, "{} _tag; ", tag_c_type(size, signed));
+        }
+        Some(EnumTag::NicheFilled { niche: Niche { offset, scalar_size, .. }, .. }) => {
+            let pad = if offset > 0 { format!("uint8_t _p[{offset}]; ") } else { String::new() };
+            let _ = write!(out, "struct {{ {pad}{} _s; }} _n; ", tag_c_type(scalar_size, false));
+        }
+        _ => {}
+    }
+    if l.size > 0 {
+        let al = if l.align > 1 { format!("_Alignas({}) ", l.align) } else { String::new() };
+        let _ = write!(out, "{al}uint8_t _size[{}]; ", l.size);
+    }
+    out.push_str("} u; }");
+    if opener.starts_with("typedef") {
+        let _ = write!(out, " {ct}");
+    }
+    out.push_str(";\n");
+    layout_assert(out, &ct, l);
+    let m = mangle(t);
+    match l.enum_tag {
+        Some(EnumTag::Explicit { .. }) => {
+            let _ = writeln!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ return (uint32_t)p->u._tag; }}");
+        }
+        Some(EnumTag::NicheFilled { variant, niche }) => {
+            let others: Vec<usize> = (0..variants.len()).filter(|&i| i != variant).collect();
+            let start = niche.start as u64;
+            let ret = if others.len() == 1 {
+                format!("return {};", others[0])
+            } else {
+                let map: Vec<String> = others.iter().map(|i| i.to_string()).collect();
+                format!("static const uint32_t map[{}] = {{{}}}; return map[s - {start}ULL];", others.len(), map.join(","))
+            };
+            let _ = writeln!(
+                out,
+                "static inline uint32_t disc_{m}(const {ct} *p) {{ uint64_t s = p->u._n._s; if (s >= {start}ULL && s < {}ULL) {{ {ret} }} return {variant}; }}",
+                start + others.len() as u64
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ (void)p; return 0; }}");
+        }
+    }
+}
+
 /// Declares the given types, plus every type they contain (by value or inside a Vec).
 fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
     // Close over field types.
@@ -1889,43 +2197,105 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             emit(p, d, emitted, out);
         }
         match t {
-            CTy::Option(e) => {
-                let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
-            }
-            CTy::Tuple(es) => {
-                let fields: String = es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
-                let fields = if fields.is_empty() { "uint8_t unused; ".to_string() } else { fields };
-                let _ = writeln!(out, "typedef struct {0} {{ {fields}}} {0};", ctype(t));
-            }
-            CTy::Array(e, n) => {
-                let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
-            }
+            CTy::Option(e) => match c_layout(p, t) {
+                Some(l) => emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![], vec![(**e).clone()]], &l),
+                None => {
+                    let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
+                }
+            },
+            CTy::Tuple(es) => match c_layout(p, t) {
+                Some(l) => {
+                    let ct = ctype(t);
+                    if es.is_empty() {
+                        let _ = writeln!(out, "typedef struct {ct} {{ }} {ct};");
+                    } else {
+                        let fields: Vec<(String, Layout, u64)> = es
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
+                            .collect();
+                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                    }
+                    layout_assert(out, &ct, &l);
+                }
+                None => {
+                    let fields: String = es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
+                    let fields = if fields.is_empty() { "uint8_t unused; ".to_string() } else { fields };
+                    let _ = writeln!(out, "typedef struct {0} {{ {fields}}} {0};", ctype(t));
+                }
+            },
+            CTy::Array(e, n) => match c_layout(p, t) {
+                Some(l) => {
+                    let ct = ctype(t);
+                    let _ = writeln!(out, "typedef struct {ct} {{ {} v[{n}]; }} {ct};", ctype(e));
+                    layout_assert(out, &ct, &l);
+                }
+                None => {
+                    let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
+                }
+            },
             CTy::Slice(e) => {
                 let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
+                if let Some(l) = c_layout(p, t) {
+                    layout_assert(out, &ctype(t), &l);
+                }
             }
             CTy::Adt(a) => {
                 let adt = p.adt(*a);
-                let a = a.0;
+                let an = a.0;
                 let _ = writeln!(out, "/* {} */", p.name(adt.name));
-                let fields = |v: &Variant| -> String {
-                    v.fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect()
-                };
+                let layout = c_layout(p, t);
                 if adt.is_enum {
-                    let _ = write!(out, "struct A{a} {{ uint32_t tag; ");
-                    if adt.variants.iter().any(|v| !v.fields.is_empty()) {
-                        out.push_str("union { ");
-                        for (vi, v) in adt.variants.iter().enumerate() {
-                            if !v.fields.is_empty() {
-                                let _ = write!(out, "struct {{ {}}} v{vi}; ", fields(v));
-                            }
+                    match layout {
+                        Some(l) => {
+                            let variants: Vec<Vec<CTy>> =
+                                adt.variants.iter().map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty)).collect()).collect();
+                            emit_enum_decl(p, out, &format!("struct A{an}"), t, &variants, &l);
                         }
-                        out.push_str("} u; ");
+                        None => {
+                            let fields = |v: &Variant| -> String {
+                                v.fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect()
+                            };
+                            let _ = write!(out, "struct A{an} {{ uint32_t tag; ");
+                            if adt.variants.iter().any(|v| !v.fields.is_empty()) {
+                                out.push_str("union { ");
+                                for (vi, v) in adt.variants.iter().enumerate() {
+                                    if !v.fields.is_empty() {
+                                        let _ = write!(out, "struct {{ {}}} v{vi}; ", fields(v));
+                                    }
+                                }
+                                out.push_str("} u; ");
+                            }
+                            out.push_str("};\n");
+                        }
                     }
-                    out.push_str("};\n");
                 } else {
-                    let f = fields(&adt.variants[0]);
-                    let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
-                    let _ = writeln!(out, "struct A{a} {{ {f}}};");
+                    match layout {
+                        Some(l) => {
+                            let v = &adt.variants[0];
+                            if v.fields.is_empty() {
+                                let _ = writeln!(out, "struct A{an} {{ }};");
+                            } else {
+                                let fields: Vec<(String, Layout, u64)> = v
+                                    .fields
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, f)| {
+                                        let ft = cty(&p.tys, f.ty);
+                                        (format!("{} f{i}", ctype(&ft)), field_layout(p, &ft), l.field_offsets[i])
+                                    })
+                                    .collect();
+                                let _ = writeln!(out, "struct A{an} {{ {}}};", layout_members(&fields, Some(l.size), l.align));
+                            }
+                            layout_assert(out, &format!("A{an}"), &l);
+                        }
+                        None => {
+                            let f: String =
+                                adt.variants[0].fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect();
+                            let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
+                            let _ = writeln!(out, "struct A{an} {{ {f}}};");
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1943,6 +2313,10 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
     let ct = ctype(t);
     let mut need = |g: Glue, t: &CTy| more.push((g, t.clone()));
     let mut body = String::new();
+    // Discriminant reads and the Option payload access for the enum
+    // shaped glue arms below (unused strings for other shapes).
+    let disc_p = disc_call(p, t, "p");
+    let pf = variant_field(p, t, "(*p)", 1, 0);
     match g {
         Glue::Drop => {
             let _ = writeln!(protos, "void drop_{m}({ct} *p);");
@@ -1953,11 +2327,15 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                         need(Glue::Drop, e);
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) drop_{}(&(({}*)p->ptr)[i]);", mangle(e), ctype(e));
                     }
-                    body.push_str("  free(p->ptr);\n");
+                    // A zero-sized element never allocates; its pointer is
+                    // the dangling aligned address, not a heap block.
+                    if c_layout(p, e).is_none_or(|l| l.size > 0) {
+                        body.push_str("  free(p->ptr);\n");
+                    }
                 }
                 CTy::Option(e) => {
                     need(Glue::Drop, e);
-                    let _ = writeln!(body, "  if (p->tag) drop_{}(&p->v);", mangle(e));
+                    let _ = writeln!(body, "  if ({disc_p}) drop_{}(&{pf});", mangle(e));
                 }
                 CTy::Tuple(es) => {
                     for (fi, ft) in es.iter().enumerate() {
@@ -1976,7 +2354,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 CTy::Adt(a) => {
                     let adt = p.adt(*a);
                     if adt.is_enum {
-                        body.push_str("  switch (p->tag) {\n");
+                        let _ = writeln!(body, "  switch ({disc_p}) {{");
                         for (vi, v) in adt.variants.iter().enumerate() {
                             let _ = write!(body, "  case {vi}:");
                             for (fi, f) in v.fields.iter().enumerate() {
@@ -2016,8 +2394,9 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
             match t {
                 CTy::String => body.push_str("  return lust_string_clone(p);\n"),
                 CTy::Option(e) => {
-                    let c = clone_of(e, "p->v", &mut need);
-                    let _ = writeln!(body, "  {ct} r = *p;\n  if (p->tag) r.v = {c};\n  return r;");
+                    let c = clone_of(e, &pf, &mut need);
+                    let rf = variant_field(p, t, "r", 1, 0);
+                    let _ = writeln!(body, "  {ct} r = *p;\n  if ({disc_p}) {rf} = {c};\n  return r;");
                 }
                 CTy::Tuple(es) => {
                     let _ = writeln!(body, "  {ct} r = *p;");
@@ -2048,7 +2427,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     let adt = p.adt(*a);
                     let _ = writeln!(body, "  {ct} r = *p;");
                     if adt.is_enum {
-                        body.push_str("  switch (p->tag) {\n");
+                        let _ = writeln!(body, "  switch ({disc_p}) {{");
                         for (vi, v) in adt.variants.iter().enumerate() {
                             let _ = write!(body, "  case {vi}:");
                             for (fi, f) in v.fields.iter().enumerate() {
@@ -2093,8 +2472,10 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 CTy::String => body.push_str("  return lust_str_eq(lust_string_as_str(a), lust_string_as_str(b));\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return lust_str_eq(*a, *b);\n"),
                 CTy::Option(e) => {
-                    let c = eq_of(e, "a->v", "b->v", &mut need);
-                    let _ = writeln!(body, "  return a->tag == b->tag && (!a->tag || {c});");
+                    let (af, bf) = (variant_field(p, t, "(*a)", 1, 0), variant_field(p, t, "(*b)", 1, 0));
+                    let c = eq_of(e, &af, &bf, &mut need);
+                    let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                    let _ = writeln!(body, "  return {da} == {db} && (!{da} || {c});");
                 }
                 CTy::Tuple(es) => {
                     for (fi, ft) in es.iter().enumerate() {
@@ -2129,7 +2510,8 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 CTy::Adt(a) => {
                     let adt = p.adt(*a);
                     if adt.is_enum {
-                        body.push_str("  if (a->tag != b->tag) return 0;\n  switch (a->tag) {\n");
+                        let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                        let _ = writeln!(body, "  if ({da} != {db}) return 0;\n  switch ({da}) {{");
                         for (vi, v) in adt.variants.iter().enumerate() {
                             let _ = write!(body, "  case {vi}:");
                             for (fi, f) in v.fields.iter().enumerate() {
@@ -2174,8 +2556,8 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
             let lit = |s: &str| format!("lust_string_push_bytes(out, {}, {});", c_string_lit(s.as_bytes()), s.len());
             match t {
                 CTy::Option(inner) => {
-                    let e = dbg_of(inner, "p->v", &mut need);
-                    let _ = writeln!(body, "  if (p->tag) {{ {} {e} {} }} else {}", lit("Some("), lit(")"), lit("None"));
+                    let e = dbg_of(inner, &pf, &mut need);
+                    let _ = writeln!(body, "  if ({disc_p}) {{ {} {e} {} }} else {}", lit("Some("), lit(")"), lit("None"));
                 }
                 CTy::Tuple(es) => {
                     let mut s = lit("(");
@@ -2256,7 +2638,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                         s
                     };
                     if adt.is_enum {
-                        body.push_str("  switch (p->tag) {\n");
+                        let _ = writeln!(body, "  switch ({disc_p}) {{");
                         for (vi, v) in adt.variants.iter().enumerate() {
                             let b = variant_body(v, &|fi| format!("p->u.v{vi}.f{fi}"), &mut need);
                             let _ = writeln!(body, "  case {vi}: {b} break;");
