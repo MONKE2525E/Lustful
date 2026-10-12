@@ -34,7 +34,7 @@ pub trait SolveCx {
     type Store: TyIntern;
     fn tys(&mut self) -> &mut Self::Store;
     /// Deeply follows inference links in one type.
-    fn resolve(&mut self, t: Ty) -> Ty;
+    fn deep_resolve(&mut self, t: Ty) -> Ty;
     /// Unifies two types, binding inference variables. False on a
     /// mismatch; bindings made before the mismatch may stand, which
     /// is why probes run under a snapshot.
@@ -111,7 +111,7 @@ fn deep_trait_ref<C: SolveCx>(cx: &mut C, tr: TraitRef) -> TraitRef {
     let mut new_args: Vec<GenericArg> = Vec::with_capacity(old_args.len());
     for g in old_args {
         new_args.push(match g {
-            GenericArg::Ty(t) => GenericArg::Ty(cx.resolve(t)),
+            GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)),
             other => other,
         });
     }
@@ -122,7 +122,7 @@ fn deep_trait_ref<C: SolveCx>(cx: &mut C, tr: TraitRef) -> TraitRef {
         new_b.push((
             d,
             match g {
-                GenericArg::Ty(t) => GenericArg::Ty(cx.resolve(t)),
+                GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)),
                 other => other,
             },
         ));
@@ -253,7 +253,7 @@ impl Solver {
             let eq = b.value;
             // Only an equality whose right side is exactly one still
             // free impl parameter variable can bind it.
-            let rhs = cx.resolve(eq.ty);
+            let rhs = cx.deep_resolve(eq.ty);
             if !matches!(cx.tys().kind(rhs), TyKind::Infer(_)) || !inst.iter().any(|g| g.as_ty() == Some(rhs)) {
                 continue;
             }
@@ -263,7 +263,7 @@ impl Solver {
             // Binding the variable to an unrewritten projection (its
             // Ty id can differ from `proj`'s by re-interning) would
             // only move the unknown, so it does not count.
-            let normed = cx.resolve(normed);
+            let normed = cx.deep_resolve(normed);
             if !matches!(cx.tys().kind(normed), TyKind::Projection(..)) && normed != rhs {
                 cx.unify(rhs, normed);
             }
@@ -289,7 +289,7 @@ impl Solver {
         for (i, g) in inst.iter().enumerate() {
             match g {
                 GenericArg::Ty(t) => {
-                    let r = cx.resolve(*t);
+                    let r = cx.deep_resolve(*t);
                     if rec.generics.params[i].kind == ParamKind::Type && matches!(cx.tys().kind(r), TyKind::Infer(_)) {
                         unbound.push(ParamId(i as u32));
                     }
@@ -306,7 +306,7 @@ impl Solver {
     /// that could still change the head. The head is the outermost
     /// form, so variables inside a fixed constructor cannot.
     fn head_is_settled<C: SolveCx>(&self, cx: &mut C, self_ty: Ty) -> bool {
-        let resolved = cx.resolve(self_ty);
+        let resolved = cx.deep_resolve(self_ty);
         head_of(cx.tys(), resolved, &|t| t).is_some()
     }
 
@@ -371,13 +371,25 @@ impl Solver {
             _ => {}
         }
 
+        // Step 6's other half, checked before any candidate can
+        // confirm: with no known head, selection always defers.
+        // A blanket probe binding here would pick the blanket
+        // before inference can name the concrete impl.
+        {
+            let self_ty = self_ty_of(cx.tys(), &obl);
+            let deep = cx.deep_resolve(self_ty);
+            if head_of(cx.tys(), deep, &|t| t).is_none() {
+                return Selection::Ambiguous;
+            }
+        }
+
         // Step 2: header candidates by probe unification.
         let self_ty = self_ty_of(cx.tys(), &obl);
         let cands: Vec<ImplId> = {
             // `candidates` reads through an immutable store view;
             // resolve in a snapshot-free way by deep-resolving Self
             // first, so `&|t| t` is exact for its head test.
-            let self_deep = cx.resolve(self_ty);
+            let self_deep = cx.deep_resolve(self_ty);
             index.candidates(cx.tys(), obl.def, self_deep, &|t| t)
         };
         cx.record_impl_set(obl.def, self_ty, cands.is_empty());
@@ -475,7 +487,7 @@ impl Solver {
             }
         }
         let self_ty = self_ty_of(cx.tys(), &tr);
-        let self_deep = cx.resolve(self_ty);
+        let self_deep = cx.deep_resolve(self_ty);
         if head_of(cx.tys(), self_deep, &|t| t).is_none() {
             return false;
         }
@@ -565,7 +577,7 @@ pub fn normalize<C: SolveCx>(solver: &mut Solver, cx: &mut C, index: &ImplIndex,
 
 impl Solver {
     fn normalize_inner<C: SolveCx>(&mut self, cx: &mut C, index: &ImplIndex, env: &[Predicate], t: Ty, depth: usize) -> Ty {
-        let t = cx.resolve(t);
+        let t = cx.deep_resolve(t);
         if depth >= MAX_DEPTH || !cx.tys().flags(t).contains_projection() {
             return t;
         }
@@ -768,31 +780,31 @@ impl<'g> SolveCx for PureCx<'g> {
     /// Deeply resolves variables, rebuilding compound types whose
     /// parts moved. A type with no inference variable (the cached
     /// flag) comes back as it is.
-    fn resolve(&mut self, t: Ty) -> Ty {
+    fn deep_resolve(&mut self, t: Ty) -> Ty {
         let t = self.resolve_shallow(t);
         if !self.tys.flags(t).contains_infer() {
             return t;
         }
         match self.tys.kind(t) {
             TyKind::Ref(r, m, e) => {
-                let e = self.resolve(e);
+                let e = self.deep_resolve(e);
                 self.tys.intern(TyKind::Ref(r, m, e))
             }
             TyKind::RawPtr(m, e) => {
-                let e = self.resolve(e);
+                let e = self.deep_resolve(e);
                 self.tys.intern(TyKind::RawPtr(m, e))
             }
             TyKind::Slice(e) => {
-                let e = self.resolve(e);
+                let e = self.deep_resolve(e);
                 self.tys.intern(TyKind::Slice(e))
             }
             TyKind::Array(e, n) => {
-                let e = self.resolve(e);
+                let e = self.deep_resolve(e);
                 self.tys.intern(TyKind::Array(e, n))
             }
             TyKind::Tuple(ts) => {
                 let old: Vec<Ty> = self.tys.tys_of(ts).to_vec();
-                let new: Vec<Ty> = old.iter().map(|&e| self.resolve(e)).collect();
+                let new: Vec<Ty> = old.iter().map(|&e| self.deep_resolve(e)).collect();
                 let ts = self.tys.intern_tys(&new);
                 self.tys.intern(TyKind::Tuple(ts))
             }
@@ -801,7 +813,7 @@ impl<'g> SolveCx for PureCx<'g> {
                 let new: Vec<GenericArg> = old
                     .iter()
                     .map(|&g| match g {
-                        GenericArg::Ty(e) => GenericArg::Ty(self.resolve(e)),
+                        GenericArg::Ty(e) => GenericArg::Ty(self.deep_resolve(e)),
                         other => other,
                     })
                     .collect();
@@ -813,7 +825,7 @@ impl<'g> SolveCx for PureCx<'g> {
                 let new: Vec<GenericArg> = old
                     .iter()
                     .map(|&g| match g {
-                        GenericArg::Ty(e) => GenericArg::Ty(self.resolve(e)),
+                        GenericArg::Ty(e) => GenericArg::Ty(self.deep_resolve(e)),
                         other => other,
                     })
                     .collect();
@@ -1137,7 +1149,7 @@ mod tests {
         let x = cx.fresh_var();
         let obl = trait_ref(&mut cx.tys, from_tr, &[p0, x]);
         assert_eq!(Solver::new().select(&mut cx, &index, &env, obl), Selection::Ambiguous);
-        let rx = cx.resolve(x);
+        let rx = cx.deep_resolve(x);
         assert!(matches!(cx.tys.kind(rx), TyKind::Infer(_)), "an ambiguous selection binds nothing");
 
         // `T: From<u8>` matches one and commits.
@@ -1176,13 +1188,13 @@ mod tests {
         let bag_ty = cx.tys.mk_adt(bag, &[GenericArg::Ty(elem)]);
         let obl = trait_ref(&mut cx.tys, from_iter, &[bag_ty, u8_ty()]);
         assert!(matches!(Solver::new().select(&mut cx, &index, &[], obl), Selection::Impl { .. }));
-        assert_eq!(cx.resolve(elem), u8_ty(), "the element type is fixed by the one candidate");
+        assert_eq!(cx.deep_resolve(elem), u8_ty(), "the element type is fixed by the one candidate");
 
         let mut cx = PureCx::new(&g);
         let x = cx.fresh_int_var();
         let obl = trait_ref(&mut cx.tys, index_tr, &[arr_ty, x]);
         assert!(matches!(Solver::new().select(&mut cx, &index, &[], obl), Selection::Impl { .. }));
-        assert_eq!(cx.resolve(x), USIZE, "the integer variable is fixed to usize");
+        assert_eq!(cx.deep_resolve(x), USIZE, "the integer variable is fixed to usize");
     }
 
     /// Section 2.5: an associated equality on a supertrait bound

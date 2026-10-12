@@ -243,7 +243,9 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
         CTy::Array(e, _) => needs_drop_c(p, e),
-        CTy::Adt(a) => p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty))),
+        CTy::Adt(a) => {
+            p.gx.drop_methods.contains_key(a) || p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
+        }
         _ => false,
     }
 }
@@ -1880,7 +1882,7 @@ impl GlueSet {
     /// content changed, so the caller must recompile it. New glue that no unit shared at freeze
     /// time is not in `shared`, so it returns false for that: the new glue is static in the
     /// function units that reach it.
-    pub fn add<'k>(&mut self, p: &Program, keys: impl Iterator<Item = &'k (Glue, CTy)>) -> bool {
+    pub fn add<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> bool {
         let mut pending: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k)).cloned().collect();
         let mut shared_changed = false;
         while let Some(g) = pending.pop() {
@@ -1890,7 +1892,7 @@ impl GlueSet {
             let mut more = Vec::new();
             let mut proto = String::new();
             let mut def = String::new();
-            glue_def(p, &g.0, &g.1, &mut proto, &mut def, &mut more);
+            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
             self.defs.push_str(&def);
             self.def_map.insert(g.clone(), def);
             self.deps.insert(g.clone(), more.clone());
@@ -2781,7 +2783,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
     out.push('\n');
 }
 
-fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut String, more: &mut Vec<(Glue, CTy)>) {
+fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, defs: &mut String, more: &mut Vec<(Glue, CTy)>) {
     let m = mangle(t);
     let ct = ctype(t);
     let mut need = |g: Glue, t: &CTy| more.push((g, t.clone()));
@@ -2827,6 +2829,12 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     }
                 }
                 CTy::Adt(a) => {
+                    // A user `Drop` impl runs before the fields drop
+                    // (W-TRAITS-CORE through W-CGEN: the glue reads
+                    // the instance from `Program::gx.drop_methods`).
+                    if let Some(&drop_fn) = p.gx.drop_methods.get(a) {
+                        let _ = writeln!(body, "  ({}lust_fns[{}])(p);", fn_ptr_cast(p, drop_fn), slots[drop_fn.0 as usize]);
+                    }
                     let adt = p.adt(*a);
                     if adt.is_enum {
                         let _ = writeln!(body, "  switch ({disc_p}) {{");

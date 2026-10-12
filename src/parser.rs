@@ -1688,7 +1688,7 @@ impl<'a> Parser<'a> {
         let mut args = Vec::new();
         while self.peek() != Tok::Gt {
             match self.peek() {
-                Tok::Lifetime(_) => return Err(lifetime_error(self.span())),
+                Tok::Lifetime(_) => args.push(GenericArg::Lifetime(self.lifetime_here()?)),
                 Tok::Ident(name) if self.peek_at(1) == Tok::Eq => {
                     let span = self.span();
                     self.bump();

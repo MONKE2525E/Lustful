@@ -1534,10 +1534,57 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
     }
-    if program.fns.len() != fn_count {
+    if program.fns.len() < fn_count {
         // The scanner and the parser disagree (only possible with unusual syntax). Start over.
         front.env_hash = None;
         return Response { stderr: "error: internal: function count mismatch; run again\n".into(), code: 3, ..Default::default() };
+    }
+    // Mono instance slots (docs/ARCH.md section 4.2; W-TRAITS-CORE
+    // through W-DRIVER): collect appends materialized instances
+    // after the AST fns. They get append-only slots keyed by their
+    // instance disk identity, exactly like AST fns in slot_update;
+    // templates and abstract instances are emptied like dead slots
+    // so only plain fns and instances are checked and generated.
+    // A generic program always runs its whole concrete work set:
+    // instance discovery is a whole-program walk, and the
+    // incremental reuse paths key on AST fns only.
+    if program.gx.has_generics {
+        for i in fn_count..program.fns.len() {
+            let disk = program.disk_id(LocalDefId(i as u32));
+            if let Err(c) = def::insert_path(&mut front.slot_paths, disk, &format!("instance#{}", disk.hash.0)) {
+                front.env_hash = None;
+                return Response { stderr: format!("error: {c}\n"), code: 3, ..Default::default() };
+            }
+            let slot = match front.slot_of.get(&disk) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = front.slot_of.len() as u32;
+                    front.slot_of.insert(disk, slot);
+                    slot
+                }
+            };
+            front.fn_slot.push(slot);
+        }
+        let n_slots = front.slot_of.len();
+        caches.ok.resize(n_slots, false);
+        caches.has_out.resize(n_slots, false);
+        caches.out.resize_with(n_slots, FnOut::default);
+        caches.slot_reads.resize_with(n_slots, || None);
+        caches.slot_used.resize_with(n_slots, Vec::new);
+        front.slot_hash.resize(n_slots, 0);
+        for i in 0..program.fns.len() {
+            if !matches!(
+                program.gx.fn_class.get(i),
+                Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance) | None
+            ) {
+                let s = front.fn_slot[i] as usize;
+                caches.out[s] = FnOut::default();
+                caches.has_out[s] = true;
+                caches.ok[s] = true;
+                caches.slot_reads[s] = None;
+                caches.slot_used[s].clear();
+            }
+        }
     }
     t.lap("collect");
 
@@ -1562,7 +1609,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mut reused: Vec<usize> = Vec::new();
         for (i, reads) in candidates {
             match reads {
-                Some(r) if { let d = program.reads_dirty(&r); reads_invalidated += d; d == 0 } => reused.push(i),
+                Some(r)
+                    if {
+                        let d = program.reads_dirty(&r);
+                        reads_invalidated += d;
+                        d == 0
+                    } =>
+                {
+                    reused.push(i)
+                }
                 Some(_) => {
                     let s = slot_at(i);
                     caches.has_out[s] = false;
@@ -1586,6 +1641,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut work = changed.clone();
     if req.cmd == Cmd::Build {
         work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
+    }
+    if program.gx.has_generics {
+        // The whole concrete set, every compile (see the instance
+        // slot block above).
+        work = (0..program.fns.len())
+            .filter(|&i| {
+                matches!(
+                    program.gx.fn_class.get(i),
+                    Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance) | None
+                )
+            })
+            .collect();
     }
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
@@ -1672,7 +1739,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Codegen for the work set.
     let bodies: Vec<(usize, ir::Body)> = work.iter().copied().zip(results).filter_map(|(i, r)| r.0.map(|b| (i, b))).collect();
-    let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, scan_of(front, *i).1, &front.fn_slot));
+    let outs = par_map(&bodies, |(i, b)| {
+        // An instance's lines and body span are its template's.
+        let scan_i = program.gx.instances.get(&LocalDefId(*i as u32)).and_then(|info| info.template_local).map_or(*i, |t| t.0 as usize);
+        let line_base = if scan_i < fn_count { scan_of(front, scan_i).1 } else { 0 };
+        cgen::gen_fn(&program, b, &map, line_base, &front.fn_slot)
+    });
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
@@ -1700,7 +1772,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
     }
-    let glue_changed = caches.glue.add(&program, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()));
+    let glue_changed = caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()));
     t.lap("codegen (par)");
 
     // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4.. = function

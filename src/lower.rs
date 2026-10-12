@@ -86,6 +86,21 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn assign(&mut self, place: Place, rv: Rvalue, span: Span) {
         self.push(StmtKind::Assign(place, rv), span);
     }
+    /// The mono instance for a call whose checked resolution
+    /// names a template, through the zonked generic args the
+    /// checker recorded for this expression (W-TRAITS-CORE through
+    /// the lower owner). Plain fns answer themselves.
+    fn resolve_generic_fn(&self, e: ExprId, f: LocalDefId) -> LocalDefId {
+        if self.p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
+            return f;
+        }
+        let ei = (e.0 - self.ck.expr_base) as usize;
+        let Some(args) = self.ck.generic_args.get(ei) else { return f };
+        if args.is_empty() {
+            return f;
+        }
+        crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f)
+    }
     /// Emits a call terminator that writes its result to `dest` and continues
     /// in a fresh block. The unwind successor is a cleanup block chain: one
     /// block per enclosing scope, innermost first, each dropping that
@@ -563,13 +578,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.goto(head, span);
                 self.cur = exit;
             }
-            Expr::For { label, pat, iter, body } => self.for_loop(*label, *pat, *iter, *body, span, dest),
+            Expr::For { label, pat, iter, body } => self.for_loop(e, *label, *pat, *iter, *body, span, dest),
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
             Expr::Call { args, .. } => {
                 let res = self.ck.res(e);
                 let ops: Vec<Operand> = args.iter().map(|&a| self.operand(a)).collect();
                 match res {
                     Res::Fn(f) => {
+                        let f = self.resolve_generic_fn(e, f);
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Fn(f), ops, d, span);
                     }
@@ -588,6 +604,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     Res::ConstUsize(v) => {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
+                    Res::FromCast => self.set_or_temp(dest, Rvalue::Cast(ops.into_iter().next().unwrap(), ty), ty, span),
                     Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
                     _ => return,
                 }
@@ -1101,7 +1118,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
         }
         let target = match callee {
-            Ok(f) => CallTarget::Fn(f),
+            Ok(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
             Err(b) => CallTarget::Builtin(b),
         };
         let d = self.call_dest(dest, self.ty(e));
@@ -1114,6 +1131,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             Some(d) => d.clone(),
             None => Place::local(self.temp(ty)),
         };
+        if let Res::TraitBin { f, ld, rd } = self.ck.res(e) {
+            let f = self.resolve_generic_fn(e, f);
+            let a = self.operand_derefs(lhs, ld);
+            let b = self.operand_derefs(rhs, rd);
+            self.call_into(CallTarget::Fn(f), vec![a, b], out, span);
+            return;
+        }
         if matches!(op, BinOp::And | BinOp::Or) {
             // Short circuit. Both sides write a mutable temporary, and the destination is
             // written once at the end. Writing the destination twice would make the borrow
@@ -1198,14 +1222,49 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Loops ----------
 
-    fn for_loop(&mut self, label: Option<ast::Label>, pat: PatId, iter: ExprId, body: ast::BlockId, span: Span, dest: Option<&Place>) {
+    fn for_loop(&mut self, for_e: ExprId, _label: Option<ast::Label>, pat: PatId, iter: ExprId, body: ast::BlockId, span: Span, dest: Option<&Place>) {
         let p = self.p;
         self.scopes.push(Vec::new());
         let item_ty = self.ck.pat_ty(pat);
         let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
         // `next` computes the loop variable into this local at the top of each iteration.
         let item = self.temp(item_ty);
-        if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter) {
+        if let Res::ForTrait { into_iter, next } = self.ck.res(for_e) {
+            // `for x in it`: into_iter() then next() until None,
+            // the Chars arm's shape with user methods.
+            let next_f = self.resolve_generic_fn(iter, next);
+            // The std blanket IntoIterator is synthetic with the
+            // sentinel id: the receiver is already the iterator.
+            let (iter_ty, it) = if into_iter.0 == u32::MAX {
+                let it = self.temp(self.ty(iter));
+                self.expr_into(iter, Some(&Place::local(it)));
+                (self.ty(iter), it)
+            } else {
+                let into_f = self.resolve_generic_fn(for_e, into_iter);
+                let iter_ty = p.fn_info(into_f).ret;
+                let src = self.temp(self.ty(iter));
+                self.expr_into(iter, Some(&Place::local(src)));
+                let it = self.temp(iter_ty);
+                let src_op = self.operand_from(Place::local(src), self.ty(iter));
+                self.call_into(CallTarget::Fn(into_f), vec![src_op], Place::local(it), span);
+                (iter_ty, it)
+            };
+            self.goto(head, span);
+            let mt = self.ref_ty(true, iter_ty);
+            let r = self.temp(mt);
+            self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
+            let ot = p.fn_info(next_f).ret;
+            let nx = self.temp(ot);
+            self.call_into(CallTarget::Fn(next_f), vec![Operand::Move(Place::local(r))], Place::local(nx), span);
+            let d = self.temp(int(IntTy::U32));
+            self.assign(Place::local(d), Rvalue::Discriminant(Place::local(nx)), span);
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, bodyb)], exit);
+            self.cur = bodyb;
+            let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
+            let op = self.operand_from(c, item_ty);
+            self.assign(Place::local(item), Rvalue::Use(op), span);
+        } else if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter) {
             let (lo, hi) = (lo.unwrap(), hi.unwrap());
             let cur = self.temp(item_ty);
             self.expr_into(lo, Some(&Place::local(cur)));

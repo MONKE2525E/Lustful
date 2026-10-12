@@ -629,8 +629,16 @@ pub trait TyIntern {
     fn flags(&self, t: Ty) -> TyFlags;
     fn intern_args(&mut self, args: &[GenericArg]) -> ArgsId;
     fn args(&self, id: ArgsId) -> &[GenericArg];
+    /// The already-interned id of this argument list, if any. Never interns.
+    fn get_args(&self, _args: &[GenericArg]) -> Option<ArgsId> {
+        None
+    }
     fn intern_tys(&mut self, tys: &[Ty]) -> TysId;
     fn tys_of(&self, id: TysId) -> &[Ty];
+    /// The already-interned id of this type list, if any. Never interns.
+    fn get_tys(&self, _tys: &[Ty]) -> Option<TysId> {
+        None
+    }
     #[allow(dead_code)] // Formed by array lengths and const generics in wave A.
     fn intern_const(&mut self, c: ConstKind) -> ConstId;
     #[allow(dead_code)] // See `intern_const`.
@@ -941,6 +949,10 @@ impl GlobalTys {
         self.adt_full_tys[i] = Some(t);
         t
     }
+    /// The already-interned id of one const value, if any.
+    pub fn consts_get(&self, k: ConstKind) -> Option<ConstId> {
+        self.consts.get_id(&k)
+    }
     /// The full applied type of a session-local Adt, if registered.
     pub fn full_adt_ty(&self, local: AdtId) -> Option<Ty> {
         self.adt_full_tys.get(local.0 as usize).copied().flatten()
@@ -973,11 +985,17 @@ impl TyIntern for GlobalTys {
     fn args(&self, id: ArgsId) -> &[GenericArg] {
         &self.args_a.items[id.0 as usize]
     }
+    fn get_args(&self, args: &[GenericArg]) -> Option<ArgsId> {
+        self.args_a.get_slice(args)
+    }
     fn intern_tys(&mut self, tys: &[Ty]) -> TysId {
         self.tys_a.intern_slice(tys, 0)
     }
     fn tys_of(&self, id: TysId) -> &[Ty] {
         &self.tys_a.items[id.0 as usize]
+    }
+    fn get_tys(&self, tys: &[Ty]) -> Option<TysId> {
+        self.tys_a.get_slice(tys)
     }
     fn intern_const(&mut self, c: ConstKind) -> ConstId {
         self.consts.intern(c, 0)
@@ -1123,6 +1141,9 @@ impl TyIntern for Tys<'_> {
         let g = self.global.args_a.len();
         if id.0 < g { &self.global.args_a.items[id.0 as usize] } else { &self.args_a.items[(id.0 - g) as usize] }
     }
+    fn get_args(&self, args: &[GenericArg]) -> Option<ArgsId> {
+        self.global.args_a.get_slice(args).or_else(|| self.args_a.get_slice(args))
+    }
     fn intern_tys(&mut self, tys: &[Ty]) -> TysId {
         if let Some(id) = self.global.tys_a.get_slice(tys) {
             return id;
@@ -1133,6 +1154,9 @@ impl TyIntern for Tys<'_> {
     fn tys_of(&self, id: TysId) -> &[Ty] {
         let g = self.global.tys_a.len();
         if id.0 < g { &self.global.tys_a.items[id.0 as usize] } else { &self.tys_a.items[(id.0 - g) as usize] }
+    }
+    fn get_tys(&self, tys: &[Ty]) -> Option<TysId> {
+        self.global.tys_a.get_slice(tys).or_else(|| self.tys_a.get_slice(tys))
     }
     fn intern_const(&mut self, c: ConstKind) -> ConstId {
         if let Some(id) = self.global.consts.get_id(&c) {
@@ -1234,6 +1258,7 @@ pub fn subst(s: &mut impl TyIntern, t: Ty, args: &[GenericArg]) -> Ty {
         }
         TyKind::Array(e, n) => {
             let e = subst(s, e, args);
+            let n = subst_const(s, n, args);
             s.intern(TyKind::Array(e, n))
         }
         TyKind::Tuple(ts) => {
@@ -1288,10 +1313,23 @@ pub fn subst(s: &mut impl TyIntern, t: Ty, args: &[GenericArg]) -> Ty {
     }
 }
 
-/// One generic argument under substitution. Lifetime and const args pass through.
+/// One const value under substitution: a const parameter takes
+/// its argument when the argument is a const.
+fn subst_const(s: &mut impl TyIntern, c: ConstId, args: &[GenericArg]) -> ConstId {
+    match s.const_kind(c) {
+        ConstKind::Param(i) => match args.get(i as usize) {
+            Some(GenericArg::Const(k)) => *k,
+            _ => c,
+        },
+        _ => c,
+    }
+}
+
+/// One generic argument under substitution. Lifetimes pass through.
 fn subst_one_arg(s: &mut impl TyIntern, g: GenericArg, args: &[GenericArg]) -> GenericArg {
     match g {
         GenericArg::Ty(t) => GenericArg::Ty(subst(s, t, args)),
+        GenericArg::Const(c) => GenericArg::Const(subst_const(s, c, args)),
         other => other,
     }
 }

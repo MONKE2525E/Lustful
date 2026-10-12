@@ -1081,6 +1081,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         let mut scope = parent_gen.scope.clone();
         scope.type_params.extend(own_scope.type_params.iter().copied());
         scope.const_params.extend(own_scope.const_params.iter().copied());
+        scope.param_tys.extend(own_scope.param_tys.iter().copied());
         scope.assoc_srcs.extend(own_scope.assoc_srcs.iter().cloned());
         // Associated sources from every bound in the combined env,
         // so `T::Assoc` resolves in this signature.
@@ -1236,10 +1237,12 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         // Inherent methods join the compat method
                         // table under the *template* Adt; instances
                         // get their own entries at materialization.
-                        if let Some(owner) = owner
-                            && p.methods.insert((owner, def.name), id).is_some()
-                        {
-                            errs.push(dup(def.name_span, interner.get(def.name)));
+                        if let Some(owner) = owner {
+                            if p.methods.insert((owner, def.name), id).is_some() {
+                                errs.push(dup(def.name_span, interner.get(def.name)));
+                            }
+                            let adt_def = p.gx.adt_info[owner.0 as usize].0;
+                            p.gx.inherent_methods.insert((adt_def, def.name), id);
                         }
                     }
                 }
@@ -1776,7 +1779,12 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                 return is_copy(p, tys, e);
             }
             match tys.local_adt(t) {
-                Some(a) => p.adt(a).derives.copy,
+                Some(a) => {
+                    p.adt(a).derives.copy
+                        && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
+                            && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty))))
+                }
                 None => false,
             }
         }
@@ -1796,7 +1804,11 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         return has_clone(p, tys, e);
     }
     match tys.local_adt(t) {
-        Some(a) => p.adt(a).derives.clone,
+        Some(a) => {
+            p.adt(a).derives.clone
+                && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+                    || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_clone(p, tys, f.ty))))
+        }
         None => is_copy(p, tys, t),
     }
 }
@@ -1817,7 +1829,11 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                 return has_eq(p, tys, e);
             }
             match tys.local_adt(t) {
-                Some(a) => p.adt(a).derives.partial_eq,
+                Some(a) => {
+                    p.adt(a).derives.partial_eq
+                        && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_eq(p, tys, f.ty))))
+                }
                 None => false,
             }
         }
@@ -1840,7 +1856,11 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                 return has_debug(p, tys, e);
             }
             match tys.local_adt(t) {
-                Some(a) => p.adt(a).derives.debug,
+                Some(a) => {
+                    p.adt(a).derives.debug
+                        && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_debug(p, tys, f.ty))))
+                }
                 None => false,
             }
         }
@@ -1871,7 +1891,9 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         return needs_drop(p, tys, e);
     }
     match tys.local_adt(t) {
-        Some(a) => p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty))),
+        Some(a) => {
+            p.gx.drop_methods.contains_key(&a) || p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
+        }
         None => false,
     }
 }

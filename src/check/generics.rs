@@ -17,6 +17,7 @@ use crate::def::{DefId, LocalDefId};
 use crate::diag::{Diag, Span, not_yet};
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::traits::index::{ImplIndex, TraitRecord};
+use crate::traits::solve::{Selection, Solver};
 use crate::ty::*;
 
 /// The defs of the lang traits lust knows without source std: the
@@ -307,6 +308,26 @@ impl LangTraits {
         })
     }
 
+    /// True for lang traits whose last input defaults to Self
+    /// (`PartialEq<Rhs = Self>`, the binary operators).
+    pub fn input_defaults_to_self(&self, def: DefId) -> bool {
+        [
+            self.partial_eq,
+            self.partial_ord,
+            self.add,
+            self.sub,
+            self.mul,
+            self.div,
+            self.rem,
+            self.bit_and,
+            self.bit_or,
+            self.bit_xor,
+            self.shl,
+            self.shr,
+        ]
+        .contains(&def)
+    }
+
     /// True for the auto traits, which selection answers
     /// structurally, never through the impl index (section 2.7).
     pub fn is_auto(&self, def: DefId) -> bool {
@@ -433,6 +454,11 @@ pub struct AssocSrc {
 /// The naming scope one signature resolves types under: generic
 /// parameters by name, the `Self` type, and the associated-type
 /// sources of `Self` and the parameters' bounds.
+/// Inference variable ids at or above this base in a resolved
+/// signature type are `_` markers from `resolve_scoped`, which
+/// the checker replaces with real body variables on sight.
+pub const INFER_MARKER_BASE: u32 = 1 << 29;
+
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     /// Type parameter name to index in the item's `Generics`.
@@ -441,12 +467,29 @@ pub struct Scope {
     pub const_params: Vec<(Sym, u32)>,
     pub self_ty: Option<Ty>,
     pub assoc_srcs: Vec<AssocSrc>,
+    /// Parameter names to their types in this scope instance:
+    /// `Param` types in a template, concrete types in an
+    /// instance. `T::assoc` paths resolve through this.
+    pub param_tys: Vec<(Sym, Ty)>,
+    /// When set, `_` in a written type resolves to a marker
+    /// inference variable (body annotations). The counter holds
+    /// the next marker id, from `INFER_MARKER_BASE`. An atomic
+    /// behind an `Arc` keeps `Program` shareable across the
+    /// parallel body checks.
+    pub infer_cell: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Scope {
     /// The scope of today's non-generic signatures.
     pub fn plain(self_ty: Option<Ty>) -> Scope {
-        Scope { type_params: Vec::new(), const_params: Vec::new(), self_ty, assoc_srcs: Vec::new() }
+        Scope {
+            type_params: Vec::new(),
+            const_params: Vec::new(),
+            self_ty,
+            assoc_srcs: Vec::new(),
+            param_tys: Vec::new(),
+            infer_cell: None,
+        }
     }
     /// The parameter index of a type parameter name.
     pub fn param_of(&self, name: Sym) -> Option<u32> {
@@ -576,7 +619,13 @@ fn resolve_const_arg(ast: &Ast, tys: &mut impl TyIntern, scope: &Scope, e: ast::
 /// The trait a written trait path names, by its last segment:
 /// user traits first, then lang traits. `std::` and `core::`
 /// prefixes are accepted and ignored, as type paths do today.
-fn trait_def_of_path(cx: &ResolveCx, interner: &Interner, known: &Known, segs: &[ast::PathSeg], span: Span) -> Result<DefId, Diag> {
+pub(crate) fn trait_def_of_path(
+    cx: &ResolveCx,
+    interner: &Interner,
+    known: &Known,
+    segs: &[ast::PathSeg],
+    span: Span,
+) -> Result<DefId, Diag> {
     let last = segs.last().ok_or_else(|| Diag::new("L0102", span, "expected a trait name", "Write a trait name."))?;
     if segs.len() > 1 && segs[0].name != known.std && interner.get(segs[0].name) != "core" && interner.get(segs[0].name) != "alloc" {
         return Err(not_yet("L0505", span, "module paths in trait references"));
@@ -661,6 +710,12 @@ fn resolve_trait_path_args(
             (inputs, bindings)
         }
     };
+    // Lang traits with a `Rhs = Self` default (the comparison and
+    // binary operator families) accept the input omitted.
+    let mut input_args = input_args;
+    if input_args.len() + 1 == n_inputs && cx.lang.input_defaults_to_self(trait_def) {
+        input_args.push(GenericArg::Ty(self_ty));
+    }
     if input_args.len() != n_inputs {
         return Err(Diag::new(
             "L0110",
@@ -740,7 +795,13 @@ pub fn resolve_scoped(
             let e = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
             Ok(tys.intern(TyKind::RawPtr(Mut::from_bool(*mutable), e)))
         }
-        TyExpr::Infer => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
+        TyExpr::Infer => match &scope.infer_cell {
+            Some(cell) => {
+                let id = cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(tys.intern(TyKind::Infer(InferId(id, false))))
+            }
+            None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
+        },
         TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
         TyExpr::Dyn { bounds, .. } => resolve_dyn(ast, interner, known, cx, tys, scope, bounds, span),
         TyExpr::QPath { self_ty, trait_path, segs } => {
@@ -923,6 +984,12 @@ fn resolve_path_ty(
     let seg = segs.last().unwrap();
     let name = seg.name;
     if segs.len() == 1 {
+        if let Some((_, t)) = scope.param_tys.iter().find(|(n, _)| *n == name) {
+            if seg.has_args() {
+                return Err(Diag::new("L0110", span, "a type parameter takes no generic arguments", "Remove the `<...>` part."));
+            }
+            return Ok(*t);
+        }
         if let Some(i) = scope.param_of(name) {
             if seg.has_args() {
                 return Err(Diag::new("L0110", span, "a type parameter takes no generic arguments", "Remove the `<...>` part."));
@@ -1202,6 +1269,13 @@ pub fn build_generics_shifted(
             predicates.push(Predicate::Trait(Binder::plain(TraitRef { def: cx.lang.sized, args, bindings: EMPTY_BINDINGS })));
         }
     }
+    scope.param_tys = type_param_tys
+        .iter()
+        .map(|(idx, t)| {
+            let name = scope.type_params.iter().find(|(_, i)| i == idx).map_or(Sym(0), |(n, _)| *n);
+            (name, *t)
+        })
+        .collect();
     (Generics { parent: None, params, predicates }, scope)
 }
 
@@ -1329,6 +1403,10 @@ pub struct GenTables<'a> {
     pub fn_class: Vec<FnClass>,
     pub instances: FxMap<LocalDefId, InstanceInfo>,
     pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
+    /// Inherent method templates by (Adt template def, name).
+    pub inherent_methods: FxMap<(DefId, Sym), LocalDefId>,
+    /// Trait defs that declare a method of this name.
+    pub traits_by_method: FxMap<Sym, Vec<DefId>>,
     /// The `Drop::drop` instance to call for one concrete Adt,
     /// for cgen's drop glue (iface: W-CGEN reads this).
     pub drop_methods: FxMap<AdtId, LocalDefId>,
@@ -1359,6 +1437,8 @@ impl Default for GenTables<'_> {
             fn_class: Vec::new(),
             instances: FxMap::default(),
             instance_by_key: FxMap::default(),
+            inherent_methods: FxMap::default(),
+            traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
@@ -1398,6 +1478,9 @@ pub fn init_lang(p: &mut Program) {
             crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Trait, None, rec.name, crate::ty::defs::Vis::Pub, Span::default());
         data.generics = rec.generics.clone();
         p.defs.insert(rec.def, data);
+        for (_, mname) in &rec.methods {
+            p.gx.traits_by_method.entry(*mname).or_default().push(rec.def);
+        }
         p.gx.index.insert_trait(rec);
     }
 }
@@ -1460,6 +1543,9 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
         let mut placeholder = Generics::default();
         for _ in 0..=ast_param_count(&tdef.generics) {
             placeholder.params.push(ParamDef { name: tdef.name, kind: ParamKind::Type, span: tdef.name_span });
+        }
+        for f in &tdef.fns {
+            p.gx.traits_by_method.entry(f.name).or_default().push(def);
         }
         p.gx.index.insert_trait(TraitRecord {
             def,
@@ -1751,6 +1837,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let mut mscope = scope.clone();
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
+            mscope.param_tys.extend(own_scope.param_tys.iter().copied());
             let (params, ret, ret_borrows_from, combined, mscope) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, errs)
@@ -1956,7 +2043,7 @@ pub fn finish_trait_impl(
             }
             continue;
         };
-        validate_method_sig(p, &tmpl, local, tr, impl_parent_n, imp.span, errs);
+        validate_method_sig(p, &tmpl, local, tr, impl_parent_n, &assoc_tys, imp.span, errs);
     }
     for &local in method_ids {
         let name = p.fn_info(local).name;
@@ -1971,6 +2058,50 @@ pub fn finish_trait_impl(
     }
 }
 
+/// Rewrites projections of this impl's associated types to the
+/// impl's bindings (in impl parameter space). Used when the
+/// solver cannot normalize them because the Self type is still
+/// a parameter.
+fn rewrite_impl_projections(p: &mut Program, t: Ty, assoc_tys: &[(DefId, Ty)]) -> Ty {
+    match p.tys.kind(t) {
+        TyKind::Projection(assoc, _) => match assoc_tys.iter().find(|(d, _)| *d == assoc.0) {
+            Some((_, bound)) => rewrite_impl_projections(p, *bound, assoc_tys),
+            None => t,
+        },
+        TyKind::Ref(r, m, e) => {
+            let e = rewrite_impl_projections(p, e, assoc_tys);
+            p.tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::Adt(d, a) => {
+            let raw: Vec<GenericArg> = p.tys.args(a).to_vec();
+            let out: Vec<GenericArg> = raw
+                .iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(e) => GenericArg::Ty(rewrite_impl_projections(p, e, assoc_tys)),
+                    other => other,
+                })
+                .collect();
+            let a = p.tys.intern_args(&out);
+            p.tys.intern(TyKind::Adt(d, a))
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
+            let out: Vec<Ty> = elems.iter().map(|&e| rewrite_impl_projections(p, e, assoc_tys)).collect();
+            let ts = p.tys.intern_tys(&out);
+            p.tys.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Slice(e) => {
+            let e = rewrite_impl_projections(p, e, assoc_tys);
+            p.tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = rewrite_impl_projections(p, e, assoc_tys);
+            p.tys.intern(TyKind::Array(e, n))
+        }
+        _ => t,
+    }
+}
+
 /// Checks one impl method signature against its trait method
 /// template: substitute the trait template with the impl's trait
 /// ref, normalize both sides (associated types through this
@@ -1981,6 +2112,7 @@ fn validate_method_sig(
     local: LocalDefId,
     tr: TraitRef,
     impl_parent_n: usize,
+    assoc_tys: &[(DefId, Ty)],
     span: Span,
     errs: &mut Vec<Diag>,
 ) {
@@ -2020,8 +2152,18 @@ fn validate_method_sig(
         let t = p.tys.intern(TyKind::Param(ParamId((impl_parent_n + j) as u32)));
         subst_args.push(GenericArg::Ty(t));
     }
-    let want_params: Vec<Ty> = tmpl.params.iter().map(|&t| subst(&mut p.tys, t, &subst_args)).collect();
-    let want_ret = subst(&mut p.tys, tmpl.ret, &subst_args);
+    let want_params: Vec<Ty> = tmpl
+        .params
+        .iter()
+        .map(|&t| {
+            let t = subst(&mut p.tys, t, &subst_args);
+            rewrite_impl_projections(p, t, assoc_tys)
+        })
+        .collect();
+    let want_ret = {
+        let t = subst(&mut p.tys, tmpl.ret, &subst_args);
+        rewrite_impl_projections(p, t, assoc_tys)
+    };
     let got_params = p.fn_info(local).params.clone();
     let got_ret = p.fn_info(local).ret;
     let mut cx = PureCx::new(&p.tys);
@@ -2200,9 +2342,728 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
 }
 
+/// An owned snapshot of a type from any store (see `lift_ty`).
+/// A body overlay borrows the global store, so a type cannot be
+/// lifted by walking it while interning into the globals; the
+/// snapshot breaks that borrow.
+enum OwnedTy {
+    Leaf(TyKind),
+    Ref(Region, Mut, Box<OwnedTy>),
+    RawPtr(Mut, Box<OwnedTy>),
+    Slice(Box<OwnedTy>),
+    Array(Box<OwnedTy>, ConstKind),
+    Tuple(Vec<OwnedTy>),
+    Adt(DefId, Vec<OwnedArg>),
+    FnDef(DefId, Vec<OwnedArg>),
+    Closure(DefId, Vec<OwnedArg>),
+    Opaque(DefId, Vec<OwnedArg>),
+    Projection(AssocId, Vec<OwnedArg>),
+    FnPtr(Binder<FnSig>, Vec<OwnedTy>, Box<OwnedTy>),
+    Dyn(Binder<Vec<OwnedArg>>, Vec<(u32, Vec<OwnedArg>)>, AutoTraits, Region),
+}
+
+enum OwnedArg {
+    Ty(OwnedTy),
+    Lifetime(Region),
+    Const(ConstKind),
+}
+
+fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
+    Some(match src.kind(t) {
+        TyKind::Infer(_) => return None,
+        TyKind::Ref(r, m, e) => OwnedTy::Ref(r, m, Box::new(snapshot_ty(src, e)?)),
+        TyKind::RawPtr(m, e) => OwnedTy::RawPtr(m, Box::new(snapshot_ty(src, e)?)),
+        TyKind::Slice(e) => OwnedTy::Slice(Box::new(snapshot_ty(src, e)?)),
+        TyKind::Array(e, n) => match src.const_kind(n) {
+            ConstKind::Infer(_) => return None,
+            k => OwnedTy::Array(Box::new(snapshot_ty(src, e)?), k),
+        },
+        TyKind::Tuple(ts) => {
+            let mut out = Vec::new();
+            for e in src.tys_of(ts).to_vec() {
+                out.push(snapshot_ty(src, e)?);
+            }
+            OwnedTy::Tuple(out)
+        }
+        TyKind::Adt(d, a) => OwnedTy::Adt(d, snapshot_args(src, a)?),
+        TyKind::FnDef(d, a) => OwnedTy::FnDef(d, snapshot_args(src, a)?),
+        TyKind::Closure(d, a) => OwnedTy::Closure(d, snapshot_args(src, a)?),
+        TyKind::Opaque(d, a) => OwnedTy::Opaque(d, snapshot_args(src, a)?),
+        TyKind::Projection(d, a) => OwnedTy::Projection(d, snapshot_args(src, a)?),
+        TyKind::FnPtr(sig) => {
+            let b = src.sig(sig);
+            let mut inputs = Vec::new();
+            for e in src.tys_of(b.value.inputs).to_vec() {
+                inputs.push(snapshot_ty(src, e)?);
+            }
+            OwnedTy::FnPtr(b, inputs, Box::new(snapshot_ty(src, b.value.output)?))
+        }
+        TyKind::Dyn(b, r) => {
+            let bounds = src.dyn_bounds(b).clone();
+            let principal: Binder<Vec<OwnedArg>> = match bounds.principal {
+                Some(pr) => Binder { count: pr.count, value: snapshot_args(src, pr.value.args)? },
+                None => Binder { count: 0, value: Vec::new() },
+            };
+            let mut supers = Vec::new();
+            for sup in bounds.supertraits.iter() {
+                supers.push((sup.count, snapshot_args(src, sup.value.args)?));
+            }
+            OwnedTy::Dyn(principal, supers, bounds.auto, r)
+        }
+        kind => OwnedTy::Leaf(kind),
+    })
+}
+
+fn snapshot_args(src: &dyn TyIntern, a: ArgsId) -> Option<Vec<OwnedArg>> {
+    let mut out = Vec::new();
+    for g in src.args(a).to_vec() {
+        out.push(match g {
+            GenericArg::Ty(e) => OwnedArg::Ty(snapshot_ty(src, e)?),
+            GenericArg::Const(c) => match src.const_kind(c) {
+                ConstKind::Infer(_) => return None,
+                k => OwnedArg::Const(k),
+            },
+            GenericArg::Lifetime(r) => OwnedArg::Lifetime(r),
+        });
+    }
+    Some(out)
+}
+
+fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
+    match t {
+        OwnedTy::Leaf(kind) => p.tys.intern(*kind),
+        OwnedTy::Ref(r, m, e) => {
+            let e = build_owned_ty(p, e);
+            p.tys.intern(TyKind::Ref(*r, *m, e))
+        }
+        OwnedTy::RawPtr(m, e) => {
+            let e = build_owned_ty(p, e);
+            p.tys.intern(TyKind::RawPtr(*m, e))
+        }
+        OwnedTy::Slice(e) => {
+            let e = build_owned_ty(p, e);
+            p.tys.intern(TyKind::Slice(e))
+        }
+        OwnedTy::Array(e, k) => {
+            let e = build_owned_ty(p, e);
+            let n = p.tys.intern_const(*k);
+            p.tys.intern(TyKind::Array(e, n))
+        }
+        OwnedTy::Tuple(elems) => {
+            let out: Vec<Ty> = elems.iter().map(|e| build_owned_ty(p, e)).collect();
+            let ts = p.tys.intern_tys(&out);
+            p.tys.intern(TyKind::Tuple(ts))
+        }
+        OwnedTy::Adt(d, a) => {
+            let a = build_owned_args(p, a);
+            p.tys.intern(TyKind::Adt(*d, a))
+        }
+        OwnedTy::FnDef(d, a) => {
+            let a = build_owned_args(p, a);
+            p.tys.intern(TyKind::FnDef(*d, a))
+        }
+        OwnedTy::Closure(d, a) => {
+            let a = build_owned_args(p, a);
+            p.tys.intern(TyKind::Closure(*d, a))
+        }
+        OwnedTy::Opaque(d, a) => {
+            let a = build_owned_args(p, a);
+            p.tys.intern(TyKind::Opaque(*d, a))
+        }
+        OwnedTy::Projection(d, a) => {
+            let a = build_owned_args(p, a);
+            p.tys.intern(TyKind::Projection(*d, a))
+        }
+        OwnedTy::FnPtr(b, inputs, output) => {
+            let out: Vec<Ty> = inputs.iter().map(|e| build_owned_ty(p, e)).collect();
+            let inputs_id = p.tys.intern_tys(&out);
+            let output = build_owned_ty(p, output);
+            let sig = p.tys.intern_sig(Binder { count: b.count, value: FnSig { inputs: inputs_id, output, ..b.value } });
+            p.tys.intern(TyKind::FnPtr(sig))
+        }
+        OwnedTy::Dyn(principal, supers, auto, r) => {
+            // Dyn bounds from another store lose their bindings
+            // here (only args are snapshotted); dyn types in
+            // instance args are outside this wave's mono subset,
+            // and the principal trait identity is not recoverable
+            // from args alone, so this arm is unreachable in
+            // practice and answers the error type.
+            let _ = (principal, supers, auto, r);
+            ERROR
+        }
+    }
+}
+
+fn build_owned_args(p: &mut Program, args: &[OwnedArg]) -> ArgsId {
+    let out: Vec<GenericArg> = args
+        .iter()
+        .map(|a| match a {
+            OwnedArg::Ty(e) => GenericArg::Ty(build_owned_ty(p, e)),
+            OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
+            OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
+        })
+        .collect();
+    p.tys.intern_args(&out)
+}
+
+/// Lifts one type from a body-local store into the program's
+/// global store (the owned type store lift of ARCH 2.1, in its
+/// structural form). None when the type still contains an
+/// inference variable (the request that named it is not
+/// concrete yet).
+pub fn lift_ty(p: &mut Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
+    let owned = snapshot_ty(src, t)?;
+    Some(build_owned_ty(p, &owned))
+}
+
+/// Finds the global type structurally equal to a body-local type.
+fn find_global_ty(p: &Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
+    let g = &p.tys;
+    Some(match src.kind(t) {
+        TyKind::Ref(r, m, e) => g.get(TyKind::Ref(r, m, find_global_ty(p, src, e)?))?,
+        TyKind::RawPtr(m, e) => g.get(TyKind::RawPtr(m, find_global_ty(p, src, e)?))?,
+        TyKind::Slice(e) => g.get(TyKind::Slice(find_global_ty(p, src, e)?))?,
+        TyKind::Array(e, n) => {
+            let n = match src.const_kind(n) {
+                ConstKind::Infer(_) => return None,
+                k => g.consts_get(k)?,
+            };
+            g.get(TyKind::Array(find_global_ty(p, src, e)?, n))?
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = src.tys_of(ts).to_vec();
+            let mut out = Vec::new();
+            for e in elems {
+                out.push(find_global_ty(p, src, e)?);
+            }
+            let ts = g.get_tys(&out)?;
+            g.get(TyKind::Tuple(ts))?
+        }
+        TyKind::Adt(d, a) => {
+            let raw: Vec<GenericArg> = src.args(a).to_vec();
+            let mut out: Vec<GenericArg> = Vec::new();
+            for gg in raw {
+                out.push(match gg {
+                    GenericArg::Ty(e) => GenericArg::Ty(find_global_ty(p, src, e)?),
+                    GenericArg::Const(c) => match src.const_kind(c) {
+                        ConstKind::Infer(_) => return None,
+                        k => GenericArg::Const(g.consts_get(k)?),
+                    },
+                    other => other,
+                });
+            }
+            let aid = g.get_args(&out)?;
+            g.get(TyKind::Adt(d, aid))?
+        }
+        TyKind::Projection(d, a) => {
+            let raw: Vec<GenericArg> = src.args(a).to_vec();
+            let mut out: Vec<GenericArg> = Vec::new();
+            for gg in raw {
+                out.push(match gg {
+                    GenericArg::Ty(e) => GenericArg::Ty(find_global_ty(p, src, e)?),
+                    other => other,
+                });
+            }
+            let aid = g.get_args(&out)?;
+            g.get(TyKind::Projection(d, aid))?
+        }
+        kind => g.get(kind)?,
+    })
+}
+
+/// The mono instance for one template and body-local args, as
+/// lowering needs it. Compares candidate instance args (global)
+/// against the lifted body args structurally.
+pub fn instance_for(p: &Program, src: &dyn TyIntern, template: LocalDefId, args: &[GenericArg]) -> Option<LocalDefId> {
+    let template_def = p.def_id(template);
+    // Lift each arg by structural find; tuple args fall back to a
+    // direct comparison against every instance of this template.
+    let mut lifted: Vec<GenericArg> = Vec::new();
+    for &g in args {
+        match g {
+            GenericArg::Ty(e) => lifted.push(GenericArg::Ty(find_global_ty(p, src, e)?)),
+            other => lifted.push(other),
+        }
+    }
+    for ((def, aid), local) in &p.gx.instance_by_key {
+        if *def == template_def && p.tys.args(*aid) == lifted.as_slice() {
+            return Some(*local);
+        }
+    }
+    None
+}
+
+/// Normalizes one global type through the solver, lifting the
+/// result back into the global store when normalization rewrote
+/// it in the solver's overlay.
+fn normalize_global(p: &mut Program, t: Ty) -> Ty {
+    if !p.tys.flags(t).contains_projection() {
+        return t;
+    }
+    let owned = {
+        let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+        let mut solver = Solver::new();
+        let out = crate::traits::solve::normalize(&mut solver, &mut cx, &p.gx.index, &[], t);
+        snapshot_ty(&cx.tys, out)
+    };
+    match owned {
+        Some(owned) => build_owned_ty(p, &owned),
+        None => t,
+    }
+}
+
+/// Substitutes and normalizes a list of signature types.
+fn subst_norm_all(p: &mut Program, tys_in: &[Ty], args: &[GenericArg]) -> Vec<Ty> {
+    let substed: Vec<Ty> = tys_in.iter().map(|&t| subst(&mut p.tys, t, args)).collect();
+    substed.into_iter().map(|t| normalize_global(p, t)).collect()
+}
+
+/// Creates (or finds) the Adt instance for one application.
+fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId {
+    let (def, _) = p.gx.adt_info[template.0 as usize];
+    let args_id = p.tys.intern_args(args);
+    if let Some(inst) = p.tys.local_adt_instance(def, args_id) {
+        return inst;
+    }
+    let src_variants: Vec<(Sym, crate::check::collect::VariantShape, Vec<(Sym, Ty)>)> =
+        p.adt(template).variants.iter().map(|v| (v.name, v.shape, v.fields.iter().map(|f| (f.name, f.ty)).collect())).collect();
+    let mut variants: Vec<crate::check::collect::Variant> = Vec::with_capacity(src_variants.len());
+    for (vname, shape, fields) in src_variants {
+        let mut out_fields = Vec::with_capacity(fields.len());
+        for (name, ty) in fields {
+            let ty = subst(&mut p.tys, ty, args);
+            let ty = normalize_global(p, ty);
+            out_fields.push(crate::check::collect::Field { name, ty });
+        }
+        variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields });
+    }
+    let id = AdtId(p.adts.len() as u32);
+    let (name, is_enum, derives, span) = {
+        let src = p.adt(template);
+        (src.name, src.is_enum, src.derives, src.span)
+    };
+    p.adts.push(crate::check::collect::AdtDef { name, is_enum, variants, derives, span });
+    p.tys.register_adt_instance(def, args_id, id);
+    p.defs.insert_adt_instance(def, id);
+    p.gx.adt_info.push((def, args.len()));
+    p.gx.adt_generics.push(Generics::default());
+    p.gx.adt_envs.push(Vec::new());
+    let full = p.tys.full_adt_ty(id).unwrap();
+    p.gx.adt_scopes.push(Scope { self_ty: Some(full), ..Scope::default() });
+    p.gx.adt_instance_of.push(Some((def, args_id)));
+    p.gx.mono_counts.1 += 1;
+    id
+}
+
+/// The owner Adt instance of one instantiated method, from its
+/// substituted receiver parameter type.
+fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKind>) -> Option<AdtId> {
+    if self_kind.is_none() {
+        return None;
+    }
+    let mut t = *params.first()?;
+    // Peel reference forms and smart-pointer-shaped typed
+    // receivers down to the Adt application.
+    for _ in 0..4 {
+        match p.tys.kind(t) {
+            TyKind::Ref(_, _, inner) => t = inner,
+            TyKind::Adt(def, args) => {
+                if let Some(template) = p.defs.local_adt(def) {
+                    let args_vec: Vec<GenericArg> = p.tys.args(args).to_vec();
+                    if args_vec.is_empty() {
+                        return Some(template);
+                    }
+                    return Some(adt_instance(p, template, &args_vec));
+                }
+                // A smart-pointer Adt (Box/Rc when they exist):
+                // look through one type argument.
+                match p.tys.args(args).first().and_then(|g| g.as_ty()) {
+                    Some(inner) => t = inner,
+                    None => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Creates (or finds) one fn instance. `class` is Instance for
+/// concrete code, Abstract for template checks.
+fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class: FnClass) -> LocalDefId {
+    let template_def = p.def_id(template);
+    let args_id = p.tys.intern_args(args);
+    if class == FnClass::Instance
+        && let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id))
+    {
+        return existing;
+    }
+    let (def, name, self_kind) = {
+        let f = p.fn_info(template);
+        (f.def, f.name, f.self_kind)
+    };
+    let raw_params: Vec<Ty> = p.fn_info(template).params.clone();
+    let raw_ret = p.fn_info(template).ret;
+    let ret_borrows_from = p.fn_info(template).ret_borrows_from;
+    let params = subst_norm_all(p, &raw_params, args);
+    let raw_ret = subst(&mut p.tys, raw_ret, args);
+    let ret = normalize_global(p, raw_ret);
+    let owner = instance_owner(p, &params, self_kind);
+    // Instance identity: template disk identity plus the args
+    // fingerprint (the InstanceKeyHash of section 4.2).
+    let key = crate::driver::graph::InstanceKey { def: template_def, args: args_id };
+    let kh = p.instance_key_hash(&key);
+    // The instance def lives under an "<instance>" module with
+    // the key hash in its name, so it can never collide with a
+    // user def's path hash in the slot registry.
+    let def_id = DefId {
+        krate: p.krate,
+        hash: crate::def::item_hash(p.stable_crate, &["<instance>"], crate::def::DefKind::Fn, &format!("{}#{}", p.name(name), kh.0), 0),
+    };
+    let id = LocalDefId(p.fns.len() as u32);
+    p.fn_defs.push(def_id);
+    p.def_by_hash.entry(def_id.hash).or_insert(id);
+    let mut data = crate::ty::defs::DefData::skeleton(
+        if owner.is_some() { crate::ty::defs::DefKind::Method } else { crate::ty::defs::DefKind::Fn },
+        None,
+        name,
+        crate::ty::defs::Vis::Priv,
+        def.name_span,
+    );
+    data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
+    p.defs.insert(def_id, data);
+    p.fns.push(crate::check::collect::FnInfo { name, def, owner, self_kind, params, ret, ret_borrows_from });
+    p.gx.fn_templates.push(None);
+    // The body scope of an instance: no parameters, the concrete
+    // Self type, and the template's assoc sources substituted.
+    let scope = {
+        let mut sc = Scope::default();
+        sc.self_ty = owner.map(|a| p.tys.adt_ty(a));
+        if let Some(ts) = p.gx.fn_scopes.get(template.0 as usize) {
+            for src in &ts.scope.assoc_srcs {
+                let self_ty = subst(&mut p.tys, src.self_ty, args);
+                let sargs = crate::traits::index::subst_args_pub(&mut p.tys, src.args, args);
+                sc.assoc_srcs.push(AssocSrc { self_ty, trait_def: src.trait_def, args: sargs, assocs: src.assocs.clone() });
+            }
+            for (name, t) in &ts.scope.param_tys {
+                let t2 = subst(&mut p.tys, *t, args);
+                sc.param_tys.push((*name, t2));
+            }
+        }
+        sc
+    };
+    p.gx.fn_scopes.push(FnScope { env: Vec::new(), scope });
+    p.gx.fn_class.push(class);
+    p.gx.instances.insert(id, InstanceInfo { template_def, template_local: Some(template), args: args_id });
+    if class == FnClass::Instance {
+        p.gx.instance_by_key.insert((template_def, args_id), id);
+        p.gx.mono_counts.1 += 1;
+        // Inherent instances join the compat method table.
+        if let Some(owner) = owner
+            && p.gx.inherent_methods.values().any(|&t| t == template)
+        {
+            p.methods.insert((owner, name), id);
+        }
+    }
+    id
+}
+
+/// Walks one checked type for generic Adt applications mono has
+/// not made yet, creating them (their own fields may name more).
+fn ensure_adt_instances_in(p: &mut Program, src: &dyn TyIntern, t: Ty, depth: u32) {
+    if depth > 32 {
+        return;
+    }
+    match src.kind(t) {
+        TyKind::Adt(def, a) => {
+            let raw: Vec<GenericArg> = src.args(a).to_vec();
+            for g in &raw {
+                if let Some(e) = g.as_ty() {
+                    ensure_adt_instances_in(p, src, e, depth + 1);
+                }
+            }
+            if !raw.is_empty()
+                && let Some(template) = p.defs.local_adt(def)
+                && !p.gx.adt_generics[template.0 as usize].params.is_empty()
+            {
+                let mut lifted: Vec<GenericArg> = Vec::new();
+                let mut ok = true;
+                for g in &raw {
+                    match g {
+                        GenericArg::Ty(e) => match lift_ty(p, src, *e) {
+                            Some(gt) => lifted.push(GenericArg::Ty(gt)),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        },
+                        GenericArg::Const(c) => match src.const_kind(*c) {
+                            ConstKind::Infer(_) => {
+                                ok = false;
+                                break;
+                            }
+                            k => lifted.push(GenericArg::Const(p.tys.intern_const(k))),
+                        },
+                        other => lifted.push(*other),
+                    }
+                }
+                if ok {
+                    adt_instance(p, template, &lifted);
+                }
+            }
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => {
+            ensure_adt_instances_in(p, src, e, depth + 1)
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = src.tys_of(ts).to_vec();
+            for e in elems {
+                ensure_adt_instances_in(p, src, e, depth + 1);
+            }
+        }
+        TyKind::Projection(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => {
+            let raw: Vec<GenericArg> = src.args(a).to_vec();
+            for g in &raw {
+                if let Some(e) = g.as_ty() {
+                    ensure_adt_instances_in(p, src, e, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Finds the Drop method instance for one concrete Adt instance,
+/// creating it when a `Drop` impl applies. Records it for cgen.
+fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
+    if p.gx.drop_methods.contains_key(&adt) {
+        return;
+    }
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    let args_id = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+    let tr = TraitRef { def: p.gx.lang.drop, args: args_id, bindings: EMPTY_BINDINGS };
+    let sel = {
+        let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+        let mut solver = Solver::new();
+        solver.select(&mut cx, &p.gx.index, &[], tr)
+    };
+    let Selection::Impl { id, args: impl_args, .. } = sel else { return };
+    let record = p.gx.index.get(id).clone();
+    let Some(local) = record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "drop"))
+    else {
+        return;
+    };
+    let drop_fn = if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+        let raw: Vec<GenericArg> = impl_args;
+        let before = p.fns.len();
+        let inst = fn_instance(p, local, &raw, FnClass::Instance);
+        if inst.0 as usize >= before {
+            queue.push(inst);
+        }
+        inst
+    } else {
+        local
+    };
+    p.gx.drop_methods.insert(adt, drop_fn);
+}
+
+/// Materializes every reachable instance (section 4.1's mono
+/// half for wave A): check plain fns for requests, create the
+/// instances they name, check those, to a fixpoint. Discovery
+/// check errors are discarded; the driver's own check reports
+/// them against the finished tables. Returns mono's own errors
+/// (instantiation depth and count caps, section 4.2).
+pub fn materialize(p: &mut Program) -> Vec<Diag> {
+    if !p.gx.has_generics {
+        return Vec::new();
+    }
+    let mut errs: Vec<Diag> = Vec::new();
+    // Adt instances named by plain signatures and fields first.
+    for a in 0..p.gx.adt_info.len() {
+        let fields: Vec<Ty> = p.adts[a].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        for t in fields {
+            ensure_global_adt_instances(p, t, 0);
+        }
+    }
+    let mut queue: Vec<LocalDefId> =
+        (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Plain)).collect();
+    let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
+    let mut rounds = 0usize;
+    while !queue.is_empty() {
+        rounds += 1;
+        if rounds > 4096 || p.fns.len() > 200_000 {
+            errs.push(Diag::new(
+                "L0611",
+                Span::default(),
+                "too many monomorphized instances",
+                "Reduce the generic instantiations in this program.",
+            ));
+            break;
+        }
+        let mut next_queue: Vec<LocalDefId> = Vec::new();
+        for fid in std::mem::take(&mut queue) {
+            let depth = depths.get(&fid).copied().unwrap_or(0);
+            // Snapshot everything the instance requests name,
+            // then drop the checked body: it borrows the program
+            // this loop is about to extend.
+            let (adt_tys_owned, requests_owned) = {
+                let (checked, _discarded) = crate::check::check_fn(p, fid);
+                let mut adt_tys: Vec<OwnedTy> = Vec::new();
+                for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
+                    if let Some(o) = snapshot_ty(&checked.tys, t) {
+                        adt_tys.push(o);
+                    }
+                }
+                let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
+                for (template, raw_args) in &checked.inst_requests {
+                    let mut owned: Vec<OwnedArg> = Vec::new();
+                    let mut ok = true;
+                    for g in raw_args {
+                        match g {
+                            GenericArg::Ty(e) => match snapshot_ty(&checked.tys, *e) {
+                                Some(o) => owned.push(OwnedArg::Ty(o)),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            GenericArg::Const(c) => match checked.tys.const_kind(*c) {
+                                ConstKind::Infer(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                                k => owned.push(OwnedArg::Const(k)),
+                            },
+                            GenericArg::Lifetime(r) => owned.push(OwnedArg::Lifetime(*r)),
+                        }
+                    }
+                    if ok {
+                        reqs.push((*template, owned));
+                    }
+                }
+                (adt_tys, reqs)
+            };
+            for owned in &adt_tys_owned {
+                let gt = build_owned_ty(p, owned);
+                ensure_global_adt_instances(p, gt, 0);
+            }
+            for (template, owned_args) in requests_owned {
+                if depth + 1 > crate::mono::MAX_INSTANCE_DEPTH {
+                    errs.push(Diag::new(
+                        "L0611",
+                        p.fn_info(template).def.name_span,
+                        "instantiation depth limit reached",
+                        "Reduce the recursive generic instantiation.",
+                    ));
+                    continue;
+                }
+                let mut lifted: Vec<GenericArg> = Vec::with_capacity(owned_args.len());
+                for a in &owned_args {
+                    lifted.push(match a {
+                        OwnedArg::Ty(e) => {
+                            let gt = build_owned_ty(p, e);
+                            GenericArg::Ty(normalize_global(p, gt))
+                        }
+                        OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
+                        OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
+                    });
+                }
+                let template_def = p.def_id(template);
+                let args_id = p.tys.intern_args(&lifted);
+                if p.gx.instance_by_key.contains_key(&(template_def, args_id)) {
+                    continue;
+                }
+                let inst = fn_instance(p, template, &lifted, FnClass::Instance);
+                depths.insert(inst, depth + 1);
+                next_queue.push(inst);
+            }
+            // Drop glue for Adt instances this round made.
+            let adt_ids: Vec<AdtId> = (0..p.adts.len() as u32).map(AdtId).collect();
+            for a in adt_ids {
+                ensure_drop_method(p, a, &mut next_queue);
+            }
+        }
+        queue = next_queue;
+    }
+    errs
+}
+
+/// `ensure_adt_instances_in` for types already in the global
+/// store (signatures and fields at collect time).
+fn ensure_global_adt_instances(p: &mut Program, t: Ty, depth: u32) {
+    if depth > 32 {
+        return;
+    }
+    match p.tys.kind(t) {
+        TyKind::Adt(def, a) => {
+            let raw: Vec<GenericArg> = p.tys.args(a).to_vec();
+            for g in &raw {
+                if let Some(e) = g.as_ty() {
+                    ensure_global_adt_instances(p, e, depth + 1);
+                }
+            }
+            if !raw.is_empty()
+                && let Some(template) = p.defs.local_adt(def)
+                && !p.gx.adt_generics[template.0 as usize].params.is_empty()
+            {
+                adt_instance(p, template, &raw);
+            }
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => {
+            ensure_global_adt_instances(p, e, depth + 1)
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
+            for e in elems {
+                ensure_global_adt_instances(p, e, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Appends trait default method bodies as template fns. Runs
+/// after collect's fn pass: `Program::fns` must keep the AST fns
+/// first, in AST order, because the driver maps slots by that
+/// order (section 1.7). Mono materializes these templates per
+/// impl instance on demand.
+pub fn append_trait_default_templates(p: &mut Program) {
+    let defaults: Vec<(DefId, TraitMethodTemplate)> =
+        p.gx.trait_methods.iter().filter(|(_, t)| t.def.body.is_some()).map(|(&d, t)| (d, t.clone())).collect();
+    for (method_def, tmpl) in defaults {
+        let local = LocalDefId(p.fns.len() as u32);
+        p.fn_defs.push(method_def);
+        p.def_by_hash.entry(method_def.hash).or_insert(local);
+        let trait_def = p.gx.index.trait_of_assoc(method_def);
+        let mut data = crate::ty::defs::DefData::skeleton(
+            crate::ty::defs::DefKind::Method,
+            trait_def,
+            tmpl.name,
+            crate::ty::defs::Vis::Priv,
+            tmpl.def.name_span,
+        );
+        data.generics = tmpl.generics.clone();
+        data.sig = crate::ty::defs::SigData::Fn { params: tmpl.params.clone(), ret: tmpl.ret };
+        p.defs.insert(method_def, data);
+        p.fns.push(crate::check::collect::FnInfo {
+            name: tmpl.name,
+            def: tmpl.def,
+            owner: None,
+            self_kind: tmpl.self_kind,
+            params: tmpl.params.clone(),
+            ret: tmpl.ret,
+            ret_borrows_from: tmpl.ret_borrows_from,
+        });
+        p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: tmpl.env.clone() }));
+        p.gx.fn_scopes.push(FnScope { env: tmpl.env.clone(), scope: tmpl.scope.clone() });
+        p.gx.fn_class.push(FnClass::Template);
+    }
+}
+
 /// The last collect step before mono: synthetic impls, then
 /// coherence over the whole index (section 2.6).
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
+    append_trait_default_templates(p);
     add_synthetic_impls(p);
     let is_local = |d: DefId| d.krate == p.krate;
     let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &is_local);
@@ -2215,5 +3076,10 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
             format!("this impl of `{trait_name}` overlaps with another impl"),
             "Remove one of the impls, or narrow its types so they cannot both apply.",
         ));
+    }
+    // Mono runs last: it checks bodies against the finished
+    // tables and appends every reachable instance.
+    if errs.is_empty() {
+        errs.extend(materialize(p));
     }
 }

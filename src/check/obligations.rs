@@ -1,36 +1,38 @@
 // The trait obligation queue of one body (docs/ARCH.md sections 2.4 and 2.12).
 //
-// S3a puts the hook calls in place and leaves this queue empty: lust has no user
-// traits yet, so no code pushes an obligation and every run is a no-op. W-TRAITS-CORE
-// owns this file from wave A and fills the runs with the selection algorithm of
-// ARCH 2.4 (whole-trait-ref matching, probes, the provably-false clause filter,
-// deferral, and the depth cap). It must not add run points: the queue runs only
-// where the checker already calls in, because running it after every expression
-// that binds a variable can go quadratic in large bodies.
+// The checker (`check/mod.rs`) drives this queue at the fixed run
+// points S3a planted: before a structural resolution (2.12), at
+// coercion sites, and at body end to a fixpoint. This module owns
+// the queue data; selection itself is `traits::solve`, run by the
+// checker over its own inference context (`SolveCx` in
+// `check/mod.rs`), because probes must bind and roll back the
+// body's inference variables.
 //
-// Fixed run points, all in `check/mod.rs`:
-// - `run_before_structural`: just before each point where a type must have a known
-//   head (ARCH 2.12): a method call receiver, a field access base, an index base,
-//   a deref operand, a binary operator's left operand, and a match scrutinee.
-//   The `?` operand and closure-param points join this list when those syntax
-//   forms land; they call the same hook.
-// - `run_at_coercion`: at every coercion site (`coerce_at`).
-// - `run_at_body_end`: once at the end of a body, to a fixpoint. Anything left is
-//   an annotation error, never a silent default, except integer and
-//   float literal fallback, which the checker keeps.
+// Most obligations are trait refs from bounds at call sites. An
+// `AssocEq` obligation comes from a selected impl's predicates
+// and from bindings written at a use (`T: Iterator<Item = u8>`):
+// it is proved by normalizing the projection, never by search.
 use crate::diag::Span;
-use crate::ty::TraitRef;
+use crate::ty::{AssocEqData, TraitRef};
 
-/// One pending trait obligation: the whole trait ref (with its bindings) plus the
-/// span that needs it. Selection matches the whole ref, never Self alone (2.4).
-#[allow(dead_code)] // First pushed by W-TRAITS-CORE when trait bounds collect.
+/// One pending obligation plus the span that needs it.
 #[derive(Clone, Copy, Debug)]
-pub struct Obligation {
-    pub trait_ref: TraitRef,
-    pub span: Span,
+pub enum Obligation {
+    Trait { trait_ref: TraitRef, span: Span, depth: u16 },
+    AssocEq { eq: AssocEqData, span: Span },
 }
 
-/// The per-body work queue. See the file header for when it runs.
+impl Obligation {
+    /// The span to blame when this obligation cannot be proved.
+    pub fn span(self) -> Span {
+        match self {
+            Obligation::Trait { span, .. } | Obligation::AssocEq { span, .. } => span,
+        }
+    }
+}
+
+/// The per-body work queue. Runs happen in `check/mod.rs`; see
+/// the file header.
 #[derive(Default)]
 pub struct Obligations {
     queue: Vec<Obligation>,
@@ -43,29 +45,39 @@ impl Obligations {
     }
 
     /// Records one obligation for a later run point.
-    #[allow(dead_code)] // First callers arrive with W-TRAITS-CORE.
     pub fn push(&mut self, obligation: Obligation) {
         self.queue.push(obligation);
     }
 
-    /// True while nothing waits. Always true until obligations can be formed.
-    #[allow(dead_code)] // Read by the selection code that lands with W-TRAITS-CORE.
+    /// Records one trait obligation.
+    pub fn push_trait(&mut self, trait_ref: TraitRef, span: Span) {
+        self.queue.push(Obligation::Trait { trait_ref, span, depth: 0 });
+    }
+
+    /// Records one trait obligation at a nested depth.
+    pub fn push_trait_at(&mut self, trait_ref: TraitRef, span: Span, depth: u16) {
+        self.queue.push(Obligation::Trait { trait_ref, span, depth });
+    }
+
+    /// True while nothing waits.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
-    /// ARCH 2.4 run point: before a structural resolution (2.12). No-op while empty.
-    pub fn run_before_structural(&mut self) {
-        debug_assert!(self.queue.is_empty(), "obligations exist before selection lands");
+    /// Takes the whole queue for one run. Obligations a run
+    /// cannot finish are pushed back by the caller.
+    pub fn take(&mut self) -> Vec<Obligation> {
+        std::mem::take(&mut self.queue)
     }
 
-    /// ARCH 2.4 run point: at a coercion site. No-op while empty.
-    pub fn run_at_coercion(&mut self) {
-        debug_assert!(self.queue.is_empty(), "obligations exist before selection lands");
+    /// How many obligations wait, for probe rollback.
+    pub fn len(&self) -> usize {
+        self.queue.len()
     }
 
-    /// ARCH 2.4 run point: at body end, to a fixpoint. No-op while empty.
-    pub fn run_at_body_end(&mut self) {
-        debug_assert!(self.queue.is_empty(), "obligations exist before selection lands");
+    /// Drops obligations queued since a `len` snapshot (a failed
+    /// method probe).
+    pub fn truncate(&mut self, len: usize) {
+        self.queue.truncate(len);
     }
 }

@@ -163,6 +163,17 @@ impl Defs {
     pub fn generics_of(&self, def: DefId) -> Option<&Generics> {
         self.get(def).map(|d| &d.generics)
     }
+    /// Records one materialized Adt instance's local index under
+    /// its template def. The def-to-template map is left alone:
+    /// `local_adt` still answers the template.
+    pub fn insert_adt_instance(&mut self, def: DefId, local: AdtId) {
+        let i = local.0 as usize;
+        if i >= self.adt_defs.len() {
+            self.adt_defs.resize(i + 1, DefId::PLACEHOLDER);
+        }
+        self.adt_defs[i] = def;
+    }
+
     /// The session-local index of a user Adt def, for the compat `AdtDef` table.
     pub fn local_adt(&self, def: DefId) -> Option<AdtId> {
         self.adt_locals.get(&def).copied()

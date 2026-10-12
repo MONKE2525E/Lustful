@@ -2,16 +2,18 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod collect;
-#[allow(dead_code)] // Wired into collect and check as generic support lands in increments.
 pub mod generics;
+pub mod method;
 pub mod obligations;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
+use crate::check::generics::Scope;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
-use crate::ty::defs::DefKind as DefsKind;
+use crate::traits::solve::{Selection, SolveCx, Solver};
+use crate::ty::defs::{DefKind as DefsKind, ROOT_MODULE};
 use crate::ty::lang;
 use crate::ty::*;
 
@@ -133,6 +135,24 @@ pub enum Res {
     Static(u32),
     /// A compile-time usize constant: `size_of`, `align_of`, `offset_of!`.
     ConstUsize(u64),
+    /// A binary operator through an operator trait: the trait
+    /// method to call (a template until mono rewrites it through
+    /// `Checked::generic_args`), with operand deref counts.
+    TraitBin {
+        f: LocalDefId,
+        ld: u8,
+        rd: u8,
+    },
+    /// A numeric `From::from` call, lowered as a cast to the
+    /// call's type. Widening conversions only (checked).
+    FromCast,
+    /// A `for` loop through `IntoIterator`: the `into_iter` and
+    /// `next` methods to call (templates until mono rewrites
+    /// them through `Checked::generic_args`).
+    ForTrait {
+        into_iter: LocalDefId,
+        next: LocalDefId,
+    },
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -195,6 +215,15 @@ pub struct Checked<'g> {
     pub pat_res: Vec<PatRes>,
     /// Number of implicit derefs before matching each pattern (default binding modes).
     pub pat_derefs: Vec<u8>,
+    /// Generic arguments of each generic call or method call, by
+    /// expression index (empty for plain calls), after zonking.
+    /// Lowering resolves the template in the call's `Res` plus
+    /// these args to a mono instance.
+    pub generic_args: Vec<Vec<GenericArg>>,
+    /// Instance requests found while checking: (template,
+    /// zonked args in this body's store). Mono lifts and
+    /// materializes them; the driver never reads this.
+    pub inst_requests: Vec<(LocalDefId, Vec<GenericArg>)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -259,9 +288,23 @@ struct Ctx<'p, 'a> {
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
     self_ty: Option<Ty>,
-    /// The trait obligation queue (ARCH 2.4). Empty until W-TRAITS-CORE fills it;
-    /// the hook calls at its fixed run points are already in place below.
+    /// The trait obligation queue (ARCH 2.4), run at the fixed
+    /// points in `run_obligations`.
     obl: obligations::Obligations,
+    /// This fn's own local id, for its scope and env.
+    fid: LocalDefId,
+    /// Selection state (memos, cycle stack) for this body.
+    solver: Solver,
+    /// Rollback trail of variable bindings, for solver probes.
+    trail: Vec<u32>,
+    /// The scope body annotations resolve under (with `_` markers on).
+    body_scope: Scope,
+    /// Generic call sites to turn into instance requests at
+    /// finish: (expression index, template, args before zonking).
+    generic_sites: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
+    /// True while normalization runs inside `unify`, to keep
+    /// projection normalization from recursing into itself.
+    in_norm: bool,
 }
 
 /// Type-checks one function body.
@@ -287,6 +330,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             pat_ty: vec![ERROR; n_pats],
             pat_res: vec![PatRes::None; n_pats],
             pat_derefs: vec![0; n_pats],
+            generic_args: vec![Vec::new(); n_exprs],
+            inst_requests: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: Reads::new(),
@@ -297,6 +342,19 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         negated_lits: Vec::new(),
         self_ty: f.owner.map(|a| p.tys.get_adt_ty(a).expect("ADT types are interned during collection")),
         obl: obligations::Obligations::new(),
+        fid,
+        solver: Solver::new(),
+        trail: Vec::new(),
+        body_scope: {
+            let mut sc = p.gx.fn_scopes.get(fid.0 as usize).map_or_else(Scope::default, |fs| fs.scope.clone());
+            sc.infer_cell = Some(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(generics::INFER_MARKER_BASE)));
+            if sc.self_ty.is_none() {
+                sc.self_ty = f.owner.map(|a| p.tys.get_adt_ty(a).expect("ADT types are interned during collection"));
+            }
+            sc
+        },
+        generic_sites: Vec::new(),
+        in_norm: false,
     };
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
@@ -487,6 +545,523 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    // ---------- Obligations (ARCH 2.4) ----------
+
+    /// Binds one inference variable, recording it on the probe
+    /// trail so solver probes can roll back (see `SolveCx`).
+    fn bind_var(&mut self, var: u32, t: Ty) {
+        self.trail.push(var);
+        self.vars[var as usize].bound = Some(t);
+    }
+
+    /// A probe snapshot of the variable bindings (see `SolveCx`).
+    fn snapshot_vars(&mut self) -> usize {
+        <Self as SolveCx>::snapshot(self)
+    }
+
+    /// Rolls variable bindings back to a probe snapshot.
+    fn rollback_vars(&mut self, snap: usize) {
+        <Self as SolveCx>::rollback(self, snap);
+    }
+
+    /// How many obligations wait, for probe rollback.
+    fn obl_len(&self) -> usize {
+        self.obl.len()
+    }
+
+    /// Drops obligations queued since an `obl_len` snapshot.
+    fn obl_truncate(&mut self, len: usize) {
+        self.obl.truncate(len);
+    }
+
+    /// This body's elaborated param env.
+    fn env(&self) -> &'p [Predicate] {
+        self.p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env)
+    }
+
+    /// Normalizes one type here (section 2.5) through this body's
+    /// solver. The solver state is taken out for the call because
+    /// the context itself is the `SolveCx`.
+    fn normalize_here(&mut self, t: Ty) -> Ty {
+        if !self.tys.flags(t).contains_projection() {
+            return t;
+        }
+        let p = self.p;
+        let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
+        let mut solver = std::mem::take(&mut self.solver);
+        let out = crate::traits::solve::normalize(&mut solver, self, &p.gx.index, env, t);
+        self.solver = solver;
+        out
+    }
+
+    /// Selects evidence for one trait obligation, with the
+    /// structural answers of sections 2.7 (`Sized`, auto traits)
+    /// and the derive-family queries ahead of the general solver
+    /// where they are exact. Commits bindings on success, like
+    /// `Solver::select`.
+    fn select_obligation(&mut self, tr: TraitRef) -> Selection {
+        self.select_obligation_at(tr, Span::default(), 0)
+    }
+
+    /// `select_obligation` at one nesting depth: a confirmed
+    /// impl's nested predicates are queued at depth + 1, so a
+    /// self-referential impl (`impl<X> T for Vec<X> where
+    /// Vec<X>: T`) overflows through the queue (section 2.4
+    /// step 7) instead of looping. Synchronous callers pass the
+    /// span to blame and depth 0.
+    fn select_obligation_at(&mut self, tr: TraitRef, span: Span, depth: u16) -> Selection {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        // Projections in the trait ref normalize first: an
+        // associated bound like `<Local2 as IntoIter>::It: Iter`
+        // selects against the concrete iterator type.
+        let tr = {
+            let raw: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+            let normed: Vec<GenericArg> = raw
+                .iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(self.normalize_here(t)),
+                    other => other,
+                })
+                .collect();
+            let args = self.tys.intern_args(&normed);
+            TraitRef { args, ..tr }
+        };
+        let self_ty = self.deep(self.tys.args(tr.args)[0].as_ty().unwrap_or(ERROR));
+        if tr.def == lang.sized {
+            return if self.sized_ok(self_ty) { Selection::ParamEvidence(usize::MAX) } else { Selection::NoImpl };
+        }
+        // Numeric `From` obligations are widening casts, with no
+        // impl behind them in this subset's lang records.
+        if tr.def == lang.from
+            && let Some(input) = self.tys.args(tr.args).get(1).and_then(|g| g.as_ty())
+        {
+            let input = self.deep(input);
+            if Self::numeric_from_ok(self.kind(input), self.kind(self_ty)) {
+                return Selection::ParamEvidence(usize::MAX);
+            }
+            if matches!(self.kind(input), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
+                && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
+            {
+                return Selection::NoImpl;
+            }
+        }
+        if lang.is_auto(tr.def) {
+            match self.auto_holds(tr.def, self_ty) {
+                Some(true) => return Selection::ParamEvidence(usize::MAX),
+                Some(false) => return Selection::NoImpl,
+                None => {}
+            }
+        }
+        let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
+        let mut solver = std::mem::take(&mut self.solver);
+        let sel = solver.select(self, &p.gx.index, env, tr);
+        self.solver = solver;
+        if sel == Selection::NoImpl && self.derive_query_holds(tr.def, self_ty) {
+            return Selection::ParamEvidence(usize::MAX);
+        }
+        if let Selection::Impl { nested, .. } = &sel {
+            if depth >= 64 {
+                return Selection::Overflow;
+            }
+            for pred in nested.clone() {
+                match pred {
+                    Predicate::Trait(b) if b.count == 0 => self.obl.push_trait_at(b.value, span, depth + 1),
+                    Predicate::AssocEq(b) if b.count == 0 => self.obl.push(obligations::Obligation::AssocEq { eq: b.value, span }),
+                    _ => {}
+                }
+            }
+        }
+        sel
+    }
+
+    /// The derive-family structural queries, for types the impl
+    /// index has no record for (tuples, arrays, slices, refs).
+    /// User and builtin Adts answer through the solver instead.
+    fn derive_query_holds(&mut self, trait_def: DefId, self_ty: Ty) -> bool {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        match self.tys.kind(self_ty) {
+            TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) => {}
+            _ => return false,
+        }
+        if trait_def == lang.copy {
+            is_copy(p, &self.tys, self_ty)
+        } else if trait_def == lang.clone {
+            has_clone(p, &self.tys, self_ty)
+        } else if trait_def == lang.debug {
+            has_debug(p, &self.tys, self_ty)
+        } else if trait_def == lang.partial_eq || trait_def == lang.eq {
+            has_eq(p, &self.tys, self_ty)
+        } else {
+            false
+        }
+    }
+
+    /// `Sized` by structure (section 2.7 basics): a parameter is
+    /// sized when the env says so; an Adt when its fields are,
+    /// with an unsized last field making the Adt unsized.
+    fn sized_ok(&mut self, t: Ty) -> bool {
+        let t = self.normalize_here(t);
+        match self.tys.kind(t) {
+            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
+            TyKind::Param(p) => self.env().iter().any(|pred| {
+                matches!(pred, Predicate::Trait(b) if b.value.def == self.p.gx.lang.sized
+                    && self.tys.args(b.value.args)[0].as_ty().is_some_and(|s| matches!(self.tys.kind(s), TyKind::Param(q) if q == p)))
+            }),
+            TyKind::Projection(..) => true,
+            TyKind::Infer(_) => true,
+            _ => {
+                if let Some(a) = self.tys.local_adt(t) {
+                    let p = self.p;
+                    p.adt(a).variants.iter().all(|v| {
+                        let n = v.fields.len();
+                        v.fields.iter().enumerate().all(|(i, f)| i + 1 == n || self.sized_ok(f.ty))
+                            && v.fields.last().is_none_or(|f| self.sized_ok(f.ty))
+                    })
+                } else {
+                    crate::check::collect::is_sized_ty(&self.tys, t)
+                }
+            }
+        }
+    }
+
+    /// An auto trait by structure (section 2.7). None when the
+    /// answer needs the param env or inference to move first.
+    fn auto_holds(&mut self, trait_def: DefId, t: Ty) -> Option<bool> {
+        let mut seen: Vec<Ty> = Vec::new();
+        self.auto_inner(trait_def, t, &mut seen)
+    }
+
+    fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
+        let lang = &self.p.gx.lang;
+        let t = self.resolve(t);
+        if seen.contains(&t) {
+            return Some(true);
+        }
+        match self.tys.kind(t) {
+            TyKind::Error => Some(true),
+            TyKind::Infer(_) | TyKind::Projection(..) => None,
+            TyKind::Param(_) => {
+                let env = self.env();
+                Some(env.iter().any(|pred| {
+                    matches!(pred, Predicate::Trait(b) if b.value.def == trait_def
+                        && self.tys.args(b.value.args)[0].as_ty() == Some(t))
+                }))
+            }
+            TyKind::RawPtr(..) => Some(trait_def == lang.unpin),
+            TyKind::Ref(_, m, e) => {
+                seen.push(t);
+                let need = if trait_def == lang.send && !m.is_mut() { lang.sync } else { trait_def };
+                if trait_def == lang.unpin {
+                    return Some(true);
+                }
+                self.auto_inner(need, e, seen)
+            }
+            TyKind::Slice(e) | TyKind::Array(e, _) => {
+                seen.push(t);
+                self.auto_inner(trait_def, e, seen)
+            }
+            TyKind::Tuple(ts) => {
+                seen.push(t);
+                let elems: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                let mut unknown = false;
+                for e in elems {
+                    match self.auto_inner(trait_def, e, seen) {
+                        Some(false) => return Some(false),
+                        None => unknown = true,
+                        _ => {}
+                    }
+                }
+                if unknown { None } else { Some(true) }
+            }
+            _ => {
+                if let Some(e) = self.tys.vec_elem(t).or_else(|| self.tys.option_elem(t)) {
+                    seen.push(t);
+                    return self.auto_inner(trait_def, e, seen);
+                }
+                if let Some(a) = self.tys.local_adt(t) {
+                    seen.push(t);
+                    let fields: Vec<Ty> = self.p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                    let mut unknown = false;
+                    for f in fields {
+                        match self.auto_inner(trait_def, f, seen) {
+                            Some(false) => return Some(false),
+                            None => unknown = true,
+                            _ => {}
+                        }
+                    }
+                    return if unknown { None } else { Some(true) };
+                }
+                Some(true)
+            }
+        }
+    }
+
+    /// Pushes one bound obligation for the next run point.
+    fn push_obligation(&mut self, tr: TraitRef, span: Span) {
+        self.obl.push_trait(tr, span);
+    }
+
+    /// Pushes the predicates of one instantiated item bound set:
+    /// trait predicates as obligations, equalities as `AssocEq`
+    /// obligations.
+    fn push_predicates(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span) {
+        let mut out: Vec<obligations::Obligation> = Vec::new();
+        for &pred in preds {
+            let pred = crate::traits::index::subst_predicate(&mut self.tys, pred, subst_args);
+            match pred {
+                Predicate::Trait(b) if b.count == 0 => out.push(obligations::Obligation::Trait { trait_ref: b.value, span, depth: 0 }),
+                Predicate::AssocEq(b) if b.count == 0 => out.push(obligations::Obligation::AssocEq { eq: b.value, span }),
+                _ => {}
+            }
+        }
+        // Elaborate so supertraits and binding equalities are
+        // proved too, then queue the lot.
+        let p = self.p;
+        let traits_only: Vec<Predicate> =
+            preds.iter().map(|&pred| crate::traits::index::subst_predicate(&mut self.tys, pred, subst_args)).collect();
+        let elaborated = generics::elaborate_env(&mut self.tys, &p.gx.index, &traits_only);
+        let mut queued = out;
+        for pred in elaborated {
+            match pred {
+                Predicate::Trait(b) if b.count == 0 => {
+                    if !queued.iter().any(|o| matches!(o, obligations::Obligation::Trait { trait_ref, .. } if *trait_ref == b.value)) {
+                        queued.push(obligations::Obligation::Trait { trait_ref: b.value, span, depth: 0 });
+                    }
+                }
+                Predicate::AssocEq(b) if b.count == 0 => {
+                    if !queued.iter().any(|o| matches!(o, obligations::Obligation::AssocEq { eq, .. } if *eq == b.value)) {
+                        queued.push(obligations::Obligation::AssocEq { eq: b.value, span });
+                    }
+                }
+                _ => {}
+            }
+        }
+        for o in queued {
+            self.obl.push(o);
+        }
+    }
+
+    /// Runs the obligation queue (the 2.4 run points). With
+    /// `hard`, anything left is an error; without, unresolved
+    /// obligations stay queued for the next point.
+    fn run_obligations(&mut self, hard: bool) {
+        if self.obl.is_empty() {
+            return;
+        }
+        // A fixpoint over rounds: nested obligations and bindings
+        // from one round can settle the next.
+        for _round in 0..128 {
+            let work = self.obl.take();
+            if work.is_empty() {
+                break;
+            }
+            let mut pending: Vec<obligations::Obligation> = Vec::new();
+            let mut progress = false;
+            for ob in work {
+                match ob {
+                    obligations::Obligation::AssocEq { eq, span } => {
+                        if self.prove_assoc_eq(eq, span) {
+                            progress = true;
+                        } else {
+                            pending.push(ob);
+                        }
+                    }
+                    obligations::Obligation::Trait { trait_ref, span, depth } => match self.select_obligation_at(trait_ref, span, depth) {
+                        Selection::Impl { unbound, .. } => {
+                            progress = true;
+                            if !unbound.is_empty() && self.still_unbound(&unbound, trait_ref) {
+                                pending.push(ob);
+                            }
+                        }
+                        Selection::ParamEvidence(_) => {
+                            progress = true;
+                            self.prove_bindings(trait_ref, span);
+                        }
+                        Selection::Ambiguous => pending.push(ob),
+                        Selection::NoImpl => {
+                            progress = true;
+                            let tn = self.tn(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
+                            let tr_name = self.trait_name(trait_ref.def);
+                            self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
+                        }
+                        Selection::Overflow => {
+                            progress = true;
+                            self.err(
+                                "L0611",
+                                span,
+                                "trait selection overflowed: the obligations recurse too deeply",
+                                "Simplify the impls or bounds involved.",
+                            );
+                        }
+                    },
+                }
+            }
+            for ob in pending {
+                self.obl.push(ob);
+            }
+            if !progress {
+                break;
+            }
+        }
+        if hard && !self.obl.is_empty() {
+            for ob in self.obl.take() {
+                match ob {
+                    obligations::Obligation::Trait { trait_ref, span, .. } => {
+                        // One last try now that literal fallbacks and
+                        // late bindings have run: an impl with a
+                        // still-unbound parameter is the step-4
+                        // error, everything else is annotation.
+                        match self.select_obligation(trait_ref) {
+                            Selection::Impl { unbound, .. } if !unbound.is_empty() => {
+                                self.err(
+                                    "L0613",
+                                    span,
+                                    "an impl parameter is not known from the trait inputs",
+                                    "Rewrite the impl so every parameter follows from the trait reference or an associated equality.",
+                                );
+                            }
+                            Selection::Impl { .. } | Selection::ParamEvidence(_) => {}
+                            Selection::NoImpl => {
+                                let tn = self.tn(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
+                                let tr_name = self.trait_name(trait_ref.def);
+                                self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
+                            }
+                            _ => {
+                                self.err(
+                                    "L0610",
+                                    span,
+                                    "type annotations needed: this trait obligation could not be resolved",
+                                    "Annotate the types involved so one impl is picked.",
+                                );
+                            }
+                        }
+                    }
+                    obligations::Obligation::AssocEq { span, .. } => {
+                        self.err(
+                            "L0610",
+                            span,
+                            "type annotations needed: an associated type could not be resolved",
+                            "Annotate the types involved, or name the associated type in the bound.",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// True while any of `unbound` still names a free variable in
+    /// the confirmed selection (checked through the obligation,
+    /// whose args the probe bound).
+    fn still_unbound(&mut self, unbound: &[ParamId], _tr: TraitRef) -> bool {
+        !unbound.is_empty()
+    }
+
+    /// Proves one associated equality by normalization. False
+    /// when the projection does not normalize yet.
+    fn prove_assoc_eq(&mut self, eq: AssocEqData, span: Span) -> bool {
+        let proj = self.tys.intern(TyKind::Projection(AssocId(eq.assoc), eq.trait_args));
+        let normed = self.normalize_here(proj);
+        let want = self.normalize_here(eq.ty);
+        if matches!(self.tys.kind(normed), TyKind::Projection(..)) && normed != want {
+            return false;
+        }
+        if !self.unify(normed, want) {
+            let (a, b) = (self.tn(want), self.tn(normed));
+            self.err(
+                "L0110",
+                span,
+                format!("associated type mismatch: expected `{a}`, found `{b}`"),
+                "Change the binding or the impl's associated type.",
+            );
+        }
+        true
+    }
+
+    /// Proves the bindings written on an obligation that the
+    /// param env answered (the impl path proves them in its
+    /// probe already).
+    fn prove_bindings(&mut self, tr: TraitRef, span: Span) {
+        let bindings: Vec<(DefId, GenericArg)> = self.tys.bindings(tr.bindings).to_vec();
+        for (assoc, ga) in bindings {
+            if let GenericArg::Ty(want) = ga {
+                let eq = AssocEqData { assoc, trait_args: tr.args, ty: want };
+                if !self.prove_assoc_eq(eq, span) {
+                    self.obl.push(obligations::Obligation::AssocEq { eq, span });
+                }
+            }
+        }
+    }
+
+    /// The display name of a trait def, for obligation errors.
+    fn trait_name(&self, def: DefId) -> String {
+        self.p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| self.p.name(r.name).to_string())
+    }
+
+    /// Replaces `_` markers in one resolved written type with
+    /// fresh body variables (distinct per marker).
+    fn instantiate_infers(&mut self, t: Ty) -> Ty {
+        self.instantiate_inner(t, &mut std::collections::HashMap::new())
+    }
+
+    fn instantiate_inner(&mut self, t: Ty, map: &mut std::collections::HashMap<u32, Ty>) -> Ty {
+        match self.tys.kind(t) {
+            TyKind::Infer(v) if v.index() >= generics::INFER_MARKER_BASE => {
+                if let Some(&u) = map.get(&v.index()) {
+                    return u;
+                }
+                let u = self.new_var(false);
+                map.insert(v.index(), u);
+                u
+            }
+            _ if !self.tys.flags(t).contains_infer() => t,
+            TyKind::Ref(r, m, e) => {
+                let e = self.instantiate_inner(e, map);
+                self.tys.intern(TyKind::Ref(r, m, e))
+            }
+            TyKind::Slice(e) => {
+                let e = self.instantiate_inner(e, map);
+                self.tys.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.instantiate_inner(e, map);
+                self.tys.intern(TyKind::Array(e, n))
+            }
+            TyKind::Tuple(ts) => {
+                let old: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                let new: Vec<Ty> = old.iter().map(|&e| self.instantiate_inner(e, map)).collect();
+                let ts = self.tys.intern_tys(&new);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Adt(d, a) => {
+                let a = self.instantiate_args(a, map);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            TyKind::Projection(d, a) => {
+                let a = self.instantiate_args(a, map);
+                self.tys.intern(TyKind::Projection(d, a))
+            }
+            TyKind::FnDef(d, a) => {
+                let a = self.instantiate_args(a, map);
+                self.tys.intern(TyKind::FnDef(d, a))
+            }
+            _ => t,
+        }
+    }
+
+    fn instantiate_args(&mut self, a: ArgsId, map: &mut std::collections::HashMap<u32, Ty>) -> ArgsId {
+        let old: Vec<GenericArg> = self.tys.args(a).to_vec();
+        let new: Vec<GenericArg> = old
+            .iter()
+            .map(|&g| match g {
+                GenericArg::Ty(e) => GenericArg::Ty(self.instantiate_inner(e, map)),
+                other => other,
+            })
+            .collect();
+        self.tys.intern_args(&new)
+    }
+
     // ---------- Inference ----------
 
     fn new_var(&mut self, int: bool) -> Ty {
@@ -528,7 +1103,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return t;
                 }
                 let d = if v.is_int() { I32 } else { ERROR };
-                self.vars[v.index() as usize].bound = Some(d);
+                self.bind_var(v.index(), d);
                 d
             }
             _ if !self.tys.flags(t).contains_infer() => t,
@@ -576,8 +1151,40 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
+            TyKind::RawPtr(m, e) => {
+                let e = self.rebuild(e, zonk);
+                self.tys.intern(TyKind::RawPtr(m, e))
+            }
+            TyKind::Projection(d, a) => {
+                let a = self.rebuild_args(a, zonk);
+                self.tys.intern(TyKind::Projection(d, a))
+            }
+            TyKind::FnDef(d, a) => {
+                let a = self.rebuild_args(a, zonk);
+                self.tys.intern(TyKind::FnDef(d, a))
+            }
+            TyKind::Closure(d, a) => {
+                let a = self.rebuild_args(a, zonk);
+                self.tys.intern(TyKind::Closure(d, a))
+            }
+            TyKind::Opaque(d, a) => {
+                let a = self.rebuild_args(a, zonk);
+                self.tys.intern(TyKind::Opaque(d, a))
+            }
             _ => t,
         }
+    }
+
+    fn rebuild_args(&mut self, a: ArgsId, zonk: bool) -> ArgsId {
+        let old: Vec<GenericArg> = self.tys.args(a).to_vec();
+        let new: Vec<GenericArg> = old
+            .iter()
+            .map(|&g| match g {
+                GenericArg::Ty(e) => GenericArg::Ty(self.rebuild(e, zonk)),
+                other => other,
+            })
+            .collect();
+        self.tys.intern_args(&new)
     }
 
     fn unify(&mut self, a: Ty, b: Ty) -> bool {
@@ -585,14 +1192,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if a == b {
             return true;
         }
+        // A projection that normalizes now unifies through its
+        // normal form (section 2.5). Only when its args hold no
+        // inference variable: selection inside probes already
+        // handles the open case, and normalizing there would loop.
+        if !self.in_norm
+            && (matches!(self.tys.kind(a), TyKind::Projection(..)) || matches!(self.tys.kind(b), TyKind::Projection(..)))
+            && !self.tys.flags(a).contains_infer()
+            && !self.tys.flags(b).contains_infer()
+        {
+            self.in_norm = true;
+            let (na, nb) = (self.normalize_here(a), self.normalize_here(b));
+            let out = (na != a || nb != b) && self.unify(na, nb);
+            self.in_norm = false;
+            if out || na != a || nb != b {
+                return out;
+            }
+        }
         match (self.tys.kind(a), self.tys.kind(b)) {
             (TyKind::Error, _) | (_, TyKind::Error) => true,
             (TyKind::Infer(v), TyKind::Infer(w)) => {
                 // Bind the general variable to the integer one, so the integer constraint survives.
                 if v.is_int() && !w.is_int() {
-                    self.vars[w.index() as usize].bound = Some(a);
+                    self.bind_var(w.index(), a);
                 } else {
-                    self.vars[v.index() as usize].bound = Some(b);
+                    self.bind_var(v.index(), b);
                 }
                 true
             }
@@ -604,7 +1228,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if self.occurs(v.index(), other) {
                     return false;
                 }
-                self.vars[v.index() as usize].bound = Some(other);
+                self.bind_var(v.index(), other);
                 true
             }
             // Regions do not take part in this equality: every region is `Erased`
@@ -620,6 +1244,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (TyKind::Slice(x), TyKind::Slice(y)) => self.unify(x, y),
             (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && self.unify(x, y),
+            (TyKind::RawPtr(m, x), TyKind::RawPtr(n, y)) => m == n && self.unify(x, y),
+            (TyKind::Projection(d, x), TyKind::Projection(e, y)) => d == e && self.unify_args(x, y),
+            (TyKind::FnDef(d, x), TyKind::FnDef(e, y)) => d == e && self.unify_args(x, y),
+            (TyKind::Closure(d, x), TyKind::Closure(e, y)) => d == e && self.unify_args(x, y),
+            (TyKind::Opaque(d, x), TyKind::Opaque(e, y)) => d == e && self.unify_args(x, y),
             _ => false,
         }
     }
@@ -678,7 +1307,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Checks `found` against `expected` at a coercion site. Records the coercion on `e`.
     fn coerce_at(&mut self, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> bool {
         // ARCH 2.4 run point: the obligation queue runs at coercion sites.
-        self.obl.run_at_coercion();
+        self.run_obligations(false);
         let (fk, ek) = (self.kind(found), self.kind(expected));
         if fk == TyKind::Never {
             return true;
@@ -875,13 +1504,81 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
         }
-        match resolve_ty(p.ast, p.interner, p.known, &p.type_names, &p.aliases, &mut self.tys, t, self.self_ty) {
-            Ok(t) => t,
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
+            Ok(t) => self.instantiate_infers(t),
             Err(d) => {
                 self.errs.push(d);
                 ERROR
             }
         }
+    }
+
+    /// Instantiates one fn template at a call site: fresh
+    /// variables for its parameters (explicit turbofish types
+    /// where written), the substituted signature, bound
+    /// obligations queued, and the site recorded for mono.
+    /// Returns (params, ret, args).
+    fn instantiate_template(
+        &mut self,
+        e: ExprId,
+        template: LocalDefId,
+        generics: &Generics,
+        explicit: &[Option<GenericArg>],
+        span: Span,
+    ) -> (Vec<Ty>, Ty, Vec<GenericArg>) {
+        let p = self.p;
+        let info = p.fn_info(template);
+        let mut args: Vec<GenericArg> = Vec::with_capacity(generics.params.len());
+        for (i, param) in generics.params.iter().enumerate() {
+            let given = explicit.get(i).copied().flatten();
+            args.push(match (given, &param.kind) {
+                (Some(g), _) => g,
+                (None, ParamKind::Type) => GenericArg::Ty(self.new_var(false)),
+                (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
+                (None, ParamKind::Const(_)) => {
+                    let c = self.tys.intern_const(ConstKind::Infer(i as u32));
+                    GenericArg::Const(c)
+                }
+            });
+        }
+        let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &args)).collect();
+        let ret = subst(&mut self.tys, info.ret, &args);
+        let preds = generics.predicates.clone();
+        self.push_predicates(&preds, &args, span);
+        self.generic_sites.push((self.ei(e), template, args.clone()));
+        (params, ret, args)
+    }
+
+    /// The explicit generic arguments written on a call path
+    /// (`f::<u8, _>(..)`), resolved in this body's scope and
+    /// aligned to parameter positions. Unwritten positions are
+    /// None.
+    fn explicit_call_args(&mut self, callee: ExprId) -> Vec<Option<GenericArg>> {
+        let p = self.p;
+        let ast::Expr::Path(segs) = p.ast.expr(callee) else { return Vec::new() };
+        let Some(seg) = segs.last() else { return Vec::new() };
+        let ast::GenericArgs::Angle(written) = &seg.args else { return Vec::new() };
+        let mut out = Vec::new();
+        for a in written {
+            out.push(match a {
+                ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
+                ast::GenericArg::Lifetime(_) => None,
+                ast::GenericArg::Const(e) => {
+                    let cx = p.gx.resolve_cx(&p.type_names);
+                    let _ = cx;
+                    crate::check::collect::eval_array_len(p.ast, *e).map(|v| {
+                        let c = self.tys.intern_const(ConstKind::Int(v));
+                        GenericArg::Const(c)
+                    })
+                }
+                ast::GenericArg::Binding { span, .. } => {
+                    self.errs.push(not_yet("L0621", *span, "associated bindings in call arguments"));
+                    None
+                }
+            });
+        }
+        out
     }
 
     // ---------- Expressions ----------
@@ -1041,7 +1738,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 l.break_ty.unwrap_or(NEVER)
             }
             Expr::For { label, pat, iter, body } => {
-                let item = self.for_iter(*iter);
+                let item = self.for_iter(e, *iter);
                 let scope = self.scopes.len();
                 self.pattern(*pat, item, false);
                 self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
@@ -1054,7 +1751,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Match { scrut, arms } => {
                 let st = self.expr(*scrut, None);
                 // ARCH 2.12 run point: a match must know the scrutinee enum.
-                self.obl.run_before_structural();
+                self.run_obligations(false);
                 let mut result: Option<Ty> = None;
                 for arm in arms {
                     let scope = self.scopes.len();
@@ -1074,15 +1771,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Call { callee, args } => self.call(e, *callee, args, span),
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
-                if !generic_args.is_empty() {
-                    self.errs.push(not_yet("L0721", *name_span, "turbofish on method calls"));
-                }
-                self.method_call(e, *recv, *name, *name_span, args)
+                self.method_call(e, *recv, *name, *name_span, args, generic_args)
             }
             Expr::Field { base, name } => {
                 let bt = self.expr(*base, None);
                 // ARCH 2.12 run point: a field access must know the base type.
-                self.obl.run_before_structural();
+                self.run_obligations(false);
                 let (derefs, inner) = self.autoderef(bt);
                 if let Some(a) = self.tys.local_adt(inner) {
                     let adt = p.adt(a);
@@ -1104,7 +1798,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let bt = self.expr(*base, None);
                 // ARCH 2.12 run point: an index must know the indexed type; the
                 // index type then follows from the selected `Index` impl.
-                self.obl.run_before_structural();
+                self.run_obligations(false);
                 let (derefs, inner) = self.autoderef(bt);
                 if let Expr::Range { lo, hi, .. } = p.ast.expr(*index) {
                     // A range index makes a slice place. Bounds are usize.
@@ -1246,7 +1940,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Deref(inner) => {
                 let t = self.expr(*inner, None);
                 // ARCH 2.12 run point: a deref must know the pointee source type.
-                self.obl.run_before_structural();
+                self.run_obligations(false);
                 match self.kind(t) {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
@@ -1476,7 +2170,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::TupleField { base, index } => {
                 let bt = self.expr(*base, None);
-                self.obl.run_before_structural();
+                self.run_obligations(false);
                 let (derefs, inner) = self.autoderef(bt);
                 let field_ty = match self.kind(inner) {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
@@ -1998,6 +2692,130 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "Use a type inside the supported layout grammar.",
                 );
                 Res::ConstUsize(0)
+    /// True for the scalar widening conversions `From` provides in
+    /// std (identity is the blanket's job and also answers true).
+    fn numeric_from_ok(src: TyKind, dst: TyKind) -> bool {
+        let bits = |k: TyKind| match k {
+            TyKind::Int(i) => Some((i.bits(), i.signed())),
+            TyKind::Bool => Some((1, false)),
+            TyKind::Char => Some((32, false)),
+            _ => None,
+        };
+        match (bits(src), bits(dst)) {
+            (Some((sb, ss)), Some((db, ds))) => {
+                if src == dst {
+                    return true;
+                }
+                if matches!(src, TyKind::Char) {
+                    return matches!(dst, TyKind::Int(IntTy::U32 | IntTy::U64 | IntTy::Usize));
+                }
+                if matches!(src, TyKind::Bool) {
+                    return matches!(dst, TyKind::Int(_));
+                }
+                db > sb && (!ss || ds) || db >= sb && ss == ds && db > sb
+            }
+            _ => src == dst,
+        }
+    }
+
+    /// An associated function call through a trait:
+    /// `<T as Tr>::name(..)` or `T::name(..)`. Selects the impl
+    /// for the Self type and calls the method as a free fn (an
+    /// explicit receiver is simply its first parameter).
+    fn assoc_call(
+        &mut self,
+        e: ExprId,
+        callee: ExprId,
+        base: Ty,
+        hint: Option<TraitRef>,
+        name: Sym,
+        args: &[ExprId],
+        span: Span,
+    ) -> Option<Ty> {
+        let p = self.p;
+        // Numeric `From::from` is a widening cast, with no user
+        // fn behind it (the lang blanket covers only identity).
+        if self.name(name) == "from" && args.len() == 1 && hint.is_none_or(|h| h.def == p.gx.lang.from) {
+            let src = self.expr(args[0], None);
+            if Self::numeric_from_ok(self.kind(src), self.kind(base)) {
+                self.set_res(callee, Res::FromCast);
+                self.set_res(e, Res::FromCast);
+                return Some(base);
+            }
+            if Self::numeric_from_ok(self.kind(base), self.kind(src))
+                || matches!(self.kind(src), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
+            {
+                // A scalar `from` that does not widen is an error
+                // here, not a missing method.
+                return None;
+            }
+        }
+        let traits: Vec<DefId> = match hint {
+            Some(tr) => vec![tr.def],
+            None => {
+                p.gx.traits_by_method
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|&d| method::trait_in_scope_pub(self, d))
+                    .collect()
+            }
+        };
+        let mut hits: Vec<(LocalDefId, Vec<Ty>, Ty)> = Vec::new();
+        for trait_def in traits {
+            let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
+            if rec.method_by_name(name).is_none() {
+                continue;
+            }
+            let n_inputs = rec.generics.params.len().saturating_sub(1);
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let sites_len = self.generic_sites.len();
+            let tr = match hint {
+                Some(written) if written.def == trait_def => written,
+                _ => {
+                    let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                    for _ in 0..n_inputs {
+                        tr_args.push(GenericArg::Ty(self.new_var(false)));
+                    }
+                    let args_id = self.tys.intern_args(&tr_args);
+                    TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
+                }
+            };
+            match self.select_obligation_at(tr, span, 0) {
+                Selection::Impl { id, args: impl_args, .. } => {
+                    let mname = self.name(name).to_string();
+                    if let Some(found) = self.method_instance_for_impl(e, id, tr, impl_args, &mname, span) {
+                        hits.push(found);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+            self.generic_sites.truncate(sites_len);
+        }
+        match hits.len() {
+            1 => {
+                let (local, params, ret) = hits.into_iter().next().unwrap();
+                self.set_res(e, Res::Fn(local));
+                self.check_args(&params, args, span);
+                Some(self.normalize_here(ret))
+            }
+            0 => None,
+            _ => {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple trait methods named `{}` apply here", self.name(name)),
+                    "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
+                );
+                for &a in args {
+                    self.expr(a, None);
+                }
+                Some(ERROR)
             }
         }
     }
@@ -2036,7 +2854,46 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     },
                 }
             }
+            Expr::QPath { self_ty, trait_path, segs } => {
+                if segs.len() == 1 {
+                    let base = self.resolve_written(*self_ty);
+                    let hint = if trait_path.is_empty() {
+                        None
+                    } else {
+                        let cx = p.gx.resolve_cx(&p.type_names);
+                        let tref = ast::TraitRefExpr { path: trait_path.clone() };
+                        generics::resolve_trait_ref(
+                            p.ast,
+                            p.interner,
+                            p.known,
+                            &cx,
+                            &mut self.tys,
+                            &self.body_scope.clone(),
+                            base,
+                            &tref,
+                            span,
+                        )
+                        .ok()
+                    };
+                    if let Some(t) = self.assoc_call(e, callee, base, hint, segs[0].name, args, span) {
+                        return t;
+                    }
+                }
+                for &a in args {
+                    self.expr(a, None);
+                }
+                self.err("L0101", span, "cannot find the associated function", "Check the trait and the name.");
+                return ERROR;
+            }
             Expr::Path(segs) => {
+                // `T::assoc_fn(..)` on a type parameter: the trait
+                // comes from the bounds in scope for its type here.
+                if segs.len() == 2
+                    && let Some((_, base)) = self.body_scope.param_tys.iter().find(|(n, _)| *n == segs[0].name).copied()
+                    && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
+                {
+                    return t;
+                }
                 let cs = self.span(callee);
                 match self.resolve_assoc(segs, cs) {
                     Some(r) => r,
@@ -2072,6 +2929,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
+                if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
+                    let explicit = self.explicit_call_args(callee);
+                    let (params, ret, _) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
+                    self.check_args(&params, args, span);
+                    return self.normalize_here(ret);
+                }
                 let (params, ret) = match p.sig_of(&mut self.out.reads, p.def_id(f)) {
                     SigOf::Fn(info) => (info.params.clone(), info.ret),
                     _ => return ERROR,
@@ -2087,9 +2950,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0114", span, "this variant is not a tuple variant", "Use `Type::Variant` or `Type::Variant { .. }`.");
                     return ERROR;
                 }
-                let params: Vec<Ty> = variant.fields.iter().map(|f| f.ty).collect();
-                self.check_args(&params, args, span);
-                self.tys.adt_ty(a)
+                let n = p.gx.adt_generics[a.0 as usize].params.len();
+                if n == 0 {
+                    let params: Vec<Ty> = variant.fields.iter().map(|f| f.ty).collect();
+                    self.check_args(&params, args, span);
+                    self.tys.adt_ty(a)
+                } else {
+                    let gen_args: Vec<GenericArg> = (0..n).map(|_| GenericArg::Ty(self.new_var(false))).collect();
+                    let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
+                    self.check_args(&params, args, span);
+                    self.tys.mk_adt(adef, &gen_args)
+                }
             }
             Res::Builtin(b) => {
                 let (params, ret): (Vec<Ty>, Ty) = match b {
@@ -2145,20 +3016,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    fn method_call(&mut self, e: ExprId, recv: ExprId, name: Sym, name_span: Span, args: &[ExprId]) -> Ty {
+    fn method_call(&mut self, e: ExprId, recv: ExprId, name: Sym, name_span: Span, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Ty {
         let p = self.p;
         let k = p.known;
         let rt = self.expr(recv, None);
         let rt = self.deep(rt);
         // ARCH 2.12 run point: a method call must know the receiver type. The
         // obligation queue runs just before that head is required (ARCH 2.4).
-        self.obl.run_before_structural();
+        self.run_obligations(false);
         let (derefs, base) = self.autoderef(rt);
         let bk = self.tys.kind(base);
         // User methods, through the method-set probes of section 2.10: every
         // form is probed in order and recorded, hit or miss, before the
         // builtin compat dispatch below runs.
         let head = Head::of(&self.tys, base);
+        // Turbofish args of the method (`x.m::<U>(..)`), resolved
+        // in this body's scope for the generic probes below.
+        let explicit: Vec<Option<GenericArg>> = turbofish
+            .iter()
+            .map(|a| match a {
+                ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
+                ast::GenericArg::Const(e2) => crate::check::collect::eval_array_len(p.ast, *e2).map(|v| {
+                    let c = self.tys.intern_const(ConstKind::Int(v));
+                    GenericArg::Const(c)
+                }),
+                _ => None,
+            })
+            .collect();
+        // Generic and trait receivers go through the full 2.10
+        // search (check/method.rs), which probes plain inherent
+        // methods with the same recorded reads, in step+form
+        // order. Builtin and scalar receivers stay on the path
+        // below.
+        if p.gx.has_generics
+            && (self.tys.local_adt(base).is_some()
+                || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..)))
+        {
+            match method::generic_method_search(self, e, rt, name, name_span, args, &explicit) {
+                method::Probe::Hit(ret) => return ret,
+                method::Probe::Failed => return ERROR,
+                method::Probe::Miss => {}
+            }
+        }
         let mut user = None;
         for form in ReceiverForm::PROBE_ORDER {
             let set = p.method_set(&mut self.out.reads, head, name, form);
@@ -2169,6 +3068,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(c) = user {
             let f = p.local_def(c.def.hash).expect("a method candidate names a local fn");
+            // A generic inherent method: instantiate it like a
+            // generic call, with the receiver unifying the impl
+            // and method parameters.
+            if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned()
+                && let Some(form) = c.receiver
+            {
+                match method::inherent_template_probe(self, e, base, form, derefs, name, name_span, args, &explicit) {
+                    method::Probe::Hit(ret) => return ret,
+                    method::Probe::Failed => return ERROR,
+                    method::Probe::Miss => {}
+                }
+                let _ = &tmpl;
+            }
             let Some(form) = c.receiver else {
                 self.err(
                     "L0104",
@@ -2398,6 +3310,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ret
             }
             None => {
+                // Generic and trait methods over the full autoderef
+                // chain (check/method.rs).
+                if p.gx.has_generics {
+                    match method::generic_method_search(self, e, rt, name, name_span, args, &explicit) {
+                        method::Probe::Hit(ret) => return ret,
+                        method::Probe::Failed => return ERROR,
+                        method::Probe::Miss => {}
+                    }
+                }
                 for &a in args {
                     self.expr(a, None);
                 }
@@ -2442,6 +3363,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         table.into_iter().find(|(n, ..)| *n == name).map(|(_, b, params, ret)| (b, Autoref::Ref, params, ret))
     }
 
+    /// One binary operator through its operator trait, with the
+    /// result type normalized through `Output`. None when no
+    /// impl applies (the caller reports the plain operator error).
+    fn trait_binop(&mut self, e: ExprId, op: BinOp, li: Ty, ri: Ty, ld: u8, rd: u8, span: Span) -> Option<Ty> {
+        use BinOp::*;
+        let p = self.p;
+        if !p.gx.has_generics {
+            return None;
+        }
+        let lang = &p.gx.lang;
+        let (trait_def, method_name) = match op {
+            Add => (lang.add, "add"),
+            Sub => (lang.sub, "sub"),
+            Mul => (lang.mul, "mul"),
+            Div => (lang.div, "div"),
+            Rem => (lang.rem, "rem"),
+            BitAnd => (lang.bit_and, "bitand"),
+            BitOr => (lang.bit_or, "bitor"),
+            BitXor => (lang.bit_xor, "bitxor"),
+            Shl => (lang.shl, "shl"),
+            Shr => (lang.shr, "shr"),
+            _ => return None,
+        };
+        let out_var = self.new_var(false);
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(li), GenericArg::Ty(ri)]);
+        let bindings = match lang.output_of(trait_def) {
+            Some(assoc) => self.tys.intern_bindings(&[(assoc, GenericArg::Ty(out_var))]),
+            None => EMPTY_BINDINGS,
+        };
+        let tr = TraitRef { def: trait_def, args: args_id, bindings };
+        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(tr) else { return None };
+        let local = self.method_instance_for_impl(e, id, tr, impl_args, method_name, span)?;
+        // The selected method's receiver and rhs are unified by
+        // selection's probe through the trait ref above; record
+        // the call for lowering.
+        self.set_res(e, Res::TraitBin { f: local.0, ld, rd });
+        Some(self.normalize_here(out_var))
+    }
+
     fn binary(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span) -> Ty {
         use BinOp::*;
         if matches!(op, And | Or) {
@@ -2453,7 +3413,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let rt = self.expr(rhs, Some(lt));
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.
-        self.obl.run_before_structural();
+        self.run_obligations(false);
         let (lk, rk) = (self.kind(lt), self.kind(rt));
         if lk == TyKind::Error || rk == TyKind::Error {
             return if op.is_cmp() { BOOL } else { ERROR };
@@ -2520,6 +3480,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let (rd, ri) = self.peel_one_ref(rt);
         let (lik, rik) = (self.kind(li), self.kind(ri));
         let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
+        // Operator traits on non-scalars (section 2.5): the
+        // builtin scalar path above stays first, as ARCH requires.
+        if !int_like(lik)
+            && !matches!(lik, TyKind::Bool)
+            && let Some(t) = self.trait_binop(e, op, li, ri, ld, rd, span)
+        {
+            return t;
+        }
         let result = match op {
             Add | Sub | Mul | Div | Rem if matches!(lik, TyKind::Float(_)) && matches!(rik, TyKind::Float(_)) => {
                 if !self.unify(li, ri) {
@@ -2564,6 +3532,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return ERROR;
         };
         self.set_res(e, Res::Variant(a, v));
+        // A generic Adt literal instantiates its parameters from
+        // the written fields (and any turbofish): field types are
+        // the template's, substituted with fresh variables.
+        let gen_args: Vec<GenericArg> = {
+            let n = p.gx.adt_generics[a.0 as usize].params.len();
+            (0..n).map(|_| GenericArg::Ty(self.new_var(false))).collect()
+        };
         let variant = &p.adt(a).variants[v as usize];
         if variant.shape != VariantShape::Named && !(variant.fields.is_empty() && fields.is_empty()) {
             self.err("L0110", span, "this is not a struct with named fields", "Use the tuple or unit form.");
@@ -2578,7 +3553,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     seen[i] = true;
                     self.check_field_vis(a, fname, fspan);
-                    self.expect_expr(fe, variant.fields[i].ty);
+                    let want =
+                        if gen_args.is_empty() { variant.fields[i].ty } else { subst(&mut self.tys, variant.fields[i].ty, &gen_args) };
+                    self.expect_expr(fe, want);
                 }
                 None => {
                     self.expr(fe, None);
@@ -2607,10 +3584,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Set every field, or fill the rest from another value with `..base`.",
             );
         }
-        self.tys.adt_ty(a)
+        if gen_args.is_empty() {
+            self.tys.adt_ty(a)
+        } else {
+            let (def, _) = p.gx.adt_info[a.0 as usize];
+            self.tys.mk_adt(def, &gen_args)
+        }
     }
 
-    fn for_iter(&mut self, iter: ExprId) -> Ty {
+    fn for_iter(&mut self, for_e: ExprId, iter: ExprId) -> Ty {
         let p = self.p;
         if let Expr::Range { lo, hi, .. } = p.ast.expr(iter) {
             let (Some(lo), Some(hi)) = (*lo, *hi) else {
@@ -2659,13 +3641,102 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ERROR
             }
             TyKind::Error => ERROR,
-            _ => {
-                let s = self.span(iter);
-                let tn = self.tn(t);
-                self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
-                ERROR
-            }
+            _ => match self.for_trait_iter(for_e, iter, t) {
+                Some(item) => item,
+                None => {
+                    let s = self.span(iter);
+                    let tn = self.tn(t);
+                    self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
+                    ERROR
+                }
+            },
         }
+    }
+
+    /// A `for` loop through `IntoIterator` (section 2.4 in a
+    /// loop head): select the impl, record the two method
+    /// instances lowering calls, and answer the item type.
+    fn for_trait_iter(&mut self, for_e: ExprId, iter: ExprId, t: Ty) -> Option<Ty> {
+        let p = self.p;
+        if !p.gx.has_generics {
+            return None;
+        }
+        self.run_obligations(false);
+        let span = self.span(iter);
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: p.gx.lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(tr) else { return None };
+        let lang = &p.gx.lang;
+        // The iterator type and item type, normalized.
+        let into_iter_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_iter), args_id));
+        let iter_ty = self.normalize_here(into_iter_proj);
+        let item_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_item), args_id));
+        let item_ty = self.normalize_here(item_proj);
+        // into_iter method instance. The std blanket
+        // (`impl<I: Iterator> IntoIterator for I`) is synthetic
+        // with no body: lowering uses the receiver as its own
+        // iterator when it sees the sentinel.
+        let into_local = if p.gx.index.get(id).items.is_empty() {
+            LocalDefId(u32::MAX)
+        } else {
+            self.method_instance_for_impl(for_e, id, tr, impl_args.clone(), "into_iter", span)?.0
+        };
+        // next() on the iterator type.
+        let iter_args_id = self.tys.intern_args(&[GenericArg::Ty(iter_ty)]);
+        let tr2 = TraitRef { def: lang.iterator, args: iter_args_id, bindings: EMPTY_BINDINGS };
+        let Selection::Impl { id: id2, args: impl_args2, .. } = self.select_obligation(tr2) else { return None };
+        let next_local = self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0;
+        self.set_res(for_e, Res::ForTrait { into_iter: into_local, next: next_local });
+        Some(item_ty)
+    }
+
+    /// The method template of one selected impl by name,
+    /// instantiated at the impl's args and recorded as an
+    /// instance request at `site`. Trait defaults answer when
+    /// the impl does not write the method.
+    fn method_instance_for_impl(
+        &mut self,
+        site: ExprId,
+        impl_id: crate::traits::ImplId,
+        tr: TraitRef,
+        impl_args: Vec<GenericArg>,
+        name: &str,
+        span: Span,
+    ) -> Option<(LocalDefId, Vec<Ty>, Ty)> {
+        let p = self.p;
+        let record = p.gx.index.get(impl_id).clone();
+        let local = record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == name)).or_else(
+            || {
+                // The trait default, materialized from its template
+                // with the trait ref args as its prefix.
+                let rec = p.gx.index.trait_record(record.trait_def)?;
+                let name_sym = rec.methods.iter().find(|(_, n)| p.name(*n) == name).map(|(d, _)| *d)?;
+                p.local_def(name_sym.hash)
+            },
+        )?;
+        let Some(Some(tmpl)) = p.gx.fn_templates.get(local.0 as usize).cloned() else {
+            let info = p.fn_info(local);
+            return Some((local, info.params.clone(), info.ret));
+        };
+        // Prefix: impl args for an impl method, trait ref args
+        // for a trait default (its template generics are the
+        // trait's). A default is the local whose def is a trait
+        // method def, not an item of this impl.
+        let is_default = !record.items.contains(&p.def_id(local));
+        let prefix: Vec<GenericArg> = if is_default {
+            let raw: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+            raw.iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(self.deep(t)),
+                    other => other,
+                })
+                .collect()
+        } else {
+            impl_args
+        };
+        let explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
+        let (params, ret, _) = self.instantiate_template(site, local, &tmpl.generics.clone(), &explicit, span);
+        Some((local, params, ret))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3410,7 +4481,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn finish(&mut self) {
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
-        self.obl.run_at_body_end();
+        self.run_obligations(true);
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
@@ -3433,6 +4504,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
             }
             self.out.locals[i].ty = z;
+        }
+        // Generic call sites become instance requests for mono,
+        // with their args zonked into place for lowering.
+        for (ei, template, args) in std::mem::take(&mut self.generic_sites) {
+            let zargs: Vec<GenericArg> = args
+                .iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(self.zonk(t)),
+                    other => other,
+                })
+                .collect();
+            if ei < self.out.generic_args.len() {
+                self.out.generic_args[ei] = zargs.clone();
+            }
+            self.out.inst_requests.push((template, zargs));
+        }
+        // A generic Adt constructor names the template Adt; the
+        // value's type names the instance mono made. Point the
+        // resolution at the instance so lowering lays it out.
+        for i in 0..self.out.expr_res.len() {
+            if let Res::Variant(a, v) = self.out.expr_res[i]
+                && let Some(inst) = self.tys.local_adt(self.out.expr_ty[i])
+                && inst != a
+            {
+                self.out.expr_res[i] = Res::Variant(inst, v);
+            }
         }
         // Literal range checks.
         let base = self.out.expr_base;
@@ -3617,4 +4714,39 @@ fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
         return Some((a, v as u32));
     }
     None
+}
+/// The solver over one body's inference state (see
+/// `traits::solve::SolveCx`): probes bind body variables and roll
+/// back through the trail `bind_var` records.
+impl<'p> SolveCx for Ctx<'p, '_> {
+    type Snapshot = usize;
+    type Store = Tys<'p>;
+
+    fn tys(&mut self) -> &mut Tys<'p> {
+        &mut self.tys
+    }
+    fn deep_resolve(&mut self, t: Ty) -> Ty {
+        self.deep(t)
+    }
+    fn unify(&mut self, a: Ty, b: Ty) -> bool {
+        self.unify(a, b)
+    }
+    fn fresh_var(&mut self) -> Ty {
+        self.new_var(false)
+    }
+    fn snapshot(&mut self) -> usize {
+        self.trail.len()
+    }
+    fn rollback(&mut self, snap: usize) {
+        while self.trail.len() > snap {
+            let var = self.trail.pop().unwrap();
+            self.vars[var as usize].bound = None;
+        }
+    }
+    fn record_impl_set(&mut self, trait_def: DefId, self_ty: Ty, _failed: bool) {
+        let p = self.p;
+        let resolved = self.resolve(self_ty);
+        let head = Head::of(&self.tys, resolved);
+        p.impl_set(&mut self.out.reads, trait_def, head);
+    }
 }
