@@ -1,0 +1,230 @@
+== ascii
+port-form: 68 65 6c 6c 6f 2c 20 77 6f 72 6c 64
+units: U+0068 U+0065 U+006C U+006C U+006F U+002C U+0020 U+0077 U+006F U+0072 U+006C U+0064
+marker: false
+go_len: 12
+bytes-back: 68 65 6c 6c 6f 2c 20 77 6f 72 6c 64
+round-trip: true
+valid-utf8: 68 65 6c 6c 6f 2c 20 77 6f 72 6c 64
+go_value: 68 65 6c 6c 6f 2c 20 77 6f 72 6c 64
+runes: U+0068 U+0065 U+006C U+006C U+006F U+002C U+0020 U+0077 U+006F U+0072 U+006C U+0064
+offset port=0 go=0 back=0 before=-1
+offset port=1 go=1 back=1 before=0
+offset port=2 go=2 back=2 before=1
+offset port=3 go=3 back=3 before=2
+offset port=4 go=4 back=4 before=3
+offset port=5 go=5 back=5 before=4
+offset port=6 go=6 back=6 before=5
+offset port=7 go=7 back=7 before=6
+offset port=8 go=8 back=8 before=7
+offset port=9 go=9 back=9 before=8
+offset port=10 go=10 back=10 before=9
+offset port=11 go=11 back=11 before=10
+offset port=12 go=12 back=12 before=11
+slice[1..n-1]: 65 6c 6c 6f 2c 20 77 6f 72 6c
+cut[0..2]: 68 65
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 48 45 4c 4c 4f 2c 20 57 4f 52 4c 44
+ord-self: Equal
+ord-str: Equal
+== utf8
+port-form: 68 c3 a9 6c 6c 6f 20 e2 86 92 20 77 c3 b6 72 6c 64 20 f0 9d 84 9e
+units: U+0068 U+00E9 U+006C U+006C U+006F U+0020 U+2192 U+0020 U+0077 U+00F6 U+0072 U+006C U+0064 U+0020 U+1D11E
+marker: false
+go_len: 22
+bytes-back: 68 c3 a9 6c 6c 6f 20 e2 86 92 20 77 c3 b6 72 6c 64 20 f0 9d 84 9e
+round-trip: true
+valid-utf8: 68 c3 a9 6c 6c 6f 20 e2 86 92 20 77 c3 b6 72 6c 64 20 f0 9d 84 9e
+go_value: 68 c3 a9 6c 6c 6f 20 e2 86 92 20 77 c3 b6 72 6c 64 20 f0 9d 84 9e
+runes: U+0068 U+00E9 U+006C U+006C U+006F U+0020 U+2192 U+0020 U+0077 U+00F6 U+0072 U+006C U+0064 U+0020 U+1D11E
+offset port=0 go=0 back=0 before=-1
+offset port=1 go=1 back=1 before=0
+offset port=3 go=3 back=3 before=2
+offset port=4 go=4 back=4 before=3
+offset port=5 go=5 back=5 before=4
+offset port=6 go=6 back=6 before=5
+offset port=7 go=7 back=7 before=6
+offset port=10 go=10 back=10 before=9
+offset port=11 go=11 back=11 before=10
+offset port=12 go=12 back=12 before=11
+offset port=14 go=14 back=14 before=13
+offset port=15 go=15 back=15 before=14
+offset port=16 go=16 back=16 before=15
+offset port=17 go=17 back=17 before=16
+offset port=18 go=18 back=18 before=17
+offset port=22 go=22 back=22 before=21
+slice[1..n-1]: c3 a9 6c 6c 6f 20 e2 86 92 20 77 c3 b6 72 6c 64 20 ef b7 90 f4 8f 9f b0 ef b7 90 f4 8f 9e 9d ef b7 90 f4 8f 9e 84
+cut[0..2]: 68 ef b7 90 f4 8f 9f 83
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 48 c3 a9 4c 4c 4f 20 e2 86 92 20 57 c3 b6 52 4c 44 20 f0 9d 84 9e
+ord-self: Equal
+ord-str: Equal
+== marker
+port-form: 61 ef b7 90 ef b7 90 62
+units: U+0061 U+FDD0 U+0062
+marker: true
+go_len: 5
+bytes-back: 61 ef b7 90 62
+round-trip: true
+valid-utf8: 61 ef b7 90 ef b7 90 62
+go_value: 61 ef b7 90 ef b7 90 62
+runes: U+0061 U+FDD0 U+0062
+offset port=0 go=0 back=0 before=-1
+offset port=1 go=1 back=1 before=0
+offset port=7 go=4 back=7 before=3
+offset port=8 go=5 back=8 before=7
+slice[1..n-1]: ef b7 90 ef b7 90
+cut[0..2]: 61 ef b7 90 f4 8f 9f af
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 41 ef b7 90 ef b7 90 42
+ord-self: Equal
+ord-str: Equal
+== invalid
+port-form: 61 ef b7 90 f4 8f 9f bf ef b7 90 f4 8f 9f be 62 ef b7 90 f4 8f 9e 80 63
+units: U+0061 BYTE(FF) BYTE(FE) U+0062 BYTE(80) U+0063
+marker: true
+go_len: 6
+bytes-back: 61 ff fe 62 80 63
+round-trip: true
+valid-utf8: 61 ef bf bd 62 ef bf bd 63
+go_value: 61 ef b7 90 f4 8f 9f bf ef b7 90 f4 8f 9f be 62 ef b7 90 f4 8f 9e 80 63
+runes: U+0061 U+FFFD U+FFFD U+0062 U+FFFD U+0063
+offset port=0 go=0 back=0 before=-1
+offset port=1 go=1 back=1 before=0
+offset port=8 go=2 back=8 before=1
+offset port=15 go=3 back=15 before=8
+offset port=16 go=4 back=16 before=15
+offset port=23 go=5 back=23 before=16
+offset port=24 go=6 back=24 before=23
+slice[1..n-1]: ef b7 90 f4 8f 9f bf ef b7 90 f4 8f 9f be 62 ef b7 90 f4 8f 9e 80
+cut[0..2]: 61 ef b7 90 f4 8f 9f bf
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 41 ef bf bd ef bf bd 42 ef bf bd 43
+ord-self: Equal
+ord-str: Equal
+== surrogate-pair
+port-form: ef b7 90 f4 8f 9f ad ef b7 90 f4 8f 9e a0 ef b7 90 f4 8f 9e b4 ef b7 90 f4 8f 9f ad ef b7 90 f4 8f 9e b4 ef b7 90 f4 8f 9e 9e
+units: BYTE(ED) BYTE(A0) BYTE(B4) BYTE(ED) BYTE(B4) BYTE(9E)
+marker: true
+go_len: 6
+bytes-back: ed a0 b4 ed b4 9e
+round-trip: true
+valid-utf8: ef bf bd
+go_value: ef b7 90 f4 8f a0 b4 ef b7 90 f4 8f b4 9e
+runes: U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD
+offset port=0 go=0 back=0 before=-1
+offset port=7 go=1 back=7 before=0
+offset port=14 go=2 back=14 before=7
+offset port=21 go=3 back=21 before=14
+offset port=28 go=4 back=28 before=21
+offset port=35 go=5 back=35 before=28
+offset port=42 go=6 back=42 before=35
+slice[1..n-1]: ef b7 90 f4 8f 9e a0 ef b7 90 f4 8f 9e b4 ef b7 90 f4 8f 9f ad ef b7 90 f4 8f 9e b4
+cut[0..2]: ef b7 90 f4 8f 9f ad
+prefix-self: true
+suffix-empty: true
+map-runes-upper: ef bf bd ef bf bd ef bf bd ef bf bd ef bf bd ef bf bd
+ord-self: Equal
+ord-str: Equal
+== lone-surrogate
+port-form: 78 ef b7 90 f4 8f 9f ad ef b7 90 f4 8f 9e a0 ef b7 90 f4 8f 9e 80 79
+units: U+0078 BYTE(ED) BYTE(A0) BYTE(80) U+0079
+marker: true
+go_len: 5
+bytes-back: 78 ed a0 80 79
+round-trip: true
+valid-utf8: 78 ef bf bd 79
+go_value: 78 ef b7 90 f4 8f a0 80 79
+runes: U+0078 U+FFFD U+FFFD U+FFFD U+0079
+offset port=0 go=0 back=0 before=-1
+offset port=1 go=1 back=1 before=0
+offset port=8 go=2 back=8 before=1
+offset port=15 go=3 back=15 before=8
+offset port=22 go=4 back=22 before=15
+offset port=23 go=5 back=23 before=22
+slice[1..n-1]: ef b7 90 f4 8f a0 80
+cut[0..2]: 78 ef b7 90 f4 8f 9f ad
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 58 ef bf bd ef bf bd ef bf bd 59
+ord-self: Equal
+ord-str: Equal
+== empty
+port-form: 
+units: 
+marker: false
+go_len: 0
+bytes-back: 
+round-trip: true
+valid-utf8: 
+go_value: 
+runes: 
+offset port=0 go=0 back=0 before=-1
+prefix-self: true
+suffix-empty: true
+map-runes-upper: 
+ord-self: Equal
+ord-str: Equal
+surr 0D7FF: high=false low=false any=false
+surr 0D800: high=true low=false any=true
+surr 0DBFF: high=true low=false any=true
+surr 0DC00: high=false low=true any=true
+surr 0DFFF: high=false low=true any=true
+surr 0E000: high=false low=false any=false
+surr 1D11E: high=false low=false any=false
+pair: 1D11E
+jsrune 00041: enc-len=1 dec=00041 size=1
+jsrune-push-same: true
+jsrune 000E9: enc-len=2 dec=000E9 size=2
+jsrune-push-same: true
+jsrune 020AC: enc-len=3 dec=020AC size=3
+jsrune-push-same: true
+jsrune 1D11E: enc-len=4 dec=1D11E size=4
+jsrune-push-same: true
+jsrune 0D800: enc-len=7 dec=0D800 size=7
+jsrune-push-same: true
+jsrune 0FFFD: enc-len=3 dec=0FFFD size=3
+jsrune-push-same: true
+jsrune 10FFFF: enc-len=4 dec=10FFFF size=4
+jsrune-push-same: true
+from-utf8: 70 6c 61 69 6e 20 ef b7 90 ef b7 90 20 74 65 78 74
+from-utf8-units: U+0070 U+006C U+0061 U+0069 U+006E U+0020 U+FDD0 U+0020 U+0074 U+0065 U+0078 U+0074
+fused: ef b7 90 f4 8f a0 b4 ef b7 90 f4 8f b4 9e
+goffsets port=0 go=0
+goffsets port=1 go=1
+goffsets port=2 go=2
+goffsets port=3 go=2
+goffsets port=4 go=2
+goffsets port=5 go=2
+goffsets port=6 go=2
+goffsets port=7 go=2
+goffsets port=8 go=2
+goffsets port=9 go=3
+goffsets port=10 go=4
+goffsets port=11 go=5
+goffsets port=12 go=5
+goffsets port=13 go=5
+goffsets port=14 go=5
+goffsets port=15 go=5
+goffsets port=16 go=5
+goffsets port=17 go=5
+goffsets port=18 go=6
+goffsets port=19 go=6
+goffsets port=20 go=6
+goffsets port=21 go=6
+goffsets port=22 go=6
+goffsets port=23 go=6
+goffsets port=24 go=6
+goffsets port=25 go=7
+goffsets port=26 go=7
+goffsets port=27 go=7
+goffsets port=28 go=7
+goffsets port=29 go=7
+goffsets port=30 go=7
+goffsets port=31 go=7
+goffsets port=32 go=8
+cmp-slices: Less
