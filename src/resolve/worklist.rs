@@ -396,7 +396,13 @@ impl ResolveCache {
     }
 
     fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
-        let e = self.files.entry(key.to_string()).or_insert_with(|| CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None });
+        let e = self.files.entry(key.to_string()).or_insert_with(|| CachedFile {
+            text_hash,
+            file_id,
+            raw: None,
+            outline: None,
+            expanded: None,
+        });
         if e.text_hash != text_hash || e.file_id != file_id {
             *e = CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None };
         }
@@ -1790,10 +1796,15 @@ fn resolve_one(
     for round in 0..8 {
         expanded.resize_with(discs.len(), || None);
         menv = MacroEnv::build(job, &discs, &expanded, dep_exports, tables, interner);
-        for di in 0..discs.len() {
+        // Expansion is per file once the macro environment is built,
+        // so it runs in parallel across files (as in the perf
+        // landing); the first error in disc order is the answer.
+        let module_paths: Vec<Vec<Sym>> = discs.iter().map(|d| tables.modules[d.module.0 as usize].path.clone()).collect();
+        let indices: Vec<usize> = (0..discs.len()).collect();
+        let results = par_map(&indices, |&di| -> Result<Option<lexer::Lexed>, Diag> {
             let (orig, text, path) = match &discs[di].lexed {
                 Some(l) => (l.clone(), discs[di].text.clone(), discs[di].path.clone()),
-                None => continue,
+                None => return Ok(None),
             };
             let ects = crate::expand::ExpandCtx {
                 interner,
@@ -1801,15 +1812,18 @@ fn resolve_one(
                 file_path: path.to_string_lossy().to_string(),
                 src: &text,
                 cfg: expand_cfg(&input.env),
-                module_path: tables.modules[discs[di].module.0 as usize].path.clone(),
+                module_path: module_paths[di].clone(),
             };
             let spliced = menv.splice(di, orig, job);
             let seeds: Vec<crate::expand::MacroSeed> = match menv.glob_seeds.get(di) {
                 Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
                 _ => menv.seeds.clone(),
             };
-            match crate::expand::expand_lexed_seeded(spliced, &ects, &seeds) {
-                Ok(l) => expanded[di] = Some(l),
+            crate::expand::expand_lexed_seeded(spliced, &ects, &seeds).map(Some)
+        });
+        for (di, r) in results.into_iter().enumerate() {
+            match r {
+                Ok(l) => expanded[di] = l,
                 Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
             }
         }
@@ -1857,20 +1871,23 @@ fn resolve_one(
     }
     let seen = seen_of(&discs);
     let (map, _all) = make_map(&seen);
-    // Parse the expanded files, in FileId order as before.
+    // Parse the expanded files in parallel, in FileId order.
     let mut order: Vec<usize> = (0..discs.len()).collect();
     order.sort_by_key(|&di| discs[di].file_id.0);
-    let mut works: Vec<FileWork> = Vec::new();
-    for &di in &order {
+    let parsed = par_map(&order, |&di| -> Result<FileWork, Diag> {
         let disc = &discs[di];
         let lexed = expanded[di]
             .clone()
             .unwrap_or_else(|| disc.lexed.clone().unwrap_or_else(|| lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }));
-        let ast = match parser::parse(&lexed, interner, known) {
-            Ok(a) => a,
+        let ast = parser::parse(&lexed, interner, known)?;
+        Ok(FileWork { path: disc.path.clone(), text: disc.text.clone(), file_id: disc.file_id, ast, module: disc.module })
+    });
+    let mut works: Vec<FileWork> = Vec::with_capacity(parsed.len());
+    for r in parsed {
+        match r {
+            Ok(w) => works.push(w),
             Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
-        };
-        works.push(FileWork { path: disc.path.clone(), text: disc.text.clone(), file_id: disc.file_id, ast, module: disc.module });
+        }
     }
     // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
@@ -1897,14 +1914,43 @@ fn resolve_one(
     for w in works.iter() {
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
     }
-    // Rewrite paths to flat names, checking visibility.
-    let mut rw = Rewrite { tables: &*tables, interner, list_module: &list_module, diags: Vec::new() };
-    for (fi, w) in works.iter_mut().enumerate() {
-        let module = w.module;
-        rw.file_items(&mut w.ast, fi, module, &[]);
-    }
-    if !rw.diags.is_empty() {
-        return Err(OneError { diags: rw.diags, seen, needs_std });
+    // Rewrite paths to flat names, checking visibility. The tables
+    // are frozen at this point and each file's Ast is its own, so
+    // the pass runs in parallel across files; diagnostics merge
+    // back in file order.
+    let rw_diags = {
+        fn rewrite_chunk(
+            works: &mut [FileWork],
+            base: usize,
+            depth: u32,
+            tables: &ResolvedTables,
+            interner: &Interner,
+            list_module: &FxMap<ItemListKey, ModuleId>,
+        ) -> Vec<Diag> {
+            if works.len() <= 1 || depth == 0 {
+                let mut rw = Rewrite { tables, interner, list_module, diags: Vec::new() };
+                for (i, w) in works.iter_mut().enumerate() {
+                    let module = w.module;
+                    rw.file_items(&mut w.ast, base + i, module, &[]);
+                }
+                return rw.diags;
+            }
+            let mid = works.len() / 2;
+            let (left, right) = works.split_at_mut(mid);
+            std::thread::scope(|s| {
+                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module));
+                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module);
+                let mut diags = handle.join().unwrap();
+                diags.append(&mut right_diags);
+                diags
+            })
+        }
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let depth = (usize::BITS - cores.leading_zeros()).min(5);
+        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module)
+    };
+    if !rw_diags.is_empty() {
+        return Err(OneError { diags: rw_diags, seen, needs_std });
     }
     // ---- Flatten: inline module bodies splice into top-level items;
     // mod, use, and extern crate items drop. Each fn's module is
@@ -1972,7 +2018,19 @@ fn resolve_one(
         use std::hash::Hasher;
         structure.finish()
     };
-    Ok(CrateOut { ast, fn_lines, body_hashes, fn_module, nested_lines, nested_hashes, nested_modules, structure_hash, seen, needs_std, exported_macros: menv.exported_sources() })
+    Ok(CrateOut {
+        ast,
+        fn_lines,
+        body_hashes,
+        fn_module,
+        nested_lines,
+        nested_hashes,
+        nested_modules,
+        structure_hash,
+        seen,
+        needs_std,
+        exported_macros: menv.exported_sources(),
+    })
 }
 
 /// Hashes one item list's module and import structure for
