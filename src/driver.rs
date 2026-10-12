@@ -313,7 +313,11 @@ fn slot_update(
         caches.glue = GlueSet::default();
         caches.objects = None;
         caches.overlays.clear();
-        caches.per_unit = (fn_count / (cores * 4)).clamp(16, 256);
+        // Cold builds gain nothing from many small units: each extra unit pays a tcc process
+        // start and a header parse. Use about one unit per core. The daemon keeps small
+        // units, so an edit recompiles little code.
+        caches.per_unit =
+            if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
     }
     // Assign slots by name. New functions get new slots; a removed function's slot is emptied.
     let keys = fn_keys(&front.ast, &front.fn_loc);
