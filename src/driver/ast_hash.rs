@@ -49,6 +49,20 @@ pub(crate) fn scan_ast(ast: &Ast) -> AstScans {
     AstScans { items, bodies }
 }
 
+/// The hash of one fn's head: name, qualifiers, generics, self and
+/// parameter bindings (names, patterns, types), return type, and
+/// where clause. The driver stores it per slot: a body is checked
+/// against its own head, so a head change always rechecks the fn
+/// itself, even when its body hash and caller-visible `Sig`
+/// fingerprint (which excludes parameter names) both stand.
+pub(crate) fn fn_head_hash(ast: &Ast, f: &FnDef) -> u64 {
+    let mut w = Walker { ast, idents: None };
+    let mut h = FxHasher::default();
+    "ast-fn-head-v1".hash(&mut h);
+    w.fn_head(&mut h, f, false);
+    h.finish()
+}
+
 /// The body hash and sorted identifier set of one fn.
 fn body_scan(ast: &Ast, f: &FnDef) -> (u64, Vec<Sym>) {
     let mut idents = Vec::new();

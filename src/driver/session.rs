@@ -52,6 +52,12 @@ pub(crate) struct Front {
     pub(crate) slot_manifest_stored: usize,
     /// Body hash per slot, at the last parse.
     pub(crate) slot_hash: Vec<u64>,
+    /// Fn head hash per slot (`ast_hash::fn_head_hash`), at the last
+    /// parse. A slot whose head changed always rechecks: its body is
+    /// checked against that head (parameter names and patterns bind
+    /// the locals), which neither the body hash nor the caller-visible
+    /// `Sig` fingerprint covers.
+    pub(crate) slot_head: Vec<u64>,
     /// Lexed and scanned chunks from the last request, reused when their text is unchanged.
     pub(crate) chunks: Vec<Chunk>,
     /// The source text of the last request, to find what an edit changed.
@@ -171,6 +177,7 @@ impl Session {
                 slot_paths: FxMap::default(),
                 slot_manifest_stored: 0,
                 slot_hash: Vec::new(),
+                slot_head: Vec::new(),
                 chunks: Vec::new(),
                 src: String::new(),
                 map: SourceMap::default(),

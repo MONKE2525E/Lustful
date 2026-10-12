@@ -20,6 +20,9 @@
 #      while the program output stays correct.
 #   6. std in sessions: a source std fn (std::process::exit, S5) runs
 #      through the daemon twice with the same result.
+#   7. resolver-path incremental: body, type, import, and new-file
+#      edits in a multi-file crate recheck only the bodies whose
+#      recorded reads changed, with matching program output.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -211,12 +214,91 @@ def case_graph_refresh_and_std():
     d.kill()
 
 
+def parse_stats(stderr):
+    st = {}
+    for line in stderr.splitlines():
+        if line.startswith("lust-stats:"):
+            for kv in line.split(":", 1)[1].split():
+                k, _, v = kv.partition("=")
+                st[k] = int(v) if v.isdigit() else v
+    return st
+
+
+def case_multi_incremental():
+    # 7. Resolver-path incremental (W-DRIVER phase 2): a multi-file
+    # crate in one daemon session. A body edit in one file rechecks
+    # one body; a type edit rechecks only the bodies that read the
+    # type (dirty walk in full mode); an import edit that changes a
+    # binding rechecks its readers; a new file adds one body.
+    work = tempfile.mkdtemp(prefix="lust-driver-multi-")
+    d = Daemon(work)
+    main_rs = os.path.join(work, "main.rs")
+    a_rs = os.path.join(work, "a.rs")
+    b_rs = os.path.join(work, "b.rs")
+    out = os.path.join(work, "x")
+    open(main_rs, "w").write(
+        "mod a;\nmod b;\n\nuse crate::a::value as av;\n\n"
+        "fn main() {\n    let p = a::Point { x: av(), y: b::value() };\n"
+        "    println!(\"{}\", p.sum() + b::other());\n}\n")
+    open(a_rs, "w").write(
+        "pub struct Point {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "impl Point {\n    pub fn sum(&self) -> i64 {\n        self.x + self.y\n    }\n}\n\n"
+        "pub fn value() -> i64 {\n    3\n}\n")
+    open(b_rs, "w").write(
+        "pub fn value() -> i64 {\n    4\n}\n\npub fn other() -> i64 {\n    10\n}\n")
+    d.start()
+    _, prog = d.build(main_rs, out)
+    check("multi cold output", prog.stdout.strip() == "17", prog.stdout)
+
+    def edit(path, old, new):
+        text = open(path).read()
+        assert old in text, f"edit not found in {path}: {old!r}"
+        open(path, "w").write(text.replace(old, new, 1))
+
+    # Body edit in one file: one body rechecks, output tracks it.
+    edit(b_rs, "    4\n", "    5\n")
+    st = parse_stats(d.run(["check", main_rs]).stderr)
+    check("multi body edit rechecks one body", st.get("mode") == "bodies" and st.get("rechecked") == 1, str(st))
+    _, prog = d.build(main_rs, out)
+    check("multi body edit output", prog.stdout.strip() == "18", prog.stdout)
+
+    # Type edit (field order swap in a.rs): full mode, but the dirty
+    # walk reuses the bodies that never read Point's layout (both
+    # b.rs bodies); a.rs's method and main (the literal) recheck.
+    edit(a_rs, "    pub x: i64,\n    pub y: i64,", "    pub y: i64,\n    pub x: i64,")
+    st = parse_stats(d.run(["check", main_rs]).stderr)
+    check("multi type edit is full mode with reuse",
+          st.get("mode") == "full" and (st.get("reused") or 0) >= 2 and (st.get("rechecked") or 99) <= 3, str(st))
+    _, prog = d.build(main_rs, out)
+    check("multi type edit output", prog.stdout.strip() == "18", prog.stdout)
+
+    # Import edit: point the alias at the other module's fn. The
+    # binding main read changes, so main rechecks and output moves.
+    edit(main_rs, "use crate::a::value as av;", "use crate::b::value as av;")
+    st = parse_stats(d.run(["check", main_rs]).stderr)
+    check("multi import edit rechecks its reader", (st.get("rechecked") or 0) >= 1, str(st))
+    _, prog = d.build(main_rs, out)
+    check("multi import edit output", prog.stdout.strip() == "20", prog.stdout)
+
+    # New file: one new body checks, the rest of the crate stands.
+    open(os.path.join(work, "c.rs"), "w").write("pub fn extra() -> i64 {\n    1\n}\n")
+    edit(main_rs, "p.sum() + b::other()", "p.sum() + b::other() + c::extra()")
+    edit(main_rs, "mod a;", "mod c;\nmod a;")
+    st = parse_stats(d.run(["check", main_rs]).stderr)
+    check("multi new file rechecks only new and edited bodies",
+          (st.get("rechecked") or 99) <= 2, str(st))
+    _, prog = d.build(main_rs, out)
+    check("multi new file output", prog.stdout.strip() == "21", prog.stdout)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
     case_slots_and_reuse()
     case_reads_reuse()
     case_graph_refresh_and_std()
+    case_multi_incremental()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

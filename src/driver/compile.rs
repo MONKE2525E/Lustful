@@ -629,6 +629,7 @@ fn slot_update(
         caches.slot_used.clear();
         caches.slot_fp.clear();
         front.slot_hash.clear();
+        front.slot_head.clear();
         caches.glue = GlueSet::default();
         caches.objects = None;
         caches.overlays.clear();
@@ -682,6 +683,20 @@ fn slot_update(
     caches.slot_used.resize_with(n_slots, Vec::new);
     caches.slot_fp.resize(n_slots, 0);
     front.slot_hash.resize(n_slots, 0);
+    front.slot_head.resize(n_slots, 0);
+    // Every fn's head hash at this parse (see `Front::slot_head`).
+    let heads: Vec<u64> = front
+        .fn_loc
+        .iter()
+        .map(|&(item, sub)| {
+            let f = match (&front.ast.items[item].kind, sub) {
+                (ItemKind::Fn(d), None) => d,
+                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+                _ => unreachable!("fn_loc out of date"),
+            };
+            super::ast_hash::fn_head_hash(&front.ast, f)
+        })
+        .collect();
     for slot in (0..n_slots).filter(|&s| !live[s]) {
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
@@ -710,21 +725,23 @@ fn slot_update(
         let own_sig_changed = keys[i].free && names.contains(&keys[i].name);
         let mentions = own_sig_changed || idents.iter().any(|s| names.contains(s));
         let body_same = front.slot_hash[slot] == hash;
-        if full_walk && body_same && caches.ok[slot] {
+        // A changed head (parameter names, patterns, types) always
+        // rechecks the fn itself: no read set covers the bindings its
+        // own head creates. The stored hash advances with the body
+        // hash below, before the check runs, under the same rule.
+        let head_same = front.slot_head[slot] == heads[i];
+        if full_walk && body_same && head_same && caches.ok[slot] {
             // Full-mode candidate: the body is unchanged and passed
             // before, so only its recorded reads can dirty it. It
             // stays in `changed` (the walk in `compile` removes the
             // clean ones) and keeps its passing mark and C until the
             // walk decides, exactly like a mention-only candidate.
-            // Its own signature is one of its stored reads (`Sig`
-            // self-read, param names and patterns included), so an
-            // own-signature edit dirties through the walk.
             mention_only.push(i);
             changed.push(i);
             continue;
         }
-        if !body_same || !caches.ok[slot] || mentions {
-            if body_same && caches.ok[slot] && mentions && !own_sig_changed {
+        if !body_same || !head_same || !caches.ok[slot] || mentions {
+            if body_same && head_same && caches.ok[slot] && mentions && !own_sig_changed {
                 mention_only.push(i);
             } else {
                 // Same rule as the bodies-only path: `slot_hash` advances
@@ -737,6 +754,7 @@ fn slot_update(
                 caches.slot_reads[slot] = None;
             }
             front.slot_hash[slot] = hash;
+            front.slot_head[slot] = heads[i];
             changed.push(i);
         }
     }

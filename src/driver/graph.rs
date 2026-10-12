@@ -683,91 +683,6 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
     Fingerprint(h.finish())
 }
 
-/// Folds a pattern's structure and bound names into `h`, for the
-/// parameter-pattern part of a fn `Sig` fingerprint. Path segments hash
-/// by name string; literal sub-expressions hash by their discriminant
-/// only (their values cannot bind locals, and a changed literal in a
-/// parameter pattern also changes the item text the driver scans).
-fn hash_pat_bindings(h: &mut FxHasher, p: &Program, pat: crate::ast::PatId) {
-    use crate::ast::Pat;
-    match p.ast.pat(pat) {
-        Pat::Wild => 0u8.hash(h),
-        Pat::Binding { name, mutable, by_ref } => {
-            1u8.hash(h);
-            p.name(*name).hash(h);
-            (mutable, by_ref).hash(h);
-        }
-        Pat::Lit(_) => 2u8.hash(h),
-        Pat::Path(segs) => {
-            3u8.hash(h);
-            for s in segs {
-                p.name(s.name).hash(h);
-            }
-        }
-        Pat::TupleStruct { path, elems } => {
-            4u8.hash(h);
-            for s in path {
-                p.name(s.name).hash(h);
-            }
-            for e in elems {
-                hash_pat_bindings(h, p, *e);
-            }
-        }
-        Pat::Struct { path, fields, rest } => {
-            5u8.hash(h);
-            for s in path {
-                p.name(s.name).hash(h);
-            }
-            for (name, sub) in fields {
-                p.name(*name).hash(h);
-                hash_pat_bindings(h, p, *sub);
-            }
-            rest.hash(h);
-        }
-        Pat::Or(elems) => {
-            6u8.hash(h);
-            for e in elems {
-                hash_pat_bindings(h, p, *e);
-            }
-        }
-        Pat::Range { inclusive, .. } => (7u8, inclusive).hash(h),
-        Pat::Tuple(elems) => {
-            8u8.hash(h);
-            for e in elems {
-                hash_pat_bindings(h, p, *e);
-            }
-        }
-        Pat::Slice { prefix, middle, suffix } => {
-            9u8.hash(h);
-            for e in prefix.iter().chain(middle.iter()).chain(suffix.iter()) {
-                hash_pat_bindings(h, p, *e);
-            }
-        }
-        Pat::Ref { mutable, inner } => {
-            (10u8, mutable).hash(h);
-            hash_pat_bindings(h, p, *inner);
-        }
-        Pat::At { name, mutable, by_ref, inner } => {
-            11u8.hash(h);
-            p.name(*name).hash(h);
-            (mutable, by_ref).hash(h);
-            hash_pat_bindings(h, p, *inner);
-        }
-        Pat::Rest => 12u8.hash(h),
-        Pat::Paren(inner) => {
-            13u8.hash(h);
-            hash_pat_bindings(h, p, *inner);
-        }
-        Pat::QPath { segs, .. } => {
-            14u8.hash(h);
-            for s in segs {
-                p.name(s.name).hash(h);
-            }
-        }
-        Pat::MacroCall(_) => 15u8.hash(h),
-    }
-}
-
 /// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
 /// signature types with defs in stable form. Types hash *deeply* (see
 /// `hash_ty_deep`): a field, layout, derive, or discriminant edit to a
@@ -804,20 +719,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         for t in &f.params {
             hash_ty_deep(&mut h, p, &p.tys, *t, &mut seen);
         }
-        // Parameter names and binding patterns bind the body's locals,
-        // so they are part of what the body was checked against: a
-        // rename or a destructuring change must dirty the fn's own
-        // `Sig` read (the driver stores one with every checked body),
-        // or the dirty walk could reuse a body under changed bindings.
-        for param in &f.def.params {
-            p.name(param.name).hash(&mut h);
-            param.mutable.hash(&mut h);
-            match param.pat {
-                Some(pat) => hash_pat_bindings(&mut h, p, pat),
-                None => 0u8.hash(&mut h),
-            }
-        }
-        (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic, f.def.is_test).hash(&mut h);
+        // Qualifiers are part of the caller-visible signature (an
+        // `unsafe fn` flip changes what callers may do). Parameter
+        // names and patterns are not: they bind only the body's own
+        // locals, and the driver guards those with its per-slot head
+        // hash, so a param rename reuses callers.
+        (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
     } else if p.adt_by_def(def).is_some() {
@@ -1703,6 +1610,108 @@ fn main() {}
         assert_eq!(dirty_in(&interner, &known, "fn main() { println!(\"{}\", nosuch()); }\n", &failing), 0, "still missing");
         let fixed = "fn nosuch() -> i64 { 1 }\nfn main() { println!(\"{}\", nosuch()); }\n";
         assert!(dirty_in(&interner, &known, fixed, &failing) >= 1, "added def dirties the failed lookup");
+    }
+
+    /// Type edits dirty through deep signature fingerprints: a body
+    /// that only receives a struct from a callee and reads a nested
+    /// field rechecks when the nested type changes, and stays clean
+    /// when an unrelated type changes. This is what lets the dirty
+    /// walk run in full mode (type edits), not only on signature text.
+    #[test]
+    fn dirty_walk_covers_type_edits_through_deep_sigs() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let src = "\
+struct Inner { x: i64 }
+struct Outer { f: Inner }
+struct Unused { n: i64 }
+fn make() -> Outer { Outer { f: Inner { x: 1 } } }
+fn main() { let v = make(); println!(\"{}\", v.f.x); }
+";
+        let reads = main_reads(&interner, &known, src);
+        assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
+        let nested = src.replace("struct Inner { x: i64 }", "struct Inner { x: bool }");
+        assert!(dirty_in(&interner, &known, &nested, &reads) >= 1, "nested field type edit dirties through make's Sig");
+        let derive = src.replace("struct Inner { x: i64 }", "#[derive(Clone)]\nstruct Inner { x: i64 }");
+        assert!(dirty_in(&interner, &known, &derive, &reads) >= 1, "derive edit dirties (clone-ness is layout content)");
+        let unrelated = src.replace("struct Unused { n: i64 }", "struct Unused { n: bool }");
+        assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "unrelated type edit stays clean");
+    }
+
+    /// The layout fingerprint is its own node: it moves on field and
+    /// derive edits, not on a method edit of the same type, and
+    /// `layout_of` records it so the walk replays it.
+    #[test]
+    fn layout_fingerprint_tracks_layout_not_methods() {
+        fn layout_of_src(src: &str) -> Fingerprint {
+            let interner = Interner::default();
+            let known = Known::new(&interner);
+            let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let a = program.type_names[&interner.intern("Foo")];
+            layout_fingerprint(&program, program.def_of_adt(a))
+        }
+        let base = "struct Foo { x: i64 }\nimpl Foo { fn get(&self) -> i64 { self.x } }\nfn main() {}\n";
+        let method_edit = base.replace("fn get(&self) -> i64 { self.x }", "fn get(&self) -> i64 { self.x + 1 }");
+        assert_eq!(layout_of_src(base), layout_of_src(&method_edit), "method body edit keeps the layout");
+        let field_edit = base.replace("struct Foo { x: i64 }", "struct Foo { x: i64, y: i64 }");
+        assert_ne!(layout_of_src(base), layout_of_src(&field_edit), "field edit moves the layout");
+        let derive_edit = base.replace("struct Foo", "#[derive(Clone)]\nstruct Foo");
+        assert_ne!(layout_of_src(base), layout_of_src(&derive_edit), "derive edit moves the layout fingerprint");
+        with_program(base, |interner, p| {
+            let a = p.type_names[&interner.intern("Foo")];
+            let def = p.def_of_adt(a);
+            let mut reads = Reads::new();
+            let fp = p.layout_of(&mut reads, def).expect("known adt");
+            assert_eq!(reads.get(&ReadKey::Layout(def)).map(|r| r.fingerprint), Some(fp));
+            assert_eq!(p.read_fingerprint(&ReadKey::Layout(def)).fingerprint, fp, "replay agrees with the recording");
+            assert_ne!(fp, sig_fingerprint(p, def), "layout is a separate fingerprint from sig");
+        });
+    }
+
+    /// A const def's `Sig` fingerprint folds its evaluated value: a
+    /// value edit moves it, a same-value rephrase does not (ARCH 8.1).
+    #[test]
+    fn const_sig_fingerprint_tracks_the_value() {
+        fn const_fp(src: &str) -> Fingerprint {
+            let interner = Interner::default();
+            let known = Known::new(&interner);
+            let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let hash = crate::def::item_hash(ids.stable, &[], crate::def::DefKind::Const, "MAX", 0);
+            sig_fingerprint(&program, DefId { krate: ids.local, hash })
+        }
+        let a = const_fp("const MAX: i64 = 3;\nfn main() { println!(\"{}\", MAX); }\n");
+        let changed = const_fp("const MAX: i64 = 4;\nfn main() { println!(\"{}\", MAX); }\n");
+        assert_ne!(a, changed, "value edit moves the const sig");
+        let same = const_fp("const MAX: i64 = 1 + 2;\nfn main() { println!(\"{}\", MAX); }\n");
+        assert_eq!(a, same, "same value, same fingerprint");
+    }
+
+    /// A builtin method probe records the probe itself: two different
+    /// builtin method names on the same head have different empty-set
+    /// fingerprints, so the recorded read names the answer the compat
+    /// dispatch gave, not a shared "empty bucket".
+    #[test]
+    fn builtin_method_probe_records_the_probe() {
+        with_program("fn main() { let mut v = Vec::new(); v.push(1); println!(\"{}\", v.len()); }\n", |interner, p| {
+            let (ck, _) = check_fn(p, p.main.unwrap());
+            let vec_def = p.tys.builtins().vec;
+            let push_key = ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("push"), form: ReceiverForm::Value });
+            let recorded = ck.reads.get(&push_key).expect("the push probe is recorded");
+            assert!(recorded.failed, "no user candidate: a failed (builtin) probe");
+            let pop_key = ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("pop"), form: ReceiverForm::Value });
+            assert_ne!(
+                recorded.fingerprint,
+                p.read_fingerprint(&pop_key).fingerprint,
+                "different builtin probes have different fingerprints"
+            );
+            assert_eq!(recorded.fingerprint, p.read_fingerprint(&push_key).fingerprint, "replay agrees");
+        });
     }
 
     /// The instance slot manifest survives a restart in any discovery
