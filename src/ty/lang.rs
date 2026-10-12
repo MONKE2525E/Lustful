@@ -384,18 +384,22 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         implemented: false,
     },
     // Float text: shortest round-trip print, correctly rounded parse.
+    // The C entry takes (out, value, spec); SigTy cannot name the spec
+    // struct yet, so these rows name the plain Display entries, whose
+    // C signatures are exactly (out, value). A formatted row joins
+    // when SigTy can name the spec (W-STD).
     IntrinsicDef {
         name: "fmt_f64",
-        c_symbol: "lust_fmt_f64",
-        params: &[S::F64, S::Ptr],
+        c_symbol: "lust_fmt_f64_display",
+        params: &[S::Ptr, S::F64],
         ret: S::Unit,
         allowed: CORE_ALLOC,
         implemented: false,
     },
     IntrinsicDef {
         name: "fmt_f32",
-        c_symbol: "lust_fmt_f32",
-        params: &[S::F32, S::Ptr],
+        c_symbol: "lust_fmt_f32_display",
+        params: &[S::Ptr, S::F32],
         ret: S::Unit,
         allowed: CORE_ALLOC,
         implemented: false,
