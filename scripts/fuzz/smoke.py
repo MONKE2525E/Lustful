@@ -276,7 +276,7 @@ fn grown() -> i64 { 1 }
         # 9. The daemon is still alive and correct after all of it.
         check("daemon alive", daemon.poll() is None)
 
-        # 9. Regression (fuzz seed 29, iter 562): a bodies-only edit whose
+        # 10. Regression (fuzz seed 29, iter 562): a bodies-only edit whose
         # later function has a body syntax error must not mark the earlier
         # changed bodies as up to date. Step 2 changes `label` to a body
         # with a check error and breaks `main`'s body syntax, so the
