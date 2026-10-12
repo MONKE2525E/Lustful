@@ -171,6 +171,9 @@ pub struct ResolvedTables {
     /// Adt def -> (field name -> vis) plus the defining module, for the
     /// field-access visibility check in check.
     pub field_vis: FxMap<DefId, (ModuleId, FxMap<Sym, VisKind>)>,
+    /// Tuple-struct def -> per-field vis in declaration order plus the
+    /// defining module, for tuple field and constructor checks in check.
+    pub tuple_field_vis: FxMap<DefId, (ModuleId, Vec<VisKind>)>,
     /// Adt def -> variant names, for variant imports and `use E::*`.
     pub variants: FxMap<DefId, Vec<Sym>>,
     pub def_info: FxMap<DefId, DefInfo>,
@@ -211,6 +214,7 @@ impl ResolvedTables {
             externs: Vec::new(),
             assoc_vis: FxMap::default(),
             field_vis: FxMap::default(),
+            tuple_field_vis: FxMap::default(),
             variants: FxMap::default(),
             def_info: FxMap::default(),
             module_defs: vec![DefId::PLACEHOLDER],
@@ -296,6 +300,78 @@ impl ResolvedTables {
                 None => false,
             },
         }
+    }
+
+    /// The set of modules a visibility reaches, as a region for the
+    /// re-export subset check: everywhere (pub), the whole crate, or one
+    /// module subtree.
+    fn vis_region(&self, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (u8, Option<ModuleId>) {
+        match vis {
+            VisKind::Pub => (2, None),
+            VisKind::Crate => (1, None),
+            VisKind::Priv => (0, Some(def_module)),
+            VisKind::Super => match self.modules[def_module.0 as usize].parent {
+                Some(p) => (0, Some(p)),
+                None => (1, None),
+            },
+            VisKind::In(path) => match self.resolve_in_path(path, def_module, interner) {
+                Some(m) => (0, Some(m)),
+                None => (0, Some(def_module)),
+            },
+        }
+    }
+
+    /// True when the region of `vis` (at `def_module`) is inside the
+    /// region of `outer` (at `outer_module`).
+    fn vis_within(&self, vis: &VisKind, def_module: ModuleId, outer: &VisKind, outer_module: ModuleId, interner: &Interner) -> bool {
+        let (ra, ma) = self.vis_region(vis, def_module, interner);
+        let (rb, mb) = self.vis_region(outer, outer_module, interner);
+        if rb == 2 {
+            return true;
+        }
+        if ra == 2 {
+            return false;
+        }
+        if rb == 1 {
+            return true;
+        }
+        if ra == 1 {
+            return false;
+        }
+        match (ma, mb) {
+            (Some(a), Some(b)) => self.is_within(a, b),
+            _ => true,
+        }
+    }
+
+    /// The re-export rule (rustc E0364): a non-private `use` of an item
+    /// whose own visibility reaches less than the `use` would is an
+    /// error. Reports and returns false when the import may not bind.
+    fn check_reexport(&self, imp: &Import, target: Target, name: &str, interner: &Interner, diags: &mut Vec<Diag>) -> bool {
+        if imp.vis == VisKind::Priv {
+            return true;
+        }
+        let (item_vis, item_module) = match target {
+            Target::Def(d) | Target::Variant(d, _) => match self.def_info.get(&d) {
+                Some(info) => (info.vis.clone(), info.module),
+                None => return true,
+            },
+            Target::Module(m) => {
+                let info = &self.modules[m.0 as usize];
+                (info.vis.clone(), info.parent.unwrap_or(crate::ty::defs::ROOT_MODULE))
+            }
+            Target::Extern(_) => return true,
+        };
+        if self.vis_within(&imp.vis, imp.module, &item_vis, item_module, interner) {
+            return true;
+        }
+        diags.push(Diag::new(
+            "L0510",
+            imp.span,
+            format!("`{name}` is private, and cannot be re-exported"),
+            "Make the item `pub`, or lower the visibility of the `use` to match.",
+        ));
+        false
     }
 
     /// Resolves a `pub(in path)` path, written relative to the defining
@@ -905,6 +981,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 && rest + 1 == path.len()
                 && tables.variants.get(&adt).is_some_and(|vs| vs.contains(&path[rest]))
             {
+                if !tables.check_reexport(imp, Target::Variant(adt, path[rest]), interner.get(path[rest]), interner, diags) {
+                    return TryOut::Done(false);
+                }
                 let out = tables.insert(
                     imp.module,
                     Namespace::Value,
@@ -922,6 +1001,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 // parser keeps an `as` name in `name`).
                 return match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
                     PathRes::Done(target) => {
+                        if !tables.check_reexport(imp, target, interner.get(*name), interner, diags) {
+                            return TryOut::Done(false);
+                        }
                         let bind_name = if *name == self_sym { mod_path.last().copied().unwrap_or(*name) } else { *name };
                         let out = tables.insert(
                             imp.module,
@@ -972,6 +1054,19 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             return TryOut::Done(false);
                         }
                         return TryOut::Wait;
+                    }
+                    // One re-export check per distinct target: a name in
+                    // two namespaces usually names two items, a struct
+                    // names the same def in type and value position.
+                    let mut seen_targets: Vec<Target> = Vec::new();
+                    for (_, bind) in &found {
+                        if seen_targets.contains(&bind.target) {
+                            continue;
+                        }
+                        seen_targets.push(bind.target);
+                        if !tables.check_reexport(imp, bind.target, interner.get(last), interner, diags) {
+                            return TryOut::Done(false);
+                        }
                     }
                     for (ns, bind) in found {
                         let out = tables.insert(imp.module, ns, *name, bind);

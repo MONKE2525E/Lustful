@@ -2808,6 +2808,9 @@ fn record_adt(
         }
         tables.field_vis.insert(def, (module, map));
     }
+    if let VariantFields::Tuple(fs) = fields {
+        tables.tuple_field_vis.insert(def, (module, fs.iter().map(|f| vis_from_ast(&f.vis, interner)).collect()));
+    }
 }
 
 /// Fills `assoc_vis` from every impl block whose self type resolves.
@@ -2815,7 +2818,11 @@ fn collect_assoc_vis(ast: &Ast, items: &[Item], module: ModuleId, interner: &Int
     for item in items {
         match &item.kind {
             ItemKind::Impl(imp) => {
-                if let TyExpr::Path(segs) = ast.ty(imp.self_ty) {
+                // Trait impl methods take the trait's visibility, not the
+                // (absent) written one; only inherent impls record here.
+                if imp.trait_ref.is_none()
+                    && let TyExpr::Path(segs) = ast.ty(imp.self_ty)
+                {
                     let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
                     if let PathRes::Done(Target::Def(def)) =
                         tables.resolve_path(module, &names, Namespace::Type, PathMode::Lexical, false, interner)
