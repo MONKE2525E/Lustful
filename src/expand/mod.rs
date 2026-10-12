@@ -994,6 +994,27 @@ impl<'a> Expander<'a> {
                     if attr.path == "cfg" {
                         cfg_off = !builtin::eval_cfg(&attr.inner, &st.ctx.cfg, st, attr.span)?;
                     }
+                    if attr.path == "cfg_attr" {
+                        // `cfg_attr(cond, macro_export)` exports under
+                        // cond; `cfg_attr(cond, cfg(..))` gates likewise.
+                        let split = attr.inner.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(attr.inner.len());
+                        if builtin::eval_cfg(&attr.inner[..split], &st.ctx.cfg, st, attr.span)? {
+                            let rest = &attr.inner[split + 1.min(attr.inner.len() - split)..];
+                            let head = rest.first().and_then(|t| match t {
+                                Tt::Tok(tok) => seg_text(tok.tok, st.ctx.interner),
+                                _ => None,
+                            });
+                            match head.as_deref() {
+                                Some("macro_export") => exported = true,
+                                Some("cfg") => {
+                                    if let Some(Tt::Delim(_, group, _)) = rest.get(1) {
+                                        cfg_off = !builtin::eval_cfg(group, &st.ctx.cfg, st, attr.span)?;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     i = attr.end;
                     continue;
                 }
@@ -1549,6 +1570,86 @@ fn mark_format_str(expanded: &mut [Tt], span: Span) {
     }
 }
 
+/// The end index of one non-item node starting at `start`: a statement
+/// (let, expression, or block-like), a match arm, or a comma-ended part
+/// (struct field, enum variant, parameter). Delimited groups are one
+/// tree, so a top-level `;`, `,`, `=>`, or a brace group bounds the
+/// node. A brace group ends the node unless an operator, `else`, or
+/// `;` follows it. With no terminator the node is the list's tail.
+/// Used to drop `#[cfg(off)]` nodes exactly as rustc does. A brace
+/// group in a head position (a struct literal scrutinee or iterator)
+/// reads as the node's end; cfg on such a head is rare enough to note
+/// rather than parse for.
+fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
+    if start >= trees.len() {
+        return None;
+    }
+    let mut j = start;
+    while j < trees.len() {
+        match &trees[j] {
+            Tt::Tok(t) if t.tok == Tok::Semi => return Some(j + 1),
+            Tt::Tok(t) if t.tok == Tok::Comma => return Some(j + 1),
+            Tt::Tok(t) if t.tok == Tok::FatArrow => {
+                // A match arm: a block body, or up to the next comma.
+                if matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Brace, _, _))) {
+                    let e = j + 2;
+                    return Some(if tok_at(trees, e).map(|t| t.tok) == Some(Tok::Comma) { e + 1 } else { e });
+                }
+                let mut k = j + 1;
+                while k < trees.len() {
+                    if matches!(&trees[k], Tt::Tok(t) if t.tok == Tok::Comma) {
+                        return Some(k + 1);
+                    }
+                    k += 1;
+                }
+                return Some(trees.len());
+            }
+            Tt::Delim(Delim::Brace, _, _) => match tok_at(trees, j + 1).map(|t| t.tok) {
+                Some(Tok::Semi) => return Some(j + 2),
+                Some(Tok::Comma) => return Some(j + 2),
+                Some(Tok::Else) => j += 2,
+                Some(
+                    Tok::Dot
+                    | Tok::Question
+                    | Tok::Plus
+                    | Tok::Minus
+                    | Tok::Star
+                    | Tok::Slash
+                    | Tok::Percent
+                    | Tok::EqEq
+                    | Tok::Ne
+                    | Tok::Lt
+                    | Tok::Gt
+                    | Tok::Le
+                    | Tok::Ge
+                    | Tok::AndAnd
+                    | Tok::OrOr
+                    | Tok::Amp
+                    | Tok::Pipe
+                    | Tok::Caret
+                    | Tok::Shl
+                    | Tok::As
+                    | Tok::PlusEq
+                    | Tok::MinusEq
+                    | Tok::StarEq
+                    | Tok::SlashEq
+                    | Tok::PercentEq
+                    | Tok::AmpEq
+                    | Tok::PipeEq
+                    | Tok::CaretEq
+                    | Tok::ShlEq
+                    | Tok::Eq
+                    | Tok::DotDot
+                    | Tok::DotDotEq,
+                ) => j += 1,
+                _ => return Some(j + 1),
+            },
+            _ => j += 1,
+        }
+    }
+    Some(trees.len())
+}
+
 /// Takes `trees[i]` out by value, leaving a placeholder behind.
 fn take(trees: &mut [Tt], i: usize) -> Tt {
     std::mem::replace(&mut trees[i], Tt::Tok(Token { tok: Tok::Eof, span: Span::default() }))
@@ -1751,17 +1852,31 @@ impl<'a> Expander<'a> {
                 if !on {
                     continue;
                 }
-                // Rebuild as the inner attribute written plainly.
+                // Rebuild as the inner attribute written plainly. An
+                // inner attribute the expander itself acts on (cfg,
+                // macro_export, macro_use) joins this run as if
+                // written, so `cfg_attr(.., macro_export)` exports.
                 let rest: Vec<Tt> = attr.inner[split + 1.min(attr.inner.len() - split)..].to_vec();
                 let fake_path = rest.iter().find_map(|t| match t {
                     Tt::Tok(tok) => seg_text(tok.tok, self.ctx.interner),
                     _ => None,
                 });
                 let span = attr.span;
+                let end = attr.end;
                 drop(attr);
+                if matches!(fake_path.as_deref(), Some("cfg" | "macro_export" | "macro_use")) {
+                    let inner = match rest.get(1) {
+                        Some(Tt::Delim(_, group, _)) => group.clone(),
+                        _ => Vec::new(),
+                    };
+                    kept.push((
+                        AttrInfo { path: fake_path.unwrap(), inner, end, span, inner_attr: false },
+                        usize::MAX,
+                    ));
+                    continue;
+                }
                 out.push(Tt::Tok(Token { tok: Tok::Pound, span }));
                 out.push(Tt::Delim(Delim::Bracket, rest, span));
-                let _ = fake_path;
                 continue;
             }
             kept.push((attr, attr_start));
@@ -1781,9 +1896,12 @@ impl<'a> Expander<'a> {
                         if let Some(end) = item_end(trees, after, self.ctx.interner) {
                             return Ok(end);
                         }
-                        // Cannot bound the annotated node: leave the
-                        // attribute for the parser to reject, and do not
-                        // expand inside what could be called a statement.
+                        // A statement, match arm, or comma-ended part:
+                        // bounded at token level, dropped whole so
+                        // nothing inside it expands.
+                        if let Some(end) = node_end(trees, after) {
+                            return Ok(end);
+                        }
                         let _ = attr_start;
                     }
                 }
