@@ -693,8 +693,58 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
 /// value invalidates nothing); type aliases fold their resolved target.
 /// Generics and predicates join when generic collect fills them
 /// (W-TRAITS-CORE); today they are empty for every user def.
+/// Folds one evaluated const value into `h`. `StaticRef` indices are
+/// collect-order positions, not stable content, so they fold the
+/// referenced static's name and (depth-capped) value instead.
+fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::ConstValue, depth: u32) {
+    use crate::ty::consteval::ConstValue;
+    match v {
+        ConstValue::Int(x) => (0u8, x).hash(h),
+        ConstValue::Bool(b) => (1u8, b).hash(h),
+        ConstValue::Char(c) => (2u8, c).hash(h),
+        ConstValue::Str(i) => {
+            3u8.hash(h);
+            p.ast.strings.get(*i as usize).map_or("", String::as_str).hash(h);
+        }
+        ConstValue::Unit => 4u8.hash(h),
+        ConstValue::Aggregate(vals) => {
+            5u8.hash(h);
+            (vals.len() as u64).hash(h);
+            for v in vals {
+                hash_const_value(h, p, v, depth);
+            }
+        }
+        ConstValue::Variant(variant, vals) => {
+            (6u8, variant).hash(h);
+            (vals.len() as u64).hash(h);
+            for v in vals {
+                hash_const_value(h, p, v, depth);
+            }
+        }
+        ConstValue::Repeat(inner, n) => {
+            (7u8, n).hash(h);
+            hash_const_value(h, p, inner, depth);
+        }
+        ConstValue::Ref(inner) => {
+            8u8.hash(h);
+            hash_const_value(h, p, inner, depth);
+        }
+        ConstValue::StaticRef(i) => {
+            9u8.hash(h);
+            match p.statics.get(*i as usize) {
+                Some(s) => {
+                    p.name(s.name).hash(h);
+                    if depth < 8 {
+                        hash_const_value(h, p, &s.value, depth + 1);
+                    }
+                }
+                None => 0u8.hash(h),
+            }
+        }
+    }
+}
+
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
-    use crate::check::collect::ConstValue;
     let mut h = FxHasher::default();
     "sig-v2".hash(&mut h);
     hash_def(&mut h, p, def);
@@ -732,20 +782,17 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         layout_fingerprint(p, def).0.hash(&mut h);
     } else if let Some(data) = p.defs.get(def) {
         2u8.hash(&mut h);
-        // Const, static, and alias payloads live in the compat tables,
-        // keyed by flat name; the def record carries the same name.
-        if let Some((ty, value)) = p.consts.get(&data.name) {
+        // Const and static payloads are found by def; aliases by flat
+        // name, which the def record carries.
+        if let Some(item) = p.const_by_def(def).map(|i| &p.consts[i as usize]) {
             0u8.hash(&mut h);
-            hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);
-            match value {
-                ConstValue::Int(v) => (0u8, v).hash(&mut h),
-                ConstValue::Bool(b) => (1u8, b).hash(&mut h),
-                ConstValue::Char(c) => (2u8, c).hash(&mut h),
-                ConstValue::Str(i) => {
-                    3u8.hash(&mut h);
-                    p.ast.strings.get(*i as usize).map_or("", String::as_str).hash(&mut h);
-                }
-            }
+            hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
+            hash_const_value(&mut h, p, &item.value, 0);
+        } else if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
+            1u8.hash(&mut h);
+            item.mutable.hash(&mut h);
+            hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
+            hash_const_value(&mut h, p, &item.value, 0);
         } else if let Some(ty) = p.aliases.get(&data.name) {
             1u8.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);

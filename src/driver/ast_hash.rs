@@ -745,6 +745,14 @@ impl Walker<'_> {
                 45u8.hash(h);
                 self.macro_call(h, c);
             }
+            Expr::OffsetOf { ty, fields } => {
+                46u8.hash(h);
+                self.ty(h, *ty);
+                (fields.len() as u64).hash(h);
+                for f in fields {
+                    self.sym(h, *f);
+                }
+            }
         }
     }
 
