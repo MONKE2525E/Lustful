@@ -2511,9 +2511,13 @@ enum OwnedArg {
     Const(ConstKind),
 }
 
+/// Copies one body type out of its store, or None when it still
+/// holds an inference variable or the error type (a variable the
+/// zonk could not resolve): such a type names no instance, and the
+/// body that made it has an error report of its own.
 fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
     Some(match src.kind(t) {
-        TyKind::Infer(_) => return None,
+        TyKind::Infer(_) | TyKind::Error => return None,
         TyKind::Ref(r, m, e) => OwnedTy::Ref(r, m, Box::new(snapshot_ty(src, e)?)),
         TyKind::RawPtr(m, e) => OwnedTy::RawPtr(m, Box::new(snapshot_ty(src, e)?)),
         TyKind::Slice(e) => OwnedTy::Slice(Box::new(snapshot_ty(src, e)?)),

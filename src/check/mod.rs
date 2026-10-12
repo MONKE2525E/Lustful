@@ -1455,6 +1455,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let self_ty = self.deep(self.tys.args(tr.args)[0].as_ty().unwrap_or(ERROR));
         if tr.def == lang.sized {
+            // A general variable may still become `[T]` or `str`
+            // (`f(s)` runs this queue before the argument unifies):
+            // keep the obligation until the variable is known.
+            if matches!(self.tys.kind(self_ty), TyKind::Infer(v) if !v.is_int() && !v.is_float()) {
+                return Selection::Ambiguous;
+            }
             return if self.sized_ok(self_ty) { Selection::ParamEvidence(usize::MAX) } else { Selection::NoImpl };
         }
         // Numeric `From` obligations are widening casts, with no
@@ -8100,6 +8106,89 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// A generic call whose type argument nothing fixed is an
+    /// annotation error (rustc E0282 and E0283), never a dropped
+    /// instance request. Runs after inference, before the hard
+    /// obligation run, which then skips the obligations on the
+    /// reported variables (one error per root). Closure sites
+    /// have their own check below; a body with an error already
+    /// reports nothing here, since its variables may be unbound
+    /// only because of that error.
+    fn uninferred_site_args(&mut self) {
+        self.run_obligations(false);
+        if !self.errs.is_empty() {
+            return;
+        }
+        let p = self.p;
+        let mut reported: Vec<u32> = Vec::new();
+        for i in 0..self.generic_sites.len() {
+            let (ei, template, args) = self.generic_sites[i].clone();
+            if p.gx.closure_fns.contains_key(&template) {
+                continue;
+            }
+            let Some(gi) = args.iter().position(|g| g.as_ty().is_some_and(|t| self.has_unbound_var(t) && !self.has_error_kind(t))) else {
+                continue;
+            };
+            let t = args[gi].as_ty().unwrap_or(ERROR);
+            let t = self.deep(t);
+            self.unbound_vars(t, &mut reported);
+            let param = p.gx.fn_templates.get(template.0 as usize).and_then(|t| t.as_ref()).and_then(|t| t.generics.params.get(gi));
+            let pname = param.map_or("_".to_string(), |d| self.name(d.name).to_string());
+            let fname = self.name(p.fn_info(template).name).to_string();
+            let span = self.span(ExprId(self.out.expr_base + ei as u32));
+            self.err(
+                "L0610",
+                span,
+                format!("type annotations needed: cannot infer the type of the generic parameter `{pname}` of `{fname}`"),
+                "Name the type with a turbofish such as `::<i32>`, or annotate the value the call returns.",
+            );
+        }
+        if reported.is_empty() {
+            return;
+        }
+        let pending = self.obl.take();
+        for ob in pending {
+            let mentions = match ob {
+                obligations::Obligation::Trait { trait_ref, .. } => self.args_mention(trait_ref.args, &reported),
+                obligations::Obligation::AssocEq { eq, .. } => {
+                    self.args_mention(eq.trait_args, &reported) || reported.iter().any(|&v| self.occurs(v, eq.ty))
+                }
+            };
+            if !mentions {
+                self.obl.push(ob);
+            }
+        }
+    }
+
+    /// The unbound general variables in one deep-resolved type.
+    fn unbound_vars(&self, t: Ty, out: &mut Vec<u32>) {
+        if !self.tys.flags(t).contains_infer() {
+            return;
+        }
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Infer(v) if !v.is_int() && !v.is_float() => out.push(v.index()),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.unbound_vars(e, out),
+            TyKind::Tuple(ts) => {
+                for &e in self.tys.tys_of(ts) {
+                    self.unbound_vars(e, out);
+                }
+            }
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) => {
+                for g in self.tys.args(a) {
+                    if let Some(e) = g.as_ty() {
+                        self.unbound_vars(e, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// True when a type argument list mentions one of `vars`.
+    fn args_mention(&self, a: ArgsId, vars: &[u32]) -> bool {
+        self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|t| vars.iter().any(|&v| self.occurs(v, t))))
+    }
+
     /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     fn finish(&mut self) {
         // Second closure inference pass: call sites may have
@@ -8112,6 +8201,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.infer_closure_body(&d.names, &d.sig, d.body, d.ret, &d.args);
             }
         }
+        self.uninferred_site_args();
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
