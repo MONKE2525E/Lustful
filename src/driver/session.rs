@@ -54,6 +54,14 @@ pub(crate) struct Front {
     pub(crate) map: SourceMap,
     /// The chunk-boundary mask (see `split_items`). Fixed for the session, so boundaries are too.
     pub(crate) split_mask: Option<u64>,
+    /// True once this session compiled through the resolver (W-RESOLVE):
+    /// routing is sticky, because the resolver path keeps a merged
+    /// multi-file AST the chunk path must never try to reuse.
+    pub(crate) resolved_crate: bool,
+    /// The Cargo-graph crate identity for the in-flight resolver
+    /// compile, handed from `resolved_setup` to the shared tail for one
+    /// request (taken there, so it never outlives its request).
+    pub(crate) resolved_crate_ids: Option<CrateIds>,
 }
 
 pub(crate) struct Chunk {
@@ -159,6 +167,8 @@ impl Session {
                 src: String::new(),
                 map: SourceMap::default(),
                 split_mask: None,
+                resolved_crate: false,
+                resolved_crate_ids: None,
             },
             caches: Caches {
                 ok: Vec::new(),

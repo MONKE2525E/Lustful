@@ -588,13 +588,15 @@ impl<'a> Program<'a> {
     /// get a `DefId` and turn it into a session-local index through
     /// `local_def`, `adt_by_def`, or `Defs` queries, never the other way.
     ///
-    /// Today's resolver behind this query is the single-file one: one crate,
-    /// one root module, no imports, so every non-root module answers
-    /// `Absent` and no answer is ever `Ambiguous`. Value answers are free
-    /// fns and struct constructors; type answers are user Adts and the
-    /// builtin `String`/`Vec`/`Option` defs; macro answers are `Absent`
-    /// until W-MACRO. W-RESOLVE replaces this body with the section 1.3
-    /// worklist result; the signature does not change.
+    /// When the crate went through the resolver (W-RESOLVE), this reads
+    /// the section 1.3 module tables: per-module bindings with glob
+    /// ambiguity, plus the flat-name index the merged AST's rewritten
+    /// names resolve through (the checker asks in the root module). A
+    /// table miss falls through to the single-file layer below, which
+    /// also still answers for the builtin `String`/`Vec`/`Option`
+    /// prelude defs. With no resolved tables (single-file programs),
+    /// only that layer answers: one root module, never `Ambiguous`.
+    /// The signature is the frozen S7 one; no caller changed.
     pub fn binding(&self, reads: &mut Reads, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
         let res = self.binding_res(module, ns, name);
         reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || binding_fingerprint(self, res));
@@ -603,9 +605,17 @@ impl<'a> Program<'a> {
 
     /// The binding answer without recording. The dirty walk replays old
     /// reads against the new program through this; `binding` is the only
-    /// recording door. W-RESOLVE replaces this body together with
-    /// `binding`'s resolver (see `binding`).
+    /// recording door. The resolver tables (W-RESOLVE) answer here
+    /// first, so replays see the same answers as `binding`.
     fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
+        // W-RESOLVE: the section 1.3 module tables answer first when the
+        // crate went through the resolver; a miss falls through to the
+        // single-file layer (builtins) below.
+        if let Some(tables) = &self.resolved
+            && let Some(res) = tables.binding(module, ns, name)
+        {
+            return res;
+        }
         if module != ROOT_MODULE {
             return BindingRes::Absent;
         }

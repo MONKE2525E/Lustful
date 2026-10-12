@@ -1,4 +1,3 @@
-// expect: L0505
 fn get(x: crate::S) -> i64 {
     x.v
 }

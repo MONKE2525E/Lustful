@@ -1,4 +1,3 @@
-// expect: L0602
 type Num = i64;
 
 fn main() {

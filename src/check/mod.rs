@@ -9,7 +9,7 @@ use crate::check::collect::*;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::Sym;
-use crate::ty::defs::{DefKind as DefsKind, ROOT_MODULE};
+use crate::ty::defs::DefKind as DefsKind;
 use crate::ty::lang;
 use crate::ty::*;
 
@@ -127,6 +127,8 @@ pub enum Res {
     SliceIndex {
         derefs: u8,
     },
+    /// A `const` or non-mut `static` scalar, read by value (W-RESOLVE).
+    ConstValue(ConstValue),
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -231,6 +233,9 @@ struct LoopCtx {
 struct Ctx<'p, 'a> {
     p: &'p Program<'a>,
     f: &'p FnInfo<'a>,
+    /// The module this fn is defined in (root without the resolver),
+    /// for field visibility checks (ARCH 1.5).
+    module: crate::ty::defs::ModuleId,
     tys: Tys<'p>,
     vars: Vec<Var>,
     out: Checked<'p>,
@@ -256,6 +261,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
     let mut cx = Ctx {
         p,
         f,
+        module: p.resolved.as_ref().and_then(|t| t.fn_module.get(fid.0 as usize).copied()).unwrap_or(crate::ty::defs::ROOT_MODULE),
         tys: Tys::new(&p.tys),
         vars: Vec::new(),
         out: Checked {
@@ -420,11 +426,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     // Cross-item reads go through the section 8.2 query functions on
-    // `Program`, which record into this body's read set. Bodies today live
-    // in the root module (one module per crate until W-RESOLVE).
+    // `Program`, which record into this body's read set. Bodies ask in
+    // their own module (the root in single-file programs).
     fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
         let p = self.p;
-        p.binding(&mut self.out.reads, ROOT_MODULE, ns, name)
+        let module = self.module;
+        p.binding(&mut self.out.reads, module, ns, name)
+    }
+
+    /// Field visibility (ARCH 1.5): a private field of a struct from
+    /// another module is L0510. Only resolver-built programs carry the
+    /// field table; single-file programs are all one module.
+    fn check_field_vis(&mut self, a: AdtId, field: Sym, span: Span) {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return };
+        let def = p.def_of_adt(a);
+        if let Some((def_mod, fields)) = tables.field_vis.get(&def)
+            && let Some(vis) = fields.get(&field)
+            && !tables.visible(vis, *def_mod, self.module, p.interner)
+        {
+            let name = self.name(field).to_string();
+            self.err(
+                "L0510",
+                span,
+                format!("field `{name}` is private"),
+                "Make the field `pub(crate)` (the smallest widening that works).",
+            );
+        }
     }
 
     /// The tuple struct a value binding names as a constructor, if it names one.
@@ -834,7 +862,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
         }
-        match resolve_ty(p.ast, p.interner, p.known, &p.type_names, &mut self.tys, t, self.self_ty) {
+        match resolve_ty(p.ast, p.interner, p.known, &p.type_names, &p.aliases, &mut self.tys, t, self.self_ty) {
             Ok(t) => t,
             Err(d) => {
                 self.errs.push(d);
@@ -960,6 +988,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if !adt.is_enum
                         && let Some(i) = adt.variants[0].fields.iter().position(|f| f.name == *name)
                     {
+                        self.check_field_vis(a, *name, span);
                         self.set_res(e, Res::Field { derefs, index: i as u32 });
                         return adt.variants[0].fields[i].ty;
                     }
@@ -1513,6 +1542,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.set_res(e, Res::Variant(a, 0));
                     return self.tys.adt_ty(a);
                 }
+            }
+            // A `const` or non-mut `static` scalar reads as its value.
+            // The binding read above already recorded the name.
+            if let Some(&(ty, val)) = p.consts.get(&name) {
+                self.set_res(e, Res::ConstValue(val));
+                return ty;
             }
             self.err(
                 "L0101",
@@ -2241,6 +2276,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.err("L0106", fspan, format!("field `{}` is set twice", self.name(fname)), "Remove one of them.");
                     }
                     seen[i] = true;
+                    self.check_field_vis(a, fname, fspan);
                     self.expect_expr(fe, variant.fields[i].ty);
                 }
                 None => {
@@ -2660,6 +2696,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         for &(fname, sub) in fields {
                             match variant.fields.iter().position(|f| f.name == fname) {
                                 Some(i) => {
+                                    self.check_field_vis(a, fname, p.ast.pat_span(sub));
                                     let ft = variant.fields[i].ty;
                                     self.pattern_mode(sub, ft, mode, in_match);
                                 }

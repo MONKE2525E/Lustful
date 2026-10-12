@@ -40,15 +40,17 @@ prints "reserved, not yet emitted".
 | L0502-L0503 | Modules and imports | W-RESOLVE | in use | L0502 ambiguous module file, L0503 module file not found |
 | L0504 | Modules and imports | W-RESOLVE | reserved | Generated name changes an earlier resolution |
 | L0505 | Modules and imports | W-RESOLVE | in use | Module, import, and module-path forms are not supported yet (S3b parser reject) |
-| L0506-L0509 | Modules and imports | W-RESOLVE | reserved | |
-| L0510-L0519 | Visibility | W-RESOLVE | reserved | |
+| L0506-L0507 | Modules and imports | W-RESOLVE | in use | L0506 unresolved import, L0507 ambiguous glob name used |
+| L0508-L0509 | Modules and imports | W-RESOLVE | reserved | |
+| L0510 | Visibility | W-RESOLVE | in use | Item or field is private |
+| L0511-L0519 | Visibility | W-RESOLVE | reserved | |
 | L0520 | cfg and attributes | W-RESOLVE | in use | Unknown cfg name |
 | L0521 | cfg and attributes | W-MACRO | reserved | Unknown attribute |
 | L0522 | cfg and attributes | W-MACRO | in use | Known attribute (cfg, repr, path, inline, and kin) is not supported yet (S3b parser reject) |
 | L0523-L0529 | cfg and attributes | W-MACRO | reserved | |
 | L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
 | L0532-L0539 | Crate session | W-DRIVER | reserved | |
-| L0601 | Types and aliases | W-CORELANG | reserved | L0601 alias cycle |
+| L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603-L0609 | Types and aliases | W-CORELANG | reserved | |
 | L0610-L0613 | Traits and inference | W-TRAITS-CORE | reserved | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known |

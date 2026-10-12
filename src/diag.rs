@@ -275,11 +275,14 @@ fn global_expansion(ctxt: CtxtId) -> Option<Expansion> {
 }
 
 /// One file known to a source map: its path (as diagnostics print it) and its line index.
-/// The map does not own source text; the session keeps the text (the driver's `Front::src`).
+/// Multi-file crates also keep each file's text in the map, so a diagnostic
+/// snippet reads the file its span names (docs/ARCH.md section 1.2). The
+/// one-file driver path keeps text out of the map and passes it to `render`.
 #[derive(Clone)]
 struct SourceFile {
     path: String,
     lines: LineIndex,
+    text: Option<String>,
 }
 
 /// The session's source map: every file's path and line index, plus the expansion table
@@ -296,14 +299,28 @@ impl SourceMap {
     /// same file for the rest of the session.
     pub fn add_file(&mut self, path: &str, src: &str) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src) });
+        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: None });
         id
+    }
+    /// Adds a file and keeps its text in the map (multi-file crates).
+    pub fn add_file_with_text(&mut self, path: &str, src: &str) -> FileId {
+        let id = FileId(self.files.len() as u32);
+        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: Some(src.to_string()) });
+        id
+    }
+    /// The number of files in the map.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+    /// The text of `file`, when the map keeps it (multi-file crates).
+    pub fn text(&self, file: FileId) -> Option<&str> {
+        self.files.get(file.0 as usize).and_then(|f| f.text.as_deref())
     }
     /// Replaces a file's path and line index. The driver uses this for the session's one
     /// file on each request: the path comes from the request, and the index is spliced
     /// from the last request's index, so it arrives ready-made.
     pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex) {
-        self.files[file.0 as usize] = SourceFile { path: path.to_string(), lines };
+        self.files[file.0 as usize] = SourceFile { path: path.to_string(), lines, text: None };
     }
     /// True when no file has been added yet (a fresh session).
     pub fn is_empty(&self) -> bool {
@@ -464,13 +481,13 @@ pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_er
         } else {
             let _ = writeln!(out, "error[{}]: {}", d.code, d.message);
             let _ = writeln!(out, "  --> {path}:{line}:{col}");
-            push_snippet(&mut out, src, map, span, None);
+            push_snippet(&mut out, map.text(span.file).unwrap_or(src), map, span, None);
             for l in &d.labels {
                 let ls = map.call_site(l.span);
                 let (ll, lc) = map.line_col(ls);
                 let lpath = map.path(ls.file);
                 let _ = writeln!(out, "  ::: {lpath}:{ll}:{lc}");
-                push_snippet(&mut out, src, map, ls, Some(&l.text));
+                push_snippet(&mut out, map.text(ls.file).unwrap_or(src), map, ls, Some(&l.text));
             }
             let _ = writeln!(out, "   = fix: {}\n", d.fix);
         }

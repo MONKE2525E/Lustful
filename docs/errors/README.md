@@ -53,11 +53,15 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0405](L0405.md) | `async` is not supported |
 | [L0502](L0502.md) | ambiguous module file |
 | [L0503](L0503.md) | module file not found |
-| [L0505](L0505.md) | modules and module paths are not supported yet |
+| [L0505](L0505.md) | this module path form is not supported yet |
+| [L0506](L0506.md) | unresolved import |
+| [L0507](L0507.md) | ambiguous name from glob imports |
+| [L0510](L0510.md) | item is private |
 | [L0520](L0520.md) | unknown cfg name |
 | [L0530](L0530.md) | unsupported edition |
 | [L0531](L0531.md) | unsupported deny-level lint |
 | [L0522](L0522.md) | this attribute is not supported yet |
+| [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
 | [L0614](L0614.md) | traits and generics are not supported yet |
 | [L0621](L0621.md) | associated items are not supported yet |

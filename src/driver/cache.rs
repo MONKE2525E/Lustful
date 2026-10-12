@@ -28,6 +28,18 @@ use crate::def::DiskDefId;
 use crate::driver::graph::UnitKey;
 use crate::intern::FxMap;
 use crate::protocol::{Cmd, Request, Response, SessionKey};
+
+/// True when the root source routes through the resolver (modules, cfg,
+/// imports): its answer depends on files outside `src`.
+fn src_needs_resolve(src: &[u8]) -> bool {
+    match std::str::from_utf8(src) {
+        Ok(text) => {
+            let interner = crate::intern::Interner::default();
+            crate::resolve::worklist::needs_resolve(text, &interner)
+        }
+        Err(_) => true,
+    }
+}
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -254,7 +266,11 @@ impl Cache {
     /// The caller gives the source bytes it read, so the file is read once per process.
     /// A stored `--timings` text never exists; a hit with timings gets one fresh line.
     pub fn lookup(&self, req: &Request, src: &[u8], start: Instant) -> Option<Response> {
-        if src_reads_outside(src) {
+        // A multi-file crate (or a manifest-selected one) is not keyed by
+        // the root file's bytes alone: module files and Cargo inputs are
+        // outside this key, so those requests skip the cache entirely
+        // until the per-node disk cache of section 8.4 exists.
+        if src_reads_outside(src) || req.session.krate.manifest_path.is_some() || src_needs_resolve(src) {
             return None;
         }
         let key = request_key(self.id, req, src);
@@ -277,6 +293,9 @@ impl Cache {
     /// which must not replay. After the write, oldest entries are evicted past the cap.
     pub fn store(&self, req: &Request, src: &[u8], resp: &Response) {
         if resp.code == 3 || src_reads_outside(src) {
+            return;
+        }
+        if req.session.krate.manifest_path.is_some() || src_needs_resolve(src) {
             return;
         }
         let key = request_key(self.id, req, src);

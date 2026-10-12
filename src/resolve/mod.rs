@@ -3,4 +3,6 @@
 // and 6.1). W-RESOLVE owns this directory and src/scan.rs.
 pub mod cargo;
 pub mod cfg;
+pub mod imports;
 pub mod modules;
+pub mod worklist;

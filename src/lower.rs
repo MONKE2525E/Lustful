@@ -341,6 +341,18 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
             Expr::Unit => Operand::Const(Const::Unit),
+            Expr::Path(_) if matches!(self.ck.res(e), Res::ConstValue(_)) => match self.ck.res(e) {
+                Res::ConstValue(v) => match v {
+                    ConstValue::Int(x) => match self.kind(ty) {
+                        TyKind::Int(it) => Operand::Const(Const::Int(x, it)),
+                        _ => Operand::Const(Const::Int(x, IntTy::I32)),
+                    },
+                    ConstValue::Bool(b) => Operand::Const(Const::Bool(b)),
+                    ConstValue::Char(c) => Operand::Const(Const::Char(c)),
+                    ConstValue::Str(s) => Operand::Const(Const::Str(s)),
+                },
+                _ => Operand::Const(Const::Unit),
+            },
             _ if self.is_place_expr(e) => {
                 let p = self.place(e);
                 self.operand_from(p, ty)
@@ -410,6 +422,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, Vec::new()), ty, span),
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
+                Res::ConstValue(_) => {
+                    if let Some(d) = dest {
+                        let op = self.operand_raw(e);
+                        self.assign(d.clone(), Rvalue::Use(op), span);
+                    }
+                }
                 _ => {}
             },
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
@@ -1208,6 +1226,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Bool(b) => Operand::Const(Const::Bool(*b)),
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
+            Expr::Path(_) => self.operand_raw(l),
             _ => Operand::Const(Const::Unit),
         }
     }

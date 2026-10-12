@@ -67,6 +67,19 @@ pub struct FnInfo<'a> {
 #[allow(dead_code)]
 pub type FnId = LocalDefId;
 
+/// A scalar constant value from the bounded evaluator (ARCH 2.13's
+/// non-generic form, landed with W-RESOLVE's item collection). Integers
+/// are stored as the low 64 bits of the value in the declared width,
+/// sign-extended by readers that know the type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstValue {
+    Int(u64),
+    Bool(bool),
+    Char(char),
+    /// Index into the AST string table.
+    Str(u32),
+}
+
 pub struct Program<'a> {
     pub ast: &'a Ast,
     pub interner: &'a Interner,
@@ -78,6 +91,10 @@ pub struct Program<'a> {
     pub adts: Vec<AdtDef>,
     pub fns: Vec<FnInfo<'a>>,
     pub type_names: HashMap<Sym, AdtId>,
+    /// Non-generic type aliases by (flat) name, fully resolved.
+    pub aliases: HashMap<Sym, Ty>,
+    /// `const` and non-mut `static` scalar values by (flat) name.
+    pub consts: HashMap<Sym, (Ty, ConstValue)>,
     pub fn_names: HashMap<Sym, LocalDefId>,
     pub methods: HashMap<(AdtId, Sym), LocalDefId>,
     pub main: Option<LocalDefId>,
@@ -101,6 +118,10 @@ pub struct Program<'a> {
     /// provenance intrinsic privilege keys on (section 3.1 item 1).
     /// Empty when no std source was spliced. Filled by the driver.
     pub shipped_ranges: Vec<(u32, u32, ShippedCrate)>,
+    /// The module binding tables of section 1.3, when the crate went
+    /// through the resolver. Filled by the driver after collection; the
+    /// S7 `Binding` query fns in driver/graph.rs read through it.
+    pub resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
 }
 
 impl<'a> Program<'a> {
@@ -212,6 +233,7 @@ pub fn resolve_ty(
     interner: &Interner,
     known: &Known,
     type_names: &HashMap<Sym, AdtId>,
+    aliases: &HashMap<Sym, Ty>,
     tys: &mut impl TyIntern,
     id: ast::TyId,
     self_ty: Option<Ty>,
@@ -221,7 +243,7 @@ pub fn resolve_ty(
         TyExpr::Unit => Ok(UNIT),
         TyExpr::Never => Ok(NEVER),
         TyExpr::Ref { mutable, inner, .. } => {
-            let inner = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
+            let inner = resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty)?;
             Ok(tys.mk_ref(*mutable, inner))
         }
         TyExpr::Path(segs) => {
@@ -264,7 +286,7 @@ pub fn resolve_ty(
                 if args.len() != 1 {
                     return Err(Diag::new("L0110", span, "Vec takes one type argument", "Write `Vec<T>`."));
                 }
-                let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 return Ok(tys.mk_vec(e));
             }
             if name == known.Option {
@@ -272,11 +294,14 @@ pub fn resolve_ty(
                 if args.len() != 1 {
                     return Err(Diag::new("L0110", span, "Option takes one type argument", "Write `Option<T>`."));
                 }
-                let e = resolve_ty(ast, interner, known, type_names, tys, args[0], self_ty)?;
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 return Ok(tys.mk_option(e));
             }
             if let Some(&adt) = type_names.get(&name) {
                 return no_generics(tys.adt_ty(adt));
+            }
+            if let Some(&t) = aliases.get(&name) {
+                return no_generics(t);
             }
             let n = interner.get(name);
             if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell", "f32", "f64", "i128", "u128"]
@@ -289,24 +314,24 @@ pub fn resolve_ty(
         TyExpr::Tuple(elems) => {
             let mut out = Vec::with_capacity(elems.len());
             for &e in elems {
-                out.push(resolve_ty(ast, interner, known, type_names, tys, e, self_ty)?);
+                out.push(resolve_ty(ast, interner, known, type_names, aliases, tys, e, self_ty)?);
             }
             let ts = tys.intern_tys(&out);
             Ok(tys.intern(TyKind::Tuple(ts)))
         }
         TyExpr::Slice(inner) => {
-            let e = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
+            let e = resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty)?;
             Ok(tys.intern(TyKind::Slice(e)))
         }
         TyExpr::Array { inner, len } => {
-            let e = resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty)?;
+            let e = resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty)?;
             let n = eval_array_len(ast, *len).ok_or_else(|| {
                 Diag::new("L0110", span, "array length must be a constant integer", "Write a literal length such as `[u8; 4]`.")
             })?;
             let c = tys.intern_const(ConstKind::Int(n));
             Ok(tys.intern(TyKind::Array(e, c)))
         }
-        TyExpr::Paren(inner) => resolve_ty(ast, interner, known, type_names, tys, *inner, self_ty),
+        TyExpr::Paren(inner) => resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty),
         _ => Err(not_yet("L0602", span, "this type form")),
     }
 }
@@ -505,6 +530,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         adts: Vec::new(),
         fns: Vec::new(),
         type_names: HashMap::default(),
+        aliases: HashMap::default(),
+        consts: HashMap::default(),
         fn_names: HashMap::default(),
         methods: HashMap::default(),
         main: None,
@@ -514,6 +541,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         def_by_hash: HashMap::default(),
         std_fns: Vec::new(),
         shipped_ranges: Vec::new(),
+        resolved: None,
     };
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their
@@ -571,6 +599,65 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
     }
 
+    // Pass 1.5: non-generic type aliases. Resolved by a small fixpoint:
+    // an alias whose target still names an unresolved alias defers to
+    // the next sweep; a sweep with no progress means a cycle (L0601) or
+    // a genuine unknown type (the first error is kept).
+    {
+        let mut pending: Vec<&ast::TypeAliasDef> = Vec::new();
+        for item in &ast.items {
+            if let ItemKind::Type(a) = &item.kind {
+                if p.type_names.contains_key(&a.name) || p.aliases.contains_key(&a.name) {
+                    errs.push(dup(a.name_span, interner.get(a.name)));
+                }
+                pending.push(a);
+                let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::TypeAlias, interner.get(a.name), 0);
+                let def = DefId { krate: p.krate, hash };
+                p.defs.insert(def, DefData::skeleton(DefsKind::TypeAlias, None, a.name, Vis::Priv, a.name_span));
+            }
+        }
+        let total = pending.len();
+        for _ in 0..=total {
+            if pending.is_empty() {
+                break;
+            }
+            let mut progress = false;
+            let mut first_err: Option<Diag> = None;
+            pending.retain(|a| match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, a.ty, None) {
+                Ok(t) => {
+                    p.aliases.insert(a.name, t);
+                    progress = true;
+                    false
+                }
+                Err(d) => {
+                    if first_err.is_none() {
+                        first_err = Some(d);
+                    }
+                    true
+                }
+            });
+            if !progress && !pending.is_empty() {
+                // A cycle if every leftover target names another alias.
+                let names: Vec<&str> = pending.iter().map(|a| interner.get(a.name)).collect();
+                let cyclic = pending.iter().all(|a| match ast.ty(a.ty) {
+                    TyExpr::Path(segs) => segs.len() == 1 && names.contains(&interner.get(segs[0].name)),
+                    _ => false,
+                });
+                if cyclic {
+                    errs.push(Diag::new(
+                        "L0601",
+                        pending[0].name_span,
+                        format!("cycle detected in type aliases: {}", names.join(", ")),
+                        "Break the cycle: an alias must not name itself, directly or through other aliases.",
+                    ));
+                } else if let Some(d) = first_err {
+                    errs.push(d);
+                }
+                break;
+            }
+        }
+    }
+
     // Pass 2: fields, variants, derives.
     let mut adt_index = 0;
     for item in &ast.items {
@@ -607,7 +694,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 if shape == VariantShape::Named && fields.iter().any(|f: &Field| f.name == fname) {
                     errs.push(dup(fspan, interner.get(fname)));
                 }
-                match resolve_ty(ast, interner, known, &p.type_names, &mut p.tys, fty, None) {
+                match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, fty, None) {
                     Ok(t) => {
                         if contains_ref(&p.tys, t) {
                             errs.push(Diag::new(
@@ -779,6 +866,113 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
     }
 
+    // `const` and `static` items: the bounded evaluator handles scalar
+    // literals, references to other consts, and integer arithmetic.
+    // Anything else (a call, a mutable static, an aggregate) is L0632.
+    // The evaluated value is part of the item's signature (section 8.1).
+    {
+        // (name, declared ty id, value expr, name span, is_static)
+        let mut todo: Vec<(Sym, ast::TyId, Option<ast::ExprId>, Span, bool)> = Vec::new();
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Const(c) => {
+                    if let Some(name) = c.name {
+                        todo.push((name, c.ty, c.value, c.name_span, false));
+                        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Const, interner.get(name), 0);
+                        p.defs
+                            .insert(DefId { krate: p.krate, hash }, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, c.name_span));
+                    } else if let Some(v) = c.value {
+                        // An unnamed const is only an assertion context;
+                        // evaluating anything but `()` there is beyond
+                        // the bounded evaluator.
+                        if !matches!(ast.expr(v), ast::Expr::Unit) {
+                            errs.push(not_yet("L0632", c.name_span, "unnamed consts with a computed value"));
+                        }
+                    }
+                }
+                ItemKind::Static(s) => {
+                    if s.mutable {
+                        errs.push(not_yet("L0632", s.name_span, "mutable statics"));
+                    } else {
+                        todo.push((s.name, s.ty, s.value, s.name_span, true));
+                        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, interner.get(s.name), 0);
+                        p.defs.insert(
+                            DefId { krate: p.krate, hash },
+                            DefData::skeleton(DefsKind::Static, None, s.name, Vis::Priv, s.name_span),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Evaluate in dependency order by fixpoint (consts are few).
+        let total = todo.len();
+        for _ in 0..=total {
+            if todo.is_empty() {
+                break;
+            }
+            let mut progress = false;
+            let mut first_err: Option<Diag> = None;
+            let mut deferred = false;
+            todo.retain(|(name, ty_id, value, span, _)| {
+                let span = *span;
+                let declared = match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, *ty_id, None) {
+                    Ok(t) => t,
+                    Err(d) => {
+                        if first_err.is_none() {
+                            first_err = Some(d);
+                        }
+                        return false;
+                    }
+                };
+                let Some(v) = value else {
+                    if first_err.is_none() {
+                        first_err = Some(not_yet("L0632", span, "const and static items without a value"));
+                    }
+                    return false;
+                };
+                match eval_const(ast, *v, &p.consts, declared, &p.tys) {
+                    Ok(val) => match check_const_ty(&p, declared, val, span, interner, *name) {
+                        Ok(val) => {
+                            if p.consts.insert(*name, (declared, val)).is_some() {
+                                errs.push(dup(span, interner.get(*name)));
+                            }
+                            progress = true;
+                            false
+                        }
+                        Err(d) => {
+                            if first_err.is_none() {
+                                first_err = Some(d);
+                            }
+                            false
+                        }
+                    },
+                    Err(ConstErr::Defer) => {
+                        deferred = true;
+                        true
+                    }
+                    Err(ConstErr::Fail(d)) => {
+                        if first_err.is_none() {
+                            first_err = Some(d);
+                        }
+                        false
+                    }
+                }
+            });
+            if !progress {
+                if deferred && !todo.is_empty() {
+                    errs.push(not_yet("L0632", todo[0].3, "cyclic consts"));
+                } else if let Some(d) = first_err {
+                    errs.push(d);
+                }
+                break;
+            }
+            if let Some(d) = first_err {
+                errs.push(d);
+            }
+        }
+    }
+
     // Functions and methods. Each gets the stable path hash its caller computed
     // (src/def.rs). Hash collisions are checked by the driver when it assigns
     // slots from the same hashes, before `collect` runs on any new def set;
@@ -803,7 +997,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             });
         }
         for param in &def.params {
-            match resolve_ty(ast, interner, known, &p.type_names, &mut p.tys, param.ty, self_ty) {
+            match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, param.ty, self_ty) {
                 Ok(t) => {
                     if !is_sized_ty(&p.tys, t) {
                         errs.push(Diag::new(
@@ -823,7 +1017,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
         let ret = match def.ret {
             None => UNIT,
-            Some(t) => resolve_ty(ast, interner, known, &p.type_names, &mut p.tys, t, self_ty).unwrap_or_else(|d| {
+            Some(t) => resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, t, self_ty).unwrap_or_else(|d| {
                 errs.push(d);
                 ERROR
             }),
@@ -934,6 +1128,181 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
     }
     if errs.is_empty() { Ok(p) } else { Err(errs) }
+}
+
+/// Why a const initializer did not evaluate: it names a const that is
+/// not evaluated yet (retry next sweep), or it is outside the bounded
+/// evaluator for good.
+enum ConstErr {
+    Defer,
+    Fail(Diag),
+}
+
+/// The bounded const evaluator for initializers: scalar literals,
+/// references to already-evaluated consts, unary `-`/`!`, and integer
+/// arithmetic in i128. Calls, aggregates, and anything else fail with
+/// L0632 (W-CORELANG's full evaluator widens this in its own wave).
+/// The evaluator's working value: integers stay in i128 so written
+/// magnitudes and negated values never alias through u64 bits.
+#[derive(Clone, Copy)]
+enum EvalVal {
+    Int(i128),
+    Bool(bool),
+    Char(char),
+    Str(u32),
+}
+
+impl From<ConstValue> for EvalVal {
+    fn from(v: ConstValue) -> EvalVal {
+        match v {
+            ConstValue::Int(x) => EvalVal::Int((x as i64) as i128),
+            ConstValue::Bool(b) => EvalVal::Bool(b),
+            ConstValue::Char(c) => EvalVal::Char(c),
+            ConstValue::Str(s) => EvalVal::Str(s),
+        }
+    }
+}
+
+fn eval_const(
+    ast: &Ast,
+    e: ast::ExprId,
+    consts: &HashMap<Sym, (Ty, ConstValue)>,
+    declared: Ty,
+    tys: &impl TyIntern,
+) -> Result<EvalVal, ConstErr> {
+    let fail = |what: &str| ConstErr::Fail(not_yet("L0632", ast.expr_span(e), what));
+    match ast.expr(e) {
+        ast::Expr::Int(v, _) => Ok(EvalVal::Int(*v as i128)),
+        ast::Expr::Bool(b) => Ok(EvalVal::Bool(*b)),
+        ast::Expr::Char(c) => Ok(EvalVal::Char(*c)),
+        ast::Expr::Str(s) => Ok(EvalVal::Str(*s)),
+        ast::Expr::Path(segs) if segs.len() == 1 => match consts.get(&segs[0].name) {
+            Some((ref_ty, v)) => {
+                // A const reference is type-exact, as in Rust: no
+                // implicit conversion between const item types.
+                if *ref_ty != declared {
+                    return Err(ConstErr::Fail(Diag::new(
+                        "L0110",
+                        ast.expr_span(e),
+                        "this const has a different type than the declared type",
+                        "Change the declared type to match, or write the value directly.",
+                    )));
+                }
+                match v {
+                    // The stored u64 reads back through the declared
+                    // type: unsigned keeps its magnitude, signed
+                    // sign-extends from two's complement.
+                    ConstValue::Int(x) => {
+                        let signed = matches!(tys.kind(declared), TyKind::Int(it) if it.signed());
+                        Ok(EvalVal::Int(if signed { (*x as i64) as i128 } else { *x as i128 }))
+                    }
+                    other => Ok(EvalVal::from(*other)),
+                }
+            }
+            None => Err(ConstErr::Defer),
+        },
+        ast::Expr::Unary { op, expr } => {
+            let v = eval_const(ast, *expr, consts, declared, tys)?;
+            match (op, v) {
+                (ast::UnOp::Neg, EvalVal::Int(x)) => {
+                    Ok(EvalVal::Int(x.checked_neg().ok_or_else(|| fail("this unary operation in a const"))?))
+                }
+                (ast::UnOp::Not, EvalVal::Int(x)) => Ok(EvalVal::Int(!x)),
+                (ast::UnOp::Not, EvalVal::Bool(b)) => Ok(EvalVal::Bool(!b)),
+                _ => Err(fail("this unary operation in a const")),
+            }
+        }
+        ast::Expr::Binary { op, lhs, rhs } => {
+            let (EvalVal::Int(a), EvalVal::Int(b)) =
+                (eval_const(ast, *lhs, consts, declared, tys)?, eval_const(ast, *rhs, consts, declared, tys)?)
+            else {
+                return Err(fail("non-integer arithmetic in a const"));
+            };
+            let r = match op {
+                ast::BinOp::Add => a.checked_add(b),
+                ast::BinOp::Sub => a.checked_sub(b),
+                ast::BinOp::Mul => a.checked_mul(b),
+                ast::BinOp::Div => {
+                    if b == 0 {
+                        return Err(ConstErr::Fail(Diag::new(
+                            "L0632",
+                            ast.expr_span(e),
+                            "division by zero in a const initializer",
+                            "Fix the divisor.",
+                        )));
+                    }
+                    a.checked_div(b)
+                }
+                ast::BinOp::Rem => {
+                    if b == 0 {
+                        return Err(ConstErr::Fail(Diag::new(
+                            "L0632",
+                            ast.expr_span(e),
+                            "remainder by zero in a const initializer",
+                            "Fix the divisor.",
+                        )));
+                    }
+                    a.checked_rem(b)
+                }
+                ast::BinOp::BitAnd => Some(a & b),
+                ast::BinOp::BitOr => Some(a | b),
+                ast::BinOp::BitXor => Some(a ^ b),
+                ast::BinOp::Shl => a.checked_shl(b as u32),
+                ast::BinOp::Shr => a.checked_shr(b as u32),
+                _ => return Err(fail("this operator in a const")),
+            };
+            match r {
+                Some(v) => Ok(EvalVal::Int(v)),
+                None => Err(fail("arithmetic that overflows a const")),
+            }
+        }
+        _ => Err(fail("this const initializer form")),
+    }
+}
+
+/// Checks an evaluated value against the declared type and stores it
+/// in the public form: the kind must match, and an integer must fit
+/// the declared width (stored as its low 64 bits).
+fn check_const_ty(p: &Program, declared: Ty, val: EvalVal, span: Span, interner: &Interner, name: Sym) -> Result<ConstValue, Diag> {
+    let n = interner.get(name);
+    let mismatch = |want: &str| {
+        Diag::new(
+            "L0110",
+            span,
+            format!("`{n}` is declared as {want} but its value is a different kind"),
+            "Change the declared type or the value.",
+        )
+    };
+    match (p.tys.kind(declared), val) {
+        (TyKind::Int(it), EvalVal::Int(v)) => {
+            let bits = it.bits().min(64);
+            let fits = if it.signed() {
+                let min = -(1i128 << (bits - 1));
+                let max = (1i128 << (bits - 1)) - 1;
+                (min..=max).contains(&v)
+            } else {
+                v >= 0 && (bits == 64 || v < (1i128 << bits))
+            };
+            if fits {
+                Ok(ConstValue::Int(v as u64))
+            } else {
+                Err(Diag::new(
+                    "L0118",
+                    span,
+                    format!("the value of `{n}` does not fit in `{}`", it.name()),
+                    "Pick a wider type or a smaller value.",
+                ))
+            }
+        }
+        (TyKind::Bool, EvalVal::Bool(b)) => Ok(ConstValue::Bool(b)),
+        (TyKind::Char, EvalVal::Char(c)) => Ok(ConstValue::Char(c)),
+        (TyKind::Str, EvalVal::Str(s)) => Ok(ConstValue::Str(s)),
+        (TyKind::Ref(_, _, inner), EvalVal::Str(s)) if p.tys.kind(inner) == TyKind::Str => Ok(ConstValue::Str(s)),
+        (TyKind::Int(_), _) => Err(mismatch("an integer")),
+        (TyKind::Bool, _) => Err(mismatch("`bool`")),
+        (TyKind::Char, _) => Err(mismatch("`char`")),
+        _ => Err(not_yet("L0632", span, "consts of this type")),
+    }
 }
 
 pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {

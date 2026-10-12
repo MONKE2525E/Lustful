@@ -935,18 +935,17 @@ impl<'a> Parser<'a> {
     fn type_alias_def(&mut self) -> PResult<TypeAliasDef> {
         let start = self.expect(Tok::Type, "`type`")?;
         let (name, name_span) = self.ident()?;
-        self.no_generics("type aliases")?;
-        if self.peek() == Tok::Where {
-            return Err(self.reject(C_TRAIT, "where clauses"));
-        }
+        let generics = self.generics("type aliases", false)?;
+        // For an alias the where clause follows the target type.
         self.expect(Tok::Eq, "`=`")?;
         let ty = self.ty()?;
+        let where_clause = self.where_clause()?;
         self.expect(Tok::Semi, "`;`")?;
         Ok(TypeAliasDef {
             name,
             name_span,
-            generics: Generics::default(),
-            where_clause: WhereClause::default(),
+            generics,
+            where_clause,
             ty,
             span: start.to(self.prev_span()),
         })
@@ -1748,18 +1747,32 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses `a::b::<T>::c`. In type position (`in_type`), generics need no `::`.
+    /// Module anchors parse as plain first segments named `crate`,
+    /// `self`, or `super` (the resolver reads them, as in use trees); a
+    /// leading `::` becomes a first segment named `::`, which the
+    /// resolver also reads and removes. Without the resolver these
+    /// paths reach collect/check, which reject them as before.
     fn path(&mut self, in_type: bool) -> PResult<Vec<PathSeg>> {
-        // Module-anchored path starts are valid Rust that the flat namespace
-        // cannot resolve yet: reject them as module paths, not as bad syntax.
-        match self.peek() {
-            Tok::PathSep => return Err(self.reject(C_MOD, "absolute paths (`::a::b`)")),
-            Tok::Crate | Tok::Super => return Err(self.reject(C_MOD, "module paths (`crate::` and `super::`)")),
-            Tok::SelfLower if self.peek_at(1) == Tok::PathSep => return Err(self.reject(C_MOD, "module paths (`self::`)")),
-            _ => {}
-        }
         let mut segs = Vec::new();
+        if self.eat(Tok::PathSep) {
+            segs.push(PathSeg::plain(self.interner.intern("::")));
+        }
         loop {
-            let (name, _) = self.ident()?;
+            let name = match self.peek() {
+                Tok::Crate => {
+                    self.bump();
+                    self.interner.intern("crate")
+                }
+                Tok::Super => {
+                    self.bump();
+                    self.interner.intern("super")
+                }
+                Tok::SelfLower => {
+                    self.bump();
+                    self.known.self_value
+                }
+                _ => self.ident()?.0,
+            };
             let turbofish = self.peek() == Tok::PathSep && self.peek_at(1) == Tok::Lt;
             let args = if (in_type && self.peek() == Tok::Lt) || turbofish {
                 if turbofish {
@@ -1770,7 +1783,9 @@ impl<'a> Parser<'a> {
                 GenericArgs::None
             };
             segs.push(PathSeg { name, args });
-            if self.peek() == Tok::PathSep && matches!(self.peek_at(1), Tok::Ident(_) | Tok::SelfUpper) {
+            if self.peek() == Tok::PathSep
+                && matches!(self.peek_at(1), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower)
+            {
                 self.bump();
             } else {
                 break;

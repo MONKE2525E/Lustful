@@ -748,6 +748,198 @@ fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
 /// Compiles one request, reusing whatever `session` holds. The session
 /// serves one `SessionKey`: a request for another key is a routing bug and
 /// gets an internal error, never this session's state.
+
+/// Splices the checked source std fns after `src` (see the call site in
+/// `compile`). Returns the shipped byte ranges and the std fn routes.
+fn splice_std(
+    src: &mut String,
+    std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
+) -> Result<(Vec<(u32, u32, crate::ty::lang::ShippedCrate)>, Vec<&'static crate::ty::lang::StdFnDef>), Response> {
+    let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
+    let load = match load {
+        Ok(l) => l,
+        Err(e) => return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() }),
+    };
+    let mut ranges = Vec::new();
+    if !src.ends_with('\n') {
+        src.push('\n');
+    }
+    for (krate, text) in &load.splices {
+        let lo = src.len() as u32;
+        src.push_str(text);
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+        ranges.push((lo, src.len() as u32, *krate));
+    }
+    Ok((ranges, load.fns.clone()))
+}
+
+/// The resolver front end (W-RESOLVE): Cargo graph selection, the
+/// outline worklist, and the session setup the shared tail consumes.
+/// Every request is a full rebuild in this path for now: correctness
+/// first, and the daemon fuzzer's fresh-session guard compares answers,
+/// not speed. Returns the tail tuple (map, changed, mention-only,
+/// fn count, mode, fn lines, body hashes, tables).
+#[allow(clippy::too_many_arguments)]
+fn resolved_setup(
+    req: &Request,
+    front: &mut Front,
+    caches: &mut Caches,
+    std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
+    user_src: &str,
+    crate_ids_default: CrateIds,
+    std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
+    std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
+    t: &mut Timer,
+) -> Result<(SourceMap, Vec<usize>, Vec<usize>, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
+    use crate::resolve::cargo::{self, GraphRequest};
+    use crate::resolve::cfg::CfgEnv;
+    use crate::resolve::worklist::{self, CrateInput, NoExpand};
+    front.resolved_crate = true;
+    let key = &req.session;
+    let code2 = |msg: String| Response { stderr: format!("error: {msg}\n"), code: 2, ..Default::default() };
+    // Crate selection: through the Cargo graph when a manifest names the
+    // crate, else the synthetic one-file package of the session key.
+    let (root_path, mut root_text, crate_ids, env, externs, crate_name) = if let Some(manifest) = &key.krate.manifest_path {
+        let greq = GraphRequest {
+            manifest_path: manifest.clone(),
+            package: None,
+            features: key.features.clone(),
+            default_features: key.default_features,
+            all_features: key.all_features,
+            target_triple: key.target_triple.clone(),
+        };
+        let graph = cargo::load_graph(&greq).map_err(code2)?;
+        t.lap("cargo graph");
+        let pre_env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
+        let unit =
+            cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
+                .map_err(code2)?;
+        let root_text = std::fs::read_to_string(&unit.target.src_path)
+            .map_err(|e| code2(format!("cannot read {}: {e}", unit.target.src_path.display())))?;
+        // Edition and lint gates for the selected unit (section 1.1),
+        // rendered against the crate root file.
+        let mut gate_map = SourceMap::default();
+        gate_map.add_file_with_text(&unit.target.src_path.to_string_lossy(), &root_text);
+        for check in [cargo::check_edition(&unit), cargo::check_lints(&graph, &unit)] {
+            if let Err(mut d) = check {
+                return Err(errors(std::slice::from_mut(&mut d), &gate_map, &root_text, req));
+            }
+        }
+        let env = CfgEnv::new(&key.target_triple, &unit.features, key.krate.test, key.profile);
+        let ids = CrateIds {
+            local: def::LOCAL_CRATE,
+            stable: def::stable_crate_hash(&unit.package_id, &key.krate.target_kind, &unit.target.name, key.krate.test),
+        };
+        (unit.target.src_path.clone(), root_text, ids, env, unit.externs.clone(), unit.package.name.replace('-', "_"))
+    } else {
+        let stem = key.krate.root.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string();
+        let env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
+        (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem)
+    };
+    // Std splice, in the root file text, exactly as the single-file path
+    // (user spans do not move). A second resolve runs when only a
+    // non-root file mentions a source std fn.
+    let mut spliced = false;
+    if crate::ty::lang::needs_std_load(&root_text) {
+        let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
+        *std_ranges = ranges;
+        *std_routes = routes;
+        spliced = true;
+        t.lap("std load+splice");
+    }
+    let resolved = loop {
+        let input = CrateInput {
+            root_path: root_path.clone(),
+            root_text: root_text.clone(),
+            env: env.clone(),
+            crate_ids,
+            crate_name: crate_name.clone(),
+            externs: externs.clone(),
+        };
+        match worklist::resolve_crate(&input, &front.interner, &front.known, &NoExpand) {
+            Ok(r) => {
+                if r.needs_std && !spliced {
+                    let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
+                    *std_ranges = ranges;
+                    *std_routes = routes;
+                    spliced = true;
+                    t.lap("std load+splice");
+                    continue;
+                }
+                break r;
+            }
+            Err(e) => {
+                if e.needs_std && !spliced {
+                    let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
+                    *std_ranges = ranges;
+                    *std_routes = routes;
+                    spliced = true;
+                    continue;
+                }
+                let mut diags = e.diags;
+                return Err(errors(&mut diags, &e.map, &e.all_text, req));
+            }
+        }
+    };
+    t.lap("resolve (worklist)");
+    let worklist::ResolvedCrate { ast, map, tables, fn_lines, body_hashes, .. } = resolved;
+    let fn_count = fn_lines.len();
+    front.ast = ast;
+    front.map = map.clone();
+    front.src.clone_from(&root_text);
+    front.resolved_crate_ids = Some(crate_ids);
+    // One synthetic chunk: the tail's slot update reads body idents and
+    // item scans from chunks; the worklist's per-fn hashes ride in
+    // through `scan_of` below, so the chunk scan carries shape only.
+    let lexed = match lexer::lex(&root_text, ROOT_FILE, 0, &front.interner) {
+        Ok(l) => l,
+        Err(mut d) => return Err(errors(std::slice::from_mut(&mut d), &map, &root_text, req)),
+    };
+    let item_scans: Vec<scan::ItemScan> = front
+        .ast
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| scan::ItemScan {
+            hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            fn_name: match &item.kind {
+                ItemKind::Fn(f) => Some(f.name),
+                _ => None,
+            },
+        })
+        .collect();
+    let n_items = item_scans.len();
+    front.chunks = vec![Chunk {
+        start: 0,
+        text: root_text,
+        lexed,
+        lexed_start: 0,
+        scan: scan::ChunkScan {
+            fns: (0..fn_count).map(|_| scan::FnScan { body_hash: 1, fn_offset: 0, body: 0..0 }).collect(),
+            items: item_scans.clone(),
+            body_idents: vec![Vec::new(); fn_count],
+            ends_at_boundary: true,
+        },
+        items: Some(0..n_items),
+    }];
+    let env = scan::env_hash(item_scans.iter());
+    let fn_at: Vec<(usize, usize)> = (0..fn_count).map(|i| (0, i)).collect();
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let lines = fn_lines.clone();
+    let hashes = body_hashes.clone();
+    let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
+    let (changed, mention_only) = match slot_update(front, caches, item_scans, env, None, &fn_at, cores, crate_ids, &scan_of, t) {
+        Ok(c) => c,
+        Err(e) => {
+            front.env_hash = None;
+            return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
+        }
+    };
+    Ok((map, changed, mention_only, fn_count, "full", fn_lines, body_hashes, Some(tables)))
+}
+
 pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut t = Timer::new();
     if req.session != session.key {
@@ -801,6 +993,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let Session { front, caches, std_cache, disk_cache, .. } = session;
     t.lap("read");
 
+    // Resolver routing (W-RESOLVE): a manifest-selected crate, or a root
+    // file that mentions modules, imports, cfg, or const/static/type
+    // items, compiles through the outline worklist (full rebuild per
+    // request for now). Routing is sticky per session (see Front).
+    let use_resolver = front.resolved_crate
+        || req.session.krate.manifest_path.is_some()
+        || crate::resolve::worklist::needs_resolve(&src, &front.interner);
+
     // Source std (S5): if this file can mention a source std fn, load the
     // checked shipped library (once per session) and splice its fns after
     // the user text. User spans do not move. `std_ranges` records which
@@ -809,27 +1009,24 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // mention a source std fn pays one byte scan and nothing else.
     let mut std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)> = Vec::new();
     let mut std_routes: Vec<&'static crate::ty::lang::StdFnDef> = Vec::new();
-    if crate::ty::lang::needs_std_load(&src) {
-        let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
-        let load = match load {
-            Ok(l) => l,
-            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
-        };
-        if !src.ends_with('\n') {
-            src.push('\n');
-        }
-        for (krate, text) in &load.splices {
-            let lo = src.len() as u32;
-            src.push_str(text);
-            if !src.ends_with('\n') {
-                src.push('\n');
+    if !use_resolver && crate::ty::lang::needs_std_load(&src) {
+        match splice_std(&mut src, std_cache) {
+            Ok((ranges, routes)) => {
+                std_ranges = ranges;
+                std_routes = routes;
             }
-            std_ranges.push((lo, src.len() as u32, *krate));
+            Err(resp) => return resp,
         }
-        std_routes = load.fns.clone();
         t.lap("std load+splice");
     }
 
+    // Both front ends produce the same locals for the shared tail.
+    let (map, mut changed, mention_only, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
+        match resolved_setup(req, front, caches, std_cache, &src, crate_ids, &mut std_ranges, &mut std_routes, &mut t) {
+            Ok(x) => x,
+            Err(resp) => return resp,
+        }
+    } else {
     // Lex and scan in chunks of whole items, in parallel. Only the region an edit touched is
     // split and lexed again: chunks entirely before it are kept as they are, and chunks entirely
     // after it are kept with shifted offsets.
@@ -1119,6 +1316,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
 
+    let fn_lines_all: Vec<u32> = (0..fn_count).map(|i| scan_of(front, i).1).collect();
+    let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
+    (map, changed, mention_only, fn_count, mode, fn_lines_all, body_hashes_all, None)
+    };
+    let scan_of = |front: &Front, i: usize| {
+        let _ = front;
+        (body_hashes_all[i], fn_lines_all[i])
+    };
+
     // Persist slot assignment when it grew (or was compacted): the next
     // daemon seeds from this file even if this compile later fails,
     // because the assignment itself is already in use by cached C.
@@ -1129,6 +1335,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.slot_manifest_stored = front.slot_of.len();
     }
 
+    // The resolver path computes crate identity from the Cargo graph;
+    // the single-file path keeps the session key's identity.
+    let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
     let mut program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
         Ok(p) => p,
         Err(mut ds) => {
@@ -1136,6 +1345,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return errors(&mut ds, &map, &src, req);
         }
     };
+    if let Some(tables) = resolved_tables {
+        program.resolved = Some(Box::new(tables));
+    }
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
