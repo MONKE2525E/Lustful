@@ -863,6 +863,36 @@ struct W_arr3_box_bool { pub inner: S_arr3_box, pub extra: bool }
 struct W_arr3_box_ref { pub inner: S_arr3_box, pub extra: &'static u8 }
 struct W_arr3_box_box { pub inner: S_arr3_box, pub extra: Box<u32> }
 struct W_arr3_box_arr3 { pub inner: S_arr3_box, pub extra: [u8; 3] }
+#[repr(C)] enum XC1 { A(u8, u64), B }
+#[repr(C)] enum XC2 { A(u64, u8), B(u8) }
+#[repr(C)] enum XC3 { A(i16, f64) }
+#[repr(C)] enum XC4 { A(bool, u16, [u8; 3]), B([u64; 2]) }
+#[repr(C)] enum XC5 { A(u128, bool), B(u8) }
+#[repr(C, u8)] enum XC6 { A(bool, u8), B(Option<char>, u128, u128) }
+#[repr(C, u8)] enum XC7 { A(bool, u16, [(i32,); 0]) }
+#[repr(C, u32)] enum XC8 { A(u8, u128), B }
+#[repr(C, i64)] enum XC9 { A(u8), B(u64, u64) }
+#[repr(u8)] enum XI1 { A(bool, u8), B(Option<char>, u128, u128) }
+#[repr(u8)] enum XI2 { A(u8, u64), B }
+#[repr(i128)] enum XI3 { A(u8) = -5, B = 100 }
+#[repr(u128)] enum XI4 { A = 5, B }
+enum XA1 { A([bool; 2]), B(u8) }
+enum XA2 { A([char; 3]), B }
+enum XA3 { A([bool; 4]), B(u8, u8, u8) }
+enum XA4 { A([Option<f64>; 3]), B(usize), C(u64, bool) }
+enum XA5 { A([bool; 0], u32), B(u8) }
+enum XA6 { A(([bool; 1], u8)), B }
+enum XU1 { A(u128), B([u64; 2], (bool, u64)) }
+enum XU2 { A((), u128), B([f64; 2], (Option<Option<i32>>, i64)) }
+enum XU3 { A(u128), B(u64, u64, bool, u64) }
+enum XU4 { A(u32), B([u8; 4], (bool, u32)) }
+enum XN1 { A = -1, B = 127 }
+enum XN2 { A = -128, B = 127 }
+enum XN3 { A = -2, B = -1 }
+enum XN4 { A = 0, B = 255 }
+enum XN5 { A = -100, B = 100 }
+#[repr(i8)] enum XN6 { A = -1, B = 0 }
+enum XN7 { A = 200, B = 201 }
 
 fn p<T>(name: &str) { println!("{name} size={} align={}", size_of::<T>(), align_of::<T>()); }
 fn main() {
@@ -2678,4 +2708,101 @@ fn main() {
     p::<Option<Option<E2f_arr3_box>>>("OPT2_E2f_arr3_box");
     p::<Option<E2v_arr3_box>>("OPT_E2v_arr3_box");
     p::<Option<Option<E2v_arr3_box>>>("OPT2_E2v_arr3_box");
+    p::<XC1>("XC1");
+    p::<Option<XC1>>("OPT_XC1");
+    p::<Option<Option<XC1>>>("OPT2_XC1");
+    p::<XC2>("XC2");
+    p::<Option<XC2>>("OPT_XC2");
+    p::<Option<Option<XC2>>>("OPT2_XC2");
+    p::<XC3>("XC3");
+    p::<Option<XC3>>("OPT_XC3");
+    p::<Option<Option<XC3>>>("OPT2_XC3");
+    p::<XC4>("XC4");
+    p::<Option<XC4>>("OPT_XC4");
+    p::<Option<Option<XC4>>>("OPT2_XC4");
+    p::<XC5>("XC5");
+    p::<Option<XC5>>("OPT_XC5");
+    p::<Option<Option<XC5>>>("OPT2_XC5");
+    p::<XC6>("XC6");
+    p::<Option<XC6>>("OPT_XC6");
+    p::<Option<Option<XC6>>>("OPT2_XC6");
+    p::<XC7>("XC7");
+    p::<Option<XC7>>("OPT_XC7");
+    p::<Option<Option<XC7>>>("OPT2_XC7");
+    p::<XC8>("XC8");
+    p::<Option<XC8>>("OPT_XC8");
+    p::<Option<Option<XC8>>>("OPT2_XC8");
+    p::<XC9>("XC9");
+    p::<Option<XC9>>("OPT_XC9");
+    p::<Option<Option<XC9>>>("OPT2_XC9");
+    p::<XI1>("XI1");
+    p::<Option<XI1>>("OPT_XI1");
+    p::<Option<Option<XI1>>>("OPT2_XI1");
+    p::<XI2>("XI2");
+    p::<Option<XI2>>("OPT_XI2");
+    p::<Option<Option<XI2>>>("OPT2_XI2");
+    p::<XI3>("XI3");
+    p::<Option<XI3>>("OPT_XI3");
+    p::<Option<Option<XI3>>>("OPT2_XI3");
+    p::<XI4>("XI4");
+    p::<Option<XI4>>("OPT_XI4");
+    p::<Option<Option<XI4>>>("OPT2_XI4");
+    p::<XA1>("XA1");
+    p::<Option<XA1>>("OPT_XA1");
+    p::<Option<Option<XA1>>>("OPT2_XA1");
+    p::<XA2>("XA2");
+    p::<Option<XA2>>("OPT_XA2");
+    p::<Option<Option<XA2>>>("OPT2_XA2");
+    p::<XA3>("XA3");
+    p::<Option<XA3>>("OPT_XA3");
+    p::<Option<Option<XA3>>>("OPT2_XA3");
+    p::<XA4>("XA4");
+    p::<Option<XA4>>("OPT_XA4");
+    p::<Option<Option<XA4>>>("OPT2_XA4");
+    p::<XA5>("XA5");
+    p::<Option<XA5>>("OPT_XA5");
+    p::<Option<Option<XA5>>>("OPT2_XA5");
+    p::<XA6>("XA6");
+    p::<Option<XA6>>("OPT_XA6");
+    p::<Option<Option<XA6>>>("OPT2_XA6");
+    p::<XU1>("XU1");
+    p::<Option<XU1>>("OPT_XU1");
+    p::<Option<Option<XU1>>>("OPT2_XU1");
+    p::<XU2>("XU2");
+    p::<Option<XU2>>("OPT_XU2");
+    p::<Option<Option<XU2>>>("OPT2_XU2");
+    p::<XU3>("XU3");
+    p::<Option<XU3>>("OPT_XU3");
+    p::<Option<Option<XU3>>>("OPT2_XU3");
+    p::<XU4>("XU4");
+    p::<Option<XU4>>("OPT_XU4");
+    p::<Option<Option<XU4>>>("OPT2_XU4");
+    p::<XN1>("XN1");
+    p::<Option<XN1>>("OPT_XN1");
+    p::<Option<Option<XN1>>>("OPT2_XN1");
+    p::<XN2>("XN2");
+    p::<Option<XN2>>("OPT_XN2");
+    p::<Option<Option<XN2>>>("OPT2_XN2");
+    p::<XN3>("XN3");
+    p::<Option<XN3>>("OPT_XN3");
+    p::<Option<Option<XN3>>>("OPT2_XN3");
+    p::<XN4>("XN4");
+    p::<Option<XN4>>("OPT_XN4");
+    p::<Option<Option<XN4>>>("OPT2_XN4");
+    p::<XN5>("XN5");
+    p::<Option<XN5>>("OPT_XN5");
+    p::<Option<Option<XN5>>>("OPT2_XN5");
+    p::<XN6>("XN6");
+    p::<Option<XN6>>("OPT_XN6");
+    p::<Option<Option<XN6>>>("OPT2_XN6");
+    p::<XN7>("XN7");
+    p::<Option<XN7>>("OPT_XN7");
+    p::<Option<Option<XN7>>>("OPT2_XN7");
+    p::<Option<[bool; 2]>>("OPT_arr_bool_2");
+    p::<Option<[char; 3]>>("OPT_arr_char_3");
+    p::<Option<[Option<bool>; 2]>>("OPT_arr_optbool_2");
+    p::<Option<[bool; 0]>>("OPT_arr_bool_0");
+    p::<Option<Option<[bool; 3]>>>("OPT2_arr_bool_3");
+    p::<[u128; 2]>("ARR_u128_2");
+    p::<((), u128)>("TUP_unit_u128");
 }

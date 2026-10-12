@@ -953,6 +953,18 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                     "Remove the integer from the repr, or make the type an enum.",
                 ));
             }
+            if adt.is_enum
+                && adt.repr.kind == ReprKind::C
+                && adt.repr.int.is_some()
+                && adt.variants.iter().all(|v| v.fields.is_empty())
+            {
+                errs.push(Diag::new(
+                    "L0110",
+                    adt.span,
+                    "conflicting representation hints: `repr(C)` and an integer repr on a fieldless enum",
+                    "Use `repr(C)` or the integer repr alone; fieldless enums have no payload for `repr(C)` to order.",
+                ));
+            }
             if adt.repr.kind == ReprKind::Packed && adt.repr.align.is_some() {
                 errs.push(Diag::new(
                     "L0110",
