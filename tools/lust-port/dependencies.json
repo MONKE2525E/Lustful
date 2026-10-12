@@ -1,0 +1,246 @@
+{
+ "schema_version": 1,
+ "description": "Per-crate dev-path decision from DESIGN-TS section 4 and INVENTORY Q4. decision is one of builtin-adapter, c-shim, compile-from-source. Release always uses the original crates through Cargo. Match by cargo package name; names are also tried with - and _ swapped. Unknown crates get decision unknown in reports.",
+ "dependencies": [
+  {
+   "name": "goport_util",
+   "decision": "compile-from-source",
+   "milestone": 8,
+   "notes": "Owned project code. JSON, std ports, diagnostics and macros."
+  },
+  {
+   "name": "goport_lsproto",
+   "decision": "compile-from-source",
+   "milestone": 8,
+   "notes": "Owned generated protocol code. Keep shared type identity and re-exports."
+  },
+  {
+   "name": "ts_goport",
+   "decision": "compile-from-source",
+   "milestone": 8,
+   "notes": "The project crate itself (ts_wasm depends on it)."
+  },
+  {
+   "name": "ts_wasm",
+   "decision": "compile-from-source",
+   "milestone": 8,
+   "notes": "Owned wasm ABI crate. Later target gate."
+  },
+  {
+   "name": "rustc-hash",
+   "decision": "compile-from-source",
+   "milestone": 5,
+   "notes": "Small hasher plus aliases to std maps. DESIGN-TS section 4 says compile the selected source; INVENTORY Q4 says built-in Fx HashMap. The hash algorithm and iteration order must match where output depends on them."
+  },
+  {
+   "name": "rustc_hash",
+   "decision": "compile-from-source",
+   "milestone": 5,
+   "notes": "Same crate as rustc-hash, underscore spelling."
+  },
+  {
+   "name": "indexmap",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Ordered map and set. Keep insertion order, removal variants, borrowed lookup, Entry and iteration."
+  },
+  {
+   "name": "smallvec",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Inline storage and spill for concrete element and capacity types."
+  },
+  {
+   "name": "bumpalo",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Typed arena allocation. Keep limits, alignment and no implicit drops. INVENTORY Q4: built-in leaked arena."
+  },
+  {
+   "name": "memchr",
+   "decision": "c-shim",
+   "milestone": 5,
+   "notes": "Exact byte search over buffers and indices. DESIGN-TS: cached shim plus lust iterator wrappers. INVENTORY Q4: built-in over C memchr/memmem."
+  },
+  {
+   "name": "xxhash-rust",
+   "decision": "c-shim",
+   "milestone": 5,
+   "notes": "xxh3_64, xxh3_128 and streaming state. Keep digest bytes; carry 128-bit results in two halves at the boundary."
+  },
+  {
+   "name": "xxhash_rust",
+   "decision": "c-shim",
+   "milestone": 5,
+   "notes": "Same crate as xxhash-rust, underscore spelling."
+  },
+  {
+   "name": "flate2",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Gzip encode and decode. Stream state can be opaque. INVENTORY Q4: gzip API over zlib."
+  },
+  {
+   "name": "jiff",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Local time zone for diagnostic timestamps. INVENTORY Q4: built-in over localtime_r."
+  },
+  {
+   "name": "rustix",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Signals, pipes, fstat, termios, events, polling and processes. Keep ownership and errno."
+  },
+  {
+   "name": "signal-hook",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Signal registration and flags. Handlers cannot call lust closures directly."
+  },
+  {
+   "name": "signal_hook",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Same crate as signal-hook, underscore spelling."
+  },
+  {
+   "name": "tikv-jemallocator",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Shared allocator bridge. Lust needs a size and alignment API, not only malloc."
+  },
+  {
+   "name": "tikv-jemalloc-ctl",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Typed arena and thread controls. Do not substitute a no-op."
+  },
+  {
+   "name": "nix",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Linux process and signal operations, fanotify, kqueue, prctl."
+  },
+  {
+   "name": "miow",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Windows named pipes. Later target gate; absent on Linux."
+  },
+  {
+   "name": "same-file",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Windows file identity. Later target gate."
+  },
+  {
+   "name": "same_file",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Same crate as same-file, underscore spelling."
+  },
+  {
+   "name": "num-bigint",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Small BigInt for literal parse and print. DESIGN-TS: opaque BigInt shim plus the used methods."
+  },
+  {
+   "name": "num_bigint",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Same crate as num-bigint, underscore spelling."
+  },
+  {
+   "name": "num-traits",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Number traits used by the BigInt layer and the project number wrapper."
+  },
+  {
+   "name": "num_traits",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Same crate as num-traits, underscore spelling."
+  },
+  {
+   "name": "ryu-js",
+   "decision": "c-shim",
+   "milestone": 5,
+   "notes": "Exact JS number formatting. Must match byte for byte; a generic float formatter is not a replacement. INVENTORY Q4 also calls this a built-in C port."
+  },
+  {
+   "name": "ryu_js",
+   "decision": "c-shim",
+   "milestone": 5,
+   "notes": "Same crate as ryu-js, underscore spelling."
+  },
+  {
+   "name": "unicode-normalization",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Buffer-based NFC normalization for macOS paths and cross-platform tests."
+  },
+  {
+   "name": "unicode_normalization",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Same crate as unicode-normalization, underscore spelling."
+  },
+  {
+   "name": "name-to-handle-at",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Linux watcher file handles."
+  },
+  {
+   "name": "name_to_handle_at",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Same crate as name-to-handle-at, underscore spelling."
+  },
+  {
+   "name": "notify",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "macOS and Windows watcher. Events cross as explicit records."
+  },
+  {
+   "name": "lzma-rust2",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Build-time use runs with Cargo in preparation. Add a decode shim for wasm."
+  },
+  {
+   "name": "lzma_rust2",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Same crate as lzma-rust2, underscore spelling."
+  },
+  {
+   "name": "libc",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Raw libc bindings. Covered by the platform shim layer."
+  },
+  {
+   "name": "hashbrown",
+   "decision": "builtin-adapter",
+   "milestone": 5,
+   "notes": "Raw table under indexmap and std maps. Not compiled from source; the adapter reproduces needed behavior."
+  },
+  {
+   "name": "equivalent",
+   "decision": "compile-from-source",
+   "milestone": 5,
+   "notes": "Small trait crate used by indexmap. Pure and safe; can compile after traits."
+  },
+  {
+   "name": "miniz_oxide",
+   "decision": "c-shim",
+   "milestone": 7,
+   "notes": "Part of flate2. Mostly safe but grouped with the gzip shim."
+  }
+ ]
+}
