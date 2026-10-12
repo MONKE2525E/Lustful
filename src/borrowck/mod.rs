@@ -18,9 +18,9 @@ use crate::ty::*;
 use std::collections::HashSet;
 
 /// A bitset over locals or loans. Most bodies fit in one word, and that word
-/// is stored inline: dataflow clones these sets per block (two per local in
-/// every `State`), so a heap allocation per set showed up once calls became
-/// terminators and block counts grew.
+/// is stored inline, so temporary sets (new loans for one statement, live
+/// loans at one point) need no heap allocation. Dataflow states do not use
+/// this type: see `State`.
 #[derive(Clone, PartialEq, Eq)]
 struct BitSet(Words);
 
@@ -48,32 +48,73 @@ impl BitSet {
         }
     }
     fn insert(&mut self, i: usize) {
-        self.words_mut()[i / 64] |= 1 << (i % 64);
+        bit_set(self.words_mut(), i);
     }
     fn remove(&mut self, i: usize) {
-        self.words_mut()[i / 64] &= !(1 << (i % 64));
+        bit_unset(self.words_mut(), i);
     }
     fn contains(&self, i: usize) -> bool {
-        self.words()[i / 64] & (1 << (i % 64)) != 0
+        bit_has(self.words(), i)
     }
     fn union(&mut self, o: &BitSet) -> bool {
-        let mut changed = false;
-        for (a, b) in self.words_mut().iter_mut().zip(o.words()) {
-            let n = *a | b;
-            changed |= n != *a;
-            *a = n;
-        }
-        changed
+        bits_or(self.words_mut(), o.words())
+    }
+    /// Unions in a set stored as words (a row of a `State`).
+    fn union_words(&mut self, o: &[u64]) -> bool {
+        bits_or(self.words_mut(), o)
     }
     fn clear(&mut self) {
-        self.words_mut().iter_mut().for_each(|w| *w = 0);
+        self.words_mut().fill(0);
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.words().iter().enumerate().flat_map(|(wi, &w)| (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| wi * 64 + b))
+        bit_iter(self.words())
     }
     fn is_empty(&self) -> bool {
-        self.words().iter().all(|&w| w == 0)
+        bits_none(self.words())
     }
+}
+
+// Bit operations on word slices: the rows of a `State` and the words of a `BitSet`.
+
+fn bit_has(w: &[u64], i: usize) -> bool {
+    w[i / 64] & (1 << (i % 64)) != 0
+}
+
+fn bit_set(w: &mut [u64], i: usize) {
+    w[i / 64] |= 1 << (i % 64);
+}
+
+fn bit_unset(w: &mut [u64], i: usize) {
+    w[i / 64] &= !(1 << (i % 64));
+}
+
+/// `dst |= src`; true if `dst` gained a bit.
+fn bits_or(dst: &mut [u64], src: &[u64]) -> bool {
+    let mut changed = 0;
+    for (a, b) in dst.iter_mut().zip(src) {
+        changed |= b & !*a;
+        *a |= b;
+    }
+    changed != 0
+}
+
+fn bits_none(w: &[u64]) -> bool {
+    w.iter().all(|&x| x == 0)
+}
+
+/// The set bits in ascending order.
+fn bit_iter(w: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    w.iter().enumerate().flat_map(|(wi, &x)| {
+        let mut x = x;
+        std::iter::from_fn(move || {
+            if x == 0 {
+                return None;
+            }
+            let b = x.trailing_zeros() as usize;
+            x &= x - 1;
+            Some(wi * 64 + b)
+        })
+    })
 }
 
 struct Loan {
@@ -132,41 +173,95 @@ fn is_prefix(a: &[u64], b: &[u64]) -> bool {
     a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
 
+/// The word layout of a `State` for one body: `n` locals, sets over locals
+/// take `wn` words, sets over loans `wl` words, and the move-path set `wm`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    n: usize,
+    wn: usize,
+    wl: usize,
+    wm: usize,
+}
+
+/// The forward dataflow state at one program point. Every set lives in one
+/// flat word vector, so copying a block's entry state is one memcpy and a
+/// join is one pass of word ORs. (Per-local vectors and hash sets made
+/// state copies most of borrowck's time on large crates.) The sets:
+///
+/// - `init`, `uninit`, `moved`: maybe-initialized, maybe-uninitialized,
+///   and maybe-moved locals.
+/// - `holds(l)`: the loans local `l` may hold.
+/// - `origins(l)`: every loan local `l` was ever assigned on this path.
+///   Unlike `holds` this is never overwritten by a later assignment (until
+///   storage ends). A local in Rust has one fixed lifetime, so at a return
+///   or a store behind a parameter every value the local ever held must
+///   satisfy that lifetime. Later assignments cannot hide an earlier one.
+///   This is only used at those sinks, not for loan liveness.
+/// - `paths`: the field paths that may have been moved out of their local,
+///   one bit per entry of `Ck::mpaths`. The empty path means the whole
+///   local may have been moved.
 #[derive(Clone, PartialEq, Eq)]
 struct State {
-    maybe_init: BitSet,
-    maybe_uninit: BitSet,
-    maybe_moved: BitSet,
-    /// For each local, the loans it may hold.
-    holds: Vec<BitSet>,
-    /// For each local, every loan it was ever assigned on this path. Unlike `holds` this is
-    /// never overwritten by a later assignment (until storage ends). A local in Rust has
-    /// one fixed lifetime, so at a return or a store behind a parameter every value the
-    /// local ever held must satisfy that lifetime. Later assignments cannot hide an
-    /// earlier one. This is only used at those sinks, not for loan liveness.
-    origins: Vec<BitSet>,
-    /// For each local, the field paths that may have been moved out of it. An empty path
-    /// means the whole local may have been moved.
-    moved_paths: Vec<std::collections::HashSet<Path>>,
+    sh: Shape,
+    w: Vec<u64>,
 }
 
 impl State {
+    fn new(sh: Shape) -> State {
+        State { sh, w: vec![0; 3 * sh.wn + 2 * sh.n * sh.wl + sh.wm] }
+    }
+    fn init(&self) -> &[u64] {
+        &self.w[..self.sh.wn]
+    }
+    fn init_mut(&mut self) -> &mut [u64] {
+        let wn = self.sh.wn;
+        &mut self.w[..wn]
+    }
+    fn uninit(&self) -> &[u64] {
+        &self.w[self.sh.wn..2 * self.sh.wn]
+    }
+    fn uninit_mut(&mut self) -> &mut [u64] {
+        let wn = self.sh.wn;
+        &mut self.w[wn..2 * wn]
+    }
+    fn moved(&self) -> &[u64] {
+        &self.w[2 * self.sh.wn..3 * self.sh.wn]
+    }
+    fn moved_mut(&mut self) -> &mut [u64] {
+        let wn = self.sh.wn;
+        &mut self.w[2 * wn..3 * wn]
+    }
+    fn holds_at(&self, l: usize) -> usize {
+        3 * self.sh.wn + l * self.sh.wl
+    }
+    fn origins_at(&self, l: usize) -> usize {
+        3 * self.sh.wn + (self.sh.n + l) * self.sh.wl
+    }
+    fn holds(&self, l: usize) -> &[u64] {
+        let a = self.holds_at(l);
+        &self.w[a..a + self.sh.wl]
+    }
+    fn holds_mut(&mut self, l: usize) -> &mut [u64] {
+        let (a, wl) = (self.holds_at(l), self.sh.wl);
+        &mut self.w[a..a + wl]
+    }
+    fn origins(&self, l: usize) -> &[u64] {
+        let a = self.origins_at(l);
+        &self.w[a..a + self.sh.wl]
+    }
+    fn origins_mut(&mut self, l: usize) -> &mut [u64] {
+        let (a, wl) = (self.origins_at(l), self.sh.wl);
+        &mut self.w[a..a + wl]
+    }
+    fn paths(&self) -> &[u64] {
+        &self.w[3 * self.sh.wn + 2 * self.sh.n * self.sh.wl..]
+    }
+    fn paths_mut(&mut self) -> &mut [u64] {
+        let a = 3 * self.sh.wn + 2 * self.sh.n * self.sh.wl;
+        &mut self.w[a..]
+    }
     fn join(&mut self, o: &State) -> bool {
-        let mut c = self.maybe_init.union(&o.maybe_init);
-        c |= self.maybe_uninit.union(&o.maybe_uninit);
-        c |= self.maybe_moved.union(&o.maybe_moved);
-        for (a, b) in self.holds.iter_mut().zip(&o.holds) {
-            c |= a.union(b);
-        }
-        for (a, b) in self.origins.iter_mut().zip(&o.origins) {
-            c |= a.union(b);
-        }
-        for (a, b) in self.moved_paths.iter_mut().zip(&o.moved_paths) {
-            let before = a.len();
-            a.extend(b.iter().cloned());
-            c |= a.len() != before;
-        }
-        c
+        bits_or(&mut self.w, &o.w)
     }
 }
 
@@ -185,14 +280,18 @@ struct Ck<'b, 'p, 'a> {
     p: &'p Program<'a>,
     body: &'b Body<'p>,
     loans: Vec<Loan>,
-    /// Loan created by each Ref statement, keyed by (block, statement index).
-    loan_at: std::collections::HashMap<(u32, u32), usize>,
+    /// The index of a block's first statement in body-wide statement order.
+    stmt_base: Vec<usize>,
+    /// Loan created by each statement (`u32::MAX` if none), by body-wide index.
+    loan_at: Vec<u32>,
     preds: Vec<Vec<u32>>,
     /// Successor blocks per block, computed once: with call terminators most
     /// blocks end in a call, and recomputing edges in every pass showed up
     /// in profiles.
     succs: Vec<Vec<Bb>>,
-    live_out_stmt: Vec<Vec<BitSet>>,
+    /// Live locals after each statement, `sh.wn` words per statement, by
+    /// body-wide statement index.
+    live_out: Vec<u64>,
     /// Live locals at each block's entry, for the loans live after a block's
     /// terminating call.
     live_in_block: Vec<BitSet>,
@@ -217,6 +316,13 @@ struct Ck<'b, 'p, 'a> {
     drop_heads: HashSet<crate::def::DefId>,
     /// Index locals with a known constant value (see `const_index_locals`).
     const_index: std::collections::HashMap<Local, u64>,
+    /// The layout of every `State` of this body.
+    sh: Shape,
+    /// Every exact path the body moves out of (see `prefix_of`), as
+    /// `(local, path)`, sorted. `State::paths` has one bit per entry.
+    mpaths: Vec<(Local, Path)>,
+    /// The `mpaths` index range of each local's paths.
+    mpath_at: Vec<(u32, u32)>,
 }
 
 /// The Adt defs that have a user `Drop` impl: every impl of the lang
@@ -242,10 +348,11 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         p,
         body,
         loans: Vec::new(),
-        loan_at: Default::default(),
+        stmt_base: Vec::new(),
+        loan_at: Vec::new(),
         preds: vec![Vec::new(); body.blocks.len()],
         succs: Vec::new(),
-        live_out_stmt: Vec::new(),
+        live_out: Vec::new(),
         live_in_block: Vec::new(),
         errs: Vec::new(),
         seen: HashSet::new(),
@@ -257,8 +364,14 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         collecting: false,
         drop_heads,
         const_index: const_index_locals(body),
+        sh: Shape { n: 0, wn: 0, wl: 0, wm: 0 },
+        mpaths: Vec::new(),
+        mpath_at: Vec::new(),
     };
     ck.collect_loans();
+    ck.collect_move_paths();
+    let n = body.locals.len();
+    ck.sh = Shape { n, wn: n.div_ceil(64).max(1), wl: ck.loans.len().div_ceil(64).max(1), wm: ck.mpaths.len().div_ceil(64) };
     ck.escaped = BitSet::new(ck.loans.len());
     ck.compute_preds();
     ck.compute_reach();
@@ -391,6 +504,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         let mut holders: Vec<Option<Local>> = vec![None; self.loans.len()];
+        let mut base = 0;
+        for b in &self.body.blocks {
+            self.stmt_base.push(base);
+            base += b.stmts.len();
+        }
+        self.loan_at = vec![u32::MAX; base];
         for (bi, b) in self.body.blocks.iter().enumerate() {
             for (si, s) in b.stmts.iter().enumerate() {
                 // SliceOf and Subslice make slice references, so they create
@@ -405,7 +524,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 if let (StmtKind::Assign(dest, _), Some((m, place))) = (&s.kind, loan_src) {
                     self.loan_block.push(bi as u32);
                     self.loan_stmt.push(si as u32);
-                    self.loan_at.insert((bi as u32, si as u32), self.loans.len());
+                    self.loan_at[self.stmt_base[bi] + si] = self.loans.len() as u32;
                     holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
                     self.loans.push(Loan { place: place.clone(), mutable: m, synthetic: false, span: s.span, last_use: None });
                 }
@@ -479,6 +598,72 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             loan.last_use =
                 uses.iter().filter(|&&(l, s)| s.lo > loan.span.lo && holders_set.contains(&l)).map(|&(_, s)| s).max_by_key(|s| s.lo);
         }
+    }
+
+    /// Fills `mpaths`: the exact paths (`prefix_of`) of every move operand,
+    /// at the same operand sites `operand` checks (rvalue and print
+    /// operands, call arguments, branch conditions, panic arguments).
+    /// Needs `const_index`.
+    fn collect_move_paths(&mut self) {
+        let mut all: Vec<(Local, Path)> = Vec::new();
+        let mut note = |o: &Operand| {
+            if let Operand::Move(p) = o
+                && let (path, true) = self.prefix_of(p)
+            {
+                all.push((p.local, path));
+            }
+        };
+        for b in &self.body.blocks {
+            for s in &b.stmts {
+                match &s.kind {
+                    StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut note),
+                    StmtKind::Print { parts, .. } => parts_operands(parts, &mut note),
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Terminator::Call { args, .. } => args.iter().for_each(&mut note),
+                Terminator::If(o, ..) | Terminator::Switch(o, ..) => note(o),
+                Terminator::Panic(parts) => parts_operands(parts, &mut note),
+                _ => {}
+            }
+        }
+        all.sort();
+        all.dedup();
+        let mut at = vec![(0u32, 0u32); self.body.locals.len()];
+        for (i, (l, _)) in all.iter().enumerate() {
+            let e = &mut at[*l as usize];
+            if e.1 == 0 {
+                e.0 = i as u32;
+            }
+            e.1 = i as u32 + 1;
+        }
+        self.mpaths = all;
+        self.mpath_at = at;
+    }
+
+    /// The `mpaths` indices of local `l`'s move paths.
+    fn mpath_range(&self, l: usize) -> std::ops::Range<usize> {
+        let (a, b) = self.mpath_at[l];
+        a as usize..b as usize
+    }
+
+    /// The `mpaths` index of local `l`'s exact path `path`, if the body
+    /// moves out of it.
+    fn mpath_index(&self, l: usize, path: &[u64]) -> Option<usize> {
+        self.mpath_range(l).find(|&i| self.mpaths[i].1 == path)
+    }
+
+    /// Clears every moved path of local `l`.
+    fn clear_paths(&self, st: &mut State, l: usize) {
+        for i in self.mpath_range(l) {
+            bit_unset(st.paths_mut(), i);
+        }
+    }
+
+    /// The moved paths of local `l` in `st`, in `mpaths` order.
+    fn moved_paths<'s>(&'s self, st: &'s State, l: usize) -> impl Iterator<Item = &'s Path> + 's {
+        self.mpath_range(l).filter(move |&i| bit_has(st.paths(), i)).map(move |i| &self.mpaths[i].1)
     }
 
     fn compute_preds(&mut self) {
@@ -618,8 +803,10 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
         }
-        // Per-statement live-out sets.
-        self.live_out_stmt = Vec::with_capacity(nb);
+        // Per-statement live-out sets, flat.
+        let wn = live.words().len();
+        let total: usize = self.body.blocks.iter().map(|b| b.stmts.len()).sum();
+        self.live_out = vec![0; total * wn];
         for bi in 0..nb {
             let b = &self.body.blocks[bi];
             live.clear();
@@ -627,40 +814,38 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 live.union(&live_in[s.0 as usize]);
             }
             Self::live_term(&b.term, &mut live);
-            let mut outs = vec![BitSet::new(n); b.stmts.len()];
             for (si, s) in b.stmts.iter().enumerate().rev() {
-                outs[si] = live.clone();
+                let at = (self.stmt_base[bi] + si) * wn;
+                self.live_out[at..at + wn].copy_from_slice(live.words());
                 Self::live_stmt(&s.kind, &mut live);
             }
-            self.live_out_stmt.push(outs);
         }
         self.live_in_block = live_in;
+    }
+
+    /// The live locals after statement `si` of block `b`.
+    fn live_after(&self, b: u32, si: u32) -> &[u64] {
+        let wn = self.sh.wn;
+        let at = (self.stmt_base[b as usize] + si as usize) * wn;
+        &self.live_out[at..at + wn]
     }
 
     // ---------- Forward dataflow and checks ----------
 
     fn entry_state(&self) -> State {
         let n = self.n_locals();
-        let nl = self.loans.len();
-        let mut st = State {
-            maybe_init: BitSet::new(n),
-            maybe_uninit: BitSet::new(n),
-            maybe_moved: BitSet::new(n),
-            holds: vec![BitSet::new(nl); n],
-            origins: vec![BitSet::new(nl); n],
-            moved_paths: vec![Default::default(); n],
-        };
+        let mut st = State::new(self.sh);
         for l in 0..n {
             if l >= 1 && l <= self.body.arg_count {
-                st.maybe_init.insert(l);
+                bit_set(st.init_mut(), l);
             } else {
-                st.maybe_uninit.insert(l);
+                bit_set(st.uninit_mut(), l);
             }
         }
         for (i, loan) in self.loans.iter().enumerate() {
             if loan.synthetic {
-                st.holds[loan.place.local as usize].insert(i);
-                st.origins[loan.place.local as usize].insert(i);
+                bit_set(st.holds_mut(loan.place.local as usize), i);
+                bit_set(st.origins_mut(loan.place.local as usize), i);
             }
         }
         st
@@ -674,9 +859,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let mut queued = vec![false; nb];
         queued[0] = true;
         // Fixpoint without reporting, then one reporting pass over the final states.
+        // `st` is the one scratch state: each visit copies a block's entry state
+        // into it, so no visit allocates.
+        let mut st = State::new(self.sh);
         while let Some(b) = work.pop() {
             queued[b as usize] = false;
-            let mut st = entry[b as usize].clone().unwrap();
+            st.w.copy_from_slice(&entry[b as usize].as_ref().unwrap().w);
             self.run_block(b, &mut st);
             for k in 0..self.succs[b as usize].len() {
                 let s = self.succs[b as usize][k];
@@ -697,15 +885,17 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // One pass to learn which loans escape into a return value or behind a parameter.
         // The reporting pass then keeps those loans live everywhere rustc's NLL does.
         self.collecting = true;
-        for (b, st) in entry.iter().enumerate() {
-            if let Some(mut st) = st.clone() {
+        for (b, e) in entry.iter().enumerate() {
+            if let Some(e) = e {
+                st.w.copy_from_slice(&e.w);
                 self.run_block(b as u32, &mut st);
             }
         }
         self.collecting = false;
         self.report = true;
-        for (b, st) in entry.into_iter().enumerate() {
-            if let Some(mut st) = st {
+        for (b, e) in entry.iter().enumerate() {
+            if let Some(e) = e {
+                st.w.copy_from_slice(&e.w);
                 self.run_block(b as u32, &mut st);
             }
         }
@@ -720,20 +910,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let span = block.term_span;
         let mut ops: Vec<&Operand> = Vec::new();
         match &block.term {
-            Terminator::Call { target, args, dest, .. } => {
-                let (target, args, dest) = (*target, args.clone(), dest.clone());
-                self.call_term(b, target, &args, &dest, span, st);
-            }
+            Terminator::Call { target, args, dest, .. } => self.call_term(b, *target, args, dest, span, st),
             Terminator::If(o, ..) | Terminator::Switch(o, ..) => ops.push(o),
             Terminator::Panic(parts) => parts_operands(parts, &mut |o| ops.push(o)),
             Terminator::Return if self.report => {
                 self.check_return(st, span);
             }
             Terminator::Return if self.collecting => {
-                let holds = st.holds[0].clone();
-                let origins = st.origins[0].clone();
-                self.escaped.union(&holds);
-                self.escaped.union(&origins);
+                self.escaped.union_words(st.holds(0));
+                self.escaped.union_words(st.origins(0));
             }
             _ => {}
         }
@@ -746,13 +931,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     /// Loans that are live after the current statement: held by some live local, plus the
     /// escaped loans (see `escaped`) at every point reachable from their creation.
-    fn live_loans(&self, st: &State, live: &BitSet, skip: Option<Local>, b: u32, si: u32) -> BitSet {
+    fn live_loans(&self, st: &State, live: &[u64], skip: Option<Local>, b: u32, si: u32) -> BitSet {
         let mut out = BitSet::new(self.loans.len());
-        for l in live.iter() {
+        for l in bit_iter(live) {
             if Some(l as Local) == skip {
                 continue;
             }
-            out.union(&st.holds[l]);
+            out.union_words(st.holds(l));
         }
         for li in self.escaped.iter() {
             let (lb, ls) = (self.loan_block[li], self.loan_stmt[li]);
@@ -773,8 +958,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
             _ => None,
         };
-        let live =
-            if self.report { self.live_loans(st, &self.live_out_stmt[b as usize][si as usize], skip, b, si) } else { BitSet::new(0) };
+        let live = if self.report { self.live_loans(st, self.live_after(b, si), skip, b, si) } else { BitSet::new(0) };
         match s {
             StmtKind::Assign(dest, rv) => {
                 // Reads and moves in the right-hand side.
@@ -793,14 +977,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             self.check_mutability(place, span, st, true);
                         }
                         self.access(place, kind, span, &live);
-                        new_holds.insert(self.loan_at[&(b, si)]);
-                        new_origins.insert(self.loan_at[&(b, si)]);
+                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
+                        new_holds.insert(loan);
+                        new_origins.insert(loan);
                         // A reborrow through a reference depends on that reference's loans.
                         if place.proj.contains(&Proj::Deref) {
-                            let h = st.holds[place.local as usize].clone();
-                            new_holds.union(&h);
-                            let o = st.origins[place.local as usize].clone();
-                            new_origins.union(&o);
+                            new_holds.union_words(st.holds(place.local as usize));
+                            new_origins.union_words(st.origins(place.local as usize));
                         }
                     }
                     Rvalue::SliceOf(place) => {
@@ -811,13 +994,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             self.check_mutability(place, span, st, true);
                         }
                         self.access(place, kind, span, &live);
-                        new_holds.insert(self.loan_at[&(b, si)]);
-                        new_origins.insert(self.loan_at[&(b, si)]);
+                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
+                        new_holds.insert(loan);
+                        new_origins.insert(loan);
                         if place.proj.contains(&Proj::Deref) {
-                            let h = st.holds[place.local as usize].clone();
-                            new_holds.union(&h);
-                            let o = st.origins[place.local as usize].clone();
-                            new_origins.union(&o);
+                            new_holds.union_words(st.holds(place.local as usize));
+                            new_origins.union_words(st.origins(place.local as usize));
                         }
                     }
                     Rvalue::Subslice { base: place, mutable, .. } => {
@@ -828,13 +1010,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             self.check_mutability(place, span, st, true);
                         }
                         self.access(place, kind, span, &live);
-                        new_holds.insert(self.loan_at[&(b, si)]);
-                        new_origins.insert(self.loan_at[&(b, si)]);
+                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
+                        new_holds.insert(loan);
+                        new_origins.insert(loan);
                         if place.proj.contains(&Proj::Deref) {
-                            let h = st.holds[place.local as usize].clone();
-                            new_holds.union(&h);
-                            let o = st.origins[place.local as usize].clone();
-                            new_origins.union(&o);
+                            new_holds.union_words(st.holds(place.local as usize));
+                            new_origins.union_words(st.origins(place.local as usize));
                         }
                     }
                     Rvalue::Discriminant(place) | Rvalue::LenOf(place) => {
@@ -857,12 +1038,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 let place = Place::local(*l);
                 self.access(&place, Access::Dead, span, &live);
                 let li = *l as usize;
-                st.maybe_init.remove(li);
-                st.maybe_uninit.insert(li);
+                bit_unset(st.init_mut(), li);
+                bit_set(st.uninit_mut(), li);
                 if matches!(s, StmtKind::StorageDead(_)) {
-                    st.holds[li].clear();
-                    st.origins[li].clear();
-                    st.moved_paths[li].clear();
+                    st.holds_mut(li).fill(0);
+                    st.origins_mut(li).fill(0);
+                    self.clear_paths(st, li);
                 }
             }
             StmtKind::FakeRead(l) => {
@@ -884,18 +1065,18 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     fn write_dest(&mut self, dest: &Place, new_holds: BitSet, new_origins: &BitSet, span: Span, live: &BitSet, st: &mut State) {
         if dest.proj.is_empty() {
             let l = dest.local as usize;
-            if !self.body.locals[l].mutable && st.maybe_init.contains(l) {
+            if !self.body.locals[l].mutable && bit_has(st.init(), l) {
                 let name = self.local_name(dest.local);
                 self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
             }
             self.access(dest, Access::Write, span, live);
             self.check_store_into_param_ref(dest, new_origins, st, span);
-            st.maybe_init.insert(l);
-            st.maybe_uninit.remove(l);
-            st.maybe_moved.remove(l);
-            st.moved_paths[l].clear();
-            st.holds[l] = new_holds;
-            st.origins[l].union(new_origins);
+            bit_set(st.init_mut(), l);
+            bit_unset(st.uninit_mut(), l);
+            bit_unset(st.moved_mut(), l);
+            self.clear_paths(st, l);
+            st.holds_mut(l).copy_from_slice(new_holds.words());
+            bits_or(st.origins_mut(l), new_origins.words());
         } else {
             self.check_init_write(dest, span, st);
             self.check_mutability(dest, span, st, false);
@@ -903,12 +1084,19 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             self.check_store_into_param_ref(dest, new_origins, st, span);
             // Writing a field puts back a field that was moved out, and every
             // field below it. Other moved fields stay moved.
-            let (path, exact) = self.prefix_of(dest);
-            if exact {
-                st.moved_paths[dest.local as usize].retain(|m| !is_prefix(&path, m));
+            let l = dest.local as usize;
+            if self.mpath_range(l).any(|i| bit_has(st.paths(), i)) {
+                let (path, exact) = self.prefix_of(dest);
+                if exact {
+                    for i in self.mpath_range(l) {
+                        if is_prefix(&path, &self.mpaths[i].1) {
+                            bit_unset(st.paths_mut(), i);
+                        }
+                    }
+                }
             }
-            st.holds[dest.local as usize].union(&new_holds);
-            st.origins[dest.local as usize].union(new_origins);
+            bits_or(st.holds_mut(l), new_holds.words());
+            bits_or(st.origins_mut(l), new_origins.words());
         }
     }
 
@@ -924,7 +1112,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             for s in &self.succs[b as usize] {
                 locals.union(&self.live_in_block[s.0 as usize]);
             }
-            self.live_loans(st, &locals, skip, b, si)
+            self.live_loans(st, locals.words(), skip, b, si)
         } else {
             BitSet::new(0)
         };
@@ -997,9 +1185,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     /// The parameter locals that the synthetic loans in `holds` stand for.
-    fn loan_origins(&self, holds: &BitSet) -> Vec<Local> {
+    fn loan_origins(&self, holds: &[u64]) -> Vec<Local> {
         let mut out: Vec<Local> = Vec::new();
-        for li in holds.iter() {
+        for li in bit_iter(holds) {
             let loan = &self.loans[li];
             if loan.synthetic && !out.contains(&loan.place.local) {
                 out.push(loan.place.local);
@@ -1071,7 +1259,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         if !direct_param && !through_deref {
             return;
         }
-        let origins = self.loan_origins(&st.holds[root as usize]);
+        let origins = self.loan_origins(st.holds(root as usize));
         if origins.is_empty() {
             return;
         }
@@ -1087,13 +1275,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     fn holds_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
         if let Operand::Copy(p) | Operand::Move(p) = o {
-            out.union(&st.holds[p.local as usize]);
+            out.union_words(st.holds(p.local as usize));
         }
     }
 
     fn origins_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
         if let Operand::Copy(p) | Operand::Move(p) = o {
-            out.union(&st.origins[p.local as usize]);
+            out.union_words(st.origins(p.local as usize));
         }
     }
 
@@ -1119,11 +1307,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 continue;
             }
             let targets: Vec<Local> =
-                st.holds[p.local as usize].iter().filter(|&l| self.loans[l].mutable).map(|l| self.loans[l].place.local).collect();
+                bit_iter(st.holds(p.local as usize)).filter(|&l| self.loans[l].mutable).map(|l| self.loans[l].place.local).collect();
             for t in targets {
                 // Storing into a target behind a parameter needs the same origin check
                 // as a direct assignment behind a parameter reference.
-                let origins = self.loan_origins(&st.holds[t as usize]);
+                let origins = self.loan_origins(st.holds(t as usize));
                 if !origins.is_empty() {
                     if self.collecting {
                         self.escaped.union(&incoming_origins);
@@ -1132,8 +1320,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         self.check_incoming_loans(&origins, &incoming_origins, t, span);
                     }
                 }
-                st.holds[t as usize].union(&incoming);
-                st.origins[t as usize].union(&incoming_origins);
+                bits_or(st.holds_mut(t as usize), incoming.words());
+                bits_or(st.origins_mut(t as usize), incoming_origins.words());
             }
         }
     }
@@ -1218,19 +1406,19 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 if exact && !path.is_empty() {
                     self.check_partial_move(p, span);
                 }
-                if exact {
-                    let l = p.local as usize;
-                    if path.is_empty() {
-                        st.maybe_init.remove(l);
-                        st.maybe_uninit.insert(l);
-                        st.maybe_moved.insert(l);
-                        st.moved_paths[l].clear();
-                        st.moved_paths[l].insert(path);
-                    } else {
-                        st.moved_paths[l].insert(path);
+                // `collect_move_paths` gave every exact moved place an entry.
+                let l = p.local as usize;
+                match if exact { self.mpath_index(l, &path) } else { None } {
+                    Some(id) => {
+                        if path.is_empty() {
+                            bit_unset(st.init_mut(), l);
+                            bit_set(st.uninit_mut(), l);
+                            bit_set(st.moved_mut(), l);
+                            self.clear_paths(st, l);
+                        }
+                        bit_set(st.paths_mut(), id);
                     }
-                } else {
-                    self.bad_move(p, span);
+                    None => self.bad_move(p, span),
                 }
             }
             Operand::Const(_) => {}
@@ -1392,21 +1580,24 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let (path, exact) = self.prefix_of(p);
         // A moved field blocks uses of itself, of fields below it, and of every value
         // that contains it. A sibling field is fine.
-        for m in &st.moved_paths[l] {
+        let hit = self.moved_paths(st, l).find_map(|m| {
+            if is_prefix(m, &path) {
+                Some("use of moved value")
+            } else if exact && is_prefix(&path, m) {
+                Some("use of partially moved value")
+            } else {
+                None
+            }
+        });
+        if let Some(what) = hit {
             let name = self.local_name(p.local);
             let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
-            if is_prefix(m, &path) {
-                self.err("L0301", span, format!("use of moved value: {name}"), fix);
-                return;
-            }
-            if exact && is_prefix(&path, m) {
-                self.err("L0301", span, format!("use of partially moved value: {name}"), fix);
-                return;
-            }
+            self.err("L0301", span, format!("{what}: {name}"), fix);
+            return;
         }
-        if st.maybe_uninit.contains(l) {
+        if bit_has(st.uninit(), l) {
             let name = self.local_name(p.local);
-            if st.maybe_moved.contains(l) {
+            if bit_has(st.moved(), l) {
                 let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
                 self.err("L0301", span, format!("use of moved value: {name}"), fix);
             } else {
@@ -1430,18 +1621,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
         let l = p.local as usize;
         let (path, exact) = self.prefix_of(p);
-        for m in &st.moved_paths[l] {
-            let under_moved = is_prefix(m, &path) && !(exact && m.len() == path.len());
-            if under_moved {
-                let name = self.local_name(p.local);
-                let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
-                self.err("L0301", span, format!("use of moved value: {name}"), fix);
-                return;
-            }
-        }
-        if st.maybe_uninit.contains(l) && st.moved_paths[l].is_empty() {
+        if self.moved_paths(st, l).any(|m| is_prefix(m, &path) && !(exact && m.len() == path.len())) {
             let name = self.local_name(p.local);
-            if st.maybe_moved.contains(l) {
+            let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
+            self.err("L0301", span, format!("use of moved value: {name}"), fix);
+            return;
+        }
+        if bit_has(st.uninit(), l) && self.moved_paths(st, l).next().is_none() {
+            let name = self.local_name(p.local);
+            if bit_has(st.moved(), l) {
                 let fix = "Clone the value before the move with `.clone()`, or borrow it with `&` instead of moving it.";
                 self.err("L0301", span, format!("use of moved value: {name}"), fix);
             } else {
@@ -1593,8 +1781,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // Every loan the return value ever held counts (see `State::origins`): a local
         // that first borrowed from a local value and only later from the right parameter
         // still cannot be returned, because its lifetime is fixed.
-        let mut holds = st.holds[0].clone();
-        holds.union(&st.origins[0].clone());
+        let mut holds = BitSet::new(self.loans.len());
+        holds.union_words(st.holds(0));
+        holds.union_words(st.origins(0));
         for li in holds.iter() {
             let loan = &self.loans[li];
             let root = loan.place.local;
@@ -1624,7 +1813,28 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::BitSet;
+    use super::{BitSet, Shape, State, bit_has, bit_iter, bit_set};
+
+    /// The flat state keeps every set apart: a bit in one local's loan row
+    /// shows up in no other row or set, and a join reports only new bits.
+    #[test]
+    fn flat_state_rows_are_disjoint() {
+        let sh = Shape { n: 70, wn: 2, wl: 2, wm: 1 };
+        let mut a = State::new(sh);
+        bit_set(a.holds_mut(69), 127);
+        bit_set(a.origins_mut(0), 0);
+        bit_set(a.uninit_mut(), 69);
+        bit_set(a.paths_mut(), 5);
+        assert_eq!(bit_iter(a.holds(69)).collect::<Vec<_>>(), vec![127]);
+        assert!((0..69).all(|l| bit_iter(a.holds(l)).next().is_none()));
+        assert!(bit_has(a.origins(0), 0) && !bit_has(a.holds(0), 0));
+        assert!(bit_has(a.uninit(), 69) && !bit_has(a.init(), 69) && !bit_has(a.moved(), 69));
+        assert_eq!(bit_iter(a.paths()).collect::<Vec<_>>(), vec![5]);
+        let mut b = State::new(sh);
+        assert!(b.join(&a), "new bits are a change");
+        assert!(!b.join(&a), "the same bits are not");
+        assert!(b == a);
+    }
 
     /// One-word sets stay inline; wider sets spill to the heap form; both
     /// answer the same operations across the boundary.
