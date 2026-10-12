@@ -812,6 +812,22 @@ pub fn resolve_scoped(
         },
         TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
         TyExpr::Dyn { bounds, .. } => resolve_dyn(ast, interner, known, cx, tys, scope, bounds, span),
+        TyExpr::FnPtr { qual, inputs, variadic, ret, .. } => {
+            if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
+                return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));
+            }
+            let mut ins = Vec::with_capacity(inputs.len());
+            for p in inputs {
+                ins.push(resolve_scoped(ast, interner, known, cx, tys, p.ty, scope)?);
+            }
+            let out = match ret {
+                Some(r) => resolve_scoped(ast, interner, known, cx, tys, *r, scope)?,
+                None => UNIT,
+            };
+            let inputs = tys.intern_tys(&ins);
+            let sig = tys.intern_sig(Binder::plain(FnSig { inputs, output: out, is_unsafe: false, extern_c: false }));
+            Ok(tys.intern(TyKind::FnPtr(sig)))
+        }
         TyExpr::QPath { self_ty, trait_path, segs } => {
             let base = resolve_scoped(ast, interner, known, cx, tys, *self_ty, scope)?;
             if trait_path.is_empty() {

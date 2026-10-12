@@ -1,4 +1,3 @@
-// expect: L0602
 fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
     f(x)
 }

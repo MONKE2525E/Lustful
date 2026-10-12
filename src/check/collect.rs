@@ -387,6 +387,27 @@ pub fn resolve_ty(
             Ok(tys.intern(TyKind::Array(e, c)))
         }
         TyExpr::Paren(inner) => resolve_ty(ast, interner, known, type_names, aliases, tys, *inner, self_ty),
+        TyExpr::FnPtr { qual, inputs, variadic, ret, .. } => {
+            if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
+                return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));
+            }
+            let mut ins = Vec::with_capacity(inputs.len());
+            for p in inputs {
+                ins.push(resolve_ty(ast, interner, known, type_names, aliases, tys, p.ty, self_ty)?);
+            }
+            let out = match ret {
+                Some(r) => resolve_ty(ast, interner, known, type_names, aliases, tys, *r, self_ty)?,
+                None => UNIT,
+            };
+            let inputs = tys.intern_tys(&ins);
+            let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig {
+                inputs,
+                output: out,
+                is_unsafe: false,
+                extern_c: false,
+            }));
+            Ok(tys.intern(TyKind::FnPtr(sig)))
+        }
         _ => Err(not_yet("L0602", span, "this type form")),
     }
 }

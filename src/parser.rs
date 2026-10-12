@@ -1627,7 +1627,44 @@ impl<'a> Parser<'a> {
                 };
                 Ok(self.push_ty(TyExpr::Dyn { binder, bounds, lifetime }, start.to(self.prev_span())))
             }
-            Tok::Fn => Err(not_yet(C_TY, start, "function pointer types")),
+            Tok::Fn => {
+                // A plain function pointer type: `fn(A, B) -> R`, with
+                // optionally named inputs. `unsafe fn`, `extern fn`, and
+                // variadic forms stay rejected below (they reach here
+                // only as the bare `fn` token).
+                self.bump();
+                self.expect(Tok::LParen, "`(` after `fn`")?;
+                let mut inputs = Vec::new();
+                let mut variadic = false;
+                while self.peek() != Tok::RParen {
+                    if self.peek() == Tok::DotDot && self.peek_at(1) == Tok::Dot {
+                        variadic = true;
+                        break;
+                    }
+                    let pstart = self.span();
+                    let name = if matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == Tok::Colon {
+                        let Tok::Ident(n) = self.bump().tok else { unreachable!() };
+                        self.bump();
+                        Some(n)
+                    } else {
+                        None
+                    };
+                    let ty = self.ty()?;
+                    inputs.push(crate::ast::FtyParam { name, ty, attrs: Vec::new(), span: pstart.to(self.prev_span()) });
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen, "`)`")?;
+                if variadic {
+                    return Err(not_yet(C_TY, start, "variadic function pointer types"));
+                }
+                let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+                Ok(self.push_ty(
+                    TyExpr::FnPtr { binder: Vec::new(), qual: FnQual::default(), inputs, variadic: false, ret },
+                    start.to(self.prev_span()),
+                ))
+            }
             Tok::Star => {
                 self.bump();
                 let mutable = if self.eat(Tok::Mut) {
