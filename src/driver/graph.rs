@@ -7,9 +7,13 @@
 // W-TRAITS-CORE, W-MACRO) code against these functions. Today's single-file,
 // single-module resolver sits behind them; W-RESOLVE replaces that resolver
 // with the module tree and import worklist of section 1.3 without changing any
-// caller. S7 is record-only: reads are stored on the checked body, and no
-// invalidation consumes them yet (the name-based prefilter in compile.rs still
-// decides what an edit rechecks, per section 8.2's staging rule).
+// caller. S7 was record-only. W-DRIVER (wave A) turns reads into reuse
+// for `Binding` nodes first: `Program::reads_dirty` below recomputes each
+// recorded node's fingerprint in the new program, and compile.rs drops a
+// recheck candidate only when its body is unchanged and every recorded
+// read still matches. Reuse is restricted to signature-only edits (the
+// name-based prefilter in compile.rs still bounds the candidate set, per
+// section 8.2's staging rule); full rebuilds do not reuse yet.
 //
 // Fingerprints here hash normalized content only: name strings, stable def
 // path hashes, and type structure. They never hash a `Sym`, a `Ty`, an
@@ -252,6 +256,12 @@ impl Reads {
     pub fn keys(&self) -> impl Iterator<Item = &ReadKey> {
         self.map.keys()
     }
+
+    /// Every recorded (key, read) pair, in hash order. The dirty walk
+    /// (`Program::reads_dirty`) iterates this; order does not matter there.
+    pub fn iter(&self) -> impl Iterator<Item = (&ReadKey, &Read)> {
+        self.map.iter()
+    }
 }
 
 // ---------- Fingerprints ----------
@@ -447,14 +457,20 @@ fn ty_fingerprint(p: &Program, t: Ty) -> Fingerprint {
 }
 
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved
-/// def in disk form, or ambiguous, or absent).
+/// def in disk form, or ambiguous, or absent). Wave A also folds the
+/// resolved def's `Sig` fingerprint in: read-based reuse must not keep a
+/// body that recorded only the binding (a fn used as a value, say) when
+/// that def's signature changed. This is coarser than section 8.1's
+/// node split and can narrow once read-coverage reviews prove every
+/// signature use records a `Sig` read.
 fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
     let mut h = FxHasher::default();
-    "binding-v1".hash(&mut h);
+    "binding-v2".hash(&mut h);
     match res {
         BindingRes::Def(def) => {
             0u8.hash(&mut h);
             hash_def(&mut h, p, def);
+            sig_fingerprint(p, def).0.hash(&mut h);
         }
         BindingRes::Ambiguous => 1u8.hash(&mut h),
         BindingRes::Absent => 2u8.hash(&mut h),
@@ -463,12 +479,15 @@ fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
 }
 
 /// The fingerprint of a `MethodSet` node's candidate list, in probe order.
+/// Candidate `Sig` fingerprints fold in for the same reason as in
+/// `binding_fingerprint`.
 fn method_set_fingerprint(p: &Program, set: &MethodSet) -> Fingerprint {
     let mut h = FxHasher::default();
-    "method-set-v1".hash(&mut h);
+    "method-set-v2".hash(&mut h);
     (set.candidates.len() as u64).hash(&mut h);
     for c in &set.candidates {
         hash_def(&mut h, p, c.def);
+        sig_fingerprint(p, c.def).0.hash(&mut h);
         match c.trait_ {
             Some(t) => hash_def(&mut h, p, t),
             None => 0u64.hash(&mut h),
@@ -577,38 +596,45 @@ impl<'a> Program<'a> {
     /// until W-MACRO. W-RESOLVE replaces this body with the section 1.3
     /// worklist result; the signature does not change.
     pub fn binding(&self, reads: &mut Reads, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
-        let res = if module != ROOT_MODULE {
-            BindingRes::Absent
-        } else {
-            match ns {
-                Namespace::Value => match self.fn_names.get(&name) {
-                    Some(&f) => BindingRes::Def(self.def_id(f)),
-                    None => match self.type_names.get(&name) {
-                        // A struct's name in value space is its constructor.
-                        Some(&a) if !self.adt(a).is_enum => BindingRes::Def(self.def_of_adt(a)),
-                        _ => BindingRes::Absent,
-                    },
-                },
-                Namespace::Type => match self.type_names.get(&name) {
-                    Some(&a) => BindingRes::Def(self.def_of_adt(a)),
-                    None => {
-                        let b = self.tys.builtins();
-                        if name == self.known.String {
-                            BindingRes::Def(b.string)
-                        } else if name == self.known.Vec {
-                            BindingRes::Def(b.vec)
-                        } else if name == self.known.Option {
-                            BindingRes::Def(b.option)
-                        } else {
-                            BindingRes::Absent
-                        }
-                    }
-                },
-                Namespace::Macro => BindingRes::Absent,
-            }
-        };
+        let res = self.binding_res(module, ns, name);
         reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || binding_fingerprint(self, res));
         res
+    }
+
+    /// The binding answer without recording. The dirty walk replays old
+    /// reads against the new program through this; `binding` is the only
+    /// recording door. W-RESOLVE replaces this body together with
+    /// `binding`'s resolver (see `binding`).
+    fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
+        if module != ROOT_MODULE {
+            return BindingRes::Absent;
+        }
+        match ns {
+            Namespace::Value => match self.fn_names.get(&name) {
+                Some(&f) => BindingRes::Def(self.def_id(f)),
+                None => match self.type_names.get(&name) {
+                    // A struct's name in value space is its constructor.
+                    Some(&a) if !self.adt(a).is_enum => BindingRes::Def(self.def_of_adt(a)),
+                    _ => BindingRes::Absent,
+                },
+            },
+            Namespace::Type => match self.type_names.get(&name) {
+                Some(&a) => BindingRes::Def(self.def_of_adt(a)),
+                None => {
+                    let b = self.tys.builtins();
+                    if name == self.known.String {
+                        BindingRes::Def(b.string)
+                    } else if name == self.known.Vec {
+                        BindingRes::Def(b.vec)
+                    } else if name == self.known.Option {
+                        BindingRes::Def(b.option)
+                    } else {
+                        BindingRes::Absent
+                    }
+                }
+            },
+            Namespace::Macro => BindingRes::Absent,
+        }
     }
 
     /// The macro-namespace binding query of section 8.2, recorded at every
@@ -631,6 +657,14 @@ impl<'a> Program<'a> {
     /// is still recorded, with the empty-bucket fingerprint, so the probe is
     /// on record when source std turns those builtins into real defs.
     pub fn method_set(&self, reads: &mut Reads, head: Head, name: Sym, form: ReceiverForm) -> MethodSet {
+        let set = self.method_candidates(head, name, form);
+        let failed = set.candidates.is_empty();
+        reads.record_with(ReadKey::MethodSet(MethodSetKey { head, name, form }), failed, || method_set_fingerprint(self, &set));
+        set
+    }
+
+    /// The method candidate set without recording. See `binding_res`.
+    fn method_candidates(&self, head: Head, name: Sym, form: ReceiverForm) -> MethodSet {
         let mut set = MethodSet::default();
         if let Head::Adt(def) = head
             && let Some(a) = self.adt_by_def(def)
@@ -648,8 +682,6 @@ impl<'a> Program<'a> {
                 set.candidates.push(MethodCandidate { def: self.def_id(f), receiver, trait_: None });
             }
         }
-        let failed = set.candidates.is_empty();
-        reads.record_with(ReadKey::MethodSet(MethodSetKey { head, name, form }), failed, || method_set_fingerprint(self, &set));
         set
     }
 
@@ -707,6 +739,52 @@ impl<'a> Program<'a> {
     /// read that produced the def.
     pub fn binding_kind(&self, def: DefId) -> Option<DefsKind> {
         self.defs.kind_of(def)
+    }
+
+    /// What one recorded read would answer in this program now, without
+    /// recording anything: the node fingerprint and failed flag the query
+    /// functions above would store today. The dirty walk compares this
+    /// with the stored read (section 8.2 rule 2). `Checked` reads carry a
+    /// mono body fingerprint this stage cannot recompute (no mono stage
+    /// records them yet), so they report a sentinel that never matches a
+    /// stored fingerprint: a body with such a read always rechecks.
+    pub fn read_fingerprint(&self, key: &ReadKey) -> Read {
+        match key {
+            ReadKey::Binding(k) => {
+                let res = self.binding_res(k.module, k.ns, k.name);
+                Read { fingerprint: binding_fingerprint(self, res), failed: res == BindingRes::Absent }
+            }
+            ReadKey::MethodSet(k) => {
+                let set = self.method_candidates(k.head, k.name, k.form);
+                Read { fingerprint: method_set_fingerprint(self, &set), failed: set.candidates.is_empty() }
+            }
+            ReadKey::ImplSet(_) => {
+                let set = ImplSet::default();
+                Read { fingerprint: impl_set_fingerprint(self, &set), failed: true }
+            }
+            ReadKey::Sig(def) => {
+                let known = self.local_def(def.hash).filter(|l| self.def_id(*l) == *def).is_some()
+                    || self.adt_by_def(*def).is_some()
+                    || self.defs.get(*def).is_some();
+                Read { fingerprint: sig_fingerprint(self, *def), failed: !known }
+            }
+            ReadKey::Layout(def) => {
+                let known = self.adt_by_def(*def).is_some() || self.defs.get(*def).is_some();
+                Read { fingerprint: sig_fingerprint(self, *def), failed: !known }
+            }
+            ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
+        }
+    }
+
+    /// The dirty walk of section 8.3 step 5, one body at a time: how many
+    /// of `reads` no longer match this program. Zero means every node the
+    /// body read (per-name bindings, method-set probes hit and miss,
+    /// failed lookups, signatures) has the same answer as when the body
+    /// was checked, so the stored result can be reused if the body itself
+    /// is unchanged. The count (not just a bool) feeds the scale gate's
+    /// invalidated-query row.
+    pub fn reads_dirty(&self, reads: &Reads) -> usize {
+        reads.iter().filter(|(k, stored)| self.read_fingerprint(k) != **stored).count()
     }
 }
 
@@ -1193,5 +1271,60 @@ fn main() {}
             let _ = builtin_calls;
             assert!(crate::borrowck::borrowck(p, &body).is_empty(), "the sample borrow-checks clean");
         });
+    }
+
+    /// Collects `src` under a shared interner (as one session does across
+    /// requests) and returns main's recorded reads. The program itself is
+    /// dropped; reads hold only stable keys (`Sym` in the shared
+    /// interner, path-hash `DefId`s), so they replay against the next
+    /// program built on the same interner.
+    fn main_reads(interner: &Interner, known: &Known, src: &str) -> Reads {
+        let lexed = lexer::lex(src, FileId(0), 0, interner).unwrap();
+        let ast = parser::parse(&lexed, interner, known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, interner, known, ids).unwrap();
+        let (ck, _) = check_fn(&program, program.main.unwrap());
+        ck.reads
+    }
+
+    /// Dirty counts of `reads` replayed against a fresh collect of `src`
+    /// on the same interner. See `main_reads`.
+    fn dirty_in(interner: &Interner, known: &Known, src: &str, reads: &Reads) -> usize {
+        let lexed = lexer::lex(src, FileId(0), 0, interner).unwrap();
+        let ast = parser::parse(&lexed, interner, known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, interner, known, ids).unwrap();
+        program.reads_dirty(reads)
+    }
+
+    /// The dirty walk (8.3 step 5): an unrelated added fn dirties nothing
+    /// a body read; a callee signature edit, a moved method candidate,
+    /// and a failed lookup that now resolves each dirty the body that
+    /// read them (8.2 rule 3).
+    #[test]
+    fn dirty_walk_replays_reads_against_new_program() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let reads = main_reads(&interner, &known, SAMPLE);
+        // Same program: clean by construction.
+        assert_eq!(dirty_in(&interner, &known, SAMPLE, &reads), 0, "unchanged program");
+        // One new unrelated pub fn: no read of main names it, so the walk
+        // reuses main (the scale-gate new-fn scenario in miniature).
+        let added = format!("{SAMPLE}fn extra() -> i64 {{ 3 }}\n");
+        assert_eq!(dirty_in(&interner, &known, &added, &reads), 0, "unrelated fn added");
+        // Callee signature edit (helper returns bool now): the Sig read
+        // and the Binding read (sig folded in) both move.
+        let sig_edit = SAMPLE.replace("fn helper() -> i64 { 40 }", "fn helper() -> bool { true }");
+        assert!(dirty_in(&interner, &known, &sig_edit, &reads) >= 2, "callee sig edit dirties");
+        // Method receiver edit (&self -> &mut self): the recorded Ref
+        // probe hit becomes a miss, so the method-set read moves.
+        let method_edit = SAMPLE.replace("fn get(&self)", "fn get(&mut self)");
+        assert!(dirty_in(&interner, &known, &method_edit, &reads) >= 1, "method probe edit dirties");
+        // Failed lookup: a body that called a missing fn rechecks once
+        // the fn exists, and only because its failed Binding read moved.
+        let failing = main_reads(&interner, &known, "fn main() { println!(\"{}\", nosuch()); }\n");
+        assert_eq!(dirty_in(&interner, &known, "fn main() { println!(\"{}\", nosuch()); }\n", &failing), 0, "still missing");
+        let fixed = "fn nosuch() -> i64 { 1 }\nfn main() { println!(\"{}\", nosuch()); }\n";
+        assert!(dirty_in(&interner, &known, fixed, &failing) >= 1, "added def dirties the failed lookup");
     }
 }

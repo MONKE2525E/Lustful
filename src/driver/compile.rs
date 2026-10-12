@@ -6,7 +6,11 @@
 //      re-check, and re-generate only those functions.
 //   2. Only top-level functions were added, removed, or changed signature (all other items the
 //      same): re-parse the file, but re-check and re-generate only the changed functions and the
-//      bodies that mention their names.
+//      bodies that mention their names. A mention-only candidate whose body is unchanged and
+//      whose recorded reads all still match the new program (`Program::reads_dirty`, the
+//      section 8.3 step 5 dirty walk for Binding and MethodSet nodes first) is reused without
+//      a recheck: per-name binding reads, method-set probes, and failed lookups are precise
+//      where name mentions are not. Candidates with no stored reads always recheck.
 //   3. Anything else (a type, an impl, a use changed): full rebuild.
 use super::session::{Caches, Chunk, Front, Session};
 use super::{Cmd, Request, Response};
@@ -50,6 +54,56 @@ impl Timer {
             let _ = writeln!(out, "  {name:<24} {ms:>9.2} ms");
         }
         let _ = writeln!(out, "  {:<24} {:>9.2} ms", "total", self.start.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
+/// True when `LUST_STATS` is set to a value other than "" or "0". Stats go
+/// to stderr as one `lust-stats:` line per compile; the scale gate
+/// (scripts/scale-gate.py) parses them. Off by default: user output does
+/// not change.
+fn stats_on() -> bool {
+    matches!(std::env::var("LUST_STATS"), Ok(v) if !v.is_empty() && v != "0")
+}
+
+/// One compile's scale-gate counters (docs/ARCH.md section 9.3 scale
+/// gate), rendered as a single line. `c_bytes` counts C text emitted
+/// this compile (units actually generated), `dirty_units` the fn units
+/// whose objects were (re)compiled or served as overlays, and
+/// `unit_cache_hits` the units whose object came from the disk unit
+/// cache instead of tcc. Instance count is the live slot count: today
+/// one instance per fn (mono instances join with generics).
+#[derive(Default)]
+struct Stats {
+    mode: &'static str,
+    fns: usize,
+    rechecked: usize,
+    reused: usize,
+    invalidated: usize,
+    c_bytes: usize,
+    dirty_units: usize,
+    units_compiled: usize,
+    unit_cache_hits: usize,
+    table_rebuilt: bool,
+    instances: usize,
+}
+
+impl Stats {
+    fn render(&self, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "lust-stats: mode={} fns={} rechecked={} reused={} invalidated={} c_bytes={} dirty_units={} units_compiled={} unit_cache_hits={} table_rebuilt={} instances={}",
+            self.mode,
+            self.fns,
+            self.rechecked,
+            self.reused,
+            self.invalidated,
+            self.c_bytes,
+            self.dirty_units,
+            self.units_compiled,
+            self.unit_cache_hits,
+            self.table_rebuilt as u8,
+            self.instances,
+        );
     }
 }
 
@@ -461,9 +515,12 @@ fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Resp
 }
 
 /// After a parse that was not "bodies only": update item tables, assign slots by
-/// stable def hash, and pick the functions to re-check. Returns their local ids
-/// as indexes. The one failure is a def hash collision (src/def.rs): an internal
-/// error the caller turns into a code 3 response.
+/// stable def hash, and pick the functions to re-check. Returns (changed,
+/// mention_only): changed local ids as indexes, plus the subset that changed
+/// only by mentioning a changed name (body hash equal, last check passed).
+/// Mention-only functions are the candidates the read-set dirty walk can
+/// reuse after collect. The one failure is a def hash collision (src/def.rs):
+/// an internal error the caller turns into a code 3 response.
 #[allow(clippy::too_many_arguments)]
 fn slot_update(
     front: &mut Front,
@@ -476,7 +533,7 @@ fn slot_update(
     crate_ids: CrateIds,
     scan_of: &dyn Fn(&Front, usize) -> (u64, u32),
     t: &mut Timer,
-) -> Result<Vec<usize>, String> {
+) -> Result<(Vec<usize>, Vec<usize>), String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
     front.env_hash = Some(env);
@@ -488,6 +545,7 @@ fn slot_update(
         caches.ok.clear();
         caches.out.clear();
         caches.has_out.clear();
+        caches.slot_reads.clear();
         front.slot_hash.clear();
         caches.glue = GlueSet::default();
         caches.objects = None;
@@ -528,29 +586,41 @@ fn slot_update(
     caches.ok.resize(n_slots, false);
     caches.has_out.resize(n_slots, false);
     caches.out.resize_with(n_slots, FnOut::default);
+    caches.slot_reads.resize_with(n_slots, || None);
     front.slot_hash.resize(n_slots, 0);
     for slot in (0..n_slots).filter(|&s| !live[s]) {
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
         caches.ok[slot] = true;
+        caches.slot_reads[slot] = None;
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
-    // function's name (only possible in the "signatures" case).
+    // function's name (only possible in the "signatures" case). A function in the last
+    // group only (same body hash, last check passed) is a reuse candidate for the read-set
+    // dirty walk after collect; its `has_out` is cleared only if the walk keeps it changed,
+    // which the caller does when it stays in the work set (see the walk in `compile`).
     let names = changed_names.unwrap_or_default();
     let mut changed = Vec::new();
+    let mut mention_only = Vec::new();
     for i in 0..fn_count {
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
         let mentions = idents.iter().any(|s| names.contains(s)) || keys[i].free && names.contains(&keys[i].name);
-        if front.slot_hash[slot] != hash || !caches.ok[slot] || mentions {
+        let body_same = front.slot_hash[slot] == hash;
+        if !body_same || !caches.ok[slot] || mentions {
+            if body_same && caches.ok[slot] && mentions {
+                mention_only.push(i);
+            } else {
+                caches.has_out[slot] = false;
+                caches.slot_reads[slot] = None;
+            }
             front.slot_hash[slot] = hash;
-            caches.has_out[slot] = false;
             changed.push(i);
         }
     }
     t.lap(if names.is_empty() { "parse (par)" } else { "parse changed chunks" });
-    Ok(changed)
+    Ok((changed, mention_only))
 }
 
 /// Function names whose signature changed, or that were added or removed, if those are the only
@@ -872,7 +942,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         "full"
     };
 
-    let changed: Vec<usize> = if bodies_only {
+    let (mut changed, mention_only): (Vec<usize>, Vec<usize>) = if bodies_only {
         let changed: Vec<usize> = (0..fn_count)
             .filter(|&i| {
                 let slot = front.fn_slot[i] as usize;
@@ -887,6 +957,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let slot = front.fn_slot[i] as usize;
             front.slot_hash[slot] = f.body_hash;
             caches.has_out[slot] = false;
+            if let Some(r) = caches.slot_reads.get_mut(slot) {
+                *r = None;
+            }
             match parser::parse_body(toks, &chunk.lexed.strings, &mut front.ast, &front.interner, &front.known) {
                 Ok((body, exprs, pats)) => {
                     let (item, sub) = front.fn_loc[i];
@@ -906,7 +979,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         t.lap("parse changed bodies");
-        changed
+        (changed, Vec::new())
     } else if changed_names.is_some() {
         // Only top-level functions changed: parse just the chunks with new text, and splice their
         // items between the unchanged chunks' items.
@@ -1011,6 +1084,43 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     t.lap("collect");
 
+    // Read-set dirty walk (section 8.3 step 5, Binding nodes first): a
+    // mention-only candidate from a signature-only edit whose recorded
+    // reads all still match this program keeps its last passing result
+    // (check state and C). Candidates with no stored reads, or with any
+    // dirty read (a changed binding answer, a moved method candidate, a
+    // failed lookup that now resolves), stay in the work set and lose
+    // their stored C, exactly as before this walk existed.
+    let mut reads_reused = 0usize;
+    let mut reads_invalidated = 0usize;
+    if mode == "signatures" && !mention_only.is_empty() {
+        let slot_at = |i: usize| front.fn_slot[i] as usize;
+        // Clone the candidate read sets out of the caches so the walk can
+        // borrow the program while results land back in the caches.
+        let candidates: Vec<(usize, Option<crate::driver::graph::Reads>)> =
+            mention_only.iter().map(|&i| (i, caches.slot_reads.get(slot_at(i)).cloned().flatten())).collect();
+        let mut reused: Vec<usize> = Vec::new();
+        for (i, reads) in candidates {
+            match reads {
+                Some(r) if { let d = program.reads_dirty(&r); reads_invalidated += d; d == 0 } => reused.push(i),
+                Some(_) => {
+                    let s = slot_at(i);
+                    caches.has_out[s] = false;
+                    caches.slot_reads[s] = None;
+                }
+                None => {
+                    let s = slot_at(i);
+                    caches.has_out[s] = false;
+                }
+            }
+        }
+        if !reused.is_empty() {
+            reads_reused = reused.len();
+            changed.retain(|i| !reused.contains(i));
+        }
+        t.lap("reads dirty walk");
+    }
+
     // Front end for the functions that need it. A build also needs IR for functions with no C yet.
     let slot = |i: usize| front.fn_slot[i] as usize;
     let mut work = changed.clone();
@@ -1030,6 +1140,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut diags: Vec<Diag> = Vec::new();
     for (k, &i) in work.iter().enumerate() {
         caches.ok[slot(i)] = results[k].1.is_empty();
+        // Store the read set with the result (section 8.2 rule 2): the
+        // next signature-only edit replays it in the dirty walk above.
+        // Only passing functions get one; a failing function always
+        // rechecks (its `ok` is false), so it needs no read set.
+        if results[k].1.is_empty()
+            && let Some(body) = &results[k].0
+            && let Some(slot_reads) = caches.slot_reads.get_mut(slot(i))
+        {
+            *slot_reads = Some(body.reads.clone());
+        }
         diags.extend(results[k].1.iter().cloned());
     }
     // A lust file is a bin crate, so check needs `main` too, as `rustc --emit=metadata`
@@ -1052,8 +1172,26 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     let mut resp = Response::default();
     if req.cmd == Cmd::Check {
+        if stats_on() {
+            Stats {
+                mode,
+                fns: program.fns.len(),
+                rechecked: work.len(),
+                reused: reads_reused,
+                invalidated: reads_invalidated,
+                instances: front.fn_slot.len(),
+                ..Default::default()
+            }
+            .render(&mut resp.stderr);
+        }
         if req.timings {
-            let _ = writeln!(resp.stderr, "lust check {path}: ok ({} functions, {mode}: {} rechecked)", program.fns.len(), work.len());
+            let _ = writeln!(
+                resp.stderr,
+                "lust check {path}: ok ({} functions, {mode}: {} rechecked, {} reused by reads)",
+                program.fns.len(),
+                work.len(),
+                reads_reused
+            );
             t.render(&mut resp.stderr);
         }
         if leak_at_exit {
@@ -1236,6 +1374,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("link");
+    if stats_on() {
+        Stats {
+            mode,
+            fns: program.fns.len(),
+            rechecked: work.len(),
+            reused: reads_reused,
+            invalidated: reads_invalidated,
+            c_bytes: units.iter().map(|u| u.1.len()).sum(),
+            dirty_units: dirty_fn_units.len(),
+            units_compiled: units.len(),
+            unit_cache_hits: 0,
+            table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
+            instances: front.fn_slot.len(),
+        }
+        .render(&mut resp.stderr);
+    }
     if req.timings {
         let kb = units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
         let _ = writeln!(

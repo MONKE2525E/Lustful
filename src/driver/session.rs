@@ -71,6 +71,13 @@ pub(crate) struct Caches {
     pub(crate) ok: Vec<bool>,
     pub(crate) out: Vec<FnOut>,
     pub(crate) has_out: Vec<bool>,
+    /// The read set of the slot's last passing check (docs/ARCH.md
+    /// section 8.2), stored with the result. On a signature-only edit the
+    /// dirty walk (`Program::reads_dirty`) replays these reads against
+    /// the new program; a body whose reads all still match is reused
+    /// without a recheck. Session-local only (`Sym` and `DefId` keys are
+    /// stable inside one session, never written to disk in this form).
+    pub(crate) slot_reads: Vec<Option<crate::driver::graph::Reads>>,
     pub(crate) glue: GlueSet,
     /// Slots per function unit. Fixed until the next full rebuild, so units stay stable.
     pub(crate) per_unit: usize,
@@ -134,6 +141,7 @@ impl Session {
                 ok: Vec::new(),
                 out: Vec::new(),
                 has_out: Vec::new(),
+                slot_reads: Vec::new(),
                 glue: GlueSet::default(),
                 per_unit: 16,
                 table_cap: 0,
