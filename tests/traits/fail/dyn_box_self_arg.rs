@@ -6,5 +6,5 @@
 trait T {
     fn f(&self, x: Box<Self>);
 }
-fn u(_: &dyn T) {}
+fn u(_x: &dyn T) {}
 fn main() {}

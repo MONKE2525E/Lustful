@@ -5,5 +5,5 @@
 trait T {
     fn g<U>(&self, x: U);
 }
-fn f(_: &dyn T) {}
+fn f(_x: &dyn T) {}
 fn main() {}

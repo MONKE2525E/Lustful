@@ -5,5 +5,5 @@
 trait Bad {
     fn copy(&self) -> Self;
 }
-fn f(_: &dyn Bad) {}
+fn f(_x: &dyn Bad) {}
 fn main() {}

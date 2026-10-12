@@ -298,7 +298,12 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         TyKind::Never => "!".into(),
         TyKind::Int(i) => i.name().into(),
         TyKind::Float(f) => f.name().into(),
-        TyKind::Ref(_, m, e) => format!("&{}{}", if m.is_mut() { "mut " } else { "" }, ty_name(p, tys, e)),
+        TyKind::Ref(_, m, e) => {
+            let inner = ty_name(p, tys, e);
+            // `&(dyn A + Send)`: the parens are part of the Rust syntax.
+            let inner = if matches!(tys.kind(e), TyKind::Dyn(..)) && inner.contains(" + ") { format!("({inner})") } else { inner };
+            format!("&{}{inner}", if m.is_mut() { "mut " } else { "" })
+        }
         TyKind::RawPtr(m, e) => format!("*{}{}", if m.is_mut() { "mut " } else { "const " }, ty_name(p, tys, e)),
         TyKind::Slice(e) => format!("[{}]", ty_name(p, tys, e)),
         TyKind::Array(e, _) => format!("[{}; _]", ty_name(p, tys, e)),
@@ -327,7 +332,24 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         },
         TyKind::FnPtr(_) | TyKind::FnDef(..) => "fn(..)".into(),
         TyKind::Closure(..) => "{closure}".into(),
-        TyKind::Dyn(..) => "dyn ..".into(),
+        TyKind::Dyn(b, r) => {
+            let b = tys.dyn_bounds(b);
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(pr) = b.principal {
+                let name = p.gx.index.trait_record(pr.value.def).map_or("?", |rec| p.name(rec.name));
+                let args: Vec<String> = tys.args(pr.value.args)[1..].iter().filter_map(|g| g.as_ty()).map(|e| ty_name(p, tys, e)).collect();
+                parts.push(if args.is_empty() { name.to_string() } else { format!("{name}<{}>", args.join(", ")) });
+            }
+            for (on, name) in [(b.auto.send, "Send"), (b.auto.sync, "Sync"), (b.auto.unpin, "Unpin")] {
+                if on {
+                    parts.push(name.to_string());
+                }
+            }
+            if r == Region::Static {
+                parts.push("'static".to_string());
+            }
+            format!("dyn {}", parts.join(" + "))
+        }
         TyKind::Opaque(..) => "impl ..".into(),
         TyKind::Param(param) => format!("T{}", param.0),
         TyKind::Projection(..) => "{projection}".into(),

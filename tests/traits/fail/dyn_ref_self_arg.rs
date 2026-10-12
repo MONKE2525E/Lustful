@@ -6,5 +6,5 @@
 trait Bad {
     fn other(&self, value: &Self);
 }
-fn use_object(_: &dyn Bad) {}
+fn use_object(_x: &dyn Bad) {}
 fn main() {}

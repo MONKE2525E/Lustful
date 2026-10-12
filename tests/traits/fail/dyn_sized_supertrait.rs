@@ -5,5 +5,5 @@
 trait T: Sized {
     fn v(&self) -> u8;
 }
-fn f(_: &dyn T) {}
+fn f(_x: &dyn T) {}
 fn main() {}

@@ -5,5 +5,5 @@
 trait T {
     const C: u8;
 }
-fn f(_: &dyn T) {}
+fn f(_x: &dyn T) {}
 fn main() {}
