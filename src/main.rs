@@ -27,6 +27,8 @@ mod lower;
 mod mono;
 mod parser;
 mod protocol;
+#[allow(dead_code)] // Wired into the driver by the worklist increment.
+mod resolve;
 mod scan;
 mod stdload;
 mod tcc;

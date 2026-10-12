@@ -154,3 +154,349 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending;
     ChunkScan { fns, items, body_idents, ends_at_boundary }
 }
+
+// ---------- Outline scan (docs/ARCH.md section 1.2) ----------
+//
+// Module discovery is a scan, not a full parse: the resolve worklist reads the
+// outline of a file to decide which files to load and which macro names exist
+// before any file is parsed. The outline records `mod` declarations (name,
+// visibility, `#[path]`, raw `#[cfg]` tokens, inline or file), `use` header
+// spans, and `macro_rules!` names, at module item level (the top level plus
+// inline module bodies). It never looks inside fn bodies or impl blocks.
+// Attribute contents stay raw tokens: cfg evaluation (src/resolve/cfg.rs) is
+// the only reader, exactly as with the AST attribute record.
+
+/// Visibility of an outline item, as written. The restricted path itself is
+/// read from the AST later; the outline only needs the three-way split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutlineVis {
+    Private,
+    Pub,
+    Restricted,
+}
+
+/// One `mod` declaration in a file outline.
+#[allow(dead_code)] // Fields are read by the resolve worklist as it lands.
+#[derive(Clone, Debug)]
+pub struct ModDecl {
+    pub name: Sym,
+    pub vis: OutlineVis,
+    /// The value of a `#[path = "..."]` attribute, when written.
+    pub path_attr: Option<String>,
+    /// The token trees inside each `#[cfg(...)]` on the declaration, raw.
+    pub cfg: Vec<Vec<crate::lexer::TokenTree>>,
+    /// True for `mod m { ... }`, false for `mod m;`.
+    pub inline: bool,
+    /// True when a `#[macro_use]` attribute is present.
+    pub macro_use: bool,
+    /// The inline module path that contains this declaration (empty at the
+    /// top level of the file). One segment per enclosing inline `mod`.
+    pub container: Vec<Sym>,
+    pub span: crate::diag::Span,
+}
+
+/// One `macro_rules!` definition name in a file outline.
+#[allow(dead_code)] // Fields are read by the resolve worklist as it lands.
+#[derive(Clone, Copy, Debug)]
+pub struct MacroDecl {
+    pub name: Sym,
+    /// True when a `#[macro_export]` attribute is present.
+    pub exported: bool,
+    /// True when `#[macro_export]` also carries `local_inner_macros`.
+    pub local_inner: bool,
+    pub container: (usize, usize),
+    pub span: crate::diag::Span,
+}
+
+/// The outline of one lexed file: module edges, import headers, macro names.
+#[derive(Clone, Debug, Default)]
+pub struct Outline {
+    pub mods: Vec<ModDecl>,
+    /// Spans of `use` declarations at module item level, for hashing and for
+    /// the worklist's quick "has imports" test. The trees themselves come
+    /// from the AST.
+    pub uses: Vec<crate::diag::Span>,
+    pub macros: Vec<MacroDecl>,
+    /// True when the file starts with an inner `#![...]` attribute list that
+    /// names `macro_use` (all modules see textual macros) — recorded for the
+    /// macro scope walk; other inner attributes are the parser's business.
+    pub inner_macro_use: bool,
+}
+
+/// Attributes pending in front of an outline item, reduced to what the
+/// outline records. String values come from the lexed string table.
+#[derive(Default)]
+struct PendingAttrs {
+    path_attr: Option<String>,
+    cfg: Vec<Vec<crate::lexer::TokenTree>>,
+    macro_use: bool,
+    macro_export: bool,
+    local_inner: bool,
+}
+
+/// Builds token trees from a flat token slice (same nesting rule as the
+/// parser's attribute storage). Used only for `#[cfg(...)]` contents.
+fn outline_trees(toks: &[crate::lexer::Token]) -> Vec<crate::lexer::TokenTree> {
+    use crate::lexer::{Delim, TokenTree};
+    fn delim_of(t: Tok) -> Option<Delim> {
+        match t {
+            Tok::LParen => Some(Delim::Paren),
+            Tok::LBracket => Some(Delim::Bracket),
+            Tok::LBrace => Some(Delim::Brace),
+            _ => None,
+        }
+    }
+    fn closes(open: Delim, t: Tok) -> bool {
+        matches!((open, t), (Delim::Paren, Tok::RParen) | (Delim::Bracket, Tok::RBracket) | (Delim::Brace, Tok::RBrace))
+    }
+    fn build(toks: &[crate::lexer::Token], pos: &mut usize, close: Option<Delim>, depth: u32) -> Vec<TokenTree> {
+        let mut out = Vec::new();
+        while let Some(t) = toks.get(*pos) {
+            if close.is_some_and(|d| closes(d, t.tok)) {
+                *pos += 1;
+                break;
+            }
+            *pos += 1;
+            if let Some(d) = delim_of(t.tok).filter(|_| depth < 256) {
+                let inner = build(toks, pos, Some(d), depth + 1);
+                out.push(TokenTree::Delim(d, inner, t.span));
+            } else {
+                out.push(TokenTree::Token(*t));
+            }
+        }
+        out
+    }
+    let mut pos = 0;
+    build(toks, &mut pos, None, 0)
+}
+
+/// Scans one whole lexed file into an outline. The file must be lexed from
+/// its start (brace depth begins at 0), unlike chunk scans.
+pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
+    let toks = &lexed.tokens;
+    let mut out = Outline::default();
+    // Brace stack: Some(name) for an inline module body, None for any other
+    // brace. Items are outline-visible exactly when every open brace is an
+    // inline module body.
+    let mut braces: Vec<Option<Sym>> = Vec::new();
+    let mut pending = PendingAttrs::default();
+    let mut pending_vis = OutlineVis::Private;
+    // (name span, container depth) of a `mod name` whose `{` is still coming.
+    let mut mod_brace_for: Option<Sym> = None;
+    let mut i = 0;
+    let at_item_level = |braces: &[Option<Sym>]| braces.iter().all(|b| b.is_some());
+    let container_of = |braces: &[Option<Sym>]| braces.iter().filter_map(|b| *b).collect::<Vec<Sym>>();
+    while i < toks.len() {
+        let t = toks[i].tok;
+        match t {
+            Tok::Eof => break,
+            Tok::LBrace => {
+                braces.push(if at_item_level(&braces) { mod_brace_for.take() } else { None });
+                i += 1;
+            }
+            Tok::RBrace => {
+                braces.pop();
+                pending = PendingAttrs::default();
+                pending_vis = OutlineVis::Private;
+                mod_brace_for = None;
+                i += 1;
+            }
+            _ if !at_item_level(&braces) => {
+                i += 1;
+            }
+            Tok::Pound => {
+                // One attribute: `#` `!`? `[` ... `]`. Read the name, then
+                // reduce the forms the outline records.
+                let mut j = i + 1;
+                let inner = toks.get(j).map(|t| t.tok) == Some(Tok::Bang);
+                if inner {
+                    j += 1;
+                }
+                if toks.get(j).map(|t| t.tok) != Some(Tok::LBracket) {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                let body_start = j;
+                let mut depth = 1usize;
+                while j < toks.len() && depth > 0 {
+                    match toks[j].tok {
+                        Tok::LBracket => depth += 1,
+                        Tok::RBracket => depth -= 1,
+                        Tok::Eof => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let body = &toks[body_start..j.saturating_sub(1).max(body_start)];
+                let name = body.first().and_then(|t| match t.tok {
+                    Tok::Ident(s) => Some(interner.get(s).to_string()),
+                    _ => None,
+                });
+                if inner && braces.is_empty() && name.as_deref() == Some("macro_use") {
+                    out.inner_macro_use = true;
+                }
+                match name.as_deref() {
+                    Some("path") => {
+                        // `path = "file.rs"`: the string token after `=`.
+                        if let Some(s) = body.iter().find_map(|t| match t.tok {
+                            Tok::Str(x) => lexed.strings.get(x as usize).cloned(),
+                            _ => None,
+                        }) {
+                            pending.path_attr = Some(s);
+                        }
+                    }
+                    Some("cfg") => {
+                        // `cfg(pred)`: the trees inside the first paren group.
+                        if let Some(open) = body.iter().position(|t| t.tok == Tok::LParen) {
+                            let mut d = 0usize;
+                            let mut end = body.len();
+                            for (k, t) in body.iter().enumerate().skip(open) {
+                                match t.tok {
+                                    Tok::LParen => d += 1,
+                                    Tok::RParen => {
+                                        d -= 1;
+                                        if d == 0 {
+                                            end = k;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            pending.cfg.push(outline_trees(&body[open + 1..end]));
+                        }
+                    }
+                    Some("macro_use") => pending.macro_use = true,
+                    Some("macro_export") => {
+                        pending.macro_export = true;
+                        pending.local_inner =
+                            body.iter().any(|t| matches!(t.tok, Tok::Ident(s) if interner.get(s) == "local_inner_macros"));
+                    }
+                    _ => {}
+                }
+                i = j;
+            }
+            Tok::Pub => {
+                pending_vis = if toks.get(i + 1).map(|t| t.tok) == Some(Tok::LParen) { OutlineVis::Restricted } else { OutlineVis::Pub };
+                i += 1;
+            }
+            Tok::Mod => {
+                let span = toks[i].span;
+                let name = match toks.get(i + 1).map(|t| t.tok) {
+                    Some(Tok::Ident(s)) => Some(s),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let after = toks.get(i + 2).map(|t| t.tok);
+                    let inline = after == Some(Tok::LBrace);
+                    if inline {
+                        mod_brace_for = Some(name);
+                    }
+                    out.mods.push(ModDecl {
+                        name,
+                        vis: pending_vis,
+                        path_attr: pending.path_attr.take(),
+                        cfg: std::mem::take(&mut pending.cfg),
+                        inline,
+                        macro_use: pending.macro_use,
+                        container: container_of(&braces),
+                        span,
+                    });
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                pending = PendingAttrs::default();
+                pending_vis = OutlineVis::Private;
+            }
+            Tok::Use => {
+                out.uses.push(toks[i].span);
+                pending = PendingAttrs::default();
+                pending_vis = OutlineVis::Private;
+                i += 1;
+            }
+            Tok::Ident(s) if interner.get(s) == "macro_rules" && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) => {
+                if let Some(Tok::Ident(name)) = toks.get(i + 2).map(|t| t.tok) {
+                    let container = container_of(&braces);
+                    out.macros.push(MacroDecl {
+                        name,
+                        exported: pending.macro_export,
+                        local_inner: pending.local_inner,
+                        container: (container.len(), i),
+                        span: toks[i].span,
+                    });
+                }
+                pending = PendingAttrs::default();
+                pending_vis = OutlineVis::Private;
+                i += 1;
+            }
+            Tok::Semi => {
+                pending = PendingAttrs::default();
+                pending_vis = OutlineVis::Private;
+                mod_brace_for = None;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+    use crate::diag::FileId;
+    use crate::intern::Interner;
+    use crate::lexer;
+
+    fn scan_outline(src: &str) -> (Outline, Interner) {
+        let interner = Interner::default();
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        (outline(&lexed, &interner), interner)
+    }
+
+    #[test]
+    fn outline_records_mods_uses_and_macros() {
+        let src = "\
+pub mod a;
+#[cfg(feature = \"x\")]
+mod b;
+#[path = \"else/where.rs\"]
+pub(crate) mod c;
+mod outer {
+    pub mod inner;
+    fn hidden() { let _ = 1; }
+}
+use a::Thing;
+#[macro_use]
+mod withmacros;
+#[macro_export]
+macro_rules! make_it { () => { 1 } }
+fn main() { println!(\"{}\", 1); }
+";
+        let (o, interner) = scan_outline(src);
+        let names: Vec<&str> = o.mods.iter().map(|m| interner.get(m.name)).collect();
+        assert_eq!(names, ["a", "b", "c", "outer", "inner", "withmacros"]);
+        assert_eq!(o.mods[0].vis, OutlineVis::Pub);
+        assert!(!o.mods[1].cfg.is_empty(), "cfg tokens recorded");
+        assert_eq!(o.mods[2].path_attr.as_deref(), Some("else/where.rs"));
+        assert_eq!(o.mods[2].vis, OutlineVis::Restricted);
+        assert!(o.mods[3].inline);
+        assert_eq!(o.mods[4].container.len(), 1, "inner lives in outer");
+        assert!(o.mods[5].macro_use);
+        assert_eq!(o.uses.len(), 1);
+        assert_eq!(o.macros.len(), 1);
+        assert_eq!(interner.get(o.macros[0].name), "make_it");
+        assert!(o.macros[0].exported);
+    }
+
+    #[test]
+    fn outline_ignores_fn_bodies_and_impls() {
+        let src = "fn f() { let mod_name = 1; println!(\"{}\", mod_name); }\nstruct S;\nimpl S { fn m(&self) {} }\n";
+        let (o, _) = scan_outline(src);
+        assert!(o.mods.is_empty() && o.uses.is_empty() && o.macros.is_empty());
+    }
+}

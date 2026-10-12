@@ -47,16 +47,34 @@ extract() {
   ' "$1"
 }
 
+# Writes the `## Files` section's extra files into the work dir: each entry
+# is a `### relpath` heading plus one fenced block. Module and manifest
+# errors (L0502, L0530, L0531) need sibling files next to the example.
+extract_files() {
+  awk -v root="$work" '
+    /^## Files$/ { on = 1; next }
+    /^## / { if (on && $0 != "## Files") on = 0 }
+    on && /^### / { path = root "/" $2; n = split(path, parts, "/"); dir = parts[1]; for (i = 2; i < n; i++) dir = dir "/" parts[i]; system("mkdir -p \"" dir "\""); next }
+    on && /^```/ { grab = !grab; next }
+    on && grab && path != "" { print > path }
+  ' "$1"
+}
+
 for page in "$root"/docs/errors/L*.md; do
   code=$(basename "$page" .md)
   [[ -n "$filter" && "$code" != *"$filter"* ]] && continue
   extract "$page" Wrong > "$work/$code-wrong.rs"
   extract "$page" Fixed > "$work/$code-fixed.rs"
+  grep -q '^## Files$' "$page" && extract_files "$page"
+  # `<!-- lust-args: ... -->` adds args to the wrong example's lust build
+  # only (a manifest selection, say); `{work}` expands to the work dir.
+  lust_args=$(sed -n 's|.*<!-- lust-args: \(.*\) -->.*|\1|p' "$page" | head -1 | sed "s|{work}|$work|g")
   if [ ! -s "$work/$code-wrong.rs" ] || [ ! -s "$work/$code-fixed.rs" ]; then
     report bad "$code" "missing a Wrong or Fixed example"; continue
   fi
   # 2. Wrong under lust.
-  out=$("$lust" build --json "$work/$code-wrong.rs" -o "$work/$code.bin" 2>&1)
+  # shellcheck disable=SC2086 # lust_args is a word list by design
+  out=$("$lust" build --json "$work/$code-wrong.rs" -o "$work/$code.bin" $lust_args 2>&1)
   if [ $? -eq 0 ]; then
     report bad "$code" "lust accepted the wrong example"; continue
   elif ! grep -q "\"code\":\"$code\"" <<<"$out"; then

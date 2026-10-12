@@ -36,14 +36,18 @@ prints "reserved, not yet emitted".
 | L0201-L0203 | References in fields, lifetime elision and syntax | collect, parser | in use | |
 | L0301-L0312 | Borrow checker: moves, borrows, value lifetimes | borrowck | in use | |
 | L0401-L0405 | User macros, attributes, derives, `unsafe`, `async` | parser, collect | in use | |
-| L0501-L0504 | Modules and imports | W-RESOLVE | reserved | L0501 import cycle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution |
+| L0501 | Modules and imports | W-RESOLVE | reserved | Import cycle does not settle |
+| L0502-L0503 | Modules and imports | W-RESOLVE | in use | L0502 ambiguous module file, L0503 module file not found |
+| L0504 | Modules and imports | W-RESOLVE | reserved | Generated name changes an earlier resolution |
 | L0505 | Modules and imports | W-RESOLVE | in use | Module, import, and module-path forms are not supported yet (S3b parser reject) |
 | L0506-L0509 | Modules and imports | W-RESOLVE | reserved | |
 | L0510-L0519 | Visibility | W-RESOLVE | reserved | |
-| L0520-L0521 | cfg and attributes | W-MACRO | reserved | L0520 unknown cfg name, L0521 unknown attribute |
+| L0520 | cfg and attributes | W-RESOLVE | in use | Unknown cfg name |
+| L0521 | cfg and attributes | W-MACRO | reserved | Unknown attribute |
 | L0522 | cfg and attributes | W-MACRO | in use | Known attribute (cfg, repr, path, inline, and kin) is not supported yet (S3b parser reject) |
 | L0523-L0529 | cfg and attributes | W-MACRO | reserved | |
-| L0530-L0539 | Crate session | W-DRIVER | reserved | L0530 unsupported edition, L0531 unsupported deny-level lint |
+| L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
+| L0532-L0539 | Crate session | W-DRIVER | reserved | |
 | L0601 | Types and aliases | W-CORELANG | reserved | L0601 alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603-L0609 | Types and aliases | W-CORELANG | reserved | |
