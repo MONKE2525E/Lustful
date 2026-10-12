@@ -259,7 +259,13 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
                 f(value)
             }
         }),
-        Rvalue::Ref(..) | Rvalue::Discriminant(_) => {}
+        Rvalue::Ref(..) | Rvalue::Discriminant(_) | Rvalue::SliceOf(_) => {}
+        Rvalue::Subslice { lo, hi, .. } => {
+            f(lo);
+            if let Some(h) = hi {
+                f(h);
+            }
+        }
     }
 }
 
@@ -341,12 +347,21 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let mut holders: Vec<Option<Local>> = vec![None; self.loans.len()];
         for (bi, b) in self.body.blocks.iter().enumerate() {
             for (si, s) in b.stmts.iter().enumerate() {
-                if let StmtKind::Assign(dest, Rvalue::Ref(m, place)) = &s.kind {
+                // SliceOf and Subslice make slice references, so they create
+                // loans just like Ref (W-CORELANG); mutability comes from the
+                // destination local's slice reference type.
+                let loan_src: Option<(bool, &Place)> = match &s.kind {
+                    StmtKind::Assign(_, Rvalue::Ref(m, place)) => Some((*m, place)),
+                    StmtKind::Assign(dest, Rvalue::SliceOf(place)) => Some((self.slice_dest_mut(dest), place)),
+                    StmtKind::Assign(_, Rvalue::Subslice { base, mutable, .. }) => Some((*mutable, base)),
+                    _ => None,
+                };
+                if let (StmtKind::Assign(dest, _), Some((m, place))) = (&s.kind, loan_src) {
                     self.loan_block.push(bi as u32);
                     self.loan_stmt.push(si as u32);
                     self.loan_at.insert((bi as u32, si as u32), self.loans.len());
                     holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
-                    self.loans.push(Loan { place: place.clone(), mutable: *m, synthetic: false, span: s.span, last_use: None });
+                    self.loans.push(Loan { place: place.clone(), mutable: m, synthetic: false, span: s.span, last_use: None });
                 }
             }
         }
@@ -374,7 +389,10 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 };
                 match &s.kind {
                     // A reborrow of a holder (for example for a method call) also counts as a use.
-                    StmtKind::Assign(_, Rvalue::Ref(_, p)) | StmtKind::Assign(_, Rvalue::Discriminant(p)) => uses.push((p.local, s.span)),
+                    StmtKind::Assign(_, Rvalue::Ref(_, p))
+                    | StmtKind::Assign(_, Rvalue::Discriminant(p))
+                    | StmtKind::Assign(_, Rvalue::SliceOf(p))
+                    | StmtKind::Assign(_, Rvalue::Subslice { base: p, .. }) => uses.push((p.local, s.span)),
                     StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut note),
                     StmtKind::Print { parts, .. } => parts_operands(parts, &mut note),
                     _ => {}
@@ -479,8 +497,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                 };
                 rvalue_operands(rv, &mut uses);
-                if let Rvalue::Ref(_, p) | Rvalue::Discriminant(p) = rv {
+                if let Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) = rv {
                     Self::uses_place(live, p);
+                }
+                if let Rvalue::Subslice { base, .. } = rv {
+                    Self::uses_place(live, base);
                 }
             }
             StmtKind::StorageDead(l) => live.remove(*l as usize),
@@ -727,6 +748,40 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                             new_origins.union(&o);
                         }
                     }
+                    Rvalue::SliceOf(place) => {
+                        let m = self.slice_dest_mut(dest);
+                        self.check_init(place, span, st);
+                        let kind = if m { Access::BorrowMut } else { Access::BorrowShared };
+                        if m {
+                            self.check_mutability(place, span, st, true);
+                        }
+                        self.access(place, kind, span, &live);
+                        new_holds.insert(self.loan_at[&(b, si)]);
+                        new_origins.insert(self.loan_at[&(b, si)]);
+                        if place.proj.contains(&Proj::Deref) {
+                            let h = st.holds[place.local as usize].clone();
+                            new_holds.union(&h);
+                            let o = st.origins[place.local as usize].clone();
+                            new_origins.union(&o);
+                        }
+                    }
+                    Rvalue::Subslice { base: place, mutable, .. } => {
+                        let m = *mutable;
+                        self.check_init(place, span, st);
+                        let kind = if m { Access::BorrowMut } else { Access::BorrowShared };
+                        if m {
+                            self.check_mutability(place, span, st, true);
+                        }
+                        self.access(place, kind, span, &live);
+                        new_holds.insert(self.loan_at[&(b, si)]);
+                        new_origins.insert(self.loan_at[&(b, si)]);
+                        if place.proj.contains(&Proj::Deref) {
+                            let h = st.holds[place.local as usize].clone();
+                            new_holds.union(&h);
+                            let o = st.origins[place.local as usize].clone();
+                            new_origins.union(&o);
+                        }
+                    }
                     Rvalue::Discriminant(place) => {
                         self.check_init(place, span, st);
                         self.access(place, Access::Read, span, &live);
@@ -848,6 +903,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         self.write_dest(dest, new_holds, &new_origins, span, &live, st);
+    }
+
+    /// True when a slice-making assignment's destination is a `&mut [T]` local.
+    fn slice_dest_mut(&self, dest: &Place) -> bool {
+        dest.proj.is_empty() && matches!(self.body.tys.kind(self.body.locals[dest.local as usize].ty), TyKind::Ref(_, Mut::Mut, _))
     }
 
     fn dest_ty(&self, dest: &Place) -> Ty {

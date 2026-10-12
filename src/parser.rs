@@ -1053,11 +1053,7 @@ impl<'a> Parser<'a> {
                     elems.push(self.ty()?);
                 }
                 self.expect(Tok::RParen, "`)`")?;
-                if tuple {
-                    Ok(self.push_ty(TyExpr::Tuple(elems), start.to(self.prev_span())))
-                } else {
-                    Ok(elems[0])
-                }
+                if tuple { Ok(self.push_ty(TyExpr::Tuple(elems), start.to(self.prev_span()))) } else { Ok(elems[0]) }
             }
             Tok::LBracket => {
                 self.bump();

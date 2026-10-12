@@ -534,6 +534,22 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
     }
 
+    // Fields must be sized: a bare slice or str cannot sit in a struct.
+    for adt in &p.adts {
+        for v in &adt.variants {
+            for f in &v.fields {
+                if !is_sized_ty(&p.tys, f.ty) {
+                    errs.push(Diag::new(
+                        "L0110",
+                        adt.span,
+                        format!("the size for values of type `{}` cannot be known", ty_name(&p, &p.tys, f.ty)),
+                        "Put the value behind a reference, such as `&[T]` or `&str`.",
+                    ));
+                }
+            }
+        }
+    }
+
     // A type that contains itself by value has infinite size.
     for i in 0..p.adts.len() {
         let mut seen = vec![false; p.adts.len()];
@@ -572,7 +588,17 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         }
         for param in &def.params {
             match resolve_ty(ast, interner, known, &p.type_names, &mut p.tys, param.ty, self_ty) {
-                Ok(t) => params.push(t),
+                Ok(t) => {
+                    if !is_sized_ty(&p.tys, t) {
+                        errs.push(Diag::new(
+                            "L0110",
+                            ast.ty_span(param.ty),
+                            format!("the size for values of type `{}` cannot be known", ty_name(p, &p.tys, t)),
+                            "Put the value behind a reference, such as `&[T]` or `&str`.",
+                        ));
+                    }
+                    params.push(t)
+                }
                 Err(d) => {
                     errs.push(d);
                     params.push(ERROR);
@@ -586,6 +612,15 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 ERROR
             }),
         };
+        if !is_sized_ty(&p.tys, ret) {
+            let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                format!("the size for values of type `{}` cannot be known", ty_name(p, &p.tys, ret)),
+                "Put the value behind a reference, such as `&[T]` or `&str`.",
+            ));
+        }
         // Elision: a returned reference borrows from `self`, or from the only reference parameter.
         let mut ret_borrows_from = None;
         if contains_ref(&p.tys, ret) {
@@ -711,6 +746,22 @@ fn contains_adt_by_value(p: &Program, root: AdtId, cur: AdtId, seen: &mut Vec<bo
         }
     }
     false
+}
+
+/// True when a type has a known size and may sit in a field, parameter, or
+/// return slot. Bare slices, `str`, and `dyn` are unsized; they may only
+/// appear behind a reference (ARCH 2.7 `Sized` basics).
+pub fn is_sized_ty(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => false,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_sized_ty(tys, e)),
+        TyKind::Array(e, _) => is_sized_ty(tys, e),
+        TyKind::Adt(..) => match tys.adt_first_ty_arg(t) {
+            Some(e) if tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() => is_sized_ty(tys, e),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// True when a field type holds the root Adt by value, through Option, tuple,

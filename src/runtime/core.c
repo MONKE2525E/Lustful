@@ -157,6 +157,22 @@ void *lust_vec_push_slot(lust_Vec *v, uint64_t elem) LUST_BODY({
     return (char *)v->ptr + (v->len++) * elem;
 })
 
+/* The end of a slice range, checked the way Rust checks it: the start must
+   not pass the end, and the end must not pass the length. An inclusive end
+   of u64::MAX overflows the +1 and always fails the length check. */
+uint64_t lust_slice_range(uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
+    uint64_t end = inclusive ? hi + 1 : hi;
+    if ((inclusive && end == 0) || lo > end || end > len) {
+        lust_String s = lust_string_new();
+        lust_string_push_cstr(&s, "slice index starts at ");
+        lust_fmt_u64(&s, lo);
+        lust_string_push_cstr(&s, " but ends at ");
+        lust_fmt_u64(&s, inclusive ? hi : end);
+        lust_panic(&s, loc);
+    }
+    return end;
+})
+
 uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
     if (i >= len) {
         lust_String s = lust_string_new();

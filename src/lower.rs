@@ -200,6 +200,35 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let b = self.place(*base);
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
+            (Expr::Index { base, index }, Res::SliceIndex { derefs }) => {
+                let b = self.place(*base);
+                let b = Self::derefs(b, derefs);
+                let (lo_e, hi_e, inclusive) = match self.p.ast.expr(*index) {
+                    Expr::Range { lo, hi, inclusive } => (*lo, *hi, *inclusive),
+                    _ => (None, None, false),
+                };
+                let bound = |this: &mut Self, e: Option<ExprId>| -> Option<Operand> {
+                    e.map(|e| {
+                        let t = this.temp(USIZE);
+                        this.expr_into(e, Some(&Place::local(t)));
+                        Operand::Copy(Place::local(t))
+                    })
+                };
+                let lo = bound(self, lo_e).unwrap_or(Operand::Const(Const::Int(0, IntTy::Usize)));
+                let hi = bound(self, hi_e);
+                let elem = match self.kind(self.ty(e)) {
+                    TyKind::Slice(el) => el,
+                    _ => ERROR,
+                };
+                let slice = self.body.tys.intern(TyKind::Slice(elem));
+                // The temporary holds the slice place itself (bare `[T]` type,
+                // a fat value in codegen), like a `str` place.
+                let t = self.temp(slice);
+                let span = self.span(e);
+                let mutable = self.mut_index > 0;
+                self.assign(Place::local(t), Rvalue::Subslice { base: b, lo, hi, inclusive, mutable }, span);
+                Place::local(t)
+            }
             (Expr::Index { base, index }, Res::Index { derefs }) => {
                 let b = self.place(*base);
                 let b = Self::derefs(b, derefs);
@@ -262,6 +291,19 @@ impl<'p, 'a> Lower<'p, 'a> {
             Coerce::Deref(n) => {
                 let place = self.op_place(op, ty, span);
                 Operand::Copy(Self::derefs(place, n))
+            }
+            Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => {
+                let place = self.op_place(op, ty, span);
+                let inner = self.peel(ty, 1);
+                let elem = match self.kind(inner) {
+                    TyKind::Array(e, _) => e,
+                    _ => self.body.tys.vec_elem(inner).unwrap_or(ERROR),
+                };
+                let slice = self.body.tys.intern(TyKind::Slice(elem));
+                let rt = self.ref_ty(m, slice);
+                let tmp = self.temp(rt);
+                self.assign(Place::local(tmp), Rvalue::SliceOf(place.deref()), span);
+                if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
             }
             Coerce::MutToShared | Coerce::Reborrow => {
                 let m = self.ck.coerce(e) == Coerce::Reborrow;
@@ -478,6 +520,17 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Ref { mutable, expr, .. } => {
+                if matches!(self.ck.res(*expr), Res::SliceIndex { .. }) {
+                    // A slice place is already a fat value in a temporary;
+                    // taking its reference moves that value (with its loan),
+                    // it does not borrow the temporary.
+                    let pl = if *mutable { self.place_for_mut(*expr) } else { self.place(*expr) };
+                    if let Some(d) = dest {
+                        let op = self.operand_from(pl, ty);
+                        self.assign(d.clone(), Rvalue::Use(op), span);
+                    }
+                    return;
+                }
                 let pl = if *mutable { self.place_for_mut(*expr) } else { self.place(*expr) };
                 if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Ref(*mutable, pl), span);
@@ -673,7 +726,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         BindMode::Move => {
                             // `let x = &temp();` extends the temporary to the enclosing block.
                             if let Expr::Ref { mutable, expr, .. } = p.ast.expr(init)
-                                && self.ck.coerce(init) == Coerce::None
+                                && matches!(self.ck.coerce(init), Coerce::None | Coerce::SliceFromArray(_) | Coerce::SliceFromVec(_))
                                 && !self.is_place_expr(*expr)
                             {
                                 let t = self.ty(*expr);
@@ -681,7 +734,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                                 let n = self.scopes.len();
                                 self.scopes[n - 2].push(tmp);
                                 self.expr_into(*expr, Some(&Place::local(tmp)));
-                                self.assign(Place::local(l), Rvalue::Ref(*mutable, Place::local(tmp)), span);
+                                if self.ck.coerce(init) == Coerce::None {
+                                    self.assign(Place::local(l), Rvalue::Ref(*mutable, Place::local(tmp)), span);
+                                } else {
+                                    self.assign(Place::local(l), Rvalue::SliceOf(Place::local(tmp)), span);
+                                }
                                 self.pop_scope(span);
                                 self.scopes.last_mut().unwrap().push(l);
                                 return;
@@ -982,14 +1039,27 @@ impl<'p, 'a> Lower<'p, 'a> {
         } else {
             // `for x in &v` / `&mut v`: index loop over a reference held for the whole loop.
             let it_ty = self.ty(iter);
+            let by_value_array = matches!(self.kind(it_ty), TyKind::Array(..));
             let m = matches!(self.kind(it_ty), TyKind::Ref(_, Mut::Mut, _));
             let vref = self.temp(it_ty);
             self.expr_into(iter, Some(&Place::local(vref)));
-            let shared = self.ref_ty(false, self.peel(it_ty, 1));
-            let sref = self.temp(shared);
-            self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(vref).deref()), span);
             let len = self.temp(USIZE);
-            self.call_into(CallTarget::Builtin(Builtin::VecLen), vec![Operand::Copy(Place::local(sref))], Place::local(len), span);
+            if by_value_array {
+                let n = match self.kind(it_ty) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => n as u64,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                self.assign(Place::local(len), Rvalue::Use(Operand::Const(Const::Int(n, IntTy::Usize))), span);
+            } else {
+                let shared = self.ref_ty(false, self.peel(it_ty, 1));
+                let sref = self.temp(shared);
+                self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(vref).deref()), span);
+                let len_builtin = if self.body.tys.vec_elem(self.peel(it_ty, 1)).is_some() { Builtin::VecLen } else { Builtin::SliceLen };
+                self.call_into(CallTarget::Builtin(len_builtin), vec![Operand::Copy(Place::local(sref))], Place::local(len), span);
+            }
             let idx = self.temp(USIZE);
             self.assign(Place::local(idx), Rvalue::Use(Operand::Const(Const::Int(0, IntTy::Usize))), span);
             self.goto(head, span);
@@ -998,8 +1068,14 @@ impl<'p, 'a> Lower<'p, 'a> {
             let b = &mut self.body.blocks[self.cur.0 as usize];
             b.term = Terminator::If(Operand::Copy(Place::local(c)), bodyb, exit);
             self.cur = bodyb;
-            let elem = Place::local(vref).deref().project(Proj::Index(idx));
-            self.assign(Place::local(item), Rvalue::Ref(m, elem), span);
+            if by_value_array {
+                let elem = Place::local(vref).project(Proj::Index(idx));
+                let op = self.operand_from(elem, item_ty);
+                self.assign(Place::local(item), Rvalue::Use(op), span);
+            } else {
+                let elem = Place::local(vref).deref().project(Proj::Index(idx));
+                self.assign(Place::local(item), Rvalue::Ref(m, elem), span);
+            }
             self.assign(
                 Place::local(idx),
                 Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(idx)), Operand::Const(Const::Int(1, IntTy::Usize))),
@@ -1171,11 +1247,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match p.ast.pat(pat) {
             Pat::TupleStruct { elems, .. } => {
                 let n = p.adt(a).variants[v as usize].fields.len();
-                crate::check::map_tuple_elems(p.ast, elems, n)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(i, s)| (i as u32, s))
-                    .collect()
+                crate::check::map_tuple_elems(p.ast, elems, n).unwrap_or_default().into_iter().map(|(i, s)| (i as u32, s)).collect()
             }
             Pat::Struct { fields, .. } => {
                 let vf = &p.adt(a).variants[v as usize].fields;

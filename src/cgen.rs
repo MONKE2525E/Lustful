@@ -29,6 +29,9 @@ pub enum CTy {
     Tuple(Vec<CTy>),
     /// An array, emitted as a generated struct holding `v[len]` (W-CORELANG).
     Array(Box<CTy>, u64),
+    /// A slice reference value or slice place: a generated fat struct holding
+    /// `ptr` and `len` (W-CORELANG), the same role `lust_str` plays for `&str`.
+    Slice(Box<CTy>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,7 +59,11 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             };
             CTy::Array(Box::new(cty(tys, e)), n)
         }
-        TyKind::Ref(_, _, e) => CTy::Ref(Box::new(cty(tys, e))),
+        TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
+        TyKind::Ref(_, _, e) => match tys.kind(e) {
+            TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
+            _ => CTy::Ref(Box::new(cty(tys, e))),
+        },
         TyKind::Adt(..) => match tys.builtin_of(t) {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
@@ -121,6 +128,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
+        CTy::Slice(_) => format!("Sl_{}", mangle(t)),
     }
 }
 
@@ -140,6 +148,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Chars => "Chars".into(),
         CTy::Tuple(es) => es.iter().map(|e| format!("{}_", mangle(e))).collect(),
         CTy::Array(e, n) => format!("{n}_{}_", mangle(e)),
+        CTy::Slice(e) => format!("sl{}_", mangle(e)),
     }
 }
 
@@ -169,6 +178,10 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(t.clone());
             collect_types(e, out);
         }
+        CTy::Slice(e) => {
+            out.insert(t.clone());
+            collect_types(e, out);
+        }
         CTy::Vec(e) | CTy::Ref(e) => collect_types(e, out),
         _ => {}
     }
@@ -177,14 +190,14 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Tuple(_) | CTy::Array(..) => out.push(t.clone()),
+        CTy::Adt(_) | CTy::Option(_) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) => out.push(t.clone()),
         _ => {}
     }
 }
 
 fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Ref(_) | CTy::Args | CTy::Chars => true,
+        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
@@ -414,6 +427,13 @@ impl FnGen<'_, '_, '_> {
                     e = format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]");
                     t = *el;
                 }
+                (Proj::Deref, CTy::Slice(_)) => {
+                    // A slice place is represented by its fat value, like `str`.
+                }
+                (Proj::Index(l), CTy::Slice(el)) => {
+                    e = format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]");
+                    t = *el;
+                }
                 _ => panic!("bad projection in codegen"),
             }
         }
@@ -623,7 +643,35 @@ impl FnGen<'_, '_, '_> {
             Rvalue::Use(o) => self.operand(o, loc, post).0,
             Rvalue::Ref(_, pl) => {
                 let (e, t) = self.place(pl, loc);
-                if t == CTy::Str { e } else { format!("(&{e})") }
+                // A slice place (a deref of a fat value, or a bare-slice
+                // temporary from a range index) is already the fat value;
+                // a place holding a slice reference takes an address as usual.
+                let slice_place = matches!(t, CTy::Slice(_))
+                    && (matches!(pl.proj.last(), Some(Proj::Deref))
+                        || matches!(self.body.tys.kind(self.body.locals[pl.local as usize].ty), TyKind::Slice(_)));
+                if t == CTy::Str || slice_place { e } else { format!("(&{e})") }
+            }
+            Rvalue::SliceOf(pl) => {
+                let (e, t) = self.place(pl, loc);
+                self.slice_of(&e, &t)
+            }
+            Rvalue::Subslice { base, lo, hi, inclusive, .. } => {
+                let (e, t) = self.place(base, loc);
+                let (ptr, len) = self.slice_ptr_len(&e, &t);
+                let (lo_v, _) = self.operand(lo, loc, post);
+                let ct = match &t {
+                    CTy::Array(el, _) | CTy::Slice(el) | CTy::Vec(el) => ctype(&CTy::Slice(el.clone())),
+                    _ => "lust_str".into(),
+                };
+                let (tmp, end) = (self.tmp(), self.tmp());
+                let hi_v = match hi {
+                    Some(h) => self.operand(h, loc, post).0,
+                    None => len.clone(),
+                };
+                let incl = if *inclusive { 1 } else { 0 };
+                let _ = writeln!(self.out, "    uint64_t {end} = lust_slice_range({lo_v}, {hi_v}, {incl}, {len}, {loc});");
+                let _ = writeln!(self.out, "    {ct} {tmp} = {{ {ptr} + {lo_v}, {end} - {lo_v} }};");
+                tmp
             }
             Rvalue::Bin(op, a, b) => {
                 let (a, at) = self.operand(a, loc, post);
@@ -706,8 +754,12 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             Rvalue::Eq { a, b, ty, ne } => {
-                let (a, _) = self.operand(a, loc, post);
-                let (b, _) = self.operand(b, loc, post);
+                let (a, at) = self.operand(a, loc, post);
+                let (b, bt) = self.operand(b, loc, post);
+                // A slice operand is already the fat value (not a pointer to
+                // it), so take its address for the glue call.
+                let a = if matches!(at, CTy::Slice(_)) { format!("(&{a})") } else { a };
+                let b = if matches!(bt, CTy::Slice(_)) { format!("(&{b})") } else { b };
                 let t = cty(&self.body.tys, *ty);
                 let e = self.eq_expr(&t, &a, &b);
                 if *ne { format!("(!{e})") } else { e }
@@ -741,11 +793,7 @@ impl FnGen<'_, '_, '_> {
             Rvalue::ArrayAgg(ty, ops) => {
                 let ct = ctype(&cty(&self.body.tys, *ty));
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-                if vals.is_empty() {
-                    format!("(({ct}){{0}})")
-                } else {
-                    format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", "))
-                }
+                if vals.is_empty() { format!("(({ct}){{0}})") } else { format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", ")) }
             }
             Rvalue::ArrayRepeat(ty, o, n) => {
                 let at = cty(&self.body.tys, *ty);
@@ -801,6 +849,29 @@ impl FnGen<'_, '_, '_> {
     }
 
     /// `a` and `b` are pointers to values of type `t`.
+    /// The data pointer and length C expressions of an array, Vec, or slice place.
+    fn slice_ptr_len(&self, e: &str, t: &CTy) -> (String, String) {
+        match t {
+            CTy::Array(_, n) => (format!("{e}.v"), n.to_string()),
+            CTy::Vec(el) => (format!("(({}*){e}.ptr)", ctype(el)), format!("{e}.len")),
+            CTy::Slice(_) => (format!("{e}.ptr"), format!("{e}.len")),
+            _ => (format!("(({e}))"), "0".into()),
+        }
+    }
+
+    /// A fat slice value over the whole of an array, Vec, or slice place.
+    fn slice_of(&mut self, e: &str, t: &CTy) -> String {
+        match t {
+            CTy::Slice(_) => e.to_string(),
+            CTy::Array(el, _) | CTy::Vec(el) => {
+                let ct = ctype(&CTy::Slice(el.clone()));
+                let (ptr, len) = self.slice_ptr_len(e, t);
+                format!("(({ct}){{ {ptr}, {len} }})")
+            }
+            _ => e.to_string(),
+        }
+    }
+
     fn eq_expr(&mut self, t: &CTy, a: &str, b: &str) -> String {
         match t {
             CTy::Unit => "1".into(),
@@ -861,6 +932,24 @@ impl FnGen<'_, '_, '_> {
             B::StrIsEmpty => format!("({}.len == 0)", vals[0]),
             B::StrToString => format!("lust_string_from({})", vals[0]),
             B::StringLen | B::VecLen => format!("({})->len", vals[0]),
+            B::SliceLen => match &tys[0] {
+                CTy::Slice(_) => format!("{}.len", vals[0]),
+                CTy::Ref(inner) => match &**inner {
+                    CTy::Array(_, n) => n.to_string(),
+                    CTy::Slice(_) => format!("{}.len", vals[0]),
+                    _ => format!("({})->len", vals[0]),
+                },
+                _ => format!("{}.len", vals[0]),
+            },
+            B::SliceIsEmpty => match &tys[0] {
+                CTy::Slice(_) => format!("({}.len == 0)", vals[0]),
+                CTy::Ref(inner) => match &**inner {
+                    CTy::Array(_, n) => format!("({n} == 0)"),
+                    CTy::Slice(_) => format!("({}.len == 0)", vals[0]),
+                    _ => format!("(({})->len == 0)", vals[0]),
+                },
+                _ => format!("({}.len == 0)", vals[0]),
+            },
             B::StringIsEmpty | B::VecIsEmpty => format!("(({})->len == 0)", vals[0]),
             B::StringPushStr => {
                 let _ = writeln!(self.out, "    lust_string_push_str({}, {});", vals[0], vals[1]);
@@ -1450,6 +1539,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Option(e) => collect_types(e, &mut inner),
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
+            CTy::Slice(e) => collect_types(e, &mut inner),
             _ => {}
         }
         stack.extend(inner);
@@ -1472,6 +1562,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Option(e) => by_value_deps(e, &mut deps),
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
+            CTy::Slice(e) => by_value_deps(e, &mut deps),
             _ => {}
         }
         for d in &deps {
@@ -1482,13 +1573,15 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
             }
             CTy::Tuple(es) => {
-                let fields: String =
-                    es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
+                let fields: String = es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
                 let fields = if fields.is_empty() { "uint8_t unused; ".to_string() } else { fields };
                 let _ = writeln!(out, "typedef struct {0} {{ {fields}}} {0};", ctype(t));
             }
             CTy::Array(e, n) => {
                 let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
+            }
+            CTy::Slice(e) => {
+                let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
             }
             CTy::Adt(a) => {
                 let adt = p.adt(*a);
@@ -1693,6 +1786,13 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     let c = eq_of(e, "a->v[i]", "b->v[i]", &mut need);
                     let _ = writeln!(body, "  for (uint64_t i = 0; i < {n}; i++) if (!{c}) return 0;\n  return 1;");
                 }
+                CTy::Slice(e) => {
+                    let c = eq_of(e, "a->ptr[i]", "b->ptr[i]", &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  if (a->len != b->len) return 0;\n  for (uint64_t i = 0; i < a->len; i++) if (!{c}) return 0;\n  return 1;"
+                    );
+                }
                 CTy::Ref(inner) => {
                     let e = eq_of(inner, "(**a)", "(**b)", &mut need);
                     let _ = writeln!(body, "  return {e};");
@@ -1779,6 +1879,16 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                         lit("]")
                     );
                 }
+                CTy::Slice(e) => {
+                    let d = dbg_of(e, "p->ptr[i]", &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  {}\n  for (uint64_t i = 0; i < p->len; i++) {{ if (i) {} {d} }}\n  {}",
+                        lit("["),
+                        lit(", "),
+                        lit("]")
+                    );
+                }
                 CTy::Ref(inner) => {
                     let e = dbg_of(inner, "(**p)", &mut need);
                     let _ = writeln!(body, "  {e}");
@@ -1858,7 +1968,8 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
     let parts_has = |ps: &[FmtPart]| ps.iter().any(|p| matches!(p, FmtPart::Arg { value, .. } if op_has(value)));
     match rv {
         Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) => op_has(o),
-        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) => place_mentions(p, l),
+        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) => place_mentions(p, l),
+        Rvalue::Subslice { base, lo, hi, .. } => place_mentions(base, l) || op_has(lo) || hi.as_ref().is_some_and(op_has),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op_has(a) || op_has(b)
         }

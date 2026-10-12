@@ -79,6 +79,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CharToUppercase,
     Builtin::CharToLowercase,
     Builtin::CharToDigit,
+    Builtin::SliceLen,
+    Builtin::SliceIsEmpty,
 ];
 
 /// How a builtin is called.
@@ -154,6 +156,8 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
         B::CharToUppercase => (&["char"], vec![k.to_ascii_uppercase], Call::Method),
         B::CharToLowercase => (&["char"], vec![k.to_ascii_lowercase], Call::Method),
         B::CharToDigit => (&["char"], vec![k.to_digit], Call::Method),
+        B::SliceLen => (&["[T]", "[T; n]"], vec![k.len], Call::Method),
+        B::SliceIsEmpty => (&["[T]", "[T; n]"], vec![k.is_empty], Call::Method),
     }
 }
 
@@ -380,6 +384,7 @@ const TYPES: &[&str] = &[
     "user structs and enums",
     "tuples",
     "arrays [T; n]",
+    "slices &[T] and &mut [T]",
     "std::env::Args (from std::env::args())",
     "str::Chars (from s.chars())",
 ];

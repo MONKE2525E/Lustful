@@ -84,11 +84,7 @@ impl Repr {
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
-    if align <= 1 {
-        v
-    } else {
-        v.div_ceil(align) * align
-    }
+    if align <= 1 { v } else { v.div_ceil(align) * align }
 }
 
 /// The layout of an integer scalar.
@@ -236,11 +232,7 @@ fn tag_width(discs: &[i128]) -> Result<(u64, bool), ()> {
     for w in [1u64, 2, 4, 8, 16] {
         let bits = w * 8;
         let (lo, hi): (i128, i128) = if signed {
-            if bits >= 128 {
-                (i128::MIN, i128::MAX)
-            } else {
-                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-            }
+            if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
         } else if bits >= 128 {
             (0, i128::MAX)
         } else {
@@ -341,11 +333,7 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
     // A fixed integer tag must hold every discriminant.
     if let Some((bits, signed)) = repr.int {
         let (lo, hi): (i128, i128) = if signed {
-            if bits >= 128 {
-                (i128::MIN, i128::MAX)
-            } else {
-                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-            }
+            if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
         } else if bits >= 128 {
             (0, i128::MAX)
         } else {

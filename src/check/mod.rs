@@ -82,6 +82,8 @@ pub enum Builtin {
     CharToUppercase,
     CharToLowercase,
     CharToDigit,
+    SliceLen,
+    SliceIsEmpty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -121,6 +123,10 @@ pub enum Res {
     /// The payload is the intrinsic's registry id (`ty::lang::INTRINSICS`).
     /// Only spliced shipped-library source can produce this resolution.
     Intrinsic(u32),
+    /// A range index `base[lo..hi]` producing a slice place (W-CORELANG).
+    SliceIndex {
+        derefs: u8,
+    },
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -135,6 +141,10 @@ pub enum Coerce {
     Reborrow,
     /// `&&T` (n extra references) to `&T`: copy the inner reference out.
     Deref(u8),
+    /// `&[T; N]` to a slice reference; the bool is the target mutability.
+    SliceFromArray(bool),
+    /// `&Vec<T>` to a slice reference; the bool is the target mutability.
+    SliceFromVec(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,6 +653,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Shared, y)) if self.unify(x, y) => Coerce::MutToShared,
             (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Mut, y)) if self.unify(x, y) => Coerce::Reborrow,
+            (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
+                if matches!(self.kind(y), TyKind::Slice(_))
+                    && (!em.is_mut() || fm.is_mut())
+                    && match self.kind(x) {
+                        TyKind::Array(xe, _) => match self.kind(y) {
+                            TyKind::Slice(ye) => self.unify(xe, ye),
+                            _ => false,
+                        },
+                        _ => false,
+                    } =>
+            {
+                Coerce::SliceFromArray(em.is_mut())
+            }
+            (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
+                if matches!(self.kind(y), TyKind::Slice(_))
+                    && (!em.is_mut() || fm.is_mut())
+                    && match self.tys.vec_elem(self.resolve(x)) {
+                        Some(xe) => match self.kind(y) {
+                            TyKind::Slice(ye) => self.unify(xe, ye),
+                            _ => false,
+                        },
+                        None => false,
+                    } =>
+            {
+                Coerce::SliceFromVec(em.is_mut())
+            }
             _ => {
                 if !self.unify(found, expected) {
                     self.mismatch(span, expected, found);
@@ -917,6 +953,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // index type then follows from the selected `Index` impl.
                 self.obl.run_before_structural();
                 let (derefs, inner) = self.autoderef(bt);
+                if let Expr::Range { lo, hi, .. } = p.ast.expr(*index) {
+                    // A range index makes a slice place. Bounds are usize.
+                    // The range expression itself is not checked as a value;
+                    // give it the error-free unit record so lowering (which
+                    // reads the bounds directly) never sees a stale type.
+                    for b in [lo, hi].into_iter().flatten() {
+                        self.expect_expr(*b, USIZE);
+                    }
+                    self.set(*index, UNIT);
+                    let elem = match self.kind(inner) {
+                        TyKind::Array(elem, _) | TyKind::Slice(elem) => Some(elem),
+                        _ => self.tys.vec_elem(inner),
+                    };
+                    match elem {
+                        Some(elem) => {
+                            self.set_res(e, Res::SliceIndex { derefs });
+                            return self.tys.intern(TyKind::Slice(elem));
+                        }
+                        None => {
+                            if !matches!(self.kind(inner), TyKind::Error) {
+                                let tn = self.tn(bt);
+                                self.err(
+                                    "L0113",
+                                    span,
+                                    format!("cannot slice a value of type `{tn}`"),
+                                    "Slice an array, a Vec, or a slice.",
+                                );
+                            }
+                            return ERROR;
+                        }
+                    }
+                }
                 self.expect_expr(*index, USIZE);
                 match self.kind(inner) {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => {
@@ -1537,17 +1605,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None => match self.tuple_struct_ctor(name) {
                         Some(a) => Res::Variant(a, 0),
                         None => {
-                        let cs = self.span(callee);
-                        self.err(
-                            "L0101",
-                            cs,
-                            format!("cannot find function `{}`", self.name(name)),
-                            "Check the spelling, or define the function.",
-                        );
-                        for &a in args {
-                            self.expr(a, None);
-                        }
-                        return ERROR;
+                            let cs = self.span(callee);
+                            self.err(
+                                "L0101",
+                                cs,
+                                format!("cannot find function `{}`", self.name(name)),
+                                "Check the spelling, or define the function.",
+                            );
+                            for &a in args {
+                                self.expr(a, None);
+                            }
+                            return ERROR;
                         }
                     },
                 }
@@ -1792,6 +1860,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::VecRemove, Autoref::RefMut, vec![USIZE], elem))
                 } else if name == k.truncate {
                     Some((B::VecTruncate, Autoref::RefMut, vec![USIZE], UNIT))
+                } else {
+                    None
+                }
+            }
+            (None, TyKind::Slice(_)) | (None, TyKind::Array(..)) => {
+                if name == k.len {
+                    Some((B::SliceLen, Autoref::Ref, vec![], USIZE))
+                } else if name == k.is_empty {
+                    Some((B::SliceIsEmpty, Autoref::Ref, vec![], BOOL))
                 } else {
                     None
                 }
@@ -2109,15 +2186,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let t = self.expr(iter, None);
         match self.kind(t) {
             _ if self.tys.is_chars_ty(self.resolve(t)) => CHAR,
-            TyKind::Ref(r, m, inner) => match self.tys.vec_elem(self.resolve(inner)) {
-                Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),
-                None => {
-                    let s = self.span(iter);
-                    let tn = self.tn(t);
-                    self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
-                    ERROR
+            TyKind::Ref(r, m, inner) => {
+                let elem = match self.kind(self.resolve(inner)) {
+                    TyKind::Slice(elem) | TyKind::Array(elem, _) => Some(elem),
+                    _ => self.tys.vec_elem(self.resolve(inner)),
+                };
+                match elem {
+                    Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),
+                    None => {
+                        let s = self.span(iter);
+                        let tn = self.tn(t);
+                        self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
+                        ERROR
+                    }
                 }
-            },
+            }
+            TyKind::Array(elem, _) => elem,
             _ if self.tys.vec_elem(self.resolve(t)).is_some() => {
                 let s = self.span(iter);
                 self.errs.push(unsupported(s, "iterating a Vec by value"));

@@ -100,6 +100,20 @@ pub enum Rvalue {
     /// `[value; len]` of the given array type for a Copy element with len
     /// above 1 (W-CORELANG, wave A).
     ArrayRepeat(Ty, Operand, u64),
+    /// A fat slice value over the whole of an array, Vec, or slice place
+    /// (W-CORELANG, wave A). The result type is a slice reference type.
+    SliceOf(Place),
+    /// A fat slice value over a range of an array, Vec, or slice place.
+    /// `hi` is the end operand when written; `inclusive` marks `..=` so the
+    /// runtime helper can reject an overflowing end (W-CORELANG, wave A).
+    Subslice {
+        base: Place,
+        lo: Operand,
+        hi: Option<Operand>,
+        inclusive: bool,
+        /// True when the slice place is used mutably (`&mut a[..]`, a write).
+        mutable: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
