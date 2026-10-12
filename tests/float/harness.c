@@ -464,7 +464,7 @@ static int run_bench(void) {
         unsigned long long f = (unsigned long long)(b_rnd() % 999983);
         long long e = (long long)((int)(b_rnd() % 600) - 300);
         snprintf(tmp, sizeof tmp, "%llu.%06llue%lld", a, f, e);
-        strs[i] = lust_realloc(NULL, strlen(tmp) + 1);
+        strs[i] = lust_alloc(strlen(tmp) + 1, 1);
         strcpy(strs[i], tmp);
     }
     t0 = b_now();
