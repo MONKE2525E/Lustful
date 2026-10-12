@@ -17,6 +17,8 @@ pub struct Derives {
     pub clone: bool,
     pub copy: bool,
     pub partial_eq: bool,
+    pub eq: bool,
+    pub hash: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1242,7 +1244,8 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                 "Clone" => d.clone = true,
                 "Copy" => d.copy = true,
                 "PartialEq" => d.partial_eq = true,
-                "Eq" | "Hash" => {}
+                "Eq" => d.eq = true,
+                "Hash" => d.hash = true,
                 n @ ("PartialOrd" | "Ord" | "Default") => errs.push(unsupported(span, &format!("#[derive({n})]"))),
                 n => errs.push(Diag::new(
                     "L0403",

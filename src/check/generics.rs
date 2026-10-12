@@ -1447,6 +1447,12 @@ pub struct GenTables<'a> {
     /// Associated type defaults from trait definitions, in trait
     /// signature form (over the trait's params, Self at 0).
     pub trait_assoc_defaults: FxMap<DefId, Ty>,
+    /// User traits written `unsafe trait`: their impls must be
+    /// `unsafe impl`, and no other impl may be.
+    pub trait_unsafe: FxMap<DefId, bool>,
+    /// Associated consts of user traits: the written type (over
+    /// the trait's params) and whether a default value is given.
+    pub trait_assoc_consts: FxMap<DefId, (Ty, bool)>,
     /// Per user Adt (templates first, instances appended): the
     /// template def and declared parameter count.
     pub adt_info: Vec<(DefId, usize)>,
@@ -1498,6 +1504,8 @@ impl Default for GenTables<'_> {
             trait_scopes: FxMap::default(),
             trait_methods: FxMap::default(),
             trait_assoc_defaults: FxMap::default(),
+            trait_unsafe: FxMap::default(),
+            trait_assoc_consts: FxMap::default(),
             adt_info: Vec::new(),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
@@ -1803,6 +1811,9 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
         .collect();
     for (item_i, trait_def) in trait_items {
         let ast::ItemKind::Trait(tdef) = &p.ast.items[item_i].kind else { unreachable!() };
+        if tdef.is_unsafe {
+            p.gx.trait_unsafe.insert(trait_def, true);
+        }
         // Clone the AST-side pieces the build needs, so the mutable
         // program borrows below stay simple.
         let tdef_generics = tdef.generics.clone();
@@ -1867,6 +1878,11 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 }
                 generics.predicates.extend(preds);
                 let _ = at_where;
+                if at_default.is_some() {
+                    // Associated type defaults are unstable in
+                    // rustc (E0658); rule zero rejects them.
+                    errs.push(not_yet("L0621", at.span, "associated type defaults"));
+                }
                 if let Some(d) = at_default {
                     match resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, d, &scope) {
                         Ok(t) => {
@@ -1877,16 +1893,22 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 }
             }
         }
-        // Associated consts: resolve the type for validation. The
-        // values ride the const evaluator when a use needs them.
-        let const_tys: Vec<ast::TyId> = {
+        // Associated consts: resolve and store the type for impl
+        // validation. The values ride the const evaluator when a
+        // use needs them.
+        let const_parts: Vec<(Sym, ast::TyId, bool)> = {
             let ast::ItemKind::Trait(tdef) = &p.ast.items[item_i].kind else { unreachable!() };
-            tdef.consts.iter().map(|ac| ac.ty).collect()
+            tdef.consts.iter().map(|ac| (ac.name, ac.ty, ac.default.is_some())).collect()
         };
-        for ty in const_tys {
+        for (ac_name, ty, has_default) in const_parts {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            if let Err(d) = resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, ty, &scope) {
-                errs.push(d);
+            match resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, ty, &scope) {
+                Ok(t) => {
+                    if let Some(assoc) = p.gx.index.trait_record(trait_def).and_then(|r| r.assoc_by_name(ac_name)) {
+                        p.gx.trait_assoc_consts.insert(assoc, (t, has_default));
+                    }
+                }
+                Err(d) => errs.push(d),
             }
         }
         // Method signature templates over trait ++ own generics.
@@ -2059,15 +2081,51 @@ pub fn finish_trait_impl(
             )),
         }
     }
-    // Associated consts: presence is required the same way. Their
-    // values are const-evaluated at use sites.
+    // Associated consts: presence is required the same way (a
+    // trait default covers a missing one), and a written const
+    // must have the trait's type for it. Their values are
+    // const-evaluated at use sites.
     for ac in &imp.consts {
-        if rec.assoc_by_name(ac.name).is_none() {
+        let Some(assoc) = rec.assoc_by_name(ac.name) else {
             errs.push(Diag::new(
                 "L0102",
                 ac.name_span,
                 format!("trait has no associated const named `{}`", p.name(ac.name)),
                 "Check the spelling against the trait definition.",
+            ));
+            continue;
+        };
+        if let Some(&(want, _)) = p.gx.trait_assoc_consts.get(&assoc) {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            match resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, ac.ty, scope) {
+                Ok(got) => {
+                    let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+                    let want = subst(&mut p.tys, want, &args);
+                    if got != want {
+                        errs.push(Diag::new(
+                            "L0110",
+                            ac.name_span,
+                            format!("associated const `{}` has a different type than the trait declares", p.name(ac.name)),
+                            "Match the type in the trait definition.",
+                        ));
+                    }
+                }
+                Err(diag) => errs.push(diag),
+            }
+        }
+    }
+    for &(assoc, cname, is_type) in &rec.assoc_items {
+        if is_type || imp.consts.iter().any(|ac| ac.name == cname) {
+            continue;
+        }
+        // Lang traits store no const types here; only user-trait
+        // consts (recorded above) can be required.
+        if p.gx.trait_assoc_consts.get(&assoc).is_some_and(|&(_, d)| !d) {
+            errs.push(Diag::new(
+                "L0110",
+                imp.span,
+                format!("the impl is missing the associated const `{}`", p.name(cname)),
+                "Add the const to the impl.",
             ));
         }
     }
@@ -2103,6 +2161,7 @@ pub fn finish_trait_impl(
             ));
         }
     }
+    check_impl_rules(p, imp, &impl_generics, self_pat, tr, errs);
     // Method validation against the trait's templates.
     let impl_parent_n = impl_generics.params.len();
     for (method_def, mname) in &rec.methods {
@@ -2130,6 +2189,137 @@ pub fn finish_trait_impl(
                 format!("`{}` is not a member of the trait being implemented", p.name(name)),
                 "Move it to an inherent impl, or add it to the trait.",
             ));
+        }
+    }
+}
+
+/// True when const parameter `idx` occurs in a type (in an
+/// array length or a const argument).
+fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
+    let in_const = |c: ConstId| matches!(tys.const_kind(c), ConstKind::Param(p) if p == idx);
+    let in_args = |a: ArgsId| {
+        tys.args(a).iter().any(|g| match g {
+            GenericArg::Ty(e) => ty_uses_const_param(tys, *e, idx),
+            GenericArg::Const(c) => in_const(*c),
+            GenericArg::Lifetime(_) => false,
+        })
+    };
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) => ty_uses_const_param(tys, e, idx),
+        TyKind::Array(e, n) => in_const(n) || ty_uses_const_param(tys, e, idx),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_uses_const_param(tys, e, idx)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(a),
+        _ => false,
+    }
+}
+
+/// The header rules of one trait impl that are not about its
+/// items: `Sized` cannot be implemented, `unsafe` must match
+/// between trait and impl, a `Drop` impl must cover the Adt as
+/// written with no extra bounds, and every impl parameter must
+/// be constrained by the trait ref (Self or a trait input).
+fn check_impl_rules(p: &mut Program, imp: &ast::ImplDef, generics: &Generics, self_pat: Ty, tr: TraitRef, errs: &mut Vec<Diag>) {
+    let lang = p.gx.lang;
+    if tr.def == lang.sized {
+        errs.push(Diag::new(
+            "L0110",
+            imp.span,
+            "the `Sized` trait cannot be implemented in user code",
+            "Remove the impl; sizedness is automatic.",
+        ));
+    }
+    let trait_unsafe = p.gx.trait_unsafe.get(&tr.def).copied().unwrap_or(false) || tr.def == lang.send || tr.def == lang.sync;
+    if trait_unsafe && !imp.is_unsafe {
+        errs.push(Diag::new(
+            "L0110",
+            imp.span,
+            "this trait is unsafe, so its impl must be `unsafe impl`",
+            "Write `unsafe impl`, after checking the trait's contract holds.",
+        ));
+    } else if !trait_unsafe && imp.is_unsafe {
+        errs.push(Diag::new(
+            "L0110",
+            imp.span,
+            "this trait is not unsafe, so its impl cannot be `unsafe impl`",
+            "Remove `unsafe` from the impl.",
+        ));
+    }
+    // Every parameter must occur in the trait ref; one that
+    // occurs only in an associated type or a where clause does
+    // not constrain the impl (rustc E0207).
+    let ref_tys: Vec<Ty> = p.tys.args(tr.args).iter().filter_map(|g| g.as_ty()).collect();
+    for (i, param) in generics.params.iter().enumerate() {
+        let used = match param.kind {
+            ParamKind::Type => ref_tys.iter().any(|&t| ty_uses_param(&p.tys, t, i as u32)),
+            ParamKind::Const(_) => ref_tys.iter().any(|&t| ty_uses_const_param(&p.tys, t, i as u32)),
+            ParamKind::Lifetime => continue,
+        };
+        if !used {
+            errs.push(Diag::new(
+                "L0110",
+                param.span,
+                format!(
+                    "the {} parameter `{}` is not used in the impl header",
+                    if matches!(param.kind, ParamKind::Const(_)) { "const" } else { "type" },
+                    p.name(param.name)
+                ),
+                "Use it in the Self type or a trait input, or remove it.",
+            ));
+        }
+    }
+    if tr.def == lang.drop {
+        check_drop_impl(p, imp, generics, self_pat, errs);
+    }
+}
+
+/// The `Drop` header rules: the Self type must be the Adt
+/// applied to its own parameters in order (no `Drop for
+/// G<u8>`), and the impl may not require more bounds than the
+/// Adt itself declares (rustc E0366 and E0367).
+fn check_drop_impl(p: &Program, imp: &ast::ImplDef, generics: &Generics, self_pat: Ty, errs: &mut Vec<Diag>) {
+    let TyKind::Adt(def, args) = p.tys.kind(self_pat) else {
+        errs.push(Diag::new("L0110", imp.span, "`Drop` can only be implemented for a struct or enum", "Implement `Drop` on the type itself."));
+        return;
+    };
+    let Some(adt_idx) = p.gx.adt_info.iter().position(|&(d, _)| d == def) else { return };
+    let n_params = p.gx.adt_generics[adt_idx].params.len();
+    let written: Vec<GenericArg> = p.tys.args(args).to_vec();
+    let in_order = written.len() == n_params
+        && written.iter().enumerate().all(|(i, g)| match g {
+            GenericArg::Ty(t) => matches!(p.tys.kind(*t), TyKind::Param(pid) if pid.0 as usize == i),
+            GenericArg::Const(c) => matches!(p.tys.const_kind(*c), ConstKind::Param(cp) if cp as usize == i),
+            GenericArg::Lifetime(_) => true,
+        });
+    if !in_order {
+        errs.push(Diag::new(
+            "L0110",
+            imp.span,
+            "`Drop` must be implemented for the type with its own parameters, not one instance of it",
+            "Write `impl<T> Drop for Type<T>` with the type's own parameter list.",
+        ));
+        return;
+    }
+    let adt_preds: Vec<TraitRef> = p.gx.adt_generics[adt_idx]
+        .predicates
+        .iter()
+        .filter_map(|p2| match p2 {
+            Predicate::Trait(b) => Some(b.value),
+            _ => None,
+        })
+        .collect();
+    for pred in &generics.predicates {
+        let Predicate::Trait(b) = pred else { continue };
+        if b.value.def == p.gx.lang.sized {
+            continue;
+        }
+        if !adt_preds.contains(&b.value) {
+            errs.push(Diag::new(
+                "L0110",
+                imp.span,
+                "a `Drop` impl cannot require bounds the type does not declare",
+                "Move the bound to the type definition, or remove it from the impl.",
+            ));
+            return;
         }
     }
 }
@@ -2757,6 +2947,8 @@ fn opaque_adt(p: &mut Program, key: (DefId, u32), bounds: &[DefId], memo: &mut F
         clone: bounds.contains(&lang.clone) || bounds.contains(&lang.copy),
         copy: bounds.contains(&lang.copy),
         partial_eq: bounds.contains(&lang.partial_eq) || bounds.contains(&lang.eq),
+        eq: bounds.contains(&lang.eq),
+        hash: bounds.contains(&lang.hash),
     };
     let id = AdtId(p.adts.len() as u32);
     let def = DefId {
@@ -3868,12 +4060,281 @@ pub fn collect_closures(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// Proves one trait goal in pattern space (collect time): the
+/// param env speaks first, then impls, with a confirmed impl's
+/// own clauses proved the same way. `Sized` and the auto traits
+/// hold by construction here (sizedness is checked where types
+/// are used). A goal the solver can only defer counts as not
+/// proved: at collect the bound must be in the env or in an impl.
+fn prove_trait_ref(
+    index: &crate::traits::ImplIndex,
+    lang: &LangTraits,
+    solver: &mut crate::traits::solve::Solver,
+    cx: &mut crate::traits::solve::PureCx,
+    env: &[Predicate],
+    tr: TraitRef,
+    depth: u32,
+) -> bool {
+    use crate::traits::solve::Selection;
+    if depth > 24 {
+        return false;
+    }
+    if tr.def == lang.sized || lang.is_auto(tr.def) {
+        return true;
+    }
+    match solver.select(cx, index, env, tr) {
+        Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
+            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(index, lang, solver, cx, env, b.value, depth + 1),
+            _ => true,
+        }),
+        Selection::ParamEvidence(_) => true,
+        _ => false,
+    }
+}
+
+/// One trait goal with a fresh solver (collect-time proves are
+/// independent of each other).
+fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {
+    let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+    let mut solver = crate::traits::solve::Solver::new();
+    prove_trait_ref(&p.gx.index, &p.gx.lang, &mut solver, &mut cx, env, tr, 0)
+}
+
+/// The obligations one written impl owes its trait: the trait's
+/// own predicates (supertraits, bounds on the trait's
+/// parameters, and bounds on its associated types) with the
+/// impl's trait ref substituted in and its associated types
+/// rewritten to the impl's bindings. Runs at finish, when the
+/// whole impl set exists (rustc E0277's class).
+fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
+    use crate::traits::index::{Synthetic, subst_predicate};
+    let records: Vec<crate::traits::index::ImplRecord> =
+        p.gx.index.all_impls().filter(|(_, r)| r.synthetic == Synthetic::None && r.local).map(|(_, r)| r.clone()).collect();
+    for rec in records {
+        let Some(trec) = p.gx.index.trait_record(rec.trait_def).cloned() else { continue };
+        if trec.generics.predicates.is_empty() {
+            continue;
+        }
+        let subst_args: Vec<GenericArg> = p.tys.args(rec.trait_ref.args).to_vec();
+        let mut goals: Vec<TraitRef> = Vec::new();
+        for &pred in &trec.generics.predicates {
+            let Predicate::Trait(b) = subst_predicate(&mut p.tys, pred, &subst_args) else { continue };
+            if b.count != 0 {
+                continue;
+            }
+            let old_args: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+            let new_args: Vec<GenericArg> = old_args
+                .iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, &rec.assoc_tys)),
+                    other => other,
+                })
+                .collect();
+            let args = p.tys.intern_args(&new_args);
+            goals.push(TraitRef { def: b.value.def, args, bindings: b.value.bindings });
+        }
+        if goals.is_empty() {
+            continue;
+        }
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
+        for goal in goals {
+            if !prove_goal(p, &env, goal) {
+                let gname = p.gx.index.trait_record(goal.def).map_or("?", |r| p.name(r.name));
+                let tname = p.name(trec.name);
+                errs.push(Diag::new(
+                    "L0612",
+                    rec.span,
+                    format!("this impl of `{tname}` does not satisfy the `{gname}` bound the trait requires"),
+                    format!("Add the `{gname}` impl or bound, or change the impl's types so the bound holds."),
+                ));
+            }
+        }
+    }
+}
+
+/// Supertrait cycles among user traits (rustc E0391): an edge
+/// runs from a trait to each trait its own bounds name on
+/// `Self`. Every trait on a cycle is reported once.
+fn check_supertrait_cycles(p: &Program, errs: &mut Vec<Diag>) {
+    let mut edges: FxMap<DefId, Vec<DefId>> = FxMap::default();
+    for &def in p.gx.trait_names.values() {
+        let Some(rec) = p.gx.index.trait_record(def) else { continue };
+        let mut outs = Vec::new();
+        for pred in &rec.generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 {
+                continue;
+            }
+            let self_is_param0 = p
+                .tys
+                .args(b.value.args)
+                .first()
+                .and_then(|g| g.as_ty())
+                .is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(pid) if pid.0 == 0));
+            if self_is_param0 && p.gx.trait_names.values().any(|&d| d == b.value.def) {
+                outs.push(b.value.def);
+            }
+        }
+        edges.insert(def, outs);
+    }
+    // A trait is on a cycle when it can reach itself.
+    for start in edges.keys().copied().collect::<Vec<_>>() {
+        let mut seen: Vec<DefId> = Vec::new();
+        let mut stack: Vec<DefId> = edges.get(&start).cloned().unwrap_or_default();
+        let mut cyclic = false;
+        while let Some(cur) = stack.pop() {
+            if cur == start {
+                cyclic = true;
+                break;
+            }
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur);
+            if let Some(next) = edges.get(&cur) {
+                stack.extend(next.iter().copied());
+            }
+        }
+        if cyclic {
+            let rec = p.gx.index.trait_record(start);
+            errs.push(Diag::new(
+                "L0110",
+                rec.map_or(Span::default(), |r| r.span),
+                format!("the supertraits of `{}` form a cycle", rec.map_or("?", |r| p.name(r.name))),
+                "Remove one of the bounds so the trait graph has no cycle.",
+            ));
+        }
+    }
+}
+
+/// A manual `Copy` impl needs every field to be `Copy` (rustc
+/// E0204), and no type may be both `Copy` and `Drop` (E0184).
+fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
+    use crate::traits::index::Synthetic;
+    let lang = p.gx.lang;
+    let records: Vec<crate::traits::index::ImplRecord> = p.gx.index.all_impls().map(|(_, r)| r.clone()).collect();
+    let mut copy_adts: Vec<DefId> = Vec::new();
+    for rec in &records {
+        if rec.trait_def == lang.copy
+            && let TyKind::Adt(d, _) = p.tys.kind(rec.self_ty(&p.tys))
+        {
+            copy_adts.push(d);
+        }
+    }
+    for rec in &records {
+        if rec.trait_def == lang.drop
+            && rec.synthetic == Synthetic::None
+            && let TyKind::Adt(d, _) = p.tys.kind(rec.self_ty(&p.tys))
+            && copy_adts.contains(&d)
+        {
+            errs.push(Diag::new(
+                "L0110",
+                rec.span,
+                "a type cannot implement both `Copy` and `Drop`",
+                "Remove the `Copy` impl or the `Drop` impl.",
+            ));
+        }
+        if rec.trait_def != lang.copy || rec.synthetic != Synthetic::None {
+            continue;
+        }
+        let self_ty = rec.self_ty(&p.tys);
+        let TyKind::Adt(def, args) = p.tys.kind(self_ty) else { continue };
+        let Some(idx) = p.gx.adt_info.iter().position(|&(d, _)| d == def) else { continue };
+        let field_tys: Vec<Ty> = p.adt(AdtId(idx as u32)).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        let self_args: Vec<GenericArg> = p.tys.args(args).to_vec();
+        let field_tys: Vec<Ty> = field_tys.iter().map(|&t| subst(&mut p.tys, t, &self_args)).collect();
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
+        for ft in field_tys {
+            let fargs = p.tys.intern_args(&[GenericArg::Ty(ft)]);
+            let goal = TraitRef { def: lang.copy, args: fargs, bindings: EMPTY_BINDINGS };
+            if !prove_goal(p, &env, goal) {
+                errs.push(Diag::new(
+                    "L0110",
+                    rec.span,
+                    "this type cannot be `Copy` because one of its fields is not `Copy`",
+                    "Remove the `Copy` impl, or change the field to a `Copy` type.",
+                ));
+                break;
+            }
+        }
+    }
+}
+
+/// `#[derive(Eq)]` requires `PartialEq` and `Eq` fields;
+/// `#[derive(Hash)]` requires `Hash` fields (rustc E0277 for
+/// the generated impls). The derived impl bounds each type
+/// parameter by the derived trait, as rustc writes it.
+fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
+    let lang = p.gx.lang;
+    let n = p.gx.adt_info.len();
+    for idx in 0..n {
+        let adt_id = AdtId(idx as u32);
+        let (def, _) = p.gx.adt_info[idx];
+        let (derives, span, field_tys) = {
+            let a = p.adt(adt_id);
+            (a.derives, a.span, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
+        };
+        if !derives.eq && !derives.hash {
+            continue;
+        }
+        let base_env = elaborate_env(&mut p.tys, &p.gx.index, &p.gx.adt_generics[idx].predicates.clone());
+        for (wanted, trait_def, dname) in [(derives.eq, lang.eq, "Eq"), (derives.hash, lang.hash, "Hash")] {
+            if !wanted {
+                continue;
+            }
+            if dname == "Eq" {
+                let has_pe = derives.partial_eq
+                    || p.gx.index.impls_of_trait(lang.partial_eq).iter().any(|&id| {
+                        matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def)
+                    });
+                if !has_pe {
+                    errs.push(Diag::new(
+                        "L0110",
+                        span,
+                        "deriving `Eq` requires `PartialEq`",
+                        "Add `PartialEq` to the derive list, or implement it by hand.",
+                    ));
+                    continue;
+                }
+            }
+            // The derive's own parameter bounds join the env.
+            let mut env = base_env.clone();
+            for (i, param) in p.gx.adt_generics[idx].params.iter().enumerate() {
+                if param.kind != ParamKind::Type {
+                    continue;
+                }
+                let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
+                let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
+                env.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
+            }
+            let env = elaborate_env(&mut p.tys, &p.gx.index, &env);
+            for &ft in &field_tys {
+                let fargs = p.tys.intern_args(&[GenericArg::Ty(ft)]);
+                let goal = TraitRef { def: trait_def, args: fargs, bindings: EMPTY_BINDINGS };
+                if !prove_goal(p, &env, goal) {
+                    errs.push(Diag::new(
+                        "L0110",
+                        span,
+                        format!("deriving `{dname}` requires every field to implement `{dname}`"),
+                        "Change the field type, or implement the trait by hand.",
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// The last collect step before mono: synthetic impls, then
 /// coherence over the whole index (section 2.6).
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
     collect_closures(p, errs);
     add_synthetic_impls(p);
+    check_supertrait_cycles(p, errs);
+    check_impl_obligations(p, errs);
+    check_copy_impls(p, errs);
+    check_derive_bounds(p, errs);
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;
     let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];
