@@ -122,8 +122,12 @@ class Harness:
         self.work = tempfile.mkdtemp(prefix="lust-fuzz-")
         self.crate = os.path.join(self.work, "crate.rs")
         self.sock = os.path.join(self.work, "d.sock")
-        self.env = dict(os.environ, LUST_DAEMON_SOCKET=self.sock)
-        self.cold = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(self.work, "none"))
+        # LUST_NO_CACHE keeps a one-shot fallback from answering out of the disk cache.
+        # The cold side also gets LUST_NO_DAEMON so the client cannot autostart a daemon
+        # at the dummy socket and turn the oracle into a second warm session.
+        self.env = dict(os.environ, LUST_DAEMON_SOCKET=self.sock, LUST_NO_CACHE="1")
+        self.cold = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(self.work, "none"),
+                         LUST_NO_CACHE="1", LUST_NO_DAEMON="1")
         self.logpath = os.path.join(self.work, "daemon.log")
         self.log = open(self.logpath, "w")
         self.daemon = None

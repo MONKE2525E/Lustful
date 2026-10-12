@@ -19,7 +19,7 @@ def check(name, cond, detail=""):
 def main():
     work = tempfile.mkdtemp(prefix="lust-smoke-")
     sock = os.path.join(work, "d.sock")
-    env = dict(os.environ, LUST_DAEMON_SOCKET=sock)
+    env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
     log = open(os.path.join(work, "daemon.log"), "w")
     daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log)
     t0 = time.time()
