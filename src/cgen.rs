@@ -33,6 +33,8 @@ pub enum CTy {
     /// A slice reference value or slice place: a generated fat struct holding
     /// `ptr` and `len` (W-CORELANG), the same role `lust_str` plays for `&str`.
     Slice(Box<CTy>),
+    /// A float, as a C `float` or `double` (W-CORELANG).
+    Float(FloatTy),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -51,6 +53,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Bool => CTy::Bool,
         TyKind::Char => CTy::Char,
         TyKind::Int(i) => CTy::Int(i),
+        TyKind::Float(f) => CTy::Float(f),
         TyKind::Str => CTy::Str,
         TyKind::Tuple(ts) => CTy::Tuple(tys.tys_of(ts).iter().map(|&e| cty(tys, e)).collect()),
         TyKind::Array(e, c) => {
@@ -133,6 +136,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
         CTy::Slice(_) => format!("Sl_{}", mangle(t)),
+        CTy::Float(f) => (*f).name().replace("f64", "double").replace("f32", "float"),
     }
 }
 
@@ -153,6 +157,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Tuple(es) => es.iter().map(|e| format!("{}_", mangle(e))).collect(),
         CTy::Array(e, n) => format!("{n}_{}_", mangle(e)),
         CTy::Slice(e) => format!("sl{}_", mangle(e)),
+        CTy::Float(f) => f.name().into(),
     }
 }
 
@@ -201,7 +206,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
 
 fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
+        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
@@ -313,6 +318,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Bool => Some(layout::bool_layout()),
             CTy::Char => Some(layout::char_layout()),
             CTy::Int(i) => Some(layout::int_layout(*i)),
+            CTy::Float(f) => Some(layout::float_layout(*f)),
             CTy::Str => Some(plain_layout(16, 8)),
             CTy::String | CTy::Vec(_) | CTy::Chars => Some(plain_layout(24, 8)),
             CTy::Args => Some(plain_layout(8, 8)),
@@ -484,6 +490,10 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let s = (i.bits() / 8) as u64;
                 (s, if is128(*i) { 16 } else { s.min(8) })
             }
+            CTy::Float(f) => match f {
+                FloatTy::F32 => (4, 4),
+                FloatTy::F64 => (8, 8),
+            },
             CTy::Str => (16, 8),
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::Args => (8, 8),
@@ -772,16 +782,21 @@ impl FnGen<'_, '_, '_> {
             }
             Operand::Const(c) => match c {
                 Const::Int(v, it) => {
-                    // IR consts carry 64 bits today, so a 128-bit literal
-                    // is a zero-extended word pair until consts widen.
                     let lit = if is128(*it) {
-                        format!("(({}){{{}ULL, 0}})", int_c(*it), v)
+                        format!("(({}){{{}ULL, {}ULL}})", int_c(*it), *v as u64, (*v >> 64) as u64)
                     } else if *v < (1 << 31) {
                         v.to_string()
                     } else {
-                        format!("(({}){}ULL)", int_c(*it), v)
+                        format!("(({}){}ULL)", int_c(*it), *v as u64)
                     };
                     (lit, CTy::Int(*it))
+                }
+                Const::Float(bits, f) => {
+                    let lit = match f {
+                        FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
+                        FloatTy::F32 => format!("(((union {{ uint32_t b; float f; }}){{ .b = {}u }}).f)", *bits as u32),
+                    };
+                    (lit, CTy::Float(*f))
                 }
                 Const::Bool(b) => ((*b as u8).to_string(), CTy::Bool),
                 Const::Char(c) => (format!("((uint32_t){})", *c as u32), CTy::Char),
@@ -1075,6 +1090,7 @@ impl FnGen<'_, '_, '_> {
             Rvalue::Un(op, a) => {
                 let (a, at) = self.operand(a, loc, post);
                 match (op, &at) {
+                    (UnOp::Neg, CTy::Float(_)) => format!("(-{a})"),
                     (UnOp::Neg, CTy::Int(i)) => format!("lust_neg_{}({a}, {loc})", int_fn(*i)),
                     (UnOp::Not, CTy::Bool) => format!("(!{a})"),
                     (UnOp::Not, CTy::Int(i)) if is128(*i) => format!("lust_{}_not({a})", int_fn(*i)),
@@ -1087,6 +1103,37 @@ impl FnGen<'_, '_, '_> {
                 let to = cty(&self.body.tys, *to);
                 // Casts to or from a 128-bit struct value are not C casts.
                 match (&from, &to) {
+                    // Float casts go through the runtime helpers so rounding
+                    // and saturation match Rust exactly (src/runtime/float.h).
+                    (CTy::Float(f), CTy::Float(g)) => {
+                        if f == g {
+                            a
+                        } else if *f == FloatTy::F64 {
+                            format!("lust_f64_to_f32({a})")
+                        } else {
+                            format!("lust_f32_to_f64({a})")
+                        }
+                    }
+                    (CTy::Float(f), CTy::Int(ti)) if is128(*ti) => {
+                        let t = self.tmp();
+                        let _ = writeln!(self.out, "    {} {t}; lust_{}_to_{}({a}, &{t}.lo, &{t}.hi);", int_c(*ti), f.name(), int_fn(*ti));
+                        t
+                    }
+                    (CTy::Float(f), CTy::Int(ti)) => format!("lust_{}_to_{}({a})", f.name(), int_fn(*ti)),
+                    (CTy::Float(f), CTy::Char) => format!("((uint32_t)lust_{}_to_u32({a}))", f.name()),
+                    (CTy::Int(fi), CTy::Float(g)) if is128(*fi) => {
+                        format!("lust_{}_to_{}(({a}).lo, ({a}).hi)", int_fn(*fi), g.name())
+                    }
+                    (CTy::Int(fi), CTy::Float(g)) => {
+                        if fi.signed() {
+                            format!("lust_i64_to_{}((int64_t)({a}))", g.name())
+                        } else {
+                            format!("lust_u64_to_{}((uint64_t)({a}))", g.name())
+                        }
+                    }
+                    (CTy::Bool | CTy::Char, CTy::Float(g)) => {
+                        format!("lust_u64_to_{}((uint64_t)({a}))", g.name())
+                    }
                     (CTy::Int(fi), CTy::Int(ti)) if is128(*fi) && is128(*ti) => {
                         if fi == ti {
                             a
@@ -1326,6 +1373,13 @@ impl FnGen<'_, '_, '_> {
             return format!("({a} {} {b})", op.symbol());
         }
         match at {
+            CTy::Float(f) => {
+                if op == Rem {
+                    format!("lust_fmod_{}({a}, {b})", f.name())
+                } else {
+                    format!("(({})({a} {} {b}))", ctype(&CTy::Float(*f)), op.symbol())
+                }
+            }
             CTy::Bool => format!("((uint8_t)({a} {} {b}))", op.symbol()),
             CTy::Int(i) => {
                 let (c, f) = (int_c(*i), int_fn(*i));
@@ -1736,6 +1790,9 @@ impl FnGen<'_, '_, '_> {
             (CTy::Int(i), _) if is128(*i) => format!("lust_fmt_{}(&{out}, {e});", int_fn(*i)),
             (CTy::Int(i), _) if i.signed() => format!("lust_fmt_i64(&{out}, (int64_t){e});"),
             (CTy::Int(_), _) => format!("lust_fmt_u64(&{out}, (uint64_t){e});"),
+            (CTy::Float(f), debug) => {
+                format!("lust_fmt_{}(&{out}, {e});", format!("{}{}", f.name(), if debug { "_debug" } else { "_display" }))
+            }
             (CTy::Bool, _) => format!("lust_fmt_bool(&{out}, {e});"),
             (CTy::Char, false) => format!("lust_string_push_char(&{out}, {e});"),
             (CTy::Char, true) => format!("lust_fmt_char_debug(&{out}, {e});"),
@@ -2103,6 +2160,12 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
 fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32) -> String {
+    if let (CV::Float(bits, f), CTy::Float(_)) = (v, t) {
+        return match f {
+            FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
+            FloatTy::F32 => format!("(((union {{ uint32_t b; float f; }}){{ .b = {}u }}).f)", *bits as u32),
+        };
+    }
     use crate::ty::consteval::ConstValue as CV;
     match (v, t) {
         (CV::Int(i), CTy::Int(it)) => {
@@ -2750,7 +2813,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 match t {
                     CTy::Unit => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
-                    CTy::Bool | CTy::Char | CTy::Int(_) => format!("({x} == {y})"),
+                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => format!("({x} == {y})"),
                     _ => {
                         need(Glue::Eq, t);
                         format!("eq_{}(&{x}, &{y})", mangle(t))
@@ -2835,6 +2898,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     CTy::Char => format!("lust_fmt_char_debug(out, {e});"),
                     CTy::String => format!("lust_fmt_str_debug(out, lust_string_as_str(&{e}));"),
                     CTy::Ref(inner) if **inner == CTy::Str => format!("lust_fmt_str_debug(out, {e});"),
+                    CTy::Float(f) => format!("lust_fmt_{}_debug(out, {e});", f.name()),
                     CTy::Unit => "lust_string_push_bytes(out, \"()\", 2);".into(),
                     _ => {
                         need(Glue::Debug, t);

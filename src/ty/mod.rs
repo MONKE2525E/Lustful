@@ -135,9 +135,9 @@ pub enum IntTy {
     U32,
     U64,
     Usize,
-    // Representation only for now: no lexer suffix, name resolution rejects `i128`/`u128`
-    // as unsupported, and capabilities lists only the types through `Usize`. W-CORELANG
-    // adds real support in wave A. Variants are added at the end (ARCH 9.2 freeze).
+    // Two-word values in codegen (tcc has no __int128); suffix, name, and
+    // literal support landed with W-CORELANG in wave A. Variants stay at
+    // the end (ARCH 9.2 freeze). Literals above u64::MAX still fail to lex.
     I128,
     U128,
 }
@@ -158,8 +158,20 @@ impl IntTy {
         IntTy::U128,
     ];
     /// The integer types this compiler supports today (the subset of `ALL` up to 64 bits).
-    pub const ALL_SUPPORTED: [IntTy; 10] =
-        [IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::Isize, IntTy::U8, IntTy::U16, IntTy::U32, IntTy::U64, IntTy::Usize];
+    pub const ALL_SUPPORTED: [IntTy; 12] = [
+        IntTy::I8,
+        IntTy::I16,
+        IntTy::I32,
+        IntTy::I64,
+        IntTy::Isize,
+        IntTy::U8,
+        IntTy::U16,
+        IntTy::U32,
+        IntTy::U64,
+        IntTy::Usize,
+        IntTy::I128,
+        IntTy::U128,
+    ];
     pub fn signed(self) -> bool {
         matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize | IntTy::I128)
     }
@@ -201,6 +213,16 @@ impl IntTy {
             (1u64 << self.bits()) - 1
         }
     }
+    /// Largest value, as u128. The full-width version of `max`.
+    pub fn max128(self) -> u128 {
+        if self.signed() {
+            if self.bits() >= 128 { i128::MAX as u128 } else { (1u128 << (self.bits() - 1)) - 1 }
+        } else if self.bits() >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << self.bits()) - 1
+        }
+    }
     pub fn from_suffix(s: crate::lexer::IntSuffix) -> IntTy {
         use crate::lexer::IntSuffix as S;
         match s {
@@ -214,12 +236,13 @@ impl IntTy {
             S::U32 => IntTy::U32,
             S::U64 => IntTy::U64,
             S::Usize => IntTy::Usize,
+            S::I128 => IntTy::I128,
+            S::U128 => IntTy::U128,
         }
     }
 }
 
-/// Floating point types. Representation only; name resolution still rejects `f32`/`f64`.
-#[allow(dead_code)] // Constructed when float support lands in wave A.
+/// Floating point types (W-CORELANG wave A).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloatTy {
     F32,
@@ -502,6 +525,8 @@ pub fn int(t: IntTy) -> Ty {
     Ty(FIRST_INT + IntTy::ALL.iter().position(|&x| x == t).unwrap() as u32)
 }
 pub const I32: Ty = Ty(FIRST_INT + 2);
+/// The pre-interned float types follow the ints and CHARS in the global store;
+/// use `float_ty` through an interner instead of naming their indexes here.
 pub const USIZE: Ty = Ty(FIRST_INT + 9);
 
 /// The session-local crate id of the builtin defs. It is a sentinel outside every
@@ -623,6 +648,10 @@ pub trait TyIntern {
     /// The def of the user Adt with this session-local index, if registered.
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId>;
 
+    /// The `f32` or `f64` type.
+    fn float_ty(&mut self, f: FloatTy) -> Ty {
+        self.intern(TyKind::Float(f))
+    }
     /// `&T` or `&mut T` with an erased region (the only milestone 4 form).
     fn mk_ref(&mut self, mutable: bool, t: Ty) -> Ty {
         self.intern(TyKind::Ref(Region::Erased, Mut::from_bool(mutable), t))

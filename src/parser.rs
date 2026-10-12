@@ -2369,7 +2369,7 @@ impl<'a> Parser<'a> {
                         return Err(syntax(self.span(), "expected identifier, found float literal"));
                     }
                     if let Tok::Int(v, suffix) = self.peek() {
-                        if suffix.is_some() || v > u32::MAX as u64 {
+                        if suffix.is_some() || v > u32::MAX as u128 {
                             return Err(syntax(self.span(), "invalid tuple field index"));
                         }
                         let index = v as u32;
@@ -2548,7 +2548,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Int(v, s)
             }
-            Tok::Float(_) => return Err(not_yet(C_LIT, start, "floating point numbers")),
+            Tok::Float(i) => {
+                self.bump();
+                Expr::Float(i + self.str_base)
+            }
             Tok::ByteStr | Tok::ByteChar => return Err(not_yet(C_LIT, start, "byte string and byte char literals")),
             Tok::Str(i) => {
                 self.bump();

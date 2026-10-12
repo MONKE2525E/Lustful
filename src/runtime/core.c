@@ -316,6 +316,87 @@ uint64_t lust_slice_range(uint64_t lo, uint64_t hi, int inclusive, uint64_t len,
     return end;
 })
 
+/* Exact float remainder (Rust `%`, truncating division), computed on the
+   mantissa integers so no libm link is needed. The algorithm is the
+   standard normalize-and-subtract loop over the exponent difference. */
+double lust_fmod_f64(double x, double y) LUST_BODY({
+    union { double f; uint64_t i; } ux, uy;
+    ux.f = x;
+    uy.f = y;
+    int ex = (int)((ux.i >> 52) & 0x7ff);
+    int ey = (int)((uy.i >> 52) & 0x7ff);
+    uint64_t sx = ux.i >> 63;
+    uint64_t ax = ux.i & (UINT64_MAX >> 1);
+    uint64_t ay = uy.i & (UINT64_MAX >> 1);
+    ux.i &= (1ULL << 52) - 1;
+    uy.i &= (1ULL << 52) - 1;
+    if (ay == 0 || ex == 0x7ff || (ey == 0x7ff && (ay & ((1ULL << 52) - 1)) != 0) || ax > 0x7ff0000000000000ULL) {
+        return (x * y) / (x * y); /* NaN */
+    }
+    if (ax <= ay) {
+        if (ax == ay) {
+            ux.f = 0.0;
+            ux.i |= sx << 63;
+            return ux.f;
+        }
+        return x;
+    }
+    /* Normalize both mantissas to 53-bit integers. */
+    if (ex == 0) {
+        uint64_t i = ux.i;
+        for (; !(i >> 52); i <<= 1) ex--;
+        ux.i = i;
+        ex += 1;
+    } else {
+        ux.i |= 1ULL << 52;
+    }
+    if (ey == 0) {
+        uint64_t i = uy.i;
+        for (; !(i >> 52); i <<= 1) ey--;
+        uy.i = i;
+        ey += 1;
+    } else {
+        uy.i |= 1ULL << 52;
+    }
+    for (; ex > ey; ex--) {
+        if (ux.i >= uy.i) {
+            ux.i -= uy.i;
+            if (ux.i == 0) {
+                ux.f = 0.0;
+                ux.i |= sx << 63;
+                return ux.f;
+            }
+        }
+        ux.i <<= 1;
+    }
+    if (ux.i >= uy.i) {
+        ux.i -= uy.i;
+        if (ux.i == 0) {
+            ux.f = 0.0;
+            ux.i |= sx << 63;
+            return ux.f;
+        }
+    }
+    while (!(ux.i >> 52)) {
+        ux.i <<= 1;
+        ey--;
+    }
+    if (ey > 0) {
+        ux.i -= 1ULL << 52;
+        ux.i |= (uint64_t)ey << 52;
+    } else {
+        ux.i >>= (uint64_t)(1 - ey);
+    }
+    ux.i |= sx << 63;
+    return ux.f;
+})
+
+float lust_fmod_f32(float x, float y) LUST_BODY({
+    /* The f64 remainder of two f32 values is exact, and its result is an
+       f32 value, so one rounding at the end is exact. */
+    return (float)lust_fmod_f64((double)x, (double)y);
+})
+
 uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
     if (i >= len) {
         lust_String s = lust_string_new();

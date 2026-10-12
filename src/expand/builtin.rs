@@ -446,7 +446,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let site = crate::diag::call_site_span(span);
             let (line, col) = st.line_col(site);
             let value = if name == "line" { line } else { col };
-            Ok(vec![Tt::Tok(Token { tok: Tok::Int(value as u64, Some(crate::lexer::IntSuffix::U32)), span })])
+            Ok(vec![Tt::Tok(Token { tok: Tok::Int(value as u128, Some(crate::lexer::IntSuffix::U32)), span })])
         }
         "file" => {
             expect_args(name, call, 0)?;

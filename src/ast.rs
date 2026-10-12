@@ -755,7 +755,7 @@ pub struct ClosureParam {
 }
 
 pub enum Expr {
-    Int(u64, Option<IntSuffix>),
+    Int(u128, Option<IntSuffix>),
     Bool(bool),
     Str(u32),
     Char(char),

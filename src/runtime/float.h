@@ -95,6 +95,11 @@ double lust_u128_to_f64(uint64_t lo, uint64_t hi);
 float lust_i128_to_f32(uint64_t lo, uint64_t hi);
 float lust_u128_to_f32(uint64_t lo, uint64_t hi);
 
+/* Remainder (Rust `%` on floats, truncating division); defined in core.c
+   next to the bounds helpers so no libm link is needed. */
+double lust_fmod_f64(double, double);
+float lust_fmod_f32(float, float);
+
 /* Float-to-float casts (Rust `as`): f64 to f32 rounds to nearest even and
    overflows to inf; f32 to f64 is exact. Bit-level code, so the host
    compiler's float behavior cannot change the result. */

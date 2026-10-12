@@ -153,6 +153,10 @@ known_syms!(
     u32,
     u64,
     usize,
+    i128,
+    u128,
+    f32,
+    f64,
     println,
     print,
     eprintln,
@@ -221,6 +225,8 @@ impl Known {
             (self.u32, U32),
             (self.u64, U64),
             (self.usize, Usize),
+            (self.i128, I128),
+            (self.u128, U128),
         ];
         table.iter().find(|(k, _)| *k == s).map(|&(_, t)| t)
     }

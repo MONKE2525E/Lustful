@@ -110,7 +110,7 @@ assert cap["schema"] == 1 and cap["kind"] == "capabilities"
 assert "push" in cap["methods"]["Vec<T>"] and "unwrap" in cap["methods"]["Option<T>"]
 assert cap["associated_functions"]["String"] == ["from", "new", "with_capacity"]
 assert cap["functions"] == {"std::env": ["args"], "std::process": ["exit"]}
-assert len(cap["integer_types"]) == 10
+assert len(cap["integer_types"]) == 12
 # Every literal at an unsupported(...) call site is named in the rejected list.
 features = [r["feature"] for r in cap["rejected"]]
 src = "\n".join(p.read_text() for p in (root / "src").rglob("*.rs") if p.name != "capabilities.rs")

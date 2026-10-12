@@ -899,6 +899,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some((t, k)) if k.is_int_infer() => t,
                 _ => self.new_var(true),
             },
+            Expr::Float(i) => {
+                let text = p.ast.strings[*i as usize].as_str();
+                match crate::check::collect::parse_float_literal(text) {
+                    Some((_, suffix)) => match suffix {
+                        Some(f) => self.tys.float_ty(f),
+                        None => match expected.map(|t| self.kind(t)) {
+                            Some(TyKind::Float(_)) => expected.unwrap(),
+                            _ => self.tys.float_ty(FloatTy::F64),
+                        },
+                    },
+                    None => {
+                        self.err("L0118", span, "invalid float literal", "Write the literal in a simpler form.");
+                        ERROR
+                    }
+                }
+            }
             Expr::Bool(_) => BOOL,
             Expr::Char(_) => CHAR,
             Expr::Str(_) => REF_STR,
@@ -1096,6 +1112,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld: d, rd: 0 });
                 let k = self.kind(inner);
                 match (op, k) {
+                    (UnOp::Neg, TyKind::Float(_)) => inner,
                     (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
                     (UnOp::Neg, k) if k.is_int_infer() => inner,
                     (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
@@ -1126,6 +1143,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
                     (_, TyKind::Int(_)) if enum_cast => true,
                     (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
+                    (TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Float(_), TyKind::Float(_)) => true,
+                    (TyKind::Float(_), TyKind::Int(_) | TyKind::Char) => true,
                     (TyKind::Int(IntTy::U8), TyKind::Char) => true,
                     (TyKind::Error, _) | (_, TyKind::Error) => true,
                     _ => false,
@@ -1191,6 +1210,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
                 let ok = !rmut
                     && match (*op, lk) {
+                        (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, TyKind::Float(_)) => self.unify(lt, rinner),
                         (_, TyKind::Error) => true,
                         (BinOp::Shl | BinOp::Shr, k) if int_like(k) => int_like(self.kind(rinner)),
                         (_, k) if int_like(k) => self.unify(lt, rinner),
@@ -1473,8 +1493,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             // AST v2 expression forms the parser still rejects.
-            Expr::Float(_)
-            | Expr::Closure { .. }
+            Expr::Closure { .. }
             | Expr::Try(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
@@ -1686,6 +1705,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Check the spelling, or declare it with `let` first.",
             );
             return ERROR;
+        }
+        // Primitive associated consts: `i64::MAX`, `u32::BITS`, and kin.
+        if segs.len() == 2
+            && let Some(it) = p.known.int_ty(segs[0].name)
+        {
+            let item = self.name(segs[1].name);
+            let bits = it.bits();
+            let v = match item {
+                "MAX" => Some(crate::ty::consteval::truncate_to_int(it.max128() as i128, it)),
+                "MIN" => Some(if it.signed() { if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } } else { 0 }),
+                "BITS" => Some(bits as i128),
+                _ => None,
+            };
+            if let Some(v) = v {
+                let (ty, val) = if item == "BITS" {
+                    (int(IntTy::U32), crate::ty::consteval::ConstValue::Int(v))
+                } else {
+                    // u128::MAX does not fit an i128; store its bits as -1 and
+                    // let materialization reinterpret them at the u128 type.
+                    let val = if it == IntTy::U128 && item == "MAX" { -1 } else { v };
+                    (int(it), crate::ty::consteval::ConstValue::Int(val))
+                };
+                let i = self.ei(e);
+                self.out.const_exprs[i] = Some(val);
+                return ty;
+            }
         }
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
@@ -2367,7 +2412,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             let lb = self.deep(lb);
             let ok = match self.tys.kind(lb) {
-                TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
                 k if k.is_int_infer() || self.tys.is_string_ty(lb) => true,
                 _ if matches!(op, Eq | Ne) => has_eq(self.p, &self.tys, lb),
                 _ => false,
@@ -2399,6 +2444,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let (lik, rik) = (self.kind(li), self.kind(ri));
         let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
         let result = match op {
+            Add | Sub | Mul | Div | Rem if matches!(lik, TyKind::Float(_)) && matches!(rik, TyKind::Float(_)) => {
+                if !self.unify(li, ri) {
+                    return bad(self);
+                }
+                li
+            }
             Shl | Shr if int_like(lik) && int_like(rik) => li,
             BitAnd | BitOr | BitXor if lik == TyKind::Bool && rik == TyKind::Bool => BOOL,
             Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor if int_like(lik) && int_like(rik) => {
@@ -3314,7 +3365,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && let TyKind::Int(it) = self.tys.kind(self.out.expr_ty[i])
             {
                 let neg = self.negated_lits.contains(&e);
-                let max = if neg && it.signed() { it.max() + 1 } else { it.max() };
+                let max = if neg && it.signed() { it.max128() + 1 } else { it.max128() };
                 if *v > max {
                     let s = self.span(e);
                     self.err(

@@ -342,6 +342,8 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
                 crate::lexer::IntSuffix::U32 => "u32",
                 crate::lexer::IntSuffix::U64 => "u64",
                 crate::lexer::IntSuffix::Usize => "usize",
+                crate::lexer::IntSuffix::I128 => "i128",
+                crate::lexer::IntSuffix::U128 => "u128",
             });
             return format!("{v}{suf}");
         }
@@ -1869,10 +1871,7 @@ impl<'a> Expander<'a> {
                         Some(Tt::Delim(_, group, _)) => group.clone(),
                         _ => Vec::new(),
                     };
-                    kept.push((
-                        AttrInfo { path: fake_path.unwrap(), inner, end, span, inner_attr: false },
-                        usize::MAX,
-                    ));
+                    kept.push((AttrInfo { path: fake_path.unwrap(), inner, end, span, inner_attr: false }, usize::MAX));
                     continue;
                 }
                 out.push(Tt::Tok(Token { tok: Tok::Pound, span }));

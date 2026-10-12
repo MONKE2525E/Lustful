@@ -337,6 +337,26 @@ impl<'p, 'a> Lower<'p, 'a> {
                 TyKind::Int(it) => Operand::Const(Const::Int(*v, it)),
                 _ => Operand::Const(Const::Int(*v, IntTy::I32)),
             },
+            Expr::Float(i) => {
+                let text = &self.p.ast.strings[*i as usize];
+                let ft = match self.kind(ty) {
+                    TyKind::Float(f) => f,
+                    _ => FloatTy::F64,
+                };
+                match crate::check::collect::parse_float_literal(text) {
+                    Some((bits, _)) => {
+                        // A literal parsed as f64 narrows to f32 when the
+                        // expected type is f32 (a suffix already pinned it).
+                        let bits = if ft == FloatTy::F32 && !text.trim_end().ends_with("f32") {
+                            (f64::from_bits(bits) as f32).to_bits() as u64
+                        } else {
+                            bits
+                        };
+                        Operand::Const(Const::Float(bits, ft))
+                    }
+                    None => Operand::Const(Const::Unit),
+                }
+            }
             Expr::Bool(b) => Operand::Const(Const::Bool(*b)),
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
@@ -401,7 +421,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             return;
         }
         match p.ast.expr(e) {
-            Expr::Int(..) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => {
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => {
                 if let Some(d) = dest {
                     let op = self.operand_raw(e);
                     self.assign(d.clone(), Rvalue::Use(op), span);
@@ -507,7 +527,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.call_into(CallTarget::Builtin(b), ops, d, span);
                     }
                     Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span),
-                    Res::ConstUsize(v) => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), ty, span),
+                    Res::ConstUsize(v) => {
+                        self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
+                    }
                     Res::OptSome => self.set_or_temp(dest, Rvalue::Opt(ty, ops.into_iter().next()), ty, span),
                     _ => return,
                 }
@@ -732,7 +754,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Expr::OffsetOf { .. } => {
                 if let Res::ConstUsize(v) = self.ck.res(e) {
-                    self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), ty, span);
+                    self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span);
                 }
             }
             // AST v2 expression forms the parser still rejects.
@@ -1008,7 +1030,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         let base = self.peel(lt, ld);
         let rv = if op.is_cmp() {
             match self.kind(base) {
-                TyKind::Int(_) | TyKind::Bool | TyKind::Char => {
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
                     let a = self.operand_derefs(lhs, ld);
                     let b = self.operand_derefs(rhs, rd);
                     Rvalue::Bin(op, a, b)
@@ -1140,7 +1162,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     },
                     _ => 0,
                 };
-                self.assign(Place::local(len), Rvalue::Use(Operand::Const(Const::Int(n, IntTy::Usize))), span);
+                self.assign(Place::local(len), Rvalue::Use(Operand::Const(Const::Int(n as u128, IntTy::Usize))), span);
             } else {
                 let shared = self.ref_ty(false, self.peel(it_ty, 1));
                 let sref = self.temp(shared);
@@ -1230,13 +1252,33 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn lit_operand(&mut self, l: ExprId, ty: Ty) -> Operand {
         match self.p.ast.expr(l) {
             Expr::Unary { expr, .. } => match (self.p.ast.expr(*expr), self.kind(ty)) {
-                (Expr::Int(v, _), TyKind::Int(it)) => Operand::Const(Const::Int((*v as i64).wrapping_neg() as u64, it)),
+                (Expr::Int(v, _), TyKind::Int(it)) => Operand::Const(Const::Int(v.wrapping_neg(), it)),
                 _ => Operand::Const(Const::Unit),
             },
             Expr::Int(v, _) => match self.kind(ty) {
                 TyKind::Int(it) => Operand::Const(Const::Int(*v, it)),
                 _ => Operand::Const(Const::Int(*v, IntTy::I32)),
             },
+            Expr::Float(i) => {
+                let text = &self.p.ast.strings[*i as usize];
+                let ft = match self.kind(ty) {
+                    TyKind::Float(f) => f,
+                    _ => FloatTy::F64,
+                };
+                match crate::check::collect::parse_float_literal(text) {
+                    Some((bits, _)) => {
+                        // A literal parsed as f64 narrows to f32 when the
+                        // expected type is f32 (a suffix already pinned it).
+                        let bits = if ft == FloatTy::F32 && !text.trim_end().ends_with("f32") {
+                            (f64::from_bits(bits) as f32).to_bits() as u64
+                        } else {
+                            bits
+                        };
+                        Operand::Const(Const::Float(bits, ft))
+                    }
+                    None => Operand::Const(Const::Unit),
+                }
+            }
             Expr::Bool(b) => Operand::Const(Const::Bool(*b)),
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
@@ -1248,7 +1290,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// A usize local holding a constant, for slice pattern indexes.
     fn const_usize(&mut self, v: u64, span: Span) -> Local {
         let t = self.temp(USIZE);
-        self.assign(Place::local(t), Rvalue::Use(Operand::Const(Const::Int(v, IntTy::Usize))), span);
+        self.assign(Place::local(t), Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), span);
         t
     }
 
@@ -1263,7 +1305,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let idx = self.temp(USIZE);
                 self.assign(
                     Place::local(idx),
-                    Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(back, IntTy::Usize))),
+                    Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(back as u128, IntTy::Usize))),
                     span,
                 );
                 idx
@@ -1343,7 +1385,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let len = self.temp(USIZE);
                     self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
                     let op = if middle.is_some() { BinOp::Ge } else { BinOp::Eq };
-                    branch(self, Rvalue::Bin(op, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(fixed, IntTy::Usize))));
+                    branch(
+                        self,
+                        Rvalue::Bin(op, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(fixed as u128, IntTy::Usize))),
+                    );
                 }
                 for (i, &sub) in prefix.iter().enumerate() {
                     let idx = self.const_usize(i as u64, span);
@@ -1500,7 +1545,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                                 // A reference middle is a subslice fat value.
                                 let lo = self.const_usize(prefix.len() as u64, span);
                                 let hi = match arr_len {
-                                    Some(n) => Operand::Const(Const::Int(n - suffix.len() as u64, IntTy::Usize)),
+                                    Some(n) => Operand::Const(Const::Int((n - suffix.len() as u64) as u128, IntTy::Usize)),
                                     None => {
                                         let len = self.temp(USIZE);
                                         self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
@@ -1510,7 +1555,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                                             Rvalue::Bin(
                                                 BinOp::Sub,
                                                 Operand::Copy(Place::local(len)),
-                                                Operand::Const(Const::Int(suffix.len() as u64, IntTy::Usize)),
+                                                Operand::Const(Const::Int(suffix.len() as u128, IntTy::Usize)),
                                             ),
                                             span,
                                         );
@@ -1686,8 +1731,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Int(it) => it,
                     _ => IntTy::I32,
                 };
-                Operand::Const(Const::Int(*i as u128 as u64, it))
+                Operand::Const(Const::Int(*i as u128, it))
             }
+            CV::Float(bits, f) => Operand::Const(Const::Float(*bits, *f)),
             CV::Bool(b) => Operand::Const(Const::Bool(*b)),
             CV::Char(c) => Operand::Const(Const::Char(*c)),
             CV::Str(i) => Operand::Const(Const::Str(*i)),

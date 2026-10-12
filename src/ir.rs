@@ -44,7 +44,9 @@ impl Place {
 
 #[derive(Clone, Debug)]
 pub enum Const {
-    Int(u64, IntTy),
+    Int(u128, IntTy),
+    /// A float literal as bits (`f32` bits zero-extended).
+    Float(u64, crate::ty::FloatTy),
     Bool(bool),
     Char(char),
     /// Index into the AST string table.

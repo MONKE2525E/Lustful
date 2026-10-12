@@ -14,6 +14,8 @@ pub enum IntSuffix {
     U32,
     U64,
     Usize,
+    I128,
+    U128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -22,7 +24,7 @@ pub enum Tok {
     /// A Rust 2024 keyword that cannot be used as an identifier (`gen`, `try`, `await`, and kin).
     /// The parser rejects it wherever an identifier is expected, with a clearer message.
     Reserved(Sym),
-    Int(u64, Option<IntSuffix>),
+    Int(u128, Option<IntSuffix>),
     /// Index into `Lexed::strings`, holding the literal text (the parser rejects floats for now).
     Float(u32),
     /// Index into `Lexed::strings`.
@@ -347,6 +349,8 @@ fn suffix(s: &str) -> Option<Option<IntSuffix>> {
         "u32" => U32,
         "u64" => U64,
         "usize" => Usize,
+        "i128" => I128,
+        "u128" => U128,
         _ => return None,
     }))
 }
@@ -768,14 +772,14 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
         return Some(float_tok(src, start, *i, strings));
     }
     // Accumulate digits directly; underscores are separators.
-    let mut value: u64 = 0;
+    let mut value: u128 = 0;
     let mut any = false;
     for &c in &b[digits_start..digits_end] {
         if c == b'_' {
             continue;
         }
-        let d = (c as char).to_digit(radix)? as u64;
-        value = value.checked_mul(radix as u64)?.checked_add(d)?;
+        let d = (c as char).to_digit(radix)? as u128;
+        value = value.checked_mul(radix as u128)?.checked_add(d)?;
         any = true;
     }
     if !any {

@@ -325,9 +325,13 @@ pub fn resolve_ty(
                 return no_generics(t);
             }
             let n = interner.get(name);
-            if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell", "f32", "f64", "i128", "u128"]
-                .contains(&n)
-            {
+            if name == known.f32 {
+                return no_generics(tys.float_ty(FloatTy::F32));
+            }
+            if name == known.f64 {
+                return no_generics(tys.float_ty(FloatTy::F64));
+            }
+            if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
                 return Err(not_yet("L0641", span, &format!("the `{n}` type")));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
@@ -378,6 +382,20 @@ pub fn eval_array_len(ast: &Ast, e: ast::ExprId) -> Option<u128> {
         }
         _ => None,
     }
+}
+
+/// Parses a float literal's text the way the host Rust parser does, which is
+/// correctly rounded for both widths. Returns the bits (`f32` bits are
+/// zero-extended into the u64) and the suffix type when one is written.
+pub fn parse_float_literal(text: &str) -> Option<(u64, Option<FloatTy>)> {
+    let clean: String = text.chars().filter(|&c| c != '_').collect();
+    if let Some(t) = clean.strip_suffix("f32") {
+        return t.parse::<f32>().ok().map(|v| (v.to_bits() as u64, Some(FloatTy::F32)));
+    }
+    if let Some(t) = clean.strip_suffix("f64") {
+        return t.parse::<f64>().ok().map(|v| (v.to_bits(), Some(FloatTy::F64)));
+    }
+    clean.parse::<f64>().ok().map(|v| (v.to_bits(), None))
 }
 
 /// Evaluates a constant integer expression at collection time: literals,
@@ -497,8 +515,8 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         "align" => match trees.get(i + 1) {
                             Some(TokenTree::Delim(_, inner, _)) => match inner.as_slice() {
                                 [TokenTree::Token(t2)] => match t2.tok {
-                                    Tok::Int(n, _) if n > 0 && n.is_power_of_two() => {
-                                        repr.align = Some(n);
+                                    Tok::Int(n, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
+                                        repr.align = Some(n as u64);
                                         i += 1;
                                     }
                                     _ => return Err(bad("align(..)")),
@@ -1493,7 +1511,7 @@ fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>
 
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),
@@ -1530,6 +1548,7 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => has_eq(p, tys, e),
@@ -1552,6 +1571,7 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => has_debug(p, tys, e),
@@ -1574,6 +1594,7 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_display(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => has_display(tys, e),
