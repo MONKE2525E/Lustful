@@ -1244,18 +1244,18 @@ pub fn elaborate(s: &impl TyIntern, written: &[Predicate], supertraits: &dyn Fn(
 
 /// The owned type store lift (ARCH 2.1): when check finishes a body, lowering lifts
 /// its local types into the crate session's append-only type store and rewrites every
-/// `Ty` in the result, so a checked body owns stable session ids. Today it is the
-/// identity: a body's `Tys` overlay moves whole into `ir::Body`, which owns it, and
-/// no result is cached or shared across crates yet. S7 replaces the body of this
-/// function when the session store lands; callers go through it now so the boundary
-/// is fixed before results start to move. Cross-crate readers must translate by
-/// structural fingerprint (ARCH 8.4), never by raw id, identity or not.
+/// `Ty` in the result, so a checked body owns stable session ids. Through S7 it is
+/// the identity: a body's `Tys` overlay moves whole into `ir::Body`, which owns it,
+/// and no result is cached or shared across crates yet. The session store that
+/// makes this rewrite real lands with mono and the disk cache (W-MONO, W-DRIVER);
+/// callers go through it now so the boundary stays fixed. Cross-crate readers must
+/// translate by structural fingerprint (ARCH 8.4), never by raw id, identity or not.
 pub fn lift_to_owned(tys: Tys<'_>) -> Tys<'_> {
     tys
 }
 
 /// One type through the owned store lift. Identity today; see `lift_to_owned`.
-#[allow(dead_code)] // The S7 session store is the first user that rewrites ids.
+#[allow(dead_code)] // The session store (W-MONO) is the first user that rewrites ids.
 pub fn lift_ty(t: Ty) -> Ty {
     t
 }

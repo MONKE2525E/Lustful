@@ -31,9 +31,9 @@ pub(crate) struct Front {
     /// Slot by stable function identity. The key is the disk pair
     /// `(StableCrateHash, DefPathHash)` (docs/ARCH.md sections 1.7 and 4.2), never
     /// a `Sym` or a local id, so the same source gets the same slots in any
-    /// session, in any interning order. The manifest type that persists this map
-    /// across daemon restarts is S7 work; the encode/decode pair below fixes the
-    /// byte shape it will carry.
+    /// session, in any interning order. `driver::graph::SlotManifest` is the
+    /// manifest type over this map (S7); the encode/decode pair below fixes the
+    /// persisted byte shape for today's non-generic keys.
     pub(crate) slot_of: FxMap<DiskDefId, u32>,
     /// Canonical def path text per slot key, for hash collision checks
     /// (src/def.rs). A key keeps the path that first claimed it; a different
@@ -165,16 +165,17 @@ impl Session {
     }
 }
 
-/// The slot manifest byte shape (pre-S7): magic, entry count, then one 20-byte
+/// The slot manifest byte shape: magic, entry count, then one 20-byte
 /// entry per slot (`DiskDefId` bytes + slot), sorted by slot. Only stable disk
 /// pairs are stored, so a restarted daemon that loads these bytes recovers the
 /// same slot assignment in any crate load or discovery order (docs/ARCH.md
-/// sections 4.2 and 8.4). S7 owns the manifest type and where it is stored;
-/// this pair fixes the encoding and its round-trip test now.
+/// sections 4.2 and 8.4). The in-memory manifest type is
+/// `driver::graph::SlotManifest`; where these bytes are stored is W-DRIVER's
+/// cache-file work, so this pair still has no caller.
 const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS1";
 
 /// Serializes a slot map. See `SLOT_MANIFEST_MAGIC`.
-#[allow(dead_code)] // First caller is the S7 slot manifest store; the encoding and its test land with the key change.
+#[allow(dead_code)] // First caller is the slot manifest store (W-DRIVER cache work).
 pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
     let mut entries: Vec<(u32, DiskDefId)> = slot_of.iter().map(|(k, &s)| (s, *k)).collect();
     entries.sort_unstable();
