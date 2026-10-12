@@ -36,20 +36,39 @@ prints "reserved, not yet emitted".
 | L0201-L0203 | References in fields, lifetime elision and syntax | collect, parser | in use | |
 | L0301-L0312 | Borrow checker: moves, borrows, value lifetimes | borrowck | in use | |
 | L0401-L0405 | User macros, attributes, derives, `unsafe`, `async` | parser, collect | in use | |
-| L0501-L0509 | Modules and imports | W-RESOLVE | reserved | L0501 import cycle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution |
+| L0501-L0504 | Modules and imports | W-RESOLVE | reserved | L0501 import cycle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution |
+| L0505 | Modules and imports | W-RESOLVE | in use | Module, import, and module-path forms are not supported yet (S3b parser reject) |
+| L0506-L0509 | Modules and imports | W-RESOLVE | reserved | |
 | L0510-L0519 | Visibility | W-RESOLVE | reserved | |
-| L0520-L0529 | cfg and attributes | W-MACRO | reserved | L0520 unknown cfg name, L0521 unknown attribute |
+| L0520-L0521 | cfg and attributes | W-MACRO | reserved | L0520 unknown cfg name, L0521 unknown attribute |
+| L0522 | cfg and attributes | W-MACRO | in use | Known attribute (cfg, repr, path, inline, and kin) is not supported yet (S3b parser reject) |
+| L0523-L0529 | cfg and attributes | W-MACRO | reserved | |
 | L0530-L0539 | Crate session | W-DRIVER | reserved | L0530 unsupported edition, L0531 unsupported deny-level lint |
-| L0601-L0609 | Types and aliases | W-CORELANG | reserved | L0601 alias cycle |
-| L0610-L0619 | Traits and inference | W-TRAITS-CORE | reserved | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known, L0615 overlapping impls |
-| L0620-L0629 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
-| L0630-L0639 | Const eval | W-CORELANG | reserved | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
-| L0640-L0649 | Std surface | W-STD | reserved | L0640 std item declared but not yet implemented |
+| L0601 | Types and aliases | W-CORELANG | reserved | L0601 alias cycle |
+| L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
+| L0603-L0609 | Types and aliases | W-CORELANG | reserved | |
+| L0610-L0613 | Traits and inference | W-TRAITS-CORE | reserved | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known |
+| L0614 | Traits and inference | W-TRAITS-CORE | in use | Trait, generic, or where-clause form is not supported yet (S3b parser reject) |
+| L0615-L0619 | Traits and inference | W-TRAITS-CORE | reserved | L0615 overlapping impls |
+| L0620 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
+| L0621 | Associated items | W-TRAITS-CORE | in use | Associated item, binding, or qualified path is not supported yet (S3b parser reject) |
+| L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |
+| L0630-L0631 | Const eval | W-CORELANG | reserved | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
+| L0632 | Const eval | W-CORELANG | in use | Const or static item, const fn, or const generic form is not supported yet (S3b parser reject) |
+| L0633-L0639 | Const eval | W-CORELANG | reserved | |
+| L0640 | Std surface | W-STD | reserved | L0640 std item declared but not yet implemented |
+| L0641 | Std surface | W-STD | in use | Float or byte literal, known std type, or format form is not supported yet (S3b) |
+| L0642-L0649 | Std surface | W-STD | reserved | |
 | L0650-L0659 | Layout | W-CORELANG | reserved | L0650 `offset_of!` on a default-repr type, L0651 reference to a packed field, L0652 unsupported layout form |
 | L0701-L0709 | dyn compatibility | W-TRAITS-CORE | reserved | L0701 not dyn compatible (name the offending item) |
 | L0710-L0719 | Binders | W-TRAITS-CORE | reserved | L0710 nested higher-ranked binder |
-| L0720-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0720 ambiguous method, L0722 unsupported receiver type; plain "no such method" stays L0104 |
+| L0720 | Methods and receivers | W-TRAITS-CORE | reserved | L0720 ambiguous method; plain "no such method" stays L0104 |
+| L0721 | Methods and receivers | W-TRAITS-CORE | in use | Method turbofish or typed receiver form is not supported yet (S3b) |
+| L0722-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0722 unsupported receiver type |
 | L0730-L0739 | Regions and drop check | W-BORROW | reserved | L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes |
 | L0801-L0809 | Macros | W-MACRO | reserved | L0801 expansion caps, L0802 unknown macro, L0803 include file not found, L0804 proc-macro dependency, L0805 local ambiguity |
-| L0810-L0819 | Foreign and shim boundary | W-SHIM | reserved | |
+| L0810 | Foreign and shim boundary | W-SHIM | in use | Extern block or foreign item is not supported yet (S3b parser reject) |
+| L0811-L0819 | Foreign and shim boundary | W-SHIM | reserved | |
+| L0820 | Core syntax forms | W-CORELANG | in use | Core expression, pattern, or statement form is not supported yet (S3b parser reject; range added by S3b because no Appendix A range covers core syntax) |
+| L0821-L0829 | Core syntax forms | W-CORELANG | reserved | |
 | L9001 | Feature not supported yet | all | in use | Do not add new L9001 sites for planned features; use the ranges above |
