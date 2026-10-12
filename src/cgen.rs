@@ -133,7 +133,8 @@ fn int_fn(i: IntTy) -> &'static str {
 
 pub fn ctype(t: &CTy) -> String {
     match t {
-        CTy::Unit | CTy::Bool => "uint8_t".into(),
+        CTy::Unit => "lust_Unit".into(),
+        CTy::Bool => "uint8_t".into(),
         CTy::Char => "uint32_t".into(),
         CTy::Int(i) => int_c(*i).into(),
         CTy::Str => "lust_str".into(),
@@ -304,27 +305,53 @@ fn plain_layout(size: u64, align: u64) -> Layout {
 }
 
 /// True when `type_decls` can emit an enum of this layout with the exact
-/// Rust size: the tag or niche scalar fits a C integer of at most 8 bytes,
-/// and niche tag values do not wrap the scalar range.
+/// Rust size: the tag or niche scalar is a C integer of at most 8 bytes,
+/// or a 16-byte two-word 128-bit struct. Niche tag values may wrap the
+/// scalar range; the readers below compare with wrapping arithmetic.
 fn enum_is_exact(l: &Layout, variants: usize) -> bool {
     match l.enum_tag {
-        Some(EnumTag::Explicit { size, .. }) => size <= 8,
-        Some(EnumTag::NicheFilled { niche, .. }) => {
-            matches!(niche.scalar_size, 1 | 2 | 4 | 8)
-                && niche.start <= u64::MAX as u128
-                && niche.start + variants.saturating_sub(1) as u128 <= (1u128 << (niche.scalar_size * 8))
-        }
+        Some(EnumTag::Explicit { size, .. }) => size <= 16,
+        Some(EnumTag::NicheFilled { niche, .. }) => matches!(niche.scalar_size, 1 | 2 | 4 | 8 | 16),
         Some(EnumTag::None) => variants == 1,
         None => false,
+    }
+}
+
+/// The bit mask of a tag or niche scalar of `size` bytes.
+fn scalar_mask(size: u64) -> u128 {
+    if size * 8 >= 128 { u128::MAX } else { (1u128 << (size * 8)) - 1 }
+}
+
+/// The niche scalar bit pattern that stands for the `k`-th non-niche
+/// variant (in the order of `NicheFilled`): successive values from
+/// `niche.start`, wrapping at the top of the scalar range.
+fn niche_val(niche: Niche, k: u128) -> u128 {
+    niche.start.wrapping_add(k) & scalar_mask(niche.scalar_size)
+}
+
+/// A C literal for the raw bit pattern `bits` of a tag or niche scalar.
+fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
+    let ct = tag_c_type(size, signed);
+    if size >= 16 {
+        return format!("(({ct}){{{}ULL, {}ULL}})", bits as u64, (bits >> 64) as u64);
+    }
+    if signed && (bits >> (size * 8 - 1)) & 1 == 1 {
+        let v = (bits as i128) - (1i128 << (size * 8));
+        if v == i64::MIN as i128 {
+            format!("(({ct})(-9223372036854775807LL - 1))")
+        } else {
+            format!("(({ct})({v}LL))")
+        }
+    } else {
+        format!("(({ct})({bits}ULL))")
     }
 }
 
 /// The Rust layout of a CTy, when this file can emit a C type of exactly
 /// that size, alignment, and field offsets. `None` means the type keeps
 /// the legacy declaration-order emission below, with its old (wrong)
-/// sizes: today that is aggregates with a direct `()` field (the C form
-/// of `CTy::Unit` is one byte, not zero), by-value cycles, and enum
-/// shapes `enum_is_exact` rejects. Every `Some` result is checked in the
+/// sizes: today that is by-value cycles, and enum shapes
+/// `enum_is_exact` rejects. Every `Some` result is checked in the
 /// emitted C by _Static_assert on sizeof and _Alignof (see `type_decls`).
 ///
 /// The layout is computed over CTy, not over `Ty`, so glue types that
@@ -336,7 +363,7 @@ fn enum_is_exact(l: &Layout, variants: usize) -> bool {
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
     fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> Option<Layout> {
         match t {
-            CTy::Unit => None,
+            CTy::Unit => Some(layout::zst_layout(1)),
             CTy::Bool => Some(layout::bool_layout()),
             CTy::Char => Some(layout::char_layout()),
             CTy::Int(i) => Some(layout::int_layout(*i)),
@@ -411,6 +438,8 @@ fn tag_c_type(size: u64, signed: bool) -> &'static str {
         (2, true) => "int16_t",
         (4, false) => "uint32_t",
         (4, true) => "int32_t",
+        (16, false) => "lust_u128",
+        (16, true) => "lust_i128",
         (_, false) => "uint64_t",
         (_, true) => "int64_t",
     }
@@ -439,15 +468,9 @@ fn discs_sequential(discs: &[i128]) -> bool {
     discs.iter().enumerate().all(|(i, &d)| d == i as i128)
 }
 
-/// A C literal for one discriminant value, cast to the tag type. The
-/// layout path only stores values that fit an 8 byte tag.
+/// A C literal for one discriminant value, cast to the tag type.
 fn disc_lit(disc: i128, size: u64, signed: bool) -> String {
-    let ct = tag_c_type(size, signed);
-    if disc < 0 {
-        if disc == i64::MIN as i128 { format!("(({ct})(-9223372036854775807LL - 1))") } else { format!("(({ct})({disc}LL))") }
-    } else {
-        format!("(({ct})({}ULL))", disc as u128)
-    }
+    scalar_lit((disc as u128) & scalar_mask(size), size, signed)
 }
 
 /// The C expression that reads the variant index of an enum or Option
@@ -458,7 +481,11 @@ fn disc_lit(disc: i128, size: u64, signed: bool) -> String {
 fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
     match c_layout(p, t) {
         Some(l) => match l.enum_tag {
-            Some(EnumTag::Explicit { .. }) if discs_sequential(&adt_discs(p, t)) => format!("(({ptr})->u._tag)"),
+            // A 16-byte tag is a C struct: it cannot be read as one
+            // integer, so it always goes through the helper.
+            Some(EnumTag::Explicit { size, .. }) if size <= 8 && discs_sequential(&adt_discs(p, t)) => {
+                format!("(({ptr})->u._tag)")
+            }
             Some(EnumTag::Explicit { .. }) | Some(EnumTag::NicheFilled { .. }) => format!("disc_{}({ptr})", mangle(t)),
             _ => "0".into(),
         },
@@ -489,7 +516,7 @@ fn disc_set(p: &Program, t: &CTy, e: &str, vi: usize) -> String {
                 String::new()
             } else {
                 let k = (0..vi).filter(|&i| i != variant).count() as u128;
-                format!("{e}.u._n._s = {}ULL;", niche.start + k)
+                format!("{e}.u._n._s = {};", scalar_lit(niche_val(niche, k), niche.scalar_size, false))
             }
         }
         _ => String::new(),
@@ -516,7 +543,8 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             (align_up(size, align), align)
         }
         match t {
-            CTy::Unit | CTy::Bool => (1, 1),
+            CTy::Unit => (0, 1),
+            CTy::Bool => (1, 1),
             CTy::Char => (4, 4),
             CTy::Int(i) => {
                 let s = (i.bits() / 8) as u64;
@@ -863,7 +891,7 @@ impl FnGen<'_, '_, '_> {
                     let s = &self.p.ast.strings[*i as usize];
                     (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len()), CTy::Ref(Box::new(CTy::Str)))
                 }
-                Const::Unit => ("0".into(), CTy::Unit),
+                Const::Unit => ("((lust_Unit){})".into(), CTy::Unit),
             },
         }
     }
@@ -948,7 +976,22 @@ impl FnGen<'_, '_, '_> {
         match s {
             StmtKind::Assign(dest, rv) => {
                 let mentions = rvalue_mentions(rv, dest.local);
-                self.emit_assign(dest, mentions, &loc, |s, loc, post| s.rvalue(rv, loc, post));
+                let dest_cty = self.place(dest, &loc).1;
+                self.emit_assign(dest, mentions, &loc, |s, loc, post| match rv {
+                    // A never value (which shares the unit C form) used
+                    // where another type is expected never actually
+                    // arrives: give the dead assignment a zero of the
+                    // destination type.
+                    Rvalue::Use(o) => {
+                        let (v, vt) = s.operand(o, loc, post);
+                        if vt == CTy::Unit && dest_cty != CTy::Unit {
+                            format!("({v}, {})", zero_lit(s.p, &dest_cty))
+                        } else {
+                            v
+                        }
+                    }
+                    _ => s.rvalue(rv, loc, post),
+                });
             }
             StmtKind::Drop(l) => {
                 let t = self.local_cty[*l as usize].clone();
@@ -997,7 +1040,20 @@ impl FnGen<'_, '_, '_> {
                 debug_assert!(unwind.is_none(), "cgen has no unwind edges yet");
                 let mentions = args.iter().any(|o| operand_mentions(o, dest.local))
                     || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
-                self.emit_assign(dest, mentions, &loc, |s, loc, post| s.call_value(*target, args, loc, post));
+                // A call to a never fn (unit C form) whose destination
+                // has another type: the call never returns, so give the
+                // dead assignment a zero of the destination type.
+                let dest_cty = self.place(dest, &loc).1;
+                let ret_unit = match target {
+                    CallTarget::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret) == CTy::Unit,
+                    CallTarget::Intrinsic(id) => lang::intrinsic(*id).ret == SigTy::Never,
+                    CallTarget::Indirect(c) => matches!(&self.local_cty[*c as usize], CTy::FnPtr(_, r) if **r == CTy::Unit),
+                    CallTarget::Builtin(_) => false,
+                };
+                self.emit_assign(dest, mentions, &loc, |s, loc, post| {
+                    let v = s.call_value(*target, args, loc, post);
+                    if ret_unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
+                });
                 if Some(next.0 as usize) != next_block {
                     let _ = writeln!(self.out, "  goto bb{};", next.0);
                 }
@@ -1174,6 +1230,20 @@ impl FnGen<'_, '_, '_> {
                         // the variant index, so map index to value.
                         let adt = self.p.adt(*aid);
                         let ct = ctype(&to);
+                        // A 16-byte tag is a two-word struct: a cast to a
+                        // 128-bit int copies both words (the bit pattern
+                        // is the discriminant), and a cast to a smaller
+                        // int reads the low word.
+                        let wide = match c_layout(self.p, &from) {
+                            Some(l) if matches!(l.enum_tag, Some(EnumTag::Explicit { size, .. }) if size >= 16) => {
+                                Some(if is128(*ti) {
+                                    format!("(({}){{({a}).u._tag.lo, ({a}).u._tag.hi}})", int_c(*ti))
+                                } else {
+                                    format!("(({ct})(({a}).u._tag.lo))")
+                                })
+                            }
+                            _ => None,
+                        };
                         let raw = match c_layout(self.p, &from) {
                             Some(l) => match l.enum_tag {
                                 Some(EnumTag::Explicit { signed, .. }) => Some((format!("(({a}).u._tag)"), signed)),
@@ -1184,8 +1254,9 @@ impl FnGen<'_, '_, '_> {
                             },
                             None => None,
                         };
-                        match raw {
-                            Some((raw, raw_signed)) => {
+                        match (wide, raw) {
+                            (Some(w), _) => w,
+                            (None, Some((raw, raw_signed))) => {
                                 if is128(*ti) {
                                     if raw_signed {
                                         format!("(({}){{(uint64_t)(int64_t)({raw}), (uint64_t)((int64_t)({raw}) >> 63)}})", int_c(*ti))
@@ -1196,7 +1267,7 @@ impl FnGen<'_, '_, '_> {
                                     format!("(({ct})({raw}))")
                                 }
                             }
-                            None => {
+                            (None, None) => {
                                 let t = self.tmp();
                                 let zero = if is128(*ti) { "{0, 0}" } else { "0" };
                                 let _ = write!(self.out, "    {ct} {t} = {zero};\n    switch ({a}.tag) {{");
@@ -1364,6 +1435,8 @@ impl FnGen<'_, '_, '_> {
                         collect_types(&t, &mut self.sig_types);
                         format!("(({})lust_tramps[{}])", ctype(&t), self.slots[f.0 as usize])
                     }
+                    // A bare fn item value is a zero-sized type.
+                    CTy::Unit => "((lust_Unit){})".into(),
                     _ => "0".into(),
                 }
             }
@@ -1497,7 +1570,7 @@ impl FnGen<'_, '_, '_> {
             // The C callee never returns (its C type is void). The comma
             // form still gives the assignment a value of the right shape
             // for the dead continuation.
-            format!("({}({}), 0)", def.c_symbol, args.join(", "))
+            format!("({}({}), ((lust_Unit){{}}))", def.c_symbol, args.join(", "))
         } else {
             format!("{}({})", def.c_symbol, args.join(", "))
         }
@@ -1548,11 +1621,11 @@ impl FnGen<'_, '_, '_> {
             B::StringIsEmpty | B::VecIsEmpty => format!("(({})->len == 0)", vals[0]),
             B::StringPushStr => {
                 let _ = writeln!(self.out, "    lust_string_push_str({}, {});", vals[0], vals[1]);
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::StringPush => {
                 let _ = writeln!(self.out, "    lust_string_push_char({}, {});", vals[0], vals[1]);
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::StringAsStr => format!("lust_string_as_str({})", vals[0]),
             B::VecPush => {
@@ -1564,7 +1637,7 @@ impl FnGen<'_, '_, '_> {
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
                 let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et}), _Alignof({et})) = {t};", vals[0]);
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::Clone => {
                 let CTy::Ref(inner) = &tys[0] else { unreachable!() };
@@ -1693,7 +1766,7 @@ impl FnGen<'_, '_, '_> {
                     self.out,
                     "    lust_bounds({a}, {vv}->len, {loc}); lust_bounds({bb}, {vv}->len, {loc});\n    {et} {t} = (({et}*){vv}->ptr)[{a}]; (({et}*){vv}->ptr)[{a}] = (({et}*){vv}->ptr)[{bb}]; (({et}*){vv}->ptr)[{bb}] = {t};"
                 );
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::VecClear | B::VecTruncate => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
@@ -1711,7 +1784,7 @@ impl FnGen<'_, '_, '_> {
                     );
                 }
                 let _ = writeln!(self.out, "    if ({n} < {vv}->len) {vv}->len = {n};");
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::VecInsert => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
@@ -1722,7 +1795,7 @@ impl FnGen<'_, '_, '_> {
                     self.out,
                     "    lust_vec_insert_at({vv}, {i}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};"
                 );
-                "0".into()
+                "((lust_Unit){})".into()
             }
             B::VecRemove => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
@@ -2230,7 +2303,7 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
                 // The variant struct carries the niche scalar as its
                 // own `_s` member, so one literal sets tag and fields.
                 let k = (0..variant).filter(|&i| i != niche_variant).count() as u128;
-                let mut init = format!("._s = {}ULL", niche.start + k);
+                let mut init = format!("._s = {}", scalar_lit(niche_val(niche, k), niche.scalar_size, false));
                 if !fields.is_empty() {
                     init.push_str(", ");
                     init.push_str(&fields.join(", "));
@@ -2270,7 +2343,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Bool(b), _) => (*b as u8).to_string(),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
-        (CV::Unit, _) => "0".into(),
+        (CV::Unit, _) => "((lust_Unit){})".into(),
         (CV::Str(i), _) => {
             let s = &p.ast.strings[*i as usize];
             format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len())
@@ -2561,7 +2634,15 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
     match l.enum_tag {
         Some(EnumTag::Explicit { size, signed }) => {
             let discs = adt_discs(p, t);
-            if !discs_sequential(&discs) {
+            if size >= 16 {
+                // A two-word tag cannot switch: compare both words.
+                let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{");
+                for (vi, &d) in discs.iter().enumerate() {
+                    let bits = d as u128;
+                    let _ = write!(out, " if (p->u._tag.lo == {}ULL && p->u._tag.hi == {}ULL) return {vi};", bits as u64, (bits >> 64) as u64);
+                }
+                let _ = writeln!(out, " return 0; }}");
+            } else if !discs_sequential(&discs) {
                 let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{ switch (p->u._tag) {{");
                 for (vi, &d) in discs.iter().enumerate() {
                     let _ = write!(out, " case {}: return {vi};", disc_lit(d, size, signed));
@@ -2571,18 +2652,31 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
         }
         Some(EnumTag::NicheFilled { variant, niche }) => {
             let others: Vec<usize> = (0..variants.len()).filter(|&i| i != variant).collect();
-            let start = niche.start as u64;
-            let ret = if others.len() == 1 {
-                format!("return {};", others[0])
+            if niche.scalar_size >= 16 {
+                let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{");
+                for (k, &vi) in others.iter().enumerate() {
+                    let bits = niche_val(niche, k as u128);
+                    let _ = write!(out, " if (p->u._n._s.lo == {}ULL && p->u._n._s.hi == {}ULL) return {vi};", bits as u64, (bits >> 64) as u64);
+                }
+                let _ = writeln!(out, " return {variant}; }}");
             } else {
-                let map: Vec<String> = others.iter().map(|i| i.to_string()).collect();
-                format!("static const uint32_t map[{}] = {{{}}}; return map[s - {start}ULL];", others.len(), map.join(","))
-            };
-            let _ = writeln!(
-                out,
-                "static inline uint32_t disc_{m}(const {ct} *p) {{ uint64_t s = p->u._n._s; if (s >= {start}ULL && s < {}ULL) {{ {ret} }} return {variant}; }}",
-                start + others.len() as u64
-            );
+                // Wrapping distance from the first niche value: values
+                // that wrap past the top of the scalar range read back
+                // as small distances.
+                let start = niche.start as u64;
+                let mask: u64 = if niche.scalar_size >= 8 { u64::MAX } else { (1u64 << (niche.scalar_size * 8)) - 1 };
+                let ret = if others.len() == 1 {
+                    format!("return {};", others[0])
+                } else {
+                    let map: Vec<String> = others.iter().map(|i| i.to_string()).collect();
+                    format!("static const uint32_t map[{}] = {{{}}}; return map[d];", others.len(), map.join(","))
+                };
+                let _ = writeln!(
+                    out,
+                    "static inline uint32_t disc_{m}(const {ct} *p) {{ uint64_t s = p->u._n._s; uint64_t d = (s - {start}ULL) & {mask}ULL; if (d < {}ULL) {{ {ret} }} return {variant}; }}",
+                    others.len()
+                );
+            }
         }
         _ => {}
     }

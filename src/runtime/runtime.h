@@ -23,6 +23,12 @@ void abort(void);
 typedef struct { _Alignas(16) uint64_t lo; uint64_t hi; } lust_u128;
 typedef struct { _Alignas(16) uint64_t lo; uint64_t hi; } lust_i128;
 
+/* Rust `()`: a zero-sized C form, so aggregates with a direct unit
+   field have the exact Rust size. Size 0 (GNU empty struct, in tcc
+   as in gcc), align 1. */
+typedef struct { } lust_Unit;
+_Static_assert(sizeof(lust_Unit) == 0 && _Alignof(lust_Unit) == 1, "unit layout");
+
 typedef struct { uint8_t *ptr; uint64_t len; } lust_str;
 typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
 typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;
