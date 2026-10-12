@@ -102,7 +102,7 @@ pub enum Res {
         derefs: u8,
         index: u32,
     },
-    /// Operand deref counts for binary operators, and for compound assignment.
+    /// Operand deref counts for binary operators, compound assignment, and unary operators (`ld` only).
     Bin {
         ld: u8,
         rd: u8,
@@ -728,11 +728,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.negated_lits.push(*expr);
                 }
                 let t = self.expr(*expr, expected);
-                let k = self.kind(t);
+                // Rust has `-` and `!` for `&T` (shared references only, not `&mut T`).
+                let (d, inner) = match self.kind(t) {
+                    TyKind::Ref(false, inner) => (1, inner),
+                    _ => (0, t),
+                };
+                self.set_res(e, Res::Bin { ld: d, rd: 0 });
+                let k = self.kind(inner);
                 match (op, k) {
-                    (UnOp::Neg, TyKind::Int(i)) if i.signed() => t,
-                    (UnOp::Neg, TyKind::Var(_, true)) => t,
-                    (UnOp::Not, TyKind::Bool | TyKind::Int(_) | TyKind::Var(_, true)) => t,
+                    (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
+                    (UnOp::Neg, TyKind::Var(_, true)) => inner,
+                    (UnOp::Not, TyKind::Bool | TyKind::Int(_) | TyKind::Var(_, true)) => inner,
                     (_, TyKind::Error) => ERROR,
                     _ => {
                         let tn = self.tn(t);
@@ -811,7 +817,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return UNIT;
                 }
                 let (rd, rinner) = self.peel_one_ref(rt);
-                let ok = match (*op, lk) {
+                // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
+                let rmut = matches!(self.kind(rt), TyKind::Ref(true, _));
+                let ok = !rmut && match (*op, lk) {
                     (_, TyKind::Error) => true,
                     (BinOp::Shl | BinOp::Shr, TyKind::Int(_) | TyKind::Var(_, true)) => {
                         matches!(self.kind(rinner), TyKind::Int(_) | TyKind::Var(_, true))
@@ -946,6 +954,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Ref(_, inner) => (1, inner),
             _ => (0, t),
         }
+    }
+    /// The mutability of each reference layer of `t`, outermost first.
+    fn ref_layers(&self, t: Ty) -> Vec<bool> {
+        let mut out = Vec::new();
+        let mut t = t;
+        while let TyKind::Ref(m, inner) = self.kind(t) {
+            out.push(m);
+            t = inner;
+        }
+        out
     }
 
     fn path_expr(&mut self, e: ExprId, segs: &[ast::PathSeg], span: Span) -> Ty {
@@ -1477,6 +1495,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld, rd });
                 return BOOL;
             }
+            // Equality allows `&T` against `&mut T`; ordering needs the same mutability.
+            if !matches!(op, Eq | Ne) && self.ref_layers(lt) != self.ref_layers(rt) {
+                return bad(self);
+            }
             if ld != rd || !self.unify(lb, rb) {
                 return bad(self);
             }
@@ -1504,6 +1526,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.coerce_expr(rhs, rt, REF_STR);
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
             return STRING;
+        }
+        // Arithmetic and bit operations exist for `&T` operands, but not for `&mut T`.
+        if matches!(lk, TyKind::Ref(true, _)) || matches!(rk, TyKind::Ref(true, _)) {
+            return bad(self);
         }
         let (ld, li) = self.peel_one_ref(lt);
         let (rd, ri) = self.peel_one_ref(rt);
