@@ -485,5 +485,9 @@ uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
     return d < radix ? d : 0xFFFFFFFFu;
 })
 
-/* Float formatting, parsing, and casts (src/rt/float.h). */
+/* Float formatting, parsing, and casts (src/runtime/float.h). */
 #include "float.h"
+
+/* Erased hash table core (src/runtime/hash.h): declarations in every
+   unit, bodies only in the runtime unit (LUST_IMPL). */
+#include "hash.h"

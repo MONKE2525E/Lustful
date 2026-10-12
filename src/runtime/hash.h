@@ -73,11 +73,11 @@
    Rust message and aborts, like the rest of this runtime; there is no
    try_reserve error path yet (typed layer gap, see tests/hash/README).
 
-   Not wired into generated code yet: later std work adds this header to
-   the runtime amalgamation the same way float.h is spliced in
-   cgen::runtime_source, plus one `#include "hash.h"` line at the end of
-   core.c. Tests include this file directly. Correctness is gated by
-   tests/hash/ against rustc 1.99 oracles. */
+   Wiring: core.c ends with `#include "hash.h"`, and
+   cgen::runtime_source splices this header (and hash.c in the runtime
+   unit) into the amalgamation the same way as float.h. Later std work
+   calls it from source wrappers. Tests include this file directly.
+   Correctness is gated by tests/hash/ against rustc 1.99 oracles. */
 #ifndef LUST_RT_HASH_H
 #define LUST_RT_HASH_H
 

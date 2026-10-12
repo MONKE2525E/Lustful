@@ -1317,31 +1317,36 @@ fn unit_header() -> String {
 }
 
 /// The full runtime source, assembled from `src/runtime/`: runtime.h first, then core.c
-/// with its two `#include` lines replaced by the included text (panic.c; float.h at the
-/// end). Units compile from strings, so file includes cannot read files; declaration
-/// units get float.h's prototypes only (`with_float_impl` false), the runtime unit gets
-/// float.c's bodies too. The runtime stays one amalgamated unit (see `runtime_unit`),
-/// so the split files are source fragments, not separate translation units, and the
-/// includes are also what a plain C compiler follows when a test harness includes
-/// runtime.h and core.c directly. The panic include sits where the panic section
-/// belonged in the old single runtime.c: after the string helpers it calls, before
-/// the checked math that calls it. Splice results reproduce that file byte for byte
-/// (plus the float text), so generated C does not change when text moves between
-/// fragments.
-fn runtime_source(with_float_impl: bool) -> String {
+/// with its `#include` lines replaced by the included text (panic.c inline; float.h and
+/// hash.h at the end). Units compile from strings, so file includes cannot read files;
+/// declaration units get float.h's prototypes only (`with_impls` false),
+/// the runtime unit gets float.c's and hash.c's bodies too. The runtime stays one
+/// amalgamated unit (see `runtime_unit`), so the split files are source fragments, not
+/// separate translation units, and the includes are also what a plain C compiler
+/// follows when a test harness includes runtime.h and core.c directly. The panic
+/// include sits where the panic section belonged in the old single runtime.c: after
+/// the string helpers it calls, before the checked math that calls it.
+fn runtime_source(with_impls: bool) -> String {
     let header = include_str!("runtime/float.h");
-    let header = if with_float_impl {
+    let header = if with_impls {
         let body = include_str!("runtime/float.c").replacen("#include \"ryu_tables.h\"", include_str!("runtime/ryu_tables.h"), 1);
         header.replacen("#include \"float.c\"", &body, 1)
     } else {
         header.replacen("#include \"float.c\"", "", 1)
     };
+    // The hash core's declarations are not in the common unit header:
+    // they cost about 26 KB of C per unit and no generated code calls
+    // the core yet. The runtime unit carries header plus bodies, so
+    // the symbols link; a unit whose code calls the core adds
+    // `hash_decls()` to its header.
+    let hash = if with_impls { hash_source(true) } else { String::new() };
     let (h, core, panic) = (include_str!("runtime/runtime.h"), include_str!("runtime/core.c"), include_str!("runtime/panic.c"));
-    let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len());
+    let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len() + hash.len());
     src.push_str(h);
     src.push_str(core);
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
-    src.replacen("#include \"float.h\"", &header, 1)
+    let src = src.replacen("#include \"float.h\"", &header, 1);
+    src.replacen("#include \"hash.h\"", &hash, 1)
 }
 
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do
@@ -1392,6 +1397,28 @@ fn runtime_decls() -> &'static str {
             1,
         )
     })
+}
+
+/// The hash core text for splicing: hash.h, with hash.c inlined when
+/// `with_bodies`. hash.h includes <stddef.h>/<stdint.h> for direct
+/// inclusion by test harnesses; spliced copies drop both lines because
+/// runtime.h already provided the types, and declaration units must
+/// not re-read the system headers (see `runtime_decls`).
+fn hash_source(with_bodies: bool) -> String {
+    let hash = include_str!("runtime/hash.h").replacen("#include <stddef.h>\n#include <stdint.h>\n", "", 1);
+    if with_bodies {
+        hash.replacen("#include \"hash.c\"", include_str!("runtime/hash.c"), 1)
+    } else {
+        hash.replacen("#include \"hash.c\"", "", 1)
+    }
+}
+
+/// Declarations for the erased hash core, for the header of a unit
+/// whose generated code calls it (the std typed layer, when it lands).
+/// Not part of the common unit header; see `runtime_source`.
+#[allow(dead_code)]
+pub fn hash_decls() -> String {
+    hash_source(false)
 }
 
 /// The unit with the runtime's function definitions. It only changes when lust itself does.
