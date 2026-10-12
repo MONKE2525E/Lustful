@@ -35,6 +35,10 @@ pub enum CTy {
     Slice(Box<CTy>),
     /// A float, as a C `float` or `double` (W-CORELANG).
     Float(FloatTy),
+    /// A function pointer value: parameter types and return type.
+    /// Emitted as a generated typedef that carries the out-pointer
+    /// return convention for large returns (W-CGEN).
+    FnPtr(Vec<CTy>, Box<CTy>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,6 +58,14 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Char => CTy::Char,
         TyKind::Int(i) => CTy::Int(i),
         TyKind::Float(f) => CTy::Float(f),
+        TyKind::FnPtr(sig) => {
+            let b = tys.sig(sig);
+            CTy::FnPtr(
+                tys.tys_of(b.value.inputs).iter().map(|&e| cty(tys, e)).collect(),
+                Box::new(cty(tys, b.value.output)),
+            )
+        }
+        TyKind::FnDef(..) => CTy::Unit,
         TyKind::Str => CTy::Str,
         TyKind::Tuple(ts) => CTy::Tuple(tys.tys_of(ts).iter().map(|&e| cty(tys, e)).collect()),
         TyKind::Array(e, c) => {
@@ -137,6 +149,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
         CTy::Slice(_) => format!("Sl_{}", mangle(t)),
         CTy::Float(f) => (*f).name().replace("f64", "double").replace("f32", "float"),
+        CTy::FnPtr(..) => format!("Fp_{}", mangle(t)),
     }
 }
 
@@ -158,6 +171,10 @@ fn mangle(t: &CTy) -> String {
         CTy::Array(e, n) => format!("{n}_{}_", mangle(e)),
         CTy::Slice(e) => format!("sl{}_", mangle(e)),
         CTy::Float(f) => f.name().into(),
+        CTy::FnPtr(ps, r) => {
+            let ps: String = ps.iter().map(|e| format!("{}_", mangle(e))).collect();
+            format!("fp{ps}r{}_", mangle(r))
+        }
     }
 }
 
@@ -191,6 +208,11 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(t.clone());
             collect_types(e, out);
         }
+        CTy::FnPtr(ps, r) => {
+            out.insert(t.clone());
+            ps.iter().for_each(|e| collect_types(e, out));
+            collect_types(r, out);
+        }
         CTy::Vec(e) | CTy::Ref(e) => collect_types(e, out),
         _ => {}
     }
@@ -199,14 +221,14 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) => out.push(t.clone()),
+        CTy::Adt(_) | CTy::Option(_) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) => out.push(t.clone()),
         _ => {}
     }
 }
 
 fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
+        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
@@ -319,6 +341,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Char => Some(layout::char_layout()),
             CTy::Int(i) => Some(layout::int_layout(*i)),
             CTy::Float(f) => Some(layout::float_layout(*f)),
+            CTy::FnPtr(..) => Some(layout::ptr_layout()),
             CTy::Str => Some(plain_layout(16, 8)),
             CTy::String | CTy::Vec(_) | CTy::Chars => Some(plain_layout(24, 8)),
             CTy::Args => Some(plain_layout(8, 8)),
@@ -494,6 +517,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 FloatTy::F32 => (4, 4),
                 FloatTy::F64 => (8, 8),
             },
+            CTy::FnPtr(..) => (8, 8),
             CTy::Str => (16, 8),
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::Args => (8, 8),
@@ -599,6 +623,31 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
     if ret_is_large(p, f) { format!("void f{slot}({params})") } else { format!("{ret} f{slot}({params})") }
 }
 
+/// The slot trampoline for function `f` (ARCH 4.5): a tiny forwarder
+/// with a stable address, stored in fn pointer values through
+/// `lust_tramps`. It forwards through `lust_fns`, so an overlay swap
+/// of the body keeps old fn pointer values calling the new body.
+/// Emitted in the function's own unit today; the table-unit home in
+/// 4.5 needs the driver to pass signatures to `table_unit`.
+fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
+    let info = p.fn_info(f);
+    let ret = ctype(&cty(&p.tys, info.ret));
+    let cast = fn_ptr_cast(p, f);
+    let names: Vec<String> = (1..=info.params.len()).map(|i| format!("p{i}")).collect();
+    let decls: Vec<String> =
+        info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
+    if ret_is_large(p, f) {
+        let mut params = vec![format!("{ret} *out")];
+        params.extend(decls);
+        let mut all = vec!["out".to_string()];
+        all.extend(names);
+        format!("static void tramp{slot}({}) {{ ({cast}lust_fns[{slot}])({}); }}\n", params.join(", "), all.join(", "))
+    } else {
+        let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
+        format!("static {ret} tramp{slot}({params}) {{ return ({cast}lust_fns[{slot}])({}); }}\n", names.join(", "))
+    }
+}
+
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
 /// file that defines it; `slots` maps every LocalDefId to its slot in `lust_fns`.
 pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
@@ -619,6 +668,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         ret_large: ret_is_large(p, body.fn_id),
     };
     g.function();
+    g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
     let mut types = std::mem::take(&mut g.sig_types);
     for t in &g.local_cty {
         collect_types(t, &mut types);
@@ -936,7 +986,8 @@ impl FnGen<'_, '_, '_> {
                 // No unwind edges exist yet (W-PANIC builds them); the slot
                 // is carried so that work needs no IR change.
                 debug_assert!(unwind.is_none(), "cgen has no unwind edges yet");
-                let mentions = args.iter().any(|o| operand_mentions(o, dest.local));
+                let mentions = args.iter().any(|o| operand_mentions(o, dest.local))
+                    || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
                 self.emit_assign(dest, mentions, &loc, |s, loc, post| s.call_value(*target, args, loc, post));
                 if Some(next.0 as usize) != next_block {
                     let _ = writeln!(self.out, "  goto bb{};", next.0);
@@ -985,7 +1036,21 @@ impl FnGen<'_, '_, '_> {
             }
             CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
-            CallTarget::Indirect(_) => unreachable!("cgen: indirect calls land with fn pointer codegen"),
+            CallTarget::Indirect(callee) => {
+                let ct = self.local_cty[callee as usize].clone();
+                let CTy::FnPtr(_, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
+                collect_types(&ct, &mut self.sig_types);
+                let args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                if c_size_align(self.p, ret).0 > 32 {
+                    let t = self.tmp();
+                    let rt = ctype(ret);
+                    let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
+                    let _ = writeln!(self.out, "    {rt} {t}; l{callee}(&{t}{pre});");
+                    t
+                } else {
+                    format!("l{callee}({})", args.join(", "))
+                }
+            }
         }
     }
 
@@ -1359,7 +1424,16 @@ impl FnGen<'_, '_, '_> {
                     _ => format!("({e})->len"),
                 }
             }
-            Rvalue::FnValue(..) => unreachable!("cgen: fn values land with fn pointer codegen"),
+            Rvalue::FnValue(f, ty) => {
+                let t = cty(&self.body.tys, *ty);
+                match t {
+                    CTy::FnPtr(..) => {
+                        collect_types(&t, &mut self.sig_types);
+                        format!("(({})lust_tramps[{}])", ctype(&t), self.slots[f.0 as usize])
+                    }
+                    _ => "0".into(),
+                }
+            }
         }
     }
 
@@ -1463,7 +1537,7 @@ impl FnGen<'_, '_, '_> {
         match t {
             CTy::Unit => "1".into(),
             CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
-            CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => format!("(*{a} == *{b})"),
+            CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("(*{a} == *{b})"),
             _ => {
                 self.want(Glue::Eq, t);
                 format!("eq_{}({a}, {b})", mangle(t))
@@ -2136,6 +2210,7 @@ pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usi
 pub fn table_unit(capacity: usize, fn_units: &[usize]) -> String {
     let mut c = unit_header();
     let _ = writeln!(c, "lust_fnptr lust_fns[{}];", capacity.max(1));
+    let _ = writeln!(c, "lust_fnptr lust_tramps[{}];", capacity.max(1));
     for u in fn_units {
         let _ = writeln!(c, "void lust_register_u{u}(void);");
     }
@@ -2433,6 +2508,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     let _ = writeln!(c, "void {register}(void) {{");
     for i in range.filter(|&i| !fns[i].code.is_empty()) {
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
+        let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
     }
     c.push_str("}\n");
     c
@@ -2578,6 +2654,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
+            CTy::FnPtr(ps, r) => {
+                ps.iter().for_each(|e| collect_types(e, &mut inner));
+                collect_types(r, &mut inner);
+            }
             _ => {}
         }
         stack.extend(inner);
@@ -2601,6 +2681,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
+            CTy::FnPtr(ps, r) => {
+                ps.iter().for_each(|e| by_value_deps(e, &mut deps));
+                by_value_deps(r, &mut deps);
+            }
             _ => {}
         }
         for d in &deps {
@@ -2648,6 +2732,24 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
                 if let Some(l) = c_layout(p, t) {
                     layout_assert(out, &ctype(t), &l);
+                }
+            }
+            CTy::FnPtr(ps, r) => {
+                let ct = ctype(t);
+                let large = c_size_align(p, r).0 > 32;
+                let mut params: Vec<String> = Vec::new();
+                if large {
+                    params.push(format!("{}*", ctype(r)));
+                }
+                params.extend(ps.iter().map(ctype));
+                let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+                if large {
+                    let _ = writeln!(out, "typedef void (*{ct})({params});");
+                } else {
+                    let _ = writeln!(out, "typedef {} (*{ct})({params});", ctype(r));
+                }
+                if let Some(l) = c_layout(p, t) {
+                    layout_assert(out, &ct, &l);
                 }
             }
             CTy::Adt(a) => {
@@ -2884,7 +2986,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                 match t {
                     CTy::Unit => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
-                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => format!("({x} == {y})"),
+                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("({x} == {y})"),
                     _ => {
                         need(Glue::Eq, t);
                         format!("eq_{}(&{x}, &{y})", mangle(t))
@@ -2966,6 +3068,7 @@ fn glue_def(p: &Program, g: &Glue, t: &CTy, protos: &mut String, defs: &mut Stri
                     CTy::Int(i) if i.signed() => format!("lust_fmt_i64(out, (int64_t){e});"),
                     CTy::Int(_) => format!("lust_fmt_u64(out, (uint64_t){e});"),
                     CTy::Float(f) => format!("lust_fmt_{}_debug(out, {e});", f.name()),
+                    CTy::FnPtr(..) => format!("lust_fmt_fnptr_debug(out, (const void*)({e}));"),
                     CTy::Bool => format!("lust_fmt_bool(out, {e});"),
                     CTy::Char => format!("lust_fmt_char_debug(out, {e});"),
                     CTy::String => format!("lust_fmt_str_debug(out, lust_string_as_str(&{e}));"),
@@ -3120,5 +3223,149 @@ fn succ(t: &Terminator) -> Vec<Bb> {
         Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
         Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::check_fn;
+    use crate::check::collect;
+    use crate::diag::{FileId, SourceMap, Span};
+    use crate::intern::{Interner, Known};
+    use crate::{lexer, parser};
+
+    /// End to end over hand-built IR for the forms the front end does
+    /// not produce yet (float values, fn pointer values and indirect
+    /// calls, 128-bit literals): collect and lower a plain program,
+    /// rewrite `main` by hand to use the new IR, generate all units,
+    /// compile them with the system C compiler, run, and compare
+    /// output. This is the verification for the float and fn pointer
+    /// codegen until W-CORELANG wires the front end (L0602, L0641).
+    #[test]
+    fn float_and_fnptr_ir_runs() {
+        let src = "fn add1(x: i64) -> i64 { x + 1 }\nfn main() { println!(\"{}\", add1(41)); }\n";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let main = program.main.unwrap();
+        let add1 = program.fn_names[&interner.intern("add1")];
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+
+        let mut outs: Vec<FnOut> = Vec::new();
+        for i in 0..n {
+            let fid = LocalDefId(i as u32);
+            let (ck, errs) = check_fn(&program, fid);
+            assert!(errs.is_empty(), "{errs:?}");
+            let mut body = crate::lower::lower(&program, fid, ck);
+            if fid == main {
+                rewrite_main(&mut body, add1);
+            }
+            outs.push(gen_fn(&program, &body, &map, 1, &slots));
+        }
+        let mut glue = GlueSet::default();
+        glue.add(&program, outs.iter().flat_map(|o| o.glue.iter()));
+        let units = [
+            main_unit(slots[main.0 as usize], "test.rs", &vec![1; n], &[]),
+            glue_unit(&program, &glue),
+            runtime_unit(),
+            table_unit(n, &[4]),
+            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u4"),
+        ];
+        let dir = std::env::temp_dir().join(format!("lust-cgen-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = Vec::new();
+        for (i, u) in units.iter().enumerate() {
+            let f = dir.join(format!("u{i}.c"));
+            std::fs::write(&f, u).unwrap();
+            files.push(f);
+        }
+        let exe = dir.join("prog");
+        let cc = std::process::Command::new("cc").arg("-O0").arg("-w").arg("-o").arg(&exe).args(&files).output().unwrap();
+        assert!(cc.status.success(), "cc failed: {}", String::from_utf8_lossy(&cc.stderr));
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8(run.stdout).unwrap(), "42\n3\n1.75\n1267650600228229401496703205381\n");
+    }
+
+    /// Replaces `main` with a hand-built body: an indirect call
+    /// through a fn pointer value, float add, remainder and a
+    /// saturating float-to-int cast, and a 128-bit literal print.
+    fn rewrite_main(body: &mut Body, add1: LocalDefId) {
+        let span = Span::new(FileId(0), 0, 0);
+        let i64_ty = int(IntTy::I64);
+        let f64_ty = body.tys.intern(TyKind::Float(FloatTy::F64));
+        let u128_ty = int(IntTy::U128);
+        let inputs = body.tys.intern_tys(&[i64_ty]);
+        let sig = body.tys.intern_sig(Binder::plain(FnSig { inputs, output: i64_ty, is_unsafe: false, extern_c: false }));
+        let fnptr_ty = body.tys.intern(TyKind::FnPtr(sig));
+        let local = |ty: Ty| LocalDecl { ty, mutable: false, name: None };
+        // Print args hold a reference to the value, as lower emits them:
+        // locals 8.. hold &l2, &l5, &l6, &l7 for the four prints.
+        let ref_i64 = body.tys.mk_ref(false, i64_ty);
+        let ref_f64 = body.tys.mk_ref(false, f64_ty);
+        let ref_u128 = body.tys.mk_ref(false, u128_ty);
+        body.locals = vec![
+            local(UNIT),
+            local(fnptr_ty),
+            local(i64_ty),
+            local(f64_ty),
+            local(f64_ty),
+            local(i64_ty),
+            local(f64_ty),
+            local(u128_ty),
+            local(ref_i64),
+            local(ref_i64),
+            local(ref_f64),
+            local(ref_u128),
+        ];
+        let assign = |l: Local, rv: Rvalue| Stmt { kind: StmtKind::Assign(Place::local(l), rv), span };
+        let print = |l: Local, ty: Ty| Stmt {
+            kind: StmtKind::Print {
+                stderr: false,
+                newline: true,
+                parts: vec![FmtPart::Arg { value: Operand::Copy(Place::local(l)), ty, debug: false }],
+            },
+            span,
+        };
+        let fconst = |v: f64| Operand::Const(Const::Float(v.to_bits(), FloatTy::F64));
+        body.blocks = vec![
+            BlockData {
+                stmts: vec![assign(1, Rvalue::FnValue(add1, fnptr_ty))],
+                term: Terminator::Call {
+                    target: CallTarget::Indirect(1),
+                    args: vec![Operand::Const(Const::Int(41, IntTy::I64))],
+                    dest: Place::local(2),
+                    next: Bb(1),
+                    unwind: None,
+                },
+                term_span: span,
+            },
+            BlockData {
+                stmts: vec![
+                    assign(3, Rvalue::Use(fconst(1.5))),
+                    assign(4, Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(3)), fconst(2.25))),
+                    assign(5, Rvalue::Cast(Operand::Copy(Place::local(4)), i64_ty)),
+                    assign(6, Rvalue::Bin(BinOp::Rem, Operand::Copy(Place::local(4)), fconst(2.0))),
+                    assign(7, Rvalue::Use(Operand::Const(Const::Int128((1u128 << 100) + 5, IntTy::U128)))),
+                    assign(8, Rvalue::Ref(false, Place::local(2))),
+                    print(8, i64_ty),
+                    assign(9, Rvalue::Ref(false, Place::local(5))),
+                    print(9, i64_ty),
+                    assign(10, Rvalue::Ref(false, Place::local(6))),
+                    print(10, f64_ty),
+                    assign(11, Rvalue::Ref(false, Place::local(7))),
+                    print(11, u128_ty),
+                ],
+                term: Terminator::Return,
+                term_span: span,
+            },
+        ];
     }
 }

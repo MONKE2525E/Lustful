@@ -35,6 +35,9 @@ extern const char *lust_file;
 /* Every function is called through this table (see cgen.rs). */
 typedef void (*lust_fnptr)(void);
 extern lust_fnptr lust_fns[];
+/* One slot trampoline per slot (ARCH 4.5): stable addresses that
+   forward through lust_fns, stored in fn pointer values. */
+extern lust_fnptr lust_tramps[];
 void lust_base_init(void);
 
 /* A source location: (function id << 32) | (line within the function << 12) | column. Lines are

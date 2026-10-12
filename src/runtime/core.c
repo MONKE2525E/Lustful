@@ -168,6 +168,24 @@ static int lust_escape_unicode(uint32_t c) {
 }
 #endif
 
+/* Debug text of a function pointer: `0x` and the address in lowercase
+   hex with no leading zeroes, as Rust prints it. */
+void lust_fmt_fnptr_debug(lust_String *out, const void *p) LUST_BODY({
+    uint64_t v = (uint64_t)(uintptr_t)p;
+    char buf[16];
+    int n = 0;
+    lust_string_push_cstr(out, "0x");
+    if (!v) {
+        lust_string_push_cstr(out, "0");
+        return;
+    }
+    while (v) {
+        buf[n++] = "0123456789abcdef"[v & 15];
+        v >>= 4;
+    }
+    while (n) lust_string_push_char(out, (uint32_t)buf[--n]);
+})
+
 void lust_fmt_escape(lust_String *out, uint32_t c, uint32_t quote) LUST_BODY({
     switch (c) {
     case '\t': lust_string_push_cstr(out, "\\t"); return;
