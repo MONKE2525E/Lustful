@@ -12,7 +12,9 @@
 #      gate joins with mono; the unit-key half is pinned by the graph
 #      unit test `instance_manifest_round_trips_and_unit_keys_follow_4_2`.
 #   4. reads reuse: a signature-header edit that changes no type
-#      rechecks zero bodies through the dirty walk.
+#      rechecks only the changed fn itself (its body is checked
+#      against its own signature; seed 42) and reuses every clean
+#      mentioning body through the dirty walk.
 #   5. graph and build-script routing: editing a build script input
 #      makes the daemon start a fresh session (its log line proves it)
 #      while the program output stays correct.
@@ -163,7 +165,11 @@ def case_reads_reuse():
                 k, _, v = kv.partition("=")
                 st[k] = int(v) if v.isdigit() else v
     check("sig-header edit is signatures mode", st.get("mode") == "signatures", str(st))
-    check("dirty walk reuses clean bodies", (st.get("reused") or 0) >= 1 and st.get("rechecked") == 0, str(st))
+    # The changed fn (compute) always rechecks: its body is checked
+    # against its own signature, which no recorded read set covers
+    # (fuzz seed 42, iter 1034). Bodies that only mention it reuse.
+    check("dirty walk reuses clean bodies, changed fn rechecks",
+          (st.get("reused") or 0) >= 1 and st.get("rechecked") == 1, str(st))
     d.kill()
 
 
