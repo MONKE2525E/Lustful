@@ -374,6 +374,16 @@ struct LoopCtx {
     label: Option<(Sym, Span)>,
 }
 
+/// One closure whose body gets a second inference pass at
+/// finish (see `infer_closure_body`).
+struct DeferredClosure {
+    names: Vec<Option<(Sym, bool, Span)>>,
+    sig: Vec<Ty>,
+    body: ExprId,
+    ret: Ty,
+    args: Vec<GenericArg>,
+}
+
 struct Ctx<'p, 'a> {
     p: &'p Program<'a>,
     f: &'p FnInfo<'a>,
@@ -407,7 +417,23 @@ struct Ctx<'p, 'a> {
     /// Closure signature types to verify at finish: a signature
     /// type still uninferred there is an annotation error, never
     /// a silent default.
-    closure_sites: Vec<(ExprId, Vec<Ty>)>,
+    closure_sites: Vec<(ExprId, Vec<Ty>, bool)>,
+    /// Full generic args of the closures whose bodies are being
+    /// checked in place, outermost first: a nested closure's
+    /// parent args while its enclosing fn is still this body.
+    closure_arg_stack: Vec<Vec<GenericArg>>,
+    /// Closures whose bodies get a second inference pass at
+    /// finish when signature variables are still unbound.
+    deferred_closures: Vec<DeferredClosure>,
+    /// Format arguments whose type was still a variable when
+    /// the format check ran: (type, wants Debug, span). The
+    /// Display/Debug test re-runs at finish (W-TRAITS-CORE).
+    deferred_fmt: Vec<(Ty, bool, Span)>,
+    /// Set when a method call inside an in-place closure body
+    /// check had an unbound-variable receiver: rustc rejects
+    /// that closure (E0282) even if a later call fixes the
+    /// signature, so the site is recorded as failed.
+    head_unknown_flag: bool,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -465,6 +491,10 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         },
         generic_sites: Vec::new(),
         closure_sites: Vec::new(),
+        closure_arg_stack: Vec::new(),
+        deferred_closures: Vec::new(),
+        deferred_fmt: Vec::new(),
+        head_unknown_flag: false,
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -2225,10 +2255,73 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// The enclosing fn's generic arguments in this body: the
     /// instance args mono recorded, or none for a plain fn.
     fn parent_generic_args(&self) -> Vec<GenericArg> {
+        if let Some(top) = self.closure_arg_stack.last() {
+            return top.clone();
+        }
         match self.p.gx.instances.get(&self.fid) {
             Some(info) => self.p.tys.args(info.args).to_vec(),
             None => Vec::new(),
         }
+    }
+
+    /// The in-place closure body check. In a concrete body it
+    /// is inference-only and fully isolated: its errors and
+    /// sites are dropped, because the closure instance check
+    /// is authoritative. In an abstract (template) body there
+    /// is no closure instance check, so this check is
+    /// authoritative and everything it records stays. Variable
+    /// bindings stay in both modes: they are the signature
+    /// inference the instance request is built from.
+    /// Returns true when a method call in the body had an
+    /// unbound-variable receiver (see `head_unknown_flag`).
+    fn infer_closure_body(&mut self, names: &[Option<(Sym, bool, Span)>], sig: &[Ty], body: ExprId, ret_ty: Ty, args: &[GenericArg]) -> bool {
+        let p = self.p;
+        let keep = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
+        let saved_errs = if keep { Vec::new() } else { std::mem::take(&mut self.errs) };
+        let saved_obl = if keep { Vec::new() } else { self.obl.take() };
+        let saved_lits = if keep { Vec::new() } else { std::mem::take(&mut self.negated_lits) };
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_loops = std::mem::take(&mut self.loops);
+        // Sites inside the body belong to the closure instance
+        // check, which re-records them in its own context (with
+        // the right enclosing args).
+        let saved_sites = self.generic_sites.len();
+        let saved_closure_sites = self.closure_sites.len();
+        let saved_deferred = self.deferred_closures.len();
+        let saved_fmt = self.deferred_fmt.len();
+        for (n, &t) in names.iter().zip(sig) {
+            if let Some((name, mutable, nspan)) = n {
+                self.add_local(*name, t, *mutable, *nspan);
+            }
+        }
+        self.closure_arg_stack.push(args.to_vec());
+        let saved_flag = self.head_unknown_flag;
+        self.head_unknown_flag = false;
+        let bt = self.expr(body, Some(ret_ty));
+        self.coerce_expr(body, bt, ret_ty);
+        let head_failed = self.head_unknown_flag;
+        self.head_unknown_flag = saved_flag;
+        self.closure_arg_stack.pop();
+        // The body's own obligations run once here so operators
+        // and method calls in the body can bind signature
+        // variables; what stays pending joins the parent queue,
+        // whose fixpoint at finish sees the call sites too.
+        if !keep {
+            self.run_obligations(false);
+            let body_pending = self.obl.take();
+            self.errs = saved_errs;
+            for ob in saved_obl.into_iter().chain(body_pending) {
+                self.obl.push(ob);
+            }
+            self.negated_lits = saved_lits;
+            self.generic_sites.truncate(saved_sites);
+            self.closure_sites.truncate(saved_closure_sites);
+            self.deferred_closures.truncate(saved_deferred);
+            self.deferred_fmt.truncate(saved_fmt);
+        }
+        self.scopes = saved_scopes;
+        self.loops = saved_loops;
+        head_failed
     }
 
     /// Checks one closure expression. The signature types are
@@ -2254,6 +2347,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return ERROR;
         };
         let mut names: Vec<Option<(Sym, bool, Span)>> = Vec::new();
+        let mut bad_pattern = false;
         let mut sig: Vec<Ty> = Vec::new();
         // The signature variables for the unwritten slots only:
         // written types are fixed in the template (see
@@ -2271,6 +2365,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         "patterns in closure parameters are not supported yet",
                         "Bind a plain name and destructure inside the body.",
                     );
+                    bad_pattern = true;
                     names.push(None);
                 }
             }
@@ -2291,6 +2386,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 v
             }
         };
+        // This closure's full generic args, computed before the
+        // in-place body check so nested closures see them as
+        // their parent args (see closure_arg_stack).
+        let mut args = self.parent_generic_args();
+        args.extend(var_sig.iter().map(|&t| GenericArg::Ty(t)));
         // Capture scan against the locals in scope right here.
         let outer: Vec<(Sym, CtxtId)> = self.scopes.iter().map(|&((n, c), _)| (n, c)).collect();
         let mut scan = CaptureScan { ast: p.ast, self_sym: p.known.self_value, outer: &outer, bound: Vec::new(), capture: None, has_return: false };
@@ -2299,6 +2399,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         scan.expr(body, true);
         let has_return = scan.has_return;
+        let mut head_failed = false;
         if let Some((name, cspan)) = scan.capture {
             let what = if name == p.known.self_value { "`self`".to_string() } else { format!("`{}`", self.name(name)) };
             self.err(
@@ -2309,48 +2410,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return ERROR;
         } else if !has_return {
-            // The in-place body check. In a concrete body it is
-            // inference-only and fully isolated: its errors,
-            // obligations, and sites are dropped, because the
-            // closure instance check is authoritative. In an
-            // abstract (template) body there is no closure
-            // instance check, so this check is authoritative
-            // and everything it records stays.
-            let keep = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
-            let saved_errs = if keep { Vec::new() } else { std::mem::take(&mut self.errs) };
-            let saved_obl = if keep { Vec::new() } else { self.obl.take() };
-            let saved_lits = if keep { Vec::new() } else { std::mem::take(&mut self.negated_lits) };
-            let saved_scopes = std::mem::take(&mut self.scopes);
-            let saved_loops = std::mem::take(&mut self.loops);
-            // Sites inside the body belong to the closure
-            // instance check, which re-records them in its own
-            // context (with the right enclosing args).
-            let saved_sites = self.generic_sites.len();
-            let saved_closure_sites = self.closure_sites.len();
-            for (n, &t) in names.iter().zip(&sig) {
-                if let Some((name, mutable, nspan)) = n {
-                    self.add_local(*name, t, *mutable, *nspan);
-                }
+            let failed = self.infer_closure_body(&names, &sig, body, ret_ty, &args);
+            head_failed = failed;
+            // In concrete bodies the check runs once more at
+            // finish if signature variables are still unbound:
+            // call sites checked after this point may have bound
+            // them, and the body then binds the rest. A failed
+            // head is final, as in rustc: no second pass.
+            let concrete = !matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
+            if concrete && !bad_pattern && !failed {
+                self.deferred_closures.push(DeferredClosure { names: names.clone(), sig: sig.clone(), body, ret: ret_ty, args: args.clone() });
             }
-            let bt = self.expr(body, Some(ret_ty));
-            self.coerce_expr(body, bt, ret_ty);
-            if !keep {
-                self.errs = saved_errs;
-                self.obl.take();
-                for ob in saved_obl {
-                    self.obl.push(ob);
-                }
-                self.negated_lits = saved_lits;
-                self.generic_sites.truncate(saved_sites);
-                self.closure_sites.truncate(saved_closure_sites);
-            }
-            self.scopes = saved_scopes;
-            self.loops = saved_loops;
         }
-        let mut args = self.parent_generic_args();
-        args.extend(var_sig.iter().map(|&t| GenericArg::Ty(t)));
         self.generic_sites.push((self.ei(e), template, args.clone()));
-        self.closure_sites.push((e, var_sig));
+        if !bad_pattern {
+            self.closure_sites.push((e, var_sig, head_failed));
+        }
         let def = p.def_id(template);
         let args_id = self.tys.intern_args(&args);
         self.tys.intern(TyKind::Closure(def, args_id))
@@ -4150,6 +4225,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.run_obligations(false);
         let (derefs, base) = self.autoderef(rt);
         let bk = self.tys.kind(base);
+        if matches!(bk, TyKind::Infer(_)) && !self.closure_arg_stack.is_empty() {
+            self.head_unknown_flag = true;
+        }
         // User methods, through the method-set probes of section 2.10: every
         // form is probed in order and recorded, hit or miss, before the
         // builtin compat dispatch below runs.
@@ -4942,7 +5020,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Shl | Shr if int_like(lik) && int_like(rik) => li,
             BitAnd | BitOr | BitXor if lik == TyKind::Bool && rik == TyKind::Bool => BOOL,
-            Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor if int_like(lik) && int_like(rik) => {
+            // One concrete int side fixes an unbound variable on
+            // the other: scalar `Add` (and friends) have
+            // Rhs = Self, Output = Self, so this is the same
+            // binding the trait impl would make. Closure
+            // signature inference depends on it.
+            Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor
+                if (int_like(lik) && (int_like(rik) || matches!(rik, TyKind::Infer(_))))
+                    || (int_like(rik) && matches!(lik, TyKind::Infer(_))) =>
+            {
                 if !self.unify(li, ri) {
                     return bad(self);
                 }
@@ -5279,6 +5365,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let a = args[*index];
                 let t = self.expr(a, None);
                 let t = self.deep(t);
+                // A still-unbound variable defers the test to
+                // finish: its type may be a closure signature
+                // that only the second inference pass binds.
+                if matches!(self.kind(t), TyKind::Infer(_)) && !self.kind(t).is_int_infer() {
+                    self.deferred_fmt.push((t, *debug, self.span(a)));
+                    continue;
+                }
                 let ok = if *debug { has_debug(self.p, &self.tys, t) } else { has_display(&self.tys, t) || self.kind(t).is_int_infer() };
                 if !ok {
                     let tn = self.tn(t);
@@ -7313,6 +7406,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     fn finish(&mut self) {
+        // Second closure inference pass: call sites may have
+        // bound signature variables since the in-place check;
+        // a body that could not be inferred then often can now.
+        self.run_obligations(false);
+        while let Some(d) = self.deferred_closures.pop() {
+            let unbound = d.sig.iter().chain([&d.ret]).any(|&t| matches!(self.kind(t), TyKind::Infer(_)));
+            if unbound {
+                self.infer_closure_body(&d.names, &d.sig, d.body, d.ret, &d.args);
+            }
+        }
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
@@ -7330,6 +7433,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     format!("cannot infer the type of `{name}`"),
                     "Add a type annotation, such as `let v: Vec<i64> = Vec::new();`.",
                 );
+            }
+        }
+        // Deferred format tests, with types as bound by now.
+        for (t, debug, span) in std::mem::take(&mut self.deferred_fmt) {
+            let t = self.deep(t);
+            let ok = if debug { has_debug(self.p, &self.tys, t) } else { has_display(&self.tys, t) || self.kind(t).is_int_infer() };
+            if !ok && self.kind(t) != TyKind::Error {
+                let tn = self.tn(t);
+                let (what, fix) = if debug {
+                    ("Debug", "Add #[derive(Debug)] to the type.")
+                } else {
+                    ("Display", "Use `{:?}` with #[derive(Debug)], or format the fields yourself.")
+                };
+                self.err("L0112", span, format!("`{tn}` does not implement {what}"), fix);
             }
         }
         for i in 0..self.out.expr_ty.len() {
@@ -7358,8 +7475,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.overflow_lint();
         // A closure signature type nothing fixed is an
         // annotation error (the E0282 class), never a default.
-        for (e, sig) in std::mem::take(&mut self.closure_sites) {
-            if sig.iter().any(|&t| self.zonk(t) == ERROR) {
+        // A method call on an unknown receiver in the body is
+        // the same class, even when a later call fixed the type.
+        for (e, sig, head_failed) in std::mem::take(&mut self.closure_sites) {
+            if head_failed || sig.iter().any(|&t| self.zonk(t) == ERROR) {
                 let span = self.span(e);
                 self.err(
                     "L0610",

@@ -102,7 +102,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         let ei = (e.0 - self.ck.expr_base) as usize;
         let Some(args) = self.ck.generic_args.get(ei) else { return f };
-        if args.is_empty() {
+        // A closure template can have no parameters at all
+        // (plain parent, fully written signature); its one
+        // instance is still a separate fn mono made.
+        if args.is_empty() && !self.p.gx.closure_fns.contains_key(&f) {
             return f;
         }
         crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f)
