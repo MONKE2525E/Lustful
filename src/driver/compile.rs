@@ -1122,8 +1122,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Resolver routing (W-RESOLVE): a manifest-selected crate, or a root
     // file that mentions modules, imports, cfg, or const/static/type
-    // items, compiles through the outline worklist (full rebuild per
-    // request for now). Routing follows the current text, never just the
+    // items, compiles through the outline worklist. Routing follows the current text, never just the
     // session's past: a fresh session routes by these same two facts, so
     // a warm session that stayed on the worklist after an edit removed
     // the trigger would answer through a different front end than a cold
@@ -1138,10 +1137,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;
+        front.adt_seq_fp = 0;
         front.items.clear();
         front.fn_loc.clear();
         front.fn_slot.clear();
         front.slot_hash.clear();
+        front.slot_head.clear();
         front.chunks.clear();
         front.src.clear();
         front.map = SourceMap::default();
