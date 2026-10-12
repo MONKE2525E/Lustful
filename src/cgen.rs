@@ -3428,15 +3428,20 @@ mod tests {
         let (key, text1) = with_program(v1, |interner, p| {
             let a = p.type_names[&interner.intern("S")];
             let key = (Glue::Debug, CTy::Adt(a));
-            glue.add(p, [&key].into_iter());
+            let slots: Vec<u32> = (0..p.fns.len() as u32).collect();
+            glue.add(p, &slots, [&key].into_iter());
             (key, glue_unit(p, &glue))
         });
-        let regen_same = with_program(v1, |_interner, p| glue.refresh(p, [&key].into_iter()).1);
+        let regen_same = with_program(v1, |_interner, p| {
+            let slots: Vec<u32> = (0..p.fns.len() as u32).collect();
+            glue.refresh(p, &slots, [&key].into_iter()).1
+        });
         assert!(!regen_same, "same program: nothing regenerates");
         let text1_again = with_program(v1, |_interner, p| glue_unit(p, &glue));
         assert_eq!(text1_again, text1, "same program: same glue text");
         let (regen, text2) = with_program(v2, |_interner, p| {
-            let regen = glue.refresh(p, [&key].into_iter()).1;
+            let slots: Vec<u32> = (0..p.fns.len() as u32).collect();
+            let regen = glue.refresh(p, &slots, [&key].into_iter()).1;
             (regen, glue_unit(p, &glue))
         });
         assert!(regen, "field type edit regenerates the Debug glue");
