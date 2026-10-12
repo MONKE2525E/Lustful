@@ -22,6 +22,8 @@ struct Lower<'p, 'a> {
     scopes: Vec<Vec<Local>>,
     loops: Vec<LoopInfo>,
     local_map: Vec<Local>,
+    /// Depth of mutable place evaluation (see `place_for_mut`).
+    mut_index: u32,
 }
 
 /// Lowers one checked function body to IR.
@@ -30,7 +32,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: FnId, mut ck: Checked<'p>) -> Body
     let tys = std::mem::replace(&mut ck.tys, Tys::new(&p.tys));
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
     let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len() };
-    let mut lw = Lower { p, ck, body, cur: Bb(0), scopes: vec![Vec::new()], loops: Vec::new(), local_map: Vec::new() };
+    let mut lw = Lower { p, ck, body, cur: Bb(0), scopes: vec![Vec::new()], loops: Vec::new(), local_map: Vec::new(), mut_index: 0 };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
     for i in 0..lw.ck.param_locals.len() {
@@ -146,6 +148,18 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// Evaluates `e` to a place that will be written or mutably borrowed. A `Vec` index in
+    /// such a place is an `IndexMut` borrow in Rust: the mutable borrow of the container
+    /// starts before the index expression runs, so `v[v.len()] = 1` and `&mut v[v.len()]`
+    /// are errors. The `Index` case in `place` models that while `mut_index` is set: it
+    /// takes a `&mut` temporary of the container first and indexes through it.
+    fn place_for_mut(&mut self, e: ExprId) -> Place {
+        self.mut_index += 1;
+        let p = self.place(e);
+        self.mut_index -= 1;
+        p
+    }
+
     /// Evaluates `e` to a place. A value expression goes into a new temporary.
     fn place(&mut self, e: ExprId) -> Place {
         match (self.p.ast.expr(e), self.ck.res(e)) {
@@ -157,6 +171,18 @@ impl<'p, 'a> Lower<'p, 'a> {
             (Expr::Index { base, index }, Res::Index { derefs }) => {
                 let b = self.place(*base);
                 let b = Self::derefs(b, derefs);
+                // Mutable use: borrow the container before the index expression runs
+                // (see `place_for_mut`), and index through that borrow.
+                let b = if self.mut_index > 0 {
+                    let bt = self.peel(self.ty(*base), derefs);
+                    let rt = self.ref_ty(true, bt);
+                    let t = self.temp(rt);
+                    let span = self.span(e);
+                    self.assign(Place::local(t), Rvalue::Ref(true, b), span);
+                    Place::local(t).deref()
+                } else {
+                    b
+                };
                 let i = self.temp(USIZE);
                 self.expr_into(*index, Some(&Place::local(i)));
                 b.project(Proj::Index(i))
@@ -408,21 +434,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Ref { mutable, expr } => {
-                let pl = self.place(*expr);
+                let pl = if *mutable { self.place_for_mut(*expr) } else { self.place(*expr) };
                 if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Ref(*mutable, pl), span);
                 }
             }
             Expr::Assign { lhs, rhs } => {
                 let o = self.operand(*rhs);
-                let pl = self.place(*lhs);
+                let pl = self.place_for_mut(*lhs);
                 self.assign(pl, Rvalue::Use(o), span);
                 self.unit(dest, span);
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 let lt = self.ty(*lhs);
                 if self.kind(lt) == TyKind::String {
-                    let pl = self.place(*lhs);
+                    let pl = self.place_for_mut(*lhs);
                     let r = self.operand(*rhs);
                     let mt = self.ref_ty(true, STRING);
                     let t = self.temp(mt);
@@ -435,7 +461,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         _ => 0,
                     };
                     let r = self.operand_derefs(*rhs, rd);
-                    let pl = self.place(*lhs);
+                    let pl = self.place_for_mut(*lhs);
                     self.assign(pl.clone(), Rvalue::Bin(*op, Operand::Copy(pl), r), span);
                 }
                 self.unit(dest, span);
@@ -575,7 +601,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                             self.expr_into(init, Some(&Place::local(l)));
                         }
                         BindMode::Ref(m) => {
-                            let pl = self.place(init);
+                            let pl = if m { self.place_for_mut(init) } else { self.place(init) };
                             self.assign(Place::local(l), Rvalue::Ref(m, pl), span);
                         }
                     }
@@ -585,10 +611,17 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             (Pat::Wild, _) => {
                 if let Some(init) = init {
-                    // `let _ = place;` does not move the place.
+                    // `let _ = place;` does not move the place. A `Copy` place is still
+                    // read, so a borrow stored in it stays live until this point: emit
+                    // the read into a throwaway temporary.
                     self.scopes.push(Vec::new());
                     if self.is_place_expr(init) {
-                        self.place(init);
+                        let pl = self.place(init);
+                        let ty = self.ty(init);
+                        if is_copy(self.p, &self.body.tys, ty) {
+                            let t = self.temp(ty);
+                            self.assign(Place::local(t), Rvalue::Use(Operand::Copy(pl)), span);
+                        }
                     } else {
                         self.expr_into(init, None);
                     }
@@ -631,23 +664,57 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Autoref::RefMut => {
-                // Two-phase borrow: a shared reservation while the arguments run, then `&mut`.
-                let pl = self.place(recv);
+                let pl = self.place_for_mut(recv);
                 let pl = Self::derefs(pl, derefs);
-                let st = self.ref_ty(false, recv_ty);
-                let reserve = self.temp(st);
-                self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
-                let mut arg_ops = Vec::new();
-                for &a in args {
-                    let o = self.operand(a);
-                    arg_ops.push(o);
-                }
-                self.push(StmtKind::FakeRead(reserve), span);
                 let mt = self.ref_ty(true, recv_ty);
-                let t = self.temp(mt);
-                self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
-                ops.push(Operand::Move(Place::local(t)));
-                ops.extend(arg_ops);
+                if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+                    // The receiver is reached through an `IndexMut` borrow, which is not
+                    // two-phase: take the `&mut` before the arguments run, so an argument
+                    // that borrows the container again is an error, as in rustc.
+                    let t = self.temp(mt);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    ops.push(Operand::Move(Place::local(t)));
+                    for &a in args {
+                        let o = self.operand(a);
+                        // A direct place read in an argument (`v[0][0]`) has no statement
+                        // of its own, so the borrow checker would only see it at the call,
+                        // after the `&mut` above is dead. Read it into a temporary first.
+                        let o = match o {
+                            Operand::Copy(pl) if !pl.proj.is_empty() => {
+                                let aty = match self.ck.coerce(a) {
+                                    Coerce::Deref(n) => self.peel(self.ty(a), n),
+                                    _ => self.ty(a),
+                                };
+                                let tt = self.temp(aty);
+                                self.assign(Place::local(tt), Rvalue::Use(Operand::Copy(pl)), span);
+                                self.operand_from(Place::local(tt), aty)
+                            }
+                            Operand::Move(pl) if !pl.proj.is_empty() => {
+                                let aty = self.ty(a);
+                                let tt = self.temp(aty);
+                                self.assign(Place::local(tt), Rvalue::Use(Operand::Move(pl)), span);
+                                self.operand_from(Place::local(tt), aty)
+                            }
+                            o => o,
+                        };
+                        ops.push(o);
+                    }
+                } else {
+                    // Two-phase borrow: a shared reservation while the arguments run, then `&mut`.
+                    let st = self.ref_ty(false, recv_ty);
+                    let reserve = self.temp(st);
+                    self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+                    let mut arg_ops = Vec::new();
+                    for &a in args {
+                        let o = self.operand(a);
+                        arg_ops.push(o);
+                    }
+                    self.push(StmtKind::FakeRead(reserve), span);
+                    let t = self.temp(mt);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    ops.push(Operand::Move(Place::local(t)));
+                    ops.extend(arg_ops);
+                }
             }
         }
         let rv = match callee {
