@@ -73,12 +73,15 @@ cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
 ## Use
 
 ```sh
-lust check main.rs [--json] [--timings]
+lust check main.rs [--json] [--max-errors N] [--timings]
 lust build main.rs [-o out] [-g] [--emit-c prefix] [--timings]
 lust run main.rs [-- args]
 lust build main.rs --release            # release build: Cargo if a Cargo.toml is above the file, else rustc -O
 lust build main.rs --profile fast       # same, with a named Cargo profile
 lust check main.rs --rustc              # second opinion: the real rustc checks the file
+lust test main.rs [filter] [--json] [--timeout SECONDS]
+lust explain L0301
+lust capabilities [--json]
 lust daemon                             # serve this directory yourself (not needed: see below)
 ```
 
@@ -90,7 +93,7 @@ Trust rule for the cache: it is trusted like ccache's local cache. A cached buil
 
 Release builds go through the real Rust toolchain on the same source, and lust prints which tool ran. With a `Cargo.toml` above the file, lust runs `cargo build --release` (or `--profile <name>`) with the file's package and bin selection; `-o` copies the artifact out of `target/`. Without one, it runs `rustc -O --edition 2024` with the release oracle flags from [DESIGN.md](DESIGN.md).
 
-`--json` prints one diagnostic per line, each with `code`, `message`, `at`, and `fix`.
+`--json` prints one diagnostic per line (schema 1), each with `code`, `severity`, `message`, `file`, `source_hash`, `span` (bytes plus line and column), labeled secondary `labels`, `fix`, and `edits`. Output is capped at 20 diagnostics by default; a final `truncated` record says how many were omitted. `lust test` runs each `#[test]` function in its own child process. `lust explain` prints the long-form page for one code (see `docs/errors/`). `lust capabilities --json` lists what the subset supports and rejects. The three agent-kit commands never use the daemon.
 
 ## Supported subset
 
@@ -112,11 +115,15 @@ Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields 
 scripts/difftest.sh             # compare with rustc
 SANITIZE=1 scripts/difftest.sh  # also run the generated C under ASan and UBSan
 scripts/test-client.sh          # daemon autostart, disk cache, release handoff
+scripts/testtest.sh             # compare `lust test` with `rustc --test`
+scripts/check-explain.sh        # check every `lust explain` example against lust and rustc
+scripts/agentkit-test.sh        # JSON diagnostics, explain, capabilities, test edges
 ```
 
 - `tests/pass`: lust and rustc must give the same stdout and exit status.
 - `tests/fail`: rustc and lust must both reject. lust must give the expected error code.
 - `tests/reject`: valid Rust that lust rejects on purpose.
+- `tests/testrun`: files with `#[test]` functions; `lust test` and `rustc --test` must agree per test.
 
 The agent-loop benchmark also tests incremental mode: every edit's result is compared with rustc.
 
@@ -127,6 +134,8 @@ The agent-loop benchmark also tests incremental mode: every edit's result is com
 | `src/client.rs`, `src/protocol.rs` | The thin `lust` client (daemon autostart, release handoff) and the daemon wire format. |
 | `src/cache.rs` | The whole-request disk cache for cold runs. |
 | `src/main.rs`, `src/daemon.rs`, `src/driver.rs` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
+| `src/diag.rs`, `docs/errors/` | Diagnostics with stable codes. `--json` uses schema 1 records with spans, labels, and a source hash. One explain page per code. |
+| `src/testrun.rs`, `src/explain.rs`, `src/capabilities.rs` | The agent kit: `lust test`, `lust explain`, and `lust capabilities`. |
 | `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas; the token scan that finds what changed. |
 | `src/collect.rs` | Item tables and signatures. |
 | `src/check.rs` | Local type inference, method resolution, exhaustiveness. |

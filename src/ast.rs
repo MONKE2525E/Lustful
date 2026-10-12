@@ -83,6 +83,8 @@ pub struct Param {
 pub struct FnDef {
     pub name: Sym,
     pub name_span: Span,
+    /// True for `#[test]` functions. Used by `lust test`; ignored by normal builds.
+    pub is_test: bool,
     pub self_param: Option<SelfParam>,
     pub params: Vec<Param>,
     pub ret: Option<TyId>,

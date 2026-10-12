@@ -128,10 +128,11 @@ impl<'a> Parser<'a> {
 
     // ---------- Items ----------
 
-    /// Parses outer attributes. Returns the derive list. `#[test]` and lint attributes are accepted
-    /// and ignored (there is no `lust test` yet).
-    fn attributes(&mut self) -> PResult<Vec<(Sym, Span)>> {
+    /// Parses outer attributes. Returns the derive list and whether `#[test]` was present.
+    /// Lint attributes are accepted and ignored.
+    fn attributes(&mut self) -> PResult<(Vec<(Sym, Span)>, bool)> {
         let mut derives = Vec::new();
+        let mut is_test = false;
         while self.peek() == Tok::Pound {
             let start = self.bump().span;
             let inner = self.eat(Tok::Bang);
@@ -149,7 +150,7 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(Tok::RParen, "`)`")?;
                 }
-                _ if name == k.test && !inner => {}
+                _ if name == k.test && !inner => is_test = true,
                 _ if name == k.allow || name == k.warn || name == k.deny => {
                     // Lint attributes have no effect in lust. Skip the argument list.
                     self.expect(Tok::LParen, "`(`")?;
@@ -174,11 +175,11 @@ impl<'a> Parser<'a> {
             }
             self.expect(Tok::RBracket, "`]`")?;
         }
-        Ok(derives)
+        Ok((derives, is_test))
     }
 
     fn item(&mut self) -> PResult<Option<Item>> {
-        let derives = self.attributes()?;
+        let (derives, is_test) = self.attributes()?;
         let start = self.span();
         self.eat(Tok::Pub);
         if self.peek() == Tok::LParen {
@@ -186,7 +187,11 @@ impl<'a> Parser<'a> {
             while self.bump().tok != Tok::RParen {}
         }
         let kind = match self.peek() {
-            Tok::Fn => ItemKind::Fn(self.fn_def()?),
+            Tok::Fn => {
+                let mut def = self.fn_def()?;
+                def.is_test = is_test;
+                ItemKind::Fn(def)
+            }
             Tok::Struct => ItemKind::Struct(self.struct_def(derives)?),
             Tok::Enum => ItemKind::Enum(self.enum_def(derives)?),
             Tok::Impl => ItemKind::Impl(self.impl_def()?),
@@ -273,7 +278,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
-        Ok(FnDef { name, name_span, self_param, params, ret, body, exprs, pats })
+        Ok(FnDef { name, name_span, is_test: false, self_param, params, ret, body, exprs, pats })
     }
 
     fn fields(&mut self) -> PResult<Vec<FieldDef>> {
@@ -352,12 +357,14 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut fns = Vec::new();
         while self.peek() != Tok::RBrace {
-            self.attributes()?;
+            let (_, is_test) = self.attributes()?;
             self.eat(Tok::Pub);
             if self.peek() != Tok::Fn {
                 return Err(unsupported(self.span(), "associated consts and types"));
             }
-            fns.push(self.fn_def()?);
+            let mut def = self.fn_def()?;
+            def.is_test = is_test;
+            fns.push(def);
         }
         self.expect(Tok::RBrace, "`}`")?;
         Ok(ImplDef { self_ty, fns })

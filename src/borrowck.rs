@@ -52,6 +52,10 @@ struct Loan {
     mutable: bool,
     /// Stands for "whatever a reference parameter points to". Only used for return checks.
     synthetic: bool,
+    /// Where the borrow starts. Used as a labeled secondary span in diagnostics.
+    span: Span,
+    /// The last use of the local that first holds this loan, if it is after the borrow.
+    last_use: Option<Span>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -184,9 +188,29 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
     fn err(&mut self, code: &'static str, span: Span, msg: String, fix: &str) {
+        self.err_labeled(code, span, msg, fix, Vec::new());
+    }
+
+    /// Reports an error with labeled secondary spans (where a borrow starts, where it is used).
+    fn err_labeled(&mut self, code: &'static str, span: Span, msg: String, fix: &str, labels: Vec<(Span, &'static str)>) {
         if self.report && self.seen.insert((code, span.start, span.end)) {
-            self.errs.push(Diag::new(code, span, msg, fix));
+            let mut d = Diag::new(code, span, msg, fix);
+            for (s, text) in labels {
+                if s != span && s != Span::default() {
+                    d = d.with_label(s, text);
+                }
+            }
+            self.errs.push(d);
         }
+    }
+
+    /// Labels for a loan: where the borrow starts, and where the borrow is used later.
+    fn loan_labels(loan: &Loan) -> Vec<(Span, &'static str)> {
+        let mut labels = vec![(loan.span, if loan.mutable { "mutably borrowed here" } else { "borrowed here" })];
+        if let Some(u) = loan.last_use {
+            labels.push((u, "borrow later used here"));
+        }
+        labels
     }
 
     // ---------- Setup ----------
@@ -195,16 +219,85 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // Synthetic loans for reference parameters, so returned references can be traced to them.
         for l in 1..=self.body.arg_count {
             if contains_ref(&self.body.tys, self.body.locals[l].ty) {
-                self.loans.push(Loan { place: Place::local(l as Local).deref(), mutable: false, synthetic: true });
+                self.loans.push(Loan {
+                    place: Place::local(l as Local).deref(),
+                    mutable: false,
+                    synthetic: true,
+                    span: Span::default(),
+                    last_use: None,
+                });
             }
         }
+        let mut holders: Vec<Option<Local>> = vec![None; self.loans.len()];
         for (bi, b) in self.body.blocks.iter().enumerate() {
             for (si, s) in b.stmts.iter().enumerate() {
-                if let StmtKind::Assign(_, Rvalue::Ref(m, place)) = &s.kind {
+                if let StmtKind::Assign(dest, Rvalue::Ref(m, place)) = &s.kind {
                     self.loan_at.insert((bi as u32, si as u32), self.loans.len());
-                    self.loans.push(Loan { place: place.clone(), mutable: *m, synthetic: false });
+                    holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
+                    self.loans.push(Loan { place: place.clone(), mutable: *m, synthetic: false, span: s.span, last_use: None });
                 }
             }
+        }
+        // For each loan, find the last read of a local that holds it. Holders start at the
+        // borrow's destination local and follow plain copies. This is the "borrow later used
+        // here" label. It is an approximation: it does not follow calls or aggregates.
+        let mut copies: Vec<(Local, Local)> = Vec::new();
+        for b in &self.body.blocks {
+            for s in &b.stmts {
+                if let StmtKind::Assign(dest, Rvalue::Use(Operand::Copy(p) | Operand::Move(p))) = &s.kind
+                    && dest.proj.is_empty()
+                    && p.proj.is_empty()
+                {
+                    copies.push((p.local, dest.local));
+                }
+            }
+        }
+        let mut uses: Vec<(Local, Span)> = Vec::new();
+        for b in &self.body.blocks {
+            for s in &b.stmts {
+                let mut note = |o: &Operand| {
+                    if let Operand::Copy(p) | Operand::Move(p) = o {
+                        uses.push((p.local, s.span));
+                    }
+                };
+                match &s.kind {
+                    // A reborrow of a holder (for example for a method call) also counts as a use.
+                    StmtKind::Assign(_, Rvalue::Ref(_, p)) | StmtKind::Assign(_, Rvalue::Discriminant(p)) => uses.push((p.local, s.span)),
+                    StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut note),
+                    StmtKind::Print { parts, .. } => parts_operands(parts, &mut note),
+                    _ => {}
+                }
+            }
+            let span = b.term_span;
+            let mut note = |o: &Operand| {
+                if let Operand::Copy(p) | Operand::Move(p) = o {
+                    uses.push((p.local, span));
+                }
+            };
+            match &b.term {
+                Terminator::If(o, ..) | Terminator::Switch(o, ..) => note(o),
+                Terminator::Panic(parts) => parts_operands(parts, &mut note),
+                _ => {}
+            }
+        }
+        for (i, loan) in self.loans.iter_mut().enumerate() {
+            let Some(first) = holders[i] else { continue };
+            let mut holders_set = vec![first];
+            let mut at = 0;
+            while at < holders_set.len() {
+                let from = holders_set[at];
+                at += 1;
+                for &(src, dst) in &copies {
+                    if src == from && !holders_set.contains(&dst) {
+                        holders_set.push(dst);
+                    }
+                }
+            }
+            loan.last_use = uses
+                .iter()
+                .filter(|&&(l, s)| s.start > loan.span.start && holders_set.contains(&l))
+                .map(|&(_, s)| s)
+                .max_by_key(|s| s.start);
         }
     }
 
@@ -731,7 +824,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     ("L0303", format!("cannot use {name} because it is mutably borrowed"), "Finish using the `&mut` reference first.")
                 }
             };
-            self.err(code, span, msg, fix);
+            let labels = Self::loan_labels(loan);
+            self.err_labeled(code, span, msg, fix, labels);
             return;
         }
     }
@@ -745,11 +839,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             let is_param = root >= 1 && (root as usize) <= self.body.arg_count;
             if !loan.place.proj.contains(&Proj::Deref) {
                 let name = self.local_name(root);
-                self.err(
+                let labels = Self::loan_labels(loan);
+                self.err_labeled(
                     "L0307",
                     span,
                     format!("cannot return a reference to {name}, which is owned by this function"),
                     "Return an owned value instead (for example `String` instead of `&str`).",
+                    labels,
                 );
             } else if is_param && Some(root) != expected && loan.place.proj.first() == Some(&Proj::Deref) {
                 let name = self.local_name(root);

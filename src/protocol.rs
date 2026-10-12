@@ -2,7 +2,8 @@
 // `lust-core` compiler, so the client stays small and starts fast.
 //
 // Wire format. Request: one line of tab-separated fields:
-//   cmd  file  out  json  timings  debug  emit_c
+//   cmd  file  out  json  timings  debug  emit_c  max_errors
+// The last field is optional on decode so an older client still works.
 // Response: "<code> <stdout len> <stderr len>\n" followed by the two byte strings.
 // Both binaries include this module and each uses only part of it.
 #![allow(dead_code)]
@@ -25,6 +26,8 @@ pub struct Request {
     pub timings: bool,
     pub debug: bool,
     pub emit_c: Option<PathBuf>,
+    /// Cap on shown diagnostics (0 means no cap). See `diag::render`.
+    pub max_errors: usize,
 }
 
 #[derive(Default)]
@@ -56,7 +59,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust daemon";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust capabilities [--json]\n       lust daemon";
 
 /// Parses the command line (without the program name). Paths become absolute.
 pub fn parse_args(args: &[String]) -> Option<Invocation> {
@@ -71,6 +74,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let mut file = PathBuf::new();
     let (mut out, mut json, mut timings, mut debug, mut emit_c, mut run_args) = (None, false, false, false, None, Vec::new());
     let (mut release, mut profile, mut rustc) = (false, None, false);
+    let mut max_errors = 20usize;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--json" => json = true,
@@ -81,6 +85,8 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "--release" => release = true,
             "--profile" => profile = Some(it.next()?.clone()),
             "--rustc" => rustc = true,
+            "--max-errors" => max_errors = it.next()?.parse().ok()?,
+            _ if a.starts_with("--max-errors=") => max_errors = a["--max-errors=".len()..].parse().ok()?,
             "--" => run_args = it.by_ref().cloned().collect(),
             _ if file.as_os_str().is_empty() => file = a.into(),
             _ => return None,
@@ -115,6 +121,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         timings,
         debug,
         emit_c: emit_c.map(|p| abs(&p)),
+        max_errors,
     };
     Some(Invocation::Compile { req, run: cmd == "run", args: run_args })
 }
@@ -128,12 +135,12 @@ pub fn encode(r: &Request) -> String {
     let b = |x: bool| if x { "1" } else { "0" };
     let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
     let emit = r.emit_c.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-    format!("{cmd}\t{}\t{}\t{}\t{}\t{}\t{emit}\n", r.file.display(), r.out.display(), b(r.json), b(r.timings), b(r.debug))
+    format!("{cmd}\t{}\t{}\t{}\t{}\t{}\t{emit}\t{}\n", r.file.display(), r.out.display(), b(r.json), b(r.timings), b(r.debug), r.max_errors)
 }
 
 pub fn decode(line: &str) -> Option<Request> {
     let f: Vec<&str> = line.trim_end_matches('\n').split('\t').collect();
-    if f.len() != 7 {
+    if f.len() != 7 && f.len() != 8 {
         return None;
     }
     Some(Request {
@@ -144,6 +151,7 @@ pub fn decode(line: &str) -> Option<Request> {
         timings: f[4] == "1",
         debug: f[5] == "1",
         emit_c: if f[6].is_empty() { None } else { Some(f[6].into()) },
+        max_errors: if f.len() == 8 { f[7].parse().ok()? } else { 20 },
     })
 }
 
