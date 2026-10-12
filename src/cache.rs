@@ -190,6 +190,7 @@ impl Cache {
             stdout: resp.stdout.clone(),
             stderr: if resp.code == 0 { String::new() } else { resp.stderr.clone() },
             code: resp.code,
+            ran: false,
         };
         self.write(&self.entry_path(&key, ""), &encode_response(&clean));
         self.evict(&key);
@@ -276,7 +277,7 @@ fn decode_response(b: &[u8]) -> Option<Response> {
     let n = u64::from_le_bytes(b.get(4..12)?.try_into().ok()?) as usize;
     let stdout = String::from_utf8(b.get(12..12 + n)?.to_vec()).ok()?;
     let stderr = String::from_utf8(b.get(12 + n..)?.to_vec()).ok()?;
-    Some(Response { stdout, stderr, code })
+    Some(Response { stdout, stderr, code, ran: false })
 }
 
 #[cfg(test)]
@@ -284,7 +285,7 @@ mod tests {
     use super::*;
 
     fn req(cmd: Cmd, json: bool, debug: bool) -> Request {
-        Request { cmd, file: "/tmp/x/main.rs".into(), out: "/tmp/x/main".into(), json, timings: false, debug, emit_c: None, max_errors: 20 }
+        Request { cmd, file: "/tmp/x/main.rs".into(), out: "/tmp/x/main".into(), json, timings: false, debug, emit_c: None, max_errors: 20, run_args: None }
     }
 
     /// Each key input named in the module docs must change the key on its own.
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn response_round_trips() {
-        let r = Response { stdout: "{\"code\":\"L0301\"}\n".into(), stderr: "err\n".into(), code: 1 };
+        let r = Response { stdout: "{\"code\":\"L0301\"}\n".into(), stderr: "err\n".into(), code: 1, ran: false };
         let back = decode_response(&encode_response(&r)).unwrap();
         assert_eq!((back.stdout.as_str(), back.stderr.as_str(), back.code), (r.stdout.as_str(), r.stderr.as_str(), 1));
         assert!(decode_response(b"short").is_none());

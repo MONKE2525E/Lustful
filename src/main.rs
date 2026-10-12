@@ -72,9 +72,11 @@ fn main() {
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args }) => {
             // Whole-request disk cache (cold runs only; the daemon path keeps its own
-            // in-memory state). `--emit-c` writes side files, so it always compiles.
+            // in-memory state). `--emit-c` writes side files, so it always compiles. A `run`
+            // request is also never cached: its response can be the program's own output and
+            // exit code (an in-memory run writes no executable), not a build result.
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() { cache::Cache::open(&req.file) } else { None };
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() { cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)

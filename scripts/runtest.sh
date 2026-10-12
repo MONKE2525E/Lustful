@@ -9,8 +9,11 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-# Make sure no daemon answers: the client must exec lust-core, which runs in memory.
+# Make sure no daemon answers (and none autostarts) and the disk cache stays out: the
+# client must exec lust-core, which compiles cold and runs in memory.
 export LUST_DAEMON_SOCKET="$work/no-daemon.sock"
+export LUST_NO_DAEMON=1
+export LUST_NO_CACHE=1
 filter=${1:-}
 pass=0
 fail=0
