@@ -68,6 +68,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         loops: Vec::new(),
         local_map: Vec::new(),
         mut_index: 0,
+        cow_view: None,
         drop_ty: Default::default(),
         upvars: None,
         guard_places: Vec::new(),

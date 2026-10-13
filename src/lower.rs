@@ -31,6 +31,11 @@ struct Lower<'p, 'a> {
     local_map: Vec<Local>,
     /// Depth of mutable place evaluation (see `place_for_mut`).
     mut_index: u32,
+    /// A method receiver lowered as a Cow's `&B` view (W-STD-B,
+    /// `Coerce::CowRecv`): the receiver expression, and the local and
+    /// type of its view, which `place`, `operand`, and `ty` give for it
+    /// while the method call lowers.
+    cow_view: Option<(ExprId, Local, Ty)>,
     /// `needs_drop` answers per body type: every scope exit asks for each of
     /// its locals, and the answer walks Adt fields.
     drop_ty: crate::intern::FxMap<Ty, bool>,
@@ -125,6 +130,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         loops: Vec::new(),
         local_map: Vec::new(),
         mut_index: 0,
+        cow_view: None,
         drop_ty: Default::default(),
         upvars: None,
         guard_places: Vec::new(),
@@ -431,7 +437,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.assign(Place::local(i), Rvalue::Use(Operand::Copy(Place::local(i))), at);
     }
     fn ty(&self, e: ExprId) -> Ty {
-        self.ck.ty(e)
+        match self.cow_view {
+            Some((x, _, t)) if x == e => t,
+            _ => self.ck.ty(e),
+        }
     }
     fn kind(&self, t: Ty) -> TyKind {
         self.body.tys.kind(t)
@@ -537,6 +546,11 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     /// Evaluates `e` to a place. A value expression goes into a new temporary.
     fn place(&mut self, e: ExprId) -> Place {
+        if let Some((x, v, _)) = self.cow_view
+            && x == e
+        {
+            return Place::local(v);
+        }
         if let Some(pl) = self.take_prelowered(e) {
             return pl;
         }
@@ -630,13 +644,20 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.mark_index_loc(i, at);
                 b.project(Proj::Index(i))
             }
-            (Expr::Deref(inner), _) => {
-                let span = self.span(e);
-                match self.deref_steps(e, *inner, span) {
-                    Some(root) => root.deref(),
-                    None => self.place(*inner).deref(),
+            (Expr::Deref(inner), _) => match self.ck.coerce(*inner) {
+                // `*cow` (W-STD-B): the place behind the Cow's `&B` view.
+                Coerce::CowRecv(n, view) => {
+                    let v = self.cow_view_of(*inner, n, view);
+                    Place::local(v).deref()
                 }
-            }
+                _ => {
+                    let span = self.span(e);
+                    match self.deref_steps(e, *inner, span) {
+                        Some(root) => root.deref(),
+                        None => self.place(*inner).deref(),
+                    }
+                }
+            },
             // A static is a place of its own (W-BORROW): reach it through
             // its address, as `&STATIC` does, never through a copy in a
             // temporary. A borrow of it is then `'static`, and a move out
@@ -666,6 +687,11 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     /// Evaluates `e` to an operand, applying the coercion recorded by the checker.
     fn operand(&mut self, e: ExprId) -> Operand {
+        if let Some((x, v, _)) = self.cow_view
+            && x == e
+        {
+            return Operand::Copy(Place::local(v));
+        }
         let op = self.operand_raw(e);
         let span = self.span(e);
         let ty = self.ty(e);
@@ -748,6 +774,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let root = self.apply_deref_steps(place, ty, steps, span);
                 if matches!(self.kind(target), TyKind::Ref(_, m, _) if m.is_mut()) { Operand::Move(root) } else { Operand::Copy(root) }
             }
+            // Only a method receiver has it, and `method_into` lowers it.
+            Coerce::CowRecv(..) => op,
             Coerce::CowDeref(n, target) => {
                 // Down to the `&Cow`, then the Cow's `&B` view (W-STD-B).
                 let place = self.op_place(op, ty, span);
@@ -2772,6 +2800,20 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// The `&B` view of the `Cow<B>` that `n` derefs of `e` reach
+    /// (W-STD-B): a shared borrow of the Cow, then its `Deref` builtin.
+    fn cow_view_of(&mut self, e: ExprId, n: u8, view: Ty) -> Local {
+        let span = self.span(e);
+        let pl = Self::derefs(self.place(e), n);
+        let cow = self.peel(self.ty(e), n);
+        let rt = self.ref_ty(false, cow);
+        let r = self.temp(rt);
+        self.assign(Place::local(r), Rvalue::Ref(false, pl), span);
+        let v = self.temp(view);
+        self.call_into(CallTarget::Builtin(Builtin::CowDeref), vec![Operand::Copy(Place::local(r))], Place::local(v), span);
+        v
+    }
+
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
         // A method call reports caller locations (track_caller builtins
         // such as unwrap and pow) at the method name, as rustc does, not
@@ -2781,6 +2823,18 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::MethodCall { name_span, .. } => *name_span,
             _ => span,
         };
+        // A receiver through a Cow's `Deref` (W-STD-B): borrow the Cow,
+        // make its `&B` view (before the arguments, as rustc adjusts the
+        // receiver first), then lower the call on the view.
+        if let Coerce::CowRecv(n, view) = self.ck.coerce(recv)
+            && self.cow_view.is_none_or(|(x, ..)| x != recv)
+        {
+            let v = self.cow_view_of(recv, n, view);
+            let saved = self.cow_view.replace((recv, v, view));
+            self.method_into(e, recv, args, dest, span);
+            self.cow_view = saved;
+            return;
+        }
         if let Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, .. } = self.ck.res(e) {
             self.write_fmt_into(e, recv, args, derefs, dest, span);
             return;
@@ -3059,6 +3113,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let b = self.str_view(rhs, rd);
                     Rvalue::StrCmp(op, a, b)
                 }
+                // `Cow<str>` (W-STD-B) compares as its `str` view, also
+                // against the other string types.
+                _ if crate::check::collect::cow_arg(&self.body.tys, base).is_some_and(|b| self.kind(b) == TyKind::Str) => {
+                    let a = self.str_view(lhs, ld);
+                    let b = self.str_view(rhs, rd);
+                    Rvalue::StrCmp(op, a, b)
+                }
                 _ if matches!(op, BinOp::Eq | BinOp::Ne) => {
                     let (a, t) = self.borrow_of(lhs, ld);
                     let (b, _) = self.borrow_of(rhs, rd);
@@ -3315,9 +3376,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             let p = self.place(e);
             return Operand::Copy(Self::derefs(p, n - 1));
         }
+        // A String's `as_str`, or a `Cow<str>`'s view (W-STD-B).
+        let b = if crate::check::collect::cow_arg(&self.body.tys, base).is_some() { Builtin::CowDeref } else { Builtin::StringAsStr };
         let (r, _) = self.borrow_of(e, n);
         let t = self.temp(REF_STR);
-        self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![r], Place::local(t), span);
+        self.call_into(CallTarget::Builtin(b), vec![r], Place::local(t), span);
         Operand::Copy(Place::local(t))
     }
 

@@ -840,6 +840,10 @@ pub enum Coerce {
     /// `&Cow<B>` (behind this many references in all) to `&B`, the
     /// payload's type (W-STD-B): the Cow's `Deref`.
     CowDeref(u8, Ty),
+    /// A method receiver through the Cow's `Deref` (W-STD-B): this many
+    /// derefs reach the `Cow<B>` place, whose `&B` view (the payload's
+    /// type) is the receiver the method's own adjustments start from.
+    CowRecv(u8, Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1694,18 +1698,32 @@ pub fn map_tuple_elems(ast: &crate::ast::Ast, elems: &[PatId], nfields: usize) -
     }
 }
 
-fn string_eq_ok(ld: u8, lk_is_string: bool, rd: u8, rk_is_string: bool) -> bool {
+/// `PartialEq` between the std string types, as std's `impl_eq!` pairs
+/// and the reference blanket impl give it: after peeling the common
+/// reference depth, `String` against `String`, `str`, and `&str`; `str`
+/// against `str`; and `Cow<str>` (W-STD-B) against `str`, `&str`,
+/// `String`, and `Cow<str>`. Each pair holds both ways.
+fn string_eq_ok(ld: u8, lk: StrKind, rd: u8, rk: StrKind) -> bool {
+    use StrKind::*;
     let peel = ld.min(rd);
-    let (la, ra) = ((ld - peel, lk_is_string), (rd - peel, rk_is_string));
-    let string = (0, true);
-    let str_ = (0, false);
-    let ref_str = (1, false);
-    matches!(
-        (la, ra),
-        (a, b) if (a == string && (b == string || b == str_ || b == ref_str))
-            || (a == str_ && (b == string || b == str_))
-            || (a == ref_str && b == string)
-    )
+    let (a, b) = ((ld - peel, lk), (rd - peel, rk));
+    let pair = |x: (u8, StrKind), y: (u8, StrKind)| (a == x && b == y) || (a == y && b == x);
+    pair((0, String), (0, String))
+        || pair((0, String), (0, Str))
+        || pair((0, String), (1, Str))
+        || pair((0, Str), (0, Str))
+        || pair((0, Cow), (0, Str))
+        || pair((0, Cow), (1, Str))
+        || pair((0, Cow), (0, String))
+        || pair((0, Cow), (0, Cow))
+}
+
+/// The std string types `string_eq_ok` compares (`Cow` is `Cow<str>`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StrKind {
+    String,
+    Str,
+    Cow,
 }
 
 impl<'p, 'a> Ctx<'p, 'a> {
@@ -6151,6 +6169,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
                     _ if self.tys.smart_elem(t).is_some() => self.tys.smart_elem(t).unwrap_or(ERROR),
+                    // `*cow` is `*Deref::deref(&cow)` (W-STD-B): the place
+                    // behind the Cow's `&B` view.
+                    _ if let Some(b) = crate::check::collect::cow_arg(&self.tys, t) => {
+                        let view = self.tys.mk_ref(false, b);
+                        let i = self.ei(*inner);
+                        self.out.coerce[i] = Coerce::CowRecv(0, view);
+                        b
+                    }
                     // `*w` through a user `Deref` impl.
                     _ if let Some(target) = self.record_place_deref(e, t, 0, span) => target,
                     _ => {
@@ -10839,13 +10865,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
         turbofish: &[ast::GenericArg],
         expected: Option<Ty>,
     ) -> Ty {
-        let p = self.p;
-        let k = p.known;
         let rt = self.deep(rt);
         self.call_expected = expected.map(|t| (e, t));
         // ARCH 2.12 run point: a method call must know the receiver type. The
         // obligation queue runs just before that head is required (ARCH 2.4).
         self.run_obligations(false);
+        self.method_call_at(e, recv, rt, name, name_span, args, turbofish, expected)
+    }
+
+    /// `method_call` once the receiver's type `rt` is known: also the
+    /// step through a Cow's `&B` view (check/cow.rs), with `rt` the view.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn method_call_at(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        rt: Ty,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Ty {
+        let p = self.p;
+        let k = p.known;
         // `Box` is a builtin deref step for method calls, as in
         // Rust. Its own `clone` is found before the step (it is
         // the one Box method this wave resolves at step zero),
@@ -11556,6 +11599,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(ret) = self.lang_default_method(e, recv, base, derefs, name, name_span, args) {
                     return ret;
                 }
+                if let Some(ret) = self.cow_deref_method(e, recv, base, derefs, name, name_span, args, turbofish, expected) {
+                    return ret;
+                }
                 if let Some(ret) = self.method_via_user_deref(e, recv, base, derefs, name, name_span, args, turbofish, expected) {
                     return ret;
                 }
@@ -11898,11 +11944,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn mixed_string_eq(&self, a: Ty, b: Ty) -> Option<(u8, u8)> {
         let (ld, lb) = self.autoderef(a);
         let (rd, rb) = self.autoderef(b);
-        let stringy = |t: Ty| self.tys.kind(t) == TyKind::Str || self.tys.is_string_ty(t);
-        if lb == rb || !stringy(lb) || !stringy(rb) {
+        let (Some(lk), Some(rk)) = (self.str_kind(lb, false), self.str_kind(rb, false)) else { return None };
+        if lb == rb {
             return None;
         }
-        string_eq_ok(ld, self.tys.is_string_ty(lb), rd, self.tys.is_string_ty(rb)).then_some((ld, rd))
+        string_eq_ok(ld, lk, rd, rk).then_some((ld, rd))
+    }
+
+    /// The std string type `t` is for `string_eq_ok`: String, str, or
+    /// (with `cow`) `Cow<str>` (W-STD-B).
+    fn str_kind(&self, t: Ty, cow: bool) -> Option<StrKind> {
+        if self.tys.kind(t) == TyKind::Str {
+            Some(StrKind::Str)
+        } else if self.tys.is_string_ty(t) {
+            Some(StrKind::String)
+        } else if cow && crate::check::collect::cow_arg(&self.tys, t).is_some_and(|b| self.tys.kind(self.resolve(b)) == TyKind::Str) {
+            Some(StrKind::Cow)
+        } else {
+            None
+        }
     }
 
     /// Methods shared by `str` and `String` (through Deref). The receiver is always `&self`.
@@ -12417,12 +12477,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return out;
         }
         if op.is_cmp() {
-            // String equality across String and &str.
+            // String equality across String, str, and `Cow<str>`.
             let (ld, lb) = self.autoderef(lt);
             let (rd, rb) = self.autoderef(rt);
-            let stringy = |t: Ty| self.tys.kind(t) == TyKind::Str || self.tys.is_string_ty(t);
-            if stringy(lb) && stringy(rb) && matches!(op, Eq | Ne) {
-                if !string_eq_ok(ld, self.tys.is_string_ty(lb), rd, self.tys.is_string_ty(rb)) {
+            if let (Some(lk), Some(rk)) = (self.str_kind(lb, true), self.str_kind(rb, true))
+                && matches!(op, Eq | Ne)
+            {
+                if !string_eq_ok(ld, lk, rd, rk) {
                     return bad(self);
                 }
                 self.set_res(e, Res::Bin { ld, rd });
@@ -16571,9 +16632,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.locals[i].ty = z;
         }
         for i in 0..self.out.coerce.len() {
-            if let Coerce::Unsize(t) = self.out.coerce[i] {
-                let z = self.zonk(t);
-                self.out.coerce[i] = Coerce::Unsize(z);
+            match self.out.coerce[i] {
+                Coerce::Unsize(t) => self.out.coerce[i] = Coerce::Unsize(self.zonk(t)),
+                Coerce::CowDeref(n, t) => self.out.coerce[i] = Coerce::CowDeref(n, self.zonk(t)),
+                Coerce::CowRecv(n, t) => self.out.coerce[i] = Coerce::CowRecv(n, self.zonk(t)),
+                _ => {}
             }
         }
         for (x, y, span) in std::mem::take(&mut self.vtable_sites) {

@@ -1004,6 +1004,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Coerce::Unsize(t) if !matches!(self.kind(t), TyKind::Ref(..)) => return false,
             // Builtin derefs down to the Cow, whose `Deref` borrows it.
             Coerce::CowDeref(n, _) => (n as usize, CaptureMode::Ref),
+            // A method receiver: `cap_receiver` covers it.
+            Coerce::CowRecv(..) => return false,
             // A dyn coercion reborrows the source at the target's
             // mutability before it builds the fat pointer.
             Coerce::Unsize(t) => (1, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref }),
@@ -1197,6 +1199,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Expr::MethodCall { recv, args, .. } => {
+                // Through a Cow's `&B` view (W-STD-B): the Cow's `Deref`
+                // borrows the Cow, whatever the method then does.
+                let res = match self.out.coerce[self.ei(*recv)] {
+                    Coerce::CowRecv(n, _) => Res::BuiltinMethod { b: crate::check::Builtin::CowDeref, derefs: n, autoref: Autoref::Ref },
+                    _ => res,
+                };
                 match res {
                     // A dyn method call through the vtable borrows its
                     // receiver like any other method call.

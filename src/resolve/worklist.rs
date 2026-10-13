@@ -5578,8 +5578,8 @@ impl Rewrite<'_> {
             }
         }
         match ast.exprs[id.0 as usize].kind_children() {
-            ExprKids { blocks, exprs, pats_with_scope, ty } => {
-                if let Some(t) = ty {
+            ExprKids { blocks, exprs, pats_with_scope, tys } => {
+                for t in tys {
                     self.ty(ast, t, module, scopes);
                 }
                 for e in exprs {
@@ -5714,7 +5714,7 @@ struct ExprKids {
     blocks: Vec<BlockId>,
     exprs: Vec<ExprId>,
     pats_with_scope: Vec<(PatId, ScopeBody)>,
-    ty: Option<TyId>,
+    tys: Vec<TyId>,
 }
 
 enum ScopeBody {
@@ -5733,7 +5733,7 @@ trait KindChildren {
 
 impl KindChildren for Expr {
     fn kind_children(&self) -> ExprKids {
-        let mut k = ExprKids { blocks: Vec::new(), exprs: Vec::new(), pats_with_scope: Vec::new(), ty: None };
+        let mut k = ExprKids { blocks: Vec::new(), exprs: Vec::new(), pats_with_scope: Vec::new(), tys: Vec::new() };
         match self {
             Expr::Int(..)
             | Expr::Bool(_)
@@ -5745,7 +5745,7 @@ impl KindChildren for Expr {
             | Expr::Float(_)
             | Expr::Underscore => {}
             Expr::Path(_) | Expr::StructLit { .. } => {}
-            Expr::OffsetOf { ty, .. } => k.ty = Some(*ty),
+            Expr::OffsetOf { ty, .. } => k.tys.push(*ty),
             Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => k.blocks.push(*b),
             Expr::LabeledBlock { body, .. } | Expr::AsyncBlock { body, .. } => k.blocks.push(*body),
             Expr::If { cond, then, els } => {
@@ -5795,7 +5795,7 @@ impl KindChildren for Expr {
             }
             Expr::Cast { expr, ty } => {
                 k.exprs.push(*expr);
-                k.ty = Some(*ty);
+                k.tys.push(*ty);
             }
             Expr::Range { lo, hi, .. } => {
                 if let Some(e) = lo {
@@ -5824,14 +5824,12 @@ impl KindChildren for Expr {
             }
             Expr::Closure { params, ret, body, .. } => {
                 for p in params {
-                    if let Some(t) = p.ty {
-                        let _ = t;
-                    }
+                    // Imported names in a parameter type (`|c: &Cow<str>|`)
+                    // resolve like any other written type.
+                    k.tys.extend(p.ty);
                     k.pats_with_scope.push((p.pat, ScopeBody::None));
                 }
-                if let Some(r) = ret {
-                    k.ty = Some(*r);
-                }
+                k.tys.extend(*ret);
                 k.exprs.push(*body);
             }
             Expr::Let { pat, scrut } => {
