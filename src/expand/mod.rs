@@ -21,7 +21,7 @@ use crate::diag::{CtxtId, Diag, HygieneMark, Span, mark_no_capture, register_exp
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree, build_trees};
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 
 // Diagnostic codes (docs/errors/REGISTRY.md, macro range).
 pub const C_CAP: &str = "L0801"; // expansion caps
@@ -31,6 +31,8 @@ pub const C_AMBIG: &str = "L0805"; // local ambiguity
 pub const C_CALL: &str = "L0806"; // invalid macro call or builtin input
 pub const C_DEF: &str = "L0807"; // invalid macro definition
 pub const C_UNSUPPORTED: &str = "L0809"; // known macro form lust does not support yet
+const C_SYNTAX: &str = "L0001"; // syntax error (a malformed `recursion_limit`)
+const C_ATTR: &str = "L0522"; // known attribute lust does not support yet
 
 /// One expansion error, in the house shape (code, span, message, fix).
 pub fn err(code: &'static str, span: Span, message: impl Into<String>, fix: impl Into<String>) -> Diag {
@@ -804,8 +806,8 @@ pub fn cache_stats() -> (u64, u64) {
 
 /// True when a flat token list can contain work for the expander: a
 /// `macro_rules` definition, a call to a macro the parser does not own,
-/// or a cfg attribute. A macro-free file pays one token scan and runs
-/// the unchanged pipeline.
+/// a cfg attribute, or a `recursion_limit` the expander reads. A
+/// macro-free file pays one token scan and runs the unchanged pipeline.
 pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
     let macro_rules = interner.intern("macro_rules");
     for (i, t) in tokens.iter().enumerate() {
@@ -830,7 +832,7 @@ pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
                 }
                 if tokens.get(j).map(|t| t.tok) == Some(Tok::LBracket)
                     && let Some(name) = tokens.get(j + 1).and_then(|t| seg_text(t.tok, interner))
-                    && (name == "cfg" || name == "cfg_attr" || name == "macro_use" || name == "macro_export")
+                    && (name == "cfg" || name == "cfg_attr" || name == "macro_use" || name == "macro_export" || name == "recursion_limit")
                 {
                     return true;
                 }
@@ -845,7 +847,7 @@ pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
 pub struct Expander<'a> {
     ctx: &'a ExpandCtx<'a>,
     strings: Vec<String>,
-    defs: Vec<Rc<MacroDef>>,
+    defs: Vec<Arc<MacroDef>>,
     /// Textually visible macros, in definition order. Lookups scan in
     /// reverse, so a later definition shadows an earlier one.
     textual: Vec<(Sym, u32)>,
@@ -879,10 +881,41 @@ pub struct Expander<'a> {
     /// The outside inputs this run read, in read order. The driver
     /// stores them next to the expanded chunk (see `Dep`).
     deps: Vec<Dep>,
-    /// Expansion depth cap for this file: 128, or the crate's
-    /// `#![recursion_limit = "N"]` when the file carries one.
+    /// Expansion depth cap for this file: 128, or the crate root's
+    /// `#![recursion_limit = "N"]` up to `RECURSION_CAP`.
     recursion_limit: u32,
+    /// True when the crate asked for more depth than `RECURSION_CAP`.
+    limit_capped: bool,
     total_tokens: usize,
+    /// The native stack segment expansion runs on (see `expand_list`):
+    /// where it began, the bytes it may use, and the bytes used by the
+    /// segments below it.
+    stack_base: usize,
+    stack_room: usize,
+    stack_below: usize,
+}
+
+/// The most expansion depth lust honors, whatever the crate's
+/// `#![recursion_limit]` asks for.
+const RECURSION_CAP: u32 = 2048;
+/// rustc's default recursion limit.
+const DEFAULT_RECURSION_LIMIT: u32 = 128;
+/// Stack bytes expansion may use on its caller's thread (a pool thread
+/// has 2 MB) before it continues on a thread of its own.
+const STACK_FIRST: usize = 256 << 10;
+/// The stack size of each thread expansion continues on, and the bytes
+/// one such segment uses before the next; the rest is headroom for
+/// work below `expand_list` (matching, transcription, fragment parses).
+const STACK_HOP: usize = 64 << 20;
+const STACK_HOP_ROOM: usize = 48 << 20;
+/// Expansion stack, all segments together, past which a file is
+/// rejected (L0801) instead of growing without bound.
+const STACK_TOTAL: usize = 1 << 30;
+
+/// The address of a local: how deep the current thread's stack is.
+fn stack_addr() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
 }
 
 impl<'a> Expander<'a> {
@@ -904,8 +937,12 @@ impl<'a> Expander<'a> {
             cur_src: ctx.src.to_string(),
             deps_hash: 0,
             deps: Vec::new(),
-            recursion_limit: 128,
+            recursion_limit: DEFAULT_RECURSION_LIMIT,
+            limit_capped: false,
             total_tokens: 0,
+            stack_base: stack_addr(),
+            stack_room: STACK_FIRST,
+            stack_below: 0,
         }
     }
 
@@ -1070,23 +1107,33 @@ pub struct MacroSeed {
     pub import_into: Option<Vec<Sym>>,
 }
 
-/// The crate recursion limit from leading inner attributes
-/// (`#![recursion_limit = "N"]`), default 128. Lust's own expansion
-/// walks the host stack, so the honored value is capped at 2048.
-fn scan_recursion_limit(trees: &[Tt], strings: &[String], interner: &Interner) -> u32 {
+/// The crate's `#![recursion_limit = "N"]` among a root file's leading
+/// inner attributes, with its span. The first one wins, as in rustc,
+/// and N is read as rustc reads it (`usize` from the whole string). A
+/// malformed one is an error in rustc, so it is one here too.
+fn scan_recursion_limit(trees: &[Tt], strings: &[String], interner: &Interner) -> Result<Option<(usize, Span)>, Diag> {
+    let mut found = None;
     let mut i = 0;
     while tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pound) && tok_at(trees, i + 1).map(|t| t.tok) == Some(Tok::Bang) {
-        let Some(Tt::Delim(Delim::Bracket, body, _)) = trees.get(i + 2) else { break };
-        if seg_text(tok_at(body, 0).map_or(Tok::Eof, |t| t.tok), interner).as_deref() == Some("recursion_limit")
-            && tok_at(body, 1).map(|t| t.tok) == Some(Tok::Eq)
-            && let Some(Tok::Str(idx)) = tok_at(body, 2).map(|t| t.tok)
-            && let Ok(n) = strings.get(idx as usize).map_or("", String::as_str).trim().parse::<u32>()
-        {
-            return n.clamp(1, 2048);
+        let Some(Tt::Delim(Delim::Bracket, body, span)) = trees.get(i + 2) else { break };
+        if seg_text(tok_at(body, 0).map_or(Tok::Eof, |t| t.tok), interner).as_deref() == Some("recursion_limit") {
+            let n = match (body.len(), tok_at(body, 1).map(|t| t.tok), tok_at(body, 2).map(|t| t.tok)) {
+                (3, Some(Tok::Eq), Some(Tok::Str(idx))) => strings.get(idx as usize).and_then(|s| s.parse::<usize>().ok()),
+                _ => None,
+            };
+            let Some(n) = n else {
+                return Err(err(
+                    C_SYNTAX,
+                    *span,
+                    "malformed `recursion_limit` attribute",
+                    "Write `#![recursion_limit = \"N\"]` with N a non-negative integer.",
+                ));
+            };
+            found.get_or_insert((n, *span));
         }
         i += 3;
     }
-    128
+    Ok(found)
 }
 
 /// Expands every macro in one lexed file or chunk, returning the
@@ -1129,9 +1176,28 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
         st.seed_macro(seed)?;
     }
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
-    st.recursion_limit = scan_recursion_limit(&tts, &st.strings, ctx.interner);
+    // Only the crate root's `#![recursion_limit]` counts, as in rustc,
+    // where a module's copy is an unused attribute.
+    let limit = if ctx.module_path.is_empty() { scan_recursion_limit(&tts, &st.strings, ctx.interner)? } else { None };
+    if let Some((n, _)) = limit {
+        st.recursion_limit = n.min(RECURSION_CAP as usize) as u32;
+        st.limit_capped = n > RECURSION_CAP as usize;
+    }
     st.prescan(&tts)?;
     let out = st.expand_list(tts, 0, true, false, 0)?;
+    // rustc also checks type, trait, and layout depth against a lowered
+    // limit, and lust does not track those: a crate that lowers it is
+    // rejected (after its macros got rustc's own depth error, if any).
+    if let Some((n, span)) = limit
+        && n < DEFAULT_RECURSION_LIMIT as usize
+    {
+        return Err(err(
+            C_ATTR,
+            span,
+            "a `#![recursion_limit]` below the default 128 is not supported yet",
+            "Remove the attribute, or set it to 128 or more.",
+        ));
+    }
     if std::env::var_os("LUST_EXPAND_STATS").is_some() {
         let (hits, misses) = cache_stats();
         eprintln!("expand cache: {hits} hits, {misses} misses");
@@ -1368,7 +1434,7 @@ impl<'a> Expander<'a> {
                         check_def_form(trees, &def)?;
                         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
                         compiled.local_def = !at_module_list;
-                        let idx = st.register(Rc::new(compiled), exported, false);
+                        let idx = st.register(Arc::new(compiled), exported, false);
                         if at_module_list {
                             st.module_defs.insert((module.clone(), def.name), idx);
                         }
@@ -1519,7 +1585,7 @@ impl<'a> Expander<'a> {
                 };
                 let at_root = seed.path.is_empty();
                 let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
-                let idx = self.register(Rc::new(compiled), at_root, false);
+                let idx = self.register(Arc::new(compiled), at_root, false);
                 self.by_path.insert((seed.path.clone(), def.name), idx);
                 if let Some(module) = &seed.import_into {
                     self.module_imports.insert((module.clone(), def.name), idx);
@@ -1553,7 +1619,7 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    fn register(&mut self, def: Rc<MacroDef>, path: bool, textual: bool) -> u32 {
+    fn register(&mut self, def: Arc<MacroDef>, path: bool, textual: bool) -> u32 {
         let idx = self.defs.len() as u32;
         if path {
             self.exported.insert(def.name, idx);
@@ -1635,14 +1701,7 @@ impl<'a> Expander<'a> {
     /// expansion step only, never chased: callers re-walk it.
     pub fn transcribe_call(&mut self, def: &MacroDef, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
         use std::sync::atomic::Ordering;
-        if depth >= self.recursion_limit {
-            return Err(err(
-                C_CAP,
-                call.span,
-                format!("recursion limit reached while expanding `{}!`", def.name_text),
-                "Give the macro a base case it can reach.",
-            ));
-        }
+        self.check_depth(depth, 0, &def.name_text, call.span)?;
         let key = CacheKey {
             def_fingerprint: def.fingerprint,
             input_hash: hash_tts(&call.inner, &self.strings),
@@ -2103,13 +2162,68 @@ fn take(trees: &mut [Tt], i: usize) -> Tt {
 }
 
 impl<'a> Expander<'a> {
+    /// Errors when a call to `name!` at `depth`, whose own expansion
+    /// reaches `extra` levels deeper (see `builtin::rustc_depth`), would
+    /// pass the recursion limit. Past `RECURSION_CAP` the limit is
+    /// lust's, not the crate's, and the message says so.
+    fn check_depth(&self, depth: u32, extra: u32, name: &str, span: Span) -> Result<(), Diag> {
+        if depth + extra < self.recursion_limit {
+            return Ok(());
+        }
+        if self.limit_capped {
+            return Err(err(
+                C_CAP,
+                span,
+                format!("expansion depth reached lust's limit of {RECURSION_CAP} while expanding `{name}!`"),
+                "Lust expands macros at most 2048 levels deep, whatever the crate's recursion limit.",
+            ));
+        }
+        Err(err(C_CAP, span, format!("recursion limit reached while expanding `{name}!`"), "Give the macro a base case it can reach."))
+    }
+
     /// Expands one tree list, outermost first (ARCH 6.1). `depth` is the
     /// expansion nesting depth of this list; `item_list` marks the file
     /// root and module bodies, where item-position rules apply;
     /// `stmt_list` marks a block body, where a brace-delimited macro
     /// call at a statement boundary is a whole statement; `nest`
     /// bounds delimiter recursion so pathological input cannot overflow.
-    pub fn expand_list(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
+    /// Every recursion of expansion passes through here. When the
+    /// current stack segment is used up, the list expands on a new
+    /// thread with a fresh stack (rustc grows its stack the same way),
+    /// so deep expansion cannot overflow the native stack, whatever
+    /// thread it started on.
+    pub fn expand_list(&mut self, trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
+        let used = self.stack_base.abs_diff(stack_addr());
+        if used < self.stack_room {
+            return self.expand_list_here(trees, depth, item_list, stmt_list, nest);
+        }
+        let span = trees.first().map_or(Span::default(), Tt::span);
+        if self.stack_below + used > STACK_TOTAL {
+            return Err(err(C_CAP, span, "macro expansion nests too deeply", "Simplify the macros or the nesting in this file."));
+        }
+        let saved = (self.stack_base, self.stack_room, self.stack_below);
+        self.stack_below += used;
+        let joined = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("lust-expand".into())
+                .stack_size(STACK_HOP)
+                .spawn_scoped(scope, || {
+                    self.stack_base = stack_addr();
+                    self.stack_room = STACK_HOP_ROOM;
+                    self.expand_list_here(trees, depth, item_list, stmt_list, nest)
+                })
+                .map(|thread| thread.join())
+        });
+        (self.stack_base, self.stack_room, self.stack_below) = saved;
+        match joined {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => Err(err(C_CAP, span, "macro expansion nests too deeply for this thread's stack", "Simplify the macros or the nesting in this file.")),
+        }
+    }
+
+    /// `expand_list` on the current stack segment.
+    fn expand_list_here(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
         if nest > 1000 {
             return Ok(trees);
         }
@@ -2195,11 +2309,12 @@ impl<'a> Expander<'a> {
                 out.push(take(&mut trees, group_idx - 1));
                 let fmt_name = segs.last().map_or("", |s| s.text.as_str());
                 let written_lit = is_str_lit_arg(&inner);
-                // A passthrough builtin still costs recursion depth
-                // (the format family costs two: it expands through a
-                // nested `format_args!` in rustc).
-                let cost = if matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
-                let mut expanded_inner = self.expand_list(inner, depth + cost, false, false, nest + 1)?;
+                // A passthrough builtin counts depth as rustc's expansion
+                // of it does (see `builtin::rustc_depth`).
+                let (extra, args) = builtin::rustc_depth(fmt_name, &inner);
+                let call_span = segs.first().map_or(group_span, |s| s.span.to(group_span));
+                self.check_depth(depth, extra, fmt_name, call_span)?;
+                let mut expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1)?;
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
                 }
@@ -2519,7 +2634,7 @@ impl<'a> Expander<'a> {
         }
         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
         compiled.local_def = local_def;
-        self.register(Rc::new(compiled), exported, true);
+        self.register(Arc::new(compiled), exported, true);
         Ok(())
     }
 
@@ -2577,14 +2692,7 @@ impl<'a> Expander<'a> {
     /// a token builtin through `builtin`, a parser macro through
     /// unchanged with its arguments expanded.
     pub fn expand_call(&mut self, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
-        if depth >= self.recursion_limit {
-            return Err(err(
-                C_CAP,
-                call.span,
-                format!("recursion limit reached while expanding `{}!`", call.path_text()),
-                "Give the macro a base case it can reach.",
-            ));
-        }
+        self.check_depth(depth, 0, &call.path_text(), call.span)?;
         if let Some(idx) = self.lookup_macro(&call.segs, call.leading_colon) {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
@@ -2598,16 +2706,20 @@ impl<'a> Expander<'a> {
         };
         let std_prefixed = matches!(call.segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc"));
         if call.segs.len() == 1 || std_prefixed {
+            // A builtin counts depth as rustc's expansion of it does (see
+            // `builtin::rustc_depth`): its arguments expand `args` levels
+            // down, so a token builtin's own one-level-down expansions
+            // run from `depth + args - 1`.
+            let (extra, args) = builtin::rustc_depth(&name, &call.inner);
             if builtin::is_token_builtin(&name) {
-                return builtin::expand_builtin(self, &name, call, depth);
+                self.check_depth(depth, extra, &name, call.span)?;
+                return builtin::expand_builtin(self, &name, call, depth + args - 1);
             }
             if builtin::is_passthrough(&name) {
+                self.check_depth(depth, extra, &name, call.span)?;
                 // The head already ends with the call's `!`. The parser
                 // owns only the plain `name!` form, so keep just the
-                // last segment and the bang of a qualified path. The
-                // format family expands through a nested `format_args!`
-                // in rustc, so it costs two depth levels, others one.
-                let cost = if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
+                // last segment and the bang of a qualified path.
                 let head = &call.head[call.head.len().saturating_sub(2)..];
                 let mut out: Vec<Tt> = head.to_vec();
                 // A renamed call keeps the canonical head name:
@@ -2619,7 +2731,7 @@ impl<'a> Expander<'a> {
                     tok.tok = Tok::Ident(canon);
                 }
                 let written_lit = is_str_lit_arg(&call.inner);
-                let mut inner = self.expand_list(call.inner.clone(), depth + cost, false, false, 0)?;
+                let mut inner = self.expand_list(call.inner.clone(), depth + args, false, false, 0)?;
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut inner, call.span);
                 }
@@ -3020,5 +3132,56 @@ mod tests {
         let out = expand_src(&interner, &known, src).expect("expansion");
         assert!(out.iter().any(|t| t == "\"f(a,b)\""), "tokens: {out:?}");
         assert!(out.iter().any(|t| t == "\"f(a, b)\""), "tokens: {out:?}");
+    }
+
+    /// `n` chained macros after `attrs`: `m0!()` expands to `m1!()`, and
+    /// so on, so the last one expands at depth `n`, one token per level.
+    fn chain_src(n: usize, attrs: &str) -> String {
+        let mut src = attrs.to_string();
+        for i in 0..n {
+            src.push_str(&format!("macro_rules! m{i} {{ () => {{ m{}!() }} }}\n", i + 1));
+        }
+        src.push_str(&format!("macro_rules! m{n} {{ () => {{ 0 }} }}\nfn main() {{ let _x = m0!(); }}\n"));
+        src
+    }
+
+    /// Expands `src` on a thread with a 512 KB stack (a pool thread has
+    /// 2 MB), returning the error code and message on failure.
+    fn expand_on_small_stack(src: String) -> Result<(), (&'static str, String)> {
+        std::thread::Builder::new()
+            .stack_size(512 << 10)
+            .spawn(move || {
+                let interner = Interner::default();
+                let known = Known::new(&interner);
+                expand_src(&interner, &known, &src).map(|_| ()).map_err(|d| (d.code, d.message))
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// The default limit allows depth 127 and stops at 128, as rustc.
+    /// Deep expansion moves to fresh stacks as it goes, so 2000 levels
+    /// fit on a small thread; past lust's cap of 2048 it stops with
+    /// L0801 whatever the crate's limit. The first limit attribute wins.
+    #[test]
+    fn expansion_depth_limits_on_a_small_stack() {
+        assert_eq!(expand_on_small_stack(chain_src(127, "")), Ok(()));
+        assert_eq!(expand_on_small_stack(chain_src(128, "")).unwrap_err().0, "L0801");
+        assert_eq!(expand_on_small_stack(chain_src(2000, "#![recursion_limit = \"2048\"]\n")), Ok(()));
+        let capped = expand_on_small_stack(chain_src(2100, "#![recursion_limit = \"5000\"]\n")).unwrap_err();
+        assert_eq!(capped.0, "L0801");
+        assert!(capped.1.contains("lust's limit of 2048"), "{}", capped.1);
+        let first_wins = "#![recursion_limit = \"300\"]\n#![recursion_limit = \"2\"]\n";
+        assert_eq!(expand_on_small_stack(chain_src(200, first_wins)), Ok(()));
+    }
+
+    /// A macro whose recursion doubles its input stops at a cap in well
+    /// under a second: repetition matching is linear in the input. It
+    /// used to take minutes, then overflow the stack.
+    #[test]
+    fn doubling_macro_stops_at_a_cap() {
+        let src = "macro_rules! count { () => { 0 }; ($h:tt $($t:tt)*) => { 1 + count!($(pub $t)*) }; }\nfn main() { let _x = count!(a b c); }";
+        assert_eq!(expand_on_small_stack(src.to_string()).unwrap_err().0, "L0801");
     }
 }

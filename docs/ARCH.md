@@ -3060,7 +3060,13 @@ section 5). Expand until no calls remain or a cap
 hits. Caps: expansion depth 128, output tokens per
 call 1,000,000, total expanded tokens per crate
 16,000,000. A cap hit is `L0801` with the macro named,
-never a hang.
+never a hang. Depth follows rustc: the crate root's
+`#![recursion_limit]` (128 to 2048; lower is `L0522`),
+and a std macro counts the levels rustc's expansion of
+it uses (`builtin::rustc_depth`). Expansion moves to a
+fresh thread stack when its segment is used up, so
+depth never overflows the native stack. Repetition
+matching is linear in the matched tokens.
 
 Macro *definitions* are items. `macro_rules!` visibility:
 

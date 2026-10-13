@@ -1,0 +1,3 @@
+expect=L0801
+# Both reject: a module's #![recursion_limit] is an unused attribute in rustc,
+# so the default 128 still applies to the module's 200-level recursion.

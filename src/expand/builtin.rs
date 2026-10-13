@@ -28,6 +28,39 @@ pub fn is_passthrough(name: &str) -> bool {
     )
 }
 
+/// How rustc 1.99 counts recursion depth for the std macro `name!` with
+/// arguments `inner`, called at depth `d`: its own expansion reaches
+/// `d + extra` (std macros it calls, such as `format_args!`), and macro
+/// calls in its arguments expand at `d + args`. The values were measured
+/// against rustc. Where the shape of the arguments is not checked here,
+/// the larger value applies, so lust never allows a depth rustc rejects.
+pub fn rustc_depth(name: &str, inner: &[Tt]) -> (u32, u32) {
+    let args = split_args(inner).len();
+    match name {
+        "println" | "eprintln" if args == 0 => (2, 2),
+        "println" | "eprintln" | "print" | "eprint" | "format" | "write" => (1, 2),
+        "writeln" => (2, 2),
+        "panic" if args == 0 => (1, 1),
+        "panic" => (2, 3),
+        "assert" if args <= 1 => (0, 1),
+        "assert" => (2, 3),
+        "assert_eq" | "assert_ne" if args <= 2 => (0, 1),
+        "assert_eq" | "assert_ne" => (1, 2),
+        "debug_assert" if args <= 1 => (1, 2),
+        "debug_assert" => (3, 4),
+        "debug_assert_eq" | "debug_assert_ne" if args <= 2 => (1, 2),
+        "debug_assert_eq" | "debug_assert_ne" => (2, 3),
+        "todo" | "unimplemented" if args == 0 => (0, 1),
+        "todo" | "unimplemented" => (4, 5),
+        "unreachable" if args == 0 => (1, 1),
+        "unreachable" => (5, 6),
+        "dbg" if args <= 1 => (3, 1),
+        "dbg" => (4, 2),
+        "thread_local" => (2, 3),
+        _ => (0, 1),
+    }
+}
+
 /// Macros this file expands at token level.
 pub fn is_token_builtin(name: &str) -> bool {
     matches!(
@@ -544,7 +577,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
         }
         "write" | "writeln" => write_macro(st, name == "writeln", call),
         "dbg" => dbg_macro(st, call),
-        "thread_local" => thread_local_macro(st, call),
+        "thread_local" => thread_local_macro(st, call, depth),
         "pin" => {
             let mut tpl = st.lex_template("::std::pin::Pin::new_unchecked(&mut (__lust_e))", span);
             tpl = splice_placeholders(tpl, "__lust_e", &call.inner, st.ctx.interner);
@@ -750,8 +783,9 @@ fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
 
 /// `thread_local!` in its ARCH 6.4 shape: one `LocalKey` static per
 /// declared static, with an init fn. Checker and thread support for
-/// `LocalKey` land with W-THREADS; the shape is fixed here.
-fn thread_local_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
+/// `LocalKey` land with W-THREADS; the shape is fixed here. Initializers
+/// expand one level below `depth`, where rustc expands them.
+fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
     let mut out = Vec::new();
     let trees = &call.inner;
@@ -814,7 +848,7 @@ fn thread_local_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
         while i < trees.len() && !trees[i].is_tok(Tok::Semi) {
             i += 1;
         }
-        let init: Vec<Tt> = trees[init_start..i].to_vec();
+        let init = st.expand_more(trees[init_start..i].to_vec(), depth)?;
         if i < trees.len() {
             i += 1; // `;`
         }
