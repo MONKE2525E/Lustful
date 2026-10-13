@@ -1625,23 +1625,38 @@ impl<'a> Parser<'a> {
                 return Err(syntax(self.span(), "expected `,` or `)`"));
             }
         }
+        // Parameter patterns belong to the fn's own expr and pat
+        // ranges, like its body: the checker indexes its tables
+        // by them.
+        let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
         while self.peek() != Tok::RParen {
             let pattrs = self.part_attributes()?;
             let start = self.span();
             if self.peek() == Tok::DotDot {
                 return Err(self.reject(C_CORE, "variadic parameters"));
             }
-            let mutable = self.eat(Tok::Mut);
-            let (pname, pspan) = match self.peek() {
-                Tok::Ident(_) => self.ident()?,
-                Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
-                _ => return Err(not_yet(C_CORE, start, "patterns in parameters")),
-            };
-            self.expect(Tok::Colon, "`:`")?;
-            let ty = self.ty()?;
-            // The span starts at the name, not at `mut`: hygiene reads the
-            // name token's context as the binding's context (ARCH 6.3).
-            params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: pspan.to(self.prev_span()) });
+            // The plain `name: Ty` and `mut name: Ty` forms keep
+            // the exact name span: hygiene reads the name token's
+            // context as the binding's context (ARCH 6.3).
+            let plain = (matches!(self.peek(), Tok::Ident(_) | Tok::Reserved(_)) && self.peek_at(1) == Tok::Colon)
+                || (self.peek() == Tok::Mut && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_at(2) == Tok::Colon);
+            if plain {
+                let mutable = self.eat(Tok::Mut);
+                let (pname, pspan) = match self.peek() {
+                    Tok::Ident(_) => self.ident()?,
+                    Tok::Reserved(_) => return Err(self.reserved_error(self.span())),
+                    _ => unreachable!(),
+                };
+                self.expect(Tok::Colon, "`:`")?;
+                let ty = self.ty()?;
+                params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: pspan.to(self.prev_span()) });
+            } else {
+                let pat = self.pattern_no_top_alt("function parameters require top-level or-patterns in parentheses")?;
+                self.expect(Tok::Colon, "`:`")?;
+                let ty = self.ty()?;
+                let span = start.to(self.prev_span());
+                params.push(Param { name: Sym(0), mutable: false, pat: Some(pat), ty, attrs: pattrs.attrs, span });
+            }
             if !self.eat(Tok::Comma) {
                 break;
             }
@@ -1649,7 +1664,6 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RParen, "`)`")?;
         let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
         let where_clause = self.where_clause()?;
-        let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
         // A fn body block permits inner attributes at its start.
         self.block_inner_ok = true;
         let body = if sig_only && self.eat(Tok::Semi) {
@@ -1658,6 +1672,18 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.block()?)
         };
+        // Patterns are not allowed in functions without bodies
+        // (rustc E0642): a trait signature takes plain names and
+        // `_` only.
+        if body.is_none() {
+            for param in &params {
+                if let Some(pat) = param.pat
+                    && !matches!(self.ast.pat(pat), Pat::Wild)
+                {
+                    return Err(syntax(param.span, "patterns are not allowed in functions without bodies"));
+                }
+            }
+        }
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
         Ok(FnDef {
@@ -2386,7 +2412,7 @@ impl<'a> Parser<'a> {
             }
             if self.peek() == Tok::Let {
                 let s = self.bump().span;
-                let pat = self.pattern()?;
+                let pat = self.pattern_no_top_alt("`let` bindings require top-level or-patterns in parentheses")?;
                 let ty = if self.eat(Tok::Colon) { Some(self.ty()?) } else { None };
                 let init = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
                 let els = if self.peek() == Tok::Else {
@@ -2489,6 +2515,21 @@ impl<'a> Parser<'a> {
             alts.push(self.pattern_one()?);
         }
         Ok(self.push_pat(Pat::Or(alts), start.to(self.prev_span())))
+    }
+
+    /// A pattern with no top-level `|` alternation, for the
+    /// positions Rust reserves it in (`let` bindings and
+    /// parameters): a top-level or-pattern there needs
+    /// parentheses, which parse through `pattern_one` anyway.
+    fn pattern_no_top_alt(&mut self, what: &'static str) -> PResult<PatId> {
+        self.nest(|p| {
+            let start = p.span();
+            let pat = p.pattern_one()?;
+            if p.peek() == Tok::Pipe {
+                return Err(syntax(start.to(p.span()), what));
+            }
+            Ok(pat)
+        })
     }
 
     /// True when the token `n` ahead can start a pattern literal.

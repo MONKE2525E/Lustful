@@ -690,6 +690,40 @@ struct Ctx<'p, 'a> {
     /// True once an unsizing coercion made a dyn value from one that
     /// may hold a borrow (see `dyn_static_clean`).
     dyn_borrow_src: bool,
+    /// Or-pattern alternatives being checked against the first
+    /// alternative's bindings, innermost last (see the `Pat::Or`
+    /// arm of `pattern_mode`).
+    or_frames: Vec<OrFrame>,
+    /// Bindings of the or-pattern first alternative currently
+    /// being recorded, when any (see `bind_pattern_local`).
+    or_log: Option<Vec<OrBind>>,
+    /// Scope length at entry to each enclosing `pattern` call:
+    /// bindings between the mark and the end of `scopes` belong
+    /// to that one pattern and may not repeat a name.
+    pat_marks: Vec<usize>,
+}
+
+/// One name bound by a pattern alternative, with the checker
+/// local every alternative shares.
+#[derive(Clone)]
+struct OrBind {
+    name: Sym,
+    ctxt: CtxtId,
+    local: u32,
+    mode: BindMode,
+    /// The binding's own type (after its mode is applied).
+    ty: Ty,
+    /// The `mut` of the local itself (`ref mut` lives in `mode`).
+    mutable: bool,
+}
+
+/// Checking one non-first or-pattern alternative: the bindings
+/// the first alternative made, which of them this alternative
+/// has bound so far, and names it bound that the first did not.
+struct OrFrame {
+    expected: Vec<OrBind>,
+    seen: Vec<bool>,
+    extra: Vec<(Sym, Span)>,
 }
 
 /// The module a body checks in: the module of the def that owns
@@ -819,6 +853,9 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         dyn_borrow_src: false,
+        or_frames: Vec::new(),
+        or_log: None,
+        pat_marks: Vec::new(),
     };
     if let Some(sibs) = p.fn_siblings.get(&fid) {
         let layer: Vec<((Sym, CtxtId), u32)> = sibs
@@ -846,11 +883,13 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
     }
     let mut seen_params: Vec<Sym> = Vec::new();
     for param in &def.params {
-        if seen_params.contains(&param.name) {
-            let name = p.name(param.name).to_string();
-            cx.err("L0106", param.span, format!("`{name}` is defined more than once"), "Rename one of the parameters.");
+        if param.pat.is_none() {
+            if seen_params.contains(&param.name) {
+                let name = p.name(param.name).to_string();
+                cx.err("L0106", param.span, format!("`{name}` is defined more than once"), "Rename one of the parameters.");
+            }
+            seen_params.push(param.name);
         }
-        seen_params.push(param.name);
         // A plain parameter name that resolves to a const item or a
         // unit variant is a refutable pattern, not a binding (rustc
         // E0005); a static name cannot be a pattern at all.
@@ -886,8 +925,33 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
                 _ => {}
             }
         }
+        // A pattern parameter binds out of a nameless argument
+        // local, like a destructuring `let` out of a temporary:
+        // `param_locals` keeps it so lowering has the place, and
+        // the pattern's own locals are the names the body sees.
         let l = cx.add_local(param.name, f.params[pi], param.mutable, param.span);
         cx.out.param_locals.push(l);
+        if let Some(pat) = param.pat {
+            let scope_before = cx.scopes.len();
+            cx.pattern(pat, f.params[pi], false);
+            // A name bound by two parameters is one definition
+            // too many, pattern parameters included.
+            for &((bound, _), _) in &cx.scopes[scope_before..].to_vec() {
+                if seen_params.contains(&bound) {
+                    let name = p.name(bound).to_string();
+                    cx.err("L0106", param.span, format!("`{name}` is defined more than once"), "Rename one of the parameters.");
+                }
+                seen_params.push(bound);
+            }
+            if !cx.pat_always_matches(pat) {
+                cx.err(
+                    "L0110",
+                    param.span,
+                    "refutable pattern in function argument",
+                    "Use a pattern that matches every value, or match in the body.",
+                );
+            }
+        }
         pi += 1;
     }
     // A template's parameters and return value are values of their
@@ -3182,7 +3246,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
                             } else {
                                 self.pattern(*pat, ty, false);
-                                if !self.irrefutable(*pat) {
+                                if !self.pat_always_matches(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
                                         self.err(
@@ -3216,7 +3280,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
                             } else {
                                 self.pattern(*pat, ty, false);
-                                if !self.irrefutable(*pat) {
+                                if !self.pat_always_matches(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
                                         self.err(
@@ -3655,7 +3719,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let item = self.for_iter(e, *iter);
                 let scope = self.scopes.len();
                 self.pattern(*pat, item, false);
-                if !self.irrefutable(*pat) {
+                if !self.pat_always_matches(*pat) {
                     let s = self.p.ast.pat_span(*pat);
                     self.err(
                         "L0110",
@@ -8994,8 +9058,76 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Remove `mut`, or match on the value instead of a reference.",
             );
         }
+        // Inside a non-first or-pattern alternative, a binding the
+        // first alternative already made reuses that local: every
+        // alternative binds the same names to the same checker
+        // locals, with the same type and binding mode (rustc
+        // E0408 and E0409). The frames nest like the patterns do.
+        let key = (name, span.ctxt);
+        let mut hit: Option<(usize, usize)> = None;
+        for (fi, frame) in self.or_frames.iter().enumerate().rev() {
+            if let Some(bi) = frame.expected.iter().position(|b| (b.name, b.ctxt) == key) {
+                hit = Some((fi, bi));
+                break;
+            }
+        }
+        if let Some((fi, bi)) = hit {
+            let exp = self.or_frames[fi].expected[bi].clone();
+            if fi + 1 != self.or_frames.len() {
+                // Found only in an outer alternative: this one
+                // binds a name its own first alternative did not.
+                self.or_frames.last_mut().unwrap().extra.push((name, span));
+            } else if self.or_frames[fi].seen[bi] {
+                self.err(
+                    "L0106",
+                    span,
+                    format!("`{}` is bound more than once in the same pattern", self.name(name)),
+                    "Rename one of the bindings.",
+                );
+            }
+            self.or_frames[fi].seen[bi] = true;
+            if mode != exp.mode || mutable_local != exp.mutable {
+                self.err(
+                    "L0110",
+                    span,
+                    format!("variable `{}` is bound inconsistently across `|` alternatives", self.name(name)),
+                    "Bind it the same way in every alternative (same `ref` and `mut`).",
+                );
+            }
+            if !self.unify(lty, exp.ty) {
+                self.mismatch(span, exp.ty, lty);
+            }
+            self.scopes.push((key, exp.local));
+            self.out.pat_res[pi] = PatRes::Binding { local: exp.local, mode };
+            if let Some(log) = &mut self.or_log {
+                log.push(OrBind { name, ctxt: span.ctxt, local: exp.local, mode, ty: lty, mutable: mutable_local });
+            }
+            return;
+        }
+        if !self.or_frames.is_empty() {
+            // A name the first alternative never bound: the
+            // alternative is rejected when it ends, but checking
+            // continues with a fresh local so the body still
+            // resolves names.
+            self.or_frames.last_mut().unwrap().extra.push((name, span));
+        } else if let Some(&mark) = self.pat_marks.last()
+            && self.scopes[mark..].iter().any(|&(k, _)| k == key)
+        {
+            // One pattern may not bind a name twice (rustc
+            // E0416): bindings an enclosing or-pattern restored
+            // into scope count too.
+            self.err(
+                "L0106",
+                span,
+                format!("`{}` is bound more than once in the same pattern", self.name(name)),
+                "Rename one of the bindings.",
+            );
+        }
         let l = self.add_local(name, lty, mutable_local, span);
         self.out.pat_res[pi] = PatRes::Binding { local: l, mode };
+        if let Some(log) = &mut self.or_log {
+            log.push(OrBind { name, ctxt: span.ctxt, local: l, mode, ty: lty, mutable: mutable_local });
+        }
     }
 
     /// Checks one const pattern value against the scrutinee type:
@@ -9439,7 +9571,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
+        // Names bound from here on belong to this one pattern
+        // (see the duplicate-name check in `bind_pattern_local`).
+        self.pat_marks.push(self.scopes.len());
         self.pattern_mode(pat, t, BindMode::Move, in_match);
+        self.pat_marks.pop();
     }
 
     fn pattern_mode(&mut self, pat: PatId, t: Ty, mode: BindMode, in_match: bool) {
@@ -9880,15 +10016,56 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Pat::Or(alts) => {
-                // Each alternative must bind the same names; the prototype only allows no bindings.
-                for &alt in alts {
-                    let before = self.out.locals.len();
+                // Every alternative binds the same names into the
+                // same locals: the first alternative records its
+                // bindings, later ones reuse them (see
+                // `bind_pattern_local`). The scopes this pattern
+                // leaves behind are the first alternative's.
+                let alts: Vec<PatId> = alts.clone();
+                if alts.is_empty() {
+                    return;
+                }
+                let scope0 = self.scopes.len();
+                let parent_log = self.or_log.take();
+                self.or_log = Some(Vec::new());
+                self.pattern_mode(alts[0], t, mode, in_match);
+                let first_log = self.or_log.take().unwrap_or_default();
+                self.or_log = parent_log;
+                if let Some(log) = &mut self.or_log {
+                    log.extend(first_log.iter().cloned());
+                }
+                let first_scope: Vec<((Sym, CtxtId), u32)> = self.scopes[scope0..].to_vec();
+                for &alt in &alts[1..] {
+                    self.scopes.truncate(scope0);
+                    self.or_frames.push(OrFrame {
+                        seen: vec![false; first_log.len()],
+                        expected: first_log.clone(),
+                        extra: Vec::new(),
+                    });
                     self.pattern_mode(alt, t, mode, in_match);
-                    if self.out.locals.len() != before {
-                        let s = p.ast.pat_span(alt);
-                        self.errs.push(unsupported(s, "bindings inside `|` patterns"));
+                    let frame = self.or_frames.pop().unwrap();
+                    let alt_span = p.ast.pat_span(alt);
+                    for (b, &seen) in frame.expected.iter().zip(&frame.seen) {
+                        if !seen {
+                            self.err(
+                                "L0110",
+                                alt_span,
+                                format!("variable `{}` is not bound in all `|` alternatives", self.name(b.name)),
+                                "Bind it in every alternative, or in none of them.",
+                            );
+                        }
+                    }
+                    for (name, s) in &frame.extra {
+                        self.err(
+                            "L0110",
+                            *s,
+                            format!("variable `{}` is not bound in all `|` alternatives", self.name(*name)),
+                            "Bind it in every alternative, or in none of them.",
+                        );
                     }
                 }
+                self.scopes.truncate(scope0);
+                self.scopes.extend(first_scope);
             }
             Pat::Tuple(elems) => {
                 if elems.is_empty() {
@@ -10504,6 +10681,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }))
     }
 
+    /// True when a checked pattern matches every value of its
+    /// type: the syntactic `irrefutable` test, or, for a pattern
+    /// that contains an or-pattern, the exhaustiveness test
+    /// (`A(x) | B(x)` over a two-variant enum always matches, as
+    /// in Rust). Tuple rest elements skip the exhaustiveness
+    /// path: `covers_variant` indexes tuple fields by position,
+    /// which a rest would shift.
+    fn pat_always_matches(&self, pat: PatId) -> bool {
+        if self.irrefutable(pat) {
+            return true;
+        }
+        fn walk(p: &Program, pat: PatId, has_or: &mut bool, has_tuple_rest: &mut bool) {
+            match p.ast.pat(pat) {
+                Pat::Or(alts) => {
+                    *has_or = true;
+                    alts.iter().for_each(|&a| walk(p, a, has_or, has_tuple_rest));
+                }
+                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) => {
+                    if elems.iter().any(|&e| matches!(p.ast.pat(e), Pat::Rest)) {
+                        *has_tuple_rest = true;
+                    }
+                    elems.iter().for_each(|&e| walk(p, e, has_or, has_tuple_rest));
+                }
+                Pat::Struct { fields, .. } => fields.iter().for_each(|&(_, s)| walk(p, s, has_or, has_tuple_rest)),
+                Pat::Slice { prefix, middle, suffix } => {
+                    prefix.iter().chain(suffix.iter()).for_each(|&s| walk(p, s, has_or, has_tuple_rest));
+                    if let Some(m) = middle {
+                        walk(p, *m, has_or, has_tuple_rest);
+                    }
+                }
+                Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => walk(p, *inner, has_or, has_tuple_rest),
+                _ => {}
+            }
+        }
+        let (mut has_or, mut has_tuple_rest) = (false, false);
+        walk(self.p, pat, &mut has_or, &mut has_tuple_rest);
+        has_or && !has_tuple_rest && self.covers(&[pat])
+    }
+
     fn irrefutable(&self, pat: PatId) -> bool {
         let p = self.p;
         if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_) | PatRes::Res(_)) {
@@ -11012,8 +11228,27 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             },
             Pat::Or(alts) => {
+                // A binding is known after an or-pattern only
+                // when every alternative binds it to the same
+                // known value; the matched alternative is the
+                // only one that runs.
+                let mut merged: Option<KEnv> = None;
                 for &a in alts {
-                    self.k_bind_pat(a, v, env, lint);
+                    let mut alt_env = env.clone();
+                    self.k_bind_pat(a, v, &mut alt_env, lint);
+                    match &mut merged {
+                        None => merged = Some(alt_env),
+                        Some(m) => {
+                            for (slot, other) in m.iter_mut().zip(alt_env) {
+                                if *slot != other {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = merged {
+                    *env = m;
                 }
             }
             Pat::Ref { inner, .. } | Pat::Paren(inner) => self.k_bind_pat(*inner, &None, env, lint),

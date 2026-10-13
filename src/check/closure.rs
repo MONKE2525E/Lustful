@@ -239,7 +239,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (None, None) => self.new_var(false),
             };
             self.pattern(prm.pat, t, false);
-            if !self.irrefutable(prm.pat) {
+            if !self.pat_always_matches(prm.pat) {
                 self.err("L0110", prm.span, "refutable pattern in closure argument", "Use a pattern that matches every value.");
             }
             inputs.push(t);
