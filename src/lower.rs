@@ -444,7 +444,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// drop) for a dyn source.
     fn unsize(&mut self, op: Operand, found: Ty, target: Ty, span: Span) -> Operand {
         use crate::check::object;
-        let TyKind::Ref(_, tm, dyn_ty) = self.kind(target) else { return op };
+        let TyKind::Ref(_, tm, dyn_ty) = self.kind(target) else { unreachable!() };
         let m = tm.is_mut();
         let place = self.op_place(op, found, span);
         let src = self.peel(found, 1);
@@ -474,11 +474,10 @@ impl<'p, 'a> Lower<'p, 'a> {
             return recv;
         }
         let cands = object::object_cands(self.p, &mut self.body.tys, principal, name);
-        let Some(c) = cands.into_iter().find(|c| c.owner.def == owner) else { return recv };
-        let path = object::upcast_path(self.p, &mut self.body.tys, principal, c.owner).unwrap_or_default();
-        if path.is_empty() {
-            return recv;
-        }
+        // Check resolved the call to this owner, so the supertrait and
+        // its slot path exist; a miss here would call the wrong vtable.
+        let Some(c) = cands.into_iter().find(|c| c.owner.def == owner) else { unreachable!() };
+        let Some(path) = object::upcast_path(self.p, &mut self.body.tys, principal, c.owner) else { unreachable!() };
         let bounds = self.body.tys.intern_dyn_bounds(DynBounds { principal: Some(Binder::plain(c.owner)), supertraits: Box::new([]), auto: AutoTraits::default() });
         let owner_dyn = self.body.tys.intern(TyKind::Dyn(bounds, Region::Erased));
         let rt = self.ref_ty(mutable, owner_dyn);
@@ -882,17 +881,20 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let op = ops.into_iter().next().unwrap_or(Operand::Const(crate::ir::Const::Unit));
                         self.set_or_temp(dest, Rvalue::Res(ty, false, op), ty, span)
                     }
-                    // `<dyn P as Tr>::m(d, ..)`: the receiver is the first
-                    // argument, already a dyn reference.
+                    // `<dyn P as Tr>::m(d, ..)`, `<dyn P>::m(d, ..)`, and
+                    // `Tr::m(d, ..)`: the receiver is the first argument,
+                    // already a dyn reference.
                     Res::DynMethod { owner, slot, .. } => {
-                        let Expr::Call { callee, .. } = p.ast.expr(e) else { return };
-                        let Expr::QPath { segs, .. } = p.ast.expr(*callee) else { return };
-                        let name = segs[0].name;
+                        let Expr::Call { callee, .. } = p.ast.expr(e) else { unreachable!() };
+                        let name = match p.ast.expr(*callee) {
+                            Expr::QPath { segs, .. } | Expr::Path(segs) => segs[segs.len() - 1].name,
+                            _ => unreachable!(),
+                        };
                         let mut ops = ops;
                         let recv_ty = self.coerced_ty(args[0]);
                         let (m, recv_dyn) = match self.kind(recv_ty) {
                             TyKind::Ref(_, m, inner) => (m.is_mut(), inner),
-                            _ => return,
+                            _ => unreachable!(),
                         };
                         let r = ops.remove(0);
                         let r = self.dyn_receiver(r, recv_dyn, m, owner, name, span);
@@ -1754,7 +1756,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
             Callee::Builtin(b) => CallTarget::Builtin(b),
             Callee::Dyn(owner, slot) => {
-                let Expr::MethodCall { name, .. } = self.p.ast.expr(e) else { return };
+                let Expr::MethodCall { name, .. } = self.p.ast.expr(e) else { unreachable!() };
                 let r = ops.remove(0);
                 let r = self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, *name, span);
                 ops.insert(0, r);
