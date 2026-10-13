@@ -1,0 +1,8 @@
+# Both reject: a private field read in a generic fn of another
+# module (the template body checks in its defining module).
+[package]
+name = "generic-field-private"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

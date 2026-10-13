@@ -1,0 +1,9 @@
+# A generic method in a non-root module reads its own type's
+# private field: the instance body checks in the template's
+# module, not the crate root.
+[package]
+name = "generic-own-field"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

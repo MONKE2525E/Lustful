@@ -1,0 +1,5 @@
+# Both reject: a generic fn in the dependent crate reads a
+# pub(crate) field of a dependency crate's type.
+[workspace]
+members = ["base", "app"]
+resolver = "2"

@@ -1,0 +1,6 @@
+# A dependency crate's generic fns read its own private and
+# pub(crate) fields when instantiated from the dependent crate:
+# each body checks in its own crate's modules.
+[workspace]
+members = ["base", "app"]
+resolver = "2"

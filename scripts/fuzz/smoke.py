@@ -434,6 +434,38 @@ fn grown() -> i64 { 1 }
         check("duplicate removed: warm accepts and runs again",
               rc == 0 and out == "1\n", f"rc={rc} out={out!r} err={err!r}")
 
+        # 15. Regression (fx-priv): a private field read inside a
+        # generic fn of another module passed `lust check` while the
+        # build rejected it. An edit that makes the field private
+        # must make the warm check reject with L0510, like the cold
+        # check, and the edit back must pass warm again.
+        pv_a = os.path.join(work, "pv_a.rs")
+        pv_main = os.path.join(work, "pv_main.rs")
+        open(pv_main, "w").write(
+            'mod pv_a;\n'
+            'fn get<T>(s: &pv_a::S, t: T) -> T { let _ = s.x; t }\n'
+            'fn main() { let s = pv_a::S::new(); println!("{}", get(&s, 3)); }\n')
+        open(pv_a, "w").write(
+            'pub struct S { pub x: i32 }\n'
+            'impl S { pub fn new() -> S { S { x: 1 } } }\n')
+        rc1, _, _ = run_lust(["check", pv_main])
+        open(pv_a, "w").write(
+            'pub struct S { x: i32 }\n'
+            'impl S { pub fn new() -> S { S { x: 1 } } }\n')
+        rcw, _, errw = run_lust(["check", pv_main])
+        r = subprocess.run([LUST, "check", pv_main], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("field made private: warm check rejects the generic reader (fx-priv)",
+              rc1 == 0 and rcw == 1 and r.returncode == 1
+              and "L0510" in errw and "L0510" in r.stderr,
+              f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+        open(pv_a, "w").write(
+            'pub struct S { pub x: i32 }\n'
+            'impl S { pub fn new() -> S { S { x: 1 } } }\n')
+        rc3, _, _ = run_lust(["check", pv_main])
+        check("field made public again: warm check passes (fx-priv)",
+              rc3 == 0, f"rc3={rc3}")
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).
