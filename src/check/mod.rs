@@ -3675,7 +3675,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     ERROR
                 }
             },
-            Expr::Path(segs) => self.path_expr(e, segs, span),
+            Expr::Path(segs) => {
+                self.lifetime_turbofish(segs);
+                self.path_expr(e, segs, span)
+            }
             Expr::Block(b) => self.block(*b, expected),
             Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
                 let scope = self.scopes.len();
@@ -3813,12 +3816,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 result.unwrap_or(NEVER)
             }
             Expr::Call { callee, args } => {
+                if let Expr::Path(segs) = p.ast.expr(*callee) {
+                    self.lifetime_turbofish(segs);
+                }
                 if let Some(t) = self.self_from_expected_call(e, *callee, args, expected, span) {
                     return t;
                 }
                 self.call(e, *callee, args, span, expected)
             }
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
+                let seg = ast::PathSeg { name: *name, args: ast::GenericArgs::Angle(generic_args.clone()) };
+                self.lifetime_turbofish(std::slice::from_ref(&seg));
                 self.method_call(e, *recv, *name, *name_span, args, generic_args, expected)
             }
             Expr::Field { base, name } => {
@@ -5308,6 +5316,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
             t = inner;
         }
         out
+    }
+
+    /// Rejects an explicit lifetime in a value path's turbofish
+    /// (`f::<'static>`, ARCH 5.5): rustc rejects it whenever the fn has a
+    /// late-bound lifetime (E0794); lust rejects it always (W-BORROW).
+    fn lifetime_turbofish(&mut self, segs: &[ast::PathSeg]) {
+        let p = self.p;
+        for seg in segs {
+            if let ast::GenericArgs::Angle(args) = &seg.args {
+                for g in args {
+                    if let ast::GenericArg::Lifetime(lt) = g
+                        && p.interner.get(lt.name) != "_"
+                    {
+                        self.err("L0731", lt.span, "explicit lifetime arguments on a fn are not supported", "Remove the lifetime argument; Rust infers it.");
+                    }
+                }
+            }
+        }
     }
 
     fn path_expr(&mut self, e: ExprId, segs: &[ast::PathSeg], span: Span) -> Ty {

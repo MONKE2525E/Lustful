@@ -376,6 +376,106 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
     }
 }
 
+/// The impl's regions (W-BORROW): its regioned Self type and associated
+/// types, for the region signatures of its methods. An elided lifetime in
+/// the header (`impl Tr for &str`, `impl S<'_>`) is an anonymous lifetime
+/// param of the impl; a lifetime hidden in a path (`impl S` for
+/// `struct S<'a>`) is rustc E0726. A named impl lifetime that only an
+/// associated type uses is unconstrained (rustc E0207).
+fn impl_regions(p: &mut Program, imp: &ast::ImplDef, scope: &mut generics::Scope, errs: &mut Vec<Diag>) {
+    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    if let Some(span) = hidden_lifetime(p, imp.self_ty) {
+        errs.push(Diag::new(
+            "L0202",
+            span,
+            "implicit elided lifetime not allowed here: this type has lifetime parameters",
+            "Write them, for example `impl S<'_>` or `impl<'a> S<'a>`.",
+        ));
+        return;
+    }
+    let named = scope.lifetimes.len() as u32;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(named));
+    let mut ks = scope.clone();
+    ks.regions = generics::RegionMode::Keep { next: Some(counter.clone()), elided: None };
+    let self_r = {
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        match generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, imp.self_ty, &ks) {
+            Ok(t) => t,
+            Err(_) => return,
+        }
+    };
+    // The header's anonymous lifetimes join the impl's params, so the
+    // methods' own lifetimes number after them.
+    let total = counter.load(std::sync::atomic::Ordering::Relaxed);
+    for k in named..total {
+        scope.lifetimes.push((interner.intern(&format!("'_impl{}", k - named)), k));
+    }
+    scope.self_ty_regioned = Some(self_r);
+    ks.lifetimes = scope.lifetimes.clone();
+    ks.regions = generics::RegionMode::Keep { next: None, elided: None };
+    ks.self_ty_regioned = Some(self_r);
+    let mut in_header: Vec<Region> = Vec::new();
+    crate::borrowck::regions_of(&p.tys, self_r, &mut in_header);
+    if let Some(tref) = &imp.trait_ref {
+        for seg in &tref.path {
+            if let ast::GenericArgs::Angle(args) = &seg.args {
+                for g in args {
+                    if let ast::GenericArg::Type(t) = g {
+                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        if let Ok(r) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, *t, &ks) {
+                            crate::borrowck::regions_of(&p.tys, r, &mut in_header);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for at in &imp.types {
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let Some(aty) = at.default else { continue };
+        let Ok(t) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, aty, &ks) else { continue };
+        let mut used: Vec<Region> = Vec::new();
+        crate::borrowck::regions_of(&p.tys, t, &mut used);
+        for &(n, i) in scope.lifetimes.iter().take(named as usize) {
+            if used.contains(&Region::Param(i)) && !in_header.contains(&Region::Param(i)) {
+                errs.push(Diag::new(
+                    "L0110",
+                    ast.ty_span(aty),
+                    format!("the lifetime parameter `'{}` is not constrained by the impl trait, self type, or predicates", interner.get(n)),
+                    "Use the lifetime in the Self type or the trait's arguments, or remove it.",
+                ));
+            }
+        }
+        scope.assoc_regioned.push((at.name, t));
+    }
+}
+
+/// The span of a path to a user Adt with lifetime params that writes none
+/// (a hidden lifetime), anywhere in a written type.
+fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
+    match p.ast.ty(id) {
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => hidden_lifetime(p, *inner),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => hidden_lifetime(p, *inner),
+        TyExpr::Tuple(elems) => elems.iter().find_map(|&e| hidden_lifetime(p, e)),
+        TyExpr::Path(segs) => {
+            let last = segs.last()?;
+            let lts = p.type_names.get(&last.name).and_then(|&a| p.gx.adt_lifetimes.get(&p.gx.adt_info[a.0 as usize].0)).map_or(0, |v| v.len());
+            let written = match &last.args {
+                ast::GenericArgs::Angle(a) => a.iter().any(|g| matches!(g, ast::GenericArg::Lifetime(_))),
+                _ => false,
+            };
+            if lts > 0 && !written {
+                return Some(p.ast.ty_span(id));
+            }
+            segs.iter().find_map(|s| match &s.args {
+                ast::GenericArgs::Angle(a) => a.iter().find_map(|g| if let ast::GenericArg::Type(t) = g { hidden_lifetime(p, *t) } else { None }),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Lifetime errors in a type alias body (W-BORROW): an alias names no
 /// lifetime params yet, so a reference must say `'static` (an elided one
 /// is rustc E0106, L0202) and any other name is undeclared (E0261, L0203).
@@ -1495,6 +1595,19 @@ pub fn collect_reuse<'a>(
         p.adts[id.0 as usize] =
             AdtDef { name, is_enum, variants: Vec::new(), derives: Derives::default(), span, repr: crate::ty::layout::Repr::default() };
         p.gx.adt_info[id.0 as usize] = (def, n_params);
+        // Lifetime params (W-BORROW): names only; the field pass gives
+        // them meaning.
+        let lifetimes: Vec<Sym> = match &item.kind {
+            ItemKind::Struct(st) => &st.generics.params,
+            ItemKind::Enum(e) => &e.generics.params,
+            _ => &[][..],
+        }
+        .iter()
+        .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.name) } else { None })
+        .collect();
+        if !lifetimes.is_empty() {
+            p.gx.adt_lifetimes.insert(def, lifetimes);
+        }
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
         p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
@@ -1625,6 +1738,8 @@ pub fn collect_reuse<'a>(
         }
         let is_enum = p.adts[id.0 as usize].is_enum;
         let mut variants = Vec::new();
+        // (variant, field, regioned type) for the borrow checker.
+        let mut region_fields: Vec<(usize, usize, Ty)> = Vec::new();
         let mut disc_explicit: Vec<bool> = Vec::new();
         let mut next_disc: i128 = 0;
         for (vname, vspan, shape, field_srcs, disc_src) in variants_src {
@@ -1641,13 +1756,24 @@ pub fn collect_reuse<'a>(
                 };
                 match resolved {
                     Ok(t) => {
-                        if contains_ref(&p.tys, t) && !generics::ref_field_ok(ast, interner, fty) {
-                            errs.push(Diag::new(
+                        // The field's regions (W-BORROW): every reference
+                        // needs a lifetime the Adt declares, or `'static`
+                        // (an elided one is rustc E0106).
+                        let regioned = {
+                            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                            let mut ks = p.gx.adt_scopes[id.0 as usize].clone();
+                            ks.regions = generics::RegionMode::Keep { next: None, elided: None };
+                            generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &ks)
+                        };
+                        match regioned {
+                            Ok(r) => region_fields.push((variants.len(), fields.len(), r)),
+                            Err(d) if d.code == "L0202" => errs.push(Diag::new(
                                 "L0201",
                                 ast.ty_span(fty),
-                                "struct and enum fields cannot hold references",
-                                "Store an owned value (for example String instead of &str), or store an index and pass the reference to each method.",
-                            ));
+                                "a reference in a struct or enum field needs a lifetime",
+                                "Declare a lifetime on the type (`struct S<'a> { x: &'a str }`), use `'static`, or store an owned value.",
+                            )),
+                            Err(_) => {}
                         }
                         fields.push(Field { name: fname, ty: t });
                     }
@@ -1760,6 +1886,44 @@ pub fn collect_reuse<'a>(
                     ));
                 }
             }
+        }
+        // Regioned field types (W-BORROW), and a lifetime param must occur
+        // in a field (rustc E0392).
+        {
+            let def = p.gx.adt_info[id.0 as usize].0;
+            let mut by_variant: Vec<Vec<Ty>> = variants.iter().map(|v| v.fields.iter().map(|f| f.ty).collect()).collect();
+            for &(vi, fi, r) in &region_fields {
+                if let Some(slot) = by_variant.get_mut(vi).and_then(|v| v.get_mut(fi)) {
+                    *slot = r;
+                }
+            }
+            if let Some(names) = p.gx.adt_lifetimes.get(&def).cloned() {
+                let mut used: Vec<Region> = Vec::new();
+                for v in &by_variant {
+                    for &t in v {
+                        crate::borrowck::regions_of(&p.tys, t, &mut used);
+                    }
+                }
+                let spans: Vec<Span> = match &item.kind {
+                    ItemKind::Struct(st) => &st.generics.params,
+                    ItemKind::Enum(e) => &e.generics.params,
+                    _ => &[][..],
+                }
+                .iter()
+                .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.span) } else { None })
+                .collect();
+                for (i, n) in names.iter().enumerate() {
+                    if !used.contains(&Region::Param(i as u32)) {
+                        errs.push(Diag::new(
+                            "L0110",
+                            spans.get(i).copied().unwrap_or(p.adts[id.0 as usize].span),
+                            format!("lifetime parameter `'{}` is never used", interner.get(*n)),
+                            "Use the lifetime in a field type, or remove it.",
+                        ));
+                    }
+                }
+            }
+            p.regions.adt_fields.insert(def, by_variant);
         }
         let adt = &mut p.adts[id.0 as usize];
         adt.variants = variants;
@@ -2006,6 +2170,8 @@ pub fn collect_reuse<'a>(
             }
         }
         let mut scope = parent_gen.scope.clone();
+        scope.lifetimes.extend(own_scope.lifetimes.iter().copied());
+        scope.region_facts.extend(own_scope.region_facts.iter().copied());
         scope.type_params.extend(own_scope.type_params.iter().copied());
         scope.const_params.extend(own_scope.const_params.iter().copied());
         scope.param_tys.extend(own_scope.param_tys.iter().copied());
@@ -2030,7 +2196,13 @@ pub fn collect_reuse<'a>(
             p.gx.has_generics = true;
         }
         let id = LocalDefId(p.fns.len() as u32);
-        if let Some(rs) = region_sig {
+        if let Some(mut rs) = region_sig {
+            // The impl's lifetimes are params of the impl: early-bound for
+            // its methods (a method does not coerce to a fn pointer that
+            // is generic over them).
+            for e in rs.early.iter_mut().take(parent_gen.scope.lifetimes.len()) {
+                *e = true;
+            }
             p.regions.fns.insert(id, rs);
         }
         let def_id = DefId { krate: p.krate, hash };
@@ -2129,6 +2301,7 @@ pub fn collect_reuse<'a>(
                 // already collected.
                 let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
+                impl_regions(&mut p, imp, &mut impl_scope, &mut errs);
                 // The owner template Adt, when the Self pattern is a
                 // local Adt application (inherent and trait impls).
                 let owner: Option<AdtId> = match p.tys.kind(self_pat) {

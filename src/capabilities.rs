@@ -670,8 +670,9 @@ fn pat_label(p: &Pat) -> &'static str {
 /// Features lust rejects, with the code it reports. The strings mirror the messages at the
 /// `unsupported(...)` and `not_yet(...)` call sites; the agentkit test greps the former.
 const REJECTED: &[(&str, &str)] = &[
-    ("references in struct and enum fields", "L0201"),
-    ("lifetime names such as 'a", "L0203"),
+    ("references in struct and enum fields without a lifetime (E0106)", "L0201"),
+    ("lifetimes in body type annotations, fn pointer types, dyn trait args, trait params, and `T: 'a` bounds", "L0203"),
+    ("explicit lifetime turbofish args", "L0731"),
     ("macro calls with no expanded form yet, such as format_args!", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
     ("known attributes such as repr and track_caller (named in the message)", "L0522"),

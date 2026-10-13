@@ -104,6 +104,8 @@ pub struct RegionSig {
     /// Display names of the universals, for diagnostics (`'a`, or the
     /// parameter an elided region sits in).
     pub names: Vec<String>,
+    /// Per named lifetime (universals `0..early.len()`): early-bound.
+    pub early: Vec<bool>,
 }
 
 /// The borrow checker's side table of region signatures (W-BORROW, ARCH 5),
@@ -115,6 +117,9 @@ pub struct RegionTables {
     pub fns: FxMap<LocalDefId, RegionSig>,
     /// Trait method signatures by method def (the stubs' callee signatures).
     pub trait_methods: FxMap<DefId, RegionSig>,
+    /// Regioned field types of each user Adt template, by def: per variant,
+    /// per field, with the Adt's lifetime params as `Region::Param(i)`.
+    pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
     adts: std::sync::OnceLock<AdtTables>,
 }
 
@@ -124,6 +129,10 @@ pub struct RegionTables {
 struct AdtTables {
     variance: FxMap<DefId, Vec<Variance>>,
     drop: FxMap<DefId, Vec<DropMode>>,
+    /// Per lifetime param of each user Adt template (W-BORROW): its
+    /// variance, and whether dropping the Adt may need it live.
+    region_variance: FxMap<DefId, Vec<Variance>>,
+    region_drop: FxMap<DefId, Vec<DropMode>>,
 }
 
 impl RegionTables {
@@ -167,6 +176,12 @@ impl AdtTables {
             let has_drop = super::drop_heads(p).contains(&def);
             t.drop.insert(def, vec![if has_drop { DropMode::All } else { DropMode::None }; n]);
         }
+        for &(def, _) in &templates {
+            let n = p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len());
+            let has_drop = super::drop_heads(p).contains(&def);
+            t.region_variance.insert(def, vec![Variance::Bi; n]);
+            t.region_drop.insert(def, vec![if has_drop { DropMode::All } else { DropMode::None }; n]);
+        }
         loop {
             let mut changed = false;
             for &(def, id) in &templates {
@@ -186,12 +201,104 @@ impl AdtTables {
                     t.drop.insert(def, drop);
                     changed = true;
                 }
+                // Lifetime params, from the regioned field types.
+                let nr = t.region_variance[&def].len();
+                if nr > 0 {
+                    let mut rvar = vec![Variance::Bi; nr];
+                    let mut rdrop = t.region_drop[&def].clone();
+                    if let Some(fields) = p.regions.adt_fields.get(&def) {
+                        for v in fields {
+                            for &f in v {
+                                t.region_uses(p, f, Variance::Co, DropMode::Owned, &mut rvar, &mut rdrop);
+                            }
+                        }
+                    }
+                    if t.region_variance[&def] != rvar {
+                        t.region_variance.insert(def, rvar);
+                        changed = true;
+                    }
+                    if t.region_drop[&def] != rdrop {
+                        t.region_drop.insert(def, rdrop);
+                        changed = true;
+                    }
+                }
             }
             if !changed {
                 break;
             }
         }
         t
+    }
+
+    /// Joins into `var` and `drop` the uses of each lifetime param
+    /// (`Region::Param(i)`) in regioned field type `ty`, at variance `v`
+    /// and drop mode `m`: a reference's region at the reference's own
+    /// position (only a `Drop` impl reading through it needs it live), an
+    /// Adt's region args at that Adt's param variance and drop mode.
+    fn region_uses(&self, p: &Program, ty: Ty, v: Variance, m: DropMode, var: &mut [Variance], drop: &mut [DropMode]) {
+        let note = |r: Region, v: Variance, m: DropMode, var: &mut [Variance], drop: &mut [DropMode]| {
+            if let Region::Param(i) = r {
+                if let Some(x) = var.get_mut(i as usize) {
+                    *x = x.join(v);
+                }
+                if let Some(x) = drop.get_mut(i as usize) {
+                    *x = x.join(if m == DropMode::All { DropMode::All } else { DropMode::None });
+                }
+            }
+        };
+        match p.tys.kind(ty) {
+            TyKind::Ref(r, mt, inner) => {
+                note(r, v, m, var, drop);
+                let iv = if mt.is_mut() { Variance::Inv } else { Variance::Co };
+                self.region_uses(p, inner, v.then(iv), if m == DropMode::All { DropMode::All } else { DropMode::None }, var, drop);
+            }
+            TyKind::RawPtr(mt, inner) => {
+                let iv = if mt.is_mut() { Variance::Inv } else { Variance::Co };
+                self.region_uses(p, inner, v.then(iv), DropMode::None, var, drop);
+            }
+            TyKind::Tuple(ts) => {
+                for &e in p.tys.tys_of(ts) {
+                    self.region_uses(p, e, v, m, var, drop);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.region_uses(p, e, v, m, var, drop),
+            TyKind::Adt(def, args) => {
+                let (mut k, mut j) = (0usize, 0usize);
+                for g in p.tys.args(args) {
+                    match *g {
+                        GenericArg::Lifetime(r) => {
+                            let rv = self.region_variance.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(Variance::Inv);
+                            let rm = self.region_drop.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(DropMode::All);
+                            let mm = if m == DropMode::None { DropMode::None } else { m.join(rm) };
+                            note(r, v.then(rv), mm, var, drop);
+                            k += 1;
+                        }
+                        GenericArg::Ty(e) => {
+                            let (pv, pm) = self.arg_modes(p, def, j);
+                            self.region_uses(p, e, v.then(pv), m.then(pm), var, drop);
+                            j += 1;
+                        }
+                        GenericArg::Const(_) => j += 1,
+                    }
+                }
+            }
+            _ => {
+                // A region inside anything else (fn pointers, dyn, closures)
+                // is held invariant and drop-visible: the safe answer.
+                let mut rs = Vec::new();
+                regions_of(&p.tys, ty, &mut rs);
+                for r in rs {
+                    note(r, Variance::Inv, if m == DropMode::None { DropMode::None } else { DropMode::All }, var, drop);
+                }
+            }
+        }
+    }
+
+    /// The variance and drop mode of lifetime param `k` of Adt `def`.
+    fn region_modes(&self, def: DefId, k: usize) -> (Variance, DropMode) {
+        let v = self.region_variance.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(Variance::Inv);
+        let m = self.region_drop.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(DropMode::All);
+        (v, m)
     }
 
     /// Joins into `var` and `drop` the uses of each `Param(i)` in field type `ty`
@@ -272,12 +379,18 @@ impl AdtTables {
 }
 
 /// The number of region params an Adt type carries ahead of its type args:
-/// one for the builtin borrowing iterators (`Chars`, `slice::Iter`,
-/// `slice::IterMut`, whose erased types drop the lifetime), else none.
-fn adt_regions(tys: &impl TyIntern, t: Ty) -> u32 {
+/// a user Adt's declared lifetimes, or one for the builtin borrowing
+/// iterators (`Chars`, `slice::Iter`, `slice::IterMut`, whose erased types
+/// drop the lifetime).
+fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     use crate::ty::iter::IterKind;
     match tys.builtin_of(t) {
-        Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)) => 1,
+        Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)) => return 1,
+        Some(_) => return 0,
+        None => {}
+    }
+    match tys.kind(t) {
+        TyKind::Adt(def, _) => p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len() as u32),
         _ => 0,
     }
 }
@@ -302,7 +415,7 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
         let n = match self.tys.kind(t) {
             TyKind::Ref(_, _, inner) => 1 + self.slots(inner),
             TyKind::Adt(_, args) => {
-                let mut n = adt_regions(self.tys, t);
+                let mut n = adt_regions(self.p, self.tys, t);
                 for g in self.tys.args(args).to_vec() {
                     if let GenericArg::Ty(e) = g {
                         n += self.slots(e);
@@ -319,6 +432,39 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
         n
     }
 
+    /// The region an erased type keeps at each of its slots (`Erased`, or
+    /// `'static` where the erased form kept it), in slot order.
+    pub fn slot_regions(&mut self, t: Ty, out: &mut Vec<Region>) {
+        match self.tys.kind(t) {
+            TyKind::Ref(r, _, inner) => {
+                out.push(r);
+                self.slot_regions(inner, out);
+            }
+            TyKind::Adt(_, args) => {
+                for _ in 0..adt_regions(self.p, self.tys, t) {
+                    out.push(Region::Erased);
+                }
+                for g in self.tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.slot_regions(e, out);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in self.tys.tys_of(ts).to_vec() {
+                    self.slot_regions(e, out);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.slot_regions(e, out),
+            TyKind::Closure(_, args) => {
+                for e in closure_fields(self.tys, args) {
+                    self.slot_regions(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Calls `f(slot, variance)` for each slot of `t`, in order, starting at
     /// slot index `at`, where `t` sits at position variance `v`. Returns the
     /// next slot index.
@@ -331,8 +477,9 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
             }
             TyKind::Adt(def, args) => {
                 let mut at = at;
-                for _ in 0..adt_regions(self.tys, t) {
-                    f(at, v);
+                for k in 0..adt_regions(self.p, self.tys, t) {
+                    let rv = if self.tys.builtin_of(t).is_some() { Variance::Co } else { self.p.regions.adts(self.p).region_modes(def, k as usize).0 };
+                    f(at, v.then(rv));
                     at += 1;
                 }
                 for (j, g) in self.tys.args(args).to_vec().into_iter().enumerate() {
@@ -377,8 +524,9 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
             TyKind::RawPtr(_, inner) => self.drop_slots(inner, if all { DropMode::All } else { DropMode::None }, at, out),
             TyKind::Adt(def, args) => {
                 let mut at = at;
-                for _ in 0..adt_regions(self.tys, t) {
-                    out[at as usize] = all;
+                for k in 0..adt_regions(self.p, self.tys, t) {
+                    let rm = if self.tys.builtin_of(t).is_some() { DropMode::None } else { self.p.regions.adts(self.p).region_modes(def, k as usize).1 };
+                    out[at as usize] = all || (m != DropMode::None && rm == DropMode::All);
                     at += 1;
                 }
                 for (j, g) in self.tys.args(args).to_vec().into_iter().enumerate() {
@@ -673,10 +821,20 @@ impl OwnSig {
                 self.pair(sc, ri, ei, binds, out)
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-                if tys.is_chars_ty(e) {
-                    self.n_univ += 1;
-                    self.names.push("an anonymous lifetime".into());
-                    out.push(self.n_univ);
+                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                for k in 0..adt_regions(sc.p, tys, e) as usize {
+                    let mut fresh = || {
+                        self.n_univ += 1;
+                        self.n_univ
+                    };
+                    let u = match lts.get(k) {
+                        Some(&r) => univ_of(r, &mut fresh),
+                        None => fresh(),
+                    };
+                    while self.names.len() < self.n_univ as usize + 1 {
+                        self.names.push("an anonymous lifetime".into());
+                    }
+                    out.push(u);
                 }
                 let rargs: Vec<Ty> = tys.args(ra).iter().filter_map(|g| g.as_ty()).collect();
                 let eargs: Vec<Ty> = tys.args(ea).iter().filter_map(|g| g.as_ty()).collect();
@@ -793,7 +951,7 @@ fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ],
             outer.pop();
         }
         TyKind::Adt(_, args) => {
-            for _ in 0..adt_regions(sc.tys, t) {
+            for _ in 0..adt_regions(sc.p, sc.tys, t) {
                 if let Some(&u) = us.get(*at) {
                     each(u, facts, outer);
                 }
@@ -1072,7 +1230,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 let gargs = tys.args(args).to_vec();
                 // The vars of each type arg inside `out`.
                 let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(gargs.len());
-                let mut at = adt_regions(tys, ty) as usize;
+                let mut at = adt_regions(self.p, tys, ty) as usize;
                 for g in &gargs {
                     let n = match g {
                         GenericArg::Ty(e) => self.sc.slots(*e) as usize,
@@ -1081,8 +1239,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     ranges.push((at, n));
                     at += n;
                 }
+                // The field's regioned form names the Adt's lifetime params;
+                // without one (no references written) the erased template is
+                // the same shape.
+                let freg = self.p.regions.adt_fields.get(&def).and_then(|v| v.get(variant as usize)).and_then(|f| f.get(i as usize)).copied();
                 let mut sub = Vec::new();
-                self.subst_vars(ftmpl, &ranges, out, &mut sub);
+                self.subst_vars(freg.unwrap_or(ftmpl), &ranges, out, &mut sub);
                 let fty = subst_get(&self.body.tys, ftmpl, &gargs)
                     .or_else(|| {
                         let a = self.body.tys.local_adt(ty)?;
@@ -1114,24 +1276,29 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         None
     }
 
-    /// The vars of template-form field type `f` under the Adt's arg vars
-    /// (`ranges` index `vars`). A reference written in a field is `'static`
-    /// in this increment (named field lifetimes come with Adt lifetime params).
+    /// The vars of regioned field type `f` (template form) under the Adt's
+    /// vars: its lifetime param `k` is `vars[k]`, type param `j` the vars in
+    /// `ranges[j]`, `'static` var 0.
     fn subst_vars(&mut self, f: Ty, ranges: &[(usize, usize)], vars: &[u32], out: &mut Vec<u32>) {
         let tys = &self.p.tys;
+        let region = |r: Region| match r {
+            Region::Param(k) => vars.get(k as usize).copied().unwrap_or(0),
+            _ => 0,
+        };
         match tys.kind(f) {
             TyKind::Param(j) => {
                 if let Some(&(s, n)) = ranges.get(j.0 as usize) {
                     out.extend_from_slice(&vars[s.min(vars.len())..(s + n).min(vars.len())]);
                 }
             }
-            TyKind::Ref(_, _, inner) => {
-                out.push(0);
+            TyKind::Ref(r, _, inner) => {
+                out.push(region(r));
                 self.subst_vars(inner, ranges, vars, out);
             }
             TyKind::Adt(_, args) => {
-                for _ in 0..adt_regions(tys, f) {
-                    out.push(0);
+                let lts: Vec<Region> = tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                for k in 0..adt_regions(self.p, tys, f) as usize {
+                    out.push(lts.get(k).map_or(0, |&r| region(r)));
                 }
                 for g in tys.args(args).to_vec() {
                     if let GenericArg::Ty(e) = g {
@@ -1193,9 +1360,10 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.walk(ai, av, ia, bi, bv, ib, v.then(if bm.is_mut() { Variance::Inv } else { Variance::Co }))
             }
             (TyKind::Adt(ad, aa), TyKind::Adt(bd, ba)) if ad == bd => {
-                for _ in 0..adt_regions(tys, a) {
+                for k in 0..adt_regions(self.p, tys, a) {
                     let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
-                    self.edge_v(x, y, v);
+                    let rv = if tys.builtin_of(a).is_some() { Variance::Co } else { self.p.regions.adts(self.p).region_modes(ad, k as usize).0 };
+                    self.edge_v(x, y, v.then(rv));
                     *ia += 1;
                     *ib += 1;
                 }
@@ -1291,7 +1459,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             let inner = vars[skip..].to_vec();
             self.implied_edges(t, &inner, &mut 0, &mut Vec::new());
             regs.clear();
-            regions_of(&self.body.tys, t, &mut regs);
+            self.sc.slot_regions(t, &mut regs);
             for (i, r) in regs.iter().enumerate() {
                 if *r == Region::Static
                     && let Some(&v) = inner.get(i)
@@ -1486,10 +1654,96 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
                 self.flow_all(&from, &dv);
             }
+            _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
             _ => self.call_opaque(&avs, dt, &dv),
+        }
+    }
+
+    /// A builtin that borrows into its receiver (`v.get(i)`, `v.last_mut()`,
+    /// `s.trim()`, `v.iter()`): Rust's `fn f<'r>(&'r self, ..) -> R<'r>`.
+    /// Each part of the result whose type is one of the receiver's
+    /// components (a `Vec`'s element type, a slice's) equals that
+    /// component's regions; every other region of the result is outlived
+    /// by the receiver borrow's region. The other arguments do not flow
+    /// into the result. False (nothing added) when the receiver is not a
+    /// reference.
+    fn call_receiver(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, x) = self.body.tys.kind(*t0) else { return false };
+        let Some((&r, xv)) = v0.split_first() else { return false };
+        let tys = &self.body.tys;
+        let comp: Option<Ty> = match tys.kind(x) {
+            TyKind::Slice(e) | TyKind::Array(e, _) => Some(e),
+            _ => tys.vec_elem(x),
+        };
+        // The element type sits at the end of the receiver's slots (after
+        // any region params of the container, which these builtins lack).
+        let comp_vars: Vec<u32> = match comp {
+            Some(e) => {
+                let n = self.sc.slots(e) as usize;
+                if n > xv.len() {
+                    return false;
+                }
+                xv[xv.len() - n..].to_vec()
+            }
+            None => Vec::new(),
+        };
+        let mut at = 0usize;
+        self.receiver_walk(dt, dv, &mut at, r, comp, &comp_vars);
+        true
+    }
+
+    fn receiver_walk(&mut self, t: Ty, dv: &[u32], at: &mut usize, r: u32, comp: Option<Ty>, comp_vars: &[u32]) {
+        if comp == Some(t) && self.sc.slots(t) as usize == comp_vars.len() {
+            for (i, &c) in comp_vars.iter().enumerate() {
+                if let Some(&d) = dv.get(*at + i) {
+                    self.edge(c, d);
+                    self.edge(d, c);
+                }
+            }
+            *at += comp_vars.len();
+            return;
+        }
+        let tys = &self.body.tys;
+        match tys.kind(t) {
+            TyKind::Ref(_, _, inner) => {
+                if let Some(&d) = dv.get(*at) {
+                    self.edge(r, d);
+                }
+                *at += 1;
+                self.receiver_walk(inner, dv, at, r, comp, comp_vars);
+            }
+            TyKind::Adt(_, args) => {
+                for _ in 0..adt_regions(self.p, tys, t) {
+                    if let Some(&d) = dv.get(*at) {
+                        self.edge(r, d);
+                    }
+                    *at += 1;
+                }
+                for g in tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.receiver_walk(e, dv, at, r, comp, comp_vars);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in tys.tys_of(ts).to_vec() {
+                    self.receiver_walk(e, dv, at, r, comp, comp_vars);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.receiver_walk(e, dv, at, r, comp, comp_vars),
+            _ => {
+                let n = self.sc.slots(t) as usize;
+                for i in 0..n {
+                    if let Some(&d) = dv.get(*at + i) {
+                        self.edge(r, d);
+                    }
+                }
+                *at += n;
+            }
         }
     }
 
@@ -1502,7 +1756,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let Some((_, args)) = self.body.tys.adt_parts(dt) else { return self.call_opaque(avs, dt, dv) };
         let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(comps.len());
-        let mut at = adt_regions(&self.body.tys, dt) as usize;
+        let mut at = adt_regions(self.p, &self.body.tys, dt) as usize;
         for &c in &comps {
             let n = self.sc.slots(c) as usize;
             ranges.push((at, n));
@@ -1547,7 +1801,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.non_closure_slots(inner, vars, at, out);
             }
             TyKind::Adt(_, args) => {
-                for _ in 0..adt_regions(&self.body.tys, t) {
+                for _ in 0..adt_regions(self.p, &self.body.tys, t) {
                     if let Some(&v) = vars.get(*at) {
                         out.push(v);
                     }
@@ -1678,8 +1932,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.inst_walk(ri, ei, univ, binds, out)
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-                for _ in 0..adt_regions(et, e) {
-                    let v = self.fresh();
+                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                for k in 0..adt_regions(self.p, et, e) as usize {
+                    let v = match lts.get(k) {
+                        Some(&r) => self.inst_region(r, univ),
+                        None => self.fresh(),
+                    };
                     out.push(v);
                 }
                 let rargs: Vec<Ty> = tys.args(ra).iter().filter_map(|g| g.as_ty()).collect();
@@ -1713,7 +1971,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 refs.pop();
             }
             TyKind::Adt(_, args) => {
-                for _ in 0..adt_regions(tys, t) {
+                for _ in 0..adt_regions(self.p, tys, t) {
                     if let Some(&v) = vars.get(*at) {
                         for &o in refs.iter() {
                             self.edge(v, o);
@@ -1747,6 +2005,36 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
 /// pointer that borrows its base (see `Builder::local_slots`).
 fn fat_local(tys: &impl TyIntern, t: Ty) -> bool {
     matches!(tys.kind(t), TyKind::Slice(_) | TyKind::Str)
+}
+
+/// The builtins that borrow into their receiver (or move elements out of
+/// it) and return nothing of their other arguments, storing nothing
+/// either (see `Builder::call_receiver`).
+fn receiver_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(
+        b,
+        B::VecGet
+            | B::VecFirst
+            | B::VecLast
+            | B::VecGetMut
+            | B::VecFirstMut
+            | B::VecLastMut
+            | B::VecAsSlice
+            | B::VecAsMutSlice
+            | B::StringAsStr
+            | B::StrTrim
+            | B::StrTrimStart
+            | B::StrTrimEnd
+            | B::StrStripPrefix
+            | B::StrStripSuffix
+            | B::IterIter
+            | B::IterIterMut
+            | B::VecPop
+            | B::VecRemove
+            | B::VecSwapRemove
+            | B::VecSplitOff
+    )
 }
 
 /// The builtin iterator calls whose result is an item (or a collection
@@ -1978,15 +2266,14 @@ fn tarjan(n: usize, start: &[u32], adj: &[u32]) -> (Vec<u32>, usize) {
     (comp, n_comp as usize)
 }
 
-/// The trait-contract check of an impl method's regions (W-BORROW): the
-/// impl may promise more than the trait (a `'static` result where the
-/// trait's borrows), never less, and it may not demand more of its
-/// inputs. Without lifetime names the only difference elision leaves is
-/// `'static`, so this pairs the two region signatures and compares where
-/// each says `'static`: a covariant (output) slot the trait makes
-/// `'static` must be `'static` in the impl, a contravariant (input) one
-/// the impl makes `'static` must be `'static` in the trait, and an
-/// invariant one must agree. Returns the first mismatch as L0734.
+/// The trait-contract check of an impl method's regions (W-BORROW, rustc
+/// compare_impl_method): the trait's signature must be a subtype of the
+/// impl's for every choice of the trait's lifetimes. The trait's
+/// universals are placeholders, the impl's are free; `trait param <: impl
+/// param` and `impl ret <: trait ret` give outlives edges, and a
+/// placeholder that must then outlive another (or `'static`) without a
+/// trait fact or implied bound is L0734. The impl may promise more (a
+/// `'static` result where the trait borrows), never less.
 pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
     let own = p.regions.fns.get(&f)?;
     let def = p.def_id(f);
@@ -1998,53 +2285,255 @@ pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
     if tsig.params.len() != own.params.len() {
         return None;
     }
-    let mut bad = false;
+    let nt = tsig.n_univ as usize;
+    let n = 1 + nt + own.n_univ as usize;
+    let mut cx = Contract { p, nt, edges: Vec::new() };
     for (&t, &i) in tsig.params.iter().zip(&own.params) {
-        contract_walk(&p.tys, t, i, Variance::Contra, &mut bad);
+        cx.walk(t, i, Variance::Co, true);
     }
-    contract_walk(&p.tys, tsig.ret, own.ret, Variance::Co, &mut bad);
-    bad.then(|| {
-        Diag::new(
-            "L0734",
-            info.def.name_span,
-            format!("lifetime mismatch: method `{}` has a lifetime `'static` where the trait's signature does not agree", p.display_name(info.name)),
-            "Match the trait method's signature: return at least what it promises, and take at least what it accepts.",
-        )
-    })
-}
-
-/// Walks a trait method type `t` and the impl's `i` in parallel, setting
-/// `bad` where a `'static` disagrees for the position's variance.
-fn contract_walk(tys: &impl TyIntern, t: Ty, i: Ty, v: Variance, bad: &mut bool) {
-    match (tys.kind(t), tys.kind(i)) {
-        (TyKind::Ref(rt, mt, it), TyKind::Ref(ri, mi, ii)) if mt == mi => {
-            let (st, si) = (rt == Region::Static, ri == Region::Static);
-            *bad |= match v {
-                Variance::Co => st && !si,
-                Variance::Contra => si && !st,
-                Variance::Inv => st != si,
-                Variance::Bi => false,
-            };
-            let iv = if mt.is_mut() { Variance::Inv } else { Variance::Co };
-            contract_walk(tys, it, ii, v.then(iv), bad);
+    cx.walk(own.ret, tsig.ret, Variance::Co, false);
+    // Known relations among the trait's lifetimes: its facts and the
+    // implied bounds of its signature types, closed transitively.
+    let mut known = vec![false; (nt + 1) * (nt + 1)];
+    for a in 0..=nt {
+        known[a * (nt + 1) + a] = true;
+        known[a] = true;
+    }
+    let add_known = |a: Region, b: Region, known: &mut Vec<bool>| {
+        let idx = |r: Region| match r {
+            Region::Static => Some(0),
+            Region::Param(k) if (k as usize) < nt => Some(1 + k as usize),
+            _ => None,
+        };
+        if let (Some(x), Some(y)) = (idx(a), idx(b)) {
+            known[x * (nt + 1) + y] = true;
         }
-        (TyKind::Adt(dt, at), TyKind::Adt(di, ai)) if dt == di => {
-            let (xs, ys) = (tys.args(at).to_vec(), tys.args(ai).to_vec());
-            for (x, y) in xs.into_iter().zip(ys) {
-                if let (GenericArg::Ty(x), GenericArg::Ty(y)) = (x, y) {
-                    // Builtin containers are covariant; a user Adt's variance
-                    // is not computed here, so its args must agree exactly.
-                    let av = if tys.builtins().kind_of(dt).is_some() { Variance::Co } else { Variance::Inv };
-                    contract_walk(tys, x, y, v.then(av), bad);
+    };
+    for &(a, b) in &tsig.facts {
+        add_known(a, b, &mut known);
+    }
+    for &t in tsig.params.iter().chain(std::iter::once(&tsig.ret)) {
+        let mut facts = Vec::new();
+        implied_regioned(&p.tys, t, &mut Vec::new(), &mut facts);
+        for (a, b) in facts {
+            add_known(a, b, &mut known);
+        }
+    }
+    let w = nt + 1;
+    for k in 0..w {
+        for a in 0..w {
+            if known[a * w + k] {
+                for b in 0..w {
+                    if known[k * w + b] {
+                        known[a * w + b] = true;
+                    }
                 }
             }
         }
-        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
-            for (x, y) in tys.tys_of(a).to_vec().into_iter().zip(tys.tys_of(b).to_vec()) {
-                contract_walk(tys, x, y, v, bad);
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(a, b) in &cx.edges {
+        adj[a].push(b);
+    }
+    for pl in 1..=nt {
+        let mut seen = vec![false; n];
+        let mut stack = vec![pl];
+        seen[pl] = true;
+        while let Some(x) = stack.pop() {
+            for &y in &adj[x] {
+                if !seen[y] {
+                    seen[y] = true;
+                    stack.push(y);
+                }
             }
         }
-        (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) => contract_walk(tys, a, b, v, bad),
+        for q in 0..=nt {
+            if q != pl && seen[q] && !known[pl * w + q] {
+                return Some(Diag::new(
+                    "L0734",
+                    info.def.name_span,
+                    format!("lifetime mismatch: method `{}` does not fit the lifetimes of the trait's signature", p.display_name(info.name)),
+                    "Match the trait method's signature: return at least what it promises, and take at least what it accepts.",
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The edge walk of `impl_contract` over two regioned types.
+struct Contract<'p, 'a> {
+    p: &'p Program<'a>,
+    /// Trait universal count: node 0 is `'static`, `1..=nt` the trait's,
+    /// the impl's after them.
+    nt: usize,
+    edges: Vec<(usize, usize)>,
+}
+
+impl Contract<'_, '_> {
+    /// The node of region `r` on the trait side or the impl side.
+    fn node(&self, r: Region, trait_side: bool) -> Option<usize> {
+        match r {
+            Region::Static => Some(0),
+            Region::Param(k) if trait_side => Some(1 + k as usize),
+            Region::Param(k) => Some(1 + self.nt + k as usize),
+            _ => None,
+        }
+    }
+
+    /// Edges for `a <: b` at variance `v`; `a_trait` says which side `a`
+    /// comes from (the other side is `b`).
+    fn walk(&mut self, a: Ty, b: Ty, v: Variance, a_trait: bool) {
+        let tys = &self.p.tys;
+        match (tys.kind(a), tys.kind(b)) {
+            (TyKind::Ref(ra, ma, ia), TyKind::Ref(rb, mb, ib)) if ma == mb => {
+                self.slot(ra, rb, v, a_trait);
+                let iv = if ma.is_mut() { Variance::Inv } else { Variance::Co };
+                self.walk(ia, ib, v.then(iv), a_trait);
+            }
+            (TyKind::Adt(da, xa), TyKind::Adt(db, xb)) if da == db => {
+                let (xs, ys) = (tys.args(xa).to_vec(), tys.args(xb).to_vec());
+                let (mut k, mut j) = (0usize, 0usize);
+                for (x, y) in xs.into_iter().zip(ys) {
+                    match (x, y) {
+                        (GenericArg::Lifetime(rx), GenericArg::Lifetime(ry)) => {
+                            let rv = self.p.regions.adts(self.p).region_modes(da, k).0;
+                            self.slot(rx, ry, v.then(rv), a_trait);
+                            k += 1;
+                        }
+                        (GenericArg::Ty(x), GenericArg::Ty(y)) => {
+                            let (pv, _) = self.p.regions.adts(self.p).arg_modes(self.p, da, j);
+                            self.walk(x, y, v.then(pv), a_trait);
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                }
+            }
+            (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+                for (x, y) in tys.tys_of(x).to_vec().into_iter().zip(tys.tys_of(y).to_vec()) {
+                    self.walk(x, y, v, a_trait);
+                }
+            }
+            (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => self.walk(x, y, v, a_trait),
+            _ => {}
+        }
+    }
+
+    fn slot(&mut self, ra: Region, rb: Region, v: Variance, a_trait: bool) {
+        let (Some(x), Some(y)) = (self.node(ra, a_trait), self.node(rb, !a_trait)) else { return };
+        match v {
+            Variance::Co => self.edges.push((x, y)),
+            Variance::Contra => self.edges.push((y, x)),
+            Variance::Inv => {
+                self.edges.push((x, y));
+                self.edges.push((y, x));
+            }
+            Variance::Bi => {}
+        }
+        // `'static` outlives everything: no edges out of it are needed.
+        self.edges.retain(|&(a, _)| a != 0);
+    }
+}
+
+/// Implied outlives facts of a regioned type: every region inside a
+/// reference outlives the reference's own region.
+fn implied_regioned(tys: &impl TyIntern, t: Ty, outer: &mut Vec<Region>, out: &mut Vec<(Region, Region)>) {
+    let note = |r: Region, outer: &Vec<Region>, out: &mut Vec<(Region, Region)>| {
+        for &o in outer {
+            out.push((r, o));
+        }
+    };
+    match tys.kind(t) {
+        TyKind::Ref(r, _, inner) => {
+            note(r, outer, out);
+            outer.push(r);
+            implied_regioned(tys, inner, outer, out);
+            outer.pop();
+        }
+        TyKind::Adt(_, args) => {
+            for g in tys.args(args).to_vec() {
+                match g {
+                    GenericArg::Lifetime(r) => note(r, outer, out),
+                    GenericArg::Ty(e) => implied_regioned(tys, e, outer, out),
+                    GenericArg::Const(_) => {}
+                }
+            }
+        }
+        TyKind::Tuple(ts) => {
+            for e in tys.tys_of(ts).to_vec() {
+                implied_regioned(tys, e, outer, out);
+            }
+        }
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => implied_regioned(tys, e, outer, out),
         _ => {}
+    }
+}
+
+/// The fn item coercion check (W-BORROW, ARCH 5.5): a fn pointer type is
+/// generic over its lifetimes, so a fn item with an early-bound lifetime
+/// (named in a bound, or in no input) does not coerce to one (rustc E0308).
+pub(super) fn fn_item_coercions(p: &Program, body: &Body) -> Vec<Diag> {
+    let mut out = Vec::new();
+    for b in &body.blocks {
+        for s in &b.stmts {
+            let StmtKind::Assign(_, Rvalue::FnValue(f, ty)) = &s.kind else { continue };
+            if !matches!(body.tys.kind(*ty), TyKind::FnPtr(_)) {
+                continue;
+            }
+            let sig = p.regions.fns.get(f).or_else(|| p.gx.instances.get(f).and_then(|i| p.regions.fns.get(&i.template_local?)));
+            if sig.is_some_and(|s| s.early.iter().any(|&e| e)) {
+                out.push(Diag::new(
+                    "L0110",
+                    s.span,
+                    format!("`{}` has an early-bound lifetime, so it cannot become a fn pointer that is generic over it", p.display_name(p.fn_info(*f).name)),
+                    "Call the fn directly, or remove the bound that makes its lifetime early-bound.",
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Variance, tarjan};
+
+    /// Components come out sinks first, and a cycle is one component.
+    #[test]
+    fn tarjan_orders_sinks_first() {
+        // 0 -> 1 -> 2 -> 1, 0 -> 3
+        let edges: Vec<(u32, u32)> = vec![(0, 1), (1, 2), (2, 1), (0, 3)];
+        let n = 4;
+        let mut start = vec![0u32; n + 1];
+        for &(a, _) in &edges {
+            start[a as usize + 1] += 1;
+        }
+        for i in 0..n {
+            start[i + 1] += start[i];
+        }
+        let mut adj = vec![0u32; edges.len()];
+        let mut fill = start.clone();
+        for &(a, b) in &edges {
+            adj[fill[a as usize] as usize] = b;
+            fill[a as usize] += 1;
+        }
+        let (comp, nc) = tarjan(n, &start, &adj);
+        assert_eq!(nc, 3);
+        assert_eq!(comp[1], comp[2], "the cycle is one component");
+        assert!(comp[0] > comp[1] && comp[0] > comp[3], "the source completes after its successors");
+    }
+
+    /// The variance algebra matches Rust's composition rules.
+    #[test]
+    fn variance_compose_and_join() {
+        use Variance::*;
+        assert_eq!(Co.then(Contra), Contra);
+        assert_eq!(Contra.then(Contra), Co);
+        assert_eq!(Contra.then(Inv), Inv);
+        assert_eq!(Bi.then(Inv), Bi);
+        assert_eq!(Co.join(Contra), Inv);
+        assert_eq!(Bi.join(Contra), Contra);
+        assert_eq!(Co.join(Co), Co);
     }
 }

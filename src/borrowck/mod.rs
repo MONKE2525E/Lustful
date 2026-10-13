@@ -58,24 +58,14 @@ impl BitSet {
     fn remove(&mut self, i: usize) {
         bit_unset(self.words_mut(), i);
     }
-    fn contains(&self, i: usize) -> bool {
-        bit_has(self.words(), i)
-    }
     fn union(&mut self, o: &BitSet) -> bool {
         bits_or(self.words_mut(), o.words())
-    }
-    /// Unions in a set stored as words (a row of a `State`).
-    fn union_words(&mut self, o: &[u64]) -> bool {
-        bits_or(self.words_mut(), o)
     }
     fn clear(&mut self) {
         self.words_mut().fill(0);
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         bit_iter(self.words())
-    }
-    fn is_empty(&self) -> bool {
-        bits_none(self.words())
     }
 }
 
@@ -101,10 +91,6 @@ fn bits_or(dst: &mut [u64], src: &[u64]) -> bool {
         *a |= b;
     }
     changed != 0
-}
-
-fn bits_none(w: &[u64]) -> bool {
-    w.iter().all(|&x| x == 0)
 }
 
 /// The set bits in ascending order.
@@ -389,6 +375,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     // A body with no loans needs no regions: no loan can conflict, and a
     // universal relation can only fail through a loan or a reference value
     // that flows between parameters, which the region pass checks below.
+    ck.errs.extend(regions::fn_item_coercions(p, body));
     let own = own_sig(p, body);
     if own.check
         && let Some(d) = regions::impl_contract(p, body.fn_id)
@@ -1415,26 +1402,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         dest.proj.is_empty() && matches!(self.body.tys.kind(self.body.locals[dest.local as usize].ty), TyKind::Ref(_, Mut::Mut, _))
     }
 
-    fn dest_ty(&self, dest: &Place) -> Ty {
-        let mut t = self.body.locals[dest.local as usize].ty;
-        for pr in &dest.proj {
-            t = match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                (_, Proj::Deref) if self.body.tys.smart_elem(t).is_some() => self.body.tys.smart_elem(t).unwrap(),
-                (_, Proj::Index(_)) => match self.body.tys.vec_elem(t) {
-                    Some(e) => e,
-                    None => return ERROR,
-                },
-                _ => return ERROR,
-            };
-        }
-        t
-    }
-
-    fn place_ty(&self, p: &Place) -> Ty {
-        if p.proj.is_empty() { self.body.locals[p.local as usize].ty } else { self.dest_ty(p) }
-    }
-
     /// The type one `Field` projection down from `t` (in the variant a
     /// preceding `Downcast` selected), or the error type when unknown.
     fn step_field_ty(&self, t: Ty, variant: u32, i: u32) -> Ty {
@@ -2060,15 +2027,15 @@ mod tests {
         let mut one = BitSet::new(64);
         one.insert(0);
         one.insert(63);
-        assert!(one.contains(0) && one.contains(63) && !one.contains(1));
+        assert!(bit_has(one.words(), 0) && bit_has(one.words(), 63) && !bit_has(one.words(), 1));
         assert_eq!(one.iter().collect::<Vec<_>>(), vec![0, 63]);
         one.remove(0);
-        assert!(!one.contains(0) && !one.is_empty());
+        assert!(!bit_has(one.words(), 0) && one.iter().next().is_some());
 
         let mut wide = BitSet::new(200);
         wide.insert(64);
         wide.insert(199);
-        assert!(wide.contains(64) && wide.contains(199) && !wide.contains(63));
+        assert!(bit_has(wide.words(), 64) && bit_has(wide.words(), 199) && !bit_has(wide.words(), 63));
         assert_eq!(wide.iter().collect::<Vec<_>>(), vec![64, 199]);
         let mut other = BitSet::new(200);
         other.insert(199);
@@ -2076,6 +2043,6 @@ mod tests {
         other.insert(65);
         assert!(wide.union(&other), "a new bit is a change");
         wide.clear();
-        assert!(wide.is_empty());
+        assert!(wide.iter().next().is_none());
     }
 }

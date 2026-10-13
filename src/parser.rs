@@ -1,6 +1,7 @@
 // Recursive-descent parser with precedence climbing for binary operators.
 // Rust syntax that lust rejects on purpose gets its own stable error code here:
-// lifetimes and user macros keep their original codes (L0203, L0401), `unsafe`
+// unsupported lifetime positions and user macros keep their original codes
+// (L0203, L0401), `unsafe`
 // and `async` keep theirs (L0404, L0405), and each AST v2 form whose parser
 // lands later rejects with the Appendix A code for its area (docs/ARCH.md S3b).
 use crate::ast::*;
@@ -683,12 +684,15 @@ fn tok_name(t: Tok) -> &'static str {
     }
 }
 
+/// The L0203 reject for a lifetime where lust does not take one yet:
+/// lifetime params on type aliases and associated types, `for<'a>`
+/// types, and a lifetime token in an identifier position.
 fn lifetime_error(span: Span) -> Diag {
     Diag::new(
         "L0203",
         span,
-        "lifetime names are not supported",
-        "Remove the lifetime. Lust uses Rust's elision rules only. If elision is ambiguous, return an owned value or an index.",
+        "a lifetime is not supported in this position yet",
+        "Lifetime params work on fns, structs, enums, and impls; elsewhere, elide the lifetime or use `'static`.",
     )
 }
 
@@ -1416,9 +1420,9 @@ impl<'a> Parser<'a> {
     /// Generic parameters as written: `<..>`, or empty when absent.
     /// Additive parser work for W-CORELANG (the AST owner) on behalf
     /// of W-TRAITS-CORE: the shapes are the frozen AST v2 ones.
-    /// Lifetime
-    /// parameters keep the old L0203 reject where `allow_lifetimes`
-    /// is false (fns, structs, enums); impls and traits record them.
+    /// Lifetime parameters keep the old L0203 reject where
+    /// `allow_lifetimes` is false (type aliases and associated types);
+    /// fns, structs, enums, impls, and traits record them (W-BORROW).
     fn generics(&mut self, allow_lifetimes: bool) -> PResult<Generics> {
         let start = self.span();
         if !self.eat(Tok::Lt) {
@@ -1596,7 +1600,7 @@ impl<'a> Parser<'a> {
     fn fn_def_inner(&mut self, sig_only: bool) -> PResult<FnDef> {
         self.expect(Tok::Fn, "`fn`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics(false)?;
+        let generics = self.generics(true)?;
         self.expect(Tok::LParen, "`(`")?;
         let mut self_param = None;
         let mut params = Vec::new();
@@ -1770,7 +1774,7 @@ impl<'a> Parser<'a> {
     fn struct_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<StructDef> {
         self.expect(Tok::Struct, "`struct`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics(false)?;
+        let generics = self.generics(true)?;
         // The where clause sits before the fields (named struct)
         // or before the `;` (unit struct). Tuple structs put it
         // after the fields; they still reject below.
@@ -1794,7 +1798,7 @@ impl<'a> Parser<'a> {
     fn enum_def(&mut self, derives: Vec<(Sym, Span)>) -> PResult<EnumDef> {
         self.expect(Tok::Enum, "`enum`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics(false)?;
+        let generics = self.generics(true)?;
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();

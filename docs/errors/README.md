@@ -31,9 +31,9 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0121](L0121.md) | invalid assignment target |
 | [L0122](L0122.md) | `mut` binding under a reference |
 | [L0130](L0130.md) | no `main` function |
-| [L0201](L0201.md) | references in struct fields are not supported |
+| [L0201](L0201.md) | a reference in a field needs a lifetime |
 | [L0202](L0202.md) | lifetime elision is ambiguous |
-| [L0203](L0203.md) | lifetime syntax is not supported |
+| [L0203](L0203.md) | lifetime name or form not supported |
 | [L0301](L0301.md) | use of moved value |
 | [L0302](L0302.md) | cannot assign to an immutable variable |
 | [L0303](L0303.md) | conflicting borrows |
@@ -95,6 +95,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0720](L0720.md) | ambiguous method |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0721](L0721.md) | this method form is not supported yet |
+| [L0731](L0731.md) | explicit lifetime arguments on a fn |
 | [L0733](L0733.md) | lifetime may not live long enough |
 | [L0734](L0734.md) | lifetime mismatch with the trait method |
 | [L0801](L0801.md) | macro expansion hit a limit |

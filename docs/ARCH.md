@@ -2781,259 +2781,175 @@ DESIGN-TS). Do not cap the region count.
 
 ### 5.1 Rollout in two steps
 
-Step A (with or before `dyn`, milestone 5 end):
-`'static` and `'_`. `'static` is `Region::Static`, no
-inference. `'_` in a signature is a fresh region param
-subject to elision; in an impl header it is required
-syntax (rustc E0726) and means the elided param. This
-step removes the `L0203` blanket reject
-(`src/parser.rs:65-72`) for these two forms and allows
-`&'static T` fields (191 in ts-rust) and std types
-like `Formatter<'_>`, `Cow<'static, str>`,
-`MutexGuard<'_>`. Step A still runs well-formedness on
-every lifetime-bearing field: a `&'static` slot accepts
-only a `'static` source, and the region checks in 5.2
-that need no named regions (static outlives, field
-bounds) run from day one. Do not enable ref fields by
-skipping those checks. INVENTORY credits this step with
-moving ts-rust from 16.6% to 32.7% of prod lines for 1k
-to 2k lines. It is the cheapest big win in the plan.
+Step A (landed with W-BORROW increment 1): `'static`
+and `'_` with real region checks. Step B (increment 2):
+named lifetime params on fns, structs, enums, and impls.
 
-Step B (milestone 6): named regions everywhere below.
+Representation. The types that check, mono, and cgen
+read stay region-erased: lifetime params do not enter
+`Generics.params` (type param indexes and instance keys
+do not change), and an Adt type drops its lifetime args.
+Only `&'static dyn Tr` keeps its `'static` in the erased
+type (`check::object`, ARCH 2.8). Collect fills a
+borrow-checker side table, `Program.regions`
+(`borrowck::RegionTables`), by resolving each signature a
+second time with `Scope.regions = RegionMode::Keep`:
+
+- per fn: a `RegionSig` with the params and return as
+  regioned types (`Region::Static`, `Region::Param(i)`),
+  the universal count, `'a: 'b` facts, display names,
+  and the early-bound flag of each named lifetime;
+- per trait method: the same, for the stubs that stand
+  for it in template bodies;
+- per Adt template: regioned field types
+  (`adt_fields`); the lifetime names live in
+  `GenTables.adt_lifetimes` for the resolver;
+- per impl: the regioned `Self` type and associated
+  types live in the method scopes (`self_ty_regioned`,
+  `assoc_regioned`).
+
+Universal numbering of a fn: the impl's named lifetimes,
+the impl header's anonymous ones (`impl Tr for &str`),
+the fn's own named ones, then one per elided input.
+Elision follows Rust: `&self`'s region, else the only
+input lifetime (named, `'static`, a hidden path lifetime,
+or a written dyn object lifetime all count), else L0202.
 
 ### 5.2 What is checked
 
-Syntax: lifetime params on fns, structs, enums, impls,
-traits, aliases; `T: 'a` and `'a: 'b` bounds; refs and
-generic args carrying regions; `dyn Trait + 'a`;
-`impl Trait + 'a`; rank-1 `for<'a>` on fn ptrs, `Fn`
-bounds, and trait objects. Elision copies Rust's three
-rules exactly (each elided input gets its own param;
-`&self` wins for outputs; else error). A signature
-that elision cannot settle and that names no lifetime
-is an error asking for a name, replacing today's
-"return owned" advice where a named region works.
+The engine is rustc's NLL (`src/borrowck/regions.rs`):
 
-Per body, region checking reuses the loan engine in
-`src/borrowck.rs`. Add one layer above it:
+1. Every region slot of every local's erased type gets a
+   region var (a reference: its own region, then its
+   pointee's; an Adt: its lifetime params, then its type
+   args; closures: their captures). Var 0 is `'static`,
+   vars `1..=n` the fn's universals.
+2. Constraints `'a: 'b` come from relating types with
+   variance at assignments, borrows (plus reborrow
+   constraints through each deref, stopping after the
+   first shared one, and well-formedness `T: 'l` for
+   `&'l T`), aggregates (operand <: field type with the
+   Adt's region args substituted), calls (the callee's
+   region signature instantiated: universals and type
+   param slots fresh, shared across occurrences; arg <:
+   param, ret <: dest, callee facts and implied bounds),
+   and the entry (parameter locals and `_0` equal the
+   signature). A shape lust cannot pair equates every
+   slot of both sides.
+3. Region values are location-insensitive: a region
+   contains a point when a local whose slots it reaches is
+   live there (or drop-live, 5.4); a universal region
+   contains every point.
+4. A loan is in scope from its borrow through every point
+   its region contains, until a statement overwrites or
+   ends the borrowed local (rustc `kill_borrows_on_place`).
+   Lust's IR reads a statement's operands in order and then
+   writes, where MIR keeps one temporary per operand: a
+   loan a later operand's local still carries, or an
+   earlier operand's value holds, conflicts with the
+   current operand's access (`x + *m` is E0503). A call's
+   destination is written after the call, a two-phase
+   receiver is activated by the call, and a temporary
+   root of an assignment's place is evaluated after the
+   value (`v[0] = v[1]`), as in rustc.
+5. Each access is checked against the in-scope loans with
+   the existing conflict rules. A loan of a local (or of
+   storage it owns, through `Box`) in scope where the local
+   dies is L0306, or L0307 when the loan reaches the return
+   place. A universal region that reaches another without
+   a declared or implied relation is L0733.
 
-1. Every `Ref` and borrow-carrying `Adt` in the body
-   gets region vars from its type. Loans (existing)
-   record which place and which region var the borrow
-   was stored under. A loan escapes into an Adt field
-   or a closure capture when the IR stores it there;
-   the field's type gives the region var it must fit.
-2. Subtyping constraints arise at assignments, calls,
-   returns, and struct literals: `actual <: expected`
-   decomposes through types with variance (5.3),
-   producing region outlives constraints `'x: 'y` and
-   "loan L must live at least 'y". Callee signatures
-   summarize: their region params are fresh vars at
-   the call, constrained by arg and return types.
-   This replaces `ret_borrows_from`
-   (`src/collect.rs:52-53`, set at
-   `src/collect.rs:372`) with the general form.
-3. Solve with NLL live ranges, exactly. A region is
-   live at a CFG point when any of these holds:
-   (a) a local whose type mentions the region is live
-   there; (b) the region outlives a region live there
-   (close over the outlives graph); (c) the region is
-   *universal*: a fn lifetime param or `'static`.
-   Universal regions contain every CFG point. A loan
-   stored under region `'x` is live at every point where
-   `'x` is live, from the loan's creation point on.
-   Then check: for every loan, the loan's place stays
-   valid (not moved, not dropped, not mutably aliased)
-   across the loan's whole live range.
-   The old rule "a loan is live where a live local may
-   hold it" is not NLL. It is closer to Polonius and it
-   accepts programs rustc rejects. The case that proves
-   it is NLL problem case 3:
+Calls lust cannot read precisely (builtins, intrinsics,
+fn pointers, dyn calls, a signature it cannot pair) use the
+conservative rule: the result may hold every argument's
+regions (equal to them when it holds a `&mut`), and each
+`&mut` argument's target may receive every other
+argument's regions. Closures: at creation all capture
+slots form one class; the output joins the class; each
+argument slot is its own universal in the closure body
+(as if higher-ranked), so a closure that stores its
+argument is L0733.
 
-   ```rust
-   fn first_or_push(v: &mut Vec<i32>) -> &i32 {
-       if let Some(x) = v.first() { return x; }
-       v.push(1);            // E0502 in rustc
-       &v[0]
-   }
-   ```
+Templates are checked with abstract type params. Instance
+bodies are borrow-checked too, without the universal
+relation check (rustc checks the template; the instance
+sees through type params where the call rules are
+coarser).
 
-   The loan behind `x` sits under the return region, a
-   universal region, so it is live at the `push` even
-   though `x` is dead on that path. Today's lust accepts
-   this program and prints `1`; that is a live rule-zero
-   bug (section 11). Under the rule above, every
-   "Polonius accepts, NLL rejects" shape rejects here
-   too. Concretely, a reference to a local can never
-   satisfy a region that reaches the return, a
-   `&'static` slot, or a field whose Adt region
-   outlives the body.
-
-This is a constraint check, not region *inference* of
-named signatures: signatures are as written (with
-elision). Inside a body, region vars are only from
-locals, temporaries, and call instantiation. The
-graph is small (vars per borrow site). Solve by
-reachability, no backtracking, in time linear-ish in
-loans. Keep the two-phase borrow support and the
-`FakeRead` device (`src/ir.rs:108-110`).
-
-Reborrows through field projections: the loan place
-set already tracks projections (`src/ir.rs:15-24`).
-Storing `&x.field` in a struct field of region `'a`
-constrains `x.field` to stay borrowed for `'a`, and
-`x` itself cannot move while the struct is live. The
-existing conflict check (access vs live loans) covers
-it once loans live as long as the containing Adt
-value, which is why loan liveness must flow *through*
-Adt fields and closure captures, not just through
-ref-typed locals. That flow is the main borrowck
-change: "local holds loan" becomes "place holds loan",
-through projections, with Adt field types telling
-which field carries which region var.
-
-Well-formedness at collect: a type `Foo<'a, T>` is
-usable only if its declared bounds hold (`T: 'a` where
-declared). Fields with refs make the Adt borrow-carrying;
-drop check (5.4) applies. `contains_ref`
-(`src/collect.rs:449-478`) generalizes to "regions of
-this type", a set of region params reachable through
-fields with variance signs.
+Signature-level checks: an impl method must keep its trait
+method's region contract (L0734: it may promise a
+`'static` result where the trait borrows, never less, and
+may not demand a `'static` input); a fn item with an
+early-bound lifetime does not coerce to a fn pointer
+(L0110, rustc E0308).
 
 ### 5.3 Variance
 
-Compute each Adt type and lifetime param's variance
-from fields, by Rust's table, pinned in full. The rows
-that are easiest to get wrong: `&'a T` is covariant in
-`'a` and in `T`; `&'a mut T` is covariant in `'a` and
-invariant in `T`; `*const T` is covariant in `T`;
-`*mut T` is invariant in `T`; `UnsafeCell<T>`, `Cell`,
-and `RefCell` are invariant in `T`; a fn pointer is
-contravariant in its args and covariant in its return;
-`Box<T>`, `Vec<T>`, and `Rc<T>` are covariant in `T`
-through their `PhantomData` and pointer fields as Rust
-computes them. `PhantomData<T>` gives
-`T`'s variance without storage. Variance feeds step 2
-above: covariant positions produce `'x: 'y`,
-contravariant flip, invariant produce equality (both
-directions). Variance is per (Adt def, param index),
-computed once at collect by fixpoint over the field
-graph. Cycles resolve to invariant on conflict.
-
-Where it bites in ts-rust: `RuleContext<'a, 'c>` holds
-`&'a mut TypeParser<'c>` (INVENTORY Q1 sample), so
-`'c` is invariant through the mut ref. Skipping
-variance would accept programs rustc rejects there.
-With 27 `&mut`-field types, this is not optional.
+Per user Adt template, by fixpoint over field types: type
+params from the erased fields, lifetime params from the
+regioned ones (`AdtTables`). `&'a T`: covariant in `'a`
+and `T`; `&'a mut T`: covariant in `'a`, invariant in
+`T`; raw pointers: `*const` covariant, `*mut` invariant;
+fn pointers: inputs contravariant, output covariant;
+builtin containers covariant; closures, dyn, opaque, and
+projections invariant (conservative). Cycles converge
+because the lattice is finite (bivariant, co, contra,
+invariant).
 
 ### 5.4 Drop check
 
-Structural drop check, conservative for user types: when
-a value of type `Adt<...>` with a `Drop` impl (or a
-field that transitively has one) drops at point P, every
-region arg of the type must still be live at P (its
-loans valid). If the check cannot prove liveness, reject
-with `L0730` naming the type and region.
-
-One exception, for std only. Real std marks some `Drop`
-impls `#[may_dangle]`, and safe programs depend on it: a
-`Vec<&String>` declared before the `String` it borrows
-compiles in rustc because `Vec`'s drop does not touch
-the elements' referents. A conservative rule for std
-containers rejects that program. So shipped std (and
-only shipped std, 3.1 item 4) carries a may-dangle flag
-on the same impls as real std: `Vec`, `Box`, `Rc`,
-`Arc`, `VecDeque`, and the iterator and guard impls the
-surface manifest lists. For a flagged impl, drop check
-does not require the type and region args that the flag
-covers to be live at the drop. User impls never get the
-flag; they stay conservative. Ts-rust writes no
-`may_dangle` of its own (it needs `unsafe`).
+A `Drop` of a maybe-initialized local is a use of its
+drop-live slots: every slot under a user `Drop` impl, the
+owned parts below containers (`Vec`, `Option`, `Result`,
+`Box`, tuples, arrays, closure captures, Adt fields), and
+nothing behind a reference. Builtin containers act as
+`#[may_dangle]` on their elements: a `Vec<&T>` may drop
+after its referent, a `Vec<W<'a>>` with `W: Drop` may not.
+Per Adt lifetime and type param, the drop mode (none,
+owned, all) is part of the Adt fixpoint.
 
 ### 5.5 What is rejected
 
-Stable errors, each with a fix hint. Port scan counts
-them before milestone 6 starts, so the list is
-evidence-checked:
+Both-reject (rustc rejects too): L0202 missing lifetime
+specifier (E0106: elision, a reference in a field or an
+alias without a lifetime, a hidden lifetime in an impl
+header, E0726); L0203 undeclared lifetime (E0261),
+reserved or duplicate names; L0110 lifetime arity (E0107),
+unused lifetime param (E0392), unconstrained impl lifetime
+in an associated type (E0207), early-bound fn item to fn
+pointer (E0308); L0306/L0307/L0303/L0312 loan conflicts;
+L0733; L0734.
 
-- GATs and any assoc type with its own lifetime
-  params (`L0620`, from 2.5).
-- Higher-ranked binders beyond rank 1, and binders on
-  trait *defs* (`trait Tr<'a>` is fine; `for<'a> Trait`
-  as a supertrait bound on a nested binder is not).
-  One explicit `for<'a>` exists in ts-rust
-  (`ast/synthetic.rs:1447` fn ptr, DESIGN-TS section
-  2 table): rank-1 fn ptr, supported.
-- Explicit lifetime turbofish args. Lust *computes* the
-  early-bound and late-bound split, as rustc does: a
-  lifetime param is early-bound when it appears in a
-  bound on another param or does not appear in the fn
-  inputs where a late-bound param must; else it is
-  late-bound and becomes a binder at each call and in
-  the fn pointer type (2.9). The split is cheap and it
-  decides fn-item coercion: an item with an early-bound
-  lifetime does not coerce to a `for<'a>` fn pointer
-  over that lifetime. But naming a lifetime in a
-  turbofish is rejected in all cases with `L0731`, a
-  stated subset cut. Rust rejects it whenever any
-  late-bound param is present (E0794:
-  `fn f<'a>(x: &'a str) -> &'a str` then
-  `f::<'static>("x")` fails), so the common case already
-  errors in both compilers. Only the all-early-bound
-  case diverges, as a lust reject of valid Rust. Port
-  scan counts those sites.
-- Higher-ranked requirements that the leak check cannot
-  prove. To check `for<'a> P<'a>`, substitute a fresh
-  *placeholder* region for `'a`, check `P` with it, then
-  verify the placeholder did not escape: it must not
-  appear in any inference var, type, or loan that
-  outlives the proof. A fresh existential var alone does
-  not prove a universal claim, it only witnesses one
-  choice. If the placeholder escapes, reject with
-  `L0732`. The negative corpus (5.6) carries both
-  directions: a callback that needs `for<'a> Fn(&'a T)`
-  must accept, and one that stores the borrowed arg
-  past the call must reject.
-- Borrows held across `.await` until the async work
-  in milestone 8b. The ATA futures borrow request
-  data across suspension (DESIGN-TS section 6); that
-  support lands with the state machine lowering, and
-  the borrow checker treats suspension points as uses
-  there. Before 8b, async itself is rejected.
-- Self-referential structs. No support; `Pin` is a
-  std type with the usual API for futures, but lust
-  does not prove pinning invariants beyond Rust's own
-  type rules. That matches Rust: pinning safety is on
-  `unsafe` code, which ts-rust does not write.
-- `impl Trait` capturing a lifetime param not named
-  in the bounds under edition 2024 rules: follow
-  2024 capture rules (capture all in scope), reject
-  2021-style implicit capture differences by edition.
-  Lust only supports edition 2024 crates (1.1); a
-  selected 2021 crate is `L0530` at session start.
-  Ts-rust is
-  edition 2024 workspace-wide
-  (`/home/theo/.t3/projects/ts-rust/Cargo.toml:11-15`).
+Stated subset cuts (valid Rust lust rejects, tests/reject):
+
+- L0203: explicit lifetimes in body type annotations (the
+  annotation's regions are not kept yet); lifetimes in fn
+  pointer types; lifetimes in a dyn type's trait args;
+  lifetime params on traits; `T: 'a` bounds on named
+  lifetimes and `'a: 'static`.
+- L0731: any explicit lifetime turbofish arg (rustc also
+  rejects it whenever the fn has a late-bound lifetime,
+  E0794).
+- L0820: closures that return references (closure.rs), and
+  closure to fn pointer coercion.
+- GATs (L0620), higher-ranked binders on bounds (L0203 at
+  the parser), async (milestone 8b), as before.
 
 ### 5.6 Negative corpus
 
-Before step B lands, write the reject corpus (each
-checked against rustc): NLL problem case 3 (5.2) and the
-other "Polonius accepts, NLL rejects" shapes, arena
-reset while borrowed,
-mutable alias through a struct field, nested borrowed
-fields escaping, invariant cell shortening, callback
-(`Rc<dyn Fn + 'a>`) escaping its scope, guard-backed
-borrow outliving its guard (`FileRef` shape), scoped
-thread borrowing past `scope` end, dropck case, and
-both directions of higher-ranked fn-pointer and
-callback coercion (5.5). The
-corpus is the gate. Features follow it (BRIEF test
-rules: `tests/fail` for both-reject, `tests/reject`
-for lust-only rejects). Problem case 3 is a bug in
-today's lust, not step B work: it gets a `tests/fail`
-case and a fix as milestone 1 work, before any of this
-lands (section 11).
+`tests/fail` holds the both-reject corpus (region_*, nll_*,
+dropck_*, named_*, alias_*, box_*, trait_method_static_*,
+and the `sol_*` probes of the design review), `tests/reject`
+the subset cuts, and `tests/pass` the positive twins and
+the gate shapes (`lifetime_gate_parser`,
+`lifetime_gate_json_decoder`, `lifetime_gate_rule_context`).
+Each case runs against rustc 1.99 in difftest.
+
+Known gaps: regions of body annotations; fn pointer and
+dyn regions; closure capture precision (one class) and
+expected closure signatures; `T: 'a`; Adt inferred outlives
+facts (missing facts reject, never accept); precise
+builtin region signatures.
 
 ## 6. Macros
 

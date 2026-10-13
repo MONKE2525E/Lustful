@@ -666,6 +666,18 @@ pub struct Scope {
     /// How written lifetimes resolve (W-BORROW). The default erases them,
     /// as every type the checker reads is region-erased.
     pub regions: RegionMode,
+    /// Named lifetime params in scope: name and universal index (the
+    /// `Region::Param` index in the item's region signature). An impl's
+    /// come first, then a method's own (W-BORROW).
+    pub lifetimes: Vec<(Sym, u32)>,
+    /// Declared `'a: 'b` facts between those params, by universal index.
+    pub region_facts: Vec<(u32, u32)>,
+    /// The regioned `Self` type of an impl, for signatures resolved in
+    /// `RegionMode::Keep` (`self_ty` stays the erased one).
+    pub self_ty_regioned: Option<Ty>,
+    /// The regioned associated types of the impl whose items resolve here,
+    /// so `Self::Assoc` keeps its regions in a region signature.
+    pub assoc_regioned: Vec<(Sym, Ty)>,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -705,6 +717,8 @@ pub struct ResolveCx<'x> {
     /// User Adt template def and declared type/const parameter
     /// count, by session-local index.
     pub adt_info: &'x [(DefId, usize)],
+    /// Lifetime param names of user Adt templates (W-BORROW).
+    pub adt_lifetimes: &'x FxMap<DefId, Vec<Sym>>,
     /// User trait name to its def. Lang traits answer after it.
     pub trait_names: &'x FxMap<Sym, DefId>,
     /// Non-generic type aliases by name (collect pass 1.5).
@@ -724,24 +738,40 @@ impl ResolveCx<'_> {
     }
 }
 
-/// The lifetime-names reject (same code and text as the parser's).
+/// The undeclared-lifetime error for one written name (rustc E0261).
+fn lifetime_diag_undeclared(interner: &Interner, lt: ast::Lifetime) -> Diag {
+    Diag::new(
+        "L0203",
+        lt.span,
+        format!("use of undeclared lifetime name `'{}`", interner.get(lt.name)),
+        "Declare it on the item (`fn f<'a>`, `struct S<'a>`, `impl<'a>`).",
+    )
+}
+
+/// The reject for a lifetime name a type alias body uses: aliases
+/// declare no lifetime params yet, so the name is undeclared there.
 pub fn lifetime_diag(span: Span) -> Diag {
     Diag::new(
         "L0203",
         span,
-        "lifetime names are not supported",
-        "Remove the lifetime. Lust uses Rust's elision rules only. If elision is ambiguous, return an owned value or an index.",
+        "use of undeclared lifetime name: type aliases take no lifetime params yet",
+        "Write `'static`, or spell the aliased type out where it is used.",
     )
 }
 
-/// Checks one written lifetime name: this milestone erases
-/// regions, so `'static` and `'_` are accepted and every other
-/// name is the subset's lifetime reject. Returns the region to
-/// record (always erased).
-fn check_lifetime(interner: &Interner, lt: ast::Lifetime) -> Result<Region, Diag> {
+/// Checks one written lifetime name: `'static`, `'_`, or a lifetime
+/// param the scope declares. Any other name is undeclared (rustc E0261,
+/// L0203). Returns the region to record in an erased type (erased).
+fn check_lifetime(interner: &Interner, scope: &Scope, lt: ast::Lifetime) -> Result<Region, Diag> {
     match interner.get(lt.name) {
         "static" | "_" => Ok(Region::Erased),
-        _ => Err(lifetime_diag(lt.span)),
+        _ if scope.lifetimes.iter().any(|(n, _)| *n == lt.name) => Ok(Region::Erased),
+        name => Err(Diag::new(
+            "L0203",
+            lt.span,
+            format!("use of undeclared lifetime name `'{name}`"),
+            "Declare it on the item (`fn f<'a>`, `struct S<'a>`, `impl<'a>`), or use `'_` or `'static`.",
+        )),
     }
 }
 
@@ -752,22 +782,24 @@ fn check_lifetime(interner: &Interner, lt: ast::Lifetime) -> Result<Region, Diag
 fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
     let name = lt.map(|lt| interner.get(lt.name));
     if let Some(lt) = lt {
-        check_lifetime(interner, lt)?;
+        check_lifetime(interner, scope, lt)?;
     }
+    let named = lt.and_then(|lt| scope.lifetimes.iter().find(|(n, _)| *n == lt.name).map(|&(_, i)| i));
     match &scope.regions {
         RegionMode::Erase => {
-            if name == Some("static") && scope.infer_cell.is_some() {
+            if (name == Some("static") || named.is_some()) && scope.infer_cell.is_some() {
                 return Err(Diag::new(
                     "L0203",
                     lt.map_or(span, |l| l.span),
-                    "an explicit `'static` in a type annotation inside a body is not supported yet",
-                    "Remove the annotation and let the type be inferred, or move the value into a `static` or `const` item.",
+                    "an explicit lifetime in a type annotation inside a body is not supported yet",
+                    "Remove the annotation and let the type be inferred, or write `'_`.",
                 ));
             }
             Ok(Region::Erased)
         }
-        RegionMode::Keep { next, elided } => match name {
-            Some("static") => Ok(Region::Static),
+        RegionMode::Keep { next, elided } => match (name, named) {
+            (Some("static"), _) => Ok(Region::Static),
+            (_, Some(i)) => Ok(Region::Param(i)),
             _ => match (elided, next) {
                 (Some(r), _) => Ok(*r),
                 (None, Some(c)) => Ok(Region::Param(c.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
@@ -780,6 +812,42 @@ fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, s
             },
         },
     }
+}
+
+/// True when a dyn trait path's args carry a free region: a reference or
+/// lifetime in angle args or bindings, or a named lifetime in `Fn` sugar.
+fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) -> bool {
+    fn has_ref(ast: &Ast, id: ast::TyId) -> bool {
+        match ast.ty(id) {
+            TyExpr::Ref { .. } | TyExpr::Dyn { .. } => true,
+            TyExpr::Tuple(elems) => elems.iter().any(|&e| has_ref(ast, e)),
+            TyExpr::Paren(i) | TyExpr::Slice(i) => has_ref(ast, *i),
+            TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => has_ref(ast, *inner),
+            TyExpr::Path(segs) => segs.iter().any(|s| match &s.args {
+                GenericArgs::Angle(a) => a.iter().any(|g| match g {
+                    AstArg::Lifetime(_) => true,
+                    AstArg::Type(t) => has_ref(ast, *t),
+                    _ => false,
+                }),
+                GenericArgs::Parenthesized { .. } => true,
+                _ => false,
+            }),
+            TyExpr::FnPtr { .. } => true,
+            _ => false,
+        }
+    }
+    path.iter().any(|seg| match &seg.args {
+        GenericArgs::Angle(a) => a.iter().any(|g| match g {
+            AstArg::Lifetime(lt) => interner.get(lt.name) != "_",
+            AstArg::Type(t) => has_ref(ast, *t),
+            AstArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => has_ref(ast, *t),
+            _ => false,
+        }),
+        GenericArgs::Parenthesized { inputs, output } => {
+            inputs.iter().any(|&t| names_lifetime(ast, interner, t)) || output.is_some_and(|t| names_lifetime(ast, interner, t))
+        }
+        _ => false,
+    })
 }
 
 /// True when a written type names a lifetime other than `'_` anywhere
@@ -891,7 +959,7 @@ fn resolve_generic_args(
                 vi += 1;
             }
             AstArg::Lifetime(lt) => {
-                check_lifetime(interner, *lt)?;
+                check_lifetime(interner, scope, *lt)?;
                 out.push(GenericArg::Lifetime(Region::Erased));
             }
             AstArg::Const(e) => {
@@ -1093,7 +1161,7 @@ fn resolve_trait_path_args(
                 match a {
                     AstArg::Type(t) => inputs.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?)),
                     AstArg::Lifetime(lt) => {
-                        check_lifetime(interner, *lt)?;
+                        check_lifetime(interner, scope, *lt)?;
                     }
                     AstArg::Const(e) => inputs.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?)),
                     AstArg::Binding { name, span: bspan, kind } => {
@@ -1370,7 +1438,7 @@ fn resolve_dyn(
     let mut auto = AutoTraits::default();
     let mut region = Region::Erased;
     let mut lifetime_bound = |lt: ast::Lifetime| -> Result<(), Diag> {
-        check_lifetime(interner, lt)?;
+        check_lifetime(interner, scope, lt)?;
         if interner.get(lt.name) == "static" {
             region = Region::Static;
         }
@@ -1388,6 +1456,18 @@ fn resolve_dyn(
             TraitBound::Trait { binder, trait_ref, maybe } => {
                 if *maybe {
                     return Err(not_yet("L0602", span, "`?Trait` bounds on dyn types"));
+                }
+                // Regions in a dyn type's trait args are free regions the
+                // borrow checker does not track through objects yet: an
+                // elided `Fn(&T)` input is the trait's own (late-bound),
+                // every other lifetime or reference there is a reject.
+                if dyn_args_have_regions(ast, interner, &trait_ref.path) {
+                    return Err(Diag::new(
+                        "L0203",
+                        span,
+                        "lifetimes in the trait arguments of a `dyn` type are not supported yet",
+                        "Use owned argument types, or elide the lifetimes in `Fn(&T)` arguments.",
+                    ));
                 }
                 let trait_def = trait_def_of_path(cx, interner, known, &trait_ref.path, span)?;
                 if cx.lang.is_auto(trait_def) {
@@ -1456,6 +1536,14 @@ fn resolve_path_ty(
         if segs[0].name == known.self_type
             && let Some(base) = scope.self_ty
         {
+            // A region signature reads the impl's own associated types with
+            // their regions (`Self::IntoIter` in `into_iter`).
+            if matches!(scope.regions, RegionMode::Keep { .. })
+                && segs.len() == 2
+                && let Some(&(_, t)) = scope.assoc_regioned.iter().find(|(n, _)| *n == segs[1].name)
+            {
+                return Ok(t);
+            }
             return assoc_projection(cx, tys, scope, base, &segs[1..], span, interner);
         }
         if let Some(i) = scope.param_of(segs[0].name) {
@@ -1496,8 +1584,8 @@ fn resolve_path_ty(
             if seg.has_args() {
                 return Err(Diag::new("L0110", span, "`Self` takes no generic arguments", "Remove the `<...>` part."));
             }
-            return scope
-                .self_ty
+            let keep = matches!(scope.regions, RegionMode::Keep { .. });
+            return (if keep { scope.self_ty_regioned.or(scope.self_ty) } else { scope.self_ty })
                 .ok_or_else(|| Diag::new("L0102", span, "`Self` is only valid inside an impl or trait", "Write the type name."));
         }
     }
@@ -1625,9 +1713,46 @@ fn resolve_path_ty(
                 return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
             }
         };
-        // Drop erased lifetime arguments before interning: declared
-        // parameters count only types and consts in this subset.
+        // Lifetime args (W-BORROW): none written (each elided), or one
+        // per declared lifetime param (rustc E0107 otherwise). The erased
+        // type drops them; a region signature keeps them first, in
+        // declared order (`Region::Param` or `'static`).
+        let n_lts = cx.adt_lifetimes.get(&def).map_or(0, |v| v.len());
+        let written: Vec<ast::Lifetime> = match &seg.args {
+            GenericArgs::Angle(a) => a.iter().filter_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect(),
+            _ => Vec::new(),
+        };
+        if scope.infer_cell.is_some()
+            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
+        {
+            return Err(Diag::new(
+                "L0203",
+                lt.span,
+                "an explicit lifetime in a type annotation inside a body is not supported yet",
+                "Remove the annotation and let the type be inferred, or write `'_`.",
+            ));
+        }
+        if !written.is_empty() && written.len() != n_lts {
+            return Err(Diag::new(
+                "L0110",
+                span,
+                format!(
+                    "`{}` takes {n_lts} lifetime argument(s), but {} were given",
+                    crate::intern::source_name(interner.get(name)),
+                    written.len()
+                ),
+                "Match the number of lifetime parameters in the definition.",
+            ));
+        }
         let gargs: Vec<GenericArg> = gargs.into_iter().filter(|g| !matches!(g, GenericArg::Lifetime(_))).collect();
+        if n_lts > 0 && matches!(scope.regions, RegionMode::Keep { .. }) {
+            let mut all: Vec<GenericArg> = Vec::with_capacity(n_lts + gargs.len());
+            for i in 0..n_lts {
+                all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
+            }
+            all.extend(gargs);
+            return Ok(tys.mk_adt(def, &all));
+        }
         return Ok(tys.mk_adt(def, &gargs));
     }
     let n = interner.get(name);
@@ -1660,9 +1785,17 @@ pub(crate) fn bound_predicates(
     errs: &mut Vec<Diag>,
 ) {
     match bound {
-        TraitBound::Lifetime(lt) => match check_lifetime(interner, *lt) {
+        TraitBound::Lifetime(lt) => match check_lifetime(interner, scope, *lt) {
             Err(d) => errs.push(d),
             Ok(_) if interner.get(lt.name) == "static" => out.push(Predicate::TypeOutlives(lhs, Region::Static)),
+            // `T: 'a` would be a type-outlives obligation at every use;
+            // lust proves only `'static` ones yet (W-BORROW).
+            Ok(_) if interner.get(lt.name) != "_" => errs.push(Diag::new(
+                "L0203",
+                lt.span,
+                "a bound like `T: 'a` on a named lifetime is not supported yet",
+                "Remove the bound if the code still checks, or bound the type by `'static`.",
+            )),
             Ok(_) => {}
         },
         TraitBound::Trait { binder, trait_ref, maybe } => {
@@ -1759,11 +1892,77 @@ pub fn build_generics_shifted(
 ) -> (Generics, Scope) {
     let mut params: Vec<ParamDef> = Vec::new();
     let mut scope = Scope::default();
+    // Pass 0 (W-BORROW): lifetime params. They do not enter `params`
+    // (type param indexes stay as before); they number the item's
+    // universal regions after the enclosing item's, in written order.
+    for p in &g.params {
+        if let ast::GenericParam::Lifetime { lt, .. } = p {
+            let name = interner.get(lt.name);
+            if name == "static" || name == "_" {
+                errs.push(Diag::new(
+                    "L0203",
+                    lt.span,
+                    format!("invalid lifetime parameter name: `'{name}` is reserved"),
+                    "Pick another name, such as `'a`.",
+                ));
+                continue;
+            }
+            if scope.lifetimes.iter().chain(&seed.lifetimes).any(|(n, _)| *n == lt.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    lt.span,
+                    format!("the lifetime `'{name}` is already declared on this item or an enclosing one"),
+                    "Rename one of the lifetime parameters.",
+                ));
+                continue;
+            }
+            let idx = (seed.lifetimes.len() + scope.lifetimes.len()) as u32;
+            scope.lifetimes.push((lt.name, idx));
+        }
+    }
+    // `'a: 'b` facts, from the params and the where clause. Their names
+    // resolve through the enclosing item's lifetimes and the own ones.
+    {
+        let find = |n: Sym| seed.lifetimes.iter().chain(&scope.lifetimes).find(|(m, _)| *m == n).map(|&(_, i)| i);
+        let mut facts: Vec<(u32, u32)> = Vec::new();
+        let mut fact = |a: &ast::Lifetime, b: &ast::Lifetime, errs: &mut Vec<Diag>| {
+            let (an, bn) = (interner.get(a.name), interner.get(b.name));
+            match (find(a.name), find(b.name), bn) {
+                (_, _, "static") if an != "static" => errs.push(Diag::new(
+                    "L0203",
+                    b.span,
+                    "a lifetime bound by `'static` is not supported yet",
+                    "Use `'static` itself instead of a bounded lifetime parameter.",
+                )),
+                (Some(x), Some(y), _) => facts.push((x, y)),
+                (None, _, _) if an != "static" => errs.push(lifetime_diag_undeclared(interner, *a)),
+                (_, None, _) if bn != "static" => errs.push(lifetime_diag_undeclared(interner, *b)),
+                _ => {}
+            }
+        };
+        for p in &g.params {
+            if let ast::GenericParam::Lifetime { lt, bounds, .. } = p {
+                for b in bounds {
+                    fact(lt, b, errs);
+                }
+            }
+        }
+        for pred in &w.preds {
+            if let ast::WherePred::Lifetime { lt, bounds } = pred {
+                for b in bounds {
+                    fact(lt, b, errs);
+                }
+            }
+        }
+        scope.region_facts = facts;
+    }
+    let mut rscope_lt = seed.lifetimes.clone();
+    rscope_lt.extend(scope.lifetimes.iter().copied());
     // Pass 1: parameter list and names. Indexes count type and
     // const parameters together, in written order.
     for p in &g.params {
         match p {
-            ast::GenericParam::Lifetime { lt, .. } => errs.push(lifetime_diag(lt.span)),
+            ast::GenericParam::Lifetime { .. } => {}
             ast::GenericParam::Type { name, span, default, .. } => {
                 // One name, one parameter in a list (rustc E0403). Type and
                 // const parameters share the list's namespace; lifetimes do not.
@@ -1810,6 +2009,7 @@ pub fn build_generics_shifted(
     // Resolution runs through the seed ++ own scope (`rscope`);
     // the returned `scope` keeps only the own parameters.
     let mut rscope = seed.clone();
+    rscope.lifetimes = rscope_lt;
     rscope.type_params.extend(scope.type_params.iter().copied());
     rscope.const_params.extend(scope.const_params.iter().copied());
     rscope.param_tys.extend(scope.type_params.iter().map(|&(n, i)| (n, tys.intern(TyKind::Param(ParamId(i))))));
@@ -1836,7 +2036,7 @@ pub fn build_generics_shifted(
     }
     for pred in &w.preds {
         match pred {
-            ast::WherePred::Lifetime { lt, .. } => errs.push(lifetime_diag(lt.span)),
+            ast::WherePred::Lifetime { .. } => {}
             ast::WherePred::Type { ty, bounds, .. } => match resolve_scoped(ast, interner, known, cx, tys, *ty, &rscope) {
                 Ok(lhs) => {
                     for b in bounds {
@@ -1889,6 +2089,18 @@ pub fn build_trait_generics(
     // `Self` resolves in the trait's own bounds and `where` clauses
     // (`trait T where Self: Sized`), so the seed scope names it.
     let seed = Scope { self_ty: Some(self_ty), ..Scope::default() };
+    // Lifetime params on a trait would need region-aware trait refs and
+    // impl selection (W-BORROW, Sol review P0.5); not supported yet.
+    for p in &g.params {
+        if let ast::GenericParam::Lifetime { lt, .. } = p {
+            errs.push(Diag::new(
+                "L0203",
+                lt.span,
+                "lifetime parameters on traits are not supported yet",
+                "Put the lifetime on the methods that need it, or on the types the trait is implemented for.",
+            ));
+        }
+    }
     let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, &seed, errs);
     generics.params.insert(0, ParamDef { name: known.self_type, kind: ParamKind::Type, span: Span::default() });
     scope.self_ty = Some(self_ty);
@@ -2026,6 +2238,10 @@ pub struct GenTables<'a> {
     /// Per user Adt (templates first, instances appended): the
     /// template def and declared parameter count.
     pub adt_info: Vec<(DefId, usize)>,
+    /// The lifetime param names of each user Adt template, by def
+    /// (W-BORROW). They are not in `adt_generics`: lifetimes leave type
+    /// param indexes and instance keys as before.
+    pub adt_lifetimes: FxMap<DefId, Vec<Sym>>,
     pub adt_generics: Vec<Generics>,
     pub adt_envs: Vec<Vec<Predicate>>,
     pub adt_scopes: Vec<Scope>,
@@ -2122,6 +2338,7 @@ impl Default for GenTables<'_> {
             trait_assoc_consts: FxMap::default(),
             wf_headers: Vec::new(),
             adt_info: Vec::new(),
+            adt_lifetimes: FxMap::default(),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
             adt_scopes: Vec::new(),
@@ -2161,7 +2378,15 @@ impl Default for GenTables<'_> {
 impl GenTables<'_> {
     /// The resolve context over the tables built so far.
     pub fn resolve_cx<'x>(&'x self, type_names: &'x FxMap<Sym, AdtId>, aliases: &'x FxMap<Sym, Ty>) -> ResolveCx<'x> {
-        ResolveCx { type_names, adt_info: &self.adt_info, trait_names: &self.trait_names, aliases, index: &self.index, lang: &self.lang }
+        ResolveCx {
+            type_names,
+            adt_info: &self.adt_info,
+            adt_lifetimes: &self.adt_lifetimes,
+            trait_names: &self.trait_names,
+            aliases,
+            index: &self.index,
+            lang: &self.lang,
+        }
     }
 }
 
@@ -2342,7 +2567,7 @@ pub fn resolve_fn_sig(
     let mut params: Vec<Ty> = Vec::new();
     if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
         if let Some(lt) = sp.lifetime
-            && let Err(d) = check_lifetime(interner, lt)
+            && let Err(d) = check_lifetime(interner, &scope, lt)
         {
             errs.push(d);
         }
@@ -2452,13 +2677,22 @@ fn region_sig(
     errs: &mut Vec<Diag>,
 ) -> Option<crate::borrowck::RegionSig> {
     use std::sync::atomic::Ordering;
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Named lifetimes (the impl's, then the fn's own) are universals
+    // 0..n; each elided input lifetime takes the next index.
+    let n_named = scope.lifetimes.len() as u32;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(n_named));
     let mut ks = scope.clone();
     ks.regions = RegionMode::Keep { next: Some(counter.clone()), elided: None };
     let mut rparams: Vec<Ty> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<String> = vec![String::new(); n_named as usize];
+    for &(n, i) in &scope.lifetimes {
+        if let Some(slot) = names.get_mut(i as usize) {
+            *slot = format!("lifetime `'{}`", interner.get(n));
+        }
+    }
     let mut self_region: Option<Region> = None;
     let mut skip = 0;
+    let self_ty = scope.self_ty_regioned.or(self_ty);
     if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
         let t = match sp.kind {
             ast::SelfKind::Value => st,
@@ -2513,7 +2747,18 @@ fn region_sig(
         },
     };
     let n_univ = counter.load(Ordering::Relaxed);
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts: Vec::new(), names })
+    let facts: Vec<(Region, Region)> = scope.region_facts.iter().map(|&(a, b)| (Region::Param(a), Region::Param(b))).collect();
+    // A named lifetime is early-bound when a bound names it or no input
+    // type does (rustc's split, ARCH 5.5): such a fn does not coerce to a
+    // fn pointer that is generic over it.
+    let mut in_inputs: Vec<Region> = Vec::new();
+    for &t in &rparams {
+        crate::borrowck::regions_of(tys, t, &mut in_inputs);
+    }
+    let early: Vec<bool> = (0..n_named)
+        .map(|i| scope.region_facts.iter().any(|&(a, b)| a == i || b == i) || !in_inputs.contains(&Region::Param(i)))
+        .collect();
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early })
 }
 
 /// True when a written type holds a `dyn` type with a written object
@@ -2535,27 +2780,6 @@ fn has_written_dyn_lifetime(ast: &Ast, id: ast::TyId) -> bool {
     }
 }
 
-/// True when a written field type holds only `'static` (or
-/// elided-in-name `'_`) references: the one reference field form
-/// this subset stores, since declared lifetimes on Adts are
-/// rejected. Elided references in fields are invalid Rust and
-/// keep the old reject.
-pub fn ref_field_ok(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
-    match ast.ty(id) {
-        TyExpr::Ref { lifetime, .. } => lifetime.is_some_and(|lt| interner.get(lt.name) == "static"),
-        TyExpr::Tuple(elems) => elems.iter().all(|&e| ref_field_ok(ast, interner, e)),
-        TyExpr::Paren(inner) => ref_field_ok(ast, interner, *inner),
-        TyExpr::Array { inner, .. } | TyExpr::Slice(inner) => ref_field_ok(ast, interner, *inner),
-        TyExpr::Path(segs) => segs.iter().all(|seg| match &seg.args {
-            GenericArgs::Angle(args) => args.iter().all(|a| match a {
-                AstArg::Type(t) => ref_field_ok(ast, interner, *t),
-                _ => true,
-            }),
-            _ => true,
-        }),
-        _ => true,
-    }
-}
 
 /// Fills in every user trait: its generics and supertraits, its
 /// method signature templates, and its associated type defaults.
@@ -2719,6 +2943,8 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 }
             }
             let mut mscope = scope.clone();
+            mscope.lifetimes.extend(own_scope.lifetimes.iter().copied());
+            mscope.region_facts.extend(own_scope.region_facts.iter().copied());
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
