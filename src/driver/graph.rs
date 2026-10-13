@@ -1241,6 +1241,16 @@ impl<'a> Program<'a> {
         set
     }
 
+    /// Records the `MethodSet` reads of every receiver form for one name on
+    /// one Adt. A lookup that reads the inherent method tables directly (a
+    /// `S::f` path, an inherent-first check) depends on the same candidates
+    /// a method probe sees, so it records the same reads.
+    pub fn inherent_reads(&self, reads: &mut Reads, adt: DefId, name: Sym) {
+        for form in ReceiverForm::PROBE_ORDER {
+            let _ = self.method_set(reads, Head::Adt(adt), name, form);
+        }
+    }
+
     /// The method candidate set without recording. See `binding_res`.
     fn method_candidates(&self, head: Head, name: Sym, form: ReceiverForm) -> MethodSet {
         let mut set = MethodSet::default();

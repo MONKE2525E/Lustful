@@ -8,14 +8,17 @@
 //
 // A stored result depends on three things, and holds while all three do:
 // - the trait system: trait items, impl items of lang and foreign
-//   traits and inherent impls, type alias and const items, and derive
-//   lists (`trait_key`). Collect drops every entry when their
-//   fingerprint changes (`GenReuse::gate`), and the driver also drops
-//   them on a const fn body edit, a nested static, or a slot renumber
-//   (`compile.rs`, "generic reuse"). Impls of user traits are not in
-//   the key: selection records an `ImplSet` read of the bucket it
-//   searched (driver/graph.rs), so an added, removed, or edited user
-//   trait impl rechecks only the bodies that read its bucket.
+//   traits, inherent impls with an associated const or a `dyn` Self,
+//   type alias and const items, and derive lists (`trait_key`).
+//   Collect drops every entry when their fingerprint changes
+//   (`GenReuse::gate`), and the driver also drops them on a const fn
+//   body edit, a nested static, or a slot renumber (`compile.rs`,
+//   "generic reuse"). Impls of user traits are not in the key:
+//   selection records an `ImplSet` read of the bucket it searched
+//   (driver/graph.rs), so an added, removed, or edited user trait impl
+//   rechecks only the bodies that read its bucket. Other inherent impls
+//   are not in it either: method probes and inherent table lookups
+//   record `MethodSet` reads (`Program::inherent_reads`).
 // - the source: the body and head hash of the AST fn whose text the
 //   body checks, and what the body takes from other checks in this
 //   collect. An instance's source is its template's source plus the
@@ -364,15 +367,23 @@ impl GenReuse {
 /// reach a type through them), and the derive list of each Adt that has
 /// one. An impl of a trait whose impls `ImplSet` reads cover
 /// (`Program::impls_read_covered`; `impl_traits` gives each trait impl's
-/// trait by item index) is left out.
+/// trait by item index) is left out, and so is an inherent impl with no
+/// associated const or type and no `dyn` Self: method probes and every
+/// direct inherent table lookup record `MethodSet` reads
+/// (`Program::inherent_reads`), whose fingerprints cover each method's
+/// signature.
 pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> u64 {
-    use crate::ast::ItemKind;
+    use crate::ast::{ItemKind, TyExpr};
     let user_trait = |d: &DefId| p.impls_read_covered(*d);
+    let plain_inherent = |imp: &crate::ast::ImplDef| {
+        imp.trait_ref.is_none() && imp.consts.is_empty() && imp.types.is_empty() && !matches!(p.ast.ty(imp.self_ty), TyExpr::Dyn { .. })
+    };
     let mut h = FxHasher::default();
     "trait-system-v2".hash(&mut h);
     for (i, item) in p.ast.items.iter().enumerate() {
         let derives = match &item.kind {
             ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
+            ItemKind::Impl(imp) if plain_inherent(imp) => continue,
             ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
                 (0u8, crate::driver::ast_hash::item_hash(p.ast, item)).hash(&mut h);
                 continue;

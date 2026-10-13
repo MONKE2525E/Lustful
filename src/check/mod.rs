@@ -6088,6 +6088,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(v) = is_variant {
             return Some(Res::Variant(a, v as u32));
         }
+        p.inherent_reads(&mut self.out.reads, adef, item);
         if let Some(&f) = p.methods.get(&(a, item)).and_then(|fs| fs.first()) {
             let what = if p.fn_info(f).self_kind.is_some() { "method" } else { "associated function" };
             self.check_assoc_vis(a, item, what, span);
@@ -6313,6 +6314,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => return None,
             }
         };
+        if !picked {
+            p.inherent_reads(&mut self.out.reads, p.def_of_adt(a), item);
+        }
         if !picked && (p.methods.contains_key(&(a, item)) || (p.adt(a).is_enum && p.adt(a).variants.iter().any(|v| v.name == item))) {
             return None;
         }
@@ -10142,9 +10146,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// True when an inherent associated function or enum variant
     /// of this name shadows any trait associated const on an Adt
     /// (inherent items win in rustc's path resolution).
-    fn inherent_value_blocks(&self, adt: AdtId, item: Sym) -> bool {
+    fn inherent_value_blocks(&mut self, adt: AdtId, item: Sym) -> bool {
         let p = self.p;
         let template = p.defs.def_of_adt(adt).and_then(|d| p.defs.local_adt(d)).unwrap_or(adt);
+        p.inherent_reads(&mut self.out.reads, p.def_of_adt(template), item);
         p.methods.contains_key(&(template, item)) || (p.adt(adt).is_enum && p.adt(adt).variants.iter().any(|v| v.name == item))
     }
 

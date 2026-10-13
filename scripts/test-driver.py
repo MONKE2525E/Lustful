@@ -62,6 +62,8 @@
 #      new struct regenerate only the edited fn; a restart builds no unit.
 #  20. user trait impl edits leave the full generic path (ImplSet reads);
 #      a lang trait impl edit still takes it.
+#  21. plain inherent impl edits leave it too (MethodSet reads); an
+#      inherent impl with an associated const still takes it.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -900,6 +902,64 @@ def case_user_trait_impl_edits():
     d.kill()
 
 
+def case_inherent_impl_edits():
+    # 21. Plain inherent impls (no associated const, no `dyn` Self) are
+    # outside the trait-system key: method probes and the direct inherent
+    # table lookups (`S::f` paths, inherent-first checks) record
+    # `MethodSet` reads. An added inherent method runs no template check
+    # and almost no discovery; one that shadows a trait method, a removed
+    # assoc fn under `S::f` and `Self::f` callers, and back all equal
+    # cold. An inherent impl with an associated const still takes the
+    # full generic path.
+    work = tempfile.mkdtemp(prefix="lust-driver-inherent-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    head = ("trait Tr {\n    fn go(&self) -> i64;\n}\n"
+            "struct A { v: i64 }\nimpl Tr for A {\n    fn go(&self) -> i64 { 1 }\n}\n"
+            "impl A {\n    fn new() -> A { A { v: 3 } }\n    fn make() -> A { Self::new() }\n}\n"
+            "fn generic<T: Tr>(t: &T) -> i64 { t.go() }\n"
+            "fn wrap<T: Copy>(t: T) -> (T, T) { (t, t) }\n")
+    plain = "".join(f"fn p{i}(x: i64) -> i64 {{ wrap(x + {i}).0 }}\n" for i in range(30))
+    main = ("fn main() {\n    let a = A::make();\n    println!(\"{} {} {}\", a.go(), generic(&a), "
+            + " + ".join(f"p{i}(1)" for i in range(30)) + ");\n}\n")
+    base = head + plain + main
+    steps = [
+        ("base", base, None),
+        ("unused inherent method", base + "impl A {\n    fn twice(&self) -> i64 { self.v * 2 }\n}\n", "few"),
+        ("inherent method shadows the trait method", base + "impl A {\n    fn go(&self) -> i64 { 50 }\n}\n", None),
+        ("assoc fn removed under Self:: and path callers", base.replace("    fn new() -> A { A { v: 3 } }\n", ""), None),
+        ("back", base, None),
+        ("inherent assoc const", base + "impl A {\n    const K: i64 = 4;\n}\n", "full"),
+    ]
+
+    def cold(text):
+        cw = tempfile.mkdtemp(prefix="lust-driver-inherent-cold-")
+        csrc = os.path.join(cw, "x.rs")
+        open(csrc, "w").write(text)
+        env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
+        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
+        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
+        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True) if b.returncode == 0 else None
+        shutil.rmtree(cw, ignore_errors=True)
+        return (c.returncode, r.stdout if r else None)
+
+    d.start()
+    for name, text, expect in steps:
+        open(src, "w").write(text)
+        c = d.run(["check", src], expect=None)
+        st = parse_stats(c.stderr)
+        b = d.run(["build", src, "-o", out], expect=None)
+        r = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+        check(f"inherent impls, {name}: warm equals cold", (c.returncode, r.stdout if r else None) == cold(text), c.stderr[-200:])
+        if expect == "few":
+            check(f"inherent impls, {name}: no template check, little discovery",
+                  st.get("templates") == 0 and st.get("discovered", 99) <= 2 and st.get("rechecked", 99) <= 2, str(st))
+        elif expect == "full":
+            check(f"inherent impls, {name}: full generic path", st.get("templates", 0) > 0, str(st))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -920,6 +980,7 @@ def main():
     case_nested_identity_and_shadowing()
     case_stable_instance_ids()
     case_user_trait_impl_edits()
+    case_inherent_impl_edits()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
