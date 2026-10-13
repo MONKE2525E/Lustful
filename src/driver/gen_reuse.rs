@@ -13,23 +13,26 @@
 //   `compile.rs`, "generic reuse"). No read records trait selection,
 //   so this is the only key for it.
 // - the source: the body and head hash of the AST fn whose text the
-//   body checks. A closure body fn's source is its parent's, an
-//   instance's source is its template's, and a trait default method's
-//   text is part of its trait item, under the first key.
+//   body checks, and what the body takes from other checks in this
+//   collect. An instance's source is its template's source plus the
+//   template check's outputs it replays (picks, closure call kinds and
+//   shapes): its own reads miss the probes that chose those picks. A
+//   closure body fn's source is its parent's plus the closure record the
+//   parent's check made. A trait default method's text is part of its
+//   trait item, under the first key.
 // - everything else the check read (section 8.2 `Reads`: bindings,
 //   method sets, signatures with generics and bounds, layouts). An entry
 //   made under another item-level environment replays its reads against
-//   this program first. Instance entries do not: an instance check
-//   replays its template's picks without probing, so its reads miss the
-//   probes that chose them; after an item edit, instances recheck.
+//   this program first.
 use crate::ast::ExprId;
 use crate::check::closure::ClosureKind;
 use crate::check::collect::Program;
-use crate::check::generics::{FnClass, OwnedArg, OwnedClosure, OwnedTy};
+use crate::check::generics::{CaptureShape, FnClass, OwnedArg, OwnedClosure, OwnedTy};
 use crate::check::picks::TraitPick;
 use crate::def::{DefId, LocalDefId};
 use crate::driver::graph::{Read, ReadKey, Reads};
-use crate::intern::FxMap;
+use crate::intern::{FxHasher, FxMap};
+use std::hash::{Hash, Hasher};
 
 /// One passing template check of a body with no closure expressions:
 /// its trait picks and closure call kinds, by expression offset from
@@ -78,6 +81,11 @@ pub struct GenReuse {
     discovery: FxMap<DefId, DiscoveryEntry>,
     /// Node answers of this collect's program, for read replays.
     memo: FxMap<ReadKey, Read>,
+    /// This collect's template check outputs that instances replay, by
+    /// template, and its closure records, by closure def (fingerprints;
+    /// see `src_of`).
+    tpl_out: FxMap<LocalDefId, u64>,
+    closure_out: FxMap<DefId, u64>,
     /// This collect's work, for the stats line: checks run and reused.
     pub templates_checked: usize,
     pub templates_reused: usize,
@@ -95,19 +103,116 @@ impl GenReuse {
     /// Resets the per-collect state before a collect runs.
     pub fn begin(&mut self) {
         self.memo.clear();
+        self.tpl_out.clear();
+        self.closure_out.clear();
         self.templates_checked = 0;
         self.templates_reused = 0;
         self.discovery_checked = 0;
         self.discovery_reused = 0;
     }
 
-    /// The source fingerprint of one fn of `p`, or None for a fn with no
-    /// checked body of its own (a trait method stub).
+    /// The source fingerprint of one fn of `p` (see the module docs),
+    /// or None for a fn with no checked body of its own (a trait method
+    /// stub) or whose upstream check output is not known yet.
     pub fn src_of(&self, p: &Program, f: LocalDefId) -> Option<u64> {
-        let s = self.source(p, f)?;
-        // A trait default body: its text is in the trait item, which
-        // the trait-system key covers.
-        Some(self.ast_src.get(s.0 as usize).copied().unwrap_or(0))
+        self.src_depth(p, f, 0)
+    }
+
+    fn src_depth(&self, p: &Program, f: LocalDefId, depth: u32) -> Option<u64> {
+        if let Some(&h) = self.ast_src.get(f.0 as usize) {
+            return Some(h);
+        }
+        if depth > 64 {
+            return None;
+        }
+        let mix = |a: u64, b: u64| {
+            let mut h = FxHasher::default();
+            (a, b).hash(&mut h);
+            h.finish()
+        };
+        match p.gx.fn_class.get(f.0 as usize)? {
+            FnClass::Instance => {
+                let t = p.gx.instances.get(&f)?.template_local?;
+                Some(mix(self.src_depth(p, t, depth + 1)?, *self.tpl_out.get(&t)?))
+            }
+            FnClass::Closure | FnClass::TemplateClosure => {
+                let def = *p.gx.closure_fns.get(&f)?;
+                let parent = p.gx.closures.get(&def)?.parent;
+                Some(mix(self.src_depth(p, parent, depth + 1)?, *self.closure_out.get(&def)?))
+            }
+            // A trait default body: its text is in the trait item, which
+            // the trait-system key covers.
+            FnClass::Template => Some(0),
+            FnClass::Plain | FnClass::Stub => None,
+        }
+    }
+
+    /// Records the outputs of template `t`'s check (fresh or reused)
+    /// that its instances replay, as one fingerprint over expression
+    /// offsets from the body's first expression.
+    pub fn note_template_out(
+        &mut self,
+        p: &Program,
+        t: LocalDefId,
+        picks: &[(ExprId, TraitPick)],
+        calls: &[(ExprId, ClosureKind)],
+        shapes: &[(ExprId, ClosureKind, Vec<CaptureShape>)],
+    ) {
+        let lo = p.fn_info(t).def.exprs.0;
+        let off = |e: ExprId| e.0.wrapping_sub(lo);
+        let mut picks: Vec<(u32, u64, u8, u8)> = picks
+            .iter()
+            .map(|(e, k)| {
+                let form = match k.form {
+                    crate::driver::graph::ReceiverForm::Value => 0u8,
+                    crate::driver::graph::ReceiverForm::Ref => 1,
+                    crate::driver::graph::ReceiverForm::RefMut => 2,
+                };
+                (off(*e), k.trait_def.hash.0, k.derefs, form)
+            })
+            .collect();
+        picks.sort_unstable();
+        let mut calls: Vec<(u32, ClosureKind)> = calls.iter().map(|(e, k)| (off(*e), *k)).collect();
+        calls.sort_unstable();
+        let mut h = FxHasher::default();
+        "tpl-out-v1".hash(&mut h);
+        picks.hash(&mut h);
+        calls.hash(&mut h);
+        (shapes.len() as u64).hash(&mut h);
+        for (e, kind, caps) in shapes {
+            (off(*e), kind).hash(&mut h);
+            (caps.len() as u64).hash(&mut h);
+            for (root, projs, mode) in caps {
+                (root, mode).hash(&mut h);
+                (projs.len() as u64).hash(&mut h);
+                for pr in projs {
+                    match pr {
+                        crate::ir::Proj::Deref => 0u8.hash(&mut h),
+                        crate::ir::Proj::Field(i) => (1u8, i).hash(&mut h),
+                        crate::ir::Proj::Downcast(i) => (2u8, i).hash(&mut h),
+                        crate::ir::Proj::Index(l) => (3u8, l).hash(&mut h),
+                    }
+                }
+            }
+        }
+        self.tpl_out.insert(t, h.finish());
+    }
+
+    /// Records the closures one discovery check registers, by def (the
+    /// first record of a def wins, as in `register_closures`).
+    pub fn note_closures(&mut self, closures: &[OwnedClosure]) {
+        for oc in closures {
+            let mut h = FxHasher::default();
+            "closure-out-v1".hash(&mut h);
+            oc.kind.hash(&mut h);
+            hash_owned_ty(&mut h, &oc.env);
+            (oc.inputs.len() as u64).hash(&mut h);
+            for t in &oc.inputs {
+                hash_owned_ty(&mut h, t);
+            }
+            hash_owned_ty(&mut h, &oc.output);
+            self.closure_out.entry(oc.def).or_insert(h.finish());
+        }
     }
 
     /// The fn whose source text one fn of `p` checks: an AST fn, or a
@@ -181,9 +286,8 @@ impl GenReuse {
             return None;
         }
         let src = self.src_of(p, f)?;
-        let instance = p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Instance);
         let e = self.discovery.get_mut(&p.def_id(f))?;
-        if e.src != src || (instance && e.env != self.env) || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
+        if e.src != src || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
             return None;
         }
         let mut requests = Vec::with_capacity(e.requests.len());
@@ -227,4 +331,79 @@ fn with_own_sig(p: &Program, f: LocalDefId, reads: &Reads) -> Reads {
     let mut reads = reads.clone();
     let _ = p.sig_of(&mut reads, p.def_id(f));
     reads
+}
+
+/// Hashes one owned type snapshot by its stable content: defs, kinds,
+/// regions, and consts; a fn pointer's session-local signature ids are
+/// skipped (its inputs and output are hashed from the snapshot).
+fn hash_owned_ty(h: &mut FxHasher, t: &OwnedTy) {
+    match t {
+        OwnedTy::Leaf(k) => (0u8, k).hash(h),
+        OwnedTy::Ref(r, m, e) => {
+            (1u8, r, m).hash(h);
+            hash_owned_ty(h, e);
+        }
+        OwnedTy::RawPtr(m, e) => {
+            (2u8, m).hash(h);
+            hash_owned_ty(h, e);
+        }
+        OwnedTy::Slice(e) => {
+            3u8.hash(h);
+            hash_owned_ty(h, e);
+        }
+        OwnedTy::Array(e, n) => {
+            (4u8, n).hash(h);
+            hash_owned_ty(h, e);
+        }
+        OwnedTy::Tuple(es) => {
+            (5u8, es.len() as u64).hash(h);
+            for e in es {
+                hash_owned_ty(h, e);
+            }
+        }
+        OwnedTy::Adt(d, a) | OwnedTy::FnDef(d, a) | OwnedTy::Closure(d, a) | OwnedTy::Opaque(d, a) => {
+            let tag = match t {
+                OwnedTy::Adt(..) => 6u8,
+                OwnedTy::FnDef(..) => 7,
+                OwnedTy::Closure(..) => 8,
+                _ => 9,
+            };
+            (tag, d).hash(h);
+            hash_owned_args(h, a);
+        }
+        OwnedTy::Projection(d, a) => {
+            (10u8, d.0).hash(h);
+            hash_owned_args(h, a);
+        }
+        OwnedTy::FnPtr(b, inputs, output) => {
+            (11u8, b.count, b.value.is_unsafe, b.value.extern_c, inputs.len() as u64).hash(h);
+            for e in inputs {
+                hash_owned_ty(h, e);
+            }
+            hash_owned_ty(h, output);
+        }
+        OwnedTy::Dyn(principal, supers, auto, r) => {
+            (12u8, principal.count, auto, r).hash(h);
+            hash_owned_args(h, &principal.value);
+            (supers.len() as u64).hash(h);
+            for (count, args) in supers {
+                count.hash(h);
+                hash_owned_args(h, args);
+            }
+        }
+    }
+}
+
+fn hash_owned_args(h: &mut FxHasher, args: &[OwnedArg]) {
+    (args.len() as u64).hash(h);
+    for a in args {
+        match a {
+            OwnedArg::Ty(t) => {
+                0u8.hash(h);
+                hash_owned_ty(h, t);
+            }
+            OwnedArg::Lifetime(r) => (1u8, r).hash(h),
+            OwnedArg::Const(c) => (2u8, c).hash(h),
+        }
+    }
 }

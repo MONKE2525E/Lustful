@@ -3547,6 +3547,7 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         // a recheck. A body with closure expressions always rechecks:
         // its check also registers closure body fns.
         if let Some((picks, calls)) = reuse.template(p, t) {
+            reuse.note_template_out(p, t, &picks, &calls, &[]);
             p.gx.trait_picks.extend(picks);
             record_template_closures(p, t, Vec::new(), calls);
             continue;
@@ -3556,11 +3557,13 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         // analysis is recorded for the instances. Only bodies with
         // closure expressions pay this extra check.
         let mut closure_fns: Vec<LocalDefId> = Vec::new();
+        let mut template_shapes: ClosureShapes = Vec::new();
         if fn_has_closures(p, t) {
             let (owned, shapes) = {
                 let (c, _) = crate::check::check_fn(p, t);
                 (snapshot_closures(&c), closure_shapes(&c))
             };
+            template_shapes.clone_from(&shapes);
             record_template_closures(p, t, shapes, Vec::new());
             if let Some(owned) = owned {
                 closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
@@ -3583,6 +3586,7 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
             (e, picks, calls, reads)
         };
         reuse.templates_checked += 1;
+        reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
         if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
             reuse.store_template(p, t, &reads, &picks, &calls);
         }
@@ -3696,11 +3700,11 @@ fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKin
 /// the program can grow while it registers (see `register_closures`).
 #[derive(Clone)]
 pub(crate) struct OwnedClosure {
-    def: DefId,
-    kind: crate::check::closure::ClosureKind,
-    env: OwnedTy,
-    inputs: Vec<OwnedTy>,
-    output: OwnedTy,
+    pub(crate) def: DefId,
+    pub(crate) kind: crate::check::closure::ClosureKind,
+    pub(crate) env: OwnedTy,
+    pub(crate) inputs: Vec<OwnedTy>,
+    pub(crate) output: OwnedTy,
 }
 
 /// Snapshots the closures of one checked body. None when a closure
@@ -4087,6 +4091,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 }
                 (adt_tys, reqs, closures_owned)
             };
+            reuse.note_closures(&closures_owned);
             register_closures(p, fid, closures_owned, FnClass::Closure);
             for owned in &adt_tys_owned {
                 let gt = build_owned_ty(p, owned);

@@ -93,6 +93,10 @@ pub(crate) struct Front {
     /// lives as long as its slot number (it clears only where
     /// `slot_of` does); `Caches::ok` false marks a stale instance.
     pub(crate) inst_slot: Vec<bool>,
+    /// Per instance slot, the item-level environment (`GenReuse::env`)
+    /// of its last check or read replay: a slot from another one
+    /// replays its stored reads before reuse.
+    pub(crate) slot_env: Vec<u64>,
     /// How many AST fns the slot assignment covers: `fn_slot` holds
     /// these first, then the instance slots of a generic program.
     pub(crate) ast_fn_count: usize,
@@ -232,9 +236,7 @@ pub(crate) struct Caches {
     /// (the item-level environment and AST fn count they were made
     /// under) holds.
     pub(crate) gen_reuse: super::gen_reuse::GenReuse,
-    /// The item-level environment (item-scan hash and AST fn count) and
-    /// the trait-system fingerprint of the last collect (see compile.rs).
-    pub(crate) gen_env: Option<u64>,
+    /// The trait-system fingerprint of the last collect (see compile.rs).
     pub(crate) gen_trait: Option<u64>,
     /// Fingerprint of the instance Adt numbering (id, instance key) the
     /// current `out` entries of a generic program were generated under.
@@ -289,6 +291,7 @@ impl Session {
                 manifest_per_unit: 0,
                 slot_hash: Vec::new(),
                 inst_slot: Vec::new(),
+                slot_env: Vec::new(),
                 ast_fn_count: 0,
                 slots_renumbered: false,
                 slot_head: Vec::new(),
@@ -325,7 +328,6 @@ impl Session {
                 persistent,
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
-                gen_env: None,
                 gen_trait: None,
                 inst_adt_fp: 0,
             },

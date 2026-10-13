@@ -2167,12 +2167,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         && !const_fn_changed
         && !nested_static
         && !front.slots_renumbered;
-    let env_same = gen_env.is_some() && caches.gen_env == gen_env;
     if !gen_ok {
         caches.gen_reuse.clear();
     }
     front.slots_renumbered = false;
-    caches.gen_env = gen_env;
     caches.gen_trait = Some(gen_trait);
     caches.gen_reuse.on = caches.persistent && gen_env.is_some() && !nested_static;
     caches.gen_reuse.env = gen_env.unwrap_or(0);
@@ -2282,6 +2280,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.slot_ir.resize_with(n_slots, || None);
         front.slot_hash.resize(n_slots, 0);
         front.inst_slot.resize(n_slots, false);
+        front.slot_env.resize(n_slots, 0);
         let mut present = vec![false; n_slots];
         for i in fn_count..program.fns.len() {
             let s = front.fn_slot[i] as usize;
@@ -2292,10 +2291,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if !front.inst_slot[s] {
                 continue;
             }
-            if !gen_ok || !env_same {
-                // Checked under another environment: an instance check
-                // replays its template's picks without probing, so its
-                // reads cannot prove it still holds (see gen_reuse.rs).
+            if !gen_ok {
+                // Checked under another trait system.
                 caches.ok[s] = false;
             }
             // An instance slot with no instance in a build is dead: its
@@ -2447,9 +2444,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if program.gx.has_generics {
         // Generic reuse: a plain fn rechecks when the front end or the
         // read-set walk put it in `changed`; an instance or closure body
-        // fn when its source changed or the environment moved (its slot
-        // is then stale, see above); any of them when its last check
-        // failed or a build has no C for it. C names Adts by id and
+        // fn when its source changed or, checked under another item-level
+        // environment, its reads no longer hold; any of them when its
+        // last check failed or a build has no C for it. C names Adts by id and
         // instance Adt ids are creation order, so a build whose
         // instance Adt numbering moved regenerates every body. Without
         // reuse, the whole concrete set rechecks, every compile.
@@ -2477,20 +2474,30 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             )
         };
         let reuse = &caches.gen_reuse;
-        work = (0..program.fns.len())
-            .filter(|&i| concrete(i))
-            .filter(|&i| {
-                let s = front.fn_slot[i] as usize;
-                regenerate_all
-                    || !caches.ok[s]
-                    || (build && !caches.has_out[s])
-                    || if i < fn_count {
-                        body_changed[i]
-                    } else {
-                        reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s])
-                    }
-            })
-            .collect();
+        let env = gen_env.unwrap_or(0);
+        let mut memo = FxMap::default();
+        work = Vec::new();
+        for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
+            let s = front.fn_slot[i] as usize;
+            let mut recheck = regenerate_all || !caches.ok[s] || (build && !caches.has_out[s]);
+            if !recheck && i < fn_count {
+                recheck = body_changed[i];
+            } else if !recheck {
+                // An instance or closure body fn: its source (with what
+                // it replays from its template or parent), then, if it
+                // was checked under another item-level environment, its
+                // reads (see gen_reuse.rs).
+                recheck = reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s])
+                    || (front.slot_env[s] != env
+                        && !caches.slot_reads[s].as_ref().is_some_and(|r| program.reads_dirty_memo(r, &mut memo) == 0));
+                if !recheck {
+                    front.slot_env[s] = env;
+                }
+            }
+            if recheck {
+                work.push(i);
+            }
+        }
         // A recheck leaves the slot's C stale until codegen replaces
         // it; a check request, or a build that stops on errors, never
         // gets there.
@@ -2515,11 +2522,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut diags: Vec<Diag> = Vec::new();
     for (k, &i) in work.iter().enumerate() {
         caches.ok[slot(i)] = results[k].1.is_empty();
-        // An instance slot remembers the source it was checked from.
+        // An instance slot remembers the source and the environment it
+        // was checked under.
         if i >= fn_count
             && let Some(src) = caches.gen_reuse.src_of(&program, LocalDefId(i as u32))
         {
             front.slot_hash[slot(i)] = src;
+            if let Some(e) = front.slot_env.get_mut(slot(i)) {
+                *e = gen_env.unwrap_or(0);
+            }
         }
         // Store the read set with the result (section 8.2 rule 2): the
         // next signature-only edit replays it in the dirty walk above.
