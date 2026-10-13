@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Parser robustness fuzz: truncations and mutations of tests/pass files, plus random
-# token soup. Every case runs under a 2 second timeout. A hang (timeout), a compiler
+# token soup. Every case runs under a timeout (PARSE_FUZZ_TIMEOUT seconds, default 2). A hang (timeout), a compiler
 # panic (exit 101), or a signal death (exit > 128) is a failure; clean accepts and
 # clean errors are both fine. Failing inputs are kept in a directory printed at the end.
 # Usage: scripts/parse-fuzz.sh [cases] [seed]
@@ -72,7 +72,7 @@ PY
 export LUST_BIN="$lust" FAILDIR="$faildir"
 run_one() {
   f="$1"
-  LUST_NO_DAEMON=1 timeout 2 "$LUST_BIN" check "$f" >/dev/null 2>&1
+  LUST_NO_DAEMON=1 timeout "${PARSE_FUZZ_TIMEOUT:-2}" "$LUST_BIN" check "$f" >/dev/null 2>&1
   code=$?
   if [ "$code" -eq 124 ] || [ "$code" -eq 101 ] || [ "$code" -gt 128 ]; then
     cp "$f" "$FAILDIR/"
