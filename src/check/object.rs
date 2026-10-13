@@ -728,18 +728,17 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 /// True when a value of type `t` may hold a borrow, so a dyn value made
 /// from it may not live for `'static` (rustc E0597, E0310): a reference,
-/// a type param or its template stand-in, a dyn type with an erased
-/// object lifetime, a borrowing std iterator, or anything holding one.
+/// a type param, a closure (its captures may borrow), a dyn type with
+/// an erased object lifetime, a borrowing std iterator, or anything
+/// holding one.
 pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Ref(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) => true,
+        TyKind::Ref(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Closure(..) => true,
         TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
         TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow(p, tys, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow(p, tys, e)),
-        TyKind::Adt(_, a) | TyKind::Closure(_, a) => {
-            tys.is_chars_ty(t)
-                || tys.local_adt(t).is_some_and(|id| p.gx.opaque_adts.contains(&id))
-                || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow(p, tys, e)))
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) => {
+            tys.is_chars_ty(t) || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow(p, tys, e)))
         }
         _ => false,
     }

@@ -1892,12 +1892,6 @@ pub struct GenTables<'a> {
     /// The self type and span of each `impl dyn Trait` block, for
     /// the dyn type checks.
     pub dyn_impl_sites: Vec<(Ty, Span)>,
-    /// The abstract stand-ins (opaque Adts) of template params
-    /// written `?Sized`: they answer `Sized` with false, so a
-    /// template cannot unsize or pass on a param that may be `dyn`.
-    pub unsized_opaques: Vec<AdtId>,
-    /// Every abstract stand-in Adt: a template param may hold a borrow.
-    pub opaque_adts: Vec<AdtId>,
     /// Impls whose header names a dyn type with a `'static` object
     /// lifetime (`impl dyn Tr`, `impl X for dyn Tr`), and their methods.
     /// Using one needs the dyn value to be `'static` (`check::object`).
@@ -1951,8 +1945,6 @@ impl Default for GenTables<'_> {
             vtable_by_key: FxMap::default(),
             dyn_inherent: FxMap::default(),
             dyn_impl_sites: Vec::new(),
-            unsized_opaques: Vec::new(),
-            opaque_adts: Vec::new(),
             static_dyn_impls: Vec::new(),
             static_dyn_fns: Vec::new(),
             mono_done: false,
@@ -3699,7 +3691,7 @@ pub(crate) fn instance_at(p: &mut Program, f: LocalDefId, args: &[GenericArg], m
         return f;
     }
     let before = p.fns.len();
-    let inst = fn_instance(p, f, args, FnClass::Instance);
+    let inst = fn_instance(p, f, args);
     if inst.0 as usize >= before {
         made.push(inst);
     }

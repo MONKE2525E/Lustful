@@ -1600,10 +1600,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // template, whose fields are over its own params:
                     // substitute this application's args first.
                     let p = self.p;
-                    // The abstract stand-in of a `?Sized` template param.
-                    if p.gx.unsized_opaques.contains(&a) {
-                        return false;
-                    }
                     let args: Vec<GenericArg> = self.tys.adt_parts(t).map(|(_, a)| self.tys.args(a).to_vec()).unwrap_or_default();
                     let lasts: Vec<Ty> = p.adt(a).variants.iter().filter_map(|v| v.fields.last().map(|f| f.ty)).collect();
                     lasts.into_iter().all(|f| {
@@ -5500,7 +5496,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn layout_of_val_callee(&mut self, callee: ExprId) -> Option<bool> {
         let Expr::Path(segs) = self.p.ast.expr(callee) else { return None };
         let last = match segs.iter().map(|s| self.name(s.name)).collect::<Vec<_>>().as_slice() {
-            [n] | ["mem", n] | ["std" | "core", "mem", n] => *n,
+            [n] | ["std" | "core", "mem", n] => *n,
             _ => return None,
         };
         let align = match last {

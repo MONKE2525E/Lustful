@@ -717,6 +717,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => (1, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
             Coerce::BoxToRef(n, m) => (n as usize, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
+            // A dyn coercion reborrows the source at the target's
+            // mutability before it builds the fat pointer.
+            Coerce::Unsize(t) => (1, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref }),
             Coerce::StrFromString => {
                 // Builtin derefs down to the `String`, then its
                 // overloaded deref borrows it.
