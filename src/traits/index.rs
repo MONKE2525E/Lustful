@@ -850,7 +850,13 @@ fn ref_has_local_side(tys: &impl TyIntern, args: ArgsId, fundamental: &[DefId], 
     for g in tys.args(args) {
         let Some(t) = g.as_ty() else { continue };
         let base = strip_fundamental(tys, &empty, t, fundamental);
-        if matches!(tys.kind(base), TyKind::Adt(d, _) if is_local(d)) {
+        let local = match tys.kind(base) {
+            TyKind::Adt(d, _) => is_local(d),
+            // `dyn LocalTrait` is local, as in rustc.
+            TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| is_local(pr.value.def)),
+            _ => false,
+        };
+        if local {
             return !seen_uncovered;
         }
         if has_uncovered_param(tys, t, false, fundamental) {
@@ -1085,6 +1091,29 @@ mod tests {
             })
         };
         assert!(!index.orphan_ok(&g, index.get(id), &[], &local_only));
+    }
+
+    /// `dyn Local` is a local type, also behind a reference (rustc's
+    /// `ty_is_local_constructor`); `dyn Foreign` is not.
+    #[test]
+    fn orphan_rule_dyn_types() {
+        let mut g = GlobalTys::new();
+        let (foreign_tr, local_tr, foreign_tr2) = (def(5000), def(10), def(5001));
+        let mut index = ImplIndex::new();
+        let local_only = |d: DefId| d.hash.0 < 1000;
+        let dyn_of = |g: &mut GlobalTys, tr: DefId| {
+            let args = g.intern_args(&[GenericArg::Ty(DYN_SELF)]);
+            let principal = Some(Binder::plain(TraitRef { def: tr, args, bindings: EMPTY_BINDINGS }));
+            let b = g.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto: AutoTraits::default() });
+            g.intern(TyKind::Dyn(b, Region::Erased))
+        };
+        let local_dyn = dyn_of(&mut g, local_tr);
+        let foreign_dyn = dyn_of(&mut g, foreign_tr2);
+        let ref_local = g.mk_ref(false, local_dyn);
+        for (n, (t, ok)) in [(local_dyn, true), (ref_local, true), (foreign_dyn, false)].into_iter().enumerate() {
+            let id = add_impl(&mut g, &mut index, 1100 + n as u64, foreign_tr, t, &[], 0, vec![]);
+            assert_eq!(index.orphan_ok(&g, index.get(id), &[], &local_only), ok, "case {n}");
+        }
     }
 
     /// Head-bucketed pair generation finds exactly the pairs the
