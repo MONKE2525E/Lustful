@@ -4,8 +4,9 @@
 #   autostart: fresh dir, first build cold and standalone, second build served
 #              by the daemon (its binary loads libbase.so). Plus LUST_NO_DAEMON,
 #              a 4-way start race, and the idle timeout.
-#   temp:      the daemon temp dir dies with the daemon (SIGTERM, SIGINT, idle),
-#              a startup sweep removes SIGKILL leftovers, kept binaries still run.
+#   temp:      the daemon temp dir dies with the daemon (SIGTERM, SIGINT, socket
+#              removal, idle), a startup sweep removes SIGKILL leftovers, and
+#              kept binaries still run.
 #   cache:     hit, then miss on edit, on -g, and on a compiler id change.
 #              Eviction keeps the newest entries under the size cap.
 #   release:   single file via rustc, a tiny Cargo project via cargo (package
@@ -165,6 +166,17 @@ for sig in TERM INT; do
   if [ -S "$(sock "$d")" ]; then bad "temp $sig: socket removed on exit" "socket still there"; else ok "temp $sig: socket removed on exit"; fi
   check "temp $sig: daemon-built binary still runs" test "$("$d/warm2")" = "hello 42"
 done
+# Removing the socket file is also a stop request: the daemon takes the
+# same controlled exit and removes its temp dir.
+d=$(fresh tmpsockrm); daemon_dirs+=("$d")
+warm_build "$d" warm2
+pid=$(cat "$(sock "$d").lock" 2>/dev/null)
+s=$(sock "$d")
+check "temp sockrm: temp dir exists while daemon runs" test -d "$TMPDIR/lust-daemon-$pid"
+rm -f "$s"
+check "temp sockrm: daemon exits" wait_dead_pid "$pid"
+if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp sockrm: temp dir removed on exit"; else bad "temp sockrm: temp dir removed on exit" "$TMPDIR/lust-daemon-$pid remains"; fi
+check "temp sockrm: daemon-built binary still runs" test "$("$d/warm2")" = "hello 42"
 # Idle exit also removes the temp dir (directory checked here; the
 # socket and restart behavior are covered in the idle section above).
 d=$(fresh tmpidle); daemon_dirs+=("$d")

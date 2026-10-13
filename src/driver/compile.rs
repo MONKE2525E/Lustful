@@ -191,7 +191,7 @@ fn install_base(tmp: &Path, dest: &Path) -> Result<(), String> {
     }
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
-        Err(e) if dest.exists() => {
+        Err(_) if dest.exists() => {
             let _ = std::fs::remove_file(tmp);
             Ok(())
         }

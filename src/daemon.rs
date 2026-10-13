@@ -6,9 +6,10 @@
 // whole life. A second daemon sees the lock taken and exits without touching the socket, so
 // a stale socket file can always be removed safely by the lock holder.
 // The daemon exits on its own after an idle span (`LUST_DAEMON_IDLE`, default 30 minutes;
-// see protocol::daemon_idle) and removes its socket on the way out. SIGTERM and SIGINT
-// take the same controlled exit (a flag plus a self-pipe wakeup; the serve loop does
-// the cleanup, never the signal handler).
+// see protocol::daemon_idle) and removes its socket on the way out. SIGTERM, SIGINT, and
+// removal of the socket file take the same controlled exit. Signals use a flag plus a
+// self-pipe wakeup; socket removal uses an inotify watch on Linux. In both cases the
+// serve loop does the cleanup.
 // Temp state: sessions work under `<temp>/lust-daemon-<pid>/`, which every controlled
 // exit deletes, and which a starting daemon also deletes for any pid that is gone
 // (that is what cleans up after SIGKILL and crashes). Deleting it is safe for built
@@ -31,7 +32,10 @@
 use crate::driver::{self, Request, Session};
 use crate::protocol::{self, Response, SessionKey};
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::io::{BufReader, Seek, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
@@ -48,11 +52,25 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn getuid() -> u32;
+    #[cfg(target_os = "linux")]
+    fn inotify_init1(flags: i32) -> i32;
+    #[cfg(target_os = "linux")]
+    fn inotify_add_watch(fd: i32, path: *const u8, mask: u32) -> i32;
+    #[cfg(target_os = "linux")]
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    #[cfg(target_os = "linux")]
+    fn close(fd: i32) -> i32;
 }
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 const F_SETFD: i32 = 2;
 const FD_CLOEXEC: i32 = 1;
+#[cfg(target_os = "linux")]
+const IN_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "linux")]
+const IN_CLOEXEC: i32 = 0o2000000;
+const IN_MOVED_FROM: u32 = 0x40;
+const IN_DELETE: u32 = 0x200;
 
 /// Set by the SIGTERM/SIGINT handler; the serve loop sees it and exits
 /// through the same cleanup as the idle timeout.
@@ -82,14 +100,102 @@ struct PollFd {
 }
 
 /// Waits until `listener` can accept, a shutdown signal pokes the wake
-/// pipe, or `timeout` passes. None timeout waits forever. True only for
-/// a readable listener; the caller checks `SHUTDOWN` itself. This is how
-/// the idle exit costs no latency: no sleep-based polling.
-fn wait_readable(listener: &UnixListener, wake: i32, timeout: Option<std::time::Duration>) -> bool {
-    let mut pfds = [PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 }, PollFd { fd: wake, events: POLLIN, revents: 0 }];
+/// pipe, the socket watch reports an event, or `timeout` passes. None
+/// timeout waits forever. True only for a readable listener; the caller
+/// checks the signal flag and the socket watch itself. This is how the
+/// idle exit costs no latency: no sleep-based polling.
+fn wait_readable(listener: &UnixListener, wake: i32, socket_watch: i32, timeout: Option<std::time::Duration>) -> bool {
+    let mut pfds = [
+        PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
+        PollFd { fd: wake, events: POLLIN, revents: 0 },
+        PollFd { fd: socket_watch, events: POLLIN, revents: 0 },
+    ];
     let ms = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
-    // SAFETY: two valid pollfds over live fds, for the duration of the call.
-    unsafe { poll(pfds.as_mut_ptr(), 2, ms) > 0 && pfds[0].revents & POLLIN != 0 }
+    // SAFETY: valid pollfds over live fds (an unavailable socket watch is
+    // -1, which poll ignores), for the duration of the call.
+    unsafe { poll(pfds.as_mut_ptr(), 3, ms) > 0 && pfds[0].revents & POLLIN != 0 }
+}
+
+/// Starts an inotify watch for deletion or move-away of `sock` from its
+/// parent directory and returns the watch fd, or -1 when the watch cannot
+/// be set up (the daemon then keeps the other exits). Linux only.
+#[cfg(target_os = "linux")]
+fn watch_socket_removal(sock: &Path) -> i32 {
+    let parent = match sock.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let Ok(parent) = CString::new(parent.as_os_str().as_bytes()) else { return -1 };
+    // SAFETY: inotify_init1 takes only flags; add_watch gets a valid fd
+    // and a NUL-terminated path that outlives the call.
+    unsafe {
+        let fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if fd < 0 {
+            return -1;
+        }
+        if inotify_add_watch(fd, parent.as_ptr() as *const u8, IN_DELETE | IN_MOVED_FROM) < 0 {
+            close(fd);
+            return -1;
+        }
+        fd
+    }
+}
+
+/// Starts an inotify watch for deletion or move-away of `sock` from its
+/// parent directory and returns the watch fd, or -1 when the watch cannot
+/// be set up (the daemon then keeps the other exits). Linux only.
+#[cfg(not(target_os = "linux"))]
+fn watch_socket_removal(_sock: &Path) -> i32 {
+    -1
+}
+
+/// True when raw inotify bytes hold a delete or move-away event for `name`.
+fn socket_removal_event(buf: &[u8], name: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at + 16 <= buf.len() {
+        let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
+        let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
+        let Some(next) = at.checked_add(16).and_then(|n| n.checked_add(len)) else { return false };
+        if next > buf.len() {
+            return false;
+        }
+        let raw = &buf[at + 16..next];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        if mask & (IN_DELETE | IN_MOVED_FROM) != 0 && &raw[..end] == name {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
+/// True when the watched socket was removed since the last call. A call
+/// with no pending events is one nonblocking read, so the serve loop can
+/// ask after every wait at no polling cost.
+#[cfg(target_os = "linux")]
+fn socket_removed(watch: i32, sock: &Path) -> bool {
+    if watch < 0 {
+        return false;
+    }
+    let Some(name) = sock.file_name() else { return false };
+    let mut buf = [0u8; 4096];
+    // SAFETY: `watch` is a live inotify fd made by `watch_socket_removal`,
+    // `buf` has room for the requested count, and the call is nonblocking.
+    let n = unsafe { read(watch, buf.as_mut_ptr(), buf.len()) };
+    if n <= 0 {
+        return false;
+    }
+    // The fallback existence check covers event-queue overflow and a
+    // removal that landed between the bind and the watch setup.
+    socket_removal_event(&buf[..n as usize], name.as_bytes()) || sock.symlink_metadata().is_err()
+}
+
+/// True when the watched socket was removed since the last call. A call
+/// with no pending events is one nonblocking read, so the serve loop can
+/// ask after every wait at no polling cost.
+#[cfg(not(target_os = "linux"))]
+fn socket_removed(_watch: i32, _sock: &Path) -> bool {
+    false
 }
 
 /// The pid in a lust temp name (`lust-daemon-<pid>`, `lust-<pid>`,
@@ -150,7 +256,8 @@ fn sweep_stale_temp_dirs() {
     }
 }
 
-/// The one controlled daemon exit (idle timeout and shutdown signals):
+/// The one controlled daemon exit (idle timeout, shutdown signals, and
+/// socket removal):
 /// sweep each session's base dir (dead executables lose their bases,
 /// kept executables keep theirs), delete the per-daemon temp dir and
 /// the socket, then exit. Guard workers may still run on a signal
@@ -534,6 +641,11 @@ pub fn serve(sock: &Path) -> ! {
         signal(SIGINT, on_shutdown_signal as usize);
         signal(SIGTERM, on_shutdown_signal as usize);
     }
+    // Removing the socket file is a stop request too. The watch wakes
+    // the same poll as the listener and the signal pipe; the serve loop
+    // checks it before each wait. A removal that lands before the watch
+    // starts is caught by the existence check in `socket_removed`.
+    let socket_watch = watch_socket_removal(sock);
     eprintln!("lust daemon: listening on {}", sock.display());
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
@@ -575,6 +687,9 @@ pub fn serve(sock: &Path) -> ! {
         last = std::time::Instant::now();
     }
     loop {
+        if socket_removed(socket_watch, sock) {
+            shutdown(sock, &base, &sessions, "socket removed");
+        }
         if SHUTDOWN.load(Ordering::SeqCst) {
             shutdown(sock, &base, &sessions, "shutdown signal");
         }
@@ -589,7 +704,7 @@ pub fn serve(sock: &Path) -> ! {
             let cap = std::time::Duration::from_millis(20);
             left = Some(left.map_or(cap, |d| d.min(cap)));
         }
-        if !wait_readable(&listener, wake_r, left) {
+        if !wait_readable(&listener, wake_r, socket_watch, left) {
             if jobs.pending == 0 && idle.is_some_and(|d| last.elapsed() >= d) {
                 shutdown(sock, &base, &sessions, "idle timeout");
             }
@@ -684,6 +799,31 @@ mod tests {
         assert!(entry.recompute_next, "the earlier recompute mark stands");
         assert_ne!(entry.session.obj_dir(), warm_dir.as_path());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Inotify bytes count as socket removal only for a delete or
+    /// move-away event that names the socket file itself.
+    #[test]
+    fn socket_removal_event_matches_delete_of_the_socket_name() {
+        let event = |mask: u32, name: &[u8]| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&1i32.to_ne_bytes());
+            b.extend_from_slice(&mask.to_ne_bytes());
+            b.extend_from_slice(&0u32.to_ne_bytes());
+            b.extend_from_slice(&(name.len() as u32 + 1).to_ne_bytes());
+            b.extend_from_slice(name);
+            b.push(0);
+            b
+        };
+        let sock: &[u8] = b".lust-daemon-x.sock";
+        assert!(socket_removal_event(&event(IN_DELETE, sock), sock), "delete of the socket");
+        assert!(socket_removal_event(&event(IN_MOVED_FROM, sock), sock), "move-away of the socket");
+        assert!(!socket_removal_event(&event(IN_DELETE, b"other.sock"), sock), "another file");
+        assert!(!socket_removal_event(&event(0x100, sock), sock), "a close event is not a removal");
+        let mut two = event(IN_DELETE, b"other.sock");
+        two.extend(event(IN_DELETE, sock));
+        assert!(socket_removal_event(&two, sock), "the socket event may follow another");
+        assert!(!socket_removal_event(&event(IN_DELETE, sock)[..8], sock), "truncated bytes never match");
     }
 
     /// Only exact pid-named lust temp entries are sweep candidates.
