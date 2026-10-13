@@ -1049,29 +1049,6 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.pop_scope(block.span);
     }
 
-    /// True when binding this pattern moves a non-Copy part out of the
-    /// matched value (so the pattern consumes the value as a whole).
-    fn pat_moves_value(&self, pat: PatId) -> bool {
-        let p = self.p;
-        if let PatRes::Binding { local, mode } = self.ck.pat_res(pat)
-            && mode == BindMode::Move
-            && !is_copy(self.p, &self.body.tys, self.ck.locals[local as usize].ty)
-        {
-            return true;
-        }
-        match p.ast.pat(pat) {
-            Pat::Tuple(elems) | Pat::TupleStruct { elems, .. } => elems.iter().any(|&e| self.pat_moves_value(e)),
-            Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.pat_moves_value(s)),
-            Pat::Slice { prefix, middle, suffix } => {
-                prefix.iter().chain(suffix.iter()).any(|&e| self.pat_moves_value(e))
-                    || middle.is_some_and(|m| self.pat_moves_value(m))
-            }
-            Pat::Or(alts) => alts.iter().any(|&a| self.pat_moves_value(a)),
-            Pat::Ref { inner, .. } | Pat::At { inner, .. } | Pat::Paren(inner) => self.pat_moves_value(*inner),
-            _ => false,
-        }
-    }
-
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>, span: Span) {
         let p = self.p;
         match (p.ast.pat(pat), self.ck.pat_res(pat)) {
@@ -1134,15 +1111,16 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             _ => {
-                // A destructuring `let` whose bindings only copy or borrow
-                // binds directly out of a place initializer, so the value
-                // is not moved at all. A pattern that moves a part consumes
-                // the whole value (the unbound rest drops with it), so it
-                // goes through a temporary: the initializer moves there
-                // once, stays in scope before the bindings, and fields the
-                // pattern does not move still drop at scope exit.
+                // A destructuring `let` binds directly out of a place
+                // initializer, as in rustc: a binding that moves a part
+                // is a partial move of that place, and the parts the
+                // pattern does not move stay in it and drop with it
+                // (codegen elaborates the drop, `cgen::FnGen::elab_drop`).
+                // Any other initializer goes through a temporary: it
+                // moves there once, stays in scope before the bindings,
+                // and parts the pattern does not move drop at scope exit.
                 if let Some(init) = init {
-                    if self.is_place_expr(init) && !self.pat_moves_value(pat) {
+                    if self.is_place_expr(init) {
                         self.scopes.push(Vec::new());
                         let pl = self.place(init);
                         // Move the place's own temporaries (index values
@@ -1576,19 +1554,10 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn match_into(&mut self, scrut: ExprId, arms: &[ast::Arm], dest: Option<&Place>, span: Span) {
         // Temporaries in the scrutinee live until the end of the match.
         self.scopes.push(Vec::new());
-        let mut sp = self.place(scrut);
-        // An arm that moves a part out consumes the whole scrutinee
-        // value: move it into a temporary first so the place it came
-        // from is spent, as with a destructuring `let`.
-        if arms.iter().any(|a| self.pat_moves_value(a.pat)) {
-            let ty = self.ty(scrut);
-            if !matches!(self.kind(ty), TyKind::Ref(..)) {
-                let t = self.temp(ty);
-                let op = self.operand_from(sp, ty);
-                self.assign(Place::local(t), Rvalue::Use(op), span);
-                sp = Place::local(t);
-            }
-        }
+        // Arms bind out of the scrutinee place itself, as in rustc: an
+        // arm that moves a part is a partial move of that place, and
+        // the rest drops with it (codegen elaborates the drop).
+        let sp = self.place(scrut);
         let end = self.new_block();
         for arm in arms {
             let next = self.new_block();
