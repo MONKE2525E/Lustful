@@ -631,6 +631,7 @@ impl ResolvedTables {
                     ResKind::Static => 4,
                     ResKind::Alias => 5,
                     ResKind::Macro => 6,
+                    ResKind::Trait => 7,
                 });
                 h.write_u64(info.flat.0 as u64);
                 h.write_u64(info.module.0 as u64);

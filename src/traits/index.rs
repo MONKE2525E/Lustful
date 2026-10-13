@@ -1113,13 +1113,13 @@ mod tests {
         for (i, &a) in ids.iter().enumerate() {
             for &b in &ids[i + 1..] {
                 let (ra, rb) = (index.get(a).clone(), index.get(b).clone());
-                if index.pair_overlaps(&mut g, &ra, &rb, &[], &is_local) {
+                if index.pair_overlaps(&mut g, &ra, &rb, &[], &[], &is_local) {
                     naive.push((a, b));
                 }
             }
         }
         naive.sort_by_key(|(a, b)| (a.0, b.0));
-        let fast = index.coherence_overlaps(&mut g, &[], &is_local);
+        let fast = index.coherence_overlaps(&mut g, &[], &[], &is_local);
         assert_eq!(fast, naive);
         // The duplicate, the generic-Adt pair, and the ref pair.
         assert_eq!(fast.len(), 3);
