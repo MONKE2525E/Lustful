@@ -1193,8 +1193,12 @@ pub fn collect_with_order<'a>(
         let item = &ast.items[item_idx];
         let id = AdtId(adt_base as u32 + rank);
         adt_id_of_item[item_idx] = Some(id);
-        if p.type_names.insert(name, id).is_some() || p.gx.trait_names.contains_key(&name) {
+        // The first type of a name owns it; a duplicate keeps its own Adt
+        // record (below) but never replaces the name entry.
+        if p.type_names.contains_key(&name) || p.gx.trait_names.contains_key(&name) {
             errs.push(dup(span, interner.get(name)));
+        } else {
+            p.type_names.insert(name, id);
         }
         let n_params = match &item.kind {
             ItemKind::Struct(st) => generics::ast_param_count(&st.generics),
@@ -1229,11 +1233,16 @@ pub fn collect_with_order<'a>(
     // a genuine unknown type (the first error is kept).
     {
         let mut pending: Vec<&ast::TypeAliasDef> = Vec::new();
+        // `aliases` fills only in the fixpoint below, so registration needs
+        // its own seen set to catch a second alias of one name.
+        let mut seen_aliases: Vec<Sym> = Vec::new();
         for item in &ast.items {
             if let ItemKind::Type(a) = &item.kind {
-                if p.type_names.contains_key(&a.name) || p.aliases.contains_key(&a.name) {
+                if p.type_names.contains_key(&a.name) || p.gx.trait_names.contains_key(&a.name) || seen_aliases.contains(&a.name) {
                     errs.push(dup(a.name_span, interner.get(a.name)));
+                    continue;
                 }
+                seen_aliases.push(a.name);
                 pending.push(a);
                 let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::TypeAlias, interner.get(a.name), 0);
                 let def = DefId { krate: p.krate, hash };
@@ -1659,10 +1668,11 @@ pub fn collect_with_order<'a>(
         generics.params.extend(own_generics.params.iter().cloned());
         generics.predicates.extend(own_generics.predicates.iter().copied());
         generics.parent = parent;
-        // A parameter may not reuse a name from the same list or
-        // from the enclosing impl or trait (rustc E0403).
-        for (i, param) in generics.params.iter().enumerate() {
-            if generics.params[..i].iter().any(|q| q.name == param.name) {
+        // A parameter may not reuse a name from the enclosing impl or
+        // trait (rustc E0403). Duplicates inside one list are reported by
+        // `build_generics_shifted`.
+        for param in &own_generics.params {
+            if parent_gen.generics.params.iter().any(|q| q.name == param.name) {
                 errs.push(Diag::new(
                     "L0106",
                     param.span,
@@ -1735,10 +1745,18 @@ pub fn collect_with_order<'a>(
             ItemKind::Fn(def) => {
                 let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
                 let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
-                if p.fn_names.insert(def.name, id).is_some() {
+                // The first value of a name owns it. A unit or tuple struct
+                // constructor is a value of the struct's name too, so a fn
+                // of that name is a duplicate; a braced struct is not.
+                let ctor_taken = p.type_names.get(&def.name).is_some_and(|&a| {
+                    !p.adts[a.0 as usize].is_enum && p.adts[a.0 as usize].variants.first().is_some_and(|v| v.shape != VariantShape::Named)
+                });
+                if p.fn_names.contains_key(&def.name) || ctor_taken {
                     errs.push(dup(def.name_span, interner.get(def.name)));
+                } else {
+                    p.fn_names.insert(def.name, id);
                 }
-                if def.name == known.main {
+                if def.name == known.main && p.main.is_none() {
                     p.main = Some(id);
                 }
             }
@@ -1917,6 +1935,24 @@ pub fn collect_with_order<'a>(
         if idxs.is_empty() {
             continue;
         }
+        // Items in one block share one value namespace, like items in a
+        // module: two of one name in the same block are a duplicate.
+        let mut seen: Vec<Sym> = Vec::new();
+        for &i in &idxs {
+            let (name, span) = match &ast.stmt_items[i as usize].kind {
+                ItemKind::Fn(def) => (Some(def.name), def.name_span),
+                ItemKind::Const(c) => (c.name, c.name_span),
+                ItemKind::Static(s) => (Some(s.name), s.name_span),
+                _ => (None, ast.stmt_items[i as usize].span),
+            };
+            if let Some(name) = name {
+                if seen.contains(&name) {
+                    errs.push(dup(span, interner.get(name)));
+                } else {
+                    seen.push(name);
+                }
+            }
+        }
         for &i in &idxs {
             if let Some(BodyItem::Fn(fid)) = p.body_items.get(&i).copied() {
                 p.fn_siblings.insert(fid, idxs.clone());
@@ -2010,7 +2046,14 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                 by_name.entry(n).or_insert(pending.len());
                 false
             } else {
-                by_name.insert(n, pending.len()).is_some() || p.fn_names.contains_key(&n)
+                // The first value of a name owns it, and a unit or tuple
+                // struct constructor is a value of the struct's name.
+                let ctor_taken = p.type_names.get(&n).is_some_and(|&a| {
+                    !p.adts[a.0 as usize].is_enum && p.adts[a.0 as usize].variants.first().is_some_and(|v| v.shape != VariantShape::Named)
+                });
+                let taken = by_name.contains_key(&n) || p.fn_names.contains_key(&n) || ctor_taken;
+                by_name.entry(n).or_insert(pending.len());
+                taken
             };
             if dup {
                 errs.push(Diag::new(
