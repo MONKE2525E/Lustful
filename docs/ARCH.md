@@ -2882,9 +2882,15 @@ universal, and the facts are: each source outlives each
 other sink and each output slot. The creator adds the same
 source-to-sink edges, and every call's result (a direct
 call, or any call taking a closure that returns borrows,
-and iterator items through it) may hold the sources. Each
-argument slot is higher-ranked, so a closure that stores
-or returns its argument is L0733.
+and iterator items through it) may hold the sources.
+Argument slots are higher-ranked (L0733 when stored or
+returned), except for a closure an iterator method takes
+(check records `free_args` from `fn_mut_param`): its
+arguments are items, free regions, sources (and sinks
+behind a `&mut`), except the outer reference of an `&item`
+argument (`filter`, `find`); the creator links them to the
+call's other arguments (the iterator's sources, `fold`'s
+initial value), write-backs only to element regions.
 
 Templates are checked with abstract type params. Instance
 bodies are borrow-checked too, without the universal
@@ -2966,10 +2972,11 @@ Each case runs against rustc 1.99 in difftest.
 
 Known gaps: regions of body types other than `let`
 annotations (casts, turbofish, closure params); fn pointer and
-dyn regions; closure arguments are always higher-ranked
-(rustc takes free ones from an expected signature: an
-iterator's items); the closure contract's coarser
-source-to-sink edges; `T: 'a`; Adt inferred outlives
+dyn regions; closure arguments are higher-ranked outside
+iterator methods (rustc also frees an unannotated closure's
+arguments, and those of a bound written over a type
+param); the closure contract's coarser source-to-sink
+edges; `T: 'a`; Adt inferred outlives
 facts (missing facts reject, never accept); precise
 builtin region signatures.
 

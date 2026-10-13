@@ -209,7 +209,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "filter" => {
                 let ri = r(self, item);
-                let p = self.fn_mut_param(&[ri], BOOL, span);
+                let p = self.fn_mut_param_ref(&[ri], BOOL, span);
                 let t = mk(self, K::Filter, &[base, p]);
                 (B::IterFilter, vec![p], t)
             }
@@ -278,7 +278,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "take_while" | "skip_while" => {
                 let ri = r(self, item);
-                let p = self.fn_mut_param(&[ri], BOOL, span);
+                let p = self.fn_mut_param_ref(&[ri], BOOL, span);
                 if n == "take_while" {
                     (B::IterTakeWhile, vec![p], mk(self, K::TakeWhile, &[base, p]))
                 } else {
@@ -294,7 +294,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "inspect" => {
                 let ri = r(self, item);
-                let f = self.fn_mut_param(&[ri], UNIT, span);
+                let f = self.fn_mut_param_ref(&[ri], UNIT, span);
                 (B::IterInspect, vec![f], mk(self, K::Inspect, &[base, f]))
             }
             "count" => (B::IterCount, vec![], USIZE),
@@ -312,7 +312,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "find" => {
                 let ri = r(self, item);
-                let p = self.fn_mut_param(&[ri], BOOL, span);
+                let p = self.fn_mut_param_ref(&[ri], BOOL, span);
                 let o = self.tys.mk_option(item);
                 (B::IterFind, vec![p], o)
             }
@@ -355,7 +355,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             "min_by_key" | "max_by_key" => {
                 let key = self.new_var(false);
                 let ri = r(self, item);
-                let f = self.fn_mut_param(&[ri], key, span);
+                let f = self.fn_mut_param_ref(&[ri], key, span);
                 self.deferred_ord.push((key, span));
                 let o = self.tys.mk_option(item);
                 (if n == "min_by_key" { B::IterMinByKey } else { B::IterMaxByKey }, vec![f], o)
@@ -445,9 +445,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// A fresh closure-argument type with the pending obligations of
-    /// `F: FnMut(inputs..) -> output`.
+    /// `F: FnMut(inputs..) -> output`. The closure's arguments are items
+    /// (or `&item`, see `fn_mut_param_ref`): free regions, which the
+    /// borrow checker takes from the iterator (W-BORROW).
     fn fn_mut_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+        self.fn_mut_param_flags(inputs, &vec![false; inputs.len()], output, span)
+    }
+
+    /// `fn_mut_param` for `F: FnMut(&Self::Item) -> output`: the outer
+    /// reference is higher-ranked (Rust's bound writes it).
+    fn fn_mut_param_ref(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+        self.fn_mut_param_flags(inputs, &vec![true; inputs.len()], output, span)
+    }
+
+    fn fn_mut_param_flags(&mut self, inputs: &[Ty], by_ref: &[bool], output: Ty, span: Span) -> Ty {
         let f = self.new_var(false);
+        if let TyKind::Infer(v) = self.kind(f) {
+            self.iter_closure_args.insert(v.0, by_ref.to_vec());
+        }
         let lang = self.p.gx.lang;
         let ts = self.tys.intern_tys(inputs);
         let tuple = self.tys.intern(TyKind::Tuple(ts));

@@ -811,6 +811,11 @@ struct Ctx<'p, 'a> {
     closure_rets: Vec<Ty>,
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
+    /// The closure-argument type vars of iterator methods (`iter.rs`
+    /// `fn_mut_param`), each with one flag per argument: true when the
+    /// argument is `&item` (W-BORROW: the closure's argument regions are
+    /// the items', free; see `ClosureInfo::free_args`).
+    iter_closure_args: std::collections::HashMap<u32, Vec<bool>>,
     /// Scalar operators checked while both operand types were still
     /// open (a closure's `|a, b| a + b`): (expr, op, operand type).
     /// Lowering emits the builtin operator, so the types must turn out
@@ -984,6 +989,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closures: Vec::new(),
         closure_rets: Vec::new(),
         closure_order: None,
+        iter_closure_args: std::collections::HashMap::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         dyn_borrow_src: false,

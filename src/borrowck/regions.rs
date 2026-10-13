@@ -872,7 +872,7 @@ impl OwnSig {
     /// adds the same source-to-sink edges, and a call's result holds the
     /// sources. Nothing relates an input to anything else.
     fn closure_sig<T: TyIntern>(&mut self, p: &Program, body: &Body, sc: &mut SlotCx<'_, '_, '_, T>) {
-        let _ = p;
+        let free = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d)).and_then(|c| c.free_args.clone());
         let fresh = |own: &mut OwnSig, name: &str| -> Univ {
             own.n_univ += 1;
             own.names.push(name.into());
@@ -911,14 +911,50 @@ impl OwnSig {
             }
             self.slots.push(out);
         }
-        // The contract (the env param's implied walk adds the capture
-        // part); every source may also flow into the output.
-        let outs: Vec<Univ> = self.slots.first().cloned().unwrap_or_default();
-        for (i, &(src, _)) in roles.iter().enumerate() {
-            if src && let Some(&a) = env_caps.get(i) {
-                for &o in &outs {
-                    self.facts.push((a, o));
+        // The contract: every source (a captured one, a free argument
+        // slot) outlives every other sink (a captured one, a free argument
+        // slot behind `&mut`, the output). Higher-ranked argument slots
+        // take no part.
+        let inputs: Vec<Ty> = (2..=body.arg_count).map(|l| body.locals[l].ty).collect();
+        let mut arg_roles = Vec::new();
+        closure_arg_roles(sc, &inputs, free.as_deref(), &mut arg_roles);
+        let args: Vec<Univ> = self.slots.iter().skip(2).flatten().copied().collect();
+        let mut cap_srcs: Vec<Univ> = Vec::new();
+        let mut snks: Vec<Univ> = self.slots.first().cloned().unwrap_or_default();
+        for (i, &(src, snk)) in roles.iter().enumerate() {
+            if let Some(&u) = env_caps.get(i) {
+                if src {
+                    cap_srcs.push(u);
                 }
+                if snk {
+                    snks.push(u);
+                }
+            }
+        }
+        let mut arg_srcs: Vec<Univ> = Vec::new();
+        let mut arg_snks: Vec<Univ> = Vec::new();
+        for (i, r) in arg_roles.iter().enumerate() {
+            if let (Some((src, snk)), Some(&u)) = (r, args.get(i)) {
+                if *src {
+                    arg_srcs.push(u);
+                }
+                if *snk {
+                    arg_snks.push(u);
+                }
+            }
+        }
+        // Sources into sinks; an argument's regions do not flow into an
+        // argument's `&mut` target (`closure_arg_vars` agrees).
+        for &a in cap_srcs.iter().chain(&arg_srcs) {
+            for &b in &snks {
+                if a != b {
+                    self.facts.push((a, b));
+                }
+            }
+        }
+        for &a in &cap_srcs {
+            for &b in &arg_snks {
+                self.facts.push((a, b));
             }
         }
         self.implied(sc, body);
@@ -994,6 +1030,57 @@ pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, args: A
                 let n = sc.slots(f) as usize;
                 out.extend(std::iter::repeat_n((true, true), n));
             }
+        }
+    }
+}
+
+/// The roles of a closure's argument slots, in slot order: `None` for a
+/// higher-ranked region; `Some((source, sink))` for a free one. With
+/// `free` (`ClosureEntry::free_args`, an iterator method's closure) the
+/// arguments are items: free, except the outer reference of an `&item`
+/// argument; every free slot is a source, and one behind a `&mut` is a
+/// sink too. Without it every argument region is higher-ranked.
+pub(super) fn closure_arg_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, inputs: &[Ty], free: Option<&[bool]>, out: &mut Vec<Option<(bool, bool)>>) {
+    for (i, &t) in inputs.iter().enumerate() {
+        let Some(flags) = free else {
+            let n = sc.slots(t) as usize;
+            out.extend(std::iter::repeat_n(None, n));
+            continue;
+        };
+        match sc.tys.kind(t) {
+            TyKind::Ref(_, _, inner) if flags.get(i).copied().unwrap_or(false) => {
+                out.push(None);
+                arg_slot_roles(sc, inner, false, out);
+            }
+            _ => arg_slot_roles(sc, t, false, out),
+        }
+    }
+}
+
+fn arg_slot_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, under_mut: bool, out: &mut Vec<Option<(bool, bool)>>) {
+    match sc.tys.kind(t) {
+        TyKind::Ref(_, m, inner) => {
+            out.push(Some((true, under_mut)));
+            arg_slot_roles(sc, inner, under_mut || m.is_mut(), out);
+        }
+        TyKind::Adt(_, args) => {
+            let n = adt_regions(sc.p, sc.tys, t) as usize;
+            out.extend(std::iter::repeat_n(Some((true, under_mut)), n));
+            for g in sc.tys.args(args).to_vec() {
+                if let GenericArg::Ty(e) = g {
+                    arg_slot_roles(sc, e, under_mut, out);
+                }
+            }
+        }
+        TyKind::Tuple(ts) => {
+            for e in sc.tys.tys_of(ts).to_vec() {
+                arg_slot_roles(sc, e, under_mut, out);
+            }
+        }
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => arg_slot_roles(sc, e, under_mut, out),
+        _ => {
+            let n = sc.slots(t) as usize;
+            out.extend(std::iter::repeat_n(Some((true, under_mut)), n));
         }
     }
 }
@@ -1105,6 +1192,9 @@ pub(super) struct Builder<'b, 'p, 'a> {
     /// types (`trait_view`): fresh vars per projection, which the impl's
     /// own instantiation constrains.
     proj: Option<FxMap<Ty, Vec<u32>>>,
+    /// The argument slot vars of each closure created here whose
+    /// arguments are free (`ClosureEntry::free_args`), by closure def.
+    closure_args: FxMap<DefId, Vec<u32>>,
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
@@ -1125,6 +1215,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             own,
             errs: Vec::new(),
             proj: None,
+            closure_args: FxMap::default(),
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -1702,6 +1793,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     let mut roles = Vec::new();
                     closure_roles(&mut self.sc, args, &mut roles);
                     self.contract_edges(&roles, &dv);
+                    if let TyKind::Closure(def, _) = self.body.tys.kind(*ty) {
+                        self.closure_arg_vars(def, &roles, &dv);
+                    }
                 }
             }
             Rvalue::ArrayAgg(_, ops) | Rvalue::VecLit(_, ops) => {
@@ -1827,6 +1921,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.call_opaque(&avs, dt, &dv);
             }
             return;
+        }
+        if matches!(target, CallTarget::Builtin(_)) {
+            self.link_closure_args(&avs);
         }
         let callee = match target {
             CallTarget::Fn(f) => Some((f, self.callee(f))),
@@ -2080,6 +2177,137 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// The conservative call rule: the result may hold any argument's
     /// regions (equal to them when it holds a `&mut`), and each `&mut`
     /// argument's target may receive every other argument's regions.
+    /// The argument slot vars of a closure with free arguments, made at
+    /// its creation with the contract edges between them and the
+    /// closure's captured slots (`caps`, roles `roles`). None for a
+    /// closure whose arguments are higher-ranked.
+    fn closure_arg_vars(&mut self, def: DefId, roles: &[(bool, bool)], caps: &[u32]) -> Option<Vec<u32>> {
+        if let Some(v) = self.closure_args.get(&def) {
+            return Some(v.clone());
+        }
+        let c = self.p.gx.closures.get(&def)?;
+        let free = c.free_args.clone()?;
+        let inputs = c.inputs.clone();
+        let mut arg_roles = Vec::new();
+        closure_arg_roles(&mut self.sc, &inputs, Some(&free), &mut arg_roles);
+        let vars: Vec<u32> = arg_roles.iter().map(|_| self.fresh()).collect();
+        let mut srcs: Vec<u32> = Vec::new();
+        let mut snks: Vec<u32> = Vec::new();
+        for (i, r) in arg_roles.iter().enumerate() {
+            if let Some((src, snk)) = r {
+                if *src {
+                    srcs.push(vars[i]);
+                }
+                if *snk {
+                    snks.push(vars[i]);
+                }
+            }
+        }
+        let mut cap_srcs: Vec<u32> = Vec::new();
+        let mut cap_snks: Vec<u32> = Vec::new();
+        for (i, &(src, snk)) in roles.iter().enumerate() {
+            if let Some(&v) = caps.get(i) {
+                if src {
+                    cap_srcs.push(v);
+                }
+                if snk {
+                    cap_snks.push(v);
+                }
+            }
+        }
+        // Argument sources into the captured sinks, captured sources into
+        // the argument sinks (capture-to-capture is `contract_edges`'; an
+        // argument does not flow into an argument's `&mut` target). The
+        // output is the call's: `closure_sources` covers it.
+        for &a in &srcs {
+            for &b in &cap_snks {
+                self.edge(a, b);
+            }
+        }
+        for &a in &cap_srcs {
+            for &b in &snks {
+                self.edge(a, b);
+            }
+        }
+        self.closure_args.insert(def, vars.clone());
+        Some(vars)
+    }
+
+    /// A builtin taking a closure with free arguments (an iterator
+    /// method): each free argument slot may hold any region of the call's
+    /// other arguments (the iterator's sources, `fold`'s initial value),
+    /// and a sink slot writes back into them.
+    fn link_closure_args(&mut self, avs: &[(Ty, Vec<u32>)]) {
+        for (k, (t, v)) in avs.iter().enumerate() {
+            let TyKind::Closure(def, args) = self.body.tys.kind(*t) else { continue };
+            let Some(free) = self.p.gx.closures.get(&def).and_then(|c| c.free_args.clone()) else { continue };
+            let mut roles = Vec::new();
+            closure_roles(&mut self.sc, args, &mut roles);
+            let Some(vars) = self.closure_arg_vars(def, &roles, v) else { continue };
+            let inputs = self.p.gx.closures.get(&def).map(|c| c.inputs.clone()).unwrap_or_default();
+            let mut arg_roles = Vec::new();
+            closure_arg_roles(&mut self.sc, &inputs, Some(&free), &mut arg_roles);
+            let mut items: Vec<u32> = Vec::new();
+            let mut elems: Vec<u32> = Vec::new();
+            for (j, (ot, ov)) in avs.iter().enumerate() {
+                if j != k {
+                    self.non_closure_slots(*ot, ov, &mut 0, &mut items);
+                    self.elem_slots(*ot, ov, &mut 0, &mut elems);
+                    self.closure_sources(*ot, ov, &mut 0, &mut elems);
+                }
+            }
+            for (i, r) in arg_roles.iter().enumerate() {
+                let (Some((_, snk)), Some(&a)) = (r, vars.get(i)) else { continue };
+                if *snk {
+                    // Behind an item's `&mut`: the source's element regions
+                    // (invariant), never the iterator's own borrow.
+                    for &s in &elems {
+                        self.edge(s, a);
+                        self.edge(a, s);
+                    }
+                } else {
+                    for &s in &items {
+                        self.edge(s, a);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `non_closure_slots` without the Adts' own region slots (an
+    /// iterator's borrow of its source): the regions of the elements.
+    fn elem_slots(&mut self, t: Ty, vars: &[u32], at: &mut usize, out: &mut Vec<u32>) {
+        let n = self.sc.slots(t) as usize;
+        match self.body.tys.kind(t) {
+            TyKind::Closure(..) => *at += n,
+            TyKind::Ref(_, _, inner) => {
+                if let Some(&v) = vars.get(*at) {
+                    out.push(v);
+                }
+                *at += 1;
+                self.elem_slots(inner, vars, at, out);
+            }
+            TyKind::Adt(_, args) => {
+                *at += adt_regions(self.p, &self.body.tys, t) as usize;
+                for g in self.body.tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.elem_slots(e, vars, at, out);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in self.body.tys.tys_of(ts).to_vec() {
+                    self.elem_slots(e, vars, at, out);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.elem_slots(e, vars, at, out),
+            _ => {
+                out.extend(vars.iter().skip(*at).take(n).copied());
+                *at += n;
+            }
+        }
+    }
+
     /// The closure contract over a closure value's slot vars: every
     /// source outlives every other sink.
     fn contract_edges(&mut self, roles: &[(bool, bool)], vars: &[u32]) {

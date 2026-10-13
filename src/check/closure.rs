@@ -62,6 +62,11 @@ pub struct ClosureInfo {
     pub captures: Vec<Capture>,
     /// The closure's own type, `Closure(def, env field types)`.
     pub ty: Ty,
+    /// W-BORROW: `Some` when an iterator method takes this closure, so
+    /// its argument regions are the items' (free, not higher-ranked);
+    /// per argument, true when it is `&item` (that outer reference is
+    /// higher-ranked). `None`: every argument region is higher-ranked.
+    pub free_args: Option<Vec<bool>>,
 }
 
 /// The env field type of one capture.
@@ -201,6 +206,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         let def = self.closure_def(e);
+        let free_args = expected.and_then(|t| match self.kind(self.resolve(t)) {
+            TyKind::Infer(v) => self.iter_closure_args.get(&v.0).cloned(),
+            _ => None,
+        });
         let sig = self.expected_closure_sig(expected);
         let expected_inputs: Option<Vec<Ty>> = sig.and_then(|(tup, _)| {
             let tup = self.deep(tup);
@@ -281,7 +290,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args });
         ty
     }
 
