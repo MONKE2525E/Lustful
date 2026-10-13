@@ -4195,6 +4195,20 @@ fn prove_trait_ref(
     }
 }
 
+/// Proves `ty: trait` for a field-type check, decomposing the
+/// structural forms core implements component-wise (tuples,
+/// arrays, references) since those have no impl records here.
+fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: Ty) -> bool {
+    match p.tys.kind(ty) {
+        TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().all(|&e| prove_field_trait(p, env, trait_def, e)),
+        TyKind::Array(e, _) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
+        _ => {
+            let a = p.tys.intern_args(&[GenericArg::Ty(ty)]);
+            prove_goal(p, env, TraitRef { def: trait_def, args: a, bindings: EMPTY_BINDINGS })
+        }
+    }
+}
+
 /// One trait goal with a fresh solver (collect-time proves are
 /// independent of each other).
 fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {
@@ -4348,9 +4362,7 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
         let field_tys: Vec<Ty> = field_tys.iter().map(|&t| subst(&mut p.tys, t, &self_args)).collect();
         let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
         for ft in field_tys {
-            let fargs = p.tys.intern_args(&[GenericArg::Ty(ft)]);
-            let goal = TraitRef { def: lang.copy, args: fargs, bindings: EMPTY_BINDINGS };
-            if !prove_goal(p, &env, goal) {
+            if !prove_field_trait(p, &env, lang.copy, ft) {
                 errs.push(Diag::new(
                     "L0110",
                     rec.span,
@@ -4412,9 +4424,7 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
             }
             let env = elaborate_env(&mut p.tys, &p.gx.index, &env);
             for &ft in &field_tys {
-                let fargs = p.tys.intern_args(&[GenericArg::Ty(ft)]);
-                let goal = TraitRef { def: trait_def, args: fargs, bindings: EMPTY_BINDINGS };
-                if !prove_goal(p, &env, goal) {
+                if !prove_field_trait(p, &env, trait_def, ft) {
                     errs.push(Diag::new(
                         "L0110",
                         span,
