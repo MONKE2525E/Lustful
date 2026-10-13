@@ -1486,7 +1486,47 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
                 self.flow_all(&from, &dv);
             }
+            _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
+                self.call_adapter(&avs, dt, &dv);
+            }
             _ => self.call_opaque(&avs, dt, &dv),
+        }
+    }
+
+    /// A builtin that builds an iterator adapter (`map`, `filter`,
+    /// `inspect`, ...): the adapter stores its arguments as its type args,
+    /// so an argument whose type is one of those args flows into that part
+    /// only (a closure's captures do not reach the source iterator's
+    /// regions). Any other argument flows into every part.
+    fn call_adapter(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) {
+        let Some((_, args)) = self.body.tys.adt_parts(dt) else { return self.call_opaque(avs, dt, dv) };
+        let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(comps.len());
+        let mut at = adt_regions(&self.body.tys, dt) as usize;
+        for &c in &comps {
+            let n = self.sc.slots(c) as usize;
+            ranges.push((at, n));
+            at += n;
+        }
+        if at != dv.len() {
+            return self.call_opaque(avs, dt, dv);
+        }
+        let mut used = vec![false; comps.len()];
+        for (t, v) in avs {
+            if v.is_empty() {
+                continue;
+            }
+            match (0..comps.len()).find(|&j| !used[j] && comps[j] == *t && ranges[j].1 == v.len()) {
+                Some(j) => {
+                    used[j] = true;
+                    let (s0, n) = ranges[j];
+                    let part = dv[s0..s0 + n].to_vec();
+                    if !self.relate(*t, v, comps[j], &part, Variance::Co) {
+                        self.flow_all(v, dv);
+                    }
+                }
+                None => self.flow_all(v, dv),
+            }
         }
     }
 
