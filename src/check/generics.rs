@@ -4273,10 +4273,23 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// The first index of each def in `adt_info`, built once per
+/// pass. It answers exactly what a linear `position` scan over
+/// `adt_info` answers (first match wins, duplicates included),
+/// without the quadratic cost on crates with many Adts.
+fn adt_first_index(p: &Program) -> FxMap<DefId, usize> {
+    let mut m: FxMap<DefId, usize> = FxMap::default();
+    m.reserve(p.gx.adt_info.len());
+    for (i, &(def, _)) in p.gx.adt_info.iter().enumerate() {
+        m.entry(def).or_insert(i);
+    }
+    m
+}
+
 /// Collects the trait goals one type owes to be well-formed:
 /// for every application of a local Adt inside it, the Adt's
 /// parameter predicates under the written arguments.
-fn wf_goals(p: &mut Program, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>) {
+fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>) {
     use crate::traits::index::subst_predicate;
     if seen.contains(&t) || t == ERROR {
         return;
@@ -4286,13 +4299,15 @@ fn wf_goals(p: &mut Program, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>)
         let argv: Vec<GenericArg> = p.tys.args(a).to_vec();
         for g in argv {
             if let Some(e) = g.as_ty() {
-                wf_goals(p, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out);
             }
         }
     };
     match p.tys.kind(t) {
         TyKind::Adt(d, a) => {
-            if let Some(idx) = p.gx.adt_info.iter().position(|&(def, _)| def == d) {
+            if let Some(&idx) = adt_idx.get(&d)
+                && !p.gx.adt_generics[idx].predicates.is_empty()
+            {
                 let argv: Vec<GenericArg> = p.tys.args(a).to_vec();
                 for &pred in &p.gx.adt_generics[idx].predicates.clone() {
                     if let Predicate::Trait(b) = subst_predicate(&mut p.tys, pred, &argv)
@@ -4304,19 +4319,19 @@ fn wf_goals(p: &mut Program, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>)
             }
             in_args(p, seen, out, a);
         }
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, e, seen, out),
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, adt_idx, e, seen, out),
         TyKind::Tuple(ts) => {
             for e in p.tys.tys_of(ts).to_vec() {
-                wf_goals(p, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out);
             }
         }
         TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(p, seen, out, a),
         TyKind::FnPtr(sig) => {
             let b = p.tys.sig(sig);
             for e in p.tys.tys_of(b.value.inputs).to_vec() {
-                wf_goals(p, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out);
             }
-            wf_goals(p, b.value.output, seen, out);
+            wf_goals(p, adt_idx, b.value.output, seen, out);
         }
         _ => {}
     }
@@ -4371,12 +4386,13 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     for rec in p.gx.trait_names.values().filter_map(|&d| p.gx.index.trait_record(d)).cloned().collect::<Vec<_>>() {
         items.push((Vec::new(), rec.generics.clone(), rec.span));
     }
+    let adt_idx = adt_first_index(p);
     for (tys, generics, span) in items {
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let mut goals: Vec<TraitRef> = Vec::new();
         let mut seen: Vec<Ty> = Vec::new();
         for t in tys {
-            wf_goals(p, t, &mut seen, &mut goals);
+            wf_goals(p, &adt_idx, t, &mut seen, &mut goals);
         }
         // A predicate over no parameter of the item must hold
         // outright (`where String: Copy`).
