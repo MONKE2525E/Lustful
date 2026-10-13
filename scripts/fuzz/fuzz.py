@@ -277,6 +277,10 @@ fn slabel(s: &str) -> &str {
     s
 }
 
+fn take_s(s: &str) -> usize {
+    s.len()
+}
+
 trait Dv {
     fn dv(&self) -> i64;
 }
@@ -304,7 +308,7 @@ fn outer_nested() -> i64 {
 fn main() {''', 1).replace('    println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());',
                             '    println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());\n'
                             '    let n9 = 9;\n'
-                            '    println!("{} {} {} {} {} {}", use_go(), gid(3i64), via_dyn(&pts[0]), outer_nested(), *idref(&n9) + *uref(&n9), slabel(sref()).len());', 1)
+                            '    println!("{} {} {} {} {} {} {}", use_go(), gid(3i64), via_dyn(&pts[0]), outer_nested(), *idref(&n9) + *uref(&n9), slabel(sref()).len(), take_s(&label(3)));', 1)
 
 SNIPPETS = ["/*", "*/", '"', "fn zz() {", "}", "#[derive(Debug)]\n", "\n\n", "pub ",
             "struct Qq {", "// note\n", "x", "123", "->", "impl Qq {", 'let q = "abc\n',
@@ -783,7 +787,11 @@ def make_feature3_edit(rng, text):
         pairs = [("fn idref(x: &i64) -> &i64", "fn idref(x: &'_ i64) -> &'_ i64"),
                  ("fn sref() -> &'static str", "fn sref() -> &str"),
                  ("fn slabel(s: &str) -> &str", "fn slabel(s: &str) -> &'static str"),
-                 ("fn uref(x: &'_ i64) -> &'_ i64", "fn uref(x: &i64) -> &i64")]
+                 ("fn uref(x: &'_ i64) -> &'_ i64", "fn uref(x: &i64) -> &i64"),
+                 # Param-side 'static: the callee still checks, so only a
+                 # caller recheck (borrowck against the new region sig)
+                 # can reject; a stale caller verdict is a false accept.
+                 ("fn take_s(s: &str) -> usize", "fn take_s(s: &'static str) -> usize")]
         rng.shuffle(pairs)
         for a, b in pairs:
             if a in text:
