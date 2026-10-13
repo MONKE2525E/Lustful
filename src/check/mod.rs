@@ -1545,11 +1545,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Infer(_) => true,
             _ => {
                 if let Some(a) = self.tys.local_adt(t) {
+                    // Only a last field can be unsized. Without a
+                    // materialized instance, `local_adt` answers with the
+                    // template, whose fields are over its own params:
+                    // substitute this application's args first.
                     let p = self.p;
-                    p.adt(a).variants.iter().all(|v| {
-                        let n = v.fields.len();
-                        v.fields.iter().enumerate().all(|(i, f)| i + 1 == n || self.sized_ok(f.ty))
-                            && v.fields.last().is_none_or(|f| self.sized_ok(f.ty))
+                    let args: Vec<GenericArg> = self.tys.adt_parts(t).map(|(_, a)| self.tys.args(a).to_vec()).unwrap_or_default();
+                    let lasts: Vec<Ty> = p.adt(a).variants.iter().filter_map(|v| v.fields.last().map(|f| f.ty)).collect();
+                    lasts.into_iter().all(|f| {
+                        let f = if args.is_empty() { f } else { subst(&mut self.tys, f, &args) };
+                        self.sized_ok(f)
                     })
                 } else {
                     crate::check::collect::is_sized_ty(&self.tys, t)
