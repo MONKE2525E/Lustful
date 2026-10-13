@@ -792,10 +792,22 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let nb = self.body.blocks.len();
         let mut live_in = vec![BitSet::new(n); nb];
         let mut live = BitSet::new(n);
+        // Backward problem: visit reachable blocks in postorder (successors
+        // first, back edges aside), then unreachable ones, so a sweep mostly
+        // sees final successor sets and few sweeps run. The result is the
+        // same in any order.
+        let mut order: Vec<u32> = self.reverse_postorder();
+        order.reverse();
+        let mut listed = vec![false; nb];
+        for &b in &order {
+            listed[b as usize] = true;
+        }
+        order.extend((0..nb as u32).rev().filter(|&b| !listed[b as usize]));
         let mut changed = true;
         while changed {
             changed = false;
-            for bi in (0..nb).rev() {
+            for &bi in &order {
+                let bi = bi as usize;
                 let b = &self.body.blocks[bi];
                 live.clear();
                 for s in &self.succs[bi] {
