@@ -285,8 +285,21 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             Predicate::TypeOutlives(t, _) => mentions_self(&p.tys, *t),
             Predicate::Outlives(..) => false,
         };
+        // rustc keeps the trait dyn compatible under `where Self: Send`
+        // (an auto trait) and under any type-outlives bound (collect
+        // drops `'static` bounds today); lust does not check those
+        // bounds at dyn calls, so they are unsupported, not violations.
+        let rustc_allows = |pred: &&Predicate| match pred {
+            Predicate::Trait(b) => p.tys.args(b.value.args).len() == 1 && lang.is_auto(b.value.def),
+            Predicate::TypeOutlives(..) => true,
+            _ => false,
+        };
         if own_preds.iter().any(pred_mentions) {
-            v = v.or(bad(format!("method `{mn}` references the `Self` type in its `where` clause")));
+            if own_preds.iter().filter(|q| pred_mentions(q)).all(|q| rustc_allows(&q)) {
+                info.unsupported.get_or_insert(format!("`dyn {tname}` with the `Self` bound in the `where` clause of `{mn}`"));
+            } else {
+                v = v.or(bad(format!("method `{mn}` references the `Self` type in its `where` clause")));
+            }
         }
         if let Some(v) = v {
             info.violation.get_or_insert(v);
