@@ -1820,12 +1820,22 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
                 self.flow_all(&from, &dv);
             }
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone)) && self.call_clone(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
             _ => self.call_opaque(&avs, dt, &dv),
         }
+    }
+
+    /// `Clone::clone(&self) -> Self` (derived and builtin clones): the
+    /// result has the receiver's pointee type and its regions; the borrow
+    /// of the receiver ends with the call. False when the shapes differ.
+    fn call_clone(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let [(t0, v0)] = avs else { return false };
+        let TyKind::Ref(_, _, x) = self.body.tys.kind(*t0) else { return false };
+        !v0.is_empty() && self.relate(x, &v0[1..], dt, dv, Variance::Co)
     }
 
     /// A builtin that borrows into its receiver (`v.get(i)`, `v.last_mut()`,
