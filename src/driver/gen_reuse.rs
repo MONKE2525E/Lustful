@@ -7,7 +7,8 @@
 // replays the rest in the cold order.
 //
 // A stored result depends on three things, and holds while all three do:
-// - the trait system: trait items, impl items, and derive lists. The
+// - the trait system: trait items, impl items, type alias and const
+//   items, and derive lists (`compile.rs` `trait_system_hash`). The
 //   driver clears the cache when their fingerprint changes (and on a
 //   const fn body edit, a nested static, or a slot renumber; see
 //   `compile.rs`, "generic reuse"). No read records trait selection,
