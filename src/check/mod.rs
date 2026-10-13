@@ -687,6 +687,10 @@ pub struct Checked<'g> {
     /// gives each binding it covers, by checker local (W-BORROW): the
     /// borrow checker relates the binding's regions to it.
     pub annotations: Vec<(u32, Ty)>,
+    /// Obligations taken from this body's queue, once per take (each
+    /// run round takes them all; `Obligations::work`). A work count for
+    /// tests that guard against selection blow-ups.
+    pub queue_work: usize,
 }
 
 impl Checked<'_> {
@@ -956,6 +960,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             closure_calls: Vec::new(),
             poisoned: false,
             annotations: Vec::new(),
+            queue_work: 0,
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
@@ -1135,9 +1140,10 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         }
     }
     cx.finish();
-    let Ctx { out, tys, errs, .. } = cx;
+    let Ctx { out, tys, errs, obl, .. } = cx;
     let mut out = out;
     out.tys = tys;
+    out.queue_work = obl.work();
     (out, errs)
 }
 

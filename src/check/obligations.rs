@@ -38,6 +38,10 @@ pub struct Obligations {
     /// The impl and args each re-queued trait obligation (trait
     /// ref, span, depth) was last selected with; see `note_requeued`.
     requeued: FxMap<(TraitRef, Span, u16), (ImplId, Vec<GenericArg>)>,
+    /// Obligations taken from the queue so far (each run round and
+    /// the literal fallback take them all): the queue's work count
+    /// (`Checked::queue_work`).
+    work: usize,
 }
 
 impl Obligations {
@@ -64,7 +68,13 @@ impl Obligations {
     /// Takes the whole queue for one run. Obligations a run
     /// cannot finish are pushed back by the caller.
     pub fn take(&mut self) -> Vec<Obligation> {
+        self.work += self.queue.len();
         std::mem::take(&mut self.queue)
+    }
+
+    /// The work count: obligations taken from the queue so far.
+    pub fn work(&self) -> usize {
+        self.work
     }
 
     /// The waiting obligations, in queue order. Closure signature
@@ -103,5 +113,70 @@ impl Obligations {
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::check::{self, collect};
+    use crate::def::{CrateIds, LOCAL_CRATE};
+    use crate::diag::FileId;
+    use crate::intern::{Interner, Known};
+    use crate::{lexer, parser};
+
+    /// A generic impl over an integer literal (`Wrap(5)`): the obligation
+    /// `Wrap<{integer}>: Show` selects the impl but stays queued until the
+    /// literal's type is known. `run` is the body of main; the impls for
+    /// `u8` and `u16` come first, then `extra`.
+    fn sample(extra: &str, run: &str) -> String {
+        format!(
+            "trait Show {{ fn show(&self) -> u32; }}\n\
+             impl Show for u8 {{ fn show(&self) -> u32 {{ *self as u32 }} }}\n\
+             impl Show for u16 {{ fn show(&self) -> u32 {{ *self as u32 }} }}\n{extra}\n\
+             struct Wrap<T>(T);\n\
+             impl<T: Show> Show for Wrap<T> {{ fn show(&self) -> u32 {{ self.0.show() + 1 }} }}\n\
+             struct Num(u32);\n\
+             impl Num {{ fn get(&self) -> u32 {{ self.0 }} }}\n\
+             fn need<S: Show>(s: S) -> u32 {{ s.show() }}\n\
+             fn main() {{ {run} }}\n"
+        )
+    }
+
+    /// Checks main of one sample file: (queue work count, error codes).
+    fn check_main(src: &str) -> (usize, Vec<&'static str>) {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let (ck, errs) = check::check_fn(&program, program.main.unwrap());
+        (ck.queue_work, errs.iter().map(|d| d.code).collect())
+    }
+
+    /// Selecting the same impl again for a queued obligation is not
+    /// progress and queues no copies. Counting it as progress ran each
+    /// run point to the 128-round cap and copied the nested `{integer}:
+    /// Show` every round (3.5 s for this main, 5 s for the 74 lines of
+    /// tests/pass/fmt_user_impl.rs).
+    #[test]
+    fn requeued_impl_selection_is_not_repeated() {
+        let run = "let a = need(Wrap(5)); let n = Num(a); let b = n.get() + n.get(); let c = n.get() * 2; \
+                   let d = need(Wrap(Wrap(7))); let e = Num(d).get(); println!(\"{} {} {} {}\", a, b, c, e);";
+        let ok = "impl Show for i32 { fn show(&self) -> u32 { *self as u32 } }";
+        let (work, errs) = check_main(&sample(ok, run));
+        assert!(errs.is_empty(), "the sample checks clean, got {errs:?}");
+        // 87 today; the repeat gave 1.5 million.
+        assert!(work <= 1000, "queue work {work}: a queued impl selection repeats each round");
+    }
+
+    /// The nested predicates still hold the obligation to account: with
+    /// no `i32` impl, the literal falls back to `i32` and `i32: Show`
+    /// fails once per distinct selection, not once per round (257 copies
+    /// of the error before).
+    #[test]
+    fn requeued_impl_selection_keeps_its_nested_errors() {
+        let (_, errs) = check_main(&sample("", "need(Wrap(5));"));
+        assert!(!errs.is_empty() && errs.len() <= 2 && errs.iter().all(|&c| c == "L0612"), "want one or two L0612 errors, got {errs:?}");
     }
 }
