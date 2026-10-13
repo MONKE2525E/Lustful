@@ -3263,6 +3263,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     inner(h, p, x);
                 }
                 cgen::CTy::ExitCode => 26u8.hash(h),
+                cgen::CTy::AccessError => 28u8.hash(h),
                 cgen::CTy::BoxSlice(x) => {
                     27u8.hash(h);
                     inner(h, p, x);

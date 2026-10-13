@@ -178,6 +178,11 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
         CTy::Weak(_) => {
             let _ = writeln!(body, "  return lust_f_write_str(f, {});", lit("(Weak)"));
         }
+        // `thread::AccessError` (W-TLS): a fieldless debug_struct, so
+        // width and `#` do not change it.
+        CTy::AccessError => {
+            let _ = writeln!(body, "  (void)p; return lust_f_write_str(f, {});", lit("AccessError"));
+        }
         // `ExitCode(unix_exit_status(N))`: std's tuple of the unix
         // status tuple, through the builders (W-STD-A).
         CTy::ExitCode => {
@@ -286,6 +291,8 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut
             Some(call) => format!("  {call}\n"),
             None => "  abort();\n".to_string(),
         },
+        // `thread::AccessError` (W-TLS): std pads its text.
+        CTy::AccessError => format!("  (void)p; return lust_f_pad(f, {});\n", lit("already destroyed")),
         _ => "  abort();\n".to_string(),
     }
 }

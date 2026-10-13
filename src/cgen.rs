@@ -91,6 +91,9 @@ pub enum CTy {
     /// stands for both `str` and `&str`. The Adt keeps its identity for
     /// glue (Debug, PartialEq, Ord call the newtype's own impls).
     Unsized(AdtId, Box<CTy>),
+    /// `std::thread::AccessError` (W-TLS): a unit struct (`lust_Unit`)
+    /// whose Debug text is its name.
+    AccessError,
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -197,7 +200,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             // A `thread_local!` key is its slot word (runtime/thread.c);
             // `AccessError` is a unit struct.
             Some(BuiltinTy::LocalKey) => CTy::Int(IntTy::U64),
-            Some(BuiltinTy::AccessError) => CTy::Unit,
+            Some(BuiltinTy::AccessError) => CTy::AccessError,
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -341,6 +344,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Result(..) => format!("R_{}", mangle(t)),
         CTy::Args => "lust_Args".into(),
         CTy::ExitCode => "uint8_t".into(),
+        CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
         CTy::Sync(k, e) => sync::sync_ctype(*k, e),
         CTy::Chars => "lust_Chars".into(),
@@ -413,6 +417,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::BoxDyn => tok(s, "Bxdyn", &[]),
         CTy::RcDyn => tok(s, "Rcdyn", &[]),
         CTy::ExitCode => tok(s, "XC", &[]),
+        CTy::AccessError => tok(s, "AE", &[]),
         CTy::Fmt(k) => tok(s, &format!("Fmt{}", *k as u8), &[]),
         CTy::Adt(a) => tok(s, &format!("A{}", a.0), &[]),
         CTy::Vec(e) => tok(s, "V", &[e]),
@@ -534,6 +539,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::Ref(_)
         | CTy::Args
         | CTy::ExitCode
+        | CTy::AccessError
         | CTy::Chars
         | CTy::Slice(_)
         | CTy::Unsized(..)
@@ -760,6 +766,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             }
             CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),
             CTy::Sync(k, _) => sync::sync_layout(*k),
+            CTy::AccessError => Some(plain_layout(0, 1)),
             CTy::Weak(_) | CTy::Guard(..) => Some(layout::ptr_layout()),
             // `UnsafeCell` hides the value's niche, as in Rust.
             CTy::Cell(e) => go(p, e, seen).map(|mut l| {
@@ -991,6 +998,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             }
             CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),
             CTy::Sync(k, _) => sync::sync_layout(*k).map_or((8, 8), |l| (l.size, l.align)),
+            CTy::AccessError => (0, 1),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
@@ -6606,7 +6614,7 @@ fn glue_def(
             }
             let eq_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
-                    CTy::Unit => "1".into(),
+                    CTy::Unit | CTy::AccessError => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
                     CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::ExitCode => format!("({x} == {y})"),
                     _ => {
@@ -6617,6 +6625,7 @@ fn glue_def(
             };
             match t {
                 CTy::ExitCode => body.push_str("  return *a == *b;\n"),
+                CTy::AccessError => body.push_str("  return 1;\n"),
                 CTy::String => body.push_str("  return lust_str_eq(lust_string_as_str(a), lust_string_as_str(b));\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return lust_str_eq(*a, *b);\n"),
                 CTy::Option(e) => {

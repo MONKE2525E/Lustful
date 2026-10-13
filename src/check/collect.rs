@@ -4510,7 +4510,7 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
-            if tys.is_exit_code(t) {
+            if tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
                 return true;
             }
             if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Copy) {
@@ -4551,7 +4551,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Array(e, _) => return glue_clone(p, tys, e, seen),
         _ => {}
     }
-    if tys.is_string_ty(t) || tys.is_exit_code(t) {
+    if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
         return true;
     }
     if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
@@ -4947,7 +4947,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_eq(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_eq(p, tys, e, seen),
         _ => {
-            if tys.is_string_ty(t) || tys.is_exit_code(t) {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
                 return true;
             }
             if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::PartialEq) {
@@ -4995,7 +4995,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
             // no such rendering, so it is not Debug here (a reject).
-            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some()
+                || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
+            {
                 return true;
             }
             match crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
@@ -5043,6 +5045,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::recv_error_def()
                         || d == generics::try_recv_error_def()
                 })
+                || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))
         }
     }
