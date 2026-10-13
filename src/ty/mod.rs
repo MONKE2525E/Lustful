@@ -672,6 +672,11 @@ pub trait TyIntern {
     fn bindings(&self, id: BindingsId) -> &[(DefId, GenericArg)];
     /// The builtin Adt defs this store's global table was built with.
     fn builtins(&self) -> BuiltinDefs;
+    /// The param env of the body this store belongs to: empty for the
+    /// global store and concrete bodies (see `Tys::env`).
+    fn param_env(&self) -> &[Predicate] {
+        &[]
+    }
     /// The session-local index of the user Adt with this def, if this store knows it.
     fn local_adt_of(&self, def: DefId) -> Option<AdtId>;
     /// The def of the user Adt with this session-local index, if registered.
@@ -1105,6 +1110,12 @@ impl TyIntern for GlobalTys {
 /// means the same value in every body and bodies need no locks.
 pub struct Tys<'g> {
     pub global: &'g GlobalTys,
+    /// The param env of the template body this store belongs to
+    /// (empty for a concrete body). Structural trait queries
+    /// (`is_copy`, `has_clone`, and kin) answer a `Param` or
+    /// projection type from it: such a type is rigid and has
+    /// exactly the traits its bounds give it (ARCH 4.1).
+    pub env: &'g [Predicate],
     kinds: Arena<TyKind, Ty>,
     flags: Vec<TyFlags>,
     args_a: Arena<Box<[GenericArg]>, ArgsId>,
@@ -1122,6 +1133,7 @@ impl<'g> Tys<'g> {
     pub fn new(global: &'g GlobalTys) -> Tys<'g> {
         Tys {
             global,
+            env: &[],
             kinds: Arena::default(),
             flags: Vec::new(),
             args_a: Arena::default(),
@@ -1248,6 +1260,9 @@ impl TyIntern for Tys<'_> {
     }
     fn builtins(&self) -> BuiltinDefs {
         self.global.builtins
+    }
+    fn param_env(&self) -> &[Predicate] {
+        self.env
     }
     fn mk_vec(&mut self, elem: Ty) -> Ty {
         let def = self.global.builtins.vec;
