@@ -903,23 +903,13 @@ impl<'a> Parser<'a> {
         Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }))
     }
 
-    /// Parses a `use` declaration into a tree. If the tree parse fails, falls
-    /// back to the old behavior (skip to the `;`, record an empty group) so
-    /// every program that parsed before still parses.
+    /// Parses a `use` declaration into a tree. A malformed tree is a
+    /// syntax error, as in rustc: an earlier fallback skipped to the `;`
+    /// and recorded an empty group, which accepted every bad `use` form.
     fn use_def(&mut self) -> PResult<UseDef> {
         let start = self.expect(Tok::Use, "`use`")?;
-        let saved = self.pos;
-        let tree = match self.use_tree() {
-            Ok(tree) if self.eat(Tok::Semi) => tree,
-            _ => {
-                self.pos = saved;
-                while self.peek() != Tok::Semi && self.peek() != Tok::Eof {
-                    self.bump();
-                }
-                self.expect(Tok::Semi, "`;`")?;
-                UseTree { leading_colon: false, prefix: Vec::new(), kind: UseKind::Group(Vec::new()), span: start }
-            }
-        };
+        let tree = self.use_tree()?;
+        self.expect(Tok::Semi, "`;`")?;
         Ok(UseDef { tree, span: start.to(self.prev_span()) })
     }
 

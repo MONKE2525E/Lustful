@@ -3317,6 +3317,9 @@ struct Frame {
     locals: Vec<Sym>,
     /// Function-local imports: (name, namespace index) to target.
     imports: FxMap<(Sym, usize), LocalBind>,
+    /// Names bound by an explicit (non-glob) local import in this
+    /// frame, for the duplicate-import check (rustc E0252).
+    explicit: Vec<(Sym, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -3834,21 +3837,112 @@ impl Rewrite<'_> {
         let span = item.span;
         let mut flat = Vec::new();
         flatten_use(&tree, module, VisKind::Priv, &mut flat, self.interner);
+        let self_sym = self.interner.intern("self");
+        let crate_sym = self.interner.intern("crate");
+        let super_sym = self.interner.intern("super");
+        let self_ty = self.interner.intern("Self");
+        let kw = |s: Sym| s == crate_sym || s == self_sym || s == super_sym;
         for imp in flat {
             match imp.kind {
+                ImportKind::BadLeading { .. } => {
+                    self.diags.push(Diag::new(
+                        "L0506",
+                        span,
+                        "the crate root in a `use` path can only be used in start position",
+                        "Move the leading `::` to the start of the whole import, or remove it.",
+                    ));
+                }
+                ImportKind::CheckPath { path } => {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let ok = matches!(
+                        self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner),
+                        PathRes::Done(_)
+                    ) || matches!(
+                        self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner),
+                        PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt)
+                    );
+                    if !ok {
+                        self.diags.push(Diag::new(
+                            "L0506",
+                            span,
+                            format!(
+                                "unresolved import `{}`",
+                                path.iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>().join("::")
+                            ),
+                            "Check the path: every segment must name a module or item that is visible here.",
+                        ));
+                    }
+                }
                 ImportKind::Single { path, name } => {
                     if path.len() == 1 {
+                        self.check_local_single_use(&path, name, imp.leading_colon, module, span);
+                        continue;
+                    }
+                    // `use super::super as x;` and kin: the whole path is
+                    // module keywords, the rename binds that module.
+                    if *path.last().unwrap() != self_sym && name != *path.last().unwrap() && path.iter().all(|&s| kw(s)) {
+                        match self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner) {
+                            PathRes::Done(Target::Module(src)) => {
+                                if insert_local(scopes, name, Namespace::Type, LocalBind::Target(Target::Module(src)), 2) {
+                                    self.push_local_dup(span, name);
+                                }
+                            }
+                            PathRes::Done(Target::Extern(_)) => {}
+                            _ => self.push_unresolved_use(span, &path),
+                        }
+                        continue;
+                    }
+                    // A trailing `self` binds the module (or enum) named
+                    // by the prefix, under the segment before it.
+                    if *path.last().unwrap() == self_sym {
+                        let mod_path = &path[..path.len() - 1];
+                        if name == self_sym && !matches!(mod_path.last(), Some(&c) if !kw(c) && c != self_ty) {
+                            self.diags.push(Diag::new(
+                                "L0506",
+                                span,
+                                "this import needs to be explicitly named",
+                                "Add a rename, such as `use self as here;`.",
+                            ));
+                            continue;
+                        }
+                        let bind_name = if name == self_sym { *mod_path.last().unwrap() } else { name };
+                        let target = match self.tables.resolve_module_path(module, mod_path, imp.leading_colon, self.interner) {
+                            PathRes::Done(t) => Some(t),
+                            _ => match self
+                                .tables
+                                .resolve_path(module, mod_path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner)
+                            {
+                                PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt) => {
+                                    Some(Target::Def(adt))
+                                }
+                                _ => None,
+                            },
+                        };
+                        match target {
+                            Some(t) => {
+                                if insert_local(scopes, bind_name, Namespace::Type, LocalBind::Target(t), 2) {
+                                    self.push_local_dup(span, bind_name);
+                                }
+                            }
+                            None => self.push_unresolved_use(span, &path),
+                        }
                         continue;
                     }
                     match self.tables.resolve_module_path(module, &path[..path.len() - 1], imp.leading_colon, self.interner) {
                         PathRes::Done(Target::Module(src)) => {
                             let last = *path.last().unwrap();
                             let mut any = false;
+                            let mut dup_reported = false;
                             for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
                                 match self.tables.lookup(src, ns, last) {
                                     Some(BindState::One(b)) if self.tables.visible(&b.vis, b.def_module, module, self.interner) => {
                                         any = true;
-                                        insert_local(scopes, name, ns, LocalBind::Target(b.target), 2);
+                                        if insert_local(scopes, name, ns, LocalBind::Target(b.target), 2) && !dup_reported {
+                                            self.push_local_dup(span, name);
+                                            dup_reported = true;
+                                        }
                                     }
                                     Some(BindState::Ambiguous) => {
                                         any = true;
@@ -3884,9 +3978,28 @@ impl Rewrite<'_> {
                     }
                 }
                 ImportKind::Glob { path } => {
-                    if let PathRes::Done(Target::Module(src)) =
-                        self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner)
+                    if path.is_empty() {
+                        self.diags.push(Diag::new(
+                            "L0506",
+                            span,
+                            "cannot glob-import all possible crates",
+                            "Name the module before the `*`, such as `use a::*;`.",
+                        ));
+                        continue;
+                    }
+                    // `use a::E::*;` in a body imports the variants.
+                    if let PathRes::Done(Target::Def(adt)) =
+                        self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner)
+                        && self.tables.variants.contains_key(&adt)
                     {
+                        for v in self.tables.variants[&adt].clone() {
+                            insert_local(scopes, v, Namespace::Value, LocalBind::Target(Target::Variant(adt, v)), 1);
+                        }
+                        continue;
+                    }
+                    match self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner) {
+                        PathRes::Done(Target::Extern(_)) => {}
+                        PathRes::Done(Target::Module(src)) => {
                         let mut entries = Vec::new();
                         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
                             for (name, state) in &self.tables.maps[src.0 as usize][ns_index(ns)] {
@@ -3902,9 +4015,69 @@ impl Rewrite<'_> {
                         for (name, ns, bind) in entries {
                             insert_local(scopes, name, ns, bind, 1);
                         }
+                        }
+                        _ => self.push_unresolved_use(span, &path),
                     }
                 }
             }
+        }
+    }
+
+    /// The L0506 diagnostic for a function-local `use` that does not
+    /// resolve, matching the module-level fixpoint message.
+    fn push_unresolved_use(&mut self, span: Span, path: &[Sym]) {
+        self.diags.push(Diag::new(
+            "L0506",
+            span,
+            format!("unresolved import `{}`", path.iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>().join("::")),
+            "Check the path: every segment must name a module or item that is visible here.",
+        ));
+    }
+
+    /// The L0106 diagnostic for a repeated function-local import name.
+    fn push_local_dup(&mut self, span: Span, name: Sym) {
+        self.diags.push(Diag::new(
+            "L0106",
+            span,
+            format!("`{}` is defined more than once", self.interner.get(name)),
+            "Rename one of the imports with `as`, or remove one.",
+        ));
+    }
+
+    /// Checks a one-segment function-local import (`use a;`, `use self;`,
+    /// `use crate as x;`). These bind nothing the later walk needs (the
+    /// name reads through the module tables), but a bad one is still an
+    /// error in rustc, so it is validated and only that.
+    fn check_local_single_use(&mut self, path: &[Sym], name: Sym, leading: bool, module: ModuleId, span: Span) {
+        let seg = path[0];
+        let self_sym = self.interner.intern("self");
+        let crate_sym = self.interner.intern("crate");
+        let super_sym = self.interner.intern("super");
+        if seg == crate_sym || seg == self_sym || seg == super_sym {
+            if name == seg {
+                self.diags.push(Diag::new(
+                    "L0506",
+                    span,
+                    "this import needs to be explicitly named",
+                    "Add a rename, such as `use self as here;`.",
+                ));
+            } else if !matches!(self.tables.resolve_module_path(module, path, leading, self.interner), PathRes::Done(_)) {
+                self.push_unresolved_use(span, path);
+            }
+            return;
+        }
+        let mut saw_private = false;
+        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            match self.tables.resolve_path(module, path, ns, PathMode::Use, leading, self.interner) {
+                PathRes::Done(_) | PathRes::Partial(..) | PathRes::Prelude => return,
+                PathRes::Private => saw_private = true,
+                _ => {}
+            }
+        }
+        if saw_private {
+            self.diags.push(private_diag(self.interner.get(seg), span));
+        } else {
+            self.push_unresolved_use(span, path);
         }
     }
 
@@ -4083,9 +4256,16 @@ fn collect_arg_tys(args: &GenericArgs, out: &mut Vec<TyId>) {
 /// Inserts one function-local import binding with a rank: an explicit
 /// import (2) beats a glob (1); two globs with different targets are
 /// ambiguous.
-fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind, rank: u8) {
-    let Some(frame) = scopes.last_mut() else { return };
+/// Inserts one function-local import binding. Returns true when an
+/// explicit (rank 2) import rebinds a name an earlier explicit local
+/// import already bound in this frame: a duplicate import (E0252).
+fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind, rank: u8) -> bool {
+    let Some(frame) = scopes.last_mut() else { return false };
     let key = (name, ns_index(ns));
+    let dup = rank >= 2 && frame.explicit.contains(&key);
+    if rank >= 2 && !dup {
+        frame.explicit.push(key);
+    }
     match (frame.imports.get(&key), bind) {
         (Some(LocalBind::Target(old)), LocalBind::Target(new)) if *old != new && rank <= 1 => {
             frame.imports.insert(key, LocalBind::Ambiguous);
@@ -4095,6 +4275,7 @@ fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind,
             frame.imports.insert(key, bind);
         }
     }
+    dup
 }
 
 /// A throwaway FnDef for `mem::replace` during the item walk.
@@ -4126,7 +4307,7 @@ trait ShallowScopes {
 
 impl ShallowScopes for [Frame] {
     fn to_vec_shallow(&self) -> Vec<Frame> {
-        self.iter().map(|f| Frame { locals: f.locals.clone(), imports: f.imports.clone() }).collect()
+        self.iter().map(|f| Frame { locals: f.locals.clone(), imports: f.imports.clone(), explicit: f.explicit.clone() }).collect()
     }
 }
 

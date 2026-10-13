@@ -996,6 +996,13 @@ pub enum ImportKind {
     Single { path: Vec<Sym>, name: Sym },
     /// `use a::b::*;`.
     Glob { path: Vec<Sym> },
+    /// The prefix of an empty group (`use a::b::{};`): it binds
+    /// nothing, but rustc still resolves the prefix and rejects a bad
+    /// one, so the path is checked and only that.
+    CheckPath { path: Vec<Sym> },
+    /// A leading `::` that is not in start position (`use a::{::b};`).
+    /// The fixpoint reports it once and settles.
+    BadLeading { path: Vec<Sym> },
 }
 
 /// Flattens one `use` tree into imports. Groups distribute their
@@ -1013,6 +1020,21 @@ pub fn flatten_use(tree: &ast::UseTree, module: ModuleId, vis: VisKind, out: &mu
     ) {
         let saved = prefix.len();
         prefix.extend(tree.prefix.iter().map(|s| s.name));
+        // A leading `::` is the crate root and belongs in start
+        // position only: `use {::std::..}` is a start, `use a::{::b}`
+        // is an error (rustc E0433).
+        if tree.leading_colon && saved > 0 {
+            out.push(Import {
+                module,
+                vis: vis.clone(),
+                leading_colon: true,
+                span: tree.span,
+                kind: ImportKind::BadLeading { path: prefix.clone() },
+            });
+            prefix.truncate(saved);
+            return;
+        }
+        let leading = leading || tree.leading_colon;
         match &tree.kind {
             ast::UseKind::Simple { rename } => {
                 if let Some(last) = prefix.last().copied() {
@@ -1040,6 +1062,15 @@ pub fn flatten_use(tree: &ast::UseTree, module: ModuleId, vis: VisKind, out: &mu
                 });
             }
             ast::UseKind::Group(children) => {
+                if children.is_empty() {
+                    out.push(Import {
+                        module,
+                        vis: vis.clone(),
+                        leading_colon: leading,
+                        span: tree.span,
+                        kind: ImportKind::CheckPath { path: prefix.clone() },
+                    });
+                }
                 for c in children {
                     walk(c, prefix, module, vis, leading, out, interner);
                 }
@@ -1096,9 +1127,10 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             continue;
         }
         let what = match &imp.kind {
-            ImportKind::Single { path, .. } | ImportKind::Glob { path } => {
-                path.iter().map(|s| interner.get(*s)).collect::<Vec<_>>().join("::")
-            }
+            ImportKind::Single { path, .. }
+            | ImportKind::Glob { path }
+            | ImportKind::CheckPath { path }
+            | ImportKind::BadLeading { path } => path.iter().map(|s| interner.get(*s)).collect::<Vec<_>>().join("::"),
         };
         diags.push(Diag::new(
             "L0506",
@@ -1123,7 +1155,48 @@ enum TryOut {
 /// Tries one import against the current tables.
 fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
     match &imp.kind {
+        ImportKind::BadLeading { .. } => {
+            diags.push(Diag::new(
+                "L0506",
+                imp.span,
+                "the crate root in a `use` path can only be used in start position",
+                "Move the leading `::` to the start of the whole import, or remove it.",
+            ));
+            TryOut::Done(false)
+        }
+        ImportKind::CheckPath { path } => {
+            // An empty group binds nothing, but its prefix must still
+            // name a module (or an enum, like a glob prefix).
+            if path.is_empty() {
+                return TryOut::Done(false);
+            }
+            match tables.resolve_module_path(imp.module, path, imp.leading_colon, interner) {
+                PathRes::Done(_) => TryOut::Done(false),
+                PathRes::Private => {
+                    diags.push(private_diag("that module", imp.span));
+                    TryOut::Done(false)
+                }
+                _ => match tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner) {
+                    PathRes::Done(Target::Def(adt)) if tables.variants.contains_key(&adt) => TryOut::Done(false),
+                    PathRes::Private => {
+                        diags.push(private_diag("that module", imp.span));
+                        TryOut::Done(false)
+                    }
+                    _ => TryOut::Wait,
+                },
+            }
+        }
         ImportKind::Glob { path } => {
+            if path.is_empty() {
+                // `use *;` and `use ::*;` name no module at all.
+                diags.push(Diag::new(
+                    "L0506",
+                    imp.span,
+                    "cannot glob-import all possible crates",
+                    "Name the module before the `*`, such as `use a::*;`.",
+                ));
+                return TryOut::Done(false);
+            }
             match tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner) {
                 // `use a::E::*` imports the enum's variants.
                 PathRes::Done(Target::Def(adt)) if tables.variants.contains_key(&adt) => {
@@ -1194,34 +1267,132 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 if !tables.check_reexport(imp, Target::Variant(adt, path[rest]), interner.get(path[rest]), interner, diags) {
                     return TryOut::Done(false);
                 }
+                let dup = explicit_exists(tables, imp, Namespace::Value, *name);
                 let out = tables.insert(
                     imp.module,
                     Namespace::Value,
                     *name,
                     Bind { target: Target::Variant(adt, path[rest]), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                 );
-                report_dup(out, imp, *name, interner, diags);
+                if dup {
+                    diags.push(dup_diag(imp, *name, interner));
+                } else {
+                    report_dup(out, imp, *name, interner, diags);
+                }
                 return TryOut::Done(out == InsertOut::Changed);
             }
             let (mod_path, last) = path.split_at(path.len() - 1);
             let last = last[0];
-            if last == self_sym {
-                // `use a::b::{self}`: bind the module itself. The binding
-                // name is the segment before `self`, or the rename (the
-                // parser keeps an `as` name in `name`).
-                return match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
+            let crate_sym = interner.intern("crate");
+            let super_sym = interner.intern("super");
+            let self_ty = interner.intern("Self");
+            let kw = |s: Sym| s == crate_sym || s == self_sym || s == super_sym;
+            // `use crate as x;`, `use super::super as x;`: the whole path
+            // is module keywords and the rename is the binding name.
+            // Without a rename these keep the plain lookup below, which
+            // finds no such name and reports the import unresolved.
+            if last != self_sym && *name != last && path.iter().all(|&s| kw(s)) {
+                return match tables.resolve_module_path(imp.module, path, imp.leading_colon, interner) {
                     PathRes::Done(target) => {
                         if !tables.check_reexport(imp, target, interner.get(*name), interner, diags) {
                             return TryOut::Done(false);
                         }
-                        let bind_name = if *name == self_sym { mod_path.last().copied().unwrap_or(*name) } else { *name };
+                        let dup = explicit_exists(tables, imp, Namespace::Type, *name);
                         let out = tables.insert(
                             imp.module,
                             Namespace::Type,
-                            bind_name,
+                            *name,
                             Bind { target, vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                         );
-                        report_dup(out, imp, *name, interner, diags);
+                        if dup {
+                            diags.push(dup_diag(imp, *name, interner));
+                        } else {
+                            report_dup(out, imp, *name, interner, diags);
+                        }
+                        TryOut::Done(out == InsertOut::Changed)
+                    }
+                    PathRes::Private => {
+                        diags.push(private_diag("that module", imp.span));
+                        TryOut::Done(false)
+                    }
+                    _ => TryOut::Wait,
+                };
+            }
+            if last == self_sym {
+                // `use a::b::{self}`: bind the module itself. The binding
+                // name is the segment before `self`, or the rename (the
+                // parser keeps an `as` name in `name`). When there is no
+                // rename and no plain segment to take the name from
+                // (`use self;`, `use crate::self;`), rustc rejects the
+                // import: it needs to be explicitly named.
+                if *name == self_sym && !matches!(mod_path.last(), Some(&c) if !kw(c) && c != self_ty) {
+                    diags.push(Diag::new(
+                        "L0506",
+                        imp.span,
+                        "this import needs to be explicitly named",
+                        "Add a rename, such as `use self as here;`.",
+                    ));
+                    return TryOut::Done(false);
+                }
+                // The prefix names a module, or an enum whose own name
+                // `self` binds (`use a::E::{self, V}`).
+                let target = match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
+                    PathRes::Done(target) => Some(target),
+                    PathRes::Private => {
+                        diags.push(private_diag("that module", imp.span));
+                        return TryOut::Done(false);
+                    }
+                    _ => match tables.resolve_path(imp.module, mod_path, Namespace::Type, PathMode::Use, imp.leading_colon, interner) {
+                        PathRes::Done(Target::Def(adt)) if tables.variants.contains_key(&adt) => Some(Target::Def(adt)),
+                        PathRes::Private => {
+                            diags.push(private_diag("that module", imp.span));
+                            return TryOut::Done(false);
+                        }
+                        _ => None,
+                    },
+                };
+                let Some(target) = target else { return TryOut::Wait };
+                if !tables.check_reexport(imp, target, interner.get(*name), interner, diags) {
+                    return TryOut::Done(false);
+                }
+                let bind_name = if *name == self_sym { mod_path.last().copied().unwrap_or(*name) } else { *name };
+                let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
+                let out = tables.insert(
+                    imp.module,
+                    Namespace::Type,
+                    bind_name,
+                    Bind { target, vis: imp.vis.clone(), rank: 2, def_module: imp.module },
+                );
+                if dup {
+                    diags.push(dup_diag(imp, bind_name, interner));
+                } else {
+                    report_dup(out, imp, bind_name, interner, diags);
+                }
+                return TryOut::Done(out == InsertOut::Changed);
+            }
+            // `use ::name;`: with a leading colon the one segment reads
+            // in the extern prelude only, never in this module.
+            if imp.leading_colon && mod_path.is_empty() {
+                return match tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, true, interner) {
+                    PathRes::Done(Target::Extern(i)) => {
+                        if let Some(why) = &tables.externs[i as usize].unsupported {
+                            diags.push(unsupported_diag(why, imp.span));
+                        }
+                        TryOut::Done(false)
+                    }
+                    PathRes::Done(Target::Module(src)) => {
+                        let dup = explicit_exists(tables, imp, Namespace::Type, *name);
+                        let out = tables.insert(
+                            imp.module,
+                            Namespace::Type,
+                            *name,
+                            Bind { target: Target::Module(src), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
+                        );
+                        if dup {
+                            diags.push(dup_diag(imp, *name, interner));
+                        } else {
+                            report_dup(out, imp, *name, interner, diags);
+                        }
                         TryOut::Done(out == InsertOut::Changed)
                     }
                     PathRes::Private => {
@@ -1278,9 +1449,18 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             return TryOut::Done(false);
                         }
                     }
+                    let mut dup_reported = false;
                     for (ns, bind) in found {
+                        let dup = explicit_exists(tables, imp, ns, *name);
                         let out = tables.insert(imp.module, ns, *name, bind);
-                        report_dup(out, imp, *name, interner, diags);
+                        if dup {
+                            if !dup_reported {
+                                diags.push(dup_diag(imp, *name, interner));
+                                dup_reported = true;
+                            }
+                        } else {
+                            report_dup(out, imp, *name, interner, diags);
+                        }
                         changed |= out == InsertOut::Changed;
                     }
                     TryOut::Done(changed)
@@ -1323,15 +1503,29 @@ fn insert_ambiguous(tables: &mut ResolvedTables, module: ModuleId, ns: Namespace
     }
 }
 
+/// True when `name` in `ns` is already bound in the importing module
+/// by a local item or by an earlier explicit import. Rust rejects a
+/// second explicit binding even for the same target (E0252, E0255),
+/// which the rank rules in `insert` alone treat as `Same`, so callers
+/// check this before they insert and report `dup_diag` once.
+fn explicit_exists(tables: &ResolvedTables, imp: &Import, ns: Namespace, name: Sym) -> bool {
+    matches!(tables.lookup(imp.module, ns, name), Some(BindState::One(b)) if b.rank >= 2)
+}
+
+/// The L0106 diagnostic for a name bound more than once in one module.
+fn dup_diag(imp: &Import, name: Sym, interner: &Interner) -> Diag {
+    Diag::new(
+        "L0106",
+        imp.span,
+        format!("`{}` is defined more than once", interner.get(name)),
+        "Rename one of the imports with `as`, or remove one.",
+    )
+}
+
 /// Reports a duplicate explicit import (two sources, one binding name).
 fn report_dup(out: InsertOut, imp: &Import, name: Sym, interner: &Interner, diags: &mut Vec<Diag>) {
     if out == InsertOut::Dup {
-        diags.push(Diag::new(
-            "L0106",
-            imp.span,
-            format!("`{}` is defined more than once", interner.get(name)),
-            "Rename one of the imports with `as`, or remove one.",
-        ));
+        diags.push(dup_diag(imp, name, interner));
     }
 }
 
