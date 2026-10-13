@@ -118,17 +118,27 @@ pub struct ResolveError {
 /// A big file is lexed in pieces in parallel (see `route_pieces`); the
 /// answer is the same as one serial lex.
 pub fn needs_resolve(root_text: &str, interner: &Interner) -> bool {
+    route_root(root_text, interner).0
+}
+
+/// `needs_resolve`, plus the root's token list when the answer is yes:
+/// exactly a serial lex at file 0, base 0, which is how discovery lexes a
+/// single-file crate root. The driver seeds the resolve cache with it
+/// (`ResolveCache::seed_root`), so the root is not lexed twice.
+pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::Lexed>) {
     if let Some(pieces) = route_pieces(root_text) {
         let answers = par_map(&pieces, |&(a, b)| {
             let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
-            piece_cut_ok(&lexed, b, root_text.len()).then(|| needs_resolve_lexed(&lexed, interner))
+            piece_cut_ok(&lexed, b, root_text.len()).then(|| (needs_resolve_lexed(&lexed, interner), lexed))
         });
-        if let Some(answers) = answers.into_iter().collect::<Option<Vec<bool>>>() {
-            return answers.contains(&true);
+        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, lexer::Lexed)>>>() {
+            let yes = answers.iter().any(|(y, _)| *y);
+            return (yes, yes.then(|| join_lexed(answers.into_iter().map(|(_, l)| l).collect())));
         }
     }
-    let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return false };
-    needs_resolve_lexed(&lexed, interner)
+    let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return (false, None) };
+    let yes = needs_resolve_lexed(&lexed, interner);
+    (yes, yes.then_some(lexed))
 }
 
 /// Cut points for lexing a big file in parallel: about four pieces per
@@ -533,6 +543,9 @@ pub struct ResolveCache {
     /// parsed Asts, or final chunks), and the resolve skips the
     /// expanded-stream hashes that only key those entries.
     one_shot: bool,
+    /// A root token list from routing (`seed_root`), stored by `begin`
+    /// after its environment check: (key, text hash, tokens).
+    seed: Option<(String, u64, lexer::Lexed)>,
 }
 
 struct CachedFile {
@@ -633,12 +646,25 @@ impl ResolveCache {
         ResolveCache { one_shot, ..ResolveCache::default() }
     }
 
-    /// Drops every entry when the cfg environment changed.
+    /// Holds a crate root's raw token list, lexed by routing, for
+    /// discovery: the root is the first file (file 0) of the root module.
+    /// A later text edit or a std splice misses on the text hash.
+    pub fn seed_root(&mut self, root_path: &std::path::Path, text: &str, lexed: lexer::Lexed) {
+        let key = format!("{}#{}", modules::canonical_string(root_path), ROOT_MODULE.0);
+        self.seed = Some((key, hash_str(text), lexed));
+    }
+
+    /// Drops every entry when the cfg environment changed, then stores a
+    /// seeded root token list (raw tokens do not depend on cfg; a one-shot
+    /// cache stores this one entry, which discovery moves out).
     fn begin(&mut self, input: &CrateInput) {
         let fp = env_fingerprint(input);
         if self.env_fp != fp {
             self.env_fp = fp;
             self.files.clear();
+        }
+        if let Some((key, text_hash, lexed)) = self.seed.take() {
+            self.entry(&key, text_hash, FileId(0)).raw = Some(lexed);
         }
     }
 
@@ -663,10 +689,12 @@ impl ResolveCache {
         self.files.get(key).filter(|e| e.text_hash == text_hash && e.file_id == file_id)
     }
 
-    /// The cached raw token stream for one file, cloned out, when
-    /// its text and file id stand.
+    /// The cached raw token stream for one file, when its text and file
+    /// id stand: cloned out, or moved out of a one-shot cache.
     fn raw(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
-        self.peek(key, text_hash, file_id).and_then(|e| e.raw.as_ref()).map(clone_lexed)
+        let one_shot = self.one_shot;
+        let e = self.files.get_mut(key).filter(|e| e.text_hash == text_hash && e.file_id == file_id)?;
+        if one_shot { e.raw.take() } else { e.raw.as_ref().map(clone_lexed) }
     }
 
     /// Every put stores nothing in a one-shot cache (see `one_shot`).
@@ -4708,6 +4736,14 @@ mod tests {
             assert!(route_pieces(text).is_some_and(|p| p.len() > 1), "case {k} splits");
             let i = Interner::default();
             assert_eq!(needs_resolve(text, &i), serial(text), "case {k}");
+            // The root tokens for discovery: exactly the serial lex, on yes.
+            let (yes, lexed) = route_root(text, &i);
+            assert_eq!(lexed.is_some(), yes, "case {k}");
+            if let Some(l) = lexed {
+                let s = lexer::lex(text, FileId(0), 0, &i).unwrap();
+                assert!(l.strings == s.strings && l.tokens.len() == s.tokens.len(), "case {k}");
+                assert!(l.tokens.iter().zip(&s.tokens).all(|(a, b)| a.tok == b.tok && a.span == b.span), "case {k}");
+            }
         }
         let answers: Vec<bool> = cases.iter().map(|t| serial(t)).collect();
         assert_eq!(answers, [false, true, true, false, false, true, true]);

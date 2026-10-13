@@ -1290,6 +1290,7 @@ fn resolved_setup(
     caches: &mut Caches,
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
     user_src: &str,
+    root_lexed: Option<lexer::Lexed>,
     crate_ids_default: CrateIds,
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
@@ -1350,6 +1351,14 @@ fn resolved_setup(
         *std_routes = routes;
         spliced = true;
         t.lap("std load+splice");
+    }
+    // Routing lexed the single-file root already: hand its tokens to
+    // discovery, unless a std splice changed the text.
+    if !spliced
+        && key.krate.manifest_path.is_none()
+        && let Some(lexed) = root_lexed
+    {
+        front.resolve_cache.seed_root(&root_path, &root_text, lexed);
     }
     let resolved = loop {
         let input = CrateInput {
@@ -1557,8 +1566,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // AST, synthetic chunk, spliced source): the chunk path must never
     // reuse it, and with `env_hash` cleared the request rebuilds in full
     // mode, which resets the caches in `slot_update`.
-    let wants_resolver =
-        req.session.krate.manifest_path.is_some() || crate::resolve::worklist::needs_resolve(&src, &front.interner);
+    let (wants_resolver, root_lexed) = if req.session.krate.manifest_path.is_some() {
+        (true, None)
+    } else {
+        crate::resolve::worklist::route_root(&src, &front.interner)
+    };
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;
@@ -1600,7 +1612,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Both front ends produce the same locals for the shared tail.
     let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
-        match resolved_setup(req, front, caches, std_cache, &src, crate_ids, &mut std_ranges, &mut std_routes, &mut t) {
+        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, crate_ids, &mut std_ranges, &mut std_routes, &mut t) {
             Ok(x) => x,
             Err(resp) => return resp,
         }
