@@ -2622,9 +2622,18 @@ fn resolve_one(
             },
         );
     }
-    // Assemble the crate outputs in file order.
-    let module_by_path: FxMap<Vec<Sym>, ModuleId> =
-        tables.modules.iter().enumerate().map(|(i, m)| (m.path.clone(), ModuleId(i as u32))).collect();
+    // Assemble the crate outputs in file order. Module paths are
+    // per-crate (every crate root has the empty path), so the map
+    // holds only this job's crate: in a workspace session the other
+    // crates' roots would collide on the same paths and every fn
+    // would take the wrong crate's module.
+    let module_by_path: FxMap<Vec<Sym>, ModuleId> = tables
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.krate_root == job.root_module)
+        .map(|(i, m)| (m.path.clone(), ModuleId(i as u32)))
+        .collect();
     let mut chunks = Vec::with_capacity(pendings.len());
     let mut fn_lines = Vec::new();
     let mut body_hashes = Vec::new();
@@ -3437,7 +3446,10 @@ fn register_items(
                     if let VariantFields::Struct(fs) = &v.fields {
                         let entry = tables.field_vis.entry(def).or_insert_with(|| (module, FxMap::default()));
                         for f in fs {
-                            entry.1.insert(f.name, vis_from_ast(&f.vis, interner));
+                            // Variant fields carry no visibility of
+                            // their own in Rust: they are visible
+                            // wherever the enum is.
+                            entry.1.insert(f.name, vis());
                         }
                     }
                 }
