@@ -1,5 +1,5 @@
-// expect: L0113
-// Two Conv impls fit; rustc E0283. Pin from the opus-fixes review (q06).
+// expect: L0610
+// Two Conv impls fit; rustc E0283 (annotations needed). Pin from the opus-fixes review (q06).
 trait Conv<T> { fn conv(&self) -> T; }
 struct S;
 impl Conv<u16> for S { fn conv(&self) -> u16 { 16 } }
