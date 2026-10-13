@@ -561,11 +561,12 @@ fn hash_lexed(l: &lexer::Lexed) -> u64 {
                 h.write_u128(v);
                 std::mem::discriminant(&suffix).hash(&mut h);
             }
-            Tok::Float(i) | Tok::Str(i) | Tok::DocStr(i) => {
-                l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
-            }
             Tok::Char(c) => h.write_u64(c as u64),
-            _ => {}
+            t => {
+                if let Some(i) = t.string_index() {
+                    l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
+                }
+            }
         }
         h.write_u64(t.span.file.0 as u64);
         h.write_u64(t.span.lo as u64);
@@ -1831,11 +1832,10 @@ impl MacroEnv {
             });
             base.iter()
                 .map(|t| {
-                    let tok = match t.tok {
-                        Tok::Str(i) => Tok::Str(i + offset),
-                        Tok::Float(i) => Tok::Float(i + offset),
-                        other => other,
-                    };
+                    let mut tok = t.tok;
+                    if let Some(i) = tok.string_index_mut() {
+                        *i += offset;
+                    }
                     Token { tok, span: t.span }
                 })
                 .collect()

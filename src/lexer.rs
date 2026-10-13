@@ -148,6 +148,25 @@ pub enum Tok {
     Eof,
 }
 
+impl Tok {
+    /// The `Lexed::strings` index this token carries, writable: `Float`,
+    /// `Str`, `DocStr`, `ByteStr`, and `ByteChar` hold one. This is the one
+    /// list of such kinds. Every pass that moves token streams between
+    /// string tables (concat, splice, slice) or compares or hashes their
+    /// strings goes through it, so a new kind is added here only.
+    pub fn string_index_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            Tok::Float(i) | Tok::Str(i) | Tok::DocStr(i) | Tok::ByteStr(i) | Tok::ByteChar(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The `Lexed::strings` index this token carries (see `string_index_mut`).
+    pub fn string_index(mut self) -> Option<u32> {
+        self.string_index_mut().map(|i| *i)
+    }
+}
+
 /// A delimiter kind for token trees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delim {

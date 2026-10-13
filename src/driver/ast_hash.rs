@@ -149,9 +149,12 @@ impl Walker<'_> {
                             v.hash(h);
                             suf.map(|s| s as u8).hash(h);
                         }
-                        Tok::Str(i) | Tok::Float(i) => self.string_at(h, *i),
                         Tok::Char(c) => c.hash(h),
-                        _ => {}
+                        t => {
+                            if let Some(i) = t.string_index() {
+                                self.string_at(h, i);
+                            }
+                        }
                     }
                 }
                 TokenTree::Delim(d, inner, _) => {

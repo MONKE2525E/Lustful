@@ -1070,14 +1070,11 @@ impl Shift {
     fn trees(&self, trees: &mut [TokenTree]) {
         for tree in trees {
             match tree {
-                TokenTree::Token(tok) => match &mut tok.tok {
-                    crate::lexer::Tok::Str(i)
-                    | crate::lexer::Tok::Float(i)
-                    | crate::lexer::Tok::DocStr(i)
-                    | crate::lexer::Tok::ByteStr(i)
-                    | crate::lexer::Tok::ByteChar(i) => *i += self.s,
-                    _ => {}
-                },
+                TokenTree::Token(tok) => {
+                    if let Some(i) = tok.tok.string_index_mut() {
+                        *i += self.s;
+                    }
+                }
                 TokenTree::Delim(_, inner, _) => self.trees(inner),
             }
         }

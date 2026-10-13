@@ -219,9 +219,12 @@ pub fn hash_token(h: &mut impl Hasher, tok: &Token, strings: &[String]) {
             v.hash(h);
             suffix.map(|s| s as u8).hash(h);
         }
-        Tok::Str(i) | Tok::Float(i) | Tok::DocStr(i) | Tok::ByteStr(i) | Tok::ByteChar(i) => strings.get(i as usize).hash(h),
         Tok::Char(c) => c.hash(h),
-        _ => {}
+        t => {
+            if let Some(i) = t.string_index() {
+                strings.get(i as usize).hash(h);
+            }
+        }
     }
 }
 
@@ -492,12 +495,10 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
 /// True when two plain tokens match as token-tree literals in a matcher:
 /// same kind and same value. Span and context do not take part.
 pub fn tok_matches(pattern: &Tok, input: &Tok, strings: &[String]) -> bool {
-    match (pattern, input) {
-        (Tok::Str(a), Tok::Str(b))
-        | (Tok::Float(a), Tok::Float(b))
-        | (Tok::DocStr(a), Tok::DocStr(b))
-        | (Tok::ByteStr(a), Tok::ByteStr(b))
-        | (Tok::ByteChar(a), Tok::ByteChar(b)) => strings.get(*a as usize) == strings.get(*b as usize),
+    match (pattern.string_index(), input.string_index()) {
+        (Some(a), Some(b)) => {
+            std::mem::discriminant(pattern) == std::mem::discriminant(input) && strings.get(a as usize) == strings.get(b as usize)
+        }
         _ => pattern == input,
     }
 }
@@ -978,14 +979,10 @@ impl<'a> Expander<'a> {
                 .iter()
                 .map(|t| match t {
                     Tt::Tok(tok) => {
-                        let tok = match tok.tok {
-                            Tok::Str(i) => Tok::Str(i + offset),
-                            Tok::Float(i) => Tok::Float(i + offset),
-                            Tok::DocStr(i) => Tok::DocStr(i + offset),
-                            Tok::ByteStr(i) => Tok::ByteStr(i + offset),
-                            Tok::ByteChar(i) => Tok::ByteChar(i + offset),
-                            other => other,
-                        };
+                        let mut tok = tok.tok;
+                        if let Some(i) = tok.string_index_mut() {
+                            *i += offset;
+                        }
                         Tt::Tok(Token { tok, span })
                     }
                     Tt::Delim(d, inner, _) => Tt::Delim(*d, remap(inner, offset, span), span),
@@ -1011,14 +1008,10 @@ impl<'a> Expander<'a> {
                 .iter()
                 .map(|t| match t {
                     Tt::Tok(tok) => {
-                        let kind = match tok.tok {
-                            Tok::Str(i) => Tok::Str(i + offset),
-                            Tok::Float(i) => Tok::Float(i + offset),
-                            Tok::DocStr(i) => Tok::DocStr(i + offset),
-                            Tok::ByteStr(i) => Tok::ByteStr(i + offset),
-                            Tok::ByteChar(i) => Tok::ByteChar(i + offset),
-                            other => other,
-                        };
+                        let mut kind = tok.tok;
+                        if let Some(i) = kind.string_index_mut() {
+                            *i += offset;
+                        }
                         Tt::Tok(Token { tok: kind, span: tok.span })
                     }
                     Tt::Delim(d, inner, span) => Tt::Delim(*d, remap(inner, offset), *span),
@@ -1489,11 +1482,10 @@ impl<'a> Expander<'a> {
             .tokens
             .iter()
             .map(|t| {
-                let tok = match t.tok {
-                    Tok::Str(i) => Tok::Str(i + offset),
-                    Tok::Float(i) => Tok::Float(i + offset),
-                    other => other,
-                };
+                let mut tok = t.tok;
+                if let Some(i) = tok.string_index_mut() {
+                    *i += offset;
+                }
                 Token { tok, span: t.span }
             })
             .collect();

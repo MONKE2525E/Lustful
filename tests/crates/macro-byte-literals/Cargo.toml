@@ -1,0 +1,11 @@
+# Byte literals in macro bodies from another file: a textual macro
+# (#[macro_use] inheritance into a parent and a later sibling) and
+# exported macros called by path. Each file also has byte literals of
+# its own at the same string table indexes, so a token whose index is
+# not moved into the expander's table reads another file's literal.
+[package]
+name = "macro-byte-literals"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
