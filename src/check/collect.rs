@@ -2066,13 +2066,32 @@ pub fn collect_reuse<'a>(
                     p.gx.dyn_impl_sites.push((self_pat, ast.ty_span(imp.self_ty)));
                 }
                 // A header dyn whose object lifetime is `'static` (a dyn
-                // Self outside a reference, or a dyn trait argument).
+                // Self outside a reference, a dyn trait argument, or a
+                // written `dyn Tr + 'static` anywhere in the header).
                 let static_dyn = crate::check::object::header_dyn_is_static(ast, interner, imp.self_ty)
+                    || p.tys.flags(self_pat).contains_static_region()
                     || trait_ref.is_some_and(|tr| {
-                        p.tys.args(tr.args).iter().skip(1).any(|g| g.as_ty().is_some_and(|t| matches!(p.tys.kind(t), TyKind::Dyn(..))))
+                        p.tys.args(tr.args).iter().skip(1).any(|g| {
+                            g.as_ty().is_some_and(|t| matches!(p.tys.kind(t), TyKind::Dyn(..)) || p.tys.flags(t).contains_static_region())
+                        })
                     });
                 if static_dyn {
                     p.gx.static_dyn_impls.push(impl_def);
+                }
+                // A `&'static` reference to a dyn value in a header: the
+                // DynStatic proof covers object lifetimes only, and lust
+                // tracks no other reference lifetime.
+                let static_ref = crate::check::object::has_static_ref(&p.tys, self_pat)
+                    || trait_ref.is_some_and(|tr| {
+                        p.tys.args(tr.args).iter().any(|g| g.as_ty().is_some_and(|t| crate::check::object::has_static_ref(&p.tys, t)))
+                    });
+                if static_ref {
+                    errs.push(Diag::new(
+                        "L0705",
+                        ast.ty_span(imp.self_ty),
+                        "lust cannot check a `&'static` reference to a `dyn` value in an impl header",
+                        "Implement the trait for `dyn Tr` itself, or for a type without `&'static dyn`.",
+                    ));
                 }
                 if trait_ref.is_none() && owner.is_none() && !dyn_self {
                     errs.push(Diag::new(

@@ -313,6 +313,8 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
                 mentions_self(&p.tys, b.value.ty)
                     || p.tys.args(b.value.trait_args).iter().any(|g| g.as_ty().is_some_and(|t| mentions_self(&p.tys, t)))
             }
+            // `where Self: 'static` is the `needs_static` flag below.
+            Predicate::TypeOutlives(t, Region::Static) if is_self(&p.tys, GenericArg::Ty(*t)) => false,
             Predicate::TypeOutlives(t, _) => mentions_self(&p.tys, *t),
             Predicate::Outlives(..) => false,
         };
@@ -780,6 +782,50 @@ pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         }
         _ => false,
     }
+}
+
+/// True when `t` holds a reference typed `&'static` (lust keeps that
+/// region only on references to dyn types).
+pub fn has_static_ref(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(Region::Static, ..) => true,
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_static_ref(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_static_ref(tys, e)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) | TyKind::Opaque(_, a) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_static_ref(tys, e)))
+        }
+        TyKind::Dyn(..) => principal_of(tys, t).is_some_and(|pr| tys.args(pr.args).iter().any(|g| g.as_ty().is_some_and(|e| has_static_ref(tys, e)))),
+        TyKind::FnPtr(sig) => {
+            let s = tys.sig(sig).value;
+            has_static_ref(tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_static_ref(tys, e))
+        }
+        _ => false,
+    }
+}
+
+/// True when an impl header type satisfies a `'static` bound (`trait
+/// Tr: 'static`): no reference (an elided one in a header is a lifetime
+/// parameter, and lust drops a written `'static` on a non-dyn
+/// reference), no dyn type with a shorter object lifetime, and no type
+/// parameter without a `'static` bound in the impl's env. `dyn_self`:
+/// the header's own dyn Self, which defaults to `'static`.
+pub fn header_type_static(p: &Program, env: &[Predicate], t: Ty, dyn_self: bool) -> bool {
+    fn go(p: &Program, env: &[Predicate], t: Ty, top: bool, depth: u32) -> bool {
+        let args_ok = |a: ArgsId| p.tys.args(a).iter().all(|g| g.as_ty().is_none_or(|e| go(p, env, e, false, depth + 1)));
+        if depth > 32 {
+            return true;
+        }
+        match p.tys.kind(t) {
+            TyKind::Ref(..) => false,
+            TyKind::Param(_) | TyKind::Projection(..) => env.iter().any(|q| matches!(q, Predicate::TypeOutlives(x, Region::Static) if *x == t)),
+            TyKind::Dyn(..) => (top || dyn_is_static(p, &p.tys, t)) && principal_of(&p.tys, t).is_none_or(|pr| args_ok(pr.args)),
+            TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => go(p, env, e, false, depth + 1),
+            TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().all(|&e| go(p, env, e, false, depth + 1)),
+            TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => args_ok(a),
+            _ => true,
+        }
+    }
+    go(p, env, t, dyn_self, 0)
 }
 
 /// True when a dyn type occurs anywhere in `t`.

@@ -1443,8 +1443,10 @@ fn resolve_path_ty(
 /// records the parameter index in `relaxed` instead of a
 /// predicate (the implicit `Sized` predicate is then withheld by
 /// `build_generics`). Lifetime bounds on named lifetimes are the
-/// subset's lifetime reject; `'static` bounds are erased and
-/// dropped, as all regions are in this milestone.
+/// subset's lifetime reject; a `'static` bound is a
+/// `TypeOutlives(lhs, 'static)` predicate, which the checker proves
+/// where lust tracks lifetimes (type parameters, dyn types; see
+/// `Ctx::static_bound_err`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bound_predicates(
     ast: &Ast,
@@ -1460,11 +1462,11 @@ pub(crate) fn bound_predicates(
     errs: &mut Vec<Diag>,
 ) {
     match bound {
-        TraitBound::Lifetime(lt) => {
-            if let Err(d) = check_lifetime(interner, *lt) {
-                errs.push(d);
-            }
-        }
+        TraitBound::Lifetime(lt) => match check_lifetime(interner, *lt) {
+            Err(d) => errs.push(d),
+            Ok(_) if interner.get(lt.name) == "static" => out.push(Predicate::TypeOutlives(lhs, Region::Static)),
+            Ok(_) => {}
+        },
         TraitBound::Trait { binder, trait_ref, maybe } => {
             let span = trait_ref.path.last().map_or(Span::default(), |_| Span::default());
             let trait_def = match trait_def_of_path(cx, interner, known, &trait_ref.path, span) {
@@ -4620,8 +4622,15 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
         }
         let subst_args: Vec<GenericArg> = p.tys.args(rec.trait_ref.args).to_vec();
         let mut goals: Vec<TraitRef> = Vec::new();
+        let mut statics: Vec<Ty> = Vec::new();
         for &pred in &trec.generics.predicates {
-            let Predicate::Trait(b) = subst_predicate(&mut p.tys, pred, &subst_args) else { continue };
+            let pred = subst_predicate(&mut p.tys, pred, &subst_args);
+            // `trait Tr: 'static`: the impl's Self type must be `'static`.
+            if let Predicate::TypeOutlives(t, Region::Static) = pred {
+                statics.push(t);
+                continue;
+            }
+            let Predicate::Trait(b) = pred else { continue };
             if b.count != 0 {
                 continue;
             }
@@ -4636,10 +4645,20 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
             let args = p.tys.intern_args(&new_args);
             goals.push(TraitRef { def: b.value.def, args, bindings: b.value.bindings });
         }
-        if goals.is_empty() {
+        if goals.is_empty() && statics.is_empty() {
             continue;
         }
         let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
+        let dyn_self = p.gx.static_dyn_impls.contains(&rec.def);
+        if statics.iter().any(|&t| !crate::check::object::header_type_static(p, &env, t, dyn_self)) {
+            let tname = p.display_path(trec.name);
+            errs.push(Diag::new(
+                "L0612",
+                rec.span,
+                format!("this impl of `{tname}` does not satisfy the `'static` bound the trait requires"),
+                "Implement the trait for a type without references, or add `'static` bounds to the impl's type parameters.",
+            ));
+        }
         for goal in goals {
             if !prove_goal(p, &env, goal) {
                 let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));

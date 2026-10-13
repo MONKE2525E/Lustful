@@ -13,7 +13,7 @@
 // and from bindings written at a use (`T: Iterator<Item = u8>`):
 // it is proved by normalizing the projection, never by search.
 use crate::diag::Span;
-use crate::ty::{AssocEqData, TraitRef};
+use crate::ty::{AssocEqData, TraitRef, Ty};
 
 /// One pending obligation plus the span that needs it.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +23,9 @@ pub enum Obligation {
     /// A use that needs a dyn value's object lifetime to be `'static`
     /// (`check::object`); decided once at body end.
     DynStatic { span: Span },
+    /// A `'static` bound (`X: 'static`) on an instantiated type;
+    /// decided once at body end (`Ctx::static_bound_err`).
+    TypeStatic { ty: Ty, span: Span },
 }
 
 /// The per-body work queue. Runs happen in `check/mod.rs`; see

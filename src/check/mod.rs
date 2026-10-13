@@ -1001,6 +1001,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn tn(&self, t: Ty) -> String {
         let t = self.resolve(t);
         match self.tys.kind(t) {
+            TyKind::Ref(_, _, e) if matches!(self.tys.kind(e), TyKind::Dyn(..)) => ty_name(self.p, &self.tys, t),
             TyKind::Ref(_, m, e) => format!("&{}{}", if m.is_mut() { "mut " } else { "" }, self.tn(e)),
             _ => match self.tys.builtin_of(t) {
                 Some(BuiltinTy::Vec) => format!("Vec<{}>", self.tn(self.tys.adt_first_ty_arg(t).unwrap_or(ERROR))),
@@ -1549,6 +1550,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match pred {
                     Predicate::Trait(b) if b.count == 0 => self.obl.push_trait_at(b.value, span, depth + 1),
                     Predicate::AssocEq(b) if b.count == 0 => self.obl.push(obligations::Obligation::AssocEq { eq: b.value, span }),
+                    Predicate::TypeOutlives(ty, Region::Static) => self.obl.push(obligations::Obligation::TypeStatic { ty, span }),
                     _ => {}
                 }
             }
@@ -1719,6 +1721,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             match pred {
                 Predicate::Trait(b) if b.count == 0 => out.push(obligations::Obligation::Trait { trait_ref: b.value, span, depth: 0 }),
                 Predicate::AssocEq(b) if b.count == 0 => out.push(obligations::Obligation::AssocEq { eq: b.value, span }),
+                Predicate::TypeOutlives(ty, Region::Static) => out.push(obligations::Obligation::TypeStatic { ty, span }),
                 _ => {}
             }
         }
@@ -1774,7 +1777,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             pending.push(ob);
                         }
                     }
-                    obligations::Obligation::DynStatic { .. } => pending.push(ob),
+                    obligations::Obligation::DynStatic { .. } | obligations::Obligation::TypeStatic { .. } => pending.push(ob),
                     obligations::Obligation::Trait { trait_ref, span, depth } => match self.select_obligation_at(trait_ref, span, depth) {
                         Selection::Impl { unbound, .. } => {
                             progress = true;
@@ -1814,9 +1817,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if hard && !self.obl.is_empty() {
             let mut dyn_static: Vec<Span> = Vec::new();
+            let mut type_static: Vec<(Ty, Span)> = Vec::new();
             for ob in self.obl.take() {
                 match ob {
                     obligations::Obligation::DynStatic { span } => dyn_static.push(span),
+                    obligations::Obligation::TypeStatic { ty, span } => type_static.push((ty, span)),
                     obligations::Obligation::Trait { trait_ref, span, .. } => {
                         // One last try now that literal fallbacks and
                         // late bindings have run: an impl with a
@@ -1858,6 +1863,85 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             self.check_dyn_static(dyn_static);
+            self.check_type_static(type_static);
+        }
+    }
+
+    /// Reports the `'static` bounds that do not hold (see
+    /// `static_bound_err`). Concrete instances skip them, as they skip
+    /// `check_dyn_static`: the template check proved each bound over
+    /// its params, and the caller proved the params' bounds.
+    fn check_type_static(&mut self, items: Vec<(Ty, Span)>) {
+        if items.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
+            return;
+        }
+        let mut seen: Vec<Span> = Vec::new();
+        for (ty, span) in items {
+            let ty = self.deep(ty);
+            if seen.contains(&span) {
+                continue;
+            }
+            if let Some((code, msg)) = self.static_bound_err(ty, 0) {
+                seen.push(span);
+                self.err(code, span, msg, "Use a type that lives for `'static` here, or add a `'static` bound to the type parameter.");
+            }
+        }
+    }
+
+    /// Why `t` may fail a `'static` bound, as far as lust can tell. A
+    /// type parameter needs a `'static` bound in the env (L0612, rustc
+    /// E0310); a dyn type needs a `'static` object lifetime, and a
+    /// reference to one a written `&'static` (L0705). Other references
+    /// pass: lust erases their lifetimes, a known gap shared with every
+    /// non-dyn reference.
+    fn static_bound_err(&mut self, t: Ty, depth: u32) -> Option<(&'static str, String)> {
+        let p = self.p;
+        if depth > 32 {
+            return None;
+        }
+        let in_args = |cx: &mut Self, a: ArgsId| {
+            let args: Vec<GenericArg> = cx.tys.args(a).to_vec();
+            args.into_iter().filter_map(|g| g.as_ty()).find_map(|e| cx.static_bound_err(e, depth + 1))
+        };
+        match self.tys.kind(t) {
+            TyKind::Param(_) | TyKind::Projection(..) => {
+                if self.env().iter().any(|pred| matches!(pred, Predicate::TypeOutlives(x, Region::Static) if *x == t)) {
+                    return None;
+                }
+                let name = match self.tys.kind(t) {
+                    TyKind::Param(ParamId(i)) => p
+                        .gx
+                        .fn_templates
+                        .get(self.fid.0 as usize)
+                        .and_then(|t| t.as_ref())
+                        .and_then(|t| t.generics.params.get(i as usize))
+                        .map(|d| p.name(d.name).to_string()),
+                    _ => None,
+                };
+                let name = name.unwrap_or_else(|| self.tn(t));
+                Some(("L0612", format!("the type `{name}` may not live long enough: this needs it to be `'static`")))
+            }
+            TyKind::Dyn(..) => {
+                if !object::dyn_is_static(p, &self.tys, t) {
+                    return Some(("L0705", format!("lust cannot prove that `{}` lives for `'static`, which this bound requires", self.tn(t))));
+                }
+                let pr = object::principal_of(&self.tys, t)?;
+                in_args(self, pr.args)
+            }
+            TyKind::Ref(r, _, e) => {
+                if r != Region::Static && object::mentions_dyn(&self.tys, e) {
+                    return Some(("L0705", format!("lust cannot prove that `{}` lives for `'static`, which this bound requires", self.tn(t))));
+                }
+                self.static_bound_err(e, depth + 1)
+            }
+            TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.static_bound_err(e, depth + 1),
+            TyKind::Tuple(ts) => {
+                let ts: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                ts.into_iter().find_map(|e| self.static_bound_err(e, depth + 1))
+            }
+            // A closure's args are its captures' field types.
+            TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => in_args(self, a),
+            _ => None,
         }
     }
 
@@ -1874,6 +1958,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     eq.trait_args
                 }
                 obligations::Obligation::DynStatic { .. } => continue,
+                obligations::Obligation::TypeStatic { ty, .. } => {
+                    self.default_literal_vars(*ty);
+                    continue;
+                }
             };
             tys.extend(self.tys.args(args).iter().filter_map(|g| g.as_ty()));
             for t in tys {
@@ -11287,6 +11375,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.args_mention(eq.trait_args, &reported) || reported.iter().any(|&v| self.occurs(v, eq.ty))
                 }
                 obligations::Obligation::DynStatic { .. } => false,
+                obligations::Obligation::TypeStatic { ty, .. } => reported.iter().any(|&v| self.occurs(v, ty)),
             };
             if !mentions {
                 self.obl.push(ob);
