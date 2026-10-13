@@ -762,6 +762,309 @@ pub fn needs_std_load(src: &str) -> bool {
     STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger))
 }
 
+/// What namespace a canonical std path names its item in. A path
+/// outside the tables below is not a std item lust knows by full
+/// path: check rejects it instead of trusting its last segment
+/// (rule zero: `std::option::Vec` must not mean `Vec`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdPathKind {
+    Type,
+    Trait,
+    Fn,
+    Macro,
+    Variant,
+}
+
+/// Canonical std paths lust can mean by full path, as
+/// `crate/module/Name`. `std` re-exports the `core` and `alloc`
+/// rows. Only rows whose item lust supports (or rejects by name,
+/// like `HashMap`) belong here; a `use` rename of a row binds the
+/// new name to the row's path (resolve), and check trusts a
+/// written `std::...` path only when it is a row.
+const STD_TYPE_PATHS: &[&str] = &[
+    "core/option/Option",
+    "std/option/Option",
+    "core/result/Result",
+    "std/result/Result",
+    "alloc/string/String",
+    "std/string/String",
+    "alloc/vec/Vec",
+    "std/vec/Vec",
+    "alloc/boxed/Box",
+    "std/boxed/Box",
+    "alloc/rc/Rc",
+    "std/rc/Rc",
+    "alloc/sync/Arc",
+    "std/sync/Arc",
+    "core/cell/Cell",
+    "std/cell/Cell",
+    "core/cell/RefCell",
+    "std/cell/RefCell",
+    "core/cmp/Ordering",
+    "std/cmp/Ordering",
+    "std/collections/HashMap",
+    "std/collections/HashSet",
+    "alloc/collections/BTreeMap",
+    "std/collections/BTreeMap",
+];
+
+const STD_TRAIT_PATHS: &[&str] = &[
+    "core/clone/Clone",
+    "std/clone/Clone",
+    "core/cmp/PartialEq",
+    "std/cmp/PartialEq",
+    "core/cmp/Eq",
+    "std/cmp/Eq",
+    "core/cmp/PartialOrd",
+    "std/cmp/PartialOrd",
+    "core/cmp/Ord",
+    "std/cmp/Ord",
+    "core/convert/From",
+    "std/convert/From",
+    "core/convert/Into",
+    "std/convert/Into",
+    "core/convert/AsRef",
+    "std/convert/AsRef",
+    "core/convert/AsMut",
+    "std/convert/AsMut",
+    "core/default/Default",
+    "std/default/Default",
+    "core/fmt/Debug",
+    "std/fmt/Debug",
+    "core/fmt/Display",
+    "std/fmt/Display",
+    "core/fmt/Write",
+    "std/fmt/Write",
+    "core/hash/Hash",
+    "std/hash/Hash",
+    "core/iter/Iterator",
+    "std/iter/Iterator",
+    "core/iter/IntoIterator",
+    "std/iter/IntoIterator",
+    "core/iter/FromIterator",
+    "std/iter/FromIterator",
+    "core/iter/ExactSizeIterator",
+    "std/iter/ExactSizeIterator",
+    "core/marker/Sized",
+    "std/marker/Sized",
+    "core/marker/Copy",
+    "std/marker/Copy",
+    "core/marker/Send",
+    "std/marker/Send",
+    "core/marker/Sync",
+    "std/marker/Sync",
+    "core/marker/Unpin",
+    "std/marker/Unpin",
+    "core/ops/Add",
+    "std/ops/Add",
+    "core/ops/Sub",
+    "std/ops/Sub",
+    "core/ops/Mul",
+    "std/ops/Mul",
+    "core/ops/Div",
+    "std/ops/Div",
+    "core/ops/Rem",
+    "std/ops/Rem",
+    "core/ops/Neg",
+    "std/ops/Neg",
+    "core/ops/Not",
+    "std/ops/Not",
+    "core/ops/BitAnd",
+    "std/ops/BitAnd",
+    "core/ops/BitOr",
+    "std/ops/BitOr",
+    "core/ops/BitXor",
+    "std/ops/BitXor",
+    "core/ops/Shl",
+    "std/ops/Shl",
+    "core/ops/Shr",
+    "std/ops/Shr",
+    "core/ops/AddAssign",
+    "std/ops/AddAssign",
+    "core/ops/SubAssign",
+    "std/ops/SubAssign",
+    "core/ops/MulAssign",
+    "std/ops/MulAssign",
+    "core/ops/DivAssign",
+    "std/ops/DivAssign",
+    "core/ops/RemAssign",
+    "std/ops/RemAssign",
+    "core/ops/BitAndAssign",
+    "std/ops/BitAndAssign",
+    "core/ops/BitOrAssign",
+    "std/ops/BitOrAssign",
+    "core/ops/BitXorAssign",
+    "std/ops/BitXorAssign",
+    "core/ops/ShlAssign",
+    "std/ops/ShlAssign",
+    "core/ops/ShrAssign",
+    "std/ops/ShrAssign",
+    "core/ops/Index",
+    "std/ops/Index",
+    "core/ops/IndexMut",
+    "std/ops/IndexMut",
+    "core/ops/Drop",
+    "std/ops/Drop",
+    "core/ops/Deref",
+    "std/ops/Deref",
+    "core/ops/DerefMut",
+    "std/ops/DerefMut",
+    "core/ops/Fn",
+    "std/ops/Fn",
+    "core/ops/FnMut",
+    "std/ops/FnMut",
+    "core/ops/FnOnce",
+    "std/ops/FnOnce",
+    "alloc/string/ToString",
+    "std/string/ToString",
+    "alloc/borrow/ToOwned",
+    "std/borrow/ToOwned",
+    "core/borrow/Borrow",
+    "std/borrow/Borrow",
+    "core/borrow/BorrowMut",
+    "std/borrow/BorrowMut",
+];
+
+const STD_FN_PATHS: &[&str] = &[
+    "core/mem/drop",
+    "std/mem/drop",
+    "core/mem/swap",
+    "std/mem/swap",
+    "core/mem/replace",
+    "std/mem/replace",
+    "core/mem/take",
+    "std/mem/take",
+    "core/mem/size_of",
+    "std/mem/size_of",
+    "core/mem/align_of",
+    "std/mem/align_of",
+    "core/mem/size_of_val",
+    "std/mem/size_of_val",
+    "core/cmp/max",
+    "std/cmp/max",
+    "core/cmp/min",
+    "std/cmp/min",
+    "std/env/args",
+    "std/process/exit",
+    "std/process/abort",
+];
+
+const STD_MACRO_PATHS: &[&str] = &[
+    "alloc/vec",
+    "std/vec",
+    "alloc/format",
+    "std/format",
+    "core/panic",
+    "std/panic",
+    "core/assert",
+    "std/assert",
+    "core/assert_eq",
+    "std/assert_eq",
+    "core/assert_ne",
+    "std/assert_ne",
+    "core/todo",
+    "std/todo",
+    "core/unreachable",
+    "std/unreachable",
+    "core/matches",
+    "std/matches",
+    "core/write",
+    "std/write",
+    "core/writeln",
+    "std/writeln",
+    "std/print",
+    "std/println",
+    "std/eprint",
+    "std/eprintln",
+];
+
+const STD_VARIANT_PATHS: &[&str] = &[
+    "core/option/Option/Some",
+    "std/option/Option/Some",
+    "core/option/Option/None",
+    "std/option/Option/None",
+    "core/result/Result/Ok",
+    "std/result/Result/Ok",
+    "core/result/Result/Err",
+    "std/result/Result/Err",
+    "core/cmp/Ordering/Less",
+    "std/cmp/Ordering/Less",
+    "core/cmp/Ordering/Equal",
+    "std/cmp/Ordering/Equal",
+    "core/cmp/Ordering/Greater",
+    "std/cmp/Ordering/Greater",
+];
+
+fn std_row_eq(row: &str, path: &[&str]) -> bool {
+    row.split('/').eq(path.iter().copied())
+}
+
+/// The kind a full written path (`core/mem/drop`) names, if the
+/// path is a canonical std path in the tables above.
+pub fn std_path_kind(path: &[&str]) -> Option<StdPathKind> {
+    let mut find = |rows: &[&str], kind| rows.iter().any(|r| std_row_eq(r, path)).then_some(kind);
+    find(STD_TYPE_PATHS, StdPathKind::Type)
+        .or_else(|| find(STD_TRAIT_PATHS, StdPathKind::Trait))
+        .or_else(|| find(STD_FN_PATHS, StdPathKind::Fn))
+        .or_else(|| find(STD_MACRO_PATHS, StdPathKind::Macro))
+        .or_else(|| find(STD_VARIANT_PATHS, StdPathKind::Variant))
+}
+
+/// True when `path` names a std module: a shipped crate root, or a
+/// proper prefix of a canonical std path. A `use` rename of a
+/// module binds the new name to this path.
+pub fn std_is_module_path(path: &[&str]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.len() == 1 {
+        return matches!(path[0], "std" | "core" | "alloc");
+    }
+    let prefix_of = |row: &str| {
+        let mut parts = row.split('/');
+        path.iter().all(|p| parts.next() == Some(p)) && parts.next().is_some()
+    };
+    [STD_TYPE_PATHS, STD_TRAIT_PATHS, STD_FN_PATHS, STD_MACRO_PATHS, STD_VARIANT_PATHS].iter().any(|rows| rows.iter().any(|r| prefix_of(r)))
+}
+
+/// True for `std::primitive::u8` style paths: a primitive type
+/// name under the `primitive` module of `std` or `core`.
+pub fn std_is_primitive_path(path: &[&str]) -> bool {
+    path.len() == 3
+        && matches!(path[0], "std" | "core")
+        && path[1] == "primitive"
+        && matches!(
+            path[2],
+            "bool"
+                | "char"
+                | "str"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f16"
+                | "f32"
+                | "f64"
+                | "f128"
+                | "never"
+                | "unit"
+                | "tuple"
+                | "array"
+                | "slice"
+                | "pointer"
+                | "reference"
+                | "fn"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +1121,28 @@ mod tests {
         assert_eq!(items.get(LangItem::Box), Some(b.boxed));
         assert_eq!(items.get(LangItem::Rc), Some(b.rc));
         assert!(items.required_missing().is_empty(), "required items must resolve: {:?}", items.required_missing());
+    }
+
+    /// The canonical std path rows are unique across kinds, and the
+    /// lookup answers only for exact rows (never a wrong module).
+    #[test]
+    fn std_path_rows_are_unique_and_exact() {
+        let all: Vec<&str> = [STD_TYPE_PATHS, STD_TRAIT_PATHS, STD_FN_PATHS, STD_MACRO_PATHS, STD_VARIANT_PATHS]
+            .iter()
+            .flat_map(|rows| rows.iter().copied())
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.is_empty());
+            assert!(all.iter().skip(i + 1).all(|b| b != a), "duplicate std path row {a}");
+        }
+        assert_eq!(std_path_kind(&["std", "option", "Option"]), Some(StdPathKind::Type));
+        assert_eq!(std_path_kind(&["core", "mem", "drop"]), Some(StdPathKind::Fn));
+        assert_eq!(std_path_kind(&["std", "option", "Vec"]), None);
+        assert_eq!(std_path_kind(&["core", "vec", "Vec"]), None);
+        assert!(std_is_module_path(&["std", "mem"]));
+        assert!(std_is_module_path(&["std"]));
+        assert!(!std_is_module_path(&["std", "mem", "drop"]));
+        assert!(!std_is_module_path(&["std", "nope"]));
     }
 
     /// Registry rows are well formed: unique names, no empty allow list,

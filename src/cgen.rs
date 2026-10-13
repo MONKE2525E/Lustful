@@ -85,10 +85,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Float(f) => CTy::Float(f),
         TyKind::FnPtr(sig) => {
             let b = tys.sig(sig);
-            CTy::FnPtr(
-                tys.tys_of(b.value.inputs).iter().map(|&e| cty(tys, e)).collect(),
-                Box::new(cty(tys, b.value.output)),
-            )
+            CTy::FnPtr(tys.tys_of(b.value.inputs).iter().map(|&e| cty(tys, e)).collect(), Box::new(cty(tys, b.value.output)))
         }
         TyKind::FnDef(..) => CTy::Unit,
         TyKind::Str => CTy::Str,
@@ -438,11 +435,7 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
     }
     if signed && (bits >> (size * 8 - 1)) & 1 == 1 {
         let v = (bits as i128) - (1i128 << (size * 8));
-        if v == i64::MIN as i128 {
-            format!("(({ct})(-9223372036854775807LL - 1))")
-        } else {
-            format!("(({ct})({v}LL))")
-        }
+        if v == i64::MIN as i128 { format!("(({ct})(-9223372036854775807LL - 1))") } else { format!("(({ct})({v}LL))") }
     } else {
         format!("(({ct})({bits}ULL))")
     }
@@ -787,8 +780,7 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
     let ret = ctype(&cty(&p.tys, info.ret));
     let cast = fn_ptr_cast(p, f);
     let names: Vec<String> = (1..=info.params.len()).map(|i| format!("p{i}")).collect();
-    let decls: Vec<String> =
-        info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
+    let decls: Vec<String> = info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
     if ret_is_large(p, f) {
         let mut params = vec![format!("{ret} *out")];
         params.extend(decls);
@@ -1449,11 +1441,7 @@ impl FnGen<'_, '_, '_> {
                     // destination type.
                     Rvalue::Use(o) => {
                         let (v, vt) = s.operand(o, loc, post);
-                        if vt == CTy::Unit && dest_cty != CTy::Unit {
-                            format!("({v}, {})", zero_lit(s.p, &dest_cty))
-                        } else {
-                            v
-                        }
+                        if vt == CTy::Unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
                     }
                     _ => s.rvalue(rv, loc, post),
                 });
@@ -1502,8 +1490,8 @@ impl FnGen<'_, '_, '_> {
                 // No unwind edges exist yet (W-PANIC builds them); the slot
                 // is carried so that work needs no IR change.
                 debug_assert!(unwind.is_none(), "cgen has no unwind edges yet");
-                let mentions = args.iter().any(|o| operand_mentions(o, dest.local))
-                    || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
+                let mentions =
+                    args.iter().any(|o| operand_mentions(o, dest.local)) || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
                 // A call to a never fn (unit C form) whose destination
                 // has another type: the call never returns, so give the
                 // dead assignment a zero of the destination type.
@@ -1752,13 +1740,11 @@ impl FnGen<'_, '_, '_> {
                         // is the discriminant), and a cast to a smaller
                         // int reads the low word.
                         let wide = match c_layout(self.p, &from) {
-                            Some(l) if matches!(l.enum_tag, Some(EnumTag::Explicit { size, .. }) if size >= 16) => {
-                                Some(if is128(*ti) {
-                                    format!("(({}){{({a}).u._tag.lo, ({a}).u._tag.hi}})", int_c(*ti))
-                                } else {
-                                    format!("(({ct})(({a}).u._tag.lo))")
-                                })
-                            }
+                            Some(l) if matches!(l.enum_tag, Some(EnumTag::Explicit { size, .. }) if size >= 16) => Some(if is128(*ti) {
+                                format!("(({}){{({a}).u._tag.lo, ({a}).u._tag.hi}})", int_c(*ti))
+                            } else {
+                                format!("(({ct})(({a}).u._tag.lo))")
+                            }),
                             _ => None,
                         };
                         let raw = match c_layout(self.p, &from) {
@@ -2419,11 +2405,7 @@ impl FnGen<'_, '_, '_> {
                 "((lust_Unit){})".into()
             }
             B::StringInsertStr => {
-                let _ = writeln!(
-                    self.out,
-                    "    lust_string_insert_bytes({}, {}, ({2}).ptr, ({2}).len, {loc});",
-                    vals[0], vals[1], vals[2]
-                );
+                let _ = writeln!(self.out, "    lust_string_insert_bytes({}, {}, ({2}).ptr, ({2}).len, {loc});", vals[0], vals[1], vals[2]);
                 "((lust_Unit){})".into()
             }
             B::StringTruncate => {
@@ -2605,7 +2587,10 @@ impl FnGen<'_, '_, '_> {
             B::CharLenUtf16 => format!("((uint64_t)({0} < 0x10000u ? 1 : 2))", vals[0]),
             B::CharIsAscii => format!("(*{0} < 128u)", vals[0]),
             B::CharIsAsciiPunctuation => {
-                format!("(((*{0} >= 33u && *{0} <= 47u) || (*{0} >= 58u && *{0} <= 64u) || (*{0} >= 91u && *{0} <= 96u) || (*{0} >= 123u && *{0} <= 126u)))", vals[0])
+                format!(
+                    "(((*{0} >= 33u && *{0} <= 47u) || (*{0} >= 58u && *{0} <= 64u) || (*{0} >= 91u && *{0} <= 96u) || (*{0} >= 123u && *{0} <= 126u)))",
+                    vals[0]
+                )
             }
             B::CharIsAsciiGraphic => format!("(*{0} >= 33u && *{0} <= 126u)", vals[0]),
             B::CharIsAsciiHexdigit => {
@@ -2839,8 +2824,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    if ({n} <= {vv}->len) {{ {vv}->len = {n}; }} else {{");
                 let _ = writeln!(self.out, "      lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
                 if is_copy_c(self.p, e) {
-                    let _ =
-                        writeln!(self.out, "      while ({vv}->len < {n}) (({et}*){vv}->ptr)[{vv}->len++] = {tv};");
+                    let _ = writeln!(self.out, "      while ({vv}->len < {n}) (({et}*){vv}->ptr)[{vv}->len++] = {tv};");
                 } else {
                     self.want(Glue::Clone, e);
                     // Clones first, the value itself last, as Rust's
@@ -2966,6 +2950,54 @@ impl FnGen<'_, '_, '_> {
                 );
                 t
             }
+            B::MemSwap => {
+                // A byte exchange through a stack temp: both places
+                // stay initialized, so their drop flags are untouched.
+                let CTy::Ref(inner) = &tys[0] else { unreachable!() };
+                let et = ctype(inner);
+                let (pa, pb, t) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {et}* {pa} = {}; {et}* {pb} = {}; {et} {t}; memcpy(&{t}, {pa}, sizeof({et})); memcpy({pa}, {pb}, sizeof({et})); memcpy({pb}, &{t}, sizeof({et}));",
+                    vals[0], vals[1]
+                );
+                "((lust_Unit){})".into()
+            }
+            B::MemReplace => {
+                let CTy::Ref(inner) = &tys[0] else { unreachable!() };
+                let et = ctype(inner);
+                let (pa, nv, old) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {et}* {pa} = {}; {et} {nv} = {}; {et} {old}; memcpy(&{old}, {pa}, sizeof({et})); memcpy({pa}, &{nv}, sizeof({et}));",
+                    vals[0], vals[1]
+                );
+                old
+            }
+            B::MemTake => unreachable!("take lowers to a default fill plus MemReplace"),
+            B::CmpMax | B::CmpMin => {
+                // Check limited these to primitive total orders. On
+                // a tie the first argument wins, as `Ord::max` and
+                // `Ord::min` specify (the loser would drop, but a
+                // primitive has no destructor).
+                let ct = ctype(&tys[0]);
+                let (a, bb) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {ct} {a} = {}; {ct} {bb} = {};", vals[0], vals[1]);
+                let ge = b == B::CmpMax;
+                match &tys[0] {
+                    CTy::Int(it) if is128(*it) => {
+                        let f = if *it == IntTy::I128 { "lust_i128_cmp" } else { "lust_u128_cmp" };
+                        if ge { format!("(({f}({a}, {bb}) >= 0) ? {a} : {bb})") } else { format!("(({f}({a}, {bb}) <= 0) ? {a} : {bb})") }
+                    }
+                    _ => {
+                        if ge {
+                            format!("(({a} >= {bb}) ? {a} : {bb})")
+                        } else {
+                            format!("(({a} <= {bb}) ? {a} : {bb})")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3004,11 +3036,7 @@ impl FnGen<'_, '_, '_> {
         // the statement text; rc is 1 ok, 0 overflow, -1 div by zero.
         let checked_call = |this: &mut Self, a64: &str, b64: &str, op: i32| -> (String, String) {
             let (o, rc) = (this.tmp(), this.tmp());
-            let _ = write!(
-                this.out,
-                "    uint64_t {o}; int {rc} = lust_checked_op({a64}, {b64}, {bits}, {}, {op}, &{o});\n",
-                sgn as i32
-            );
+            let _ = write!(this.out, "    uint64_t {o}; int {rc} = lust_checked_op({a64}, {b64}, {bits}, {}, {op}, &{o});\n", sgn as i32);
             (o, rc)
         };
         match b {
@@ -3058,12 +3086,8 @@ impl FnGen<'_, '_, '_> {
             }
             B::CheckedPow => {
                 let (o, rc) = (self.tmp(), self.tmp());
-                let _ = writeln!(
-                    self.out,
-                    "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});",
-                    vals[1],
-                    sgn as i32
-                );
+                let _ =
+                    writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});", vals[1], sgn as i32);
                 self.int_option_c(&format!("(({ct}){o})"), &format!("{rc} == 1"), it)
             }
             B::CheckedShl | B::CheckedShr => {
@@ -3133,16 +3157,8 @@ impl FnGen<'_, '_, '_> {
         };
         if let Some(op) = sat_op(b) {
             let (o, rc) = (self.tmp(), self.tmp());
-            let _ = writeln!(
-                self.out,
-                "    uint64_t {o}; int {rc} = lust_checked_op({ua}, {ub}, {bits}, {}, {op}, &{o});",
-                sgn as i32
-            );
-            let div0msg = if op == 4 {
-                "attempt to calculate the remainder with a divisor of zero"
-            } else {
-                "attempt to divide by zero"
-            };
+            let _ = writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_op({ua}, {ub}, {bits}, {}, {op}, &{o});", sgn as i32);
+            let div0msg = if op == 4 { "attempt to calculate the remainder with a divisor of zero" } else { "attempt to divide by zero" };
             let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{div0msg}\", {loc});");
             if matches!(b, B::SaturatingAdd | B::SaturatingSub | B::SaturatingMul | B::SaturatingDiv) {
                 // Clamp to the endpoint the true result passes.
@@ -3182,11 +3198,8 @@ impl FnGen<'_, '_, '_> {
             B::OverflowingNeg | B::OverflowingAbs => {
                 let (o, rc) = (self.tmp(), self.tmp());
                 if b == B::OverflowingNeg {
-                    let _ = writeln!(
-                        self.out,
-                        "    uint64_t {o}; int {rc} = lust_checked_op(0ull, {ua}, {bits}, {}, 1, &{o});",
-                        sgn as i32
-                    );
+                    let _ =
+                        writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_op(0ull, {ua}, {bits}, {}, 1, &{o});", sgn as i32);
                 } else {
                     let x = self.tmp();
                     let _ = writeln!(self.out, "    {ct} {x} = {a};");
@@ -3204,18 +3217,10 @@ impl FnGen<'_, '_, '_> {
             }
             B::SaturatingPow | B::OverflowingPow => {
                 let (o, rc) = (self.tmp(), self.tmp());
-                let _ = writeln!(
-                    self.out,
-                    "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});",
-                    vals[1],
-                    sgn as i32
-                );
+                let _ =
+                    writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});", vals[1], sgn as i32);
                 if b == B::SaturatingPow {
-                    let clamp = if sgn {
-                        format!("(({sa} < 0 && ({} & 1u)) ? {min_lit} : {max_lit})", vals[1])
-                    } else {
-                        max_lit.clone()
-                    };
+                    let clamp = if sgn { format!("(({sa} < 0 && ({} & 1u)) ? {min_lit} : {max_lit})", vals[1]) } else { max_lit.clone() };
                     let t = self.tmp();
                     let _ = writeln!(self.out, "    {ct} {t} = {rc} == 1 ? ({ct}){o} : {clamp};");
                     t
@@ -3312,10 +3317,7 @@ impl FnGen<'_, '_, '_> {
             B::WrappingShr => format!("lust_{f}_shr({x}, {} & 127u)", vals[1]),
             B::WrappingAbs => {
                 let t = self.tmp();
-                let _ = writeln!(
-                    self.out,
-                    "    {ct} {t} = (int64_t){x}.hi < 0 ? lust_{f}_sub((({ct}){{0, 0}}), {x}) : {x};"
-                );
+                let _ = writeln!(self.out, "    {ct} {t} = (int64_t){x}.hi < 0 ? lust_{f}_sub((({ct}){{0, 0}}), {x}) : {x};");
                 t
             }
             B::CountOnes => format!("(lust_count_ones64({x}.lo) + lust_count_ones64({x}.hi))"),
@@ -3699,10 +3701,8 @@ impl GlueSet {
             let mut def = String::new();
             glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
             let is_new = !self.protos.contains_key(&g);
-            let changed = is_new
-                || self.def_map.get(&g) != Some(&def)
-                || self.protos.get(&g) != Some(&proto)
-                || self.deps.get(&g) != Some(&more);
+            let changed =
+                is_new || self.def_map.get(&g) != Some(&def) || self.protos.get(&g) != Some(&proto) || self.deps.get(&g) != Some(&more);
             if changed {
                 regenerated |= !is_new;
                 shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
@@ -4501,7 +4501,8 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
                 let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{");
                 for (vi, &d) in discs.iter().enumerate() {
                     let bits = d as u128;
-                    let _ = write!(out, " if (p->u._tag.lo == {}ULL && p->u._tag.hi == {}ULL) return {vi};", bits as u64, (bits >> 64) as u64);
+                    let _ =
+                        write!(out, " if (p->u._tag.lo == {}ULL && p->u._tag.hi == {}ULL) return {vi};", bits as u64, (bits >> 64) as u64);
                 }
                 let _ = writeln!(out, " return 0; }}");
             } else if !discs_sequential(&discs) {
@@ -4518,7 +4519,12 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
                 let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{");
                 for (k, &vi) in others.iter().enumerate() {
                     let bits = niche_val(niche, k as u128);
-                    let _ = write!(out, " if (p->u._n._s.lo == {}ULL && p->u._n._s.hi == {}ULL) return {vi};", bits as u64, (bits >> 64) as u64);
+                    let _ = write!(
+                        out,
+                        " if (p->u._n._s.lo == {}ULL && p->u._n._s.hi == {}ULL) return {vi};",
+                        bits as u64,
+                        (bits >> 64) as u64
+                    );
                 }
                 let _ = writeln!(out, " return {variant}; }}");
             } else {

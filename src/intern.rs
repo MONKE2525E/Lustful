@@ -367,6 +367,7 @@ known_syms!(
     last,
     contains,
     swap,
+    take,
     clear,
     insert,
     remove,

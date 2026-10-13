@@ -398,7 +398,14 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.display, "Display", 0, vec![], vec![], &["fmt"]),
         rec(lang.partial_eq, "PartialEq", 1, vec![], vec![], &["eq", "ne"]),
         rec(lang.eq, "Eq", 0, vec![self_pred(tys, lang.partial_eq, &[0])], vec![], &[]),
-        rec(lang.partial_ord, "PartialOrd", 1, vec![self_pred(tys, lang.partial_eq, &[1])], vec![], &["partial_cmp", "lt", "le", "gt", "ge"]),
+        rec(
+            lang.partial_ord,
+            "PartialOrd",
+            1,
+            vec![self_pred(tys, lang.partial_eq, &[1])],
+            vec![],
+            &["partial_cmp", "lt", "le", "gt", "ge"],
+        ),
         rec(lang.ord, "Ord", 0, vec![self_pred(tys, lang.eq, &[]), self_pred(tys, lang.partial_ord, &[0])], vec![], &["cmp"]),
         rec(lang.hash, "Hash", 0, vec![], vec![], &["hash"]),
         rec(lang.default, "Default", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["default"]),
@@ -488,7 +495,12 @@ pub struct LangMethodSig {
 /// this subset: `fmt` and `hash` name types lust has no def for
 /// yet (`Formatter`, `Hasher`), `from_iter` has a method-level
 /// generic the stub form cannot state, and `drop` is not callable.
-pub fn lang_method_sigs(lang: &LangTraits, interner: &Interner, tys: &mut impl TyIntern, records: &[TraitRecord]) -> FxMap<DefId, LangMethodSig> {
+pub fn lang_method_sigs(
+    lang: &LangTraits,
+    interner: &Interner,
+    tys: &mut impl TyIntern,
+    records: &[TraitRecord],
+) -> FxMap<DefId, LangMethodSig> {
     use ast::SelfKind::{Ref, RefMut, Value};
     let p0 = tys.intern(TyKind::Param(ParamId(0)));
     let p1 = tys.intern(TyKind::Param(ParamId(1)));
@@ -531,14 +543,19 @@ pub fn lang_method_sigs(lang: &LangTraits, interner: &Interner, tys: &mut impl T
         for &(method_def, name) in &rec.methods {
             let name: &str = interner.get(name);
             let sig = match (rec.def, name) {
-                (d, "clone") if d == lang.clone => LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: p0, ret_borrows_from: None },
+                (d, "clone") if d == lang.clone => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: p0, ret_borrows_from: None }
+                }
                 (d, "next") if d == lang.iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
                 }
-                (d, "into_iter") if d == lang.into_iterator => {
-                    LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: proj(tys, lang.assoc_into_iter, &[p0]), ret_borrows_from: None }
-                }
+                (d, "into_iter") if d == lang.into_iterator => LangMethodSig {
+                    self_kind: Some(Value),
+                    params: vec![p0],
+                    ret: proj(tys, lang.assoc_into_iter, &[p0]),
+                    ret_borrows_from: None,
+                },
                 (d, "deref") if d == lang.deref => {
                     let t = proj(tys, lang.assoc_target, &[p0]);
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: tys.mk_ref(false, t), ret_borrows_from: Some(0) }
@@ -548,8 +565,12 @@ pub fn lang_method_sigs(lang: &LangTraits, interner: &Interner, tys: &mut impl T
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_ref(true, t), ret_borrows_from: Some(0) }
                 }
                 (d, "from") if d == lang.from => LangMethodSig { self_kind: None, params: vec![p1], ret: p0, ret_borrows_from: None },
-                (d, "into") if d == lang.into => LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: p1, ret_borrows_from: None },
-                (d, "default") if d == lang.default => LangMethodSig { self_kind: None, params: Vec::new(), ret: p0, ret_borrows_from: None },
+                (d, "into") if d == lang.into => {
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: p1, ret_borrows_from: None }
+                }
+                (d, "default") if d == lang.default => {
+                    LangMethodSig { self_kind: None, params: Vec::new(), ret: p0, ret_borrows_from: None }
+                }
                 (d, "eq" | "ne") if d == lang.partial_eq => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: BOOL, ret_borrows_from: None }
                 }
@@ -559,7 +580,9 @@ pub fn lang_method_sigs(lang: &LangTraits, interner: &Interner, tys: &mut impl T
                 (d, "lt" | "le" | "gt" | "ge") if d == lang.partial_ord => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: BOOL, ret_borrows_from: None }
                 }
-                (d, "cmp") if d == lang.ord => LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None },
+                (d, "cmp") if d == lang.ord => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None }
+                }
                 (d, "len") if d == lang.exact_size_iterator => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: USIZE, ret_borrows_from: None }
                 }
@@ -831,12 +854,9 @@ fn resolve_const_arg(
             // A named const item evaluates like the literal forms below.
             match crate::check::collect::eval_array_len(ast, interner, known, e) {
                 Some(v) => Ok(tys.intern_const(ConstKind::Int(v))),
-                None => Err(Diag::new(
-                    "L0110",
-                    span,
-                    "const argument must be a literal or a const parameter",
-                    "Use a literal such as `3`.",
-                )),
+                None => {
+                    Err(Diag::new("L0110", span, "const argument must be a literal or a const parameter", "Use a literal such as `3`."))
+                }
             }
         }
         ast::Expr::Bool(b) => Ok(tys.intern_const(ConstKind::Bool(*b))),
@@ -862,8 +882,27 @@ pub(crate) fn trait_def_of_path(
     if segs.len() > 1 && segs[0].name != known.std && interner.get(segs[0].name) != "core" && interner.get(segs[0].name) != "alloc" {
         return Err(not_yet("L0505", span, "module paths in trait references"));
     }
+    // A full std path must name the trait really living at that
+    // path (`std::mem::Display` is not `Display`): only exact
+    // canonical rows fall through to the by-name lookup.
+    if segs.len() > 1 {
+        let path: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+        if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Trait) {
+            return Err(Diag::new(
+                "L0102",
+                span,
+                format!("unknown trait `{}`", crate::intern::source_path(interner.get(last.name))),
+                "Check the spelling, or define the trait.",
+            ));
+        }
+    }
     cx.trait_by_name(interner, last.name).ok_or_else(|| {
-        Diag::new("L0102", span, format!("unknown trait `{}`", crate::intern::source_path(interner.get(last.name))), "Check the spelling, or define the trait.")
+        Diag::new(
+            "L0102",
+            span,
+            format!("unknown trait `{}`", crate::intern::source_path(interner.get(last.name))),
+            "Check the spelling, or define the trait.",
+        )
     })
 }
 
@@ -1271,7 +1310,16 @@ fn resolve_path_ty(
             return assoc_projection(cx, tys, scope, base, &segs[1..], span, interner);
         }
         if segs[0].name == known.std || interner.get(segs[0].name) == "core" || interner.get(segs[0].name) == "alloc" {
-            // Fall through with the last segment, as resolve_ty does.
+            // Fall through with the last segment, but only for a
+            // path that really names a std type there
+            // (`std::option::Vec` is not `Vec`).
+            let path: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+            if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type)
+                && !crate::ty::lang::std_is_primitive_path(&path)
+            {
+                let n = interner.get(segs.last().unwrap().name);
+                return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
+            }
         } else {
             return Err(not_yet("L0505", span, "module paths in types"));
         }
@@ -1361,12 +1409,7 @@ fn resolve_path_ty(
         let args = match &seg.args {
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false, false], span, interner.get(name))?,
             _ => {
-                return Err(Diag::new(
-                    "L0110",
-                    span,
-                    "`Result` takes two type arguments".to_string(),
-                    "Write `Result<T, E>`.",
-                ));
+                return Err(Diag::new("L0110", span, "`Result` takes two type arguments".to_string(), "Write `Result<T, E>`."));
             }
         };
         let mut it = args.iter().filter_map(|g| g.as_ty());
@@ -2830,7 +2873,12 @@ fn check_impl_rules(p: &mut Program, imp: &ast::ImplDef, generics: &Generics, se
 /// Adt itself declares (rustc E0366 and E0367).
 fn check_drop_impl(p: &Program, imp: &ast::ImplDef, generics: &Generics, self_pat: Ty, errs: &mut Vec<Diag>) {
     let TyKind::Adt(def, args) = p.tys.kind(self_pat) else {
-        errs.push(Diag::new("L0110", imp.span, "`Drop` can only be implemented for a struct or enum", "Implement `Drop` on the type itself."));
+        errs.push(Diag::new(
+            "L0110",
+            imp.span,
+            "`Drop` can only be implemented for a struct or enum",
+            "Implement `Drop` on the type itself.",
+        ));
         return;
     };
     let Some(adt_idx) = p.gx.adt_info.iter().position(|&(d, _)| d == def) else { return };
@@ -2977,8 +3025,7 @@ fn validate_method_sig(
     };
     let kinds_match = own_impl == own_trait
         && impl_gen.as_ref().is_none_or(|g| {
-            (0..own_trait)
-                .all(|j| kind_class(&g.params[impl_parent_n + j].kind) == kind_class(&tmpl.generics.params[trait_n + j].kind))
+            (0..own_trait).all(|j| kind_class(&g.params[impl_parent_n + j].kind) == kind_class(&tmpl.generics.params[trait_n + j].kind))
         });
     if !kinds_match {
         errs.push(Diag::new(
@@ -4009,7 +4056,10 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
 type ClosureShapes = Vec<(ast::ExprId, crate::check::closure::ClosureKind, Vec<CaptureShape>)>;
 
 fn closure_shapes(c: &crate::check::Checked) -> ClosureShapes {
-    c.closures.iter().map(|cl| (cl.expr, cl.kind, cl.captures.iter().map(|cap| (cap.root, cap.projs.clone(), cap.mode)).collect())).collect()
+    c.closures
+        .iter()
+        .map(|cl| (cl.expr, cl.kind, cl.captures.iter().map(|cap| (cap.root, cap.projs.clone(), cap.mode)).collect()))
+        .collect()
 }
 
 /// True when a fn body holds a closure expression.
@@ -4020,7 +4070,12 @@ fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
 
 /// Records one template check's closure analysis and closure call
 /// modes, for the template's concrete instances.
-fn record_template_closures(p: &mut Program, template: LocalDefId, shapes: ClosureShapes, calls: Vec<(ast::ExprId, crate::check::closure::ClosureKind)>) {
+fn record_template_closures(
+    p: &mut Program,
+    template: LocalDefId,
+    shapes: ClosureShapes,
+    calls: Vec<(ast::ExprId, crate::check::closure::ClosureKind)>,
+) {
     for (e, k, sh) in shapes {
         p.gx.template_closures.insert((template, e), (k, sh));
     }
@@ -4062,7 +4117,8 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let id = LocalDefId(p.fns.len() as u32);
         p.fn_defs.push(oc.def);
         p.def_by_hash.entry(oc.def.hash).or_insert(id);
-        let mut data = crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Closure, None, name, crate::ty::defs::Vis::Priv, def.name_span);
+        let mut data =
+            crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Closure, None, name, crate::ty::defs::Vis::Priv, def.name_span);
         data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret: output };
         p.defs.insert(oc.def, data);
         p.fns.push(crate::check::collect::FnInfo {
@@ -4804,9 +4860,11 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
             }
             if dname == "Eq" {
                 let has_pe = derives.partial_eq
-                    || p.gx.index.impls_of_trait(lang.partial_eq).iter().any(|&id| {
-                        matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def)
-                    });
+                    || p.gx
+                        .index
+                        .impls_of_trait(lang.partial_eq)
+                        .iter()
+                        .any(|&id| matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def));
                 if !has_pe {
                     errs.push(Diag::new(
                         "L0110",

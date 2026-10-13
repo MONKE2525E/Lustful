@@ -226,6 +226,15 @@ pub enum Builtin {
     RcMakeMut,
     RcGetMut,
     RcTryUnwrap,
+    /// The `core::mem` byte-move family and `core::cmp::max`/`min`
+    /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
+    /// which fills the freed slot with a synthesized default and
+    /// calls `MemReplace`.
+    MemSwap,
+    MemReplace,
+    MemTake,
+    CmpMax,
+    CmpMin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -937,7 +946,6 @@ pub fn allow_attr(attr: &ast::Attr, interner: &Interner, name: &str) -> bool {
     }
     has(trees, interner, name)
 }
-
 
 /// The name and binding span of an optional AST label.
 fn label_of(label: &Option<ast::Label>) -> Option<(Sym, Span)> {
@@ -3344,7 +3352,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         (params, ret, args)
     }
 
-
     /// The explicit generic arguments written on a call path
     /// (`f::<u8, _>(..)`), resolved in this body's scope and
     /// aligned to parameter positions. Unwritten positions are
@@ -3837,19 +3844,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // and char never cast to a float, only `u8` casts to char,
                 // nothing casts to bool, a fieldless enum casts only to an
                 // integer. A same-kind cast (`bool as bool`) is fine.
-                let ok = fn_cast || ref_cast || match (self.kind(t), self.kind(target)) {
-                    // An integer of unknown type stays open: later uses decide it (default i32).
-                    (k, TyKind::Int(_)) if k.is_int_infer() => true,
-                    (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
-                    (_, TyKind::Int(_)) if enum_cast => true,
-                    (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
-                    (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
-                    (TyKind::Float(_), TyKind::Int(_)) => true,
-                    (TyKind::Int(IntTy::U8) | TyKind::Char, TyKind::Char) => true,
-                    (TyKind::Bool, TyKind::Bool) => true,
-                    (TyKind::Error, _) | (_, TyKind::Error) => true,
-                    _ => false,
-                };
+                let ok = fn_cast
+                    || ref_cast
+                    || match (self.kind(t), self.kind(target)) {
+                        // An integer of unknown type stays open: later uses decide it (default i32).
+                        (k, TyKind::Int(_)) if k.is_int_infer() => true,
+                        (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
+                        (_, TyKind::Int(_)) if enum_cast => true,
+                        (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
+                        (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
+                        (TyKind::Float(_), TyKind::Int(_)) => true,
+                        (TyKind::Int(IntTy::U8) | TyKind::Char, TyKind::Char) => true,
+                        (TyKind::Bool, TyKind::Bool) => true,
+                        (TyKind::Error, _) | (_, TyKind::Error) => true,
+                        _ => false,
+                    };
                 if !ok {
                     let (a, b) = (self.tn(t), self.tn(target));
                     self.err(
@@ -5357,6 +5366,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Res::Fn(f) = r {
                 return self.fn_value_ty(f, span);
             }
+            if matches!(
+                r,
+                Res::Builtin(
+                    Builtin::MemDrop | Builtin::MemSwap | Builtin::MemReplace | Builtin::MemTake | Builtin::CmpMax | Builtin::CmpMin
+                )
+            ) {
+                self.errs.push(unsupported(span, "this std function used as a value"));
+            }
             return ERROR;
         }
         ERROR
@@ -5473,11 +5490,35 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             };
         }
-        if segs.len() != 2 {
-            self.errs.push(not_yet("L0505", span, "module paths"));
-            return None;
+        // The `core::mem` and `core::cmp` free fns by module path.
+        if names.len() == 3 && (names[0] == k.std || names[0] == k.core) {
+            let b = match (self.name(names[1]), self.name(names[2])) {
+                ("mem", "drop") => Some(Builtin::MemDrop),
+                ("mem", "swap") => Some(Builtin::MemSwap),
+                ("mem", "replace") => Some(Builtin::MemReplace),
+                ("mem", "take") => Some(Builtin::MemTake),
+                ("cmp", "max") => Some(Builtin::CmpMax),
+                ("cmp", "min") => Some(Builtin::CmpMin),
+                _ => None,
+            };
+            if let Some(b) = b {
+                return Some(Res::Builtin(b));
+            }
         }
-        let (ty_name, item) = (names[0], names[1]);
+        // A canonical std type path plus an associated item
+        // (`std::vec::Vec::new`, `core::option::Option::Some`):
+        // the last two segments name the type and the item, as in
+        // the two-segment spelling. Only exact table rows qualify.
+        let (ty_name, item) = if segs.len() == 2 {
+            (names[0], names[1])
+        } else {
+            let path: Vec<&str> = names[..names.len() - 1].iter().map(|n| self.name(*n)).collect();
+            if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type) {
+                self.errs.push(not_yet("L0505", span, "module paths"));
+                return None;
+            }
+            (names[names.len() - 2], names[names.len() - 1])
+        };
         // The first segment is a type-namespace binding read (`Self` is a
         // scope name, not a binding, and records nothing).
         let ty_bound = if ty_name == k.self_type { BindingRes::Absent } else { self.binding(Namespace::Type, ty_name) };
@@ -5588,7 +5629,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         };
         let Some(a) = adt else {
-            self.err("L0101", span, format!("cannot find type `{}`", crate::intern::source_name(self.name(ty_name))), "Check the spelling.");
+            self.err(
+                "L0101",
+                span,
+                format!("cannot find type `{}`", crate::intern::source_name(self.name(ty_name))),
+                "Check the spelling.",
+            );
             return None;
         };
         // The variant and associated-item tables of the Adt are part of its
@@ -5609,6 +5655,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let tn = self.name(ty_name).to_string();
         self.err("L0104", span, format!("no variant or associated function `{}` on `{tn}`", self.name(item)), "Check the name.");
         None
+    }
+
+    /// The one turbofish type argument on a path callee's last
+    /// segment, resolved; a fresh inference variable when absent.
+    fn callee_turbo_ty(&mut self, callee: ExprId, span: Span) -> Ty {
+        let args = match self.p.ast.expr(callee) {
+            Expr::Path(segs) => segs.last().map(|s| s.type_args()).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        match args.len() {
+            0 => self.new_var(false),
+            1 => self.resolve_written(args[0]),
+            _ => {
+                self.err("L0105", span, "this function takes one type argument", "Write one type in the `::<...>`.");
+                ERROR
+            }
+        }
     }
 
     /// A `size_of` or `align_of` query on the given turbofish type argument:
@@ -6282,12 +6345,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && self.body_item_of(segs[0].name, self.span(callee).ctxt).is_none();
             if qualified || bare {
                 if args.len() != 1 {
-                    self.err(
-                        "L0105",
-                        span,
-                        "this function takes 1 argument but a different number was given",
-                        "Pass exactly one value.",
-                    );
+                    self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one value.");
                     for &a in args {
                         self.expr(a, None);
                     }
@@ -6309,8 +6367,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => match self.binding_fn(name) {
                         Some(f) => Res::Fn(f),
                         None if name == p.known.Some => Res::OptSome,
-                    None if name == p.known.Ok => Res::ResOk,
-                    None if name == p.known.Err => Res::ResErr,
+                        None if name == p.known.Ok => Res::ResOk,
+                        None if name == p.known.Err => Res::ResErr,
+                        // The prelude re-exports `core::mem::drop` by
+                        // this plain name (2024 prelude).
+                        None if self.name(name) == "drop" => Res::Builtin(Builtin::MemDrop),
                         None if matches!(self.name(name), "size_of" | "align_of") && !segs[0].type_args().is_empty() => {
                             let align = self.name(name) == "align_of";
                             self.layout_query(&segs[0], align, span)
@@ -6613,11 +6674,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // `check_args` then checks it as itself.
                         let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
                         let at = self.resolve(at);
-                        if at == CHAR || at == STRING {
-                            (vec![at], STRING)
-                        } else {
-                            (vec![REF_STR], STRING)
-                        }
+                        if at == CHAR || at == STRING { (vec![at], STRING) } else { (vec![REF_STR], STRING) }
                     }
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
                     Builtin::EnvArgs => (vec![], ARGS),
@@ -6717,7 +6774,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {
-                            Expr::Path(segs) => segs[0].type_args(),
+                            Expr::Path(segs) => segs.iter().find(|s| s.name == p.known.Vec).map(|s| s.type_args()).unwrap_or_default(),
                             _ => Vec::new(),
                         };
                         let elem = match generics.first() {
@@ -6727,9 +6784,82 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let params = if b == Builtin::VecNew { vec![] } else { vec![USIZE] };
                         (params, self.tys.mk_vec(elem))
                     }
+                    Builtin::MemDrop => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        (vec![t], UNIT)
+                    }
+                    Builtin::MemSwap => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        let r = self.tys.mk_ref(true, t);
+                        (vec![r, r], UNIT)
+                    }
+                    Builtin::MemReplace => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        let r = self.tys.mk_ref(true, t);
+                        (vec![r, t], t)
+                    }
+                    Builtin::MemTake => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        let r = self.tys.mk_ref(true, t);
+                        (vec![r], t)
+                    }
+                    Builtin::CmpMax | Builtin::CmpMin => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        (vec![t, t], t)
+                    }
                     _ => unreachable!(),
                 };
                 self.check_args(&params, args, span);
+                // The byte-move and scalar-cmp builtins have type
+                // limits rustc states as `Sized`, `Default`, and
+                // `Ord` bounds; outside the exact supported shapes
+                // lust rejects (a safe false reject) instead of
+                // guessing a value.
+                let elem_of = |this: &mut Self, i: usize| {
+                    let t = this.resolve(params[i]);
+                    match this.tys.kind(t) {
+                        TyKind::Ref(_, _, inner) => this.resolve(inner),
+                        _ => t,
+                    }
+                };
+                match b {
+                    Builtin::MemDrop | Builtin::MemSwap | Builtin::MemReplace => {
+                        // For `drop`, T is the argument itself (a
+                        // reference to an unsized value is sized);
+                        // for swap/replace, T sits behind the `&mut`.
+                        let t = if b == Builtin::MemDrop { self.resolve(params[0]) } else { elem_of(self, 0) };
+                        if matches!(self.tys.kind(t), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                            let tn = self.tn(t);
+                            self.err(
+                                "L0110",
+                                span,
+                                format!("the size for values of type `{tn}` cannot be known at compilation time"),
+                                "Use a sized value, or move through a sized place.",
+                            );
+                        }
+                    }
+                    Builtin::MemTake => {
+                        let t = elem_of(self, 0);
+                        let k = self.tys.kind(t);
+                        let ok = matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit)
+                            || k.is_int_infer()
+                            || k.is_float_infer()
+                            || self.tys.is_string_ty(t)
+                            || self.tys.vec_elem(t).is_some()
+                            || self.tys.option_elem(t).is_some();
+                        if !ok {
+                            self.errs.push(unsupported(span, "`mem::take` on this type"));
+                        }
+                    }
+                    Builtin::CmpMax | Builtin::CmpMin => {
+                        let t = elem_of(self, 0);
+                        let k = self.tys.kind(t);
+                        if !(matches!(k, TyKind::Int(_) | TyKind::Char | TyKind::Bool) || k.is_int_infer()) {
+                            self.errs.push(unsupported(span, "`cmp::max`/`cmp::min` on this type"));
+                        }
+                    }
+                    _ => {}
+                }
                 ret
             }
             Res::Intrinsic(id) => {
@@ -8637,10 +8767,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let bad = (spec.plus && !numeric)
             || (spec.zero && !numeric)
             || (spec.precision.is_some() && !numeric && !stringy && bk != TyKind::Char)
-            || (spec.alt && !matches!(spec.kind, FmtKind::LowerHex | FmtKind::UpperHex | FmtKind::Octal | FmtKind::Binary) && !matches!(bk, TyKind::Float(_)));
+            || (spec.alt
+                && !matches!(spec.kind, FmtKind::LowerHex | FmtKind::UpperHex | FmtKind::Octal | FmtKind::Binary)
+                && !matches!(bk, TyKind::Float(_)));
         if bad && self.kind(t) != TyKind::Error {
             let tn = self.tn(t);
-            self.err("L0112", span, format!("invalid format options for `{tn}`"), "Sign, zero padding, and `#` only apply as in Rust: numbers and the radix formats.");
+            self.err(
+                "L0112",
+                span,
+                format!("invalid format options for `{tn}`"),
+                "Sign, zero padding, and `#` only apply as in Rust: numbers and the radix formats.",
+            );
         }
     }
 
@@ -9276,7 +9413,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let inner = self.new_var(false);
             let ot = self.tys.mk_option(inner);
             if std::env::var_os("LUST_DEBUG_PAT").is_some() {
-                eprintln!("PAT opt scrutinee ty={} kind={:?} fn={} params={:?}", self.tn(t), self.tys.kind(t), self.name(self.f.name), self.f.params.iter().map(|&x| self.tn(x)).collect::<Vec<_>>());
+                eprintln!(
+                    "PAT opt scrutinee ty={} kind={:?} fn={} params={:?}",
+                    self.tn(t),
+                    self.tys.kind(t),
+                    self.name(self.f.name),
+                    self.f.params.iter().map(|&x| self.tn(x)).collect::<Vec<_>>()
+                );
             }
             if !self.unify(ot, t) {
                 self.mismatch(span, t, ot);
@@ -9822,15 +9965,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// `Some(p)` is Some(true), `None` is Some(false), anything else is None.
+    /// True when `path` is `<parent>::<last>` with the parent in a
+    /// plain or canonical std spelling (`Option::Some`,
+    /// `std::option::Option::Some`).
+    fn std_parent_path(&self, path: &[ast::PathSeg], parent: Sym, last: Sym) -> bool {
+        if path.len() < 2 || path[path.len() - 1].name != last {
+            return false;
+        }
+        let head = &path[..path.len() - 1];
+        if head.len() == 1 {
+            return head[0].name == parent;
+        }
+        if head[head.len() - 1].name != parent {
+            return false;
+        }
+        let names: Vec<&str> = head.iter().map(|s| self.p.interner.get(s.name)).collect();
+        crate::ty::lang::std_path_kind(&names) == Some(crate::ty::lang::StdPathKind::Type)
+    }
+
     fn option_pattern(&self, pat: PatId) -> Option<bool> {
         let k = self.p.known;
         match self.p.ast.pat(pat) {
             Pat::Binding { name, mutable: false, by_ref: false } if *name == k.None => Some(false),
-            Pat::Path(segs) if segs.len() == 2 && segs[0].name == k.Option && segs[1].name == k.None => Some(false),
+            Pat::Path(segs) if self.std_parent_path(segs, k.Option, k.None) => Some(false),
             Pat::TupleStruct { path, elems }
-                if elems.len() == 1
-                    && ((path.len() == 1 && path[0].name == k.Some)
-                        || (path.len() == 2 && path[0].name == k.Option && path[1].name == k.Some)) =>
+                if elems.len() == 1 && ((path.len() == 1 && path[0].name == k.Some) || self.std_parent_path(path, k.Option, k.Some)) =>
             {
                 Some(true)
             }
@@ -9845,9 +10004,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match self.p.ast.pat(pat) {
             Pat::TupleStruct { path, elems } if elems.len() == 1 => {
                 let last = path.last().map(|s| s.name)?;
-                if (path.len() == 1 || (path.len() == 2 && path[0].name == k.Result)) && last == k.Ok {
+                if (path.len() == 1 && last == k.Ok) || self.std_parent_path(path, k.Result, k.Ok) {
                     Some(true)
-                } else if (path.len() == 1 || (path.len() == 2 && path[0].name == k.Result)) && last == k.Err {
+                } else if (path.len() == 1 && last == k.Err) || self.std_parent_path(path, k.Result, k.Err) {
                     Some(false)
                 } else {
                     None
@@ -10488,12 +10647,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             c.ty = self.zonk(c.ty);
             if contains_ref(&self.tys, c.output) {
                 let span = self.span(c.expr);
-                self.err(
-                    "L0820",
-                    span,
-                    "closures that return references are not supported yet",
-                    "Return an owned value from the closure.",
-                );
+                self.err("L0820", span, "closures that return references are not supported yet", "Return an owned value from the closure.");
             }
             self.out.closures.push(c);
         }
@@ -10518,9 +10672,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// True when a closure type sits inside an Adt's type arguments.
     fn closure_in_adt(&self, t: Ty, in_adt: bool) -> bool {
         match self.tys.kind(t) {
-            TyKind::Closure(_, a) => {
-                in_adt || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, in_adt)))
-            }
+            TyKind::Closure(_, a) => in_adt || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, in_adt))),
             TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, true))),
             TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.closure_in_adt(e, in_adt),
             TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.closure_in_adt(e, in_adt)),
@@ -10557,11 +10709,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Orders two known values at integer type `t` (in the u128 domain
     /// for `u128`, where the stored i128 is only the bit pattern).
     fn k_cmp(&self, a: i128, b: i128, t: Ty) -> std::cmp::Ordering {
-        if self.k_is_u128(t) {
-            (a as u128).cmp(&(b as u128))
-        } else {
-            a.cmp(&b)
-        }
+        if self.k_is_u128(t) { (a as u128).cmp(&(b as u128)) } else { a.cmp(&b) }
     }
 
     /// The mathematical value of an i128 seen at integer type `t`. For
@@ -11430,11 +11578,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let c = self.k_cmp(val, x, sty);
                     if *inclusive { c != Greater } else { c == Less }
                 });
-                if lo_ok && hi_ok {
-                    KCov::Yes
-                } else {
-                    KCov::No
-                }
+                if lo_ok && hi_ok { KCov::Yes } else { KCov::No }
             }
             Pat::Or(alts) => {
                 let mut any_unknown = false;
@@ -11445,11 +11589,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         KCov::No => {}
                     }
                 }
-                if any_unknown {
-                    KCov::Unknown
-                } else {
-                    KCov::No
-                }
+                if any_unknown { KCov::Unknown } else { KCov::No }
             }
             Pat::At { inner, .. } | Pat::Paren(inner) => self.k_scalar_covers(*inner, val, sty),
             _ => KCov::Unknown,
@@ -11470,11 +11610,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Pat::Struct { fields, .. } => fields.iter().all(|&(_, s)| self.k_pat_catches(s)),
                     _ => true,
                 };
-                if subs_catch {
-                    KCov::Yes
-                } else {
-                    KCov::Unknown
-                }
+                if subs_catch { KCov::Yes } else { KCov::Unknown }
             }
             PatRes::Variant(..) => KCov::Unknown,
             _ => match p.ast.pat(pat) {
@@ -11492,11 +11628,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             KCov::No => {}
                         }
                     }
-                    if any_unknown {
-                        KCov::Unknown
-                    } else {
-                        KCov::No
-                    }
+                    if any_unknown { KCov::Unknown } else { KCov::No }
                 }
                 Pat::At { inner, .. } | Pat::Paren(inner) => self.k_enum_covers(*inner, adt, var),
                 _ => KCov::Unknown,

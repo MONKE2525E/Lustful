@@ -216,6 +216,11 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::RcMakeMut,
     Builtin::RcGetMut,
     Builtin::RcTryUnwrap,
+    Builtin::MemSwap,
+    Builtin::MemReplace,
+    Builtin::MemTake,
+    Builtin::CmpMax,
+    Builtin::CmpMin,
 ];
 
 /// How a builtin is called.
@@ -428,6 +433,11 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
         B::RcMakeMut => (&["Rc<T>"], vec![k.make_mut], Call::Associated),
         B::RcGetMut => (&["Rc<T>"], vec![k.get_mut], Call::Associated),
         B::RcTryUnwrap => (&["Rc<T>"], vec![k.try_unwrap], Call::Associated),
+        B::MemSwap => (&["core::mem"], vec![k.swap], Call::Function),
+        B::MemReplace => (&["core::mem"], vec![k.replace], Call::Function),
+        B::MemTake => (&["core::mem"], vec![k.take], Call::Function),
+        B::CmpMax => (&["core::cmp"], vec![k.max], Call::Function),
+        B::CmpMin => (&["core::cmp"], vec![k.min], Call::Function),
     }
 }
 
@@ -589,6 +599,9 @@ const REJECTED: &[(&str, &str)] = &[
     ("open ranges", "L9001"),
     ("refutable patterns here (in `let` and parameters)", "L9001"),
     ("bindings inside `|` patterns", "L9001"),
+    ("`mem::take` on this type", "L9001"),
+    ("`cmp::max`/`cmp::min` on this type", "L9001"),
+    ("this std function used as a value", "L9001"),
     ("#[derive(PartialOrd)]", "L9001"),
     ("#[derive(Ord)]", "L9001"),
     ("#[derive(Default)]", "L9001"),

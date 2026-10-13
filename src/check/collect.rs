@@ -380,8 +380,18 @@ pub fn resolve_ty(
             Ok(tys.mk_ref(*mutable, inner))
         }
         TyExpr::Path(segs) => {
-            // Accept `std::...::Name` by looking only at the last segment of std paths.
-            let seg = if segs.len() > 1 && segs[0].name == known.std {
+            // Accept a canonical std type path by its last segment
+            // (`std::vec::Vec`); a wrong-module path
+            // (`std::option::Vec`) never falls through.
+            let std_prefixed = segs.len() > 1 && (segs[0].name == known.std || matches!(interner.get(segs[0].name), "core" | "alloc"));
+            let seg = if std_prefixed {
+                let path: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+                if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type)
+                    && !crate::ty::lang::std_is_primitive_path(&path)
+                {
+                    let n = interner.get(segs.last().unwrap().name);
+                    return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
+                }
                 segs.last().unwrap()
             } else if segs.len() == 1 {
                 &segs[0]
@@ -515,12 +525,7 @@ pub fn resolve_ty(
                 None => UNIT,
             };
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig {
-                inputs,
-                output: out,
-                is_unsafe: false,
-                extern_c: false,
-            }));
+            let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: out, is_unsafe: false, extern_c: false }));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         _ => Err(not_yet("L0602", span, "this type form")),
@@ -809,10 +814,7 @@ fn eval_scalar(
                 let b = val(ast, interner, known, *rhs, depth + 1, env, steps);
                 return SFlow::V(b.map(|b| (b != 0) as i128));
             }
-            let (a, b) = (
-                val(ast, interner, known, *lhs, depth + 1, env, steps),
-                val(ast, interner, known, *rhs, depth + 1, env, steps),
-            );
+            let (a, b) = (val(ast, interner, known, *lhs, depth + 1, env, steps), val(ast, interner, known, *rhs, depth + 1, env, steps));
             let (Some(a), Some(b)) = (a, b) else { return SFlow::V(None) };
             SFlow::V(match op {
                 BinOp::Add => a.checked_add(b),
@@ -859,36 +861,32 @@ fn eval_scalar(
                 }
             }
         }
-        Expr::While { cond, body, .. } => {
-            loop {
-                let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
-                if c == 0 {
-                    return SFlow::V(None);
-                }
-                let b = *body;
-                match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
-                    SFlow::V(_) | SFlow::Continue => {}
-                    SFlow::Break(_) => return SFlow::V(None),
-                    other => return other,
-                }
-                if *steps > 100_000 {
-                    return SFlow::V(None);
-                }
+        Expr::While { cond, body, .. } => loop {
+            let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
+            if c == 0 {
+                return SFlow::V(None);
             }
-        }
-        Expr::Loop { body, .. } => {
-            loop {
-                let b = *body;
-                match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
-                    SFlow::V(_) | SFlow::Continue => {}
-                    SFlow::Break(v) => return SFlow::V(v),
-                    other => return other,
-                }
-                if *steps > 100_000 {
-                    return SFlow::V(None);
-                }
+            let b = *body;
+            match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
+                SFlow::V(_) | SFlow::Continue => {}
+                SFlow::Break(_) => return SFlow::V(None),
+                other => return other,
             }
-        }
+            if *steps > 100_000 {
+                return SFlow::V(None);
+            }
+        },
+        Expr::Loop { body, .. } => loop {
+            let b = *body;
+            match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
+                SFlow::V(_) | SFlow::Continue => {}
+                SFlow::Break(v) => return SFlow::V(v),
+                other => return other,
+            }
+            if *steps > 100_000 {
+                return SFlow::V(None);
+            }
+        },
         Expr::Break { value, .. } => {
             let v = match value {
                 Some(v) => val(ast, interner, known, *v, depth + 1, env, steps),
@@ -1009,11 +1007,7 @@ fn eval_scalar(
                 let bits = it.bits();
                 match item {
                     "MAX" => Some(truncate_to_int(it.max128() as i128, it)),
-                    "MIN" => Some(if it.signed() {
-                        if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) }
-                    } else {
-                        0
-                    }),
+                    "MIN" => Some(if it.signed() { if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } } else { 0 }),
                     "BITS" => Some(bits as i128),
                     _ => None,
                 }
@@ -1122,10 +1116,9 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
 fn variant_fields_src(interner: &Interner, vf: &VariantFields) -> (VariantShape, Vec<(Sym, ast::TyId, Span)>) {
     match vf {
         VariantFields::Unit => (VariantShape::Unit, Vec::new()),
-        VariantFields::Tuple(fs) => (
-            VariantShape::Tuple,
-            fs.iter().enumerate().map(|(i, f)| (interner.intern(&i.to_string()), f.ty, f.span)).collect(),
-        ),
+        VariantFields::Tuple(fs) => {
+            (VariantShape::Tuple, fs.iter().enumerate().map(|(i, f)| (interner.intern(&i.to_string()), f.ty, f.span)).collect())
+        }
         VariantFields::Struct(fs) => (VariantShape::Named, fs.iter().map(|f| (f.name, f.ty, f.span)).collect()),
     }
 }
@@ -1164,8 +1157,7 @@ pub(crate) fn stable_ranks(order: &mut Vec<crate::def::DefPathHash>, hashes: &[c
 /// to decide whether cached output still applies).
 pub(crate) fn stable_ranks_preview(order: &[crate::def::DefPathHash], hashes: &[crate::def::DefPathHash]) -> Vec<u32> {
     let mut extended: Vec<crate::def::DefPathHash> = order.to_vec();
-    let mut pos: std::collections::HashMap<crate::def::DefPathHash, usize> =
-        extended.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+    let mut pos: std::collections::HashMap<crate::def::DefPathHash, usize> = extended.iter().enumerate().map(|(i, h)| (*h, i)).collect();
     let mut unseen: Vec<crate::def::DefPathHash> = hashes.iter().copied().filter(|h| !pos.contains_key(h)).collect();
     unseen.sort_by_key(|h| h.0);
     unseen.dedup();
@@ -1429,14 +1421,8 @@ pub fn collect_reuse<'a>(
         // duplicate definition (the error above), and the disambiguator keeps the
         // two records apart in the def table, as the old dense ids did.
         let def = DefId { krate: p.krate, hash };
-        p.adts[id.0 as usize] = AdtDef {
-            name,
-            is_enum,
-            variants: Vec::new(),
-            derives: Derives::default(),
-            span,
-            repr: crate::ty::layout::Repr::default(),
-        };
+        p.adts[id.0 as usize] =
+            AdtDef { name, is_enum, variants: Vec::new(), derives: Derives::default(), span, repr: crate::ty::layout::Repr::default() };
         p.gx.adt_info[id.0 as usize] = (def, n_params);
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
@@ -1680,11 +1666,7 @@ pub fn collect_reuse<'a>(
                     "Remove the integer from the repr, or make the type an enum.",
                 ));
             }
-            if adt.is_enum
-                && adt.repr.kind == ReprKind::C
-                && adt.repr.int.is_some()
-                && adt.variants.iter().all(|v| v.fields.is_empty())
-            {
+            if adt.is_enum && adt.repr.kind == ReprKind::C && adt.repr.int.is_some() && adt.variants.iter().all(|v| v.fields.is_empty()) {
                 errs.push(Diag::new(
                     "L0110",
                     adt.span,
@@ -1879,7 +1861,18 @@ pub fn collect_reuse<'a>(
         let shift = parent_gen.generics.params.len() as u32;
         let (own_generics, own_scope) = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &def.generics, &def.where_clause, shift, &parent_gen.scope, errs)
+            generics::build_generics_shifted(
+                ast,
+                interner,
+                known,
+                &cx,
+                &mut p.tys,
+                &def.generics,
+                &def.where_clause,
+                shift,
+                &parent_gen.scope,
+                errs,
+            )
         };
         let mut generics = parent_gen.generics.clone();
         generics.params.extend(own_generics.params.iter().cloned());

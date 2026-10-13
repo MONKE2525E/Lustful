@@ -868,9 +868,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Intrinsic(id), ops, d, span);
                     }
-                    Res::Builtin(Builtin::VecNew) => {
-                        self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span)
-                    }
+                    Res::Builtin(Builtin::VecNew) => self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span),
                     Res::Builtin(Builtin::VecWithCapacity) => {
                         // An empty Vec in a temporary, an exact
                         // reserve on it, then a move to the dest:
@@ -892,6 +890,31 @@ impl<'p, 'a> Lower<'p, 'a> {
                         );
                         self.set_or_temp(dest, Rvalue::Use(Operand::Move(Place::local(tv))), ty, span);
                     }
+                    Res::Builtin(Builtin::MemTake) => {
+                        // Check limited `take` to types whose `Default`
+                        // value is one of the synthesized forms below:
+                        // fill a slot with it, then byte-replace.
+                        let slot = self.temp(ty);
+                        match self.kind(ty) {
+                            TyKind::Int(it) => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Int(0, it))), span),
+                            TyKind::Float(f) => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Float(0, f))), span),
+                            TyKind::Bool => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Bool(false))), span),
+                            TyKind::Char => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Char('\0'))), span),
+                            TyKind::Unit => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Unit)), span),
+                            _ if self.body.tys.is_string_ty(ty) => {
+                                self.call_into(CallTarget::Builtin(Builtin::StringNew), Vec::new(), Place::local(slot), span)
+                            }
+                            _ if self.body.tys.vec_elem(ty).is_some() => {
+                                self.assign(Place::local(slot), Rvalue::VecLit(self.peel_vec(ty), Vec::new()), span)
+                            }
+                            _ => self.assign(Place::local(slot), Rvalue::Opt(ty, None), span),
+                        }
+                        let fill = self.operand_from(Place::local(slot), ty);
+                        let mut ops = ops;
+                        ops.push(fill);
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Builtin(Builtin::MemReplace), ops, d, span);
+                    }
                     Res::Builtin(b) => {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(b), ops, d, span);
@@ -909,7 +932,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                             self.call_into(CallTarget::Builtin(len), ops, Place::local(t), span);
                             self.set_or_temp(
                                 dest,
-                                Rvalue::Bin(BinOp::Mul, Operand::Copy(Place::local(t)), Operand::Const(Const::Int(elem as u128, IntTy::Usize))),
+                                Rvalue::Bin(
+                                    BinOp::Mul,
+                                    Operand::Copy(Place::local(t)),
+                                    Operand::Const(Const::Int(elem as u128, IntTy::Usize)),
+                                ),
                                 ty,
                                 span,
                             );
@@ -2446,8 +2473,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| self.pat_moves_noncopy(s)),
             Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.pat_moves_noncopy(s)),
             Pat::Slice { prefix, middle, suffix } => {
-                middle.is_some_and(|m| self.pat_moves_noncopy(m))
-                    || prefix.iter().chain(suffix.iter()).any(|&s| self.pat_moves_noncopy(s))
+                middle.is_some_and(|m| self.pat_moves_noncopy(m)) || prefix.iter().chain(suffix.iter()).any(|&s| self.pat_moves_noncopy(s))
             }
             Pat::Paren(i) | Pat::Ref { inner: i, .. } => self.pat_moves_noncopy(*i),
             _ => false,
@@ -2560,8 +2586,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         fn walk(p: &Program, pat: PatId) -> bool {
             match p.ast.pat(pat) {
                 Pat::Slice { prefix, middle, suffix } => {
-                    middle.is_some_and(|m| binds(p, m) || walk(p, m))
-                        || prefix.iter().chain(suffix.iter()).any(|&s| walk(p, s))
+                    middle.is_some_and(|m| binds(p, m) || walk(p, m)) || prefix.iter().chain(suffix.iter()).any(|&s| walk(p, s))
                 }
                 Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| walk(p, s)),
                 Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| walk(p, s)),
