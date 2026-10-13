@@ -154,6 +154,7 @@ int lust_str_cmp(lust_str a, lust_str b) LUST_BODY({
 uint8_t lust_str_eq(lust_str a, lust_str b) LUST_BODY({ return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); })
 
 #include "panic.c"
+#include "thread.c"
 /* ---------- Formatting ---------- */
 
 void lust_fmt_u64(lust_String *out, uint64_t v) LUST_BODY({
@@ -264,9 +265,10 @@ void lust_write(int to_stderr, lust_String *s) LUST_BODY({
 void lust_flush(void) LUST_BODY({ fflush(stdout); })
 
 /* The `exit` intrinsic behind std::process::exit: lust print output is
-   buffered in stdio, so flush before the libc exit. Destructors do not
-   run, as in Rust. */
-void lust_exit(int32_t code) LUST_BODY({ fflush(stdout); exit(code); })
+   buffered in stdio, so flush before the libc exit. Destructors on the
+   stack do not run, as in Rust; the calling thread's thread-local
+   destructors do (glibc's exit() runs them for Rust std). */
+void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); fflush(stdout); exit(code); })
 
 /* ---------- Vec ---------- */
 

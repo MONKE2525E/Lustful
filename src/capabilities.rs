@@ -372,6 +372,16 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::Utf8ErrorValidUpTo,
     Builtin::Utf8ErrorErrorLen,
     Builtin::Sync(crate::check::sync::SyncOp::SpinLoop),
+    Builtin::TlsWith,
+    Builtin::TlsTryWith,
+    Builtin::TlsWithBorrow,
+    Builtin::TlsWithBorrowMut,
+    Builtin::TlsSet,
+    Builtin::TlsGet,
+    Builtin::TlsTake,
+    Builtin::TlsReplace,
+    Builtin::TlsAccess,
+    Builtin::TlsInitWith,
 ];
 
 /// How a builtin is called.
@@ -746,6 +756,16 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::FromUtf8ErrorIntoBytes => (&["std::string::FromUtf8Error"], vec![i.intern("into_bytes")], Call::Method),
         B::Utf8ErrorValidUpTo => (&["std::str::Utf8Error"], vec![i.intern("valid_up_to")], Call::Method),
         B::Utf8ErrorErrorLen => (&["std::str::Utf8Error"], vec![i.intern("error_len")], Call::Method),
+        B::TlsWith => (&["std::thread::LocalKey<T>"], vec![i.intern("with")], Call::Method),
+        B::TlsTryWith => (&["std::thread::LocalKey<T>"], vec![i.intern("try_with")], Call::Method),
+        B::TlsWithBorrow => (&["std::thread::LocalKey<RefCell<T>>"], vec![i.intern("with_borrow")], Call::Method),
+        B::TlsWithBorrowMut => (&["std::thread::LocalKey<RefCell<T>>"], vec![i.intern("with_borrow_mut")], Call::Method),
+        B::TlsSet => (&["std::thread::LocalKey<Cell<T>>", "std::thread::LocalKey<RefCell<T>>"], vec![i.intern("set")], Call::Method),
+        B::TlsGet => (&["std::thread::LocalKey<Cell<T>>"], vec![i.intern("get")], Call::Method),
+        B::TlsTake => (&["std::thread::LocalKey<Cell<T>>", "std::thread::LocalKey<RefCell<T>>"], vec![i.intern("take")], Call::Method),
+        B::TlsReplace => (&["std::thread::LocalKey<Cell<T>>", "std::thread::LocalKey<RefCell<T>>"], vec![i.intern("replace")], Call::Method),
+        // Internal to the thread_local! expansion; no user spelling.
+        B::TlsAccess | B::TlsInitWith => (&["std::thread::LocalKey<T>"], vec![], Call::Method),
     }
 }
 

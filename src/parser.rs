@@ -265,6 +265,13 @@ struct ParsedAttrs {
 /// loading. `cfg!` the macro is a separate form and stays with W-MACRO.
 const RESOLVE_ATTRS: &[&str] = &["cfg", "cfg_attr", "path", "macro_use", "macro_export", "no_implicit_prelude"];
 
+/// The attributes `thread_local!` puts on each static it declares
+/// (expand/builtin.rs), lazy and `const { .. }` form. No source text can
+/// spell these names, so only that expansion makes them; collect reads
+/// them (check/tls.rs).
+pub const TLS_ATTR: &str = "thread_local!";
+pub const TLS_CONST_ATTR: &str = "thread_local!const";
+
 /// Rust attribute names lust knows by name but does not handle yet
 /// (docs/ARCH.md section 1.6 lists what each later package must honor).
 /// These reject with L0522; any other name rejects with L0402.
@@ -1660,6 +1667,7 @@ impl<'a> Parser<'a> {
                 _ if first == k.test && !inner => out.is_test = true,
                 // Doc comments lex to this attribute; it carries no code.
                 _ if name_text == "doc" => {}
+                _ if item_level && (name_text == TLS_ATTR || name_text == TLS_CONST_ATTR) => {}
                 _ if name_text == "repr" => {}
                 // `attrs::check_input` judged the lint list (L0531 for deny and forbid).
                 _ if first == k.allow || first == k.warn || first == k.deny || name_text == "forbid" => {}

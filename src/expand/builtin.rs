@@ -773,22 +773,36 @@ fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     Ok(tpl)
 }
 
-/// `thread_local!` in its ARCH 6.4 shape: one `LocalKey` static per
-/// declared static, with an init fn. Checker and thread support for
-/// `LocalKey` land with W-THREADS; the shape is fixed here. Initializers
-/// expand one level below `depth`, where rustc expands them.
+/// `thread_local!` (ARCH 6.4, 7.3). Each declared static becomes two
+/// items, as in rustc's own expansion (a `LocalKey` const holding an
+/// init fn), but with no `unsafe`:
+///
+/// ```text
+/// #[attrs] #[thread_local!] vis static NAME: T = NAME#init;
+/// #[attrs] fn NAME#init() -> T { init }
+/// ```
+///
+/// The marker attribute and the init fn name are spellings no source
+/// text can lex, so only this expansion makes them. Collect types the
+/// marked static as `LocalKey<T>` and keeps the init fn as the value's
+/// lazy initializer. The `const { e }` form gets `#[thread_local!const]`
+/// and the block as the init fn body; the checker proves that body is a
+/// const initializer (check/tls.rs). Initializers expand one level below
+/// `depth`, where rustc expands them.
 fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
+    let shape = |what: &str| err(C_CALL, span, format!("thread_local! {what}"), "Write `static NAME: Type = init;` in thread_local!.");
     let mut out = Vec::new();
     let trees = &call.inner;
     let mut i = 0;
     while i < trees.len() {
         // One static: attributes, visibility, `static`, name, `:`, type,
-        // `=`, init, `;`. Read it off the token shape.
+        // `=`, init, then `;` or the end of the input.
         let item_start = i;
         while let Some(attr) = attr_at(trees, i, st.ctx.interner) {
             i = attr.end;
         }
+        let attrs: Vec<Tt> = trees[item_start..i].to_vec();
         let vis_start = i;
         if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pub) {
             i += 1;
@@ -797,43 +811,37 @@ fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<
             }
         }
         let vis: Vec<Tt> = trees[vis_start..i].to_vec();
-        let attrs: Vec<Tt> = trees[item_start..vis_start].to_vec();
         if tok_at(trees, i).map(|t| t.tok) != Some(Tok::Static) {
-            return Err(err(
-                C_CALL,
-                span,
-                "thread_local! holds static declarations",
-                "Write `static NAME: Type = init;` in thread_local!.",
-            ));
+            return Err(shape("holds static declarations"));
         }
         i += 1;
-        let Some(name_tok) = tok_at(trees, i) else {
-            return Err(err(
-                C_CALL,
-                span,
-                "thread_local! holds static declarations",
-                "Write `static NAME: Type = init;` in thread_local!.",
-            ));
+        let name_tok = match trees.get(i).map(|t| unwrap_frag(std::slice::from_ref(t))) {
+            Some([Tt::Tok(t)]) if matches!(t.tok, Tok::Ident(_)) => *t,
+            _ => return Err(shape("holds static declarations")),
         };
-        let name_tree = std::slice::from_ref(&trees[i]).to_vec();
-        let _ = name_tok;
+        let Tok::Ident(name) = name_tok.tok else { unreachable!() };
         i += 1;
         if tok_at(trees, i).map(|t| t.tok) != Some(Tok::Colon) {
-            return Err(err(C_CALL, span, "thread_local! statics need a type", "Write `static NAME: Type = init;` in thread_local!."));
+            return Err(shape("statics need a type"));
         }
         i += 1;
+        // The type runs to the first `=` outside angle brackets, so an
+        // associated type binding (`Iterator<Item = u8>`) stays in it.
         let ty_start = i;
-        while i < trees.len() && tok_at(trees, i).map(|t| t.tok) != Some(Tok::Eq) {
+        let mut angle = 0i32;
+        while let Some(t) = trees.get(i) {
+            match t {
+                Tt::Tok(t) if t.tok == Tok::Eq && angle == 0 => break,
+                Tt::Tok(t) if t.tok == Tok::Lt => angle += 1,
+                Tt::Tok(t) if t.tok == Tok::Gt => angle -= 1,
+                Tt::Tok(t) if t.tok == Tok::Shr => angle -= 2,
+                _ => {}
+            }
             i += 1;
         }
         let ty: Vec<Tt> = trees[ty_start..i].to_vec();
-        if i >= trees.len() {
-            return Err(err(
-                C_CALL,
-                span,
-                "thread_local! statics need an initializer",
-                "Write `static NAME: Type = init;` in thread_local!.",
-            ));
+        if i >= trees.len() || ty.is_empty() {
+            return Err(shape("statics need a type and an initializer"));
         }
         i += 1; // `=`
         let init_start = i;
@@ -844,14 +852,34 @@ fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<
         if i < trees.len() {
             i += 1; // `;`
         }
-        let mut tpl = st.lex_template(
-            "__lust_vis static __lust_name: ::std::thread::LocalKey<__lust_ty> = { fn __lust_init() -> __lust_ty { __lust_initval } unsafe { ::std::thread::LocalKey::new(__lust_init) } };",
-            span,
-        );
+        // `const { e }` and nothing else is the const form; any other
+        // initializer (`const { 1 } + 1` included) is a lazy expression.
+        let const_block = match init.as_slice() {
+            [c, b] if c.is_tok(Tok::Const) => match unwrap_frag(std::slice::from_ref(b)) {
+                [Tt::Delim(Delim::Brace, inner, s)] => Some(Tt::Delim(Delim::Brace, inner.clone(), *s)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if init.is_empty() {
+            return Err(shape("statics need an initializer"));
+        }
+        let marker = if const_block.is_some() { crate::parser::TLS_CONST_ATTR } else { crate::parser::TLS_ATTR };
+        let init_name = format!("{}#init", st.ctx.interner.get(name));
+        let init_fn = Tt::Tok(Token { tok: Tok::Ident(st.ctx.interner.intern(&init_name)), span: name_tok.span });
+        let body = const_block.unwrap_or_else(|| Tt::Delim(Delim::Brace, init, span));
+        let mut tpl = st.lex_template("#[__lust_marker] __lust_vis static __lust_name: __lust_ty = __lust_init;", span);
+        tpl = splice_placeholders(tpl, "__lust_marker", &[st.ident_tree(marker, span)], st.ctx.interner);
         tpl = splice_placeholders(tpl, "__lust_vis", &vis, st.ctx.interner);
-        tpl = splice_placeholders(tpl, "__lust_name", &name_tree, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_name", &[Tt::Tok(name_tok)], st.ctx.interner);
         tpl = splice_placeholders(tpl, "__lust_ty", &ty, st.ctx.interner);
-        tpl = splice_placeholders(tpl, "__lust_initval", &init, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_init", std::slice::from_ref(&init_fn), st.ctx.interner);
+        out.extend(attrs.iter().cloned());
+        out.extend(tpl);
+        let mut tpl = st.lex_template("fn __lust_init() -> __lust_ty __lust_body", span);
+        tpl = splice_placeholders(tpl, "__lust_init", &[init_fn], st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_ty", &ty, st.ctx.interner);
+        tpl = splice_placeholders(tpl, "__lust_body", &[body], st.ctx.interner);
         out.extend(attrs);
         out.extend(tpl);
     }

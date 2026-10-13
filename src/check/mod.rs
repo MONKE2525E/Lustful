@@ -23,6 +23,7 @@ pub mod platform;
 pub mod project;
 pub mod sized;
 pub mod stdtypes;
+pub mod tls;
 pub mod usefulness;
 pub mod sync;
 pub mod variance;
@@ -440,6 +441,25 @@ pub enum Builtin {
     Utf8ErrorErrorLen,
     /// A `std::sync` or `std::thread` call (check/sync.rs, W-THREADS).
     Sync(sync::SyncOp),
+    /// `LocalKey` methods on a `thread_local!` static (check/tls.rs).
+    /// Lowering adds the static's init fn as the last operand;
+    /// lower/tls.rs expands each call after borrowck.
+    TlsWith,
+    TlsTryWith,
+    TlsWithBorrow,
+    TlsWithBorrowMut,
+    TlsSet,
+    TlsGet,
+    TlsTake,
+    TlsReplace,
+    /// Only made by lower/tls.rs: `(key, init) -> Option<&T>`, the
+    /// thread's value (made by `init` on the first access), or None
+    /// once its destructor ran.
+    TlsAccess,
+    /// Only made by lower/tls.rs: `(key, value) -> Option<T>`. A lazy
+    /// key not yet made on this thread takes `value` as its value
+    /// (None comes back); any other state gives `value` back.
+    TlsInitWith,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -10618,6 +10638,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `type_id`, `is`, and the downcasts of `core::any` (check/any.rs).
         if let Some(ret) = self.any_method(e, rt, name, name_span, args, turbofish, &explicit, expected) {
+            return ret;
+        }
+        // `LocalKey` methods on a `thread_local!` static (check/tls.rs).
+        if let Some(ret) = self.tls_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         // Generic and trait receivers go through the full 2.10

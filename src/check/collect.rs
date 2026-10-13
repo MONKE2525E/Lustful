@@ -85,6 +85,9 @@ pub struct StaticItem {
     pub ty: Ty,
     pub mutable: bool,
     pub value: crate::ty::consteval::ConstValue,
+    /// Set for a `thread_local!` static: `ty` is `LocalKey<T>` and
+    /// `value` the key's zero slot word (check/tls.rs).
+    pub tls: Option<super::tls::TlsKey>,
 }
 
 pub struct FnInfo<'a> {
@@ -396,6 +399,8 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
                 Some(e) => format!("{}<{}>", k.display(), ty_name(p, tys, e)),
                 None => k.display(),
             },
+            Some(BuiltinTy::LocalKey) => format!("LocalKey<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::AccessError) => "AccessError".into(),
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -1884,6 +1889,8 @@ pub fn collect_reuse<'a>(
         for (def, n) in [(b.weak, "Weak"), (b.refcell, "RefCell"), (b.cell, "Cell"), (b.ref_guard, "Ref"), (b.ref_mut_guard, "RefMut")] {
             insert_builtin(&mut p, def, DefsKind::Struct, interner.intern(n), one_ty_param());
         }
+        insert_builtin(&mut p, b.local_key, DefsKind::Struct, interner.intern("LocalKey"), one_ty_param());
+        insert_builtin(&mut p, b.access_error, DefsKind::Struct, interner.intern("AccessError"), Generics::default());
         for k in crate::ty::iter::IterKind::ALL {
             let params = (0..k.n_args())
                 .map(|i| ParamDef { name: interner.intern(["I", "F", "B"][i]), kind: ParamKind::Type, span: dummy })
@@ -3258,6 +3265,9 @@ struct PendingConst {
     static_idx: u32,
     /// Set for an associated const (never a plain-name lookup).
     assoc: Option<PendingAssoc>,
+    /// Set for a `thread_local!` static: whether it is the `const`
+    /// form. Its value is the key's slot word, never evaluated.
+    tls: Option<bool>,
 }
 
 enum PendingState {
@@ -3284,6 +3294,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             _ => continue,
         };
         let Some(value) = value else { continue };
+        let tls = if is_static.is_some() { super::tls::key_form(&item.attrs, p.interner) } else { None };
         let ty = match resolve_item_ty(p, ty_id, None) {
             Ok(t) => generics::normalize_item_ty(p, t),
             Err(d) => {
@@ -3300,6 +3311,8 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             ));
             continue;
         }
+        // A `thread_local!` static's own type is `LocalKey<T>`.
+        let ty = if tls.is_some() { p.tys.mk_local_key(ty) } else { ty };
         // A static is shared by every thread: its type must be `Sync`
         // (rustc E0277), proven by the auto trait walk (ARCH 2.7).
         if is_static.is_some() {
@@ -3344,7 +3357,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                 ));
             }
         }
-        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None }, PendingState::Todo));
+        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None, tls }, PendingState::Todo));
     }
     // Associated consts evaluate in the same pending list, so a
     // free const can read an inherent associated const (and back)
@@ -3472,13 +3485,23 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                 } else if p.static_defs.len() <= item.static_idx as usize {
                     p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
                 }
-                statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value });
+                let tls = match item.tls {
+                    Some(eager) => match super::tls::init_fn(p, item.expr, item.stmt_idx) {
+                        Some(init) => Some(super::tls::TlsKey { init, eager }),
+                        None => {
+                            errs.push(Diag::new("L0806", item.span, "thread_local! static without its init fn", "Declare the static inside thread_local!."));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value, tls });
             }
         }
     }
     p.statics = statics
         .into_iter()
-        .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit }))
+        .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit, tls: None }))
         .collect();
 }
 
@@ -3570,6 +3593,7 @@ fn register_assoc_consts<'a>(
                         static_idx: 0,
                         stmt_idx: None,
                         assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
+                        tls: None,
                     },
                     PendingState::Todo,
                 ));
@@ -3616,6 +3640,7 @@ fn register_assoc_consts<'a>(
                     static_idx: 0,
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::Inherent { owner, impl_def, self_pat, generics: impl_generics.clone() }),
+                    tls: None,
                 },
                 PendingState::Todo,
             ));
@@ -3648,6 +3673,7 @@ fn register_assoc_consts<'a>(
                     static_idx: 0,
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::TraitDefault { trait_def, assoc }),
+                    tls: None,
                 },
                 PendingState::Todo,
             ));
@@ -3853,6 +3879,13 @@ impl CollectCx<'_, '_> {
                 return None;
             }
             PendingState::Todo => {}
+        }
+        // A `thread_local!` key's value is its zero slot word; its
+        // initializer is the init fn, checked as a body (check/tls.rs).
+        if self.pending[idx].0.tls.is_some() {
+            let v = crate::ty::consteval::ConstValue::Int(0);
+            self.pending[idx].1 = PendingState::Done(v.clone());
+            return Some(v);
         }
         self.pending[idx].1 = PendingState::Doing;
         let (expr, ty, span) = {

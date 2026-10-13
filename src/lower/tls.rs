@@ -1,0 +1,305 @@
+// `LocalKey` method calls (check/tls.rs) in lowering and after borrowck.
+//
+// Lowering gives each key method call the static's init fn as its last
+// operand (`init_operand`), as an `fn() -> T` pointer value. Borrowck sees
+// the call as one builtin call: the key borrow, the closure moved in, the
+// result out. Codegen calls `expand` first, and each call becomes plain IR
+// over two runtime accesses (`TlsAccess`, `TlsInitWith`, emitted by
+// cgen.rs): a switch on the value's `Option<&T>`, the closure call, and
+// Rust's AccessError panic once the value is destroyed.
+//
+// Every `emit_*` function starts in `self.cur` and leaves `self.cur` at the
+// block that follows the value it wrote.
+use super::Lower;
+use crate::check::Builtin;
+use crate::check::closure::ClosureKind;
+use crate::check::collect::{Program, needs_drop};
+use crate::diag::Span;
+use crate::ir::*;
+use crate::ty::*;
+
+type R = Result<(), String>;
+
+/// Rust 1.99's panic text for a key used during or after its destructor.
+const ACCESS_PANIC: &str = "cannot access a Thread Local Storage value during or after destruction: AccessError";
+
+/// True for the `LocalKey` method builtins: lowering adds the init fn
+/// operand, and `expand` rewrites them.
+pub fn is_key_method(b: Builtin) -> bool {
+    use Builtin as B;
+    matches!(b, B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut | B::TlsSet | B::TlsGet | B::TlsTake | B::TlsReplace)
+}
+
+impl Lower<'_, '_> {
+    /// The init fn of the `thread_local!` static a key method's receiver
+    /// names (the checker allows no other receiver), as an `fn() -> T`
+    /// pointer value.
+    pub(super) fn tls_init_operand(&mut self, recv: crate::ast::ExprId, span: Span) -> Operand {
+        let crate::check::Res::Static(idx) = self.ck.res(recv) else { unreachable!("check/tls.rs: a key method names its static") };
+        let st = &self.p.statics[idx as usize];
+        let (key, ty) = (st.tls.expect("check/tls.rs: a key method names a thread_local! static"), st.ty);
+        let t = self.body.tys.local_key_elem(ty).expect("a thread_local! static is a LocalKey");
+        let inputs = self.body.tys.intern_tys(&[]);
+        let sig = self.body.tys.intern_sig(Binder::plain(FnSig { inputs, output: t, is_unsafe: false, extern_c: false }));
+        let fp = self.body.tys.intern(TyKind::FnPtr(sig));
+        let l = self.temp(fp);
+        self.assign(Place::local(l), Rvalue::FnValue(key.init, fp), span);
+        Operand::Copy(Place::local(l))
+    }
+}
+
+/// The body with every key method call expanded, or None when it has
+/// none (the common case: no copy is made).
+pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, String> {
+    let has = body.blocks.iter().any(|b| matches!(b.term, Terminator::Call { target: CallTarget::Builtin(x), .. } if is_key_method(x)));
+    if !has {
+        return Ok(None);
+    }
+    let copy = Body {
+        fn_id: body.fn_id,
+        tys: body.tys.clone(),
+        locals: body.locals.clone(),
+        blocks: body.blocks.clone(),
+        arg_count: body.arg_count,
+        reads: Default::default(),
+        lower_errs: Vec::new(),
+        annotations: Vec::new(),
+        promoted: Vec::new(),
+        index_exprs: Vec::new(),
+        false_edges: Vec::new(),
+        opaque_locals: Vec::new(),
+    };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default() };
+    for b in 0..ex.body.blocks.len() {
+        let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
+        if !is_key_method(x) {
+            continue;
+        }
+        let term = std::mem::replace(&mut ex.body.blocks[b].term, Terminator::Unreachable);
+        let Terminator::Call { args, dest, next, .. } = term else { unreachable!() };
+        ex.cur = Bb(b as u32);
+        ex.span = ex.body.blocks[b].term_span;
+        ex.method(x, args, dest)?;
+        ex.goto(next);
+    }
+    Ok(Some(ex.body))
+}
+
+struct Ex<'b, 'p, 'g> {
+    p: &'b Program<'p>,
+    body: Body<'g>,
+    cur: Bb,
+    span: Span,
+}
+
+impl Ex<'_, '_, '_> {
+    // ---------- IR building ----------
+
+    fn local(&mut self, ty: Ty) -> Local {
+        self.body.locals.push(LocalDecl { ty, mutable: true, name: None });
+        self.body.locals.len() as Local - 1
+    }
+    fn block(&mut self) -> Bb {
+        self.body.blocks.push(BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: self.span });
+        Bb(self.body.blocks.len() as u32 - 1)
+    }
+    fn assign(&mut self, pl: Place, rv: Rvalue) {
+        let span = self.span;
+        self.body.blocks[self.cur.0 as usize].stmts.push(Stmt { kind: StmtKind::Assign(pl, rv), span });
+    }
+    fn drop_local(&mut self, l: Local) {
+        let span = self.span;
+        self.body.blocks[self.cur.0 as usize].stmts.push(Stmt { kind: StmtKind::Drop(l), span });
+    }
+    fn term(&mut self, t: Terminator) {
+        let b = &mut self.body.blocks[self.cur.0 as usize];
+        b.term = t;
+        b.term_span = self.span;
+    }
+    fn goto(&mut self, b: Bb) {
+        self.term(Terminator::Goto(b));
+    }
+    /// Ends the current block with a call and continues after it.
+    fn call(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place) {
+        let next = self.block();
+        self.term(Terminator::Call { target, args, dest, next, unwind: None });
+        self.cur = next;
+    }
+    /// The type of an operand. Every operand of a key method call is a
+    /// place (a closure, a captured closure's env field, a temporary).
+    fn op_ty(&mut self, o: &Operand) -> Result<Ty, String> {
+        match o {
+            Operand::Copy(pl) | Operand::Move(pl) => self.place_ty(pl),
+            Operand::Const(_) => Err("thread_local expansion: a constant operand".into()),
+        }
+    }
+
+    /// The type of a place: its local's type through the projections
+    /// lowering makes for operands and destinations (derefs, fields of
+    /// tuples, closures, Adts, and enum variants).
+    fn place_ty(&mut self, pl: &Place) -> Result<Ty, String> {
+        let mut t = self.body.locals[pl.local as usize].ty;
+        let mut variant: Option<u32> = None;
+        for pr in &pl.proj {
+            let tys = &mut self.body.tys;
+            t = match *pr {
+                Proj::Deref => match tys.kind(t) {
+                    TyKind::Ref(_, _, i) => i,
+                    _ => tys.smart_elem(t).ok_or("thread_local expansion: deref of a non-pointer place")?,
+                },
+                Proj::Downcast(v) => {
+                    variant = Some(v);
+                    continue;
+                }
+                Proj::Field(i) => {
+                    let v = variant.take();
+                    if let Some(e) = tys.option_elem(t) {
+                        e
+                    } else if let Some((a, b)) = tys.result_args(t) {
+                        if v == Some(1) { b } else { a }
+                    } else if let TyKind::Tuple(ts) = tys.kind(t) {
+                        tys.tys_of(ts)[i as usize]
+                    } else if let TyKind::Closure(_, a) = tys.kind(t) {
+                        crate::check::collect::closure_fields(tys, a)[i as usize]
+                    } else if let Some(a) = tys.local_adt(t) {
+                        self.p.adt(a).variants[v.unwrap_or(0) as usize].fields[i as usize].ty
+                    } else {
+                        return Err("thread_local expansion: field of an unknown place type".into());
+                    }
+                }
+                Proj::Index(_) => match tys.kind(t) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => e,
+                    _ => tys.vec_elem(t).ok_or("thread_local expansion: index of a non-sequence place")?,
+                },
+            };
+        }
+        Ok(t)
+    }
+    /// Moves an operand into a fresh local of its own.
+    fn own(&mut self, o: Operand) -> Result<(Local, Ty), String> {
+        let ty = self.op_ty(&o)?;
+        let l = self.local(ty);
+        self.assign(Place::local(l), Rvalue::Use(o));
+        Ok((l, ty))
+    }
+
+    // ---------- Key access ----------
+
+    /// `&T` of the key's value into a fresh local: the runtime access
+    /// (which runs the init fn on the thread's first access), then
+    /// Rust's AccessError panic when the value is destroyed. With
+    /// `on_none`, the destroyed case runs it instead of the panic and
+    /// goes on at the returned join block.
+    fn access(&mut self, key: &Operand, init: &Operand, t: Ty, on_none: Option<&mut dyn FnMut(&mut Self) -> R>) -> Result<(Local, Option<Bb>), String> {
+        let rt = self.body.tys.mk_ref(false, t);
+        let ot = self.body.tys.mk_option(rt);
+        let o = self.local(ot);
+        self.call(CallTarget::Builtin(Builtin::TlsAccess), vec![key.clone(), init.clone()], Place::local(o));
+        let d = self.local(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(Place::local(o)));
+        let (some, none) = (self.block(), self.block());
+        self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, some)], none));
+        self.cur = none;
+        let join = match on_none {
+            Some(k) => {
+                k(self)?;
+                let j = self.block();
+                self.goto(j);
+                Some(j)
+            }
+            None => {
+                self.term(Terminator::Panic(vec![FmtPart::Lit(ACCESS_PANIC.into())]));
+                None
+            }
+        };
+        self.cur = some;
+        let r = self.local(rt);
+        self.assign(Place::local(r), Rvalue::Use(Operand::Copy(Place::local(o).project(Proj::Downcast(1)).project(Proj::Field(0)))));
+        Ok((r, join))
+    }
+
+    /// `dest = f(args..)` through `FnOnce` for the callable in local
+    /// `f`: a closure by its own kind (an `Fn` or `FnMut` closure goes by
+    /// reference and drops after the call, as `call_once` does), a fn
+    /// item, or a fn pointer.
+    fn call_once(&mut self, f: Local, fty: Ty, args: Vec<Operand>, dest: Place) -> R {
+        match self.body.tys.kind(fty) {
+            TyKind::Closure(def, _) => {
+                let entry = self.p.gx.closures.get(&def).ok_or("thread_local expansion: closure body not registered")?;
+                let (body_fn, kind) = (entry.body_fn, entry.kind);
+                let env = match kind {
+                    ClosureKind::FnOnce => Operand::Move(Place::local(f)),
+                    ClosureKind::Fn | ClosureKind::FnMut => {
+                        let m = kind == ClosureKind::FnMut;
+                        let rt = self.body.tys.mk_ref(m, fty);
+                        let r = self.local(rt);
+                        self.assign(Place::local(r), Rvalue::Ref(m, Place::local(f)));
+                        Operand::Move(Place::local(r))
+                    }
+                };
+                let mut ops = vec![env];
+                ops.extend(args);
+                self.call(CallTarget::Fn(body_fn), ops, dest);
+                if kind != ClosureKind::FnOnce && needs_drop(self.p, &self.body.tys, fty) {
+                    self.drop_local(f);
+                }
+                Ok(())
+            }
+            TyKind::FnPtr(_) => {
+                self.call(CallTarget::Indirect(f), args, dest);
+                Ok(())
+            }
+            TyKind::FnDef(def, _) => {
+                let local = self.p.local_def(def.hash).ok_or("thread_local expansion: fn item outside this crate")?;
+                self.call(CallTarget::Fn(local), args, dest);
+                Ok(())
+            }
+            _ => Err("thread_local expansion: the callable is not a closure or fn".into()),
+        }
+    }
+
+    // ---------- Methods ----------
+
+    /// One key method call: `args` are the key reference, the method's
+    /// own arguments, then the init fn (see `Lower::tls_init_operand`).
+    fn method(&mut self, b: Builtin, mut args: Vec<Operand>, dest: Place) -> R {
+        use Builtin as B;
+        let init = args.pop().ok_or("thread_local expansion: missing init fn")?;
+        let key = args.first().cloned().ok_or("thread_local expansion: missing key")?;
+        let init_ty = self.op_ty(&init)?;
+        let TyKind::FnPtr(sig) = self.body.tys.kind(init_ty) else { return Err("thread_local expansion: init is not a fn pointer".into()) };
+        let t = self.body.tys.sig(sig).value.output;
+        match b {
+            B::TlsWith => {
+                let (f, fty) = self.own(args.get(1).cloned().ok_or("thread_local expansion: missing closure")?)?;
+                let (r, _) = self.access(&key, &init, t, None)?;
+                self.call_once(f, fty, vec![Operand::Copy(Place::local(r))], dest)
+            }
+            B::TlsTryWith => {
+                let dest_ty = self.place_ty(&dest)?;
+                let (rt, _) = self.body.tys.result_args(dest_ty).ok_or("thread_local expansion: try_with result")?;
+                let (f, fty) = self.own(args.get(1).cloned().ok_or("thread_local expansion: missing closure")?)?;
+                let drop_f = needs_drop(self.p, &self.body.tys, fty);
+                let err_dest = dest.clone();
+                let mut on_none = |this: &mut Self| -> R {
+                    // `try_with` returns before calling `f`, which drops.
+                    if drop_f {
+                        this.drop_local(f);
+                    }
+                    this.assign(err_dest.clone(), Rvalue::Res(dest_ty, false, Operand::Const(Const::Unit)));
+                    Ok(())
+                };
+                let (r, join) = self.access(&key, &init, t, Some(&mut on_none))?;
+                let out = self.local(rt);
+                self.call_once(f, fty, vec![Operand::Copy(Place::local(r))], Place::local(out))?;
+                self.assign(dest, Rvalue::Res(dest_ty, true, Operand::Move(Place::local(out))));
+                let join = join.expect("try_with has a join block");
+                self.goto(join);
+                self.cur = join;
+                Ok(())
+            }
+            _ => Err(format!("thread_local expansion: `{b:?}` is not supported yet")),
+        }
+    }
+
+}

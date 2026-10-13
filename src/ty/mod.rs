@@ -605,6 +605,10 @@ pub struct BuiltinDefs {
     /// The `std::sync` and `std::thread` types, by `SyncTy` index
     /// (ty/sync.rs, W-THREADS).
     pub sync_tys: [DefId; sync::SyncTy::ALL.len()],
+    /// `std::thread::LocalKey` and `std::thread::AccessError`
+    /// (thread_local!, check/tls.rs).
+    pub local_key: DefId,
+    pub access_error: DefId,
 }
 
 impl BuiltinDefs {
@@ -646,6 +650,10 @@ impl BuiltinDefs {
             Some(BuiltinTy::Sync(sync::SyncTy::ALL[i]))
         } else if def.krate != BUILTIN_CRATE {
             None
+        } else if def == self.local_key {
+            Some(BuiltinTy::LocalKey)
+        } else if def == self.access_error {
+            Some(BuiltinTy::AccessError)
         } else {
             self.iters.iter().position(|&d| d == def).map(|i| BuiltinTy::Iter(iter::IterKind::ALL[i]))
         }
@@ -679,6 +687,10 @@ pub enum BuiltinTy {
     ExitCode,
     /// A `std::sync` or `std::thread` type (ty/sync.rs).
     Sync(sync::SyncTy),
+    /// `std::thread::LocalKey<T>`, the type of a `thread_local!` static.
+    LocalKey,
+    /// `std::thread::AccessError`, `LocalKey::try_with`'s error.
+    AccessError,
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -880,6 +892,22 @@ pub trait TyIntern {
     /// The pointee type of a `Box<T>`, an `Rc<T>`, or a `RefCell`
     /// guard (`Ref<T>`, `RefMut<T>`): the smart pointers method calls,
     /// fields, and coercions deref through.
+    /// The value type `T` of a `LocalKey<T>`.
+    fn local_key_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::LocalKey)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// `LocalKey<elem>` as an Adt application of the builtin def.
+    fn mk_local_key(&mut self, elem: Ty) -> Ty {
+        let def = self.builtins().local_key;
+        self.mk_adt(def, &[GenericArg::Ty(elem)])
+    }
+    /// `std::thread::AccessError`.
+    fn access_error_ty(&mut self) -> Ty {
+        let def = self.builtins().access_error;
+        self.mk_adt(def, &[])
+    }
+    /// The pointee type of a `Box<T>` or an `Rc<T>`: the smart
+    /// pointers method calls, fields, and coercions deref through.
     fn smart_elem(&self, t: Ty) -> Option<Ty> {
         self.boxed_elem(t).or_else(|| self.rc_elem(t)).or_else(|| self.guard_elem(t).map(|g| g.0))
     }
@@ -1120,6 +1148,8 @@ impl GlobalTys {
             ref_mut_guard: builtin_def(&["core", "cell"], "RefMut"),
             exit_code: builtin_def(&["std", "process"], "ExitCode"),
             sync_tys: sync::SyncTy::ALL.map(sync::sync_def),
+            local_key: builtin_def(&["std", "thread"], "LocalKey"),
+            access_error: builtin_def(&["std", "thread"], "AccessError"),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

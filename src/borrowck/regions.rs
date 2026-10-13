@@ -506,6 +506,11 @@ impl AdtTables {
             ) => return (Variance::Co, DropMode::Owned),
             // `fmt` types (W-STD-B) and `ExitCode` take no type args.
             Some(BuiltinTy::Fmt(_) | BuiltinTy::ExitCode) => return (Variance::Inv, DropMode::Owned),
+            // `LocalKey<T>` holds an `fn` that returns `*const T`:
+            // covariant, and it never drops a `T`; `AccessError` takes no
+            // type args (W-TLS).
+            Some(BuiltinTy::LocalKey) => return (Variance::Co, DropMode::None),
+            Some(BuiltinTy::AccessError) => return (Variance::Inv, DropMode::Owned),
             // `RefMut<'b, T>` acts as `&'b mut T`, `Ref<'b, T>` as `&'b T`;
             // neither drops the `T` (W-STD-A).
             Some(BuiltinTy::RefMutGuard) => return (Variance::Inv, DropMode::None),

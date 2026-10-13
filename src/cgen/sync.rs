@@ -138,6 +138,7 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             Glue::Display => (format!("int disp_{m}(lust_Formatter *f, {ct} *p)"), format!("disp_{rm}(f, p)")),
             Glue::Default => (format!("{ct} default_{m}(void)"), format!("default_{rm}()")),
             Glue::Drop | Glue::Clone => unreachable!("Arc's own drop and clone"),
+            Glue::TlsInit | Glue::TlsDtor => unreachable!("TLS glue is per thread_local! key"),
         };
         let _ = writeln!(protos, "{proto};");
         let _ = writeln!(defs, "{proto} {{\n  return {call};\n}}\n");

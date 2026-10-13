@@ -9,6 +9,7 @@ use crate::ty::*;
 mod any;
 mod closure;
 pub mod iter;
+pub mod tls;
 
 struct LoopInfo {
     break_bb: Bb,
@@ -2796,6 +2797,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                     ops.extend(arg_ops);
                 }
             }
+        }
+        // A `LocalKey` method also takes its static's init fn (lower/tls.rs).
+        if let Callee::Builtin(b) = callee
+            && tls::is_key_method(b)
+        {
+            let init = self.tls_init_operand(recv, span);
+            ops.push(init);
         }
         let target = match callee {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),

@@ -120,6 +120,14 @@ pub enum Glue {
     Default,
     /// Display of a type with a user `impl Display` (cgen/fmt.rs).
     Display,
+    /// The slow path of a `thread_local!` access, keyed by the cell
+    /// type `(u8, T)` (state byte, value; runtime/thread.c):
+    /// `C *tlsinit_C(C *c, void *init)` makes the value with `init` (an
+    /// `fn() -> T` pointer) and returns the cell, or NULL once destroyed.
+    TlsInit,
+    /// `void tlsdtor_C(void *c)`: a cell's thread-exit destructor (state
+    /// destroyed, then the value's drop), keyed like `TlsInit`.
+    TlsDtor,
 }
 
 /// Maps a semantic type to its body-independent C form. Builtin Adts reach this
@@ -186,6 +194,10 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::RefGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), false),
             Some(BuiltinTy::RefMutGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), true),
             Some(BuiltinTy::Sync(k)) => CTy::Sync(k, Box::new(tys.adt_first_ty_arg(t).map_or(CTy::Unit, |e| cty(tys, e)))),
+            // A `thread_local!` key is its slot word (runtime/thread.c);
+            // `AccessError` is a unit struct.
+            Some(BuiltinTy::LocalKey) => CTy::Int(IntTy::U64),
+            Some(BuiltinTy::AccessError) => CTy::Unit,
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -1196,6 +1208,17 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     if !has_generated_body(p, body.fn_id) {
         return FnOut { error: Some(no_body_error(p, body, body.fn_id)), ..Default::default() };
     }
+    // `LocalKey` calls become plain IR first (lower/tls.rs); their
+    // closures never hold iterator builtins the next step would miss.
+    let tls_expanded;
+    let body = match crate::lower::tls::expand(p, body) {
+        Ok(Some(b)) => {
+            tls_expanded = b;
+            &tls_expanded
+        }
+        Ok(None) => body,
+        Err(e) => return FnOut { error: Some(e), ..Default::default() },
+    };
     // Iterator builtins become plain IR first (W-STD-A, lower/iter.rs).
     let expanded;
     let body = match crate::lower::iter::expand(p, body) {
@@ -3283,6 +3306,10 @@ impl FnGen<'_, '_, '_> {
                 format!("&(*{v})->v")
             }
             B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
+            B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut | B::TlsSet | B::TlsGet | B::TlsTake | B::TlsReplace => {
+                unreachable!("lower/tls.rs expands LocalKey calls before codegen")
+            }
+            B::TlsAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys),
             B::RcTryUnwrap => {
                 let elem = match &tys[0] { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(CTy::Rc(Box::new(elem.clone()))));
@@ -5156,6 +5183,7 @@ fn runtime_source(with_impls: bool) -> String {
     src.push_str(h);
     src.push_str(core);
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
+    let src = src.replacen("#include \"thread.c\"\n", include_str!("runtime/thread.c"), 1);
     let src = src.replacen("#include \"float.h\"", &header, 1);
     let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
     let src = src.replacen("#include \"sort.h\"", include_str!("runtime/sort.h"), 1);
@@ -5316,7 +5344,7 @@ pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usi
     }
     let _ = writeln!(
         c,
-        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  lust_flush();\n  return 0;\n}}"
+        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); lust_tls_exit(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  lust_tls_exit();\n  lust_flush();\n  return 0;\n}}"
     );
     c
 }
@@ -6878,6 +6906,7 @@ fn glue_def(
             }
             let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{body}}}\n");
         }
+        Glue::TlsInit | Glue::TlsDtor => tls_glue(p, g, t, protos, defs, &mut need),
         Glue::Debug => {
             let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
             let body = fmt::debug_glue_body(p, t, slots, &mut need, types);
@@ -7276,5 +7305,93 @@ mod tests {
                 term_span: span,
             },
         ];
+    }
+}
+
+/// The `(u8, T)` cell of a `thread_local!` value of C type `t`: the
+/// state byte (0 initial, 1 alive, 2 destroyed) and the value.
+fn tls_cell(t: &CTy) -> CTy {
+    CTy::Tuple(vec![CTy::Int(IntTy::U8), t.clone()])
+}
+
+/// The `TlsInit` and `TlsDtor` glue of the cell type `c` (see `Glue`).
+/// Rust's `LazyStorage` order: a value made while the init fn ran (a
+/// recursive access) is replaced and dropped; else the cell turns alive
+/// and a value that needs drop registers its destructor.
+fn tls_glue(p: &Program, g: &Glue, c: &CTy, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+    let CTy::Tuple(parts) = c else { unreachable!("tls glue keys on the cell tuple") };
+    let t = &parts[1];
+    let (m, ct, vt) = (mangle(c), ctype(c), ctype(t));
+    let drops = needs_drop_c(p, t);
+    if drops {
+        need(Glue::Drop, t);
+    }
+    if *g == Glue::TlsDtor {
+        let _ = writeln!(protos, "void tlsdtor_{m}(void *p);");
+        let drop = if drops { format!("drop_{}(&c->f1); ", mangle(t)) } else { String::new() };
+        let _ = writeln!(defs, "void tlsdtor_{m}(void *p) {{
+  {ct} *c = ({ct} *)p;
+  if (c->f0 == 1) {{ c->f0 = 2; {drop}}}
+}}
+");
+        return;
+    }
+    let _ = writeln!(protos, "{ct} *tlsinit_{m}({ct} *c, void *init);");
+    let make = if c_size_align(p, t).0 > 32 { format!("((void (*)({vt} *))init)(&v);") } else { format!("v = (({vt} (*)(void))init)();") };
+    let (replace, register) = if drops {
+        need(Glue::TlsDtor, c);
+        (format!(" {vt} old = c->f1; c->f1 = v; drop_{}(&old); ", mangle(t)), format!(" lust_tls_register(c, tlsdtor_{m});"))
+    } else {
+        (" c->f1 = v; ".to_string(), String::new())
+    };
+    let _ = writeln!(
+        defs,
+        "{ct} *tlsinit_{m}({ct} *c, void *init) {{\n  if (c->f0 == 2) return 0;\n  {vt} v; {make}\n  if (c->f0 == 1) {{{replace}}}\n  else {{ c->f1 = v; c->f0 = 1;{register} }}\n  return c;\n}}\n"
+    );
+}
+
+impl FnGen<'_, '_, '_> {
+    /// `TlsAccess(key, init) -> Option<&T>` and `TlsInitWith(key, value)
+    /// -> Option<T>` (lower/tls.rs), over the runtime's per-thread cells.
+    fn tls_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy]) -> String {
+        let t = match b {
+            Builtin::TlsAccess => match &tys[1] {
+                CTy::FnPtr(_, r) => (**r).clone(),
+                _ => unreachable!("TlsAccess takes the init fn pointer"),
+            },
+            _ => tys[1].clone(),
+        };
+        let cell = tls_cell(&t);
+        collect_types(&cell, &mut self.sig_types);
+        let (m, ct) = (mangle(&cell), ctype(&cell));
+        let c = self.tmp();
+        let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)lust_tls_cell((uint64_t *){}, sizeof({ct}), _Alignof({ct}));", vals[0]);
+        if b == Builtin::TlsAccess {
+            self.want(Glue::TlsInit, &cell);
+            let _ = writeln!(self.out, "    if ({c}->f0 != 1) {c} = tlsinit_{m}({c}, (void *){});", vals[1]);
+            let opt = CTy::Option(Box::new(CTy::Ref(Box::new(t))));
+            collect_types(&opt, &mut self.sig_types);
+            let (some, none) = (self.make_variant(&opt, 1, &[format!("&{c}->f1")]), self.make_variant(&opt, 0, &[]));
+            return format!("({c} ? {some} : {none})");
+        }
+        let opt = CTy::Option(Box::new(t.clone()));
+        collect_types(&opt, &mut self.sig_types);
+        let (r, v) = (self.tmp(), self.tmp());
+        let register = if needs_drop_c(self.p, &t) {
+            self.want(Glue::TlsDtor, &cell);
+            format!(" lust_tls_register({c}, tlsdtor_{m});")
+        } else {
+            String::new()
+        };
+        let none = self.make_variant(&opt, 0, &[]);
+        let some = self.make_variant(&opt, 1, std::slice::from_ref(&v));
+        let _ = writeln!(
+            self.out,
+            "    {} {v} = {}; {} {r}; if ({c}->f0 == 0) {{ {c}->f1 = {v}; {c}->f0 = 1;{register} {r} = {none}; }} else {r} = {some};",
+            ctype(&t),
+            vals[1],
+            ctype(&opt)
+        );
+        r
     }
 }

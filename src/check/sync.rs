@@ -704,8 +704,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// A fresh closure-argument type with the pending obligations of
-    /// `F: FnOnce(inputs..) -> output`.
-    fn fn_once_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+    /// `F: FnOnce(inputs..) -> output` (also `LocalKey::with`, check/tls.rs).
+    pub(super) fn fn_once_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
         let f = self.new_var(false);
         let lang = self.p.gx.lang;
         let ts = self.tys.intern_tys(inputs);
@@ -1165,7 +1165,8 @@ pub fn builtin_auto(
         if unknown { None } else { Some(true) }
     };
     Some(match b {
-        B::String | B::Chars | B::ExitCode => Some(true),
+        // `LocalKey` holds a fn pointer; `AccessError` is a unit struct.
+        B::String | B::Chars | B::ExitCode | B::LocalKey | B::AccessError => Some(true),
         // `env::Args`, `Rc`, `rc::Weak`, the `RefCell` guards, and the
         // `fmt` types are neither `Send` nor `Sync`.
         B::Args | B::Rc | B::Weak | B::RefGuard | B::RefMutGuard | B::Fmt(_) => Some(false),
