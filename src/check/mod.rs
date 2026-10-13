@@ -452,6 +452,10 @@ pub enum Builtin {
     TlsGet,
     TlsTake,
     TlsReplace,
+    /// `KEY.try_with(Cell::get)` and `KEY.with(Rc::clone)`: a std fn
+    /// path as the callable (`KEY.with(Cell::get)` is `TlsGet`).
+    TlsTryGet,
+    TlsCloneRc,
     /// Only made by lower/tls.rs: `(key, init) -> Option<&T>`, the
     /// thread's value (made by `init` on the first access), or None
     /// once its destructor ran.

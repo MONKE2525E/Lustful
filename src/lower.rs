@@ -2710,6 +2710,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             None => self.ty(recv),
         };
         let recv_ty = self.peel(root_ty, derefs);
+        // `KEY.with(Cell::get)`: the std fn path is no operand (lower/tls.rs).
+        let args = match callee {
+            Callee::Builtin(b) if tls::takes_no_args(b) => &[][..],
+            _ => args,
+        };
         let mut ops = Vec::with_capacity(args.len() + 1);
         match autoref {
             Autoref::None => {

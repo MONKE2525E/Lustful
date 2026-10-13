@@ -3306,7 +3306,16 @@ impl FnGen<'_, '_, '_> {
                 format!("&(*{v})->v")
             }
             B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
-            B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut | B::TlsSet | B::TlsGet | B::TlsTake | B::TlsReplace => {
+            B::TlsWith
+            | B::TlsTryWith
+            | B::TlsWithBorrow
+            | B::TlsWithBorrowMut
+            | B::TlsSet
+            | B::TlsGet
+            | B::TlsTake
+            | B::TlsReplace
+            | B::TlsTryGet
+            | B::TlsCloneRc => {
                 unreachable!("lower/tls.rs expands LocalKey calls before codegen")
             }
             B::TlsAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys),

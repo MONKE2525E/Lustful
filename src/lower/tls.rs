@@ -29,7 +29,26 @@ const ACCESS_PANIC: &str = "cannot access a Thread Local Storage value during or
 /// operand, and `expand` rewrites them.
 pub fn is_key_method(b: Builtin) -> bool {
     use Builtin as B;
-    matches!(b, B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut | B::TlsSet | B::TlsGet | B::TlsTake | B::TlsReplace)
+    matches!(
+        b,
+        B::TlsWith
+            | B::TlsTryWith
+            | B::TlsWithBorrow
+            | B::TlsWithBorrowMut
+            | B::TlsSet
+            | B::TlsGet
+            | B::TlsTake
+            | B::TlsReplace
+            | B::TlsTryGet
+            | B::TlsCloneRc
+    )
+}
+
+/// The key methods that take no operand of their own, even when written
+/// with a std fn path argument (`KEY.with(Cell::get)` is `TlsGet`):
+/// lowering skips their arguments.
+pub fn takes_no_args(b: Builtin) -> bool {
+    matches!(b, Builtin::TlsGet | Builtin::TlsTryGet | Builtin::TlsCloneRc | Builtin::TlsTake)
 }
 
 impl Lower<'_, '_> {
@@ -321,6 +340,30 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(ur), Rvalue::Ref(m, Place::local(g).deref()));
                 self.call_once(f, fty, vec![Operand::Move(Place::local(ur))], dest)?;
                 self.drop_local(g);
+                Ok(())
+            }
+            B::TlsTryGet => {
+                // `try_with(Cell::get)`: Ok(the copy), or Err once destroyed.
+                let dest_ty = self.place_ty(&dest)?;
+                let (u, _) = self.body.tys.result_args(dest_ty).ok_or("thread_local expansion: try_with result")?;
+                let err_dest = dest.clone();
+                let mut on_none = |this: &mut Self| -> R {
+                    this.assign(err_dest.clone(), Rvalue::Res(dest_ty, false, Operand::Const(Const::Unit)));
+                    Ok(())
+                };
+                let (r, join) = self.access(&key, &init, t, Some(&mut on_none))?;
+                let out = self.local(u);
+                self.call(CallTarget::Builtin(B::CellGet), vec![Operand::Copy(Place::local(r))], Place::local(out));
+                self.assign(dest, Rvalue::Res(dest_ty, true, Operand::Move(Place::local(out))));
+                let join = join.expect("try_with has a join block");
+                self.goto(join);
+                self.cur = join;
+                Ok(())
+            }
+            B::TlsCloneRc => {
+                // `with(Rc::clone)`: a new strong reference.
+                let (r, _) = self.access(&key, &init, t, None)?;
+                self.call(CallTarget::Builtin(B::Clone), vec![Operand::Copy(Place::local(r))], dest);
                 Ok(())
             }
             B::TlsGet | B::TlsTake | B::TlsReplace => {

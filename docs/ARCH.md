@@ -3415,8 +3415,11 @@ INVENTORY Q2
   `OUT_DIR`) plus the daemon's environment snapshot at
   session start. The read keys enter the cache key.
   Reading live env per request breaks cache soundness.
-- `thread_local!` (73) desugars to a `Static` def of
-  std `LocalKey<T>` plus an init fn (7.3).
+- `thread_local!` (73) desugars to a static marked
+  `#[thread_local!]` (collect types it `LocalKey<T>`)
+  plus an init fn `NAME#init`. Both spellings are
+  unlexable, so the expansion needs no `unsafe` and no
+  user code can name them (7.3).
 - `debug_assert!` compiles to nothing when
   `debug_assertions` cfg is off. Dev default on.
 - `vec![x; n]` with non-`Copy` `x` clones per element,
@@ -3698,17 +3701,30 @@ path: no checks, `catch_unwind` rejected there.
   removing DESIGN's old "no spawn in generic code"
   limit, which ts-rust violates
   (`GoThread::spawn<F, T>` at gopanic.rs:249).
-- TLS: pthread keys only. No C `_Thread_local` or
-  `__thread` in generated code or the runtime (7.2: tcc
-  breaks TLS in shared objects). One pthread key per
-  `thread_local!` static, plus one for panic state.
-  Lazy init on first `with`, destructor drops the
-  value at thread exit in unspecified order (Rust
-  makes the same weak promise). `LocalKey::with` and
-  `try_with` in source. A TLS destructor that panics
-  aborts. Re-entrant init gives Rust's behavior
-  (panic on recursive access during init for
-  non-const init). 73 `thread_local!` uses, including
+- TLS (W-TLS, `runtime/thread.c`): pthread keys only.
+  No C `_Thread_local` or `__thread` in generated code
+  or the runtime (7.2: tcc breaks TLS in shared
+  objects). One pthread key holds each thread's block:
+  a cell per `thread_local!` static the thread touched
+  (found by the static's slot word, set at its first
+  access from any thread) and the destructor list. Not
+  one key per static: glibc clears a key's value before
+  its destructor runs, and Rust's order is newest
+  registration first (glibc `__cxa_thread_atexit_impl`,
+  which std uses on Linux). A value that needs drop
+  registers at its first access, a `const` one too.
+  Destructors run at thread exit from the key's
+  destructor, and for the main thread after `main`
+  returns and in `process::exit` (glibc's `exit()` runs
+  them for Rust std), before stdout is flushed. After
+  its destructor a key is destroyed: `with` panics with
+  Rust's AccessError text, `try_with` is `Err`. A
+  recursive lazy init makes the inner value, then the
+  outer value replaces and drops it (Rust 1.99
+  `LazyStorage`, no panic). `LocalKey` is a builtin type
+  with builtin methods (`check/tls.rs`, `lower/tls.rs`)
+  until generic source std lands. A TLS destructor that
+  panics aborts. 73 `thread_local!` uses, including
   per-thread leaked arenas (3.6).
 - Atomics: types in source over C11 `stdatomic.h`
   intrinsics (3.2). Widths: bool, 8 to 64-bit ints,

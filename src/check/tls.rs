@@ -92,6 +92,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let t = self.resolve(t);
         use Builtin as B;
+        if let Some(found) = self.tls_path_callable(&n, t, args, span) {
+            let (b, ret) = found;
+            self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+            return Some(ret);
+        }
         let (b, params, ret) = match n.as_str() {
             "with" | "try_with" => {
                 let r = self.new_var(false);
@@ -139,6 +144,51 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
         self.check_args(&params, args, span);
         Some(ret)
+    }
+
+    /// `KEY.with(Cell::get)`, `KEY.try_with(Cell::get)`, and
+    /// `KEY.with(Rc::clone)`: a std fn path as the callable (lust has no
+    /// fn item type for builtin methods). The path must name std's type:
+    /// a std path, or a bare name no user type shadows (the resolver
+    /// checks its import). Lowering gives the path no operand.
+    fn tls_path_callable(&mut self, n: &str, t: Ty, args: &[ExprId], span: Span) -> Option<(Builtin, Ty)> {
+        let [a] = args else { return None };
+        let ast::Expr::Path(segs) = self.p.ast.expr(*a) else { return None };
+        let names: Vec<&str> = segs.iter().map(|s| self.p.interner.get(s.name)).collect();
+        let (ty, item, prefix) = match names.as_slice() {
+            [ty, item] => (*ty, *item, None),
+            [k, m, ty, item] => (*ty, *item, Some((*k, *m))),
+            _ => return None,
+        };
+        if segs.iter().any(|s| !s.type_args().is_empty()) {
+            return None;
+        }
+        let ty_sym = segs[segs.len() - 2].name;
+        let std_named = |module: &str| match prefix {
+            None => !self.p.type_names.contains_key(&ty_sym),
+            Some((k, m)) => matches!(k, "std" | "core" | "alloc") && m == module,
+        };
+        use Builtin as B;
+        let found = match (n, ty, item) {
+            ("with" | "try_with", "Cell", "get") if std_named("cell") => {
+                let u = self.tys.cell_elem(t)?;
+                self.deferred_copy.push((u, span));
+                if n == "with" {
+                    (B::TlsGet, u)
+                } else {
+                    let ae = self.tys.access_error_ty();
+                    (B::TlsTryGet, self.tys.mk_result(u, ae))
+                }
+            }
+            ("with", "Rc", "clone") if std_named("rc") => {
+                self.tys.rc_elem(t)?;
+                (B::TlsCloneRc, t)
+            }
+            _ => return None,
+        };
+        let i = self.ei(*a);
+        self.out.expr_ty[i] = UNIT;
+        Some(found)
     }
 
     /// The `const { .. }` form of `thread_local!`: rustc makes its block
