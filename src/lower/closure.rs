@@ -57,6 +57,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         mut_index: 0,
         drop_ty: Default::default(),
         upvars: None,
+        guard_places: Vec::new(),
     };
     let Some(info) = info.filter(|_| !poisoned) else {
         // The parent failed to check and reports why; keep the shape
@@ -69,6 +70,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
     let Expr::Closure { params, body: body_expr, .. } = p.ast.expr(info.expr) else { unreachable!("closure info names a closure") };
     lw.new_local(info.output, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
+    lw.guard_places = vec![None; lw.ck.locals.len()];
     let env_ty = match info.kind {
         ClosureKind::Fn => lw.body.tys.mk_ref(false, info.ty),
         ClosureKind::FnMut => lw.body.tys.mk_ref(true, info.ty),
