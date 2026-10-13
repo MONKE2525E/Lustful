@@ -26,6 +26,9 @@ struct Lower<'p, 'a> {
     local_map: Vec<Local>,
     /// Depth of mutable place evaluation (see `place_for_mut`).
     mut_index: u32,
+    /// `needs_drop` answers per body type: every scope exit asks for each of
+    /// its locals, and the answer walks Adt fields.
+    drop_ty: crate::intern::FxMap<Ty, bool>,
 }
 
 /// Lowers one checked function body to IR.
@@ -37,7 +40,17 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     let reads = std::mem::take(&mut ck.reads);
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
     let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads };
-    let mut lw = Lower { p, ck, body, cur: Bb(0), scopes: vec![Vec::new()], loops: Vec::new(), local_map: Vec::new(), mut_index: 0 };
+    let mut lw = Lower {
+        p,
+        ck,
+        body,
+        cur: Bb(0),
+        scopes: vec![Vec::new()],
+        loops: Vec::new(),
+        local_map: Vec::new(),
+        mut_index: 0,
+        drop_ty: Default::default(),
+    };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
     for i in 0..lw.ck.param_locals.len() {
@@ -163,7 +176,16 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
     fn emit_drops(&mut self, locals: &[Local], span: Span) {
         for &l in locals.iter().rev() {
-            if needs_drop(self.p, &self.body.tys, self.body.locals[l as usize].ty) {
+            let ty = self.body.locals[l as usize].ty;
+            let drops = match self.drop_ty.get(&ty) {
+                Some(&d) => d,
+                None => {
+                    let d = needs_drop(self.p, &self.body.tys, ty);
+                    self.drop_ty.insert(ty, d);
+                    d
+                }
+            };
+            if drops {
                 self.push(StmtKind::Drop(l), span);
             }
             self.push(StmtKind::StorageDead(l), span);
