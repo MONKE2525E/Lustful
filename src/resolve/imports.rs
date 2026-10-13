@@ -382,13 +382,21 @@ impl ResolvedTables {
         if self.vis_within(&imp.vis, imp.module, &item_vis, item_module, interner) {
             return true;
         }
-        diags.push(Diag::new(
-            "L0510",
-            imp.span,
-            format!("`{name}` is private, and cannot be re-exported"),
-            "Make the item `pub`, or lower the visibility of the `use` to match.",
-        ));
+        diags.push(reexport_diag(name, imp.span));
         false
+    }
+
+    /// The visibility a glob import gives one name, as rustc does: the
+    /// `use` visibility when the source binding reaches at least as far,
+    /// else the source binding's own narrower visibility at its own
+    /// module. So `pub use inner::*` of a `pub(super)` item binds it as
+    /// that `pub(super)`, not as `pub`.
+    fn glob_vis(&self, imp: &Import, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (VisKind, ModuleId) {
+        if self.vis_within(&imp.vis, imp.module, vis, def_module, interner) {
+            (imp.vis.clone(), imp.module)
+        } else {
+            (vis.clone(), def_module)
+        }
     }
 
     /// Resolves a `pub(in path)` path, written relative to the defining
@@ -1272,8 +1280,13 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 // `use a::E::*` imports the enum's variants.
                 PathRes::Done(Target::Def(adt)) if tables.variants.contains_key(&adt) => {
                     let mut changed = false;
+                    // Variants take the enum's visibility.
+                    let (vis, def_module) = match tables.def_info.get(&adt) {
+                        Some(info) => tables.glob_vis(imp, &info.vis, info.module, interner),
+                        None => (imp.vis.clone(), imp.module),
+                    };
                     for v in tables.variants[&adt].clone() {
-                        let bind = Bind { target: Target::Variant(adt, v), vis: imp.vis.clone(), rank: 1, def_module: imp.module };
+                        let bind = Bind { target: Target::Variant(adt, v), vis: vis.clone(), rank: 1, def_module };
                         if tables.insert(imp.module, Namespace::Value, v, bind) == InsertOut::Changed {
                             changed = true;
                         }
@@ -1295,11 +1308,8 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 if let BindState::One(b) = state
                                     && tables.visible(&b.vis, b.def_module, imp.module, interner)
                                 {
-                                    entries.push((
-                                        ns,
-                                        *name,
-                                        Bind { target: b.target, vis: imp.vis.clone(), rank: 1, def_module: imp.module },
-                                    ));
+                                    let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
+                                    entries.push((ns, *name, Bind { target: b.target, vis, rank: 1, def_module }));
                                 }
                             }
                         }
@@ -1497,6 +1507,10 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut any = false;
                     let mut changed = false;
                     let mut saw_private = false;
+                    // A re-export of an import binding reaches no further
+                    // than that binding (rustc E0364); `check_reexport`
+                    // below checks the item's own visibility.
+                    let mut narrower = false;
                     let mut found: Vec<(Namespace, Bind)> = Vec::new();
                     let mut alias_paths: Vec<Vec<Sym>> = Vec::new();
                     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
@@ -1504,6 +1518,11 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             Some(BindState::One(b)) => {
                                 if tables.visible(&b.vis, b.def_module, imp.module, interner) {
                                     any = true;
+                                    let is_macro = matches!(b.target, Target::Def(d) if tables.def_info.get(&d).is_some_and(|i| i.kind == ResKind::Macro));
+                                    narrower |= imp.vis != VisKind::Priv
+                                        && !is_macro
+                                        && !matches!(b.target, Target::Extern(_))
+                                        && !tables.vis_within(&imp.vis, imp.module, &b.vis, b.def_module, interner);
                                     found.push((ns, Bind { target: b.target, vis: imp.vis.clone(), rank: 2, def_module: imp.module }));
                                 } else {
                                     saw_private = true;
@@ -1552,6 +1571,10 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         if !tables.check_reexport(imp, bind.target, interner.get(last), interner, diags) {
                             return TryOut::Done(false);
                         }
+                    }
+                    if narrower {
+                        diags.push(reexport_diag(interner.get(last), imp.span));
+                        return TryOut::Done(false);
                     }
                     let mut dup_reported = false;
                     for (ns, bind) in found {
@@ -1680,6 +1703,17 @@ pub fn private_diag(name: &str, span: Span) -> Diag {
         span,
         format!("`{name}` is private"),
         "Make the item `pub(crate)` (the smallest widening that works), or add a public re-export.",
+    )
+}
+
+/// The L0510 diagnostic for a re-export that reaches further than the
+/// item or binding it re-exports (rustc E0364).
+fn reexport_diag(name: &str, span: Span) -> Diag {
+    Diag::new(
+        "L0510",
+        span,
+        format!("`{name}` is private, and cannot be re-exported"),
+        "Make the item `pub`, or lower the visibility of the `use` to match.",
     )
 }
 
