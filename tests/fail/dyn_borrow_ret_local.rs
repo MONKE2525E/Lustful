@@ -1,4 +1,4 @@
-// expect: L0306
+// expect: L0307
 // ARCH 2.8, rustc E0515: the returned `&dyn` borrows a local, not the parameter.
 trait Tr { fn m(&self) -> u8; }
 struct S;

@@ -1,4 +1,4 @@
-// expect: L0202
+// expect: L0705
 // ARCH 2.8, rustc E0515: the dyn reference would point at a dead local.
 trait Tr { fn m(&self) -> u8; }
 struct S;

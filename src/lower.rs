@@ -247,7 +247,7 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     fn is_place_expr(&self, e: ExprId) -> bool {
         match self.p.ast.expr(e) {
-            Expr::Path(_) | Expr::SelfValue => matches!(self.ck.res(e), Res::Local(_)),
+            Expr::Path(_) | Expr::SelfValue => matches!(self.ck.res(e), Res::Local(_) | Res::Static(_)),
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
             _ => false,
         }
@@ -384,6 +384,17 @@ impl<'p, 'a> Lower<'p, 'a> {
                 b.project(Proj::Index(i))
             }
             (Expr::Deref(inner), _) => self.place(*inner).deref(),
+            // A static is a place of its own (W-BORROW): reach it through
+            // its address, as `&STATIC` does, never through a copy in a
+            // temporary. A borrow of it is then `'static`, and a move out
+            // of it is a move out of a reference (rustc E0507).
+            (Expr::Path(_), Res::Static(idx)) => {
+                let rt = self.ref_ty(false, self.ty(e));
+                let t = self.temp(rt);
+                let span = self.span(e);
+                self.assign(Place::local(t), Rvalue::StaticRef(idx), span);
+                Place::local(t).deref()
+            }
             // A field, index, or deref the checker could not resolve (its base
             // type is an error type, so no `Res` was recorded): evaluating it
             // through `expr_into` would call `place` on this same expression
