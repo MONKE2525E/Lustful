@@ -662,6 +662,92 @@ void lust_hash_drain_finish(lust_hash_drain *d, lust_hash_drop_fn drop, void *ct
 #define LUST_FX_SEED2 0x13198a2e03707344ull
 #define LUST_FX_PREVENT_ZERO 0xa4093822299f31d0ull
 
+/* ---------------- SipHash-1-3 (core::hash::sip) ---------------- */
+
+static uint64_t lh_rotl(uint64_t x, int b) { return (x << b) | (x >> (64 - b)); }
+
+/* sip.rs compress! */
+static void lh_sip_round(lust_sip13 *s) {
+    s->v0 += s->v1; s->v1 = lh_rotl(s->v1, 13); s->v1 ^= s->v0; s->v0 = lh_rotl(s->v0, 32);
+    s->v2 += s->v3; s->v3 = lh_rotl(s->v3, 16); s->v3 ^= s->v2;
+    s->v0 += s->v3; s->v3 = lh_rotl(s->v3, 21); s->v3 ^= s->v0;
+    s->v2 += s->v1; s->v1 = lh_rotl(s->v1, 17); s->v1 ^= s->v2; s->v2 = lh_rotl(s->v2, 32);
+}
+
+/* u8to64_le: `len` (< 8) bytes at `p` as a little-endian word. */
+static uint64_t lh_u8to64_le(const uint8_t *p, uint64_t len) {
+    uint64_t out = 0;
+    for (uint64_t i = 0; i < len; i++) out |= (uint64_t)p[i] << (8 * i);
+    return out;
+}
+
+lust_sip13 lust_sip13_new_with_keys(uint64_t k0, uint64_t k1) {
+    lust_sip13 h;
+    h.k0 = k0;
+    h.k1 = k1;
+    h.length = 0;
+    h.v0 = k0 ^ 0x736f6d6570736575ull;
+    h.v1 = k1 ^ 0x646f72616e646f6dull;
+    h.v2 = k0 ^ 0x6c7967656e657261ull;
+    h.v3 = k1 ^ 0x7465646279746573ull;
+    h.tail = 0;
+    h.ntail = 0;
+    return h;
+}
+
+/* sip.rs Hasher::write. */
+void lust_sip13_write(lust_sip13 *h, const void *bytes, uint64_t length) {
+    const uint8_t *msg = (const uint8_t *)bytes;
+    h->length += length;
+    uint64_t needed = 0;
+    if (h->ntail != 0) {
+        needed = 8 - h->ntail;
+        h->tail |= lh_u8to64_le(msg, length < needed ? length : needed) << (8 * h->ntail);
+        if (length < needed) {
+            h->ntail += length;
+            return;
+        }
+        h->v3 ^= h->tail;
+        lh_sip_round(h);
+        h->v0 ^= h->tail;
+        h->ntail = 0;
+    }
+    uint64_t len = length - needed;
+    uint64_t left = len & 7;
+    uint64_t i = needed;
+    while (i < len - left) {
+        uint64_t mi = lh_u8to64_le(msg + i, 8);
+        h->v3 ^= mi;
+        lh_sip_round(h);
+        h->v0 ^= mi;
+        i += 8;
+    }
+    h->tail = lh_u8to64_le(msg + i, left);
+    h->ntail = left;
+}
+
+/* sip.rs Hasher::finish: 1 compression round per block, 3 to finish. */
+uint64_t lust_sip13_finish(const lust_sip13 *h) {
+    lust_sip13 s = *h;
+    uint64_t b = ((s.length & 0xff) << 56) | s.tail;
+    s.v3 ^= b;
+    lh_sip_round(&s);
+    s.v0 ^= b;
+    s.v2 ^= 0xff;
+    lh_sip_round(&s);
+    lh_sip_round(&s);
+    lh_sip_round(&s);
+    return s.v0 ^ s.v1 ^ s.v2 ^ s.v3;
+}
+
+lust_random_state lust_random_state_new(void) {
+    static uint64_t k0 = 0x6c75737473697031ull;
+    lust_random_state r;
+    r.k0 = k0++;
+    r.k1 = 0x6861736862726f77ull;
+    return r;
+}
+
 lust_fx_hasher lust_fx_new(void) {
     lust_fx_hasher h;
     h.hash = 0;

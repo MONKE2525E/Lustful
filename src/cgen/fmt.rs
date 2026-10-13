@@ -219,6 +219,33 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
                 lit("value")
             );
         }
+        // HashMap: debug_map of (k, v) in bucket order; HashSet:
+        // debug_set (std's Debug impls iterate the table).
+        CTy::Hash(crate::ty::hash::HashTy::HashMap, a) => {
+            let et = ctype(&CTy::Tuple(vec![a[0].clone(), a[1].clone()]));
+            let ke = fmt_expr(&a[0], FmtKind::Debug, "w", &format!("(&(({et}*)e)->f0)"), need);
+            let ve = fmt_expr(&a[1], FmtKind::Debug, "w", &format!("(&(({et}*)e)->f1)"), need);
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugMap b; lust_fmt_slot s; lust_Formatter *w; lust_hash_iter it; void *e; lust_dmap_new(&b, f); lust_hash_iter_init(&it, &p->t);\n    while ((e = lust_hash_iter_next(&it, 0))) {{ if ((w = lust_dmap_key(&b, &s, 0))) lust_dmap_key_end(&b, &s, {ke}); if ((w = lust_dmap_value(&b, &s, 0))) lust_dmap_value_end(&b, &s, {ve}); }}\n    return lust_dmap_finish(&b, 0); }}"
+            );
+        }
+        // std: `f.debug_struct("RandomState").finish_non_exhaustive()`.
+        CTy::Hash(crate::ty::hash::HashTy::RandomState, _) => {
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugStruct d; lust_dstruct_new(&d, f, {}); return lust_dstruct_finish_ne(&d); }}",
+                lit("RandomState")
+            );
+        }
+        CTy::Hash(crate::ty::hash::HashTy::HashSet, a) => {
+            let et = ctype(&a[0]);
+            let ee = fmt_expr(&a[0], FmtKind::Debug, "w", &format!("(({et}*)e)"), need);
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugList b; lust_fmt_slot s; lust_Formatter *w; lust_hash_iter it; void *e; lust_dlist_new(&b, f, 1); lust_hash_iter_init(&it, &p->t);\n    while ((e = lust_hash_iter_next(&it, 0))) {{ if ((w = lust_dlist_entry(&b, &s))) lust_dlist_entry_end(&b, &s, {ee}); }}\n    return lust_dlist_finish(&b); }}"
+            );
+        }
         CTy::Adt(a) => {
             if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots, "p", types) {
                 let _ = writeln!(body, "  {call}");

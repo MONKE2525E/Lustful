@@ -125,7 +125,7 @@ for lit in re.findall(r'unsupported\([^,]+,\s*(?:&format!\()?"((?:[^"\\]|\\.)*)"
         missing.append(prefix)
 assert not missing, f"rejected list misses: {missing}"
 # Named std types rejected in check/collect.rs appear by name.
-m = re.search(r'\["(HashMap[^]]*)\]', src)
+m = re.search(r'\["(BTreeMap[^]]*)\]', src)
 names = re.findall(r'"([A-Za-z0-9]+)"', m.group(1))
 assert all(any(n in f for f in features) for n in names), names
 # The Builtin enum and ALL_BUILTINS have the same number of variants.

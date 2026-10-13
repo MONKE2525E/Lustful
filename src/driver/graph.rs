@@ -636,6 +636,24 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     // The written impls derive glue calls for a value of this type.
     let glue = |tr: DefId| p.gx.glue_methods.contains_key(&(a, tr));
     (glue(p.gx.lang.clone), glue(p.gx.lang.default), glue(p.gx.lang.partial_eq), glue(p.gx.lang.partial_ord)).hash(h);
+    // The written `Hasher` and `BuildHasher` impls the hash glue calls
+    // into: which methods they write, and the `Hasher` type (W-STD-B).
+    for tr in [p.gx.lang.hasher, p.gx.lang.build_hasher] {
+        for &id in p.gx.index.impls_of_trait(tr) {
+            let rec = p.gx.index.get(id);
+            if rec.synthetic != crate::traits::index::Synthetic::None || rec.head != crate::traits::index::SelfHead::Adt(def) {
+                continue;
+            }
+            for &m in &rec.items {
+                if let Some(l) = p.local_def(m.hash) {
+                    p.name(p.fn_info(l).name).hash(h);
+                }
+            }
+            for &(_, t) in &rec.assoc_tys {
+                hash_ty_deep(h, p, &p.tys, t, seen);
+            }
+        }
+    }
     // A generic Adt's parameters and bounds: a bound edit changes what
     // every use of the type must prove (generic reuse, W-PERF).
     if let Some(g) = p.gx.adt_generics.get(a.0 as usize) {

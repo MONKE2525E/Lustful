@@ -401,6 +401,11 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             },
             Some(BuiltinTy::LocalKey) => format!("LocalKey<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::AccessError) => "AccessError".into(),
+            Some(BuiltinTy::Hash(k)) => {
+                let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                let shown: Vec<String> = a.iter().map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
+                if shown.is_empty() { k.path().1.to_string() } else { format!("{}<{}>", k.path().1, shown.join(", ")) }
+            }
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -845,6 +850,32 @@ pub fn resolve_ty(
                 {
                     return Ok(tys.intern(TyKind::Adt(def, EMPTY_ARGS)));
                 }
+                // The hashed collections and hashers (W-STD-B): written
+                // args, with the default `S = RandomState` filled.
+                if let Some(k) = crate::ty::hash::HashTy::by_name(path[path.len() - 1])
+                    && matches!(path[1], "collections" | "hash")
+                {
+                    use crate::ty::hash::{HashTy, mk_hash};
+                    let seg = segs.last().unwrap();
+                    let mut args = Vec::new();
+                    for &a in seg.type_args().iter() {
+                        args.push(resolve_ty(ast, interner, known, type_names, aliases, tys, a, self_ty)?);
+                    }
+                    let n = k.n_args();
+                    let fill = matches!(k, HashTy::HashMap | HashTy::HashSet) && args.len() + 1 == n;
+                    if fill {
+                        args.push(mk_hash(tys, HashTy::RandomState, &[]));
+                    }
+                    if args.len() != n {
+                        return Err(Diag::new(
+                            "L0110",
+                            span,
+                            format!("`{}` takes {n} type argument(s) here", k.path().1),
+                            "Write the type arguments.",
+                        ));
+                    }
+                    return Ok(mk_hash(tys, k, &args));
+                }
                 segs.last().unwrap()
             } else if segs.len() == 1 {
                 &segs[0]
@@ -999,8 +1030,11 @@ pub fn resolve_ty(
             if std_prefixed {
                 return Err(std_path_shadowed(interner, name, span));
             }
-            if ["HashMap", "HashSet", "BTreeMap", "Arc"].contains(&n) {
+            if ["BTreeMap", "Arc"].contains(&n) {
                 return Err(not_yet("L0641", span, &format!("the `{n}` type")));
+            }
+            if let Some(k) = crate::ty::hash::HashTy::by_name(n) {
+                return Err(crate::ty::hash::not_imported(k, span));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
         }
@@ -1891,6 +1925,13 @@ pub fn collect_reuse<'a>(
         }
         insert_builtin(&mut p, b.local_key, DefsKind::Struct, interner.intern("LocalKey"), one_ty_param());
         insert_builtin(&mut p, b.access_error, DefsKind::Struct, interner.intern("AccessError"), Generics::default());
+        for k in crate::ty::hash::HashTy::ALL {
+            let params = (0..k.n_args())
+                .map(|i| ParamDef { name: interner.intern(["K", "V", "S"][i.min(2)]), kind: ParamKind::Type, span: dummy })
+                .collect();
+            let g = Generics { parent: None, params, predicates: Vec::new() };
+            insert_builtin(&mut p, b.hash_tys[k as usize], DefsKind::Struct, interner.intern(k.path().1), g);
+        }
         for k in crate::ty::iter::IterKind::ALL {
             let params = (0..k.n_args())
                 .map(|i| ParamDef { name: interner.intern(["I", "F", "B"][i]), kind: ParamKind::Type, span: dummy })
@@ -4612,6 +4653,15 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     if let Some(e) = tys.boxed_slice_elem(t) {
         return has_clone(p, tys, e);
     }
+    // Hash tables clone their args; the std hashers are Clone (W-STD-B).
+    if let Some((k, a)) = crate::ty::hash::hash_parts(tys, t) {
+        use crate::ty::hash::HashTy;
+        return match k {
+            HashTy::HashMap | HashTy::HashSet => a.iter().all(|&e| glue_clone(p, tys, e, seen)),
+            HashTy::Entry => false,
+            _ => true,
+        };
+    }
     if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
         return glue_clone(p, tys, e, seen);
     }
@@ -5051,6 +5101,16 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
                 return glue_debug(p, tys, e, seen);
             }
+            // HashMap and HashSet print their keys and values (W-STD-B).
+            if let Some((k, a)) = crate::ty::hash::hash_parts(tys, t) {
+                use crate::ty::hash::HashTy;
+                return match k {
+                    HashTy::HashMap => glue_debug(p, tys, a[0], seen) && glue_debug(p, tys, a[1], seen),
+                    HashTy::HashSet => glue_debug(p, tys, a[0], seen),
+                    HashTy::RandomState => true,
+                    _ => false,
+                };
+            }
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_debug(p, tys, a, seen) && glue_debug(p, tys, b, seen);
             }
@@ -5131,6 +5191,15 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
     if let Some((a, b)) = tys.result_args(t) {
         return needs_drop(p, tys, a) || needs_drop(p, tys, b);
+    }
+    // The hash tables own their buckets; an Entry its key (W-STD-B).
+    if let Some((k, a)) = crate::ty::hash::hash_parts(tys, t) {
+        use crate::ty::hash::HashTy;
+        return match k {
+            HashTy::HashMap | HashTy::HashSet => true,
+            HashTy::Entry => a.first().is_some_and(|&e| needs_drop(p, tys, e)),
+            _ => false,
+        };
     }
     if let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) {
         // `vec::IntoIter` owns its buffer. Other kinds drop what their

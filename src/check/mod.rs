@@ -15,6 +15,7 @@ pub mod defaults;
 pub mod fmt;
 pub mod generics;
 pub mod into;
+pub mod hashmap;
 pub mod iter;
 pub mod method;
 pub mod object;
@@ -477,6 +478,31 @@ pub enum Builtin {
     /// key not yet made on this thread takes `value` as its value
     /// (None comes back); any other state gives `value` back.
     TlsInitWith,
+    /// The hashed collections (W-STD-B, check/hashmap.rs, cgen/hash.rs):
+    /// constructors (the result type tells map, set, or hasher), table
+    /// queries, map and set methods, and the Entry methods.
+    HashNew,
+    HashWithCapacity,
+    HashWithHasher,
+    HashWithCapacityAndHasher,
+    HashDefault,
+    HashLen,
+    HashIsEmpty,
+    HashClear,
+    HashCapacity,
+    MapInsert,
+    MapGet,
+    MapGetMut,
+    MapContainsKey,
+    MapRemove,
+    MapEntry,
+    EntryOrInsert,
+    EntryOrDefault,
+    EntryKey,
+    SetInsert,
+    SetContains,
+    SetRemove,
+    SetGet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1068,6 +1094,9 @@ struct Ctx<'p, 'a> {
     /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
     /// `downgrade`, whose `Weak` is a thin pointer).
     deferred_sized: Vec<(Ty, Span)>,
+    /// Map and set keys and lookup types, re-tested at finish
+    /// (`check_hash_key`, W-STD-B): (key, lookup, span).
+    deferred_hash_key: Vec<(Ty, Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -1326,6 +1355,7 @@ fn check_fn_mode<'p, 'a>(
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
+        deferred_hash_key: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -8173,6 +8203,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (names[names.len() - 2], names[names.len() - 1])
         };
+        // The hashed collections and hashers by their std path (an
+        // import expands to it; a bare name reaching here was not
+        // imported, which rustc rejects).
+        if segs.len() > 2
+            && let Some(hk) = crate::ty::hash::HashTy::by_name(self.name(ty_name))
+        {
+            return match crate::check::hashmap::hash_ctor_builtin(hk, self.name(item)) {
+                Some(b) => Some(Res::Builtin(b)),
+                None => {
+                    self.err("L0104", span, format!("no function `{}::{}`", self.name(ty_name), self.name(item)), "Check the name.");
+                    None
+                }
+            };
+        }
         // The first segment is a type-namespace binding read (`Self` is a
         // scope name, not a binding, and records nothing).
         let ty_bound = if ty_name == k.self_type { BindingRes::Absent } else { self.binding(Namespace::Type, ty_name) };
@@ -9977,6 +10021,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 let (params, ret): (Vec<Ty>, Ty) = match b {
                     Builtin::Sync(op) => self.sync_call_sig(op, callee, span),
+                    b if crate::check::hashmap::is_hash_ctor(b) => match self.hash_ctor_sig(b, callee, span) {
+                        Some(sig) => sig,
+                        None => (vec![], ERROR),
+                    },
                     Builtin::Clone => {
                         // The associated form `Type::clone(&x)`:
                         // the argument fixes the type.
@@ -10989,6 +11037,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // AsRef, AsMut, Borrow, BorrowMut, ToOwned on builtin values
             // (check/convert.rs, W-STD-B).
             if let Some(ret) = self.convert_method(e, recv, rt, name, name_span, args, expected) {
+                return ret;
+            }
+            // HashMap, HashSet, and Entry methods (check/hashmap.rs).
+            if let Some(ret) = self.hash_coll_method(e, recv, base, derefs, name, name_span, args) {
                 return ret;
             }
         }
@@ -16375,6 +16427,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` does not implement Debug"), "Add #[derive(Debug)] to the type.");
             }
+        }
+        for (k, q, span) in std::mem::take(&mut self.deferred_hash_key) {
+            self.check_hash_key(k, q, span);
         }
         for (t, span) in std::mem::take(&mut self.deferred_ord) {
             let t = self.deep(t);

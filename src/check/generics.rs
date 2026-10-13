@@ -91,6 +91,11 @@ pub struct LangTraits {
     /// through one synthetic blanket impl.
     pub any: DefId,
     pub assoc_owned: DefId,
+    /// `core::hash::Hasher` and `BuildHasher` with its `Hasher` assoc
+    /// (W-STD-B, the hashed collections).
+    pub hasher: DefId,
+    pub build_hasher: DefId,
+    pub assoc_hasher: DefId,
     /// `Iterator::Item`.
     pub assoc_item: DefId,
     /// `IntoIterator::IntoIter` (its `Item` is a distinct def).
@@ -178,6 +183,8 @@ impl LangTraits {
         let borrow = lang_trait(&["core", "borrow"], "Borrow");
         let borrow_mut = lang_trait(&["core", "borrow"], "BorrowMut");
         let to_owned = lang_trait(&["alloc", "borrow"], "ToOwned");
+        let hasher = lang_trait(&["core", "hash"], "Hasher");
+        let build_hasher = lang_trait(&["core", "hash"], "BuildHasher");
         let from = lang_trait(&["core", "convert"], "From");
         let into = lang_trait(&["core", "convert"], "Into");
         let any = lang_trait(&["core", "any"], "Any");
@@ -240,6 +247,9 @@ impl LangTraits {
             to_owned,
             any,
             assoc_owned: lang_assoc(to_owned, "Owned"),
+            hasher,
+            build_hasher,
+            assoc_hasher: lang_assoc(build_hasher, "Hasher"),
             assoc_item: lang_assoc(iterator, "Item"),
             assoc_into_iter: lang_assoc(into_iterator, "IntoIter"),
             assoc_into_item: lang_assoc(into_iterator, "Item"),
@@ -337,6 +347,8 @@ impl LangTraits {
             "Borrow" => self.borrow,
             "BorrowMut" => self.borrow_mut,
             "ToOwned" => self.to_owned,
+            "Hasher" => self.hasher,
+            "BuildHasher" => self.build_hasher,
             "From" => self.from,
             "Into" => self.into,
             "Fn" => self.fn_,
@@ -492,6 +504,8 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
         rec(lang.borrow_mut, "BorrowMut", 1, vec![self_pred(tys, lang.borrow, &[1])], vec![], &["borrow_mut"]),
         rec(lang.to_owned, "ToOwned", 0, vec![], vec![(lang.assoc_owned, "Owned")], &["to_owned", "clone_into"]),
+        rec(lang.hasher, "Hasher", 0, vec![], vec![], &crate::check::hashmap::HASHER_METHODS),
+        rec(lang.build_hasher, "BuildHasher", 0, vec![], vec![(lang.assoc_hasher, "Hasher")], &["build_hasher", "hash_one"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
         rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
         rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![], &["call"]),
@@ -790,6 +804,25 @@ pub fn lang_method_sigs(
                 (d, "as_mut" | "borrow_mut") if d == lang.as_mut || d == lang.borrow_mut => {
                     let m1 = tys.mk_ref(true, p1);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: m1, ret_borrows_from: Some(0) }
+                }
+                // `Hasher` (W-STD-B): finish, write, and the write_* family.
+                (d, "finish") if d == lang.hasher => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: int(IntTy::U64), ret_borrows_from: None }
+                }
+                (d, n) if d == lang.hasher => {
+                    let arg = match crate::check::hashmap::hasher_write_arg(n) {
+                        Some(Some(i)) => int(i),
+                        Some(None) => {
+                            let s = tys.intern(TyKind::Slice(int(IntTy::U8)));
+                            tys.mk_ref(false, s)
+                        }
+                        None => continue,
+                    };
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0, arg], ret: UNIT, ret_borrows_from: None }
+                }
+                (d, "build_hasher") if d == lang.build_hasher => {
+                    let h = proj(tys, lang.assoc_hasher, &[p0]);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: h, ret_borrows_from: None }
                 }
                 (d, "to_owned") if d == lang.to_owned => {
                     let owned = proj(tys, lang.assoc_owned, &[p0]);
@@ -2489,6 +2522,12 @@ pub(crate) fn resolve_path_ty(
                 }
                 return Ok(type_id_ty(tys));
             }
+            // The hashed collections and hashers (W-STD-B, ty/hash.rs).
+            if let Some(k) = crate::ty::hash::HashTy::by_name(path[path.len() - 1])
+                && matches!(path[1], "collections" | "hash")
+            {
+                return resolve_hash_path(ast, interner, known, cx, tys, scope, k, segs.last().unwrap(), span);
+            }
         } else {
             return Err(not_yet("L0505", span, "module paths in types"));
         }
@@ -2858,10 +2897,65 @@ pub(crate) fn resolve_path_ty(
         return Ok(tys.mk_adt(def, &gargs));
     }
     let n = interner.get(name);
-    if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc"].contains(&n) {
+    if ["BTreeMap", "Box", "Rc", "Arc"].contains(&n) {
         return Err(not_yet("L0641", span, &format!("the `{n}` type")));
     }
+    if let Some(k) = crate::ty::hash::HashTy::by_name(n) {
+        return Err(crate::ty::hash::not_imported(k, span));
+    }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
+}
+
+/// A hashed collection or hasher type by its std path (W-STD-B):
+/// type args as written, with the default `S = RandomState` filled.
+#[allow(clippy::too_many_arguments)]
+fn resolve_hash_path(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    k: crate::ty::hash::HashTy,
+    seg: &ast::PathSeg,
+    span: Span,
+) -> Result<Ty, Diag> {
+    use crate::ty::hash::{HashTy, mk_hash};
+    let n = k.n_args();
+    let written: Vec<Ty> = match &seg.args {
+        GenericArgs::None => Vec::new(),
+        GenericArgs::Angle(a) => {
+            let kinds = vec![false; a.len()];
+            resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, k.path().1)?
+                .into_iter()
+                .filter_map(|g| g.as_ty())
+                .collect()
+        }
+        GenericArgs::Parenthesized { .. } => {
+            return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
+        }
+    };
+    let defaults = match k {
+        HashTy::HashMap | HashTy::HashSet => 1,
+        _ => 0,
+    };
+    if written.len() > n || written.len() + defaults < n || (written.is_empty() && n > 0) {
+        return Err(Diag::new(
+            "L0110",
+            span,
+            format!(
+                "`{}` takes {} type argument(s)",
+                k.path().1,
+                if defaults > 0 { format!("{} or {n}", n - defaults) } else { n.to_string() }
+            ),
+            "Write the arguments, for example with `_` where inference should fill them in a body.",
+        ));
+    }
+    let mut args = written;
+    if args.len() < n {
+        args.push(mk_hash(tys, HashTy::RandomState, &[]));
+    }
+    Ok(mk_hash(tys, k, &args))
 }
 
 /// A `core::fmt` type by its last path segment (W-STD-B): the
@@ -3630,6 +3724,13 @@ pub struct GenTables<'a> {
     /// structural rules could not answer at collect (a written `impl
     /// Debug` is not in the index yet): proven in `finish_collect`.
     pub deferred_debug_fields: Vec<(Ty, Span)>,
+    /// The user `Hasher` method instances of one concrete Adt, by index
+    /// into `check::hashmap::HASHER_METHODS` (methods the impl leaves out
+    /// take core's defaults in cgen), and the `BuildHasher::build_hasher`
+    /// instance with the impl's `Hasher` type (W-STD-B; iface: W-CGEN
+    /// reads these for the hash glue).
+    pub hasher_methods: FxMap<(AdtId, u8), LocalDefId>,
+    pub build_hashers: FxMap<AdtId, (LocalDefId, Ty)>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -3744,6 +3845,8 @@ impl Default for GenTables<'_> {
             glue_methods: FxMap::default(),
             fmt_methods: FxMap::default(),
             deferred_debug_fields: Vec::new(),
+            hasher_methods: FxMap::default(),
+            build_hashers: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
@@ -5923,6 +6026,62 @@ pub fn add_synthetic_impls(p: &mut Program) {
             insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
         }
     }
+    // The std hashers and hashed collections (ty/hash.rs, W-STD-B), as
+    // the std impl blocks state them. Traits without a port here
+    // (PartialEq on the tables, Debug on DefaultHasher) reject.
+    {
+        use crate::ty::hash::{HashTy as H, mk_hash};
+        let rs = mk_hash(&mut p.tys, H::RandomState, &[]);
+        let dh = mk_hash(&mut p.tys, H::DefaultHasher, &[]);
+        let bhd = mk_hash(&mut p.tys, H::BuildHasherDefault, &[p0]);
+        insert_synthetic(p, &mut ordinal, lang.hasher, dh, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(
+            p,
+            &mut ordinal,
+            lang.build_hasher,
+            rs,
+            &[],
+            g0.clone(),
+            vec![(lang.assoc_hasher, dh)],
+            Synthetic::Lang,
+            false,
+            span,
+        );
+        let mut g1 = one.clone();
+        g1.predicates = vec![pred_on(p, lang.default, p0), pred_on(p, lang.hasher, p0)];
+        insert_synthetic(p, &mut ordinal, lang.build_hasher, bhd, &[], g1, vec![(lang.assoc_hasher, p0)], Synthetic::Lang, false, span);
+        for tr in [lang.clone, lang.default] {
+            insert_synthetic(p, &mut ordinal, tr, rs, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, dh, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, bhd, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, &mut ordinal, lang.debug, rs, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        // HashMap<K, V, S> and HashSet<T, S>: Clone through every
+        // param, Default through S, Debug through the elements.
+        let p2 = p.tys.intern(TyKind::Param(ParamId(2)));
+        let names = |p: &mut Program, ns: &[&str]| -> Vec<ParamDef> {
+            ns.iter().map(|n| ParamDef { name: p.interner.intern(n), kind: ParamKind::Type, span }).collect()
+        };
+        let map = mk_hash(&mut p.tys, H::HashMap, &[p0, p1, p2]);
+        let set = mk_hash(&mut p.tys, H::HashSet, &[p0, p1]);
+        for (self_pat, params, elems, s) in
+            [(map, names(p, &["K", "V", "S"]), vec![p0, p1], p2), (set, names(p, &["T", "S"]), vec![p0], p1)]
+        {
+            let g = |p: &mut Program, tr: DefId, on: &[Ty]| Generics {
+                parent: None,
+                params: params.clone(),
+                predicates: on.iter().map(|&t| pred_on(p, tr, t)).collect(),
+            };
+            let mut all = elems.clone();
+            all.push(s);
+            let gc = g(p, lang.clone, &all);
+            insert_synthetic(p, &mut ordinal, lang.clone, self_pat, &[], gc, Vec::new(), Synthetic::Lang, false, span);
+            let gd = g(p, lang.default, &[s]);
+            insert_synthetic(p, &mut ordinal, lang.default, self_pat, &[], gd, Vec::new(), Synthetic::Lang, false, span);
+            let gf = g(p, lang.debug, &elems);
+            insert_synthetic(p, &mut ordinal, lang.debug, self_pat, &[], gf, Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
     // The IntoIterator blanket: impl<I: Iterator> IntoIterator
     // for I, Item = I::Item, IntoIter = I.
     {
@@ -7054,6 +7213,57 @@ fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     p.gx.drop_methods.insert(adt, drop_fn);
 }
 
+/// The user `Hasher` and `BuildHasher` method instances of one concrete
+/// Adt (`gx.hasher_methods`, `gx.build_hashers`; W-STD-B): selection on
+/// the Adt's full type, then every method of the written impl.
+fn ensure_hash_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
+    use crate::traits::index::Synthetic;
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    if p.tys.flags(self_ty).contains_param() {
+        return;
+    }
+    for trait_def in [p.gx.lang.hasher, p.gx.lang.build_hasher] {
+        let args_id = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        let sel = {
+            let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+            let mut solver = Solver::new();
+            solver.select(&mut cx, &p.gx.index, &[], tr)
+        };
+        let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
+        let record = p.gx.index.get(id).clone();
+        if record.synthetic != Synthetic::None || !prove_goal(p, &[], tr) {
+            continue;
+        }
+        for d in record.items.clone() {
+            let Some(local) = p.local_def(d.hash) else { continue };
+            let name = p.name(p.fn_info(local).name).to_string();
+            let f = if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+                let before = p.fns.len();
+                let inst = fn_instance(p, local, &impl_args);
+                if inst.0 as usize >= before {
+                    queue.push(inst);
+                }
+                inst
+            } else {
+                local
+            };
+            if trait_def == p.gx.lang.hasher {
+                if let Some(i) = crate::check::hashmap::HASHER_METHODS.iter().position(|m| *m == name) {
+                    p.gx.hasher_methods.insert((adt, i as u8), f);
+                }
+            } else if name == "build_hasher"
+                && let Some(h) = record.assoc_ty(p.gx.lang.assoc_hasher)
+            {
+                let h = subst(&mut p.tys, h, &impl_args);
+                let h = normalize_global(p, h);
+                ensure_global_adt_instances(p, h, 0);
+                p.gx.build_hashers.insert(adt, (f, h));
+            }
+        }
+    }
+}
+
 /// The user `fmt` method instances of one concrete Adt, for cgen's
 /// Display and Debug glue (`gx.fmt_methods`, W-STD-B): for each of the
 /// two traits, selection on the Adt's full type, and the selected
@@ -7344,6 +7554,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             for a in adt_ids {
                 ensure_drop_method(p, a, &mut next_queue);
                 ensure_fmt_methods(p, a, &mut next_queue);
+                ensure_hash_methods(p, a, &mut next_queue);
             }
         }
         queue = next_queue;

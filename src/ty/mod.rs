@@ -14,6 +14,7 @@
 pub mod consteval;
 pub mod defs;
 pub mod fmt;
+pub mod hash;
 pub mod iter;
 pub mod lang;
 pub mod layout;
@@ -609,6 +610,9 @@ pub struct BuiltinDefs {
     /// (thread_local!, check/tls.rs).
     pub local_key: DefId,
     pub access_error: DefId,
+    /// The hashed collections and hasher types, by `HashTy` index
+    /// (ty/hash.rs).
+    pub hash_tys: [DefId; hash::HashTy::ALL.len()],
 }
 
 impl BuiltinDefs {
@@ -648,6 +652,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::ExitCode)
         } else if let Some(i) = self.sync_tys.iter().position(|&d| d == def) {
             Some(BuiltinTy::Sync(sync::SyncTy::ALL[i]))
+        } else if let Some(i) = self.hash_tys.iter().position(|&d| d == def) {
+            Some(BuiltinTy::Hash(hash::HashTy::ALL[i]))
         } else if def.krate != BUILTIN_CRATE {
             None
         } else if def == self.local_key {
@@ -691,6 +697,8 @@ pub enum BuiltinTy {
     LocalKey,
     /// `std::thread::AccessError`, `LocalKey::try_with`'s error.
     AccessError,
+    /// A hashed collection or std hasher type (ty/hash.rs).
+    Hash(hash::HashTy),
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -1150,6 +1158,7 @@ impl GlobalTys {
             sync_tys: sync::SyncTy::ALL.map(sync::sync_def),
             local_key: builtin_def(&["std", "thread"], "LocalKey"),
             access_error: builtin_def(&["std", "thread"], "AccessError"),
+            hash_tys: hash::HashTy::ALL.map(hash::hash_def),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

@@ -3226,6 +3226,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Hash(k, args) => {
+                    (43u8, *k as u8, args.len() as u64).hash(h);
+                    for t in args {
+                        inner(h, p, t);
+                    }
+                }
                 cgen::CTy::Tuple(ts) => {
                     12u8.hash(h);
                     (ts.len() as u64).hash(h);

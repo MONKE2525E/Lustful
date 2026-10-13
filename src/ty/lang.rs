@@ -1194,6 +1194,14 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/fmt/DebugMap",
     "core/sync/atomic/Ordering",
     "std/sync/atomic/Ordering",
+    "std/collections/hash_map/HashMap",
+    "std/collections/hash_set/HashSet",
+    "std/collections/hash_map/RandomState",
+    "std/collections/hash_map/DefaultHasher",
+    "std/hash/RandomState",
+    "std/hash/DefaultHasher",
+    "std/hash/BuildHasherDefault",
+    "core/hash/BuildHasherDefault",
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[
@@ -1227,6 +1235,10 @@ const STD_TRAIT_PATHS: &[&str] = &[
     "std/fmt/Write",
     "core/hash/Hash",
     "std/hash/Hash",
+    "core/hash/Hasher",
+    "std/hash/Hasher",
+    "core/hash/BuildHasher",
+    "std/hash/BuildHasher",
     "core/iter/Iterator",
     "std/iter/Iterator",
     "core/iter/IntoIterator",

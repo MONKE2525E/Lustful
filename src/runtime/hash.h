@@ -282,6 +282,36 @@ uint64_t lust_fx_hash_u64(uint64_t v);
 uint64_t lust_fx_hash_usize(uint64_t v);
 uint64_t lust_fx_hash_str(const void *bytes, uint64_t len);
 
+/* ---------------- SipHash-1-3 (std DefaultHasher) ----------------
+   core::hash::sip::Hasher<Sip13Rounds> as Rust 1.99 has it, behind
+   std::hash::DefaultHasher: a byte-stream hash, so every write_* is a
+   write of the value's little-endian bytes, and write_str adds 0xff.
+   DefaultHasher::new() is keys (0, 0); RandomState draws keys (lust:
+   a fixed start, k0 bumped per RandomState, as std bumps its per-thread
+   keys; map order under RandomState is not an observable). The field
+   order and size match Rust's (72 bytes). */
+typedef struct {
+    uint64_t k0;
+    uint64_t k1;
+    uint64_t length;
+    uint64_t v0;
+    uint64_t v2;
+    uint64_t v1;
+    uint64_t v3;
+    uint64_t tail;
+    uint64_t ntail;
+} lust_sip13;
+typedef struct {
+    uint64_t k0;
+    uint64_t k1;
+} lust_random_state;
+
+lust_sip13 lust_sip13_new_with_keys(uint64_t k0, uint64_t k1);
+void lust_sip13_write(lust_sip13 *h, const void *bytes, uint64_t len);
+uint64_t lust_sip13_finish(const lust_sip13 *h);
+/* RandomState::new(): the next keys (std: per-thread, k0 + 1 each). */
+lust_random_state lust_random_state_new(void);
+
 /* ---------------- IndexMap core (indexmap 2.14.0) ----------------
    Entries are kept in insertion order in one erased Vec; a side
    lust_hash_table maps key hash to entry index (hashbrown HashTable of

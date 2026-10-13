@@ -488,6 +488,20 @@ impl AdtTables {
             // `slice::IterMut<'a, T>` holds `&'a mut [T]`: invariant in `T`.
             Some(BuiltinTy::Iter(IterKind::SliceIterMut)) => return (Variance::Inv, DropMode::None),
             Some(BuiltinTy::Iter(IterKind::SliceIter)) => return (Variance::Co, DropMode::None),
+            // The hashed collections (W-STD-B): HashMap and HashSet are
+            // covariant and own their elements (hashbrown's RawTable);
+            // `BuildHasherDefault<H>` holds `PhantomData<fn() -> H>`; an
+            // Entry holds `&'a mut HashMap<K, V>`: invariant, and it owns
+            // only its probe key.
+            Some(BuiltinTy::Hash(k)) => {
+                use crate::ty::hash::HashTy;
+                return match k {
+                    HashTy::HashMap | HashTy::HashSet => (Variance::Co, DropMode::Owned),
+                    HashTy::BuildHasherDefault => (Variance::Co, DropMode::None),
+                    HashTy::Entry => (Variance::Inv, if j == 0 { DropMode::Owned } else { DropMode::None }),
+                    HashTy::RandomState | HashTy::DefaultHasher => (Variance::Inv, DropMode::Owned),
+                };
+            }
             // Owning containers and the other iterators: covariant, their
             // drop may reach the elements. Exhaustive on purpose: a new
             // builtin picks its variance here (a `Cell`-like type is
@@ -560,10 +574,12 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
-        // A Debug builder holds `&mut Formatter` (W-STD-B).
+        // A Debug builder holds `&mut Formatter`, a map Entry `&mut` its
+        // map (W-STD-B).
         Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
         // The lock guards borrow their lock (W-THREADS).
         Some(BuiltinTy::Sync(k)) if k.regions() > 0 => return k.regions(),
+        Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry)) => return 1,
         Some(_) => return 0,
         None => {}
     }
@@ -3077,6 +3093,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && inner == dt
                 && !av.is_empty()
                 && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
+            // A map or set lookup (W-STD-B) reads its `&Q` key during the
+            // call only: the opaque rule over the receiver alone.
+            _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
+                self.call_opaque(&avs[..1], dt, &dv)
+            }
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
@@ -5344,6 +5365,13 @@ fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey))
 }
 
+/// The map and set lookups by `&Q` (W-STD-B): the key is not stored or
+/// returned.
+fn hash_lookup_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(b, B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::SetContains | B::SetRemove | B::SetGet)
+}
+
 /// The builtin iterator calls whose result is an item (or a collection
 /// of items): their regions come from the iterator's sources.
 /// The `core::fmt` builtins whose result borrows from the receiver
@@ -5366,6 +5394,8 @@ fn fmt_builder_builtin(b: crate::check::Builtin) -> bool {
     )
 }
 
+/// The builtin iterator calls whose result is an item (or a collection
+/// of items): their regions come from the iterator's sources.
 fn item_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(
@@ -5395,6 +5425,10 @@ fn has_interior(tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 fn has_mut_ref(tys: &impl TyIntern, t: Ty) -> bool {
+    // A map Entry holds `&'a mut HashMap<K, V>` (W-STD-B).
+    if let Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry)) = tys.builtin_of(t) {
+        return true;
+    }
     match tys.kind(t) {
         TyKind::Ref(_, m, inner) => m.is_mut() || has_mut_ref(tys, inner),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_mut_ref(tys, e)),

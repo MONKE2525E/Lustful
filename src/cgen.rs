@@ -14,6 +14,7 @@ use std::fmt::Write;
 
 mod fmt;
 mod sync;
+mod hash;
 
 /// A body-independent type, so glue can be shared across functions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +95,11 @@ pub enum CTy {
     /// `std::thread::AccessError` (W-TLS): a unit struct (`lust_Unit`)
     /// whose Debug text is its name.
     AccessError,
+    /// A hashed collection or std hasher (W-STD-B, cgen/hash.rs), with
+    /// its type args: `HashMap [K, V, S]` and `HashSet [T, S]` are a
+    /// generated `{ lust_hash_table t; S s; }`; the hashers are runtime
+    /// structs.
+    Hash(crate::ty::hash::HashTy, Vec<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -131,6 +137,22 @@ pub enum Glue {
     /// `void tlsdtor_C(void *c)`: a cell's thread-exit destructor (state
     /// destroyed, then the value's drop), keyed like `TlsInit`.
     TlsDtor,
+    /// The hashed collections (cgen/hash.rs, W-STD-B): `hv_<T,H,..>`
+    /// feeds a value to a hasher (key `(T, H, &[u8])`); per table,
+    /// `hk_` hashes a key with the map's builder, `hof_`/`heq_`/`hcl_`
+    /// are the core's hash-of, equality, and clone callbacks; per
+    /// (table, lookup type Q), `hkq_` and `heqq_` (key `(table, Q)`).
+    HashValue,
+    HashKey,
+    HashOf,
+    HashEq,
+    HashClone,
+    HashKeyQ,
+    HashEqQ,
+    /// `heqe_`: the Entry search's equality, `stored == probe`.
+    HashEqEntry,
+    /// `hdr_`: the core's element drop callback.
+    HashDrop,
 }
 
 /// Maps a semantic type to its body-independent C form. Builtin Adts reach this
@@ -201,6 +223,13 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             // `AccessError` is a unit struct.
             Some(BuiltinTy::LocalKey) => CTy::Int(IntTy::U64),
             Some(BuiltinTy::AccessError) => CTy::AccessError,
+            Some(BuiltinTy::Hash(k)) => {
+                let args = tys
+                    .adt_parts(t)
+                    .map(|(_, a)| tys.args(a).iter().filter_map(|g| g.as_ty()).map(|e| cty(tys, e)).collect())
+                    .unwrap_or_default();
+                CTy::Hash(k, args)
+            }
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -391,6 +420,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Dyn => "lust_dyn".into(),
         CTy::Fmt(k) => fmt_ctype(*k).into(),
         CTy::Unsized(_, inner) => ctype(inner),
+        CTy::Hash(k, _) => hash::hash_ctype(*k, &mangle(t)),
     }
 }
 
@@ -454,6 +484,8 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::ExitCode => tok(s, "XC", &[]),
         CTy::AccessError => tok(s, "AE", &[]),
         CTy::Fmt(k) => tok(s, &format!("Fmt{}", *k as u8), &[]),
+        // The kind fixes how many type arguments follow.
+        CTy::Hash(k, args) => tok(s, &format!("H{}", *k as u8), &args.iter().collect::<Vec<_>>()),
         CTy::Adt(a) => tok(s, &format!("A{}", a.0), &[]),
         CTy::Vec(e) => tok(s, "V", &[e]),
         CTy::Boxed(e) => tok(s, "Bx", &[e]),
@@ -538,6 +570,19 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             collect_types(e, out);
         }
         CTy::Sync(k, e) => sync::sync_collect_types(*k, e, out),
+        // Every hash type, so a unit that names one gets the core's
+        // declarations (`type_decls`).
+        CTy::Hash(k, args) => {
+            out.insert(t.clone());
+            if hash::has_struct(*k) {
+                collect_types(&hash::elem_cty(t), out);
+            }
+            // The hash glue passes `&[u8]` to `Hasher::write`.
+            if hash::is_table(*k) {
+                collect_types(&CTy::Slice(Box::new(CTy::Int(IntTy::U8))), out);
+            }
+            args.iter().for_each(|e| collect_types(e, out));
+        }
         _ => {}
     }
 }
@@ -559,6 +604,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // no forward form (a closure capturing a fn pointer by ref).
         CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
         CTy::Unsized(_, inner) => by_value_deps(inner, out),
+        CTy::Hash(k, _) if hash::has_struct(*k) => out.push(t.clone()),
         _ => {}
     }
 }
@@ -613,6 +659,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
+        CTy::Hash(k, a) => hash::is_table(*k) || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k))),
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -822,6 +869,22 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Fmt(k) => {
                 let (size, align) = fmt_size_align(*k);
                 Some(plain_layout(size, align))
+            }
+            // The C structs of cgen/hash.rs (`struct_fields`) and the
+            // runtime's hasher types.
+            CTy::Hash(k, args) => {
+                use crate::ty::hash::HashTy;
+                let c = layout::Repr { kind: ReprKind::C, ..layout::Repr::default() };
+                match k {
+                    HashTy::RandomState => Some(plain_layout(16, 8)),
+                    HashTy::DefaultHasher => Some(plain_layout(72, 8)),
+                    HashTy::BuildHasherDefault => Some(layout::zst_layout(1)),
+                    HashTy::Entry => {
+                        let key = go(p, args.first()?, seen)?;
+                        layout::struct_layout(&[layout::ptr_layout(), layout::int_layout(IntTy::U64), layout::ptr_layout(), key], c).ok()
+                    }
+                    HashTy::HashMap | HashTy::HashSet => layout::struct_layout(&[plain_layout(64, 8), go(p, args.last()?, seen)?], c).ok(),
+                }
             }
             CTy::Args => Some(plain_layout(8, 8)),
             CTy::ExitCode => Some(plain_layout(1, 1)),
@@ -1069,6 +1132,23 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),
             CTy::Sync(k, _) => sync::sync_layout(*k).map_or((8, 8), |l| (l.size, l.align)),
             CTy::AccessError => (0, 1),
+            CTy::Hash(k, args) => match k {
+                crate::ty::hash::HashTy::RandomState => (16, 8),
+                crate::ty::hash::HashTy::DefaultHasher => (72, 8),
+                crate::ty::hash::HashTy::BuildHasherDefault => (0, 1),
+                crate::ty::hash::HashTy::Entry => {
+                    // `{ table ptr, hash, slot ptr, K key }`
+                    let (ks, ka) = args.first().map_or((0, 1), |k| go(p, k, seen));
+                    let align = ka.max(8);
+                    (align_up(align_up(24, ka) + ks, align), align)
+                }
+                _ => {
+                    // `{ lust_hash_table t (8 words); S s; }`
+                    let (ss, sa) = args.last().map_or((0, 1), |s| go(p, s, seen));
+                    let align = sa.max(8);
+                    (align_up(64 + ss, align), align)
+                }
+            },
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
@@ -2209,7 +2289,10 @@ impl FnGen<'_, '_, '_> {
                 self.want(Glue::Default, dest_cty);
                 format!("default_{}()", mangle(dest_cty))
             }
-            CallTarget::Builtin(b) => self.builtin(b, args, loc, post),
+            CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
+                Some(v) => v,
+                None => self.builtin(b, args, loc, post),
+            },
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
             CallTarget::Dyn(k) => {
                 // Through the vtable: entry `k` is a shim whose receiver
@@ -3275,6 +3358,28 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {ot}* {pa} = {}; {ot} {old} = *{pa}; *{pa} = {none};", vals[0]);
                 old
             }
+            B::HashNew
+            | B::HashWithCapacity
+            | B::HashWithHasher
+            | B::HashWithCapacityAndHasher
+            | B::HashDefault
+            | B::HashLen
+            | B::HashIsEmpty
+            | B::HashClear
+            | B::HashCapacity
+            | B::MapInsert
+            | B::MapGet
+            | B::MapGetMut
+            | B::MapContainsKey
+            | B::MapRemove
+            | B::MapEntry
+            | B::EntryOrInsert
+            | B::EntryOrDefault
+            | B::EntryKey
+            | B::SetInsert
+            | B::SetContains
+            | B::SetRemove
+            | B::SetGet => unreachable!("hash builtins emit in cgen/hash.rs"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.
@@ -6245,9 +6350,18 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 ps.iter().for_each(|e| collect_types(e, &mut inner));
                 collect_types(r, &mut inner);
             }
+            CTy::Hash(_, args) => {
+                args.iter().for_each(|e| collect_types(e, &mut inner));
+                collect_types(&hash::elem_cty(&t), &mut inner);
+            }
             _ => {}
         }
         stack.extend(inner);
+    }
+    // The hash core's declarations, only in units that name a hash type
+    // (see `runtime_source`).
+    if wanted.iter().any(|t| matches!(t, CTy::Hash(..))) {
+        out.push_str(&hash_decls());
     }
     let mut list: Vec<CTy> = wanted.into_iter().collect();
     list.sort_by_cached_key(mangle);
@@ -6273,6 +6387,11 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             _ => {}
         }
+        if let CTy::Hash(k, _) = t
+            && hash::has_struct(*k)
+        {
+            let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
+        }
     }
     // Each definition comes after the types it holds by value.
     fn emit(p: &Program, t: &CTy, emitted: &mut HashSet<CTy>, out: &mut String) {
@@ -6296,10 +6415,26 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 ps.iter().for_each(|e| by_value_deps(e, &mut deps));
                 by_value_deps(r, &mut deps);
             }
+            CTy::Hash(_, args) => {
+                // A table holds its builder by value; an Entry its key.
+                if let Some(s) = args.last() {
+                    by_value_deps(s, &mut deps);
+                }
+                if let Some(k) = args.first() {
+                    by_value_deps(k, &mut deps);
+                }
+                by_value_deps(&hash::elem_cty(t), &mut deps);
+            }
             _ => {}
         }
         for d in &deps {
             emit(p, d, emitted, out);
+        }
+        if let CTy::Hash(k, _) = t
+            && hash::has_struct(*k)
+        {
+            let _ = writeln!(out, "struct {} {{ {} }};", ctype(t), hash::struct_fields(t));
+            return;
         }
         match t {
             CTy::Option(e) => match c_layout(p, t) {
@@ -6526,6 +6661,12 @@ fn glue_def(
             let _ = writeln!(protos, "void drop_{m}({ct} *p);");
             match t {
                 CTy::String => body.push_str("  lust_string_drop(p);\n"),
+                CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::drop_body(p, t, &mut need)),
+                // An occupied Entry dropped its key at `entry()`.
+                CTy::Hash(crate::ty::hash::HashTy::Entry, a) => {
+                    need(Glue::Drop, &a[0]);
+                    let _ = writeln!(body, "  if (!p->slot) drop_{}(&p->key);", mangle(&a[0]));
+                }
                 CTy::Vec(e) => {
                     if needs_drop_c(p, e) {
                         need(Glue::Drop, e);
@@ -6707,6 +6848,7 @@ fn glue_def(
             }
             match t {
                 CTy::String => body.push_str("  return lust_string_clone(p);\n"),
+                CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::clone_body(p, t, &mut need)),
                 CTy::Boxed(e) => {
                     let et = ctype(e);
                     let c = clone_of(e, "(**p)", &mut need);
@@ -7085,6 +7227,7 @@ fn glue_def(
                 }
             };
             match t {
+                CTy::Hash(..) => body.push_str(&hash::default_body(p, t, &mut need)),
                 CTy::String => body.push_str("  return lust_string_new();\n"),
                 CTy::Vec(e) => {
                     let et = ctype(e);
@@ -7154,6 +7297,19 @@ fn glue_def(
             let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
             let body = fmt::display_glue_body(p, t, slots, types);
             let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
+        }
+        Glue::HashValue
+        | Glue::HashKey
+        | Glue::HashOf
+        | Glue::HashEq
+        | Glue::HashClone
+        | Glue::HashKeyQ
+        | Glue::HashEqQ
+        | Glue::HashEqEntry
+        | Glue::HashDrop => {
+            let (sig, body) = hash::glue(p, slots, g, t, &mut need);
+            let _ = writeln!(protos, "{sig};");
+            let _ = writeln!(defs, "{sig} {{\n{body}}}\n");
         }
     }
 }

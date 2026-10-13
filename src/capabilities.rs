@@ -389,6 +389,28 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::TlsAccess,
     Builtin::TlsTryAccess,
     Builtin::TlsInitWith,
+    Builtin::HashNew,
+    Builtin::HashWithCapacity,
+    Builtin::HashWithHasher,
+    Builtin::HashWithCapacityAndHasher,
+    Builtin::HashDefault,
+    Builtin::HashLen,
+    Builtin::HashIsEmpty,
+    Builtin::HashClear,
+    Builtin::HashCapacity,
+    Builtin::MapInsert,
+    Builtin::MapGet,
+    Builtin::MapGetMut,
+    Builtin::MapContainsKey,
+    Builtin::MapRemove,
+    Builtin::MapEntry,
+    Builtin::EntryOrInsert,
+    Builtin::EntryOrDefault,
+    Builtin::EntryKey,
+    Builtin::SetInsert,
+    Builtin::SetContains,
+    Builtin::SetRemove,
+    Builtin::SetGet,
 ];
 
 /// How a builtin is called.
@@ -708,6 +730,33 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         ),
         B::FmtWriteFmt => (&["fmt::Formatter", "String"], vec![i.intern("write_fmt")], Call::Method),
         B::FmtCallDisplay | B::FmtCallDebug => (&["builtin Display and Debug types"], vec![i.intern("fmt")], Call::Method),
+        B::HashNew | B::HashWithCapacity | B::HashWithHasher | B::HashWithCapacityAndHasher | B::HashDefault => (
+            &["HashMap<K, V, S>", "HashSet<T, S>", "RandomState", "DefaultHasher"],
+            vec![
+                i.intern("new"),
+                i.intern("with_capacity"),
+                i.intern("with_hasher"),
+                i.intern("with_capacity_and_hasher"),
+                i.intern("default"),
+            ],
+            Call::Associated,
+        ),
+        B::HashLen | B::HashIsEmpty | B::HashClear | B::HashCapacity => (
+            &["HashMap<K, V, S>", "HashSet<T, S>"],
+            vec![i.intern("len"), i.intern("is_empty"), i.intern("clear"), i.intern("capacity")],
+            Call::Method,
+        ),
+        B::MapInsert | B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::MapEntry => (
+            &["HashMap<K, V, S>"],
+            vec![i.intern("insert"), i.intern("get"), i.intern("get_mut"), i.intern("contains_key"), i.intern("remove"), i.intern("entry")],
+            Call::Method,
+        ),
+        B::EntryOrInsert | B::EntryOrDefault | B::EntryKey => {
+            (&["hash_map::Entry<K, V>"], vec![i.intern("or_insert"), i.intern("or_default"), i.intern("key")], Call::Method)
+        }
+        B::SetInsert | B::SetContains | B::SetRemove | B::SetGet => {
+            (&["HashSet<T, S>"], vec![i.intern("insert"), i.intern("contains"), i.intern("remove"), i.intern("get")], Call::Method)
+        }
         B::ConvIdent | B::ConvStrBytes | B::ConvArraySlice | B::ConvDeref | B::ConvRcInner => (
             &["str", "String", "[T]", "[T; N]", "Vec<T>", "Box<T>", "Rc<T>", "&T"],
             vec![i.intern("as_ref"), i.intern("as_mut"), i.intern("borrow"), i.intern("borrow_mut")],
@@ -949,8 +998,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("#[derive(PartialOrd)]", "L9001"),
     ("#[derive(Ord)]", "L9001"),
     ("#[derive(Default)]", "L9001"),
-    ("the `HashMap` type", "L0641"),
-    ("the `HashSet` type", "L0641"),
     ("the `BTreeMap` type", "L0641"),
     ("a Box of an unsized type", "L0641"),
     ("an Rc of an unsized type", "L0641"),

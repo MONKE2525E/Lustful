@@ -1,0 +1,784 @@
+// The hashed collections in C (W-STD-B; ty/hash.rs, runtime/hash.h).
+//
+// A `HashMap<K, V, S>` is `{ lust_hash_table t; S s; }` over elements
+// `(K, V)` (a `HashSet<T, S>` over `T`), laid out by the hashbrown-exact
+// core. Hashing runs Rust's byte streams: `hv_*` glue feeds a value to a
+// hasher exactly as core's `Hash` impls and derives do (str adds 0xff,
+// slices a length prefix, enums an `isize` discriminant), through the
+// hasher's own methods (a user `impl Hasher`, with core's defaults for
+// the methods it leaves out) or the SipHash-1-3 of `DefaultHasher`.
+use super::*;
+use crate::check::hashmap::HASHER_METHODS;
+use crate::ty::hash::HashTy;
+
+/// True for the two table types (`HashMap`, `HashSet`).
+pub(super) fn is_table(k: HashTy) -> bool {
+    matches!(k, HashTy::HashMap | HashTy::HashSet)
+}
+
+/// True for the hash types cgen declares a struct for: the tables and
+/// `Entry`.
+pub(super) fn has_struct(k: HashTy) -> bool {
+    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry)
+}
+
+/// The member list of a declared hash struct: a table and its builder,
+/// or an Entry (the table, the key's hash, the found element or NULL,
+/// and the key moved in).
+pub(super) fn struct_fields(t: &CTy) -> String {
+    match t {
+        CTy::Hash(HashTy::Entry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
+        _ => format!("lust_hash_table t; {} s;", ctype(&builder_cty(t))),
+    }
+}
+
+/// The C type name of one hash type.
+pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
+    match k {
+        HashTy::HashMap | HashTy::HashSet => format!("HT_{mangled}"),
+        HashTy::RandomState => "lust_random_state".into(),
+        HashTy::DefaultHasher => "lust_sip13".into(),
+        HashTy::BuildHasherDefault => "lust_Unit".into(),
+        HashTy::Entry => format!("HE_{mangled}"),
+    }
+}
+
+/// The element type of a table: `(K, V)` for a map and its Entry, `T`
+/// for a set.
+pub(super) fn elem_cty(t: &CTy) -> CTy {
+    match t {
+        CTy::Hash(HashTy::HashMap | HashTy::Entry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
+        CTy::Hash(HashTy::HashSet, a) => a[0].clone(),
+        _ => CTy::Unit,
+    }
+}
+
+/// The key type of a table.
+pub(super) fn key_cty(t: &CTy) -> CTy {
+    match t {
+        CTy::Hash(_, a) if !a.is_empty() => a[0].clone(),
+        _ => CTy::Unit,
+    }
+}
+
+/// The `S` (BuildHasher) type of a table.
+fn builder_cty(t: &CTy) -> CTy {
+    match t {
+        CTy::Hash(_, a) => a.last().cloned().unwrap_or(CTy::Unit),
+        _ => CTy::Unit,
+    }
+}
+
+/// The key's place inside an element pointer expression `e`.
+fn key_of(t: &CTy, e: &str) -> String {
+    match t {
+        CTy::Hash(HashTy::HashMap, _) => format!("(&({e})->f0)"),
+        _ => format!("({e})"),
+    }
+}
+
+/// The `Hasher` a `BuildHasher` builds: DefaultHasher for RandomState,
+/// `H` for BuildHasherDefault<H>, a user impl's `Hasher` assoc type.
+pub(super) fn hasher_cty(p: &Program, s: &CTy) -> CTy {
+    match s {
+        CTy::Hash(HashTy::RandomState, _) => CTy::Hash(HashTy::DefaultHasher, Vec::new()),
+        CTy::Hash(HashTy::BuildHasherDefault, a) => a.first().cloned().unwrap_or(CTy::Unit),
+        CTy::Adt(a) => p.gx.build_hashers.get(a).map_or(CTy::Unit, |&(_, h)| cty(&p.tys, h)),
+        _ => CTy::Unit,
+    }
+}
+
+/// The C expression of a fresh hasher from the builder at `s` (a
+/// `S*`): `BuildHasher::build_hasher`.
+fn build_expr(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    match s_cty {
+        CTy::Hash(HashTy::RandomState, _) => format!("lust_sip13_new_with_keys(({s})->k0, ({s})->k1)"),
+        CTy::Hash(HashTy::BuildHasherDefault, a) => match a.first() {
+            Some(CTy::Hash(HashTy::DefaultHasher, _)) => "lust_sip13_new_with_keys(0, 0)".into(),
+            Some(h) => {
+                need(Glue::Default, h);
+                format!("default_{}()", mangle(h))
+            }
+            None => "0".into(),
+        },
+        CTy::Adt(a) => match p.gx.build_hashers.get(a) {
+            Some(&(f, _)) => format!("(({}lust_fns[{}])({s}))", fn_ptr_cast(p, f), slots[f.0 as usize]),
+            None => "0".into(),
+        },
+        _ => "0".into(),
+    }
+}
+
+/// The C type of the bytes argument of `Hasher::write` (`&[u8]`).
+fn bytes_cty() -> CTy {
+    CTy::Slice(Box::new(CTy::Int(IntTy::U8)))
+}
+
+/// One Hasher method call on `h` (an `H*`) with argument `arg` (a C
+/// value of the method's argument type, or "" for `finish`), as a C
+/// statement (`finish`: an expression). A user hasher calls its own
+/// method, else core's default for it: `write_<uint>` writes the
+/// value's native-endian bytes, `write_<int>` defers to the unsigned
+/// method of the same width.
+fn hasher_call(p: &Program, slots: &[u32], hc: &CTy, m: usize, h: &str, arg: &str) -> String {
+    let name = HASHER_METHODS[m];
+    let int_of = |m: usize| crate::check::hashmap::hasher_write_arg(HASHER_METHODS[m]).flatten();
+    match hc {
+        CTy::Hash(HashTy::DefaultHasher, _) => match name {
+            "finish" => format!("lust_sip13_finish({h})"),
+            "write" => format!("{{ {} b_ = {arg}; lust_sip13_write({h}, b_.ptr, b_.len); }}", ctype(&bytes_cty())),
+            _ => {
+                let it = int_of(m).unwrap_or(IntTy::U8);
+                format!("{{ {} v_ = {arg}; lust_sip13_write({h}, &v_, sizeof v_); }}", int_c(it))
+            }
+        },
+        CTy::Adt(a) => {
+            if let Some(&f) = p.gx.hasher_methods.get(&(*a, m as u8)) {
+                let call = format!(
+                    "(({}lust_fns[{}])({h}{}{arg}))",
+                    fn_ptr_cast(p, f),
+                    slots[f.0 as usize],
+                    if arg.is_empty() { "" } else { ", " }
+                );
+                return if name == "finish" { call } else { format!("{call};") };
+            }
+            match name {
+                "finish" | "write" => "0".into(),
+                _ => {
+                    let it = int_of(m).unwrap_or(IntTy::U8);
+                    if it.signed() {
+                        // write_iN(x) is write_uN(x as uN): the same bits,
+                        // read through a pointer (128-bit values are structs).
+                        let u = unsigned_of(it);
+                        let call = hasher_call(p, slots, hc, write_int(u), h, &format!("(*({}*)&s_)", int_c(u)));
+                        format!("{{ {} s_ = {arg}; {call} }}", int_c(it))
+                    } else {
+                        let w = HASHER_METHODS.iter().position(|n| *n == "write").unwrap_or(1);
+                        let bytes = format!("(({}){{ (uint8_t*)&v_, sizeof v_ }})", ctype(&bytes_cty()));
+                        format!("{{ {} v_ = {arg}; {} }}", int_c(it), hasher_call(p, slots, hc, w, h, &bytes))
+                    }
+                }
+            }
+        }
+        _ => "0".into(),
+    }
+}
+
+/// The unsigned integer type of the same width.
+fn unsigned_of(i: IntTy) -> IntTy {
+    match i {
+        IntTy::I8 => IntTy::U8,
+        IntTy::I16 => IntTy::U16,
+        IntTy::I32 => IntTy::U32,
+        IntTy::I64 => IntTy::U64,
+        IntTy::Isize => IntTy::Usize,
+        IntTy::I128 => IntTy::U128,
+        u => u,
+    }
+}
+
+/// The HASHER_METHODS index of `write_<i>`.
+fn write_int(i: IntTy) -> usize {
+    HASHER_METHODS.iter().position(|n| *n == format!("write_{}", i.name())).unwrap_or(2)
+}
+
+/// The glue key of the hash value glue for values of `t` fed to a
+/// hasher of `hc`. The key tuple carries `&[u8]` so the glue's units
+/// declare the bytes type the hasher calls take.
+pub(super) fn hv_key(t: &CTy, hc: &CTy) -> CTy {
+    CTy::Tuple(vec![t.clone(), hc.clone(), bytes_cty()])
+}
+
+/// C statements that hash the value `v` points at (a `ctype(t)*`) into
+/// the hasher `h` (an `H*`), as core's `Hash` impl of `t` does.
+fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let call = |m: usize, arg: &str| hasher_call(p, slots, hc, m, h, arg);
+    let write = HASHER_METHODS.iter().position(|n| *n == "write").unwrap_or(1);
+    let bytes = |ptr: &str, len: &str| format!("(({}){{ (uint8_t*)({ptr}), {len} }})", ctype(&bytes_cty()));
+    match t {
+        CTy::Unit => String::new(),
+        CTy::Int(i) => call(write_int(*i), &format!("(*{v})")),
+        CTy::Bool => call(write_int(IntTy::U8), &format!("(uint8_t)(*{v})")),
+        CTy::Char => call(write_int(IntTy::U32), &format!("(uint32_t)(*{v})")),
+        // str: write(bytes), then write_u8(0xff) (Hasher::write_str's default).
+        CTy::Str | CTy::String => {
+            let s = if *t == CTy::String { format!("lust_string_as_str({v})") } else { format!("(*{v})") };
+            format!("{{ lust_str s_ = {s}; {} {} }}", call(write, &bytes("s_.ptr", "s_.len")), call(write_int(IntTy::U8), "0xff"))
+        }
+        CTy::Ref(inner) if **inner == CTy::Str => hash_stmts(p, slots, &CTy::Str, hc, h, v, need),
+        CTy::Ref(inner) | CTy::Boxed(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(*{v})"), need),
+        CTy::Rc(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(&(*{v})->v)"), need),
+        CTy::Tuple(es) => es.iter().enumerate().map(|(i, e)| hash_stmts(p, slots, e, hc, h, &format!("(&({v})->f{i})"), need)).collect(),
+        // [T], Vec<T>, [T; N]: write_length_prefix (write_usize), then
+        // hash_slice: one write of all bytes for integers, else each.
+        CTy::Slice(e) | CTy::Vec(e) | CTy::Array(e, _) => {
+            let (ptr, len) = match t {
+                CTy::Slice(_) => (format!("({v})->ptr"), format!("({v})->len")),
+                CTy::Vec(_) => (format!("(({}*)({v})->ptr)", ctype(e)), format!("({v})->len")),
+                CTy::Array(_, n) => (format!("({v})->v"), format!("((uint64_t){n})")),
+                _ => unreachable!(),
+            };
+            let mut s = format!("{{ uint64_t n_ = {len}; {}", call(write_int(IntTy::Usize), "n_"));
+            if let CTy::Int(_) = **e {
+                let _ = write!(s, " {}", call(write, &bytes(&ptr, &format!("n_ * sizeof(*{ptr})"))));
+            } else {
+                need(Glue::HashValue, &hv_key(e, hc));
+                let _ = write!(s, " for (uint64_t i_ = 0; i_ < n_; i_++) hv_{}({h}, &({ptr})[i_]);", mangle(&hv_key(e, hc)));
+            }
+            s.push_str(" }");
+            s
+        }
+        _ => {
+            need(Glue::HashValue, &hv_key(t, hc));
+            format!("hv_{}({h}, {v});", mangle(&hv_key(t, hc)))
+        }
+    }
+}
+
+/// The body of `void hv_<T,H>(H *h, T *p)`: Option and Result as
+/// core derives them (an `isize` discriminant, then the payload), and a
+/// derived Adt: a discriminant for an enum of more than one variant
+/// (its repr type, `isize` by default; the variant's value), then the
+/// fields in order. Everything else is `hash_stmts`.
+pub(super) fn hash_value_body(p: &Program, slots: &[u32], key: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let CTy::Tuple(parts) = key else { return String::new() };
+    let (t, hc) = (&parts[0], &parts[1]);
+    let isize_call = |disc: &str| hasher_call(p, slots, hc, write_int(IntTy::Isize), "h", &format!("(int64_t)({disc})"));
+    let mut body = String::new();
+    match t {
+        CTy::Option(e) => {
+            let disc = disc_call(p, t, "p");
+            let _ = writeln!(body, "  {}", isize_call(&disc));
+            let f = format!("&{}", variant_field(p, t, "(*p)", 1, 0));
+            let _ = writeln!(body, "  if ({disc}) {{ {} }}", hash_stmts(p, slots, e, hc, "h", &f, need));
+        }
+        CTy::Result(a, b) => {
+            let disc = disc_call(p, t, "p");
+            let _ = writeln!(body, "  {}", isize_call(&disc));
+            let fa = format!("&{}", variant_field(p, t, "(*p)", 0, 0));
+            let fb = format!("&{}", variant_field(p, t, "(*p)", 1, 0));
+            let _ = writeln!(
+                body,
+                "  if ({disc}) {{ {} }} else {{ {} }}",
+                hash_stmts(p, slots, b, hc, "h", &fb, need),
+                hash_stmts(p, slots, a, hc, "h", &fa, need)
+            );
+        }
+        CTy::Adt(a) => {
+            let adt = p.adt(*a);
+            if adt.is_enum {
+                let disc = disc_call(p, t, "p");
+                let _ = writeln!(body, "  switch ({disc}) {{");
+                for (vi, v) in adt.variants.iter().enumerate() {
+                    let mut arm = String::new();
+                    if adt.variants.len() > 1 {
+                        let dv = v.disc;
+                        let m = match adt.repr.int {
+                            Some((bits, signed)) => {
+                                let it =
+                                    IntTy::ALL.iter().copied().find(|i| i.bits() == bits && i.signed() == signed).unwrap_or(IntTy::Isize);
+                                (write_int(it), format!("({}){dv}", int_c(it)))
+                            }
+                            None => (write_int(IntTy::Isize), format!("(int64_t){dv}")),
+                        };
+                        arm.push_str(&hasher_call(p, slots, hc, m.0, "h", &m.1));
+                    }
+                    for (fi, fd) in v.fields.iter().enumerate() {
+                        arm.push_str(&hash_stmts(p, slots, &cty(&p.tys, fd.ty), hc, "h", &format!("(&p->u.v{vi}.f{fi})"), need));
+                    }
+                    let _ = writeln!(body, "  case {vi}: {arm} break;");
+                }
+                body.push_str("  }\n");
+            } else {
+                for (fi, fd) in adt.variants[0].fields.iter().enumerate() {
+                    let _ = writeln!(body, "  {}", hash_stmts(p, slots, &cty(&p.tys, fd.ty), hc, "h", &format!("(&p->f{fi})"), need));
+                }
+            }
+        }
+        _ => {
+            let _ = writeln!(body, "  {}", hash_stmts(p, slots, t, hc, "h", "p", need));
+        }
+    }
+    body
+}
+
+/// The C signature of the hash value glue of `key`.
+pub(super) fn hash_value_sig(key: &CTy) -> String {
+    let CTy::Tuple(parts) = key else { return String::new() };
+    format!("void hv_{}({} *h, {} *p)", mangle(key), ctype(&parts[1]), ctype(&parts[0]))
+}
+
+/// The body of `uint64_t hk_<map>(S *s, K *k)`: one key hashed with a
+/// fresh hasher from the map's builder, as `make_hash` does.
+pub(super) fn hash_key_body(p: &Program, slots: &[u32], map: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let s_cty = builder_cty(map);
+    let hc = hasher_cty(p, &s_cty);
+    let build = build_expr(p, slots, &s_cty, "s", need);
+    let stmts = hash_stmts(p, slots, k_cty, &hc, "(&h)", "k", need);
+    let finish = hasher_call(p, slots, &hc, 0, "(&h)", "");
+    let drop = if needs_drop_c(p, &hc) {
+        need(Glue::Drop, &hc);
+        format!(" drop_{}(&h);", mangle(&hc))
+    } else {
+        String::new()
+    };
+    format!("  {} h = {build};\n  {stmts}\n  uint64_t r = {finish};{drop}\n  return r;\n", ctype(&hc))
+}
+
+/// One hash glue function: (signature, body).
+pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> (String, String) {
+    let m = mangle(t);
+    match g {
+        Glue::HashValue => (hash_value_sig(t), hash_value_body(p, slots, t, need)),
+        Glue::HashKey => {
+            let s = ctype(&builder_cty(t));
+            let k = ctype(&key_cty(t));
+            (format!("uint64_t hk_{m}({s} *s, {k} *k)"), hash_key_body(p, slots, t, &key_cty(t), need))
+        }
+        Glue::HashOf => {
+            need(Glue::HashKey, t);
+            let (s, k, e) = (ctype(&builder_cty(t)), ctype(&key_cty(t)), ctype(&elem_cty(t)));
+            let key = key_of(t, &format!("({e}*)elem"));
+            (format!("uint64_t hof_{m}(void *ctx, const void *elem)"), format!("  return hk_{m}(({s}*)ctx, ({k}*){key});\n"))
+        }
+        Glue::HashEq => {
+            let (k_cty, e) = (key_cty(t), ctype(&elem_cty(t)));
+            let key = key_of(t, &format!("({e}*)elem"));
+            let eq = eq_expr(p, &k_cty, &format!("({}*)ctx", ctype(&k_cty)), &format!("({}*){key}", ctype(&k_cty)), need);
+            (format!("int heq_{m}(void *ctx, const void *elem)"), format!("  return {eq};\n"))
+        }
+        Glue::HashEqEntry => {
+            // `rustc_entry` compares `stored == probe` (the other
+            // lookups put the probe key on the left).
+            let (k_cty, e) = (key_cty(t), ctype(&elem_cty(t)));
+            let key = key_of(t, &format!("({e}*)elem"));
+            let eq = eq_expr(p, &k_cty, &format!("({}*){key}", ctype(&k_cty)), &format!("({}*)ctx", ctype(&k_cty)), need);
+            (format!("int heqe_{m}(void *ctx, const void *elem)"), format!("  return {eq};\n"))
+        }
+        Glue::HashDrop => {
+            let ec = elem_cty(t);
+            need(Glue::Drop, &ec);
+            (format!("void hdr_{m}(void *ctx, void *elem)"), format!("  (void)ctx; drop_{}(({}*)elem);\n", mangle(&ec), ctype(&ec)))
+        }
+        Glue::HashClone => {
+            let ec = elem_cty(t);
+            let e = ctype(&ec);
+            let body = if is_copy_c(p, &ec) {
+                format!("  (void)ctx; *({e}*)dst = *({e}*)src;\n")
+            } else {
+                need(Glue::Clone, &ec);
+                format!("  (void)ctx; *({e}*)dst = clone_{}(({e}*)src);\n", mangle(&ec))
+            };
+            (format!("void hcl_{m}(void *ctx, void *dst, const void *src)"), body)
+        }
+        Glue::HashKeyQ | Glue::HashEqQ => {
+            let CTy::Tuple(parts) = t else { return (String::new(), String::new()) };
+            let (map, q) = (&parts[0], &parts[1]);
+            let qc = ctype(q);
+            if *g == Glue::HashKeyQ {
+                let s = ctype(&builder_cty(map));
+                (format!("uint64_t hkq_{m}({s} *s, {qc} *k)"), hash_key_body(p, slots, map, q, need))
+            } else {
+                let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
+                let key = key_of(map, &format!("({e}*)elem"));
+                let borrowed = borrow_expr(&k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
+                let eq = eq_expr(p, q, &format!("({qc}*)ctx"), &borrowed, need);
+                (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {eq};\n"))
+            }
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// A `Q*` expression for `<K as Borrow<Q>>::borrow` of the key at `k`
+/// (a `K*`): String to str, Vec<T> to [T], one deref of Box/Rc/&T, or
+/// the key itself. The result points at a temporary for the fat forms.
+fn borrow_expr(k: &CTy, q: &CTy, kp: &str) -> String {
+    if k == q {
+        return kp.to_string();
+    }
+    match (k, q) {
+        (CTy::String, CTy::Str) => format!("((lust_str[]){{ lust_string_as_str({kp}) }})"),
+        (CTy::Vec(e), CTy::Slice(_)) => format!("(&({}){{ ({}*)({kp})->ptr, ({kp})->len }})", ctype(q), ctype(e)),
+        (CTy::Array(_, n), CTy::Slice(_)) => format!("(&({}){{ ({kp})->v, {n} }})", ctype(q)),
+        // `&str` and `Box<str>` are the fat str value itself.
+        (CTy::Ref(inner) | CTy::Boxed(inner), CTy::Str) if **inner == CTy::Str => kp.to_string(),
+        (CTy::Boxed(_) | CTy::Ref(_), _) => format!("(*{kp})"),
+        (CTy::Rc(_), _) => format!("(&(*{kp})->v)"),
+        _ => kp.to_string(),
+    }
+}
+
+/// `PartialEq::eq` of two values of `t` at `a` and `b` (`t*`).
+fn eq_expr(p: &Program, t: &CTy, a: &str, b: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let _ = p;
+    match t {
+        CTy::Unit => "1".into(),
+        CTy::Bool | CTy::Char | CTy::Int(_) if !matches!(t, CTy::Int(i) if is128(*i)) => format!("(*({a}) == *({b}))"),
+        CTy::Str => format!("lust_str_eq(*({a}), *({b}))"),
+        CTy::Ref(inner) if **inner == CTy::Str => format!("lust_str_eq(*({a}), *({b}))"),
+        CTy::String => format!("lust_str_eq(lust_string_as_str({a}), lust_string_as_str({b}))"),
+        _ => {
+            need(Glue::Eq, t);
+            format!("eq_{}({a}, {b})", mangle(t))
+        }
+    }
+}
+
+/// The drop glue body of a table: the builder first, then every
+/// element in bucket order (hashbrown's field order and drop loop).
+pub(super) fn drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let (s, ec) = (builder_cty(t), elem_cty(t));
+    let mut body = String::new();
+    if needs_drop_c(p, &s) {
+        need(Glue::Drop, &s);
+        let _ = writeln!(body, "  drop_{}(&p->s);", mangle(&s));
+    }
+    if needs_drop_c(p, &ec) {
+        need(Glue::Drop, &ec);
+        let _ = writeln!(
+            body,
+            "  {{ lust_hash_iter it; lust_hash_iter_init(&it, &p->t); void *e; while ((e = lust_hash_iter_next(&it, 0))) drop_{}(({}*)e); }}",
+            mangle(&ec),
+            ctype(&ec)
+        );
+    }
+    body.push_str("  lust_hash_drop_table(&p->t, 0, 0);\n");
+    body
+}
+
+/// The clone glue body of a table: the builder, then the table with
+/// the same buckets, elements cloned in bucket order.
+pub(super) fn clone_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let (s, ec) = (builder_cty(t), elem_cty(t));
+    let ct = ctype(t);
+    let e = ctype(&ec);
+    let sc = if is_copy_c(p, &s) {
+        "p->s".to_string()
+    } else {
+        need(Glue::Clone, &s);
+        format!("clone_{}(&p->s)", mangle(&s))
+    };
+    need(Glue::HashClone, t);
+    format!(
+        "  {ct} r; r.s = {sc}; lust_hash_init(&r.t, sizeof({e}), _Alignof({e}));\n  lust_hash_clone_into(&r.t, &p->t, hcl_{}, 0);\n  return r;\n",
+        mangle(t)
+    )
+}
+
+/// The body of `default_T` for a hash type: `Default::default()` of
+/// the builders and hashers, and a table built `with_hasher(S::default())`.
+pub(super) fn default_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    match t {
+        CTy::Hash(k, _) if is_table(*k) => {
+            let (s, e) = (builder_cty(t), ctype(&elem_cty(t)));
+            let sv = default_of(p, &s, need);
+            format!("  {} r; r.s = {sv}; lust_hash_init(&r.t, sizeof({e}), _Alignof({e}));\n  return r;\n", ctype(t))
+        }
+        _ => format!("  return {};\n", default_of(p, t, need)),
+    }
+}
+
+/// `Default::default()` of a builder or hasher type as a C expression.
+fn default_of(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    match t {
+        CTy::Hash(HashTy::RandomState, _) => "lust_random_state_new()".into(),
+        CTy::Hash(HashTy::DefaultHasher, _) => "lust_sip13_new_with_keys(0, 0)".into(),
+        CTy::Hash(HashTy::BuildHasherDefault, _) | CTy::Unit => "((lust_Unit){})".into(),
+        _ => {
+            let _ = p;
+            need(Glue::Default, t);
+            format!("default_{}()", mangle(t))
+        }
+    }
+}
+
+/// True for the builtins `FnGen::hash_builtin` emits.
+fn is_hash_builtin(b: Builtin) -> bool {
+    use Builtin as B;
+    matches!(
+        b,
+        B::HashNew
+            | B::HashWithCapacity
+            | B::HashWithHasher
+            | B::HashWithCapacityAndHasher
+            | B::HashDefault
+            | B::HashLen
+            | B::HashIsEmpty
+            | B::HashClear
+            | B::HashCapacity
+            | B::MapInsert
+            | B::MapGet
+            | B::MapGetMut
+            | B::MapContainsKey
+            | B::MapRemove
+            | B::MapEntry
+            | B::EntryOrInsert
+            | B::EntryOrDefault
+            | B::EntryKey
+            | B::SetInsert
+            | B::SetContains
+            | B::SetRemove
+            | B::SetGet
+    )
+}
+
+impl FnGen<'_, '_, '_> {
+    /// One HashMap, HashSet, or Entry builtin call (check/hashmap.rs) as
+    /// hashbrown runs it, or None for every other builtin. `dest` is the
+    /// call's result type, which the constructors build.
+    pub(super) fn hash_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {
+        use Builtin as B;
+        if !is_hash_builtin(b) {
+            return None;
+        }
+        let mut vals = Vec::new();
+        let mut tys = Vec::new();
+        for o in ops {
+            let (v, t) = self.operand(o, loc, post);
+            vals.push(v);
+            tys.push(t);
+        }
+        collect_types(dest, &mut self.sig_types);
+        let dc = ctype(dest);
+        // The receiver: a table or Entry behind `&`/`&mut`, or an Entry
+        // by value.
+        let (recv, r) = match tys.first() {
+            Some(CTy::Ref(inner)) => ((**inner).clone(), format!("({})", vals[0])),
+            Some(t) => (t.clone(), format!("(&{})", vals.first().cloned().unwrap_or_default())),
+            None => (CTy::Unit, String::new()),
+        };
+        let t = self.tmp();
+        match b {
+            B::HashNew | B::HashWithCapacity | B::HashWithHasher | B::HashWithCapacityAndHasher | B::HashDefault => {
+                let CTy::Hash(k, _) = dest else { return Some("((lust_Unit){})".into()) };
+                if !is_table(*k) {
+                    let mut need = Vec::new();
+                    let v = default_of(self.p, dest, &mut |g, t| need.push((g, t.clone())));
+                    for (g, t) in need {
+                        self.want(g, &t);
+                    }
+                    return Some(v);
+                }
+                let e = ctype(&elem_cty(dest));
+                let s = match b {
+                    B::HashWithHasher => vals[0].clone(),
+                    B::HashWithCapacityAndHasher => vals[1].clone(),
+                    B::HashDefault => {
+                        let mut need = Vec::new();
+                        let v = default_of(self.p, &builder_cty(dest), &mut |g, t| need.push((g, t.clone())));
+                        for (g, t) in need {
+                            self.want(g, &t);
+                        }
+                        v
+                    }
+                    _ => "lust_random_state_new()".into(),
+                };
+                let init = match b {
+                    B::HashWithCapacity => format!("lust_hash_init_with_capacity(&{t}.t, sizeof({e}), _Alignof({e}), {});", vals[0]),
+                    B::HashWithCapacityAndHasher => {
+                        format!("lust_hash_init_with_capacity(&{t}.t, sizeof({e}), _Alignof({e}), {});", vals[0])
+                    }
+                    _ => format!("lust_hash_init(&{t}.t, sizeof({e}), _Alignof({e}));"),
+                };
+                let _ = writeln!(self.out, "    {dc} {t}; {t}.s = {s}; {init}");
+                Some(t)
+            }
+            B::HashLen => Some(format!("lust_hash_len(&{r}->t)")),
+            B::HashIsEmpty => Some(format!("((uint8_t)(lust_hash_len(&{r}->t) == 0))")),
+            B::HashCapacity => Some(format!("lust_hash_capacity(&{r}->t)")),
+            B::HashClear => {
+                let ec = elem_cty(&recv);
+                let drop = if needs_drop_c(self.p, &ec) {
+                    self.want(Glue::HashDrop, &recv);
+                    format!("hdr_{}", mangle(&recv))
+                } else {
+                    "0".into()
+                };
+                let _ = writeln!(self.out, "    lust_hash_clear(&{r}->t, {drop}, 0);");
+                Some("((lust_Unit){})".into())
+            }
+            B::MapGet | B::MapGetMut | B::MapContainsKey | B::SetContains | B::SetGet => {
+                // hashbrown's `get_inner`: an empty table answers None
+                // without hashing the key.
+                let (q, qp) = self.q_arg(&tys[1], &vals[1]);
+                let mk = self.want_q(&recv, &q);
+                let e = ctype(&elem_cty(&recv));
+                let f = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    {e} *{f} = 0; if (lust_hash_len(&{r}->t) != 0) {f} = ({e}*)lust_hash_find(&{r}->t, hkq_{mk}(&{r}->s, {qp}), heqq_{mk}, (void*){qp}, 0);"
+                );
+                Some(match b {
+                    B::MapContainsKey | B::SetContains => format!("((uint8_t)({f} != 0))"),
+                    _ => {
+                        let some = self.make_variant(dest, 1, &[if b == B::SetGet { f.clone() } else { format!("(&{f}->f1)") }]);
+                        let none = self.make_variant(dest, 0, &[]);
+                        let _ = writeln!(self.out, "    {dc} {t} = {f} ? {some} : {none};");
+                        t
+                    }
+                })
+            }
+            B::MapRemove | B::SetRemove => {
+                let (q, qp) = self.q_arg(&tys[1], &vals[1]);
+                let mk = self.want_q(&recv, &q);
+                let ec = elem_cty(&recv);
+                let (e, o) = (ctype(&ec), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {e} {o}; int {o}_hit = lust_hash_remove(&{r}->t, hkq_{mk}(&{r}->s, {qp}), heqq_{mk}, (void*){qp}, &{o});"
+                );
+                if b == B::SetRemove {
+                    if needs_drop_c(self.p, &ec) {
+                        self.want(Glue::Drop, &ec);
+                        let _ = writeln!(self.out, "    if ({o}_hit) drop_{}(&{o});", mangle(&ec));
+                    }
+                    return Some(format!("((uint8_t){o}_hit)"));
+                }
+                let kc = key_cty(&recv);
+                if needs_drop_c(self.p, &kc) {
+                    self.want(Glue::Drop, &kc);
+                    let _ = writeln!(self.out, "    if ({o}_hit) drop_{}(&{o}.f0);", mangle(&kc));
+                }
+                let some = self.make_variant(dest, 1, &[format!("{o}.f1")]);
+                let none = self.make_variant(dest, 0, &[]);
+                let _ = writeln!(self.out, "    {dc} {t} = {o}_hit ? {some} : {none};");
+                Some(t)
+            }
+            B::MapInsert | B::SetInsert => {
+                let m = mangle(&recv);
+                for g in [Glue::HashKey, Glue::HashEq, Glue::HashOf] {
+                    self.want(g, &recv);
+                }
+                let (kc, ec) = (key_cty(&recv), elem_cty(&recv));
+                let (k, e) = (ctype(&kc), ctype(&ec));
+                let (kv, h, s, i) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {k} {kv} = {}; uint64_t {h} = hk_{m}(&{r}->s, &{kv}); void *{s}; uint64_t {i};", vals[1]);
+                let drop_key = if needs_drop_c(self.p, &kc) {
+                    self.want(Glue::Drop, &kc);
+                    format!(" drop_{}(&{kv});", mangle(&kc))
+                } else {
+                    String::new()
+                };
+                let find = format!("lust_hash_find_or_insert(&{r}->t, {h}, heq_{m}, &{kv}, hof_{m}, &{r}->s, &{s}, &{i})");
+                if b == B::SetInsert {
+                    let _ = writeln!(
+                        self.out,
+                        "    uint8_t {t}; if ({find}) {{ {t} = 0;{drop_key} }} else {{ *({e}*)lust_hash_insert_at(&{r}->t, {h}, {i}) = {kv}; {t} = 1; }}"
+                    );
+                    return Some(t);
+                }
+                let vt = match &ec {
+                    CTy::Tuple(es) => ctype(&es[1]),
+                    _ => "lust_Unit".into(),
+                };
+                let vv = self.tmp();
+                let some = self.make_variant(dest, 1, &[format!("(({e}*){s})->f1")]);
+                let none = self.make_variant(dest, 0, &[]);
+                let _ = writeln!(
+                    self.out,
+                    "    {vt} {vv} = {}; {dc} {t}; if ({find}) {{ {t} = {some}; (({e}*){s})->f1 = {vv};{drop_key} }} else {{ {e} *n_{t} = ({e}*)lust_hash_insert_at(&{r}->t, {h}, {i}); n_{t}->f0 = {kv}; n_{t}->f1 = {vv}; {t} = {none}; }}",
+                    vals[2]
+                );
+                Some(t)
+            }
+            B::MapEntry => {
+                // hashbrown's `rustc_entry`: hash, find (stored == probe);
+                // occupied drops the probe key now, vacant reserves one.
+                let m = mangle(&recv);
+                for g in [Glue::HashKey, Glue::HashEqEntry, Glue::HashOf] {
+                    self.want(g, &recv);
+                }
+                let kc = key_cty(&recv);
+                let k = ctype(&kc);
+                let kv = self.tmp();
+                let drop_key = if needs_drop_c(self.p, &kc) {
+                    self.want(Glue::Drop, &kc);
+                    format!("drop_{}(&{kv});", mangle(&kc))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {k} {kv} = {}; {dc} {t}; {t}.t = &{r}->t; {t}.hash = hk_{m}(&{r}->s, &{kv}); {t}.slot = lust_hash_find(&{r}->t, {t}.hash, heqe_{m}, &{kv}, 0);",
+                    vals[1]
+                );
+                let _ = writeln!(
+                    self.out,
+                    "    if ({t}.slot) {{ {drop_key} }} else {{ lust_hash_reserve(&{r}->t, 1, hof_{m}, &{r}->s); {t}.key = {kv}; }}"
+                );
+                Some(t)
+            }
+            B::EntryOrInsert | B::EntryOrDefault => {
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let vc = match &ec {
+                    CTy::Tuple(es) => es[1].clone(),
+                    _ => CTy::Unit,
+                };
+                let ev = self.tmp();
+                let _ = writeln!(self.out, "    {} {ev} = {};", ctype(&recv), vals[0]);
+                let (pre, occupied_drop, value) = if b == B::EntryOrInsert {
+                    let vv = self.tmp();
+                    let drop = if needs_drop_c(self.p, &vc) {
+                        self.want(Glue::Drop, &vc);
+                        format!(" drop_{}(&{vv});", mangle(&vc))
+                    } else {
+                        String::new()
+                    };
+                    (format!("{} {vv} = {}; ", ctype(&vc), vals[1]), drop, vv)
+                } else {
+                    let mut need = Vec::new();
+                    let v = match &vc {
+                        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(self.p, &vc),
+                        _ => {
+                            need.push((Glue::Default, vc.clone()));
+                            format!("default_{}()", mangle(&vc))
+                        }
+                    };
+                    for (g, t) in need {
+                        self.want(g, &t);
+                    }
+                    (String::new(), String::new(), v)
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {pre}{dc} {t}; if ({ev}.slot) {{ {t} = &(({e}*){ev}.slot)->f1;{occupied_drop} }} else {{ {e} *n_{t} = ({e}*)lust_hash_insert_no_grow_slot({ev}.t, {ev}.hash, 0); n_{t}->f0 = {ev}.key; n_{t}->f1 = {value}; {t} = &n_{t}->f1; }}"
+                );
+                Some(t)
+            }
+            B::EntryKey => {
+                let e = ctype(&elem_cty(&recv));
+                Some(format!("({r}->slot ? &(({e}*){r}->slot)->f0 : &{r}->key)"))
+            }
+            _ => None,
+        }
+    }
+
+    /// The lookup type `Q` of a `&Q` argument and a `Q*` C expression for
+    /// it (a fat `&str` or `&[T]` goes through a temporary).
+    fn q_arg(&mut self, t: &CTy, v: &str) -> (CTy, String) {
+        match t {
+            CTy::Ref(inner) if **inner == CTy::Str => {
+                let q = self.tmp();
+                let _ = writeln!(self.out, "    lust_str {q} = {v};");
+                (CTy::Str, format!("(&{q})"))
+            }
+            CTy::Ref(inner) => ((**inner).clone(), format!("({v})")),
+            _ => {
+                let q = self.tmp();
+                let _ = writeln!(self.out, "    {} {q} = {v};", ctype(t));
+                (t.clone(), format!("(&{q})"))
+            }
+        }
+    }
+
+    /// Requests the per-(table, Q) lookup glue and returns its mangled
+    /// key.
+    fn want_q(&mut self, table: &CTy, q: &CTy) -> String {
+        let key = CTy::Tuple(vec![table.clone(), q.clone()]);
+        self.want(Glue::HashKeyQ, &key);
+        self.want(Glue::HashEqQ, &key);
+        mangle(&key)
+    }
+}

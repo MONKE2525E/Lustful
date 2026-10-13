@@ -1,0 +1,89 @@
+// The hashed collections lust knows by def (W-STD-B): `HashMap`,
+// `HashSet`, and the std hasher types. Each is a builtin Adt with its
+// own def; values live in C over the hashbrown-exact table core
+// (src/runtime/hash.h), with the element layout and callbacks cgen
+// generates per instance (cgen/hash.rs).
+use super::*;
+
+/// One hashed-collection struct lust knows by def.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HashTy {
+    /// `HashMap<K, V, S>`: args `[K, V, S]`.
+    HashMap,
+    /// `HashSet<T, S>`: args `[T, S]`.
+    HashSet,
+    /// `hash::RandomState`, the default `S`.
+    RandomState,
+    /// `hash::DefaultHasher` (SipHash-1-3), RandomState's hasher.
+    DefaultHasher,
+    /// `hash::BuildHasherDefault<H>`: args `[H]`.
+    BuildHasherDefault,
+    /// `hash_map::Entry<'a, K, V>`: args `[K, V]`. Only its methods are
+    /// supported (not matching on its variants).
+    Entry,
+}
+
+impl HashTy {
+    pub const ALL: [HashTy; 6] =
+        [HashTy::HashMap, HashTy::HashSet, HashTy::RandomState, HashTy::DefaultHasher, HashTy::BuildHasherDefault, HashTy::Entry];
+
+    /// The std module path and struct name: the def hash input and the
+    /// printed name.
+    pub fn path(self) -> (&'static [&'static str], &'static str) {
+        match self {
+            HashTy::HashMap => (&["std", "collections", "hash_map"], "HashMap"),
+            HashTy::HashSet => (&["std", "collections", "hash_set"], "HashSet"),
+            HashTy::RandomState => (&["std", "hash", "random"], "RandomState"),
+            HashTy::DefaultHasher => (&["std", "hash", "random"], "DefaultHasher"),
+            HashTy::BuildHasherDefault => (&["core", "hash"], "BuildHasherDefault"),
+            HashTy::Entry => (&["std", "collections", "hash_map"], "Entry"),
+        }
+    }
+
+    /// The number of type args.
+    pub fn n_args(self) -> usize {
+        match self {
+            HashTy::HashMap => 3,
+            HashTy::HashSet | HashTy::Entry => 2,
+            HashTy::BuildHasherDefault => 1,
+            HashTy::RandomState | HashTy::DefaultHasher => 0,
+        }
+    }
+
+    /// The kind a std path's last segment names.
+    pub fn by_name(name: &str) -> Option<HashTy> {
+        HashTy::ALL.iter().copied().find(|k| k.path().1 == name)
+    }
+}
+
+/// The def of one hash struct (see `BuiltinDefs::hash_tys`).
+pub(super) fn hash_def(k: HashTy) -> DefId {
+    let (module, name) = k.path();
+    builtin_def(module, name)
+}
+
+/// The hash kind and type args of a type, when it is one of these.
+pub fn hash_parts(tys: &impl TyIntern, t: Ty) -> Option<(HashTy, Vec<Ty>)> {
+    let Some(BuiltinTy::Hash(k)) = tys.builtin_of(t) else { return None };
+    let (_, a) = tys.adt_parts(t)?;
+    Some((k, tys.args(a).iter().filter_map(|g| g.as_ty()).collect()))
+}
+
+/// The type of one hash struct at `args`.
+pub fn mk_hash(tys: &mut impl TyIntern, k: HashTy, args: &[Ty]) -> Ty {
+    let def = tys.builtins().hash_tys[k as usize];
+    let a: Vec<GenericArg> = args.iter().map(|&t| GenericArg::Ty(t)).collect();
+    tys.mk_adt(def, &a)
+}
+
+/// The error for a hash type named without its import (rustc E0412):
+/// none of these is in the prelude.
+pub fn not_imported(k: HashTy, span: crate::diag::Span) -> crate::diag::Diag {
+    let name = k.path().1;
+    let fix = match k {
+        HashTy::HashMap | HashTy::HashSet => format!("Import it: `use std::collections::{name};`."),
+        HashTy::Entry => "Name the entry through its methods only (`map.entry(k).or_insert(v)`).".to_string(),
+        _ => format!("Import it: `use std::hash::{name};`."),
+    };
+    crate::diag::Diag::new("L0102", span, format!("cannot find type `{name}` in this scope"), fix)
+}
