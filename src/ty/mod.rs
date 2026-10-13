@@ -847,6 +847,13 @@ pub trait TyIntern {
     fn boxed_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Boxed)).then(|| self.adt_first_ty_arg(t)).flatten()
     }
+    /// The element type of a boxed slice `Box<[T]>`.
+    fn boxed_slice_elem(&self, t: Ty) -> Option<Ty> {
+        match self.kind(self.boxed_elem(t)?) {
+            TyKind::Slice(e) => Some(e),
+            _ => None,
+        }
+    }
     /// The pointee type of an `Rc<T>`.
     fn rc_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Rc)).then(|| self.adt_first_ty_arg(t)).flatten()

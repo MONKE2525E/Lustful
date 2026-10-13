@@ -79,6 +79,9 @@ pub enum CTy {
     Fmt(crate::ty::fmt::FmtTy),
     /// A `process::ExitCode`: its status byte as a `uint8_t`.
     ExitCode,
+    /// A `Box<[T]>`: the slice's fat `{ptr, len}` struct, owning its
+    /// elements and buffer; a deref is the slice place itself.
+    BoxSlice(Box<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -152,7 +155,10 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::Boxed | BuiltinTy::Rc) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
                 if tys.builtin_of(t) == Some(BuiltinTy::Boxed) { CTy::BoxDyn } else { CTy::RcDyn }
             }
-            Some(BuiltinTy::Boxed) => CTy::Boxed(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Boxed) => match tys.boxed_slice_elem(t) {
+                Some(e) => CTy::BoxSlice(Box::new(cty(tys, e))),
+                None => CTy::Boxed(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            },
             Some(BuiltinTy::Rc) => CTy::Rc(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Option) => CTy::Option(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Result) => {
@@ -296,6 +302,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Result(..) => format!("R_{}", mangle(t)),
         CTy::Args => "lust_Args".into(),
         CTy::ExitCode => "uint8_t".into(),
+        CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
@@ -346,6 +353,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Cell(e) => format!("Cl_{}_", mangle(e)),
         CTy::Guard(e, m) => format!("Gd{}_{}_", if *m { "M" } else { "" }, mangle(e)),
         CTy::ExitCode => "XC".into(),
+        CTy::BoxSlice(e) => format!("BS_{}_", mangle(e)),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -412,6 +420,10 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(CTy::Rc(e.clone()));
             collect_types(e, out);
         }
+        CTy::BoxSlice(e) => {
+            out.insert(CTy::Slice(e.clone()));
+            collect_types(e, out);
+        }
         CTy::RefCell(e) => {
             out.insert(t.clone());
             collect_types(e, out);
@@ -437,6 +449,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // `Rc`, `Weak`, and the `RefCell` guards are pointers to forward-
         // declared structs, so a recursive `Option<Rc<Node>>` field works.
         CTy::Cell(e) => by_value_deps(e, out),
+        CTy::BoxSlice(e) => out.push(CTy::Slice(e.clone())),
         // A pointer to a fn pointer still names its typedef, which has
         // no forward form (a closure capturing a fn pointer by ref).
         CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
@@ -487,7 +500,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
@@ -686,7 +699,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
-            CTy::Slice(_) | CTy::Dyn => Some(layout::fat_ptr_layout()),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::tuple_layout(&fields?).ok()
@@ -924,7 +937,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let (es, ea) = go(p, e, seen);
                 (es * (*n).max(1), ea)
             }
-            CTy::Slice(_) | CTy::Dyn => (16, 8),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -1610,6 +1623,10 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Deref, CTy::Slice(_)) | (Proj::Deref, CTy::Dyn) => {
                     // A slice or dyn place is represented by its fat value, like `str`.
+                }
+                (Proj::Deref, CTy::BoxSlice(el)) => {
+                    // The boxed slice's fat value is its slice place too.
+                    t = CTy::Slice(el);
                 }
                 (Proj::Index(l), CTy::Slice(el)) => {
                     e = format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]");
@@ -2915,6 +2932,15 @@ impl FnGen<'_, '_, '_> {
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
+            B::VecIntoBoxedSlice => {
+                // Rust shrinks the buffer to the length first.
+                let CTy::Vec(e) = &tys[0] else { unreachable!("into_boxed_slice on a Vec") };
+                let (et, st) = (ctype(e), ctype(&CTy::Slice(e.clone())));
+                let v = self.tmp();
+                let _ = writeln!(self.out, "    lust_Vec {v} = {}; lust_vec_shrink_to(&{v}, 0, sizeof({et}), _Alignof({et}));", vals[0]);
+                format!("(({st}){{ ({et}*){v}.ptr, {v}.len }})")
+            }
+            B::BoxSliceIntoVec => format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, ({0}).len }})", vals[0]),
             B::StringFromUtf8 | B::StrFromUtf8 => {
                 // Validate, then build `Ok(text)` or `Err(error)` with
                 // Rust's `valid_up_to` and `error_len` (runtime core.c).
@@ -5713,6 +5739,15 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let et = ctype(e);
                     let _ = writeln!(body, "  lust_dealloc((void*)*p, sizeof({et}), _Alignof({et}));");
                 }
+                CTy::BoxSlice(e) => {
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) drop_{}(&p->ptr[i]);", mangle(e));
+                    }
+                    // An empty boxed slice holds a dangling pointer.
+                    let et = ctype(e);
+                    let _ = writeln!(body, "  lust_dealloc((void*)p->ptr, p->len * sizeof({et}), _Alignof({et}));");
+                }
                 CTy::VecIter(e) => {
                     // What `next` has not moved out yet: `front..len`,
                     // in order, then the buffer (as `vec::IntoIter`).
@@ -5860,6 +5895,14 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 CTy::RcDyn => {
                     body.push_str("  ((uint64_t *)p->data)[-2]++; return *p;\n");
                 }
+                CTy::BoxSlice(e) => {
+                    let et = ctype(e);
+                    let c = clone_of(e, "p->ptr[i]", &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  {ct} r; r.len = p->len; r.ptr = ({et}*)lust_alloc(p->len * sizeof({et}), _Alignof({et}));\n  for (uint64_t i = 0; i < p->len; i++) r.ptr[i] = {c};\n  return r;"
+                    );
+                }
                 CTy::Rc(_) => {
                     body.push_str("  (*p)->strong++; return *p;\n");
                 }
@@ -6000,7 +6043,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let c = eq_of(e, "a->v[i]", "b->v[i]", &mut need);
                     let _ = writeln!(body, "  for (uint64_t i = 0; i < {n}; i++) if (!{c}) return 0;\n  return 1;");
                 }
-                CTy::Slice(e) => {
+                CTy::Slice(e) | CTy::BoxSlice(e) => {
                     let c = eq_of(e, "a->ptr[i]", "b->ptr[i]", &mut need);
                     let _ = writeln!(
                         body,

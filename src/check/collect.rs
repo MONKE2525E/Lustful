@@ -859,7 +859,8 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, "Box takes one type argument", "Write `Box<T>`."));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
-                if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                // `Box<[T]>` is the one unsized Box lust has (W-STD-A).
+                if matches!(tys.kind(e), TyKind::Str | TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, "a Box of an unsized type"));
                 }
                 return Ok(tys.mk_boxed(e));
@@ -4232,6 +4233,10 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     }
     if let Some(e) = tys.cell_elem(t) {
         return is_copy(p, tys, e);
+    }
+    // `Box<[T]>` clones its elements.
+    if let Some(e) = tys.boxed_slice_elem(t) {
+        return has_clone(p, tys, e);
     }
     if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
         return glue_clone(p, tys, e, seen);

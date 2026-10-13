@@ -795,6 +795,8 @@ fn compute(
             {
                 Ok(fat_ptr_layout())
             }
+            // `Box<[T]>` is a fat pointer, like `&[T]`.
+            Some(BuiltinTy::Boxed) if tys.boxed_slice_elem(t).is_some() => Ok(fat_ptr_layout()),
             Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => {
                 struct_layout(&[ptr_layout(), int_layout(IntTy::Usize), int_layout(IntTy::Usize)], Repr::default())

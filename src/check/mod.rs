@@ -384,6 +384,9 @@ pub enum Builtin {
     CellSwap,
     /// `ExitCode::from(u8)` (check/process.rs).
     ExitCodeFrom,
+    /// `Vec::into_boxed_slice` and `Box<[T]>::into_vec`.
+    VecIntoBoxedSlice,
+    BoxSliceIntoVec,
     /// UTF-8 decoding (check/utf8.rs): `String::from_utf8`,
     /// `str::from_utf8`, and the methods of their errors.
     StringFromUtf8,
@@ -9634,6 +9637,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Rust. Its own `clone` is found before the step (it is
         // the one Box method this wave resolves at step zero),
         // so that name keeps the unpeeled receiver.
+        // `Box<[T]>`'s by-value methods, found before the deref step.
+        if let Some(el) = self.tys.boxed_slice_elem(self.resolve(rt)) {
+            match self.name(name) {
+                "into_vec" => {
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::BoxSliceIntoVec, derefs: 0, autoref: Autoref::None });
+                    self.check_args(&[], args, name_span);
+                    return self.tys.mk_vec(el);
+                }
+                // Rust 2024 iterates a boxed slice by value here.
+                "into_iter" => {
+                    self.err("L0640", name_span, "`into_iter` on a `Box<[T]>` is not implemented yet", "Use `.iter()`, or `.into_vec().into_iter()`.");
+                    return ERROR;
+                }
+                _ => {}
+            }
+        }
         let (derefs, base) = if name == k.clone {
             // A `RefCell` guard has no `clone` method of its own (only
             // the associated `Ref::clone`): the call clones the value.
@@ -9995,6 +10014,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::VecReserveExact, Autoref::RefMut, vec![USIZE], UNIT))
                 } else if name == k.shrink_to_fit {
                     Some((B::VecShrinkToFit, Autoref::RefMut, vec![], UNIT))
+                } else if derefs == 0 && self.name(name) == "into_boxed_slice" {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    Some((B::VecIntoBoxedSlice, Autoref::None, vec![], self.tys.mk_boxed(sl)))
                 } else if name == k.shrink_to {
                     Some((B::VecShrinkTo, Autoref::RefMut, vec![USIZE], UNIT))
                 } else if name == k.swap_remove {

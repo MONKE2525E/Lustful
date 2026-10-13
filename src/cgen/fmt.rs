@@ -149,7 +149,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
         CTy::Array(e, n) => {
             let _ = writeln!(body, "  {}", builder_list(&n.to_string(), "&p->v[i]", e, need));
         }
-        CTy::Slice(e) => {
+        CTy::Slice(e) | CTy::BoxSlice(e) => {
             let _ = writeln!(body, "  {}", builder_list("p->len", "&p->ptr[i]", e, need));
         }
         CTy::Vec(e) => {
@@ -274,6 +274,8 @@ fn may_fail(t: &CTy) -> bool {
     match t {
         CTy::Adt(_) => true,
         CTy::Vec(e) | CTy::Option(e) | CTy::Ref(e) | CTy::Array(e, _) | CTy::Slice(e) | CTy::Boxed(e) | CTy::Rc(e) => may_fail(e),
+        // std's cells and boxed slices (W-STD-A) format their contents.
+        CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
         CTy::Result(a, b) => may_fail(a) || may_fail(b),
         CTy::Tuple(es) => es.iter().any(may_fail),
         _ => false,

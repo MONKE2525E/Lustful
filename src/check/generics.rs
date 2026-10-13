@@ -2048,8 +2048,9 @@ fn resolve_path_ty(
             elem = tys.intern(TyKind::Dyn(b, Region::Static));
         }
         // `Box<dyn Tr>` and `Rc<dyn Tr>` are owning fat pointers (ARCH
-        // 2.8); boxed slices and strs are not supported yet.
-        if name == known.Box && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str) {
+        // 2.8), and `Box<[T]>` a boxed slice (W-STD-A); boxed strs are
+        // not supported yet.
+        if name == known.Box && matches!(tys.kind(elem), TyKind::Str) {
             return Err(not_yet("L0641", span, "a Box of an unsized type"));
         }
         if name == known.Rc && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str) {
