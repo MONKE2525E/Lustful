@@ -2958,7 +2958,7 @@ impl FnGen<'_, '_, '_> {
                 let (pa, pb, t) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
-                    "    {et}* {pa} = {}; {et}* {pb} = {}; {et} {t}; memcpy(&{t}, {pa}, sizeof({et})); memcpy({pa}, {pb}, sizeof({et})); memcpy({pb}, &{t}, sizeof({et}));",
+                    "    {et}* {pa} = {}; {et}* {pb} = {}; {et} {t}; lust_memcpy(&{t}, {pa}, sizeof({et})); lust_memcpy({pa}, {pb}, sizeof({et})); lust_memcpy({pb}, &{t}, sizeof({et}));",
                     vals[0], vals[1]
                 );
                 "((lust_Unit){})".into()
@@ -2969,7 +2969,7 @@ impl FnGen<'_, '_, '_> {
                 let (pa, nv, old) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
-                    "    {et}* {pa} = {}; {et} {nv} = {}; {et} {old}; memcpy(&{old}, {pa}, sizeof({et})); memcpy({pa}, &{nv}, sizeof({et}));",
+                    "    {et}* {pa} = {}; {et} {nv} = {}; {et} {old}; lust_memcpy(&{old}, {pa}, sizeof({et})); lust_memcpy({pa}, &{nv}, sizeof({et}));",
                     vals[0], vals[1]
                 );
                 old
