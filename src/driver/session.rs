@@ -51,7 +51,8 @@ pub(crate) struct Front {
     /// nested static's) can shift when a def is added even though the
     /// defs in `prev_adt_ids` and `prev_static_ids` keep theirs.
     /// Growth is then not reusable. Instance Adt ids of a generic
-    /// program shift too; builds check those (`Caches::inst_adt_fp`).
+    /// program are session places that growth does not move; builds
+    /// check them (`Caches::inst_ids`).
     pub(crate) prev_order_fragile: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
@@ -249,10 +250,11 @@ pub(crate) struct Caches {
     pub(crate) gen_reuse: super::gen_reuse::GenReuse,
     /// The trait-system fingerprint of the last collect (see compile.rs).
     pub(crate) gen_trait: Option<u64>,
-    /// Fingerprint of the instance Adt numbering (id, instance key) the
-    /// current `out` entries of a generic program were generated under.
-    /// C names Adts by id, so cached C is reusable only while it holds.
-    pub(crate) inst_adt_fp: u64,
+    /// The instance key each instance Adt id named in the C made since
+    /// the last full regeneration of a generic program. C names Adts by
+    /// id, so cached C is reusable only while every id names the same
+    /// instance (`compile::inst_adt_ids`).
+    pub(crate) inst_ids: FxMap<u32, u64>,
     /// Units whose current code is in an overlay object, not in libbase.so.
     pub(crate) overlays: std::collections::BTreeSet<usize>,
 }
@@ -340,7 +342,7 @@ impl Session {
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
                 gen_trait: None,
-                inst_adt_fp: 0,
+                inst_ids: FxMap::default(),
             },
             std_cache: None,
             disk_cache: None,
@@ -398,24 +400,32 @@ pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>, per_unit: u3
 }
 
 /// The def-order file byte shape: magic, the stable crate hash the
-/// hashes were numbered under, Adt count, static count, then each
-/// def hash in order (Adts first). Only stable def hashes are
-/// stored (each already mixes in the stable crate hash), so a
-/// restarted daemon recovers the same Adt and static numbering
-/// (see `collect::DefOrder`). The stored crate hash lets a reader
-/// reject a file written for a different crate identity instead of
-/// numbering this crate's defs by a foreign order.
-const DEF_ORDER_MAGIC: &[u8; 4] = b"LSDO";
+/// hashes were numbered under, Adt count, static count, instance base,
+/// instance count (4 bytes each), then each def hash in order (Adts
+/// first) and each instance key in order (`collect::InstOrder`), 8
+/// bytes each. Only stable hashes are stored (def hashes mix in the
+/// stable crate hash; instance keys hash def disk ids and args), so a
+/// restarted daemon recovers the same Adt, static, and instance Adt
+/// numbering (see `collect::DefOrder`). The stored crate hash lets a
+/// reader reject a file written for a different crate identity instead
+/// of numbering this crate's defs by a foreign order. `LSDO` files
+/// (no instances) read as a miss.
+const DEF_ORDER_MAGIC: &[u8; 4] = b"LSD2";
 
 /// Serializes a def order. See `DEF_ORDER_MAGIC`.
 pub(crate) fn encode_def_order(order: &crate::check::collect::DefOrder, stable: crate::def::StableCrateHash) -> Vec<u8> {
-    let mut out = Vec::with_capacity(20 + (order.adts.len() + order.statics.len()) * 8);
+    let inst = &order.instances;
+    let mut out = Vec::with_capacity(28 + (order.adts.len() + order.statics.len() + inst.keys.len()) * 8);
     out.extend_from_slice(DEF_ORDER_MAGIC);
     out.extend_from_slice(&stable.0.to_le_bytes());
-    out.extend_from_slice(&(order.adts.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(order.statics.len() as u32).to_le_bytes());
+    for n in [order.adts.len(), order.statics.len(), inst.base as usize, inst.keys.len()] {
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    }
     for h in order.adts.iter().chain(&order.statics) {
         out.extend_from_slice(&h.0.to_le_bytes());
+    }
+    for k in &inst.keys {
+        out.extend_from_slice(&k.to_le_bytes());
     }
     out
 }
@@ -432,20 +442,29 @@ pub(crate) fn decode_def_order(b: &[u8], stable: crate::def::StableCrateHash) ->
     if u64::from_le_bytes(b.get(4..12)?.try_into().ok()?) != stable.0 {
         return None;
     }
-    let na = u32::from_le_bytes(b.get(12..16)?.try_into().ok()?) as usize;
-    let ns = u32::from_le_bytes(b.get(16..20)?.try_into().ok()?) as usize;
+    let word = |at: usize| -> Option<usize> { Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize) };
+    let (na, ns, base, ni) = (word(12)?, word(16)?, word(20)?, word(24)?);
     let n = na.checked_add(ns)?;
-    if b.len() != n.checked_mul(8)?.checked_add(20)? {
+    if b.len() != n.checked_add(ni)?.checked_mul(8)?.checked_add(28)? {
         return None;
     }
     let mut order = crate::check::collect::DefOrder::default();
     for i in 0..n {
-        let at = 20 + i * 8;
+        let at = 28 + i * 8;
         let h = crate::def::DefPathHash(u64::from_le_bytes(b[at..at + 8].try_into().ok()?));
         if order.adts.contains(&h) || order.statics.contains(&h) {
             return None;
         }
         if i < na { &mut order.adts } else { &mut order.statics }.push(h);
+    }
+    order.instances.base = base as u32;
+    for i in 0..ni {
+        let at = 28 + (n + i) * 8;
+        let k = u64::from_le_bytes(b[at..at + 8].try_into().ok()?);
+        if order.instances.place.contains_key(&k) {
+            return None;
+        }
+        order.instances.place_of(k);
     }
     Some(order)
 }
@@ -543,10 +562,16 @@ mod tests {
         let mut order = crate::check::collect::DefOrder::default();
         order.adts = vec![DefPathHash(30), DefPathHash(10), DefPathHash(20)];
         order.statics = vec![DefPathHash(7), DefPathHash(9)];
+        order.instances.base = 40;
+        for k in [77, 55, 66] {
+            order.instances.place_of(k);
+        }
         let bytes = encode_def_order(&order, stable);
         let back = decode_def_order(&bytes, stable).unwrap();
         assert_eq!(back.adts, order.adts);
         assert_eq!(back.statics, order.statics);
+        assert_eq!((back.instances.base, &back.instances.keys), (40, &vec![77, 55, 66]));
+        assert_eq!(back.instances.place.get(&55), Some(&1));
         // Every prefix and a trailing byte are shape errors.
         for cut in 0..bytes.len() {
             assert!(decode_def_order(&bytes[..cut], stable).is_none(), "prefix {cut}");
@@ -559,10 +584,15 @@ mod tests {
         let mut wrong = bytes.clone();
         wrong[0] = b'X';
         assert!(decode_def_order(&wrong, stable).is_none(), "magic");
-        // A hash listed twice is bad, in one list or across both.
+        // A hash listed twice is bad, in one list or across both, and
+        // so is an instance key listed twice.
         let mut dup = encode_def_order(&order, stable);
-        dup[20..28].copy_from_slice(&20u64.to_le_bytes());
+        dup[28..36].copy_from_slice(&20u64.to_le_bytes());
         assert!(decode_def_order(&dup, stable).is_none(), "duplicate hash");
+        let mut dup_inst = encode_def_order(&order, stable);
+        let last = dup_inst.len() - 8;
+        dup_inst[last..].copy_from_slice(&77u64.to_le_bytes());
+        assert!(decode_def_order(&dup_inst, stable).is_none(), "duplicate instance key");
         order.statics = vec![DefPathHash(30)];
         assert!(decode_def_order(&encode_def_order(&order, stable), stable).is_none(), "hash in both lists");
     }

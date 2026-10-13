@@ -1297,6 +1297,42 @@ fn variant_fields_src(interner: &Interner, vf: &VariantFields) -> (VariantShape,
 pub struct DefOrder {
     pub adts: Vec<crate::def::DefPathHash>,
     pub statics: Vec<crate::def::DefPathHash>,
+    /// Adt instance ids (see `InstOrder`).
+    pub instances: InstOrder,
+}
+
+/// Session-stable Adt instance ids (W-PERF): an instance Adt's id is
+/// `base` plus the place of its instance key (`Program::instance_key_hash`
+/// of template def and args) in first-seen order. Places are never
+/// reused, so a new instance never moves the id of another: C names Adts
+/// `A<id>`, and cached C, type sets, and glue keep their meaning. Rows
+/// from the template Adts up to `base`, and the places of instances a
+/// program does not make, are inert placeholder rows. `base` sits past
+/// the template Adts with room for more; it moves (and every instance id
+/// with it) only when templates outgrow it.
+#[derive(Default, Clone)]
+pub struct InstOrder {
+    pub base: u32,
+    pub keys: Vec<u64>,
+    pub place: HashMap<u64, u32>,
+}
+
+impl InstOrder {
+    /// Fits `base` past `templates` Adt rows (before a collect's first instance).
+    pub fn fit(&mut self, templates: usize) {
+        if (self.base as usize) < templates {
+            self.base = (templates + 32 + templates / 8) as u32;
+        }
+    }
+
+    /// The place of `key`, appended when it is new.
+    pub fn place_of(&mut self, key: u64) -> u32 {
+        let keys = &mut self.keys;
+        *self.place.entry(key).or_insert_with(|| {
+            keys.push(key);
+            keys.len() as u32 - 1
+        })
+    }
 }
 
 /// The rank of each hash among `hashes`, by position in `order`
@@ -1439,6 +1475,7 @@ pub fn collect_reuse<'a>(
     };
     p.gx.walk_instances = walk_instances;
     p.gx.reuse = std::mem::take(reuse);
+    p.gx.inst_order = std::mem::take(&mut def_order.instances);
     p.gx.reuse.begin();
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their
@@ -2599,6 +2636,7 @@ pub fn collect_reuse<'a>(
     }
 
     *reuse = std::mem::take(&mut p.gx.reuse);
+    def_order.instances = std::mem::take(&mut p.gx.inst_order);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }
 

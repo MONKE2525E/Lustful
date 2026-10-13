@@ -58,6 +58,8 @@
 #      instance C that calls a moved nested fn (see each case).
 #  18. nested fn identity follows the parent fn, and a sibling that
 #      shadows a name an unchanged nested fn calls rechecks it.
+#  19. stable instance Adt ids: a new instance first in discovery and a
+#      new struct regenerate only the edited fn; a restart builds no unit.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -793,6 +795,53 @@ def case_nested_identity_and_shadowing():
     d.kill()
 
 
+def case_stable_instance_ids():
+    # 19. Instance Adt ids are session places (collect::InstOrder): a
+    # new instance made first in discovery and a new struct (one more
+    # template Adt) keep every other instance's id, so a build
+    # regenerates only the edited fn, not every body; a restarted
+    # daemon reads the places back with the def order and builds no
+    # unit again. Every answer equals a cold build.
+    work = tempfile.mkdtemp(prefix="lust-driver-stable-ids-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    fns = ["#[derive(Debug, Clone)]\nstruct W<T> {\n    a: T,\n    b: u8,\n}\n",
+           "fn f0() -> usize {\n    let w = W { a: 5u8, b: 6 };\n    format!(\"{:?}\", w).len()\n}\n"]
+    fns += [f"fn f{i}() -> usize {{\n    let w = W {{ a: {i}u8, b: 9 }};\n    format!(\"{{:?}}\", w).len()\n}}\n" for i in range(1, 49)]
+    fns += [f"fn f{i}() -> usize {{\n    let w = W {{ a: {i}u16, b: 3 }};\n    format!(\"{{:?}}\", w).len()\n}}\n" for i in range(49, 97)]
+    main = ("fn main() {\n    let mut t = 0;\n" + "".join(f"    t += f{i}();\n" for i in range(97))
+            + "    println!(\"{}\", t);\n    println!(\"{:?}\", W { a: 1u8, b: 2 });\n}\n")
+    base = "\n".join(fns) + main
+    new_inst = base.replace("fn f0() -> usize {\n", "fn f0() -> usize {\n    let z = W { a: 70000u32, b: 1 };\n"
+                            "    let _ = format!(\"{:?}\", z);\n", 1)
+    new_struct = "struct Fresh { v: u8 }\n\n" + new_inst.replace("    println!(\"{}\", t);\n", "    println!(\"{} {}\", t, Fresh { v: 4 }.v);\n")
+
+    def cold(text):
+        cw = tempfile.mkdtemp(prefix="lust-driver-stable-ids-cold-")
+        csrc = os.path.join(cw, "x.rs")
+        open(csrc, "w").write(text)
+        env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
+        subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
+        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True)
+        shutil.rmtree(cw, ignore_errors=True)
+        return r.stdout
+
+    d.start()
+    for name, text, most in (("base", base, None), ("new instance first in discovery", new_inst, 2), ("new struct", new_struct, 2)):
+        open(src, "w").write(text)
+        st, prog = d.build(src, out)
+        check(f"stable instance ids, {name}: warm equals cold", prog.stdout == cold(text), prog.stdout[-80:])
+        if most is not None:
+            check(f"stable instance ids, {name}: only the edited fn regenerates", st.get("rechecked", 99) <= most, str(st))
+    d.kill()
+    d.start()
+    st, prog = d.build(src, out)
+    check("stable instance ids, restart: warm equals cold", prog.stdout == cold(new_struct), prog.stdout[-80:])
+    check("stable instance ids, restart: every unit from disk", st.get("units_compiled") == 0, str(st))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -811,6 +860,7 @@ def main():
     case_moved_and_revived_slots()
     case_instance_calls_moved_slot()
     case_nested_identity_and_shadowing()
+    case_stable_instance_ids()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

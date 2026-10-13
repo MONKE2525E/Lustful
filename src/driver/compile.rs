@@ -271,19 +271,24 @@ fn wipe_slot(caches: &mut Caches, s: usize) {
     caches.slot_ir[s] = None;
 }
 
-/// The fingerprint of a generic program's instance Adt numbering: each
-/// instance Adt's id with its stable instance key. C names Adts by id
-/// (`A<id>`), so cached C of a generic program is reusable only while
-/// this holds.
-fn inst_adt_fingerprint(p: &collect::Program) -> u64 {
-    let mut h = crate::intern::FxHasher::default();
+/// Each instance Adt's id with its stable instance key. C names Adts by
+/// id (`A<id>`), so cached C of a generic program is reusable only while
+/// every id it was made under names the same instance. Ids are session
+/// places (`collect::InstOrder`), so a new instance keeps the others' ids.
+fn inst_adt_ids(p: &collect::Program) -> Vec<(u32, u64)> {
+    let mut out = Vec::new();
     for (a, inst) in p.gx.adt_instance_of.iter().enumerate() {
         if let Some((def, args)) = inst {
-            let key = p.instance_key_hash(&crate::driver::graph::InstanceKey { def: *def, args: *args });
-            std::hash::Hash::hash(&(a, key.0), &mut h);
+            out.push((a as u32, p.instance_key_hash(&crate::driver::graph::InstanceKey { def: *def, args: *args }).0));
         }
     }
-    std::hash::Hasher::finish(&h)
+    out
+}
+
+/// The size of a def order as the disk file records it: every list only
+/// grows and the instance base only rises, so a store is due when it moves.
+fn def_order_size(order: &collect::DefOrder) -> usize {
+    order.adts.len() + order.statics.len() + order.instances.keys.len() + order.instances.base as usize
 }
 
 /// Unique temp file sequence for base-dir writes in this process. Several
@@ -902,9 +907,9 @@ fn file_text_hash(map: &SourceMap, file: FileId) -> u64 {
 /// one Ast under the session `DefOrder`, predicted with the same
 /// hash and rank rules collect uses, plus whether this Ast has a
 /// shape whose derived indices can shift on growth (a nested
-/// static). Instance Adt ids of a generic program shift on growth
-/// too, but the build checks those itself (`inst_adt_fingerprint`)
-/// and regenerates C when they move. The slot update
+/// static). Instance Adt ids are session places that new instances
+/// do not move; the build checks them itself (`inst_adt_ids`) and
+/// regenerates C if one ever names another instance. The slot update
 /// compares the prediction with the last parse's indices: cached
 /// output carries session-local indices (CTy in glue and type
 /// sets, static indices in IR), so it is reusable only when every
@@ -1775,7 +1780,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             && let Some(cache) = &session.disk_cache
             && let Some(order) = cache.load_def_order(&session.key, crate_ids.stable)
         {
-            session.front.def_order_stored = order.adts.len() + order.statics.len();
+            session.front.def_order_stored = def_order_size(&order);
             session.front.def_order = order;
             session.front.def_order_loaded = true;
         }
@@ -2464,11 +2469,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // manifest above: the next daemon must number defs as this
     // one did or the disk objects' indices move under it.
     front.def_order_loaded = false;
-    if front.def_order.adts.len() + front.def_order.statics.len() != front.def_order_stored {
+    if def_order_size(&front.def_order) != front.def_order_stored {
         if let Some(cache) = disk_cache {
             cache.store_def_order(&session_key, &front.def_order, crate_ids.stable);
         }
-        front.def_order_stored = front.def_order.adts.len() + front.def_order.statics.len();
+        front.def_order_stored = def_order_size(&front.def_order);
     }
     // Read sets serve the next request's dirty walk; a one-shot process
     // has none, so its body checks skip recording and fingerprinting.
@@ -2698,20 +2703,26 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if req.cmd == Cmd::Build {
         work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
     }
-    // The instance Adt numbering this build generates C under.
-    let inst_adt_fp = if program.gx.has_generics && req.cmd == Cmd::Build { inst_adt_fingerprint(&program) } else { 0 };
+    // The instance Adt ids this build generates C under, and whether one
+    // names another instance than in the C made since the last full
+    // regeneration (ids are session places: only a moved base or a reset
+    // order does that).
+    let inst_ids = if program.gx.has_generics && req.cmd == Cmd::Build { inst_adt_ids(&program) } else { Vec::new() };
+    let ids_moved = inst_ids.iter().any(|(id, key)| caches.inst_ids.get(id).is_some_and(|k| k != key));
     if program.gx.has_generics {
         // Generic reuse: a plain fn rechecks when the front end or the
         // read-set walk put it in `changed`; an instance or closure body
         // fn when its source changed or, checked under another item-level
         // environment, its reads no longer hold; any of them when its
-        // last check failed or a build has no C for it. C names Adts by id and
-        // instance Adt ids are creation order, so a build whose
-        // instance Adt numbering moved regenerates every body. Without
-        // reuse, the whole concrete set rechecks, every compile.
+        // last check failed or a build has no C for it. C names Adts by
+        // id, so a build whose instance ids moved regenerates every body.
+        // Without reuse, the whole concrete set rechecks, every compile.
         let build = req.cmd == Cmd::Build;
-        let regenerate_all = !gen_ok || (build && inst_adt_fp != caches.inst_adt_fp);
-        if build && inst_adt_fp != caches.inst_adt_fp {
+        let regenerate_all = !gen_ok || (build && ids_moved);
+        if regenerate_all {
+            caches.inst_ids.clear();
+        }
+        if build && ids_moved {
             // Moved ids rename types and glue (`A<id>`, `drop_A<id>`):
             // the glue set and every unit object, the glue unit's
             // included, rebuild from the regenerated C. Comparing glue
@@ -2938,11 +2949,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
         }
     }
-    // Every live slot's C of a generic program is now under this
-    // numbering (a moved numbering regenerated all of it above).
-    if program.gx.has_generics {
-        caches.inst_adt_fp = inst_adt_fp;
-    }
+    // Every live slot's C of a generic program is now under these ids
+    // (moved ids regenerated all of it above).
+    caches.inst_ids.extend(inst_ids);
     // Derived glue (Debug, Clone, Eq, Drop) is keyed by Adt id but
     // generated from field and variant types, and the glue unit also
     // holds the statics. Regenerate every live glue definition and
@@ -3678,6 +3687,36 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
         assert_eq!(a1[2], a2[2], "Zed keeps its index");
         assert_eq!(s1[1], s2[1], "SM keeps its index");
         assert_eq!(s1[2], s2[2], "SZ keeps its index");
+    }
+
+    /// Instance Adt ids are session places (`collect::InstOrder`): a new
+    /// instance made first in discovery and a new struct (one more
+    /// template Adt) keep every other instance's id, so cached C that
+    /// names `A<id>` keeps its meaning.
+    #[test]
+    fn instance_adt_ids_are_stable() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
+        let inst_ids = |src: &str, order: &mut collect::DefOrder| -> FxMap<u64, u32> {
+            let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
+            inst_adt_ids(&program).into_iter().map(|(id, key)| (key, id)).collect()
+        };
+        let base = "struct W<T> { a: T }\nfn f() -> u8 { W { a: 1u8 }.a }\nfn g() -> u16 { W { a: 2u16 }.a }\n\
+                    fn main() { println!(\"{} {}\", f(), g()); }\n";
+        let first = base.replace("fn f() -> u8 {", "fn f() -> u8 { let _z = W { a: 3u32 };");
+        let grown = format!("struct Fresh {{ v: u8 }}\n{first}");
+        let mut order = collect::DefOrder::default();
+        let a = inst_ids(base, &mut order);
+        let b = inst_ids(&first, &mut order);
+        let c = inst_ids(&grown, &mut order);
+        assert_eq!((a.len(), b.len(), c.len()), (2, 3, 3));
+        for (k, id) in &a {
+            assert_eq!(b.get(k), Some(id), "a new instance first keeps the others' ids");
+            assert_eq!(c.get(k), Some(id), "a new struct keeps every instance id");
+        }
     }
 
     /// A disk-loaded def order is stale only when it names none of

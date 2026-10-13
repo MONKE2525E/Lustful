@@ -2464,6 +2464,14 @@ pub struct GenTables<'a> {
     /// True once mono's materialize pass is done: every vtable a
     /// concrete body needs exists from then on.
     pub mono_done: bool,
+    /// The session's Adt instance ids, lent to this collect like `reuse`
+    /// (`collect::InstOrder`).
+    pub inst_order: crate::check::collect::InstOrder,
+    /// The Adt template rows (set at the first instance; every row past
+    /// them is an instance or a placeholder).
+    pub template_rows: Option<u32>,
+    /// Adt instances in creation order (ids are not: see `InstOrder`).
+    pub adt_created: Vec<AdtId>,
 }
 
 impl Default for GenTables<'_> {
@@ -2516,6 +2524,9 @@ impl Default for GenTables<'_> {
             static_dyn_impls: Vec::new(),
             static_dyn_fns: Vec::new(),
             mono_done: false,
+            inst_order: Default::default(),
+            template_rows: None,
+            adt_created: Vec::new(),
         }
     }
 }
@@ -4726,22 +4737,57 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
         }
         variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields, disc });
     }
-    let id = AdtId(p.adts.len() as u32);
+    let id = instance_adt_id(p, def, args_id);
+    let at = id.0 as usize;
     let (name, is_enum, derives, span) = {
         let src = p.adt(template);
         (src.name, src.is_enum, src.derives, src.span)
     };
-    p.adts.push(crate::check::collect::AdtDef { name, is_enum, variants, derives, span, repr: p.adt(template).repr });
+    p.adts[at] = crate::check::collect::AdtDef { name, is_enum, variants, derives, span, repr: p.adt(template).repr };
     p.tys.register_adt_instance(def, args_id, id);
     p.defs.insert_adt_instance(def, id);
-    p.gx.adt_info.push((def, args.len()));
-    p.gx.adt_generics.push(Generics::default());
-    p.gx.adt_envs.push(Vec::new());
+    p.gx.adt_info[at] = (def, args.len());
     let full = p.tys.full_adt_ty(id).unwrap();
-    p.gx.adt_scopes.push(Scope { self_ty: Some(full), ..Scope::default() });
-    p.gx.adt_instance_of.push(Some((def, args_id)));
+    p.gx.adt_scopes[at] = Scope { self_ty: Some(full), ..Scope::default() };
+    p.gx.adt_instance_of[at] = Some((def, args_id));
+    p.gx.adt_created.push(id);
     p.gx.mono_counts.1 += 1;
     id
+}
+
+/// The id of a new Adt instance: the session's stable place for its
+/// instance key (`collect::InstOrder`), with inert placeholder rows up to
+/// it. A key whose place another instance of this program holds (two
+/// instances that differ only in lifetimes) takes the next free key.
+fn instance_adt_id(p: &mut Program, def: DefId, args: ArgsId) -> AdtId {
+    if p.gx.template_rows.is_none() {
+        p.gx.template_rows = Some(p.adts.len() as u32);
+        p.gx.inst_order.fit(p.adts.len());
+    }
+    let mut key = p.instance_key_hash(&crate::driver::graph::InstanceKey { def, args }).0;
+    let at = loop {
+        let at = (p.gx.inst_order.base + p.gx.inst_order.place_of(key)) as usize;
+        if p.gx.adt_instance_of.get(at).is_none_or(|i| i.is_none()) {
+            break at;
+        }
+        key = key.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    };
+    while p.adts.len() <= at {
+        p.adts.push(crate::check::collect::AdtDef {
+            name: p.interner.intern(""),
+            is_enum: false,
+            variants: Vec::new(),
+            derives: Default::default(),
+            span: Span::default(),
+            repr: Default::default(),
+        });
+        p.gx.adt_info.push((DefId::PLACEHOLDER, 0));
+        p.gx.adt_generics.push(Generics::default());
+        p.gx.adt_envs.push(Vec::new());
+        p.gx.adt_scopes.push(Scope::default());
+        p.gx.adt_instance_of.push(None);
+    }
+    AdtId(at as u32)
 }
 
 /// The owner Adt instance of one instantiated method, from its
@@ -5165,6 +5211,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
     let mut drop_done = 0u32;
+    let mut drop_created = 0usize;
     let mut reuse = std::mem::take(&mut p.gx.reuse);
     while !queue.is_empty() {
         rounds += 1;
@@ -5294,12 +5341,17 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 depths.insert(inst, depth + 1);
                 next_queue.push(inst);
             }
-            // Drop glue for Adt instances made since the last pass. An
-            // Adt's Drop selection cannot change while materialize runs
-            // (the impl index is fixed), so each Adt is asked once, in
-            // the same order as asking all of them after every body.
-            let adt_ids: Vec<AdtId> = (drop_done..p.adts.len() as u32).map(AdtId).collect();
-            drop_done = p.adts.len() as u32;
+            // Drop glue for Adts made since the last pass: the template
+            // rows first, then instances in creation order (their ids
+            // are session places, not creation order). An Adt's Drop
+            // selection cannot change while materialize runs (the impl
+            // index is fixed), so each Adt is asked once, in the same
+            // order as asking all of them after every body.
+            let templates = p.gx.template_rows.unwrap_or(p.adts.len() as u32);
+            let mut adt_ids: Vec<AdtId> = (drop_done..templates).map(AdtId).collect();
+            drop_done = templates;
+            adt_ids.extend_from_slice(&p.gx.adt_created[drop_created..]);
+            drop_created = p.gx.adt_created.len();
             for a in adt_ids {
                 ensure_drop_method(p, a, &mut next_queue);
                 ensure_fmt_methods(p, a, &mut next_queue);
