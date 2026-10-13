@@ -46,6 +46,35 @@ pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sym(pub u32);
 
+/// The source name of a def name that may be a resolver flat name
+/// (`a$b$Name`, or `k<hash>$a$Name` for a source dependency; see
+/// `resolve::worklist::flat_name`): the last `$` segment, which is the
+/// name as written. Plain names pass through. This is the name rustc
+/// prints in derived `Debug` output. Display only; never a lookup key.
+pub fn source_name(name: &str) -> &str {
+    name.rsplit('$').next().unwrap_or(name)
+}
+
+/// The source path of a def name that may be a resolver flat name, for
+/// diagnostics: `a$b$Name` reads `a::b::Name`. A leading
+/// dependency-crate hash segment (`k` plus 16 hex digits) is dropped,
+/// because the flat name does not carry the crate name;
+/// `ResolvedTables::display_names` holds the full path (with the crate
+/// name) when the resolver ran. Display only; never a lookup key.
+pub fn source_path(name: &str) -> String {
+    let mut segs: Vec<&str> = name.split('$').collect();
+    if segs.len() > 1 && is_dep_prefix(segs[0]) {
+        segs.remove(0);
+    }
+    segs.join("::")
+}
+
+/// True for the stable-hash prefix segment of a source dependency's
+/// flat names (`k` plus 16 hex digits).
+fn is_dep_prefix(seg: &str) -> bool {
+    seg.len() == 17 && seg.starts_with('k') && seg[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 const SHARD_BITS: u32 = 6;
 const SHARDS: usize = 1 << SHARD_BITS;
 

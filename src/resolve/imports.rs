@@ -178,6 +178,11 @@ pub struct ResolvedTables {
     /// Adt def -> variant names, for variant imports and `use E::*`.
     pub variants: FxMap<DefId, Vec<Sym>>,
     pub def_info: FxMap<DefId, DefInfo>,
+    /// Flat name -> the source path text for diagnostics (`m0::Stats`,
+    /// or `base::inner::Deep` for a source dependency, whose flat name
+    /// carries only a hash of the crate). Filled where defs are renamed
+    /// to flat names in the worklist. Display only; never a lookup key.
+    pub display_names: FxMap<Sym, Sym>,
     /// Each module's own def (index by ModuleId), filled at registration.
     pub module_defs: Vec<DefId>,
     /// Flat name -> def, per namespace, for the merged AST's names. The
@@ -218,6 +223,7 @@ impl ResolvedTables {
             tuple_field_vis: FxMap::default(),
             variants: FxMap::default(),
             def_info: FxMap::default(),
+            display_names: FxMap::default(),
             module_defs: vec![DefId::PLACEHOLDER],
             flat: Default::default(),
             fn_module: Vec::new(),

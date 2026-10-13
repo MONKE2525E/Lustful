@@ -13,7 +13,9 @@
 //
 // Output shape: one merged Ast for collect. Defs outside the root module
 // carry module-mangled flat names (`a$b$name`, never a legal Rust
-// identifier), and every path the resolver can prove is rewritten to the
+// identifier; `ResolvedTables::display_names` keeps the source path of
+// each, so flat names never reach program output or diagnostics), and
+// every path the resolver can prove is rewritten to the
 // flat name (one segment, or two for `Type::assoc`), so collect and
 // check keep their flat tables while the binding tables here hold the
 // real module semantics. DefIds are computed with the same formulas
@@ -3037,6 +3039,30 @@ fn flat_name(tables: &ResolvedTables, flat_prefix: &str, module: ModuleId, name:
     interner.intern(&s)
 }
 
+/// Records the source path text of one renamed def in
+/// `ResolvedTables::display_names`, for diagnostics: the module path
+/// and name joined with `::`, prefixed with the crate name for a
+/// source dependency (whose flat name carries only a crate hash).
+/// Root defs of the selected crate keep their plain name and need no
+/// entry. Display only; never a lookup key.
+fn record_display(tables: &mut ResolvedTables, input: &OneInput, flat_prefix: &str, module: ModuleId, flat: Sym, name: Sym, interner: &Interner) {
+    if flat == name {
+        return;
+    }
+    let mut s = String::new();
+    if !flat_prefix.is_empty() {
+        s.push_str(&input.crate_name);
+        s.push_str("::");
+    }
+    for seg in &tables.modules[module.0 as usize].path.clone() {
+        s.push_str(interner.get(*seg));
+        s.push_str("::");
+    }
+    s.push_str(interner.get(name));
+    let display = interner.intern(&s);
+    tables.display_names.insert(flat, display);
+}
+
 /// Step 3 input: registers every defined name in one item list, renames
 /// defs to their flat names, and collects the module's imports. Module
 /// bindings register first (same sweep): a `mod` item's name is a
@@ -3088,6 +3114,7 @@ fn register_items(
             }
             ItemKind::Fn(f) => {
                 let flat = flat_name(tables, flat_prefix, module, f.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, f.name, interner);
                 let def = DefId { krate: input.crate_ids.local, hash: def::free_fn_hash(input.crate_ids.stable, &[], interner.get(flat)) };
                 bind(tables, Namespace::Value, f.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Fn, flat, module, vis: vis() });
@@ -3096,6 +3123,7 @@ fn register_items(
             }
             ItemKind::Struct(s) => {
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, s.name, interner);
                 let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
                 let def = DefId {
                     krate: input.crate_ids.local,
@@ -3108,6 +3136,7 @@ fn register_items(
             }
             ItemKind::Enum(e) => {
                 let flat = flat_name(tables, flat_prefix, module, e.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, e.name, interner);
                 let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
                 let def = DefId {
                     krate: input.crate_ids.local,
@@ -3130,6 +3159,7 @@ fn register_items(
             ItemKind::Const(c) => {
                 if let Some(name) = c.name {
                     let flat = flat_name(tables, flat_prefix, module, name, interner);
+                    record_display(tables, input, flat_prefix, module, flat, name, interner);
                     let def = DefId {
                         krate: input.crate_ids.local,
                         hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Const, interner.get(flat), 0),
@@ -3142,6 +3172,7 @@ fn register_items(
             }
             ItemKind::Static(s) => {
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, s.name, interner);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Static, interner.get(flat), 0),
@@ -3153,6 +3184,7 @@ fn register_items(
             }
             ItemKind::Type(a) => {
                 let flat = flat_name(tables, flat_prefix, module, a.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, a.name, interner);
                 let def = DefId {
                     krate: input.crate_ids.local,
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::TypeAlias, interner.get(flat), 0),
@@ -3164,6 +3196,7 @@ fn register_items(
             }
             ItemKind::Trait(t) => {
                 let flat = flat_name(tables, flat_prefix, module, t.name, interner);
+                record_display(tables, input, flat_prefix, module, flat, t.name, interner);
                 // The ordinal counts same-flat-name traits in
                 // walk order, matching collect's trait defs.
                 let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Trait && i.flat == flat).count() as u32;
