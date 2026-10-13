@@ -728,7 +728,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("extern blocks", "L0810"),
     ("extern functions", "L0810"),
     ("C string literals", "L0641"),
-    ("float and byte literals in patterns", "L0641"),
     ("higher-ranked (`for<..>`) types and bounds", "L0614"),
     ("unions", "L0602"),
     ("extern function types", "L0602"),

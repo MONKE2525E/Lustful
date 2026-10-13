@@ -3291,7 +3291,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 let s = self.p.ast.pat_span(*pat);
                                 self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
                             } else {
-                                self.pattern(*pat, ty, false);
+                                // A `let...else` allows refutable
+                                // patterns, like a match arm does.
+                                self.pattern(*pat, ty, els.is_some());
                                 if !self.pat_always_matches(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
@@ -3325,7 +3327,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 let s = self.p.ast.pat_span(*pat);
                                 self.errs.push(unsupported(s, "destructuring in `let` without an initializer"));
                             } else {
-                                self.pattern(*pat, ty, false);
+                                // A `let...else` allows refutable
+                                // patterns, like a match arm does.
+                                self.pattern(*pat, ty, els.is_some());
                                 if !self.pat_always_matches(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
@@ -5349,6 +5353,55 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => (0, t),
         }
     }
+    /// True when `e` is a byte string literal, which the parser
+    /// builds as a reference to a byte array literal.
+    fn is_byte_str_lit(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Ref { mutable: false, raw: false, expr } => matches!(self.p.ast.expr(*expr), Expr::Array(_)),
+            _ => false,
+        }
+    }
+
+    /// True when a byte string pattern of type `&[u8; N]` may match
+    /// a scrutinee of type `t`: rustc also allows `&[u8]` with the
+    /// same mutability and element type. Other shapes (an array
+    /// value, `&str`, a different length) stay type errors.
+    fn byte_str_pat_ok(&mut self, lt: Ty, t: Ty) -> bool {
+        let (TyKind::Ref(_, lm, li), TyKind::Ref(_, tm, ti)) = (self.kind(lt), self.kind(t)) else { return false };
+        if lm != tm {
+            return false;
+        }
+        match (self.kind(li), self.kind(ti)) {
+            (TyKind::Array(e1, _), TyKind::Slice(e2)) => self.unify(e1, e2),
+            _ => false,
+        }
+    }
+
+    /// The value of a float pattern bound, widened to `f64` (exact
+    /// for `f32`), if it is known: a float literal (possibly
+    /// negated) or a const the checker evaluated.
+    fn const_float(&self, e: ExprId, ft: crate::ty::FloatTy) -> Option<f64> {
+        use crate::ty::FloatTy;
+        if let Some(cv) = &self.out.const_exprs[self.ei(e)] {
+            return match cv {
+                crate::ty::consteval::ConstValue::Float(bits, FloatTy::F32) => Some(f32::from_bits(*bits as u32) as f64),
+                crate::ty::consteval::ConstValue::Float(bits, FloatTy::F64) => Some(f64::from_bits(*bits)),
+                _ => None,
+            };
+        }
+        match self.p.ast.expr(e) {
+            Expr::Float(i) => {
+                let text = &self.p.ast.strings[*i as usize];
+                crate::check::collect::parse_float_literal_as(text, ft).map(|bits| match ft {
+                    FloatTy::F32 => f32::from_bits(bits as u32) as f64,
+                    FloatTy::F64 => f64::from_bits(bits),
+                })
+            }
+            Expr::Unary { op: UnOp::Neg, expr } => self.const_float(*expr, ft).map(|v| -v),
+            _ => None,
+        }
+    }
+
     /// The value of a literal expression (an integer, possibly negated, or a char), if it is one.
     fn const_scalar(&self, e: ExprId) -> Option<i128> {
         // A const item or associated const the checker evaluated.
@@ -9845,10 +9898,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if structural {
             let mut derefs = 0;
             while let TyKind::Ref(_, m, inner) = self.tys.kind(t) {
-                // A string literal or &str const pattern matches `&str` directly.
-                let str_pat = matches!(p.ast.pat(pat), Pat::Lit(l) if matches!(p.ast.expr(*l), Expr::Str(_)))
+                // A string literal, byte string literal, or &str const
+                // pattern has a reference type itself, so it matches
+                // the scrutinee reference directly and never
+                // auto-derefs (rustc rejects `&&str` against `"ab"`
+                // and `&&[u8]` against `b"ab"`).
+                let str_pat = matches!(p.ast.pat(pat), Pat::Lit(l) if matches!(p.ast.expr(*l), Expr::Str(_)) || self.is_byte_str_lit(*l))
                     || matches!(p.ast.pat(pat), Pat::Path(segs) if segs.len() == 1 && p.const_names.get(&segs[0].name).is_some_and(|&i| matches!(p.consts[i as usize].value, crate::ty::consteval::ConstValue::Str(_))));
-                if str_pat && self.kind(inner) == TyKind::Str {
+                if str_pat {
                     break;
                 }
                 derefs += 1;
@@ -10036,8 +10093,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             },
             Pat::Lit(l) => {
-                let lt = self.expr(*l, Some(t));
-                if !self.unify(lt, t) {
+                // A byte string literal has type `&[u8; N]` but, as a
+                // pattern, also matches a `&[u8]` scrutinee (rustc's
+                // byte string pattern rule). Check it with no expected
+                // type so the array keeps its own length, then apply
+                // that rule by hand.
+                let byte_str = self.is_byte_str_lit(*l);
+                let lt = self.expr(*l, if byte_str { None } else { Some(t) });
+                if !self.unify(lt, t) && !(byte_str && self.byte_str_pat_ok(lt, t)) {
                     self.mismatch(span, t, lt);
                 }
                 if !in_match {
@@ -10069,7 +10132,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
                 // An exclusive range `lo..hi` needs lo < hi (rustc E0579);
-                // an inclusive one needs lo <= hi (rustc E0030).
+                // an inclusive one needs lo <= hi (rustc E0030). Float
+                // ranges follow the same rules, and a NaN bound is an
+                // error in rustc ("cannot use NaN in patterns").
+                let mut empty = false;
+                // An unresolved float variable falls back to `f64` at
+                // body end, so its bounds read as `f64` here too.
+                let float_ft = match self.kind(t) {
+                    TyKind::Float(ft) => Some(ft),
+                    k if k.is_float_infer() => Some(FloatTy::F64),
+                    _ => None,
+                };
+                if let Some(ft) = float_ft {
+                    let vals: Vec<Option<f64>> = bound_tys.iter().map(|&(b_e, _)| self.const_float(b_e, ft)).collect();
+                    for (&(b_e, _), v) in bound_tys.iter().zip(&vals) {
+                        if v.is_some_and(|v| v.is_nan()) {
+                            let b_span = self.span(b_e);
+                            self.err(
+                                "L0110",
+                                b_span,
+                                "cannot use NaN in patterns",
+                                "Use a guard to test for NaN.",
+                            );
+                        }
+                    }
+                    if let [Some(lo_v), Some(hi_v)] = vals[..] {
+                        empty = lo_v > hi_v || (!inclusive && lo_v == hi_v);
+                    }
+                }
                 if let [(lo_e, _), (hi_e, _)] = bound_tys[..]
                     && let (Some(lo_v), Some(hi_v)) = (self.const_scalar(lo_e), self.const_scalar(hi_e))
                     && match (self.scalar_key(lo_v, t), self.scalar_key(hi_v, t)) {
@@ -10077,6 +10167,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         _ => lo_v > hi_v || (!inclusive && lo_v == hi_v),
                     }
                 {
+                    empty = true;
+                }
+                if empty {
                     self.err(
                         "L0119",
                         span,
@@ -10085,12 +10178,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     );
                 }
                 if bound_tys.iter().any(|&(_, bt)| !self.unify(bt, t))
-                    || !(matches!(self.kind(t), TyKind::Int(_) | TyKind::Char) || self.kind(t).is_int_infer())
+                    || !(matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char)
+                        || self.kind(t).is_int_infer()
+                        || self.kind(t).is_float_infer())
                 {
                     self.err(
                         "L0110",
                         span,
-                        "range patterns need integer or char bounds of the matched type",
+                        "range patterns need integer, float, or char bounds of the matched type",
                         "Use bounds of the scrutinee's type.",
                     );
                 }

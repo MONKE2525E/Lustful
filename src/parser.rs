@@ -18,7 +18,7 @@ const C_TY: &str = "L0602"; // type forms and type aliases
 const C_TRAIT: &str = "L0614"; // traits, generics, and where clauses
 const C_ASSOC: &str = "L0621"; // associated items and qualified paths
 const C_CONST: &str = "L0632"; // const and static items, const generics
-const C_LIT: &str = "L0641"; // float and byte literals, other std-surface syntax
+const C_LIT: &str = "L0641"; // C string literals and other std-surface syntax
 #[allow(dead_code)] // Typed receivers parse now; collect rejects them until method resolution lands.
 const C_METHOD: &str = "L0721"; // method and receiver forms
 const C_EXTERN: &str = "L0810"; // extern blocks and foreign items
@@ -2572,12 +2572,23 @@ impl<'a> Parser<'a> {
 
     /// True when the token `n` ahead can start a pattern literal.
     fn at_literal_start_at(&self, n: usize) -> bool {
-        matches!(self.peek_at(n), Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False)
+        matches!(
+            self.peek_at(n),
+            Tok::Int(..)
+                | Tok::Float(_)
+                | Tok::ByteStr(_)
+                | Tok::ByteChar(_)
+                | Tok::Minus
+                | Tok::Str(_)
+                | Tok::Char(_)
+                | Tok::True
+                | Tok::False
+        )
     }
 
     /// True when the next token can start a pattern literal.
     fn at_literal_start(&self) -> bool {
-        matches!(self.peek(), Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False)
+        self.at_literal_start_at(0)
     }
 
     /// True when the next token can start a range pattern bound: a
@@ -2617,7 +2628,8 @@ impl<'a> Parser<'a> {
                     Pat::Binding { name, mutable, by_ref }
                 }
             }
-            Tok::Int(..) | Tok::Minus | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False => {
+            Tok::Int(..) | Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Minus | Tok::Str(_) | Tok::Char(_)
+            | Tok::True | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
                     let hi = self.pattern_bound()?;
@@ -2647,7 +2659,6 @@ impl<'a> Parser<'a> {
                 let hi = self.pattern_bound()?;
                 Pat::Range { lo: None, hi: Some(hi), inclusive: true }
             }
-            Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) => return Err(not_yet(C_LIT, start, "float and byte literals")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Pat::QPath { self_ty, trait_path, segs }
@@ -2824,11 +2835,39 @@ impl<'a> Parser<'a> {
         Ok(self.push_pat(pat, start.to(self.prev_span())))
     }
 
+    /// The `u8` expression for a byte char literal token (`b'x'`).
+    fn byte_char_expr(&self, i: u32, start: Span) -> PResult<Expr> {
+        let text = self.ast.strings[(i + self.str_base) as usize].clone();
+        match decode_byte_char(&text) {
+            Some(v) => Ok(Expr::Int(v as u128, Some(crate::lexer::IntSuffix::U8))),
+            None => Err(syntax(start, "invalid byte char literal")),
+        }
+    }
+
+    /// The `&[u8; N]` expression for a byte string literal token
+    /// (`b".."`, `br".."`, `br#".."#`): a reference to a byte array
+    /// literal, which is its Rust type. C string literals share the
+    /// token and stay rejected.
+    fn byte_str_expr(&mut self, i: u32, start: Span) -> PResult<Expr> {
+        let text = self.ast.strings[(i + self.str_base) as usize].clone();
+        if text.starts_with('c') {
+            return Err(not_yet(C_LIT, start, "C string literals"));
+        }
+        let Some(bytes) = decode_byte_str(&text) else { return Err(syntax(start, "invalid byte string literal")) };
+        let elems: Vec<ExprId> =
+            bytes.iter().map(|&b| self.push_expr(Expr::Int(b as u128, Some(crate::lexer::IntSuffix::U8)), start)).collect();
+        let arr = self.push_expr(Expr::Array(elems), start);
+        Ok(Expr::Ref { mutable: false, raw: false, expr: arr })
+    }
+
     fn literal_expr(&mut self) -> PResult<ExprId> {
         let start = self.span();
         let neg = self.eat(Tok::Minus);
         let e = match self.bump().tok {
             Tok::Int(v, s) => Expr::Int(v, s),
+            Tok::Float(i) => Expr::Float(i + self.str_base),
+            Tok::ByteChar(i) if !neg => self.byte_char_expr(i, start)?,
+            Tok::ByteStr(i) if !neg => self.byte_str_expr(i, start)?,
             Tok::Str(i) if !neg => Expr::Str(i + self.str_base),
             Tok::Char(c) if !neg => Expr::Char(c),
             Tok::True if !neg => Expr::Bool(true),
@@ -3303,26 +3342,11 @@ impl<'a> Parser<'a> {
             }
             Tok::ByteChar(i) => {
                 self.bump();
-                let text = self.ast.strings[(i + self.str_base) as usize].clone();
-                match decode_byte_char(&text) {
-                    Some(v) => Expr::Int(v as u128, Some(crate::lexer::IntSuffix::U8)),
-                    None => return Err(syntax(start, "invalid byte char literal")),
-                }
+                self.byte_char_expr(i, start)?
             }
             Tok::ByteStr(i) => {
                 self.bump();
-                let text = self.ast.strings[(i + self.str_base) as usize].clone();
-                if text.starts_with('c') {
-                    return Err(not_yet(C_LIT, start, "C string literals"));
-                }
-                // A byte string expands to a reference to a byte array
-                // literal, which is its Rust type (`&[u8; N]`). Patterns
-                // keep the byte literal reject for now.
-                let Some(bytes) = decode_byte_str(&text) else { return Err(syntax(start, "invalid byte string literal")) };
-                let elems: Vec<ExprId> =
-                    bytes.iter().map(|&b| self.push_expr(Expr::Int(b as u128, Some(crate::lexer::IntSuffix::U8)), start)).collect();
-                let arr = self.push_expr(Expr::Array(elems), start);
-                Expr::Ref { mutable: false, raw: false, expr: arr }
+                self.byte_str_expr(i, start)?
             }
             Tok::Str(i) => {
                 self.bump();

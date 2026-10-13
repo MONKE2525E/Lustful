@@ -1416,6 +1416,38 @@ impl Evaluator {
                 Ok(values_eq(v, &lv))
             }
             Pat::Range { lo, hi, inclusive } => {
+                // A float range compares with `partial_cmp`: a NaN
+                // scrutinee matches no range, as in rustc.
+                if let ConstValue::Float(bits, ft) = v {
+                    let n = match ft {
+                        FloatTy::F32 => f32::from_bits(*bits as u32) as f64,
+                        FloatTy::F64 => f64::from_bits(*bits),
+                    };
+                    let fbound = |hv: &ConstValue| match hv {
+                        ConstValue::Float(b, FloatTy::F32) => Some(f32::from_bits(*b as u32) as f64),
+                        ConstValue::Float(b, FloatTy::F64) => Some(f64::from_bits(*b)),
+                        _ => None,
+                    };
+                    if let Some(lo) = lo {
+                        let (lv, _) = self.value(cx, env, *lo, Some(t))?;
+                        let Some(l) = fbound(&lv) else { return Ok(false) };
+                        if !(n >= l) {
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(hi) = hi {
+                        let (hv, _) = self.value(cx, env, *hi, Some(t))?;
+                        let Some(h) = fbound(&hv) else { return Ok(false) };
+                        if *inclusive {
+                            if !(n <= h) {
+                                return Ok(false);
+                            }
+                        } else if !(n < h) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 let num = match v {
                     ConstValue::Int(i) => Some(*i),
                     ConstValue::Char(c) => Some(*c as i128),

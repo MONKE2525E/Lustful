@@ -3062,10 +3062,40 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// The bytes of a byte string literal pattern, which the parser
+    /// builds as `&[b0, b1, ..]` over `u8` integer literals.
+    fn byte_str_bytes(&self, l: ExprId) -> Option<Vec<u8>> {
+        let Expr::Ref { mutable: false, raw: false, expr } = self.p.ast.expr(l) else { return None };
+        let Expr::Array(elems) = self.p.ast.expr(*expr) else { return None };
+        let mut out = Vec::with_capacity(elems.len());
+        for &e in elems {
+            match self.p.ast.expr(e) {
+                Expr::Int(v, Some(crate::lexer::IntSuffix::U8)) => out.push(*v as u8),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
     fn lit_operand(&mut self, l: ExprId, ty: Ty) -> Operand {
         match self.p.ast.expr(l) {
             Expr::Unary { expr, .. } => match (self.p.ast.expr(*expr), self.kind(ty)) {
                 (Expr::Int(v, _), TyKind::Int(it)) => Operand::Const(Const::Int(v.wrapping_neg(), it)),
+                (Expr::Float(i), TyKind::Float(ft)) => {
+                    let text = &self.p.ast.strings[*i as usize];
+                    // Negation flips only the sign bit, as in rustc:
+                    // `-0.0` stays distinct in bits from `0.0`.
+                    match crate::check::collect::parse_float_literal_as(text, ft) {
+                        Some(bits) => {
+                            let sign = match ft {
+                                FloatTy::F32 => 1u64 << 31,
+                                FloatTy::F64 => 1u64 << 63,
+                            };
+                            Operand::Const(Const::Float(bits ^ sign, ft))
+                        }
+                        None => Operand::Const(Const::Unit),
+                    }
+                }
                 _ => Operand::Const(Const::Unit),
             },
             Expr::Int(v, _) => match self.kind(ty) {
@@ -3203,6 +3233,40 @@ impl<'p, 'a> Lower<'p, 'a> {
         match p.ast.pat(pat) {
             Pat::Wild | Pat::Binding { .. } => {}
             Pat::Lit(l) => {
+                if let Some(bytes) = self.byte_str_bytes(*l) {
+                    // A byte string pattern: `place` holds `&[u8; N]`
+                    // or `&[u8]`. A slice needs a length test first;
+                    // then each byte must be equal.
+                    let base = place.deref();
+                    let is_slice = match self.kind(ty) {
+                        TyKind::Ref(_, _, inner) => matches!(self.kind(inner), TyKind::Slice(_)),
+                        _ => false,
+                    };
+                    if is_slice {
+                        let len = self.temp(USIZE);
+                        self.assign(Place::local(len), Rvalue::LenOf(base.clone()), span);
+                        branch(
+                            self,
+                            Rvalue::Bin(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(len)),
+                                Operand::Const(Const::Int(bytes.len() as u128, IntTy::Usize)),
+                            ),
+                        );
+                    }
+                    for (i, b) in bytes.iter().enumerate() {
+                        let idx = self.const_usize(i as u64, span);
+                        branch(
+                            self,
+                            Rvalue::Bin(
+                                BinOp::Eq,
+                                Operand::Copy(base.project(Proj::Index(idx))),
+                                Operand::Const(Const::Int(*b as u128, IntTy::U8)),
+                            ),
+                        );
+                    }
+                    return;
+                }
                 let lit = self.lit_operand(*l, ty);
                 if matches!(lit, Operand::Const(Const::Str(_))) {
                     branch(self, Rvalue::StrCmp(BinOp::Eq, Operand::Copy(place), lit));
