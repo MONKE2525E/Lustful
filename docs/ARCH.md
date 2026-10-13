@@ -4600,6 +4600,27 @@ last scan) drift, so no gate hard-codes them.
    numbers use interleaved runs and medians (brief
    rule for the shared box).
 
+### 9.6 `unsafe` in lust's own code
+
+lust's own Rust code uses `unsafe` only by opt-in, and
+every use is documented. (This is about the compiler
+itself. `unsafe` in the source that lust compiles is
+the PLAN.md decision 3 opt-in; see 3.1.)
+
+1. A C or libc call (libtcc, `fork`, `waitpid`,
+   `flock`, `signal`, `pipe`) may use `unsafe`. Each
+   block has a `SAFETY:` comment.
+2. Any other `unsafe` needs a waiver in the table
+   below: the site, what the `unsafe` does, and why
+   safe code does not do the job. The site has a
+   `SAFETY:` comment with the proof and names this
+   section.
+3. A waiver goes when its code goes.
+
+| Site | What it does | Why not safe code |
+|---|---|---|
+| `src/pool.rs`, `run` | Erases the lifetime of a phase's job (`&(dyn Fn() + Sync)` to `'static`), so the persistent workers can call it. `EndPhase` runs on every exit path of `run`, a panic included: it stops new workers from joining and waits until no worker is inside the job, so no use outlives the borrow. | Scoped threads are safe but start new threads in every phase: a cold check of the 31k-line crate started 149 threads with them and 23 with the pool (review of land-t2). |
+
 
 ## 10. Spikes, risks, and rejected options
 
