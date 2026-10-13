@@ -663,9 +663,35 @@ pub struct Scope {
     /// behind an `Arc` keeps `Program` shareable across the
     /// parallel body checks.
     pub infer_cell: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// How written lifetimes resolve (W-BORROW). The default erases them,
+    /// as every type the checker reads is region-erased.
+    pub regions: RegionMode,
+}
+
+/// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
+/// resolves each signature a second time in `Keep` mode for the borrow
+/// checker's region signatures (`crate::borrowck::RegionTables`).
+#[derive(Clone, Debug, Default)]
+pub enum RegionMode {
+    /// Regions erased: `'static` and `'_` resolve to `Region::Erased`.
+    #[default]
+    Erase,
+    /// Regions kept: `'static` is `Region::Static`; an elided or `'_`
+    /// region is `elided` when set (an output under Rust's elision rules),
+    /// else the next `Region::Param` from `next` (each input its own), and
+    /// with neither it is the missing-lifetime error (L0202, rustc E0106).
+    Keep { next: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>, elided: Option<Region> },
 }
 
 impl Scope {
+    /// This scope with lifetimes erased: for the insides of fn pointer and
+    /// `dyn` types, whose elided lifetimes are their own (late-bound).
+    fn erased(&self) -> Scope {
+        let mut s = self.clone();
+        s.regions = RegionMode::Erase;
+        s
+    }
+
     /// The parameter index of a type parameter name.
     pub fn param_of(&self, name: Sym) -> Option<u32> {
         self.type_params.iter().find(|(n, _)| *n == name).map(|(_, i)| *i)
@@ -716,6 +742,115 @@ fn check_lifetime(interner: &Interner, lt: ast::Lifetime) -> Result<Region, Diag
     match interner.get(lt.name) {
         "static" | "_" => Ok(Region::Erased),
         _ => Err(lifetime_diag(lt.span)),
+    }
+}
+
+/// The region of a reference's written (or elided) lifetime under the
+/// scope's region mode (W-BORROW). In a body annotation an explicit
+/// `'static` is not supported yet: the annotation's region would be
+/// lost, and lust must not accept a borrow rustc rejects (L0203).
+fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
+    let name = lt.map(|lt| interner.get(lt.name));
+    if let Some(lt) = lt {
+        check_lifetime(interner, lt)?;
+    }
+    match &scope.regions {
+        RegionMode::Erase => {
+            if name == Some("static") && scope.infer_cell.is_some() {
+                return Err(Diag::new(
+                    "L0203",
+                    lt.map_or(span, |l| l.span),
+                    "an explicit `'static` in a type annotation inside a body is not supported yet",
+                    "Remove the annotation and let the type be inferred, or move the value into a `static` or `const` item.",
+                ));
+            }
+            Ok(Region::Erased)
+        }
+        RegionMode::Keep { next, elided } => match name {
+            Some("static") => Ok(Region::Static),
+            _ => match (elided, next) {
+                (Some(r), _) => Ok(*r),
+                (None, Some(c)) => Ok(Region::Param(c.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
+                (None, None) => Err(Diag::new(
+                    "L0202",
+                    span,
+                    "missing lifetime specifier: elision cannot tell which input this reference borrows from",
+                    "Return an owned value, take exactly one reference parameter, or borrow from `self`.",
+                )),
+            },
+        },
+    }
+}
+
+/// True when a written type names a lifetime other than `'_` anywhere
+/// (fn pointer types cannot carry one yet, W-BORROW).
+fn names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    let named = |lt: &ast::Lifetime| interner.get(lt.name) != "_";
+    let in_args = |args: &GenericArgs| match args {
+        GenericArgs::Angle(a) => a.iter().any(|g| match g {
+            AstArg::Lifetime(lt) => named(lt),
+            AstArg::Type(t) => names_lifetime(ast, interner, *t),
+            _ => false,
+        }),
+        GenericArgs::Parenthesized { inputs, output } => {
+            inputs.iter().any(|&t| names_lifetime(ast, interner, t)) || output.is_some_and(|t| names_lifetime(ast, interner, t))
+        }
+        _ => false,
+    };
+    match ast.ty(id) {
+        TyExpr::Ref { lifetime, inner, .. } => lifetime.as_ref().is_some_and(named) || names_lifetime(ast, interner, *inner),
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| names_lifetime(ast, interner, e)),
+        TyExpr::Paren(i) | TyExpr::Slice(i) => names_lifetime(ast, interner, *i),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => names_lifetime(ast, interner, *inner),
+        TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
+        TyExpr::FnPtr { inputs, ret, .. } => {
+            inputs.iter().any(|p| names_lifetime(ast, interner, p.ty)) || ret.is_some_and(|r| names_lifetime(ast, interner, r))
+        }
+        TyExpr::Dyn { bounds, lifetime, .. } => {
+            lifetime.as_ref().is_some_and(named)
+                || bounds.iter().any(|b| match b {
+                    TraitBound::Lifetime(lt) => named(lt),
+                    TraitBound::Trait { trait_ref, .. } => trait_ref.path.iter().any(|s| in_args(&s.args)),
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `t` with every reference region `'static`: the region form of a type
+/// alias body, which may only use `'static` (W-BORROW, increment 1).
+fn staticize(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => {
+            let i = staticize(tys, inner);
+            tys.intern(TyKind::Ref(Region::Static, m, i))
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = tys.tys_of(ts).to_vec().into_iter().map(|e| staticize(tys, e)).collect();
+            let id = tys.intern_tys(&elems);
+            tys.intern(TyKind::Tuple(id))
+        }
+        TyKind::Array(e, n) => {
+            let e = staticize(tys, e);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let e = staticize(tys, e);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Adt(d, a) => {
+            let args: Vec<GenericArg> = tys
+                .args(a)
+                .to_vec()
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => GenericArg::Ty(staticize(tys, e)),
+                    x => x,
+                })
+                .collect();
+            tys.mk_adt(d, &args)
+        }
+        _ => t,
     }
 }
 
@@ -1043,15 +1178,13 @@ pub fn resolve_scoped(
         TyExpr::Unit => Ok(UNIT),
         TyExpr::Never => Ok(NEVER),
         TyExpr::Ref { lifetime, mutable, inner } => {
-            if let Some(lt) = lifetime {
-                check_lifetime(interner, *lt)?;
-            }
-            let mut inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
             // `&'static dyn Tr` defaults its object lifetime to the
             // reference's: `&'static (dyn Tr + 'static)` (ARCH 2.8).
             // A reference to a dyn type keeps a written `'static`, so
-            // a coercion into it can be checked (`check::object`);
-            // every other reference is erased.
+            // a coercion into it can be checked (`check::object`); the
+            // borrow checker honors that kept region too. Every other
+            // reference resolves under the scope's region mode.
+            let mut inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
             if lifetime.is_some_and(|lt| interner.get(lt.name) == "static")
                 && let TyKind::Dyn(b, r) = tys.kind(inner)
             {
@@ -1060,7 +1193,8 @@ pub fn resolve_scoped(
                 }
                 return Ok(tys.intern(TyKind::Ref(Region::Static, Mut::from_bool(*mutable), inner)));
             }
-            Ok(tys.mk_ref(*mutable, inner))
+            let region = scope_region(interner, scope, *lifetime, span)?;
+            Ok(if region == Region::Erased { tys.mk_ref(*mutable, inner) } else { tys.intern(TyKind::Ref(region, Mut::from_bool(*mutable), inner)) })
         }
         TyExpr::Tuple(elems) => {
             let mut out = Vec::with_capacity(elems.len());
@@ -1092,11 +1226,24 @@ pub fn resolve_scoped(
             None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
         },
         TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
-        TyExpr::Dyn { binder, bounds, lifetime } => resolve_dyn(ast, interner, known, cx, tys, scope, binder, bounds, *lifetime, span),
+        TyExpr::Dyn { binder, bounds, lifetime } => resolve_dyn(ast, interner, known, cx, tys, &scope.erased(), binder, bounds, *lifetime, span),
         TyExpr::FnPtr { qual, inputs, variadic, ret, .. } => {
             if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
                 return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));
             }
+            // A fn pointer's elided lifetimes are its own (late-bound); a
+            // named or `'static` one would need regions in fn pointer types,
+            // which lust does not track yet (W-BORROW increment 5).
+            if names_lifetime(ast, interner, id) {
+                return Err(Diag::new(
+                    "L0203",
+                    span,
+                    "lifetimes in function pointer types are not supported yet",
+                    "Elide the lifetimes (`fn(&T) -> &U`), or use a generic `F: Fn(&T) -> &U` parameter.",
+                ));
+            }
+            let erased = scope.erased();
+            let scope = &erased;
             let mut ins = Vec::with_capacity(inputs.len());
             for p in inputs {
                 ins.push(resolve_scoped(ast, interner, known, cx, tys, p.ty, scope)?);
@@ -1427,6 +1574,8 @@ fn resolve_path_ty(
     {
         return if seg.has_args() {
             Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
+        } else if matches!(scope.regions, RegionMode::Keep { .. }) {
+            Ok(staticize(tys, alias_ty))
         } else {
             Ok(alias_ty)
         };
@@ -2171,7 +2320,8 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
 /// Resolves one fn signature in template form: self parameter,
 /// params, and return, under the combined scope. Handles
 /// `impl Trait` argument sugar by growing the generics. Returns
-/// (params with self first, ret, ret_borrows_from).
+/// (params with self first, ret, ret_borrows_from, generics, scope,
+/// region signature for the borrow checker).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_fn_sig(
     ast: &Ast,
@@ -2184,7 +2334,7 @@ pub fn resolve_fn_sig(
     scope: &Scope,
     self_ty: Option<Ty>,
     errs: &mut Vec<Diag>,
-) -> (Vec<Ty>, Ty, Option<usize>, Generics, Scope) {
+) -> (Vec<Ty>, Ty, Option<usize>, Generics, Scope, Option<crate::borrowck::RegionSig>) {
     let mut scope = scope.clone();
     if scope.self_ty.is_none() {
         scope.self_ty = self_ty;
@@ -2265,10 +2415,10 @@ pub fn resolve_fn_sig(
             "Put the value behind a reference, such as `&[T]` or `&str`.",
         ));
     }
-    // Elision, as in the plain path: a returned reference borrows
-    // from `self`, or from the only reference parameter. A written
-    // `dyn` object lifetime (`+ '_`, `+ 'static`) is one more input
-    // lifetime, so that parameter is no single source (rustc E0106).
+    // The parameter a returned reference borrows from under elision
+    // (compat field; the borrow checker reads the region signature).
+    // A written `dyn` object lifetime (`+ '_`, `+ 'static`) is one
+    // more input lifetime, so that parameter is no single source.
     let mut ret_borrows_from = None;
     if crate::check::collect::contains_ref(tys, ret) {
         let ref_params: Vec<usize> = (0..params.len()).filter(|&i| crate::check::collect::contains_ref(tys, params[i])).collect();
@@ -2277,17 +2427,93 @@ pub fn resolve_fn_sig(
             ret_borrows_from = Some(0);
         } else if ref_params.len() == 1 && !dyn_lt {
             ret_borrows_from = Some(ref_params[0]);
-        } else {
-            let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
-            errs.push(Diag::new(
-                "L0202",
-                span,
-                "this function returns a reference, but elision cannot tell which parameter it borrows from",
-                "Return an owned value (such as String), or take exactly one reference parameter. Lust has no lifetime names.",
-            ));
         }
     }
-    (params, ret, ret_borrows_from, generics, scope)
+    let region_sig = region_sig(ast, interner, known, tys, cx, def, &scope, self_ty, &params, errs);
+    (params, ret, ret_borrows_from, generics, scope, region_sig)
+}
+
+/// The region signature of one fn (W-BORROW, ARCH 5.2): its params and
+/// return resolved again with lifetimes kept. Each elided input lifetime
+/// is its own universal region; elided output lifetimes take `&self`'s,
+/// else the only input lifetime, else they are L0202 (rustc E0106). None
+/// when a type does not resolve (the erased pass reported why).
+#[allow(clippy::too_many_arguments)]
+fn region_sig(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &mut impl TyIntern,
+    cx: &ResolveCx,
+    def: &ast::FnDef,
+    scope: &Scope,
+    self_ty: Option<Ty>,
+    params: &[Ty],
+    errs: &mut Vec<Diag>,
+) -> Option<crate::borrowck::RegionSig> {
+    use std::sync::atomic::Ordering;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut ks = scope.clone();
+    ks.regions = RegionMode::Keep { next: Some(counter.clone()), elided: None };
+    let mut rparams: Vec<Ty> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut self_region: Option<Region> = None;
+    let mut skip = 0;
+    if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
+        let t = match sp.kind {
+            ast::SelfKind::Value => st,
+            ast::SelfKind::Ref | ast::SelfKind::RefMut => {
+                let r = scope_region(interner, &ks, sp.lifetime, sp.span).ok()?;
+                self_region = Some(r);
+                tys.intern(TyKind::Ref(r, Mut::from_bool(sp.kind == ast::SelfKind::RefMut), st))
+            }
+            ast::SelfKind::Typed => match sp.ty {
+                Some(t) => resolve_scoped(ast, interner, known, cx, tys, t, &ks).ok()?,
+                None => st,
+            },
+        };
+        for _ in names.len()..counter.load(Ordering::Relaxed) as usize {
+            names.push("the lifetime of `self`".into());
+        }
+        rparams.push(t);
+        skip = 1;
+    }
+    for (i, param) in def.params.iter().enumerate() {
+        let t = if let TyExpr::ImplTrait { .. } = ast.ty(param.ty) {
+            *params.get(skip + i)?
+        } else {
+            resolve_scoped(ast, interner, known, cx, tys, param.ty, &ks).ok()?
+        };
+        for _ in names.len()..counter.load(Ordering::Relaxed) as usize {
+            names.push(format!("the lifetime of parameter {}", i + 1));
+        }
+        rparams.push(t);
+    }
+    let mut inputs: Vec<Region> = Vec::new();
+    for &t in &rparams {
+        crate::borrowck::regions_of(tys, t, &mut inputs);
+    }
+    // A written dyn object lifetime is one more input lifetime (E0106).
+    if def.params.iter().any(|prm| has_written_dyn_lifetime(ast, prm.ty)) {
+        inputs.push(Region::Erased);
+    }
+    let elided = self_region.or(if inputs.len() == 1 { Some(inputs[0]) } else { None });
+    let mut rs = scope.clone();
+    rs.regions = RegionMode::Keep { next: None, elided };
+    let rret = match def.ret {
+        None => UNIT,
+        Some(t) => match resolve_scoped(ast, interner, known, cx, tys, t, &rs) {
+            Ok(t) => t,
+            Err(d) => {
+                if d.code == "L0202" {
+                    errs.push(d);
+                }
+                return None;
+            }
+        },
+    };
+    let n_univ = counter.load(Ordering::Relaxed);
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts: Vec::new(), names })
 }
 
 /// True when a written type holds a `dyn` type with a written object
@@ -2496,10 +2722,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
-            let (params, ret, ret_borrows_from, combined, mscope) = {
+            let (params, ret, ret_borrows_from, combined, mscope, region_sig) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, errs)
             };
+            if let Some(rs) = region_sig {
+                p.regions.trait_methods.insert(method_def, rs);
+            }
             let menv = elaborate_env(&mut p.tys, &p.gx.index, &combined.predicates);
             p.gx.trait_methods.insert(
                 method_def,

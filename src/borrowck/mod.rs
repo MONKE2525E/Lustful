@@ -2,15 +2,20 @@
 //
 // 1. Initialization: forward dataflow of maybe-init and maybe-moved locals. Moves are
 //    tracked per field path, so moving `p.x` leaves `p.y` usable (a partial move).
-// 2. Loans: each `&place` creates a loan. Forward dataflow tracks which locals may hold
-//    which loans, and (for lifetime checks at returns and parameter stores) every loan a
-//    local was ever assigned, because a local has one fixed lifetime.
-// 3. Liveness: backward dataflow. A loan is live where some live local may hold it. A
-//    loan that flows into a return value or behind a parameter is also live at every
-//    point reachable from the borrow, as in rustc's NLL (this rejects problem case 3,
-//    which Polonius would accept).
-// 4. Each access is checked against the live loans it conflicts with.
-use crate::check::Builtin;
+// 2. Liveness: backward dataflow of live locals at every point (use-live), and of
+//    locals whose pending `Drop` may touch their regions (drop-live, ARCH 5.4).
+// 3. Regions (regions.rs): rustc's NLL. Each `&place` creates a loan with a region
+//    var; constraints from statements and calls say which locals' regions the loan's
+//    region must contain, and whether it must outlive the fn (a universal region).
+// 4. Loan scopes: a loan is in scope from its borrow through every point where one of
+//    those locals is live (everywhere reachable, for a universal region), until the
+//    borrowed local is overwritten. This rejects NLL problem case 3 and every other
+//    "Polonius accepts, NLL rejects" shape (ARCH 5.2).
+// 5. Each access is checked against the in-scope loans it conflicts with, and region
+//    relations the signature does not give are L0733.
+mod regions;
+pub use regions::{RegionSig, RegionTables, regions_of};
+
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};
 use crate::ir::*;
@@ -120,16 +125,12 @@ fn bit_iter(w: &[u64]) -> impl Iterator<Item = usize> + '_ {
 struct Loan {
     place: Place,
     mutable: bool,
-    /// Stands for "whatever a reference parameter points to". Only used for return checks.
-    synthetic: bool,
     /// Where the borrow starts. Used as a labeled secondary span in diagnostics.
     span: Span,
     /// The last use of the local that first holds this loan, if it is after the borrow.
     last_use: Option<Span>,
-    /// Made for a closure capture (its holder goes into a closure
-    /// value). Iterator items never carry these: a closure cannot
-    /// return a reference, so item references come from the sources.
-    capture: bool,
+    /// The local the borrow is first stored in (the borrow statement's destination).
+    holder: Option<Local>,
 }
 
 /// One field path below a local, as encoded projections (`Field`/`Downcast`). An empty path
@@ -185,12 +186,11 @@ fn is_prefix(a: &[u64], b: &[u64]) -> bool {
 }
 
 /// The word layout of a `State` for one body: `n` locals, sets over locals
-/// take `wn` words, sets over loans `wl` words, and the move-path set `wm`.
+/// take `wn` words, and the move-path set `wm`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Shape {
     n: usize,
     wn: usize,
-    wl: usize,
     wm: usize,
 }
 
@@ -201,13 +201,6 @@ struct Shape {
 ///
 /// - `init`, `uninit`, `moved`: maybe-initialized, maybe-uninitialized,
 ///   and maybe-moved locals.
-/// - `holds(l)`: the loans local `l` may hold.
-/// - `origins(l)`: every loan local `l` was ever assigned on this path.
-///   Unlike `holds` this is never overwritten by a later assignment (until
-///   storage ends). A local in Rust has one fixed lifetime, so at a return
-///   or a store behind a parameter every value the local ever held must
-///   satisfy that lifetime. Later assignments cannot hide an earlier one.
-///   This is only used at those sinks, not for loan liveness.
 /// - `paths`: the field paths that may have been moved out of their local,
 ///   one bit per entry of `Ck::mpaths`. The empty path means the whole
 ///   local may have been moved.
@@ -219,7 +212,7 @@ struct State {
 
 impl State {
     fn new(sh: Shape) -> State {
-        State { sh, w: vec![0; 3 * sh.wn + 2 * sh.n * sh.wl + sh.wm] }
+        State { sh, w: vec![0; 3 * sh.wn + sh.wm] }
     }
     fn init(&self) -> &[u64] {
         &self.w[..self.sh.wn]
@@ -242,33 +235,11 @@ impl State {
         let wn = self.sh.wn;
         &mut self.w[2 * wn..3 * wn]
     }
-    fn holds_at(&self, l: usize) -> usize {
-        3 * self.sh.wn + l * self.sh.wl
-    }
-    fn origins_at(&self, l: usize) -> usize {
-        3 * self.sh.wn + (self.sh.n + l) * self.sh.wl
-    }
-    fn holds(&self, l: usize) -> &[u64] {
-        let a = self.holds_at(l);
-        &self.w[a..a + self.sh.wl]
-    }
-    fn holds_mut(&mut self, l: usize) -> &mut [u64] {
-        let (a, wl) = (self.holds_at(l), self.sh.wl);
-        &mut self.w[a..a + wl]
-    }
-    fn origins(&self, l: usize) -> &[u64] {
-        let a = self.origins_at(l);
-        &self.w[a..a + self.sh.wl]
-    }
-    fn origins_mut(&mut self, l: usize) -> &mut [u64] {
-        let (a, wl) = (self.origins_at(l), self.sh.wl);
-        &mut self.w[a..a + wl]
-    }
     fn paths(&self) -> &[u64] {
-        &self.w[3 * self.sh.wn + 2 * self.sh.n * self.sh.wl..]
+        &self.w[3 * self.sh.wn..]
     }
     fn paths_mut(&mut self) -> &mut [u64] {
-        let a = 3 * self.sh.wn + 2 * self.sh.n * self.sh.wl;
+        let a = 3 * self.sh.wn;
         &mut self.w[a..]
     }
     fn join(&mut self, o: &State) -> bool {
@@ -300,27 +271,27 @@ struct Ck<'b, 'p, 'a> {
     /// blocks end in a call, and recomputing edges in every pass showed up
     /// in profiles.
     succs: Vec<Vec<Bb>>,
-    /// Live locals after each statement, `sh.wn` words per statement, by
-    /// body-wide statement index.
-    live_out: Vec<u64>,
-    /// Live locals at each block's entry, for the loans live after a block's
-    /// terminating call.
-    live_in_block: Vec<BitSet>,
+    /// The first point of each block. A block has one point per statement
+    /// plus one for its terminator; point `point_base[b] + i` is the entry
+    /// of statement `i` (or of the terminator, at `i == len`).
+    point_base: Vec<usize>,
+    /// Use-live locals at the entry of each point, `sh.wn` words per point.
+    live_entry: Vec<u64>,
+    /// Drop-live locals at the entry of each point (empty when no local's
+    /// drop touches regions): locals whose later `Drop` may read a region.
+    drop_entry: Vec<u64>,
+    /// Loans in scope at the entry of each point, `wl` words per point.
+    scope: Vec<u64>,
+    /// Words per set over loans.
+    wl: usize,
+    /// The region solution (set before the reporting pass).
+    sol: Option<regions::Solution>,
     errs: Vec<Diag>,
     seen: HashSet<(&'static str, Span)>,
     report: bool,
-    /// Loans that flow into a return value or behind a parameter reference. Their region
-    /// must outlive a parameter lifetime, and rustc's NLL treats such a region as live at
-    /// every point reachable from the borrow (not only where a holder local is used).
-    /// This is what makes rustc reject NLL problem case 3; Polonius would accept it.
-    escaped: BitSet,
-    /// Creation point of each loan (`u32::MAX` for synthetic parameter loans).
+    /// Creation point of each loan.
     loan_block: Vec<u32>,
     loan_stmt: Vec<u32>,
-    /// `reach[b]` is the set of blocks reachable from `b`, including `b`.
-    reach: Vec<BitSet>,
-    /// True in the pass that only collects `escaped` loans.
-    collecting: bool,
     /// Defs of Adts with a user `Drop` impl (any impl of the lang `Drop`
     /// trait whose Self head is that Adt). Computed once per body from
     /// the impl index; the partial-move checks below read it.
@@ -334,9 +305,6 @@ struct Ck<'b, 'p, 'a> {
     mpaths: Vec<(Local, Path)>,
     /// The `mpaths` index range of each local's paths.
     mpath_at: Vec<(u32, u32)>,
-    /// Per local: its type contains a reference (computed once; every
-    /// assignment asks, in every pass).
-    ref_local: Vec<bool>,
     /// Reused operand list of the statement being checked, so a statement
     /// visit does not allocate.
     ops_buf: Vec<&'b Operand>,
@@ -358,6 +326,27 @@ fn drop_heads(p: &Program) -> HashSet<crate::def::DefId> {
     out
 }
 
+/// The universal regions of a body's own signature: its fn's region
+/// signature (a closure body's from the closure rule, an instance's from
+/// its template), or one unrelated universal per slot when lust has none.
+fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
+    use crate::check::generics::FnClass;
+    let f = body.fn_id;
+    let class = p.gx.fn_class.get(f.0 as usize).copied().unwrap_or_default();
+    let closure = p.gx.closure_fns.contains_key(&f);
+    // Instances (and closures of instances) are not checked for universal
+    // relations: rustc checks the template, which lust checks too, and the
+    // instance sees through type params where the call rules are coarser.
+    let of_instance = |g: LocalDefId| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Instance);
+    let check = class != FnClass::Instance
+        && !(closure && p.gx.closure_fns.get(&f).and_then(|d| p.gx.closures.get(d)).is_some_and(|c| of_instance(c.parent)));
+    let sig = p.regions.fns.get(&f).or_else(|| {
+        let inst = p.gx.instances.get(&f)?;
+        p.regions.fns.get(&inst.template_local?)
+    });
+    regions::OwnSig::build(p, body, sig, closure, check)
+}
+
 /// Borrow-checks one function body.
 pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     let drop_heads = drop_heads(p);
@@ -369,22 +358,22 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         loan_at: Vec::new(),
         preds: vec![Vec::new(); body.blocks.len()],
         succs: Vec::new(),
-        live_out: Vec::new(),
-        live_in_block: Vec::new(),
+        point_base: Vec::new(),
+        live_entry: Vec::new(),
+        drop_entry: Vec::new(),
+        scope: Vec::new(),
+        wl: 0,
+        sol: None,
         errs: Vec::new(),
         seen: HashSet::new(),
         report: false,
-        escaped: BitSet::new(0),
         loan_block: Vec::new(),
         loan_stmt: Vec::new(),
-        reach: Vec::new(),
-        collecting: false,
         drop_heads,
         const_index: const_index_locals(body),
-        sh: Shape { n: 0, wn: 0, wl: 0, wm: 0 },
+        sh: Shape { n: 0, wn: 0, wm: 0 },
         mpaths: Vec::new(),
         mpath_at: Vec::new(),
-        ref_local: body.locals.iter().map(|l| contains_ref(&body.tys, l.ty)).collect(),
         ops_buf: Vec::new(),
     };
     if !body.lower_errs.is_empty() {
@@ -393,20 +382,30 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     ck.collect_loans();
     ck.collect_move_paths();
     let n = body.locals.len();
-    // A body with no loans keeps no loan rows in its states
-    // (`wl` 0: every holds/origins row is empty), and the two
-    // passes that only exist to answer which loans are live
-    // (reachability for escaped loans, local liveness) skip:
-    // `live_loans` is empty at every point of such a body, and
-    // the two call sites that ask for it short-circuit below.
-    ck.sh = Shape { n, wn: n.div_ceil(64).max(1), wl: ck.loans.len().div_ceil(64), wm: ck.mpaths.len().div_ceil(64) };
-    ck.escaped = BitSet::new(ck.loans.len());
+    ck.sh = Shape { n, wn: n.div_ceil(64).max(1), wm: ck.mpaths.len().div_ceil(64) };
+    ck.wl = ck.loans.len().div_ceil(64);
     ck.compute_preds();
-    if !ck.loans.is_empty() {
-        ck.compute_reach();
-        ck.liveness();
+    let entry = ck.init_fixpoint();
+    // A body with no loans needs no regions: no loan can conflict, and a
+    // universal relation can only fail through a loan or a reference value
+    // that flows between parameters, which the region pass checks below.
+    let own = own_sig(p, body);
+    let needs_regions = !ck.loans.is_empty() || own.n_univ > 0;
+    if needs_regions {
+        let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);
+        b.build();
+        let sol = b.solve();
+        ck.errs.extend(sol.errs.iter().cloned());
+        ck.sol = Some(sol);
+        if !ck.loans.is_empty() {
+            ck.liveness(&entry);
+            ck.loan_scopes();
+        }
     }
-    ck.dataflow();
+    if std::env::var_os("LUST_BCK_DEBUG").is_some() {
+        ck.debug_dump();
+    }
+    ck.report_pass(&entry);
     ck.errs
 }
 
@@ -488,6 +487,29 @@ fn overlap(a: &Place, b: &Place) -> bool {
 }
 
 impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
+    /// Prints the body, its loans, and their scopes (LUST_BCK_DEBUG).
+    fn debug_dump(&self) {
+        eprintln!("== borrowck {}", self.p.display_name(self.p.fn_info(self.body.fn_id).name));
+        for (i, l) in self.body.locals.iter().enumerate() {
+            eprintln!("  _{i}: {:?} {:?}", l.name, self.body.tys.kind(l.ty));
+        }
+        for (bi, b) in self.body.blocks.iter().enumerate() {
+            eprintln!("  bb{bi}:");
+            for (si, s) in b.stmts.iter().enumerate() {
+                let q = self.point_base[bi] + si;
+                let sc: Vec<usize> = if self.scope.is_empty() { Vec::new() } else { bit_iter(&self.scope[q * self.wl..(q + 1) * self.wl]).collect() };
+                eprintln!("    [{q}] {:?}   scope={sc:?}", s.kind);
+            }
+            eprintln!("    term {:?}", b.term);
+        }
+        if let Some(sol) = &self.sol {
+            for (i, l) in self.loans.iter().enumerate() {
+                let us: Vec<usize> = bit_iter(sol.use_set(i)).collect();
+                eprintln!("  loan {i}: {:?} mut={} univ={} ret={} use={us:?}", l.place, l.mutable, sol.univ[i], sol.to_ret[i]);
+            }
+        }
+    }
+
     fn n_locals(&self) -> usize {
         self.body.locals.len()
     }
@@ -526,22 +548,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     // ---------- Setup ----------
 
     fn collect_loans(&mut self) {
-        // Synthetic loans for reference parameters, so returned references can be traced to them.
-        for l in 1..=self.body.arg_count {
-            if contains_ref(&self.body.tys, self.body.locals[l].ty) {
-                self.loan_block.push(u32::MAX);
-                self.loan_stmt.push(u32::MAX);
-                self.loans.push(Loan {
-                    place: Place::local(l as Local).deref(),
-                    mutable: false,
-                    synthetic: true,
-                    span: Span::default(),
-                    last_use: None,
-                    capture: false,
-                });
-            }
-        }
-        let mut holders: Vec<Option<Local>> = vec![None; self.loans.len()];
+        let mut holders: Vec<Option<Local>> = Vec::new();
         let mut base = 0;
         for b in &self.body.blocks {
             self.stmt_base.push(base);
@@ -563,28 +570,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.loan_block.push(bi as u32);
                     self.loan_stmt.push(si as u32);
                     self.loan_at[self.stmt_base[bi] + si] = self.loans.len() as u32;
-                    holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
-                    self.loans.push(Loan { place: place.clone(), mutable: m, synthetic: false, span: s.span, last_use: None, capture: false });
-                }
-            }
-        }
-        // Loans whose holder goes into a closure value are capture loans.
-        for b in &self.body.blocks {
-            for st in &b.stmts {
-                if let StmtKind::Assign(_, Rvalue::TupleAgg(ty, ops)) = &st.kind
-                    && matches!(self.body.tys.kind(*ty), TyKind::Closure(..))
-                {
-                    for o in ops {
-                        if let Operand::Copy(p) | Operand::Move(p) = o
-                            && p.proj.is_empty()
-                        {
-                            for (li, h) in holders.iter().enumerate() {
-                                if *h == Some(p.local) {
-                                    self.loans[li].capture = true;
-                                }
-                            }
-                        }
-                    }
+                    let holder = if dest.proj.is_empty() { Some(dest.local) } else { None };
+                    holders.push(holder);
+                    self.loans.push(Loan { place: place.clone(), mutable: m, span: s.span, last_use: None, holder });
                 }
             }
         }
@@ -725,6 +713,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     fn compute_preds(&mut self) {
+        self.compute_points();
         self.succs = self.body.blocks.iter().map(|b| successors(&b.term)).collect();
         for bi in 0..self.succs.len() {
             for k in 0..self.succs[bi].len() {
@@ -732,38 +721,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 self.preds[s.0 as usize].push(bi as u32);
             }
         }
-    }
-
-    fn compute_reach(&mut self) {
-        // reach[b] = {b} plus everything its successors reach, to a fixpoint.
-        // The same sets a per-block search computes, without re-walking the
-        // graph once per block.
-        let nb = self.body.blocks.len();
-        let mut reach = vec![BitSet::new(nb); nb];
-        for (b, r) in reach.iter_mut().enumerate() {
-            r.insert(b);
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in (0..nb).rev() {
-                for k in 0..self.succs[b].len() {
-                    let s = self.succs[b][k].0 as usize;
-                    if s != b {
-                        let (lo, hi) = if b < s { (b, s) } else { (s, b) };
-                        let (left, right) = reach.split_at_mut(hi);
-                        let (dst, src) = if b < s { (&mut left[lo], &right[0]) } else { (&mut right[0], &left[lo]) };
-                        changed |= dst.union(src);
-                    }
-                }
-            }
-        }
-        self.reach = reach;
-    }
-
-    /// True if block `b` can reach itself again through at least one edge (it is in a loop).
-    fn loops_back(&self, b: u32) -> bool {
-        self.succs[b as usize].iter().any(|s| self.reach[s.0 as usize].contains(b as usize))
     }
 
     // ---------- Liveness ----------
@@ -837,15 +794,28 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 
-    fn liveness(&mut self) {
+    /// The first point of each block, plus a sentinel past the last.
+    fn compute_points(&mut self) {
+        let mut base = 0;
+        self.point_base.clear();
+        for b in &self.body.blocks {
+            self.point_base.push(base);
+            base += b.stmts.len() + 1;
+        }
+        self.point_base.push(base);
+    }
+
+    /// Backward liveness to a fixpoint, then the live set at each point's
+    /// entry. With `drop_uses`, this is drop-liveness: only a `Drop` whose
+    /// point is marked uses its local; whole-local assignments and
+    /// `StorageDead` kill. Otherwise every read is a use.
+    fn backward(&self, drop_uses: Option<&[bool]>) -> Vec<u64> {
         let n = self.n_locals();
         let nb = self.body.blocks.len();
         let mut live_in = vec![BitSet::new(n); nb];
         let mut live = BitSet::new(n);
-        // Backward problem: visit reachable blocks in postorder (successors
-        // first, back edges aside), then unreachable ones, so a sweep mostly
-        // sees final successor sets and few sweeps run. The result is the
-        // same in any order.
+        // Successors first (back edges aside), then unreachable blocks, so a
+        // sweep mostly sees final successor sets. Any order gives the same.
         let mut order: Vec<u32> = self.reverse_postorder();
         order.reverse();
         let mut listed = vec![false; nb];
@@ -858,46 +828,285 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             changed = false;
             for &bi in &order {
                 let bi = bi as usize;
-                let b = &self.body.blocks[bi];
-                live.clear();
-                for s in &self.succs[bi] {
-                    live.union(&live_in[s.0 as usize]);
-                }
-                Self::live_term(&b.term, &mut live);
-                for s in b.stmts.iter().rev() {
-                    Self::live_stmt(&s.kind, &mut live);
-                }
+                self.block_backward(bi, &live_in, &mut live, drop_uses, None);
                 if live != live_in[bi] {
                     live_in[bi] = live.clone();
                     changed = true;
                 }
             }
         }
-        // Per-statement live-out sets, flat.
-        let wn = live.words().len();
-        let total: usize = self.body.blocks.iter().map(|b| b.stmts.len()).sum();
-        self.live_out = vec![0; total * wn];
+        let wn = self.sh.wn;
+        let mut out = vec![0u64; self.point_base[nb] * wn];
         for bi in 0..nb {
-            let b = &self.body.blocks[bi];
-            live.clear();
-            for s in &self.succs[bi] {
-                live.union(&live_in[s.0 as usize]);
-            }
-            Self::live_term(&b.term, &mut live);
-            for (si, s) in b.stmts.iter().enumerate().rev() {
-                let at = (self.stmt_base[bi] + si) * wn;
-                self.live_out[at..at + wn].copy_from_slice(live.words());
-                Self::live_stmt(&s.kind, &mut live);
-            }
+            self.block_backward(bi, &live_in, &mut live, drop_uses, Some(&mut out));
         }
-        self.live_in_block = live_in;
+        out
     }
 
-    /// The live locals after statement `si` of block `b`.
-    fn live_after(&self, b: u32, si: u32) -> &[u64] {
+    /// One block of `backward`: leaves the block's live-in set in `live`,
+    /// and records each point's entry set in `out` when given.
+    fn block_backward(&self, bi: usize, live_in: &[BitSet], live: &mut BitSet, drop_uses: Option<&[bool]>, mut out: Option<&mut Vec<u64>>) {
+        let b = &self.body.blocks[bi];
         let wn = self.sh.wn;
-        let at = (self.stmt_base[b as usize] + si as usize) * wn;
-        &self.live_out[at..at + wn]
+        let base = self.point_base[bi];
+        live.clear();
+        for s in &self.succs[bi] {
+            live.union(&live_in[s.0 as usize]);
+        }
+        match drop_uses {
+            None => Self::live_term(&b.term, live),
+            Some(_) => {
+                if let Terminator::Call { dest, .. } = &b.term
+                    && dest.proj.is_empty()
+                {
+                    live.remove(dest.local as usize);
+                }
+            }
+        }
+        let tp = base + b.stmts.len();
+        if let Some(o) = out.as_deref_mut() {
+            o[tp * wn..(tp + 1) * wn].copy_from_slice(live.words());
+        }
+        for (si, s) in b.stmts.iter().enumerate().rev() {
+            match drop_uses {
+                None => Self::live_stmt(&s.kind, live),
+                Some(du) => match &s.kind {
+                    StmtKind::Assign(dest, _) if dest.proj.is_empty() => live.remove(dest.local as usize),
+                    StmtKind::StorageDead(l) => live.remove(*l as usize),
+                    StmtKind::Drop(l) if du[base + si] => live.insert(*l as usize),
+                    _ => {}
+                },
+            }
+            if let Some(o) = out.as_deref_mut() {
+                let p = base + si;
+                o[p * wn..(p + 1) * wn].copy_from_slice(live.words());
+            }
+        }
+    }
+
+    /// Use-liveness at every point, and drop-liveness when some local's
+    /// drop touches its regions: a `Drop` of a maybe-initialized local with
+    /// drop-live slots is a use of those regions (ARCH 5.4). `entry` is the
+    /// init fixpoint, which says whether a local may be initialized at its
+    /// `Drop` (a drop of a moved-out local runs no destructor).
+    fn liveness(&mut self, entry: &[Option<State>]) {
+        self.live_entry = self.backward(None);
+        let drop_live = match &self.sol {
+            Some(sol) if sol.drop_live.iter().any(|&d| d) => sol.drop_live.clone(),
+            _ => return,
+        };
+        let mut uses = vec![false; self.point_base[self.body.blocks.len()]];
+        let mut st = State::new(self.sh);
+        let body = self.body;
+        for (bi, b) in body.blocks.iter().enumerate() {
+            if !b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Drop(l) if drop_live[l as usize])) {
+                continue;
+            }
+            let Some(e) = &entry[bi] else { continue };
+            st.w.copy_from_slice(&e.w);
+            for (si, s) in b.stmts.iter().enumerate() {
+                if let StmtKind::Drop(l) = s.kind
+                    && drop_live[l as usize]
+                    && bit_has(st.init(), l as usize)
+                {
+                    uses[self.point_base[bi] + si] = true;
+                }
+                self.stmt(bi as u32, si as u32, &s.kind, s.span, &mut st);
+            }
+        }
+        if uses.iter().any(|&u| u) {
+            self.drop_entry = self.backward(Some(&uses));
+        }
+    }
+
+    /// True when loan `li`'s region contains point `q`: it reaches a
+    /// universal region, or a local whose (drop-live) slots it reaches is
+    /// (drop-)live at `q`'s entry.
+    fn contains(&self, li: usize, q: usize) -> bool {
+        let Some(sol) = &self.sol else { return false };
+        if sol.univ[li] {
+            return true;
+        }
+        let wn = self.sh.wn;
+        let le = &self.live_entry[q * wn..(q + 1) * wn];
+        if le.iter().zip(sol.use_set(li)).any(|(a, b)| a & b != 0) {
+            return true;
+        }
+        if !self.drop_entry.is_empty() {
+            let de = &self.drop_entry[q * wn..(q + 1) * wn];
+            return de.iter().zip(sol.drop_set(li)).any(|(a, b)| a & b != 0);
+        }
+        false
+    }
+
+    /// The block and index of point `q`.
+    fn point_at(&self, q: usize) -> (usize, usize) {
+        let b = self.point_base.partition_point(|&s| s <= q) - 1;
+        (b, q - self.point_base[b])
+    }
+
+    /// True when the statement or terminator at `q` overwrites or ends the
+    /// local loan `li` borrows from: the loan does not survive past it
+    /// (rustc `kill_borrows_on_place`).
+    fn kills(&self, li: usize, q: usize) -> bool {
+        let local = self.loans[li].place.local;
+        let (b, i) = self.point_at(q);
+        let block = &self.body.blocks[b];
+        match block.stmts.get(i) {
+            Some(s) => match &s.kind {
+                StmtKind::Assign(dest, _) => dest.proj.is_empty() && dest.local == local,
+                StmtKind::StorageDead(l) => *l == local,
+                _ => false,
+            },
+            None => matches!(&block.term, Terminator::Call { dest, .. } if dest.proj.is_empty() && dest.local == local),
+        }
+    }
+
+    /// Loan scopes (NLL): from the point after each borrow, every point
+    /// reachable through points its region contains, stopping after a
+    /// point that kills it.
+    fn loan_scopes(&mut self) {
+        let np = self.point_base[self.body.blocks.len()];
+        let wl = self.wl;
+        let mut scope = vec![0u64; np * wl];
+        let mut stamp = vec![u32::MAX; np];
+        let mut stack: Vec<usize> = Vec::new();
+        for li in 0..self.loans.len() {
+            let (lb, ls) = (self.loan_block[li] as usize, self.loan_stmt[li] as usize);
+            stack.clear();
+            stack.push(self.point_base[lb] + ls + 1);
+            while let Some(q) = stack.pop() {
+                if stamp[q] == li as u32 {
+                    continue;
+                }
+                stamp[q] = li as u32;
+                if !self.contains(li, q) {
+                    continue;
+                }
+                bit_set(&mut scope[q * wl..(q + 1) * wl], li);
+                if self.kills(li, q) {
+                    continue;
+                }
+                let (b, i) = self.point_at(q);
+                if i < self.body.blocks[b].stmts.len() {
+                    stack.push(q + 1);
+                } else {
+                    for s in &self.succs[b] {
+                        stack.push(self.point_base[s.0 as usize]);
+                    }
+                }
+            }
+        }
+        self.scope = scope;
+    }
+
+    /// True when loan `li` is still needed after the statement or
+    /// terminator at `q`: its region contains a following point.
+    fn needed_after(&self, li: usize, q: usize) -> bool {
+        let (b, i) = self.point_at(q);
+        if i < self.body.blocks[b].stmts.len() {
+            return self.contains(li, q + 1);
+        }
+        self.succs[b].iter().any(|s| self.contains(li, self.point_base[s.0 as usize]))
+    }
+
+    /// True when local `l`'s slots are reached by loan `li`'s region.
+    fn carries(&self, li: usize, l: Local) -> bool {
+        (l as usize) < self.n_locals() && self.sol.as_ref().is_some_and(|sol| bit_has(sol.use_set(li), l as usize))
+    }
+
+    /// The loans an access at point `q` conflicts with, when in scope: those
+    /// needed after `q`, and those a sibling operand of the same statement
+    /// still carries. Lust's IR reads a statement's operands in order and
+    /// then writes, where MIR uses a temporary per operand: a later operand
+    /// keeps its local's loans in scope (rustc E0503 on `x + *m`), and an
+    /// earlier operand whose value holds regions keeps them until the
+    /// statement completes. `j` is the access's operand index (`None` for
+    /// the final write); `carriers` are (root local, value holds regions)
+    /// per operand, in order.
+    fn live_for(&self, q: usize, j: Option<usize>, carriers: &[(Local, bool)]) -> BitSet {
+        let mut out = BitSet::new(self.loans.len());
+        if !self.report || self.loans.is_empty() || self.scope.is_empty() {
+            return out;
+        }
+        let wl = self.wl;
+        for li in bit_iter(&self.scope[q * wl..(q + 1) * wl]) {
+            let sibling = carriers.iter().enumerate().any(|(i, &(root, regions))| {
+                Some(i) != j && (regions || j.is_some_and(|j| i > j)) && self.carries(li, root)
+            });
+            if sibling || self.needed_after(li, q) {
+                out.insert(li);
+            }
+        }
+        out
+    }
+
+    /// The carriers of a statement's operands for `live_for`: each operand's
+    /// root local and whether its value holds regions, then the destination's
+    /// root when the write goes through a projection of a user variable (it
+    /// is read last). A temporary root was made for this assignment's place,
+    /// which Rust evaluates after the value (`v[0] = v[1]` borrows `v`
+    /// mutably only after reading `v[1]`), so it does not count.
+    fn carriers(&self, ops: &[&Operand], dest: Option<&Place>) -> Vec<(Local, bool)> {
+        let mut out: Vec<(Local, bool)> = Vec::with_capacity(ops.len() + 1);
+        for o in ops {
+            match o {
+                Operand::Copy(p) | Operand::Move(p) => out.push((p.local, self.has_regions(self.value_ty(p)))),
+                Operand::Const(_) => out.push((u32::MAX, false)),
+            }
+        }
+        if let Some(d) = dest
+            && !d.proj.is_empty()
+            && self.body.locals[d.local as usize].name.is_some()
+        {
+            out.push((d.local, false));
+        }
+        out
+    }
+
+    /// The type of the value at a place (`ERROR` when a step is unknown).
+    fn value_ty(&self, p: &Place) -> Ty {
+        let tys = &self.body.tys;
+        let mut t = self.body.locals[p.local as usize].ty;
+        let mut variant = 0;
+        for pr in &p.proj {
+            t = match *pr {
+                Proj::Deref => match tys.kind(t) {
+                    TyKind::Ref(_, _, i) => i,
+                    _ => tys.adt_first_ty_arg(t).unwrap_or(ERROR),
+                },
+                Proj::Field(i) => {
+                    let f = self.step_field_ty(t, variant, i);
+                    variant = 0;
+                    f
+                }
+                Proj::Downcast(v) => {
+                    variant = v;
+                    t
+                }
+                Proj::Index(_) => match tys.kind(t) {
+                    TyKind::Array(e, _) | TyKind::Slice(e) => e,
+                    _ => tys.vec_elem(t).unwrap_or(ERROR),
+                },
+            };
+            if t == ERROR {
+                return ERROR;
+            }
+        }
+        t
+    }
+
+    /// True when a type has region slots (unknown types count).
+    fn has_regions(&self, t: Ty) -> bool {
+        let tys = &self.body.tys;
+        match tys.kind(t) {
+            TyKind::Error | TyKind::Ref(..) => true,
+            TyKind::Adt(_, a) => tys.is_chars_ty(t) || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.has_regions(e))),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| self.has_regions(e)),
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.has_regions(e),
+            TyKind::Closure(_, a) => closure_fields(tys, a).iter().any(|&e| self.has_regions(e)),
+            _ => false,
+        }
     }
 
     // ---------- Forward dataflow and checks ----------
@@ -910,12 +1119,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 bit_set(st.init_mut(), l);
             } else {
                 bit_set(st.uninit_mut(), l);
-            }
-        }
-        for (i, loan) in self.loans.iter().enumerate() {
-            if loan.synthetic {
-                bit_set(st.holds_mut(loan.place.local as usize), i);
-                bit_set(st.origins_mut(loan.place.local as usize), i);
             }
         }
         st
@@ -950,28 +1153,20 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         post
     }
 
-    fn dataflow(&mut self) {
+    /// The init dataflow to its fixpoint, without reporting: the entry state
+    /// of each reachable block.
+    fn init_fixpoint(&mut self) -> Vec<Option<State>> {
         let nb = self.body.blocks.len();
         let mut entry: Vec<Option<State>> = vec![None; nb];
         entry[0] = Some(self.entry_state());
         // Visit pending blocks in reverse postorder, in rounds: a block's
         // predecessors (back edges aside) run before it in the same round,
         // so most blocks run once and only loops take another round. The
-        // fixpoint is the same in any visit order.
+        // fixpoint is the same in any visit order. `st` is the one scratch
+        // state: each visit copies a block's entry state into it.
         let rpo = self.reverse_postorder();
         let mut pending = vec![false; nb];
         pending[0] = true;
-        // Fixpoint without reporting, then one reporting pass over the final states.
-        // `st` is the one scratch state: each visit copies a block's entry state
-        // into it, so no visit allocates.
-        //
-        // The fixpoint also learns which loans escape into a return value or
-        // behind a parameter (`collecting`); the reporting pass then keeps those
-        // loans live everywhere rustc's NLL does. Collecting during the fixpoint
-        // gives the same set as a pass over the final states: states only grow
-        // toward the final ones, the escape rules are monotone in the state, and
-        // every block's last visit runs on its final entry state.
-        self.collecting = true;
         let mut st = State::new(self.sh);
         while pending.contains(&true) {
             for &b in &rpo {
@@ -997,8 +1192,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
             }
         }
-        self.collecting = false;
+        entry
+    }
+
+    /// One reporting pass over the final states of the init fixpoint.
+    fn report_pass(&mut self, entry: &[Option<State>]) {
         self.report = true;
+        let mut st = State::new(self.sh);
         for (b, e) in entry.iter().enumerate() {
             if let Some(e) = e {
                 st.w.copy_from_slice(&e.w);
@@ -1014,163 +1214,80 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             self.stmt(b, si as u32, &s.kind, s.span, st);
         }
         let span = block.term_span;
+        let q = self.point_base[b as usize] + block.stmts.len();
         let mut ops: Vec<&Operand> = Vec::new();
         match &block.term {
             Terminator::Call { target, args, dest, .. } => self.call_term(b, *target, args, dest, span, st),
             Terminator::If(o, ..) | Terminator::Switch(o, ..) => ops.push(o),
             Terminator::Panic(parts) => parts_operands(parts, &mut |o| ops.push(o)),
-            Terminator::Return if self.report => {
-                self.check_return(st, span);
-            }
-            Terminator::Return if self.collecting => {
-                self.escaped.union_words(st.holds(0));
-                self.escaped.union_words(st.origins(0));
-            }
+            Terminator::Return if self.report => self.check_return(q, span),
             _ => {}
         }
-        // Nothing runs after a terminator inside this block, so no loan is live past its reads.
-        let none = BitSet::new(0);
-        for o in ops {
-            self.operand(o, span, st, &none);
+        let carriers = if self.report { self.carriers(&ops, None) } else { Vec::new() };
+        for (j, o) in ops.iter().enumerate() {
+            let live = self.live_for(q, Some(j), &carriers);
+            self.operand(o, span, st, &live);
         }
-    }
-
-    /// Loans that are live after the current statement: held by some live local, plus the
-    /// escaped loans (see `escaped`) at every point reachable from their creation.
-    fn live_loans(&self, st: &State, live: &[u64], skip: Option<Local>, b: u32, si: u32) -> BitSet {
-        let mut out = BitSet::new(self.loans.len());
-        for l in bit_iter(live) {
-            if Some(l as Local) == skip {
-                continue;
-            }
-            out.union_words(st.holds(l));
-        }
-        for li in self.escaped.iter() {
-            let (lb, ls) = (self.loan_block[li], self.loan_stmt[li]);
-            if lb == u32::MAX {
-                continue;
-            }
-            let on = if lb == b { ls < si || (ls > si && self.loops_back(b)) } else { self.reach[lb as usize].contains(b as usize) };
-            if on {
-                out.insert(li);
-            }
-        }
-        out
     }
 
     fn stmt(&mut self, b: u32, si: u32, s: &'b StmtKind, span: Span, st: &mut State) {
-        // Loans live after this statement. Only needed in the reporting pass.
-        let skip = match s {
-            StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
-            _ => None,
-        };
-        let live = if self.report && !self.loans.is_empty() {
-            self.live_loans(st, self.live_after(b, si), skip, b, si)
-        } else {
-            BitSet::new(0)
-        };
+        let q = self.point_base[b as usize] + si as usize;
         match s {
             StmtKind::Assign(dest, rv) => {
-                // Reads and moves in the right-hand side.
+                // Reads and moves in the right-hand side, in order.
                 let mut ops = std::mem::take(&mut self.ops_buf);
                 ops.clear();
                 rvalue_operands(rv, &mut |o| ops.push(o));
-                for o in &ops {
+                let carriers = if self.report { self.carriers(&ops, Some(dest)) } else { Vec::new() };
+                for (j, o) in ops.iter().enumerate() {
+                    let live = self.live_for(q, Some(j), &carriers);
                     self.operand(o, span, st, &live);
                 }
-                let mut new_holds = BitSet::new(self.loans.len());
-                let mut new_origins = BitSet::new(self.loans.len());
-                match rv {
-                    Rvalue::Ref(m, place) => {
-                        self.check_init(place, span, st);
-                        let kind = if *m { Access::BorrowMut } else { Access::BorrowShared };
-                        if *m {
-                            self.check_mutability(place, span, st, true);
-                        }
-                        self.access(place, kind, span, &live);
-                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
-                        new_holds.insert(loan);
-                        new_origins.insert(loan);
-                        // A reborrow through a reference depends on that
-                        // reference's loans. So does a borrow of a value
-                        // that holds references (`&r` for `r: &u8`): the
-                        // new reference reaches the same data, so it keeps
-                        // those loans live (rustc: `&'a &'b T` needs
-                        // `'b: 'a`). This is what keeps a `&dyn` made from
-                        // such a value honest.
-                        if place.proj.contains(&Proj::Deref) || self.place_holds_refs(place) {
-                            new_holds.union_words(st.holds(place.local as usize));
-                            new_origins.union_words(st.origins(place.local as usize));
-                        }
+                let borrow = match rv {
+                    Rvalue::Ref(m, place) => Some((*m, place)),
+                    Rvalue::SliceOf(place) => Some((self.slice_dest_mut(dest), place)),
+                    Rvalue::Subslice { base, mutable, .. } => Some((*mutable, base)),
+                    _ => None,
+                };
+                if let Some((m, place)) = borrow {
+                    self.check_init(place, span, st);
+                    let kind = if m { Access::BorrowMut } else { Access::BorrowShared };
+                    if m {
+                        self.check_mutability(place, span, st, true);
                     }
-                    Rvalue::SliceOf(place) => {
-                        let m = self.slice_dest_mut(dest);
-                        self.check_init(place, span, st);
-                        let kind = if m { Access::BorrowMut } else { Access::BorrowShared };
-                        if m {
-                            self.check_mutability(place, span, st, true);
-                        }
-                        self.access(place, kind, span, &live);
-                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
-                        new_holds.insert(loan);
-                        new_origins.insert(loan);
-                        if place.proj.contains(&Proj::Deref) {
-                            new_holds.union_words(st.holds(place.local as usize));
-                            new_origins.union_words(st.origins(place.local as usize));
-                        }
-                    }
-                    Rvalue::Subslice { base: place, mutable, .. } => {
-                        let m = *mutable;
-                        self.check_init(place, span, st);
-                        let kind = if m { Access::BorrowMut } else { Access::BorrowShared };
-                        if m {
-                            self.check_mutability(place, span, st, true);
-                        }
-                        self.access(place, kind, span, &live);
-                        let loan = self.loan_at[self.stmt_base[b as usize] + si as usize] as usize;
-                        new_holds.insert(loan);
-                        new_origins.insert(loan);
-                        if place.proj.contains(&Proj::Deref) {
-                            new_holds.union_words(st.holds(place.local as usize));
-                            new_origins.union_words(st.origins(place.local as usize));
-                        }
-                    }
-                    Rvalue::Discriminant(place) | Rvalue::LenOf(place) => {
-                        self.check_init(place, span, st);
-                        self.access(place, Access::Read, span, &live);
-                    }
-                    _ => {
-                        if self.dest_holds_refs(dest) {
-                            for o in &ops {
-                                self.holds_of(o, st, &mut new_holds);
-                                self.origins_of(o, st, &mut new_origins);
-                            }
-                        }
-                    }
+                    let live = self.live_for(q, Some(ops.len()), &carriers);
+                    self.access(place, kind, span, &live);
+                } else if let Rvalue::Discriminant(place) | Rvalue::LenOf(place) = rv {
+                    self.check_init(place, span, st);
+                    let live = self.live_for(q, Some(ops.len()), &carriers);
+                    self.access(place, Access::Read, span, &live);
                 }
-                self.write_dest(dest, new_holds, &new_origins, span, &live, st);
+                let live = self.live_for(q, None, &carriers);
+                self.write_dest(dest, span, &live, st);
                 self.ops_buf = ops;
             }
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
                 let place = Place::local(*l);
+                let live = self.live_for(q, None, &[]);
                 self.access(&place, Access::Dead, span, &live);
                 let li = *l as usize;
                 bit_unset(st.init_mut(), li);
                 bit_set(st.uninit_mut(), li);
                 if matches!(s, StmtKind::StorageDead(_)) {
-                    st.holds_mut(li).fill(0);
-                    st.origins_mut(li).fill(0);
                     self.clear_paths(st, li);
                 }
             }
             StmtKind::FakeRead(l) => {
                 let place = Place::local(*l);
+                let live = self.live_for(q, None, &[]);
                 self.access(&place, Access::Read, span, &live);
             }
             StmtKind::Print { parts, .. } => {
                 let mut ops: Vec<&Operand> = Vec::new();
                 parts_operands(parts, &mut |o| ops.push(o));
-                for o in ops {
+                let carriers = if self.report { self.carriers(&ops, None) } else { Vec::new() };
+                for (j, o) in ops.iter().enumerate() {
+                    let live = self.live_for(q, Some(j), &carriers);
                     self.operand(o, span, st, &live);
                 }
             }
@@ -1178,8 +1295,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     /// The write side of an assignment or a call's result store: mutability,
-    /// conflicts with live loans, parameter-origin checks, and init state.
-    fn write_dest(&mut self, dest: &Place, new_holds: BitSet, new_origins: &BitSet, span: Span, live: &BitSet, st: &mut State) {
+    /// conflicts with in-scope loans, and init state.
+    fn write_dest(&mut self, dest: &Place, span: Span, live: &BitSet, st: &mut State) {
         if dest.proj.is_empty() {
             let l = dest.local as usize;
             if !self.body.locals[l].mutable && bit_has(st.init(), l) {
@@ -1187,23 +1304,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
             }
             self.access(dest, Access::Write, span, live);
-            self.check_store_into_param_ref(dest, new_origins, st, span);
             bit_set(st.init_mut(), l);
             bit_unset(st.uninit_mut(), l);
             bit_unset(st.moved_mut(), l);
             self.clear_paths(st, l);
-            // Zip, not copy_from_slice: with no loans the row is
-            // empty while `new_holds` keeps its one inline (zero)
-            // word. With loans the lengths are both `wl`.
-            for (a, b) in st.holds_mut(l).iter_mut().zip(new_holds.words()) {
-                *a = *b;
-            }
-            bits_or(st.origins_mut(l), new_origins.words());
         } else {
             self.check_init_write(dest, span, st);
             self.check_mutability(dest, span, st, false);
             self.access(dest, Access::Write, span, live);
-            self.check_store_into_param_ref(dest, new_origins, st, span);
             // Writing a field puts back a field that was moved out, and every
             // field below it. Other moved fields stay moved.
             let l = dest.local as usize;
@@ -1217,130 +1325,47 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                 }
             }
-            bits_or(st.holds_mut(l), new_holds.words());
-            bits_or(st.origins_mut(l), new_origins.words());
         }
     }
 
     /// One `Call` terminator, checked like the assignment it ends: argument
-    /// reads first, then loan flow into the result and into `&mut` argument
-    /// targets, then the write to `dest`. The loans live after the call are
-    /// the ones its successors keep live.
+    /// reads in order, then the write to `dest` after the call (as MIR
+    /// writes a call's destination on its return edge). Loan flow through
+    /// calls is in the region constraints (regions.rs).
     fn call_term(&mut self, b: u32, target: CallTarget, args: &[Operand], dest: &Place, span: Span, st: &mut State) {
-        let si = self.body.blocks[b as usize].stmts.len() as u32;
-        let skip = if dest.proj.is_empty() { Some(dest.local) } else { None };
-        let live = if self.report && !self.loans.is_empty() {
-            let mut locals = BitSet::new(self.n_locals());
-            for s in &self.succs[b as usize] {
-                locals.union(&self.live_in_block[s.0 as usize]);
-            }
-            self.live_loans(st, locals.words(), skip, b, si)
-        } else {
-            BitSet::new(0)
-        };
-        for o in args {
+        let q = self.point_base[b as usize] + self.body.blocks[b as usize].stmts.len();
+        let mut ops: Vec<&Operand> = args.iter().collect();
+        let callee_op;
+        if let CallTarget::Indirect(callee) = target {
+            callee_op = Operand::Copy(Place::local(callee));
+            ops.insert(0, &callee_op);
+        }
+        let mut carriers = if self.report { self.carriers(&ops, Some(dest)) } else { Vec::new() };
+        // A two-phase receiver (lowered as reservation, arguments, `FakeRead`,
+        // then `&mut`) is activated by the call itself: the other arguments
+        // are read before it in Rust, so it does not hold their reads.
+        if self.two_phase_receiver(b, args)
+            && let Some(c) = carriers.first_mut()
+        {
+            c.1 = false;
+        }
+        for (j, o) in ops.iter().enumerate() {
+            let live = self.live_for(q, Some(j), &carriers);
             self.operand(o, span, st, &live);
         }
-        let mut new_holds = BitSet::new(self.loans.len());
-        let mut new_origins = BitSet::new(self.loans.len());
-        match target {
-            CallTarget::Fn(f) => {
-                let info = self.p.fn_info(f);
-                if let Some(i) = info.ret_borrows_from {
-                    self.holds_of(&args[i], st, &mut new_holds);
-                    self.origins_of(&args[i], st, &mut new_origins);
-                } else if contains_ref(&self.body.tys, self.dest_ty(dest)) {
-                    // A result that holds references with no single
-                    // source parameter (a generic `fn keep<F>(f: F) -> F`
-                    // called with a closure that borrows): it may hold
-                    // any argument's loans, as in the indirect case.
-                    for o in args {
-                        self.holds_of(o, st, &mut new_holds);
-                        self.origins_of(o, st, &mut new_origins);
-                    }
-                }
-                self.flow_into_mut_args(args, st, span);
-            }
-            CallTarget::Indirect(_) | CallTarget::Dyn(_) => {
-                // The callee signature is not a fn the checker can
-                // summarize yet, so treat the call conservatively: the
-                // callee local is read, a reference result may hold any
-                // argument's loans, and loans flow into &mut args. The
-                // IR owner refines this when fn pointers lower. A dyn
-                // call's receiver is its first argument, read below.
-                if let CallTarget::Indirect(callee) = target {
-                    self.operand(&Operand::Copy(Place::local(callee)), span, st, &live);
-                }
-                if self.dest_holds_refs(dest) {
-                    for o in args {
-                        self.holds_of(o, st, &mut new_holds);
-                        self.origins_of(o, st, &mut new_origins);
-                    }
-                }
-                self.flow_into_mut_args(args, st, span);
-            }
-            CallTarget::Builtin(Builtin::IterNext | Builtin::IterNth | Builtin::IterFind | Builtin::IterFindMap) => {
-                // An iterator item borrows what the iterator borrows,
-                // never the iterator itself (W-STD-A, ty/iter.rs): the
-                // result holds the loans of the place the `&mut self`
-                // argument borrows, not that temporary borrow.
-                if self.dest_holds_refs(dest) {
-                    if let Some(Operand::Copy(p) | Operand::Move(p)) = args.first() {
-                        let targets: Vec<Local> = bit_iter(st.holds(p.local as usize)).map(|l| self.loans[l].place.local).collect();
-                        for t in targets {
-                            new_holds.union_words(st.holds(t as usize));
-                            new_origins.union_words(st.origins(t as usize));
-                        }
-                        new_origins.union_words(st.origins(p.local as usize));
-                    }
-                    for o in args.iter().skip(1) {
-                        self.holds_of(o, st, &mut new_holds);
-                        self.origins_of(o, st, &mut new_origins);
-                    }
-                }
-            }
-            CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => {
-                // Builtins were plain rvalues before S7: a reference-typed
-                // result may hold any argument's loans.
-                if self.dest_holds_refs(dest) {
-                    for o in args {
-                        self.holds_of(o, st, &mut new_holds);
-                        self.origins_of(o, st, &mut new_origins);
-                    }
-                }
-                if target == CallTarget::Builtin(Builtin::VecPush) {
-                    self.flow_into_mut_args(args, st, span);
-                }
-            }
-        }
-        // Iterator items and the containers built from them never
-        // carry a closure's capture loans (see `Loan::capture`).
-        if let CallTarget::Builtin(
-            Builtin::IterNext
-            | Builtin::IterNth
-            | Builtin::IterFind
-            | Builtin::IterFindMap
-            | Builtin::IterLast
-            | Builtin::IterMin
-            | Builtin::IterMax
-            | Builtin::IterMinByKey
-            | Builtin::IterMaxByKey
-            | Builtin::IterCollect,
-        ) = target
-        {
-            for li in 0..self.loans.len() {
-                if self.loans[li].capture {
-                    new_holds.remove(li);
-                    new_origins.remove(li);
-                }
-            }
-        }
-        self.write_dest(dest, new_holds, &new_origins, span, &live, st);
+        let live = self.live_for(q, None, &[]);
+        self.write_dest(dest, span, &live, st);
     }
 
-    /// True when the type written at `dest` contains a reference.
-    fn dest_holds_refs(&self, dest: &Place) -> bool {
-        if dest.proj.is_empty() { self.ref_local[dest.local as usize] } else { contains_ref(&self.body.tys, self.dest_ty(dest)) }
+    /// True when the call ending block `b` takes a two-phase `&mut`
+    /// receiver: its first argument moves the temporary that the block's
+    /// last statement borrows mutably, right after a `FakeRead`.
+    fn two_phase_receiver(&self, b: u32, args: &[Operand]) -> bool {
+        let stmts = &self.body.blocks[b as usize].stmts;
+        let [.., before, last] = stmts.as_slice() else { return false };
+        matches!((&before.kind, &last.kind, args.first()),
+            (StmtKind::FakeRead(_), StmtKind::Assign(t, Rvalue::Ref(true, _)), Some(Operand::Move(a)))
+                if t.proj.is_empty() && a.proj.is_empty() && a.local == t.local)
     }
 
     /// True when a slice-making assignment's destination is a `&mut [T]` local.
@@ -1362,148 +1387,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             };
         }
         t
-    }
-
-    /// The parameter locals that the synthetic loans in `holds` stand for.
-    fn loan_origins(&self, holds: &[u64]) -> Vec<Local> {
-        let mut out: Vec<Local> = Vec::new();
-        for li in bit_iter(holds) {
-            let loan = &self.loans[li];
-            if loan.synthetic && !out.contains(&loan.place.local) {
-                out.push(loan.place.local);
-            }
-        }
-        out
-    }
-
-    /// True if a place root is one of the function's parameter locals.
-    fn is_param(&self, l: Local) -> bool {
-        l >= 1 && (l as usize) <= self.body.arg_count
-    }
-
-    /// True if `loan` may be stored where a reference with `origins` (parameter lifetimes
-    /// from the signature) is required: it borrows from one of those parameters.
-    /// A promoted constant (`&1`) is `'static` in Rust, but lust keeps it in a stack
-    /// temporary, so storing it behind a parameter stays rejected here.
-    fn store_loan_ok(&self, origins: &[Local], loan: &Loan) -> bool {
-        if loan.synthetic {
-            return origins.contains(&loan.place.local);
-        }
-        loan.place.proj.contains(&Proj::Deref) && origins.contains(&loan.place.local)
-    }
-
-    /// Reports the first loan in `incoming` that may not be stored behind `origins`.
-    fn check_incoming_loans(&mut self, origins: &[Local], incoming: &BitSet, dest: Local, span: Span) {
-        for li in incoming.iter() {
-            let loan = &self.loans[li];
-            if self.store_loan_ok(origins, loan) {
-                continue;
-            }
-            let dest_name = self.local_name(dest);
-            if loan.synthetic {
-                let src = self.local_name(loan.place.local);
-                let want = self.local_name(origins[0]);
-                self.err(
-                    "L0202",
-                    span,
-                    format!("this stores a reference that borrows from {src}, but {dest_name} must borrow from {want}"),
-                    "Borrow from the same parameter. Lust ties each reference to one parameter, as Rust's elision does here.",
-                );
-            } else {
-                let name = self.local_name(loan.place.local);
-                self.err(
-                    "L0306",
-                    span,
-                    format!("{name} does not live long enough: it is borrowed into {dest_name}, which borrows from a parameter"),
-                    "Borrow from a parameter instead, or store an owned value (for example `*dest = value`).",
-                );
-            }
-            return;
-        }
-    }
-
-    /// A reference that comes from a parameter must keep borrowing from that parameter.
-    /// Storing a borrow of a local value into such a place is an error even if the place
-    /// is never read again (`v = &mut Vec::new()` for `v: &mut Vec<_>`), because the
-    /// signature ties the place's reference to the caller's lifetime. This applies to a
-    /// parameter local itself and to places behind a parameter-derived reference
-    /// (`*slot = &local`), but not to a plain local holding a reborrow: its lifetime
-    /// can shrink, so NLL rules apply there.
-    fn check_store_into_param_ref(&mut self, dest: &Place, new_origins: &BitSet, st: &State, span: Span) {
-        if !self.report && !self.collecting {
-            return;
-        }
-        let root = dest.local;
-        let direct_param = dest.proj.is_empty() && self.is_param(root);
-        let through_deref = dest.proj.first() == Some(&Proj::Deref);
-        if !direct_param && !through_deref {
-            return;
-        }
-        let origins = self.loan_origins(st.holds(root as usize));
-        if origins.is_empty() {
-            return;
-        }
-        if self.collecting {
-            self.escaped.union(new_origins);
-            return;
-        }
-        // `new_origins` holds every loan the source local ever held, so a value that was
-        // first borrowed from the wrong place and only later from the right parameter is
-        // still rejected. Rust gives the source local one lifetime; it cannot change.
-        self.check_incoming_loans(&origins, new_origins, root, span);
-    }
-
-    fn holds_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
-        if let Operand::Copy(p) | Operand::Move(p) = o {
-            out.union_words(st.holds(p.local as usize));
-        }
-    }
-
-    fn origins_of(&self, o: &Operand, st: &State, out: &mut BitSet) {
-        if let Operand::Copy(p) | Operand::Move(p) = o {
-            out.union_words(st.origins(p.local as usize));
-        }
-    }
-
-    /// References passed to a call may be stored behind one of its `&mut` arguments, if that
-    /// argument's target type can hold references (for example `v.push(&x)` on a `Vec<&T>`).
-    fn flow_into_mut_args(&mut self, args: &[Operand], st: &mut State, span: Span) {
-        for (i, a) in args.iter().enumerate() {
-            let (Operand::Move(p) | Operand::Copy(p)) = a else { continue };
-            let ty = self.place_ty(p);
-            let TyKind::Ref(_, Mut::Mut, target) = self.body.tys.kind(ty) else { continue };
-            if !contains_ref(&self.body.tys, target) {
-                continue;
-            }
-            let mut incoming = BitSet::new(self.loans.len());
-            let mut incoming_origins = BitSet::new(self.loans.len());
-            for (j, b) in args.iter().enumerate() {
-                if j != i {
-                    self.holds_of(b, st, &mut incoming);
-                    self.origins_of(b, st, &mut incoming_origins);
-                }
-            }
-            if incoming.is_empty() && incoming_origins.is_empty() {
-                continue;
-            }
-            let targets: Vec<Local> =
-                bit_iter(st.holds(p.local as usize)).filter(|&l| self.loans[l].mutable).map(|l| self.loans[l].place.local).collect();
-            for t in targets {
-                // Storing into a target behind a parameter needs the same origin check
-                // as a direct assignment behind a parameter reference.
-                let origins = self.loan_origins(st.holds(t as usize));
-                if !origins.is_empty() {
-                    if self.collecting {
-                        self.escaped.union(&incoming_origins);
-                    }
-                    if self.report {
-                        self.check_incoming_loans(&origins, &incoming_origins, t, span);
-                    }
-                }
-                bits_or(st.holds_mut(t as usize), incoming.words());
-                bits_or(st.origins_mut(t as usize), incoming_origins.words());
-            }
-        }
     }
 
     fn place_ty(&self, p: &Place) -> Ty {
@@ -1576,40 +1459,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         (path, true)
-    }
-
-    /// True when the value at a place (fields, tuple elements, and Vec
-    /// elements included) can hold a reference. A place whose type this
-    /// cannot follow answers true, the conservative side.
-    fn place_holds_refs(&self, p: &Place) -> bool {
-        let tys = &self.body.tys;
-        let mut t = self.body.locals[p.local as usize].ty;
-        let mut variant = 0usize;
-        for pr in &p.proj {
-            t = match (tys.kind(t), pr) {
-                (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                (_, Proj::Downcast(v)) => {
-                    variant = *v as usize;
-                    continue;
-                }
-                (TyKind::Tuple(ts), Proj::Field(i)) => tys.tys_of(ts)[*i as usize],
-                (TyKind::Adt(..), Proj::Field(i)) => match tys.local_adt(t) {
-                    Some(a) => self.p.adt(a).variants[variant].fields[*i as usize].ty,
-                    None => match tys.option_elem(t) {
-                        Some(e) => e,
-                        None => return true,
-                    },
-                },
-                (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => e,
-                (_, Proj::Index(_)) => match tys.vec_elem(t) {
-                    Some(e) => e,
-                    None => return true,
-                },
-                _ => return true,
-            };
-            variant = 0;
-        }
-        contains_ref(tys, t)
     }
 
     fn operand(&mut self, o: &Operand, span: Span, st: &mut State, live: &BitSet) {
@@ -1811,7 +1660,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             if self.body.locals[p.local as usize].name.is_some() {
                 return None;
             }
-            bit_iter(st.holds(p.local as usize)).find_map(|li| self.index_container_ty(&self.loans[li].place))
+            let _ = st;
+            self.loans.iter().filter(|l| l.holder == Some(p.local)).find_map(|l| self.index_container_ty(&l.place))
         })?;
         let name = self.container_name(container);
         Some(match self.body.tys.kind(container) {
@@ -2036,9 +1886,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
         for li in live_loans.iter() {
             let loan = &self.loans[li];
-            if loan.synthetic {
-                continue;
-            }
             // A write to a whole local is shallow: writing a reference local itself does
             // not touch the value behind it, so a loan on `*a` does not block `a = ...`.
             if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) {
@@ -2053,7 +1900,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 continue;
             }
             let name = self.local_name(loan.place.local);
+            let to_ret = self.sol.as_ref().is_some_and(|s| s.to_ret[li]);
             let (code, msg, fix) = match (kind, loan.mutable) {
+                (Access::Dead, _) if to_ret => (
+                    "L0307",
+                    format!("cannot return a reference to {name}, which is owned by this function"),
+                    "Return an owned value instead (for example `String` instead of `&str`).",
+                ),
                 (Access::Dead, _) if self.body.locals[loan.place.local as usize].name.is_none() => (
                     "L0306",
                     "a temporary value is dropped while it is still borrowed".to_string(),
@@ -2099,21 +1952,24 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 
-    fn check_return(&mut self, st: &State, span: Span) {
-        let expected = self.p.fn_info(self.body.fn_id).ret_borrows_from.map(|i| (i + 1) as Local);
-        // Every loan the return value ever held counts (see `State::origins`): a local
-        // that first borrowed from a local value and only later from the right parameter
-        // still cannot be returned, because its lifetime is fixed.
-        let mut holds = BitSet::new(self.loans.len());
-        holds.union_words(st.holds(0));
-        holds.union_words(st.origins(0));
-        for li in holds.iter() {
+    /// At a return, every local's storage ends: a loan of a local (not
+    /// through a reference) still in scope there must outlive the body,
+    /// because its region reaches the return value or a universal region.
+    fn check_return(&mut self, q: usize, span: Span) {
+        if self.scope.is_empty() {
+            return;
+        }
+        let wl = self.wl;
+        let in_scope: Vec<usize> = bit_iter(&self.scope[q * wl..(q + 1) * wl]).collect();
+        for li in in_scope {
             let loan = &self.loans[li];
-            let root = loan.place.local;
-            let is_param = root >= 1 && (root as usize) <= self.body.arg_count;
-            if !loan.place.proj.contains(&Proj::Deref) {
-                let name = self.local_name(root);
-                let labels = Self::loan_labels(loan);
+            if loan.place.proj.contains(&Proj::Deref) {
+                continue;
+            }
+            let name = self.local_name(loan.place.local);
+            let labels = Self::loan_labels(loan);
+            let to_ret = self.sol.as_ref().is_some_and(|s| s.to_ret[li]);
+            if to_ret {
                 self.err_labeled(
                     "L0307",
                     span,
@@ -2121,13 +1977,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     "Return an owned value instead (for example `String` instead of `&str`).",
                     labels,
                 );
-            } else if is_param && Some(root) != expected && loan.place.proj.first() == Some(&Proj::Deref) {
-                let name = self.local_name(root);
-                self.err(
-                    "L0202",
+            } else {
+                self.err_labeled(
+                    "L0306",
                     span,
-                    format!("this returns a reference that borrows from {name}, but elision ties the result to another parameter"),
-                    "Return an owned value, or change the signature so the reference comes from `self` or the only reference parameter.",
+                    format!("{name} does not live long enough: it is still borrowed when the function returns"),
+                    "Borrow from a parameter instead, or store an owned value.",
+                    labels,
                 );
             }
         }
@@ -2138,40 +1994,22 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 mod tests {
     use super::{BitSet, Shape, State, bit_has, bit_iter, bit_set};
 
-    /// The flat state keeps every set apart: a bit in one local's loan row
-    /// shows up in no other row or set, and a join reports only new bits.
+    /// The flat state keeps every set apart: a bit in one set shows up in
+    /// no other set, and a join reports only new bits.
     #[test]
-    fn flat_state_rows_are_disjoint() {
-        let sh = Shape { n: 70, wn: 2, wl: 2, wm: 1 };
+    fn flat_state_sets_are_disjoint() {
+        let sh = Shape { n: 70, wn: 2, wm: 1 };
         let mut a = State::new(sh);
-        bit_set(a.holds_mut(69), 127);
-        bit_set(a.origins_mut(0), 0);
         bit_set(a.uninit_mut(), 69);
         bit_set(a.paths_mut(), 5);
-        assert_eq!(bit_iter(a.holds(69)).collect::<Vec<_>>(), vec![127]);
-        assert!((0..69).all(|l| bit_iter(a.holds(l)).next().is_none()));
-        assert!(bit_has(a.origins(0), 0) && !bit_has(a.holds(0), 0));
+        bit_set(a.moved_mut(), 3);
         assert!(bit_has(a.uninit(), 69) && !bit_has(a.init(), 69) && !bit_has(a.moved(), 69));
         assert_eq!(bit_iter(a.paths()).collect::<Vec<_>>(), vec![5]);
+        assert!(bit_has(a.moved(), 3) && !bit_has(a.init(), 3));
         let mut b = State::new(sh);
         assert!(b.join(&a), "new bits are a change");
         assert!(!b.join(&a), "the same bits are not");
         assert!(b == a);
-    }
-
-    /// A no-loan body has `wl` 0: loan rows are empty, and the move
-    /// paths start right after the local sets (no row words between).
-    #[test]
-    fn zero_loan_state_has_no_rows() {
-        let sh = Shape { n: 3, wn: 1, wl: 0, wm: 1 };
-        let mut a = State::new(sh);
-        assert!(a.holds(0).is_empty() && a.holds(2).is_empty() && a.origins(1).is_empty());
-        bit_set(a.paths_mut(), 4);
-        bit_set(a.moved_mut(), 2);
-        assert_eq!(bit_iter(a.paths()).collect::<Vec<_>>(), vec![4]);
-        assert!(bit_has(a.moved(), 2) && !bit_has(a.init(), 2));
-        let mut b = State::new(sh);
-        assert!(b.join(&a) && b == a);
     }
 
     /// One-word sets stay inline; wider sets spill to the heap form; both

@@ -94,6 +94,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0720](L0720.md) | ambiguous method |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0721](L0721.md) | this method form is not supported yet |
+| [L0733](L0733.md) | lifetime may not live long enough |
 | [L0801](L0801.md) | macro expansion hit a limit |
 | [L0802](L0802.md) | no macro with this name is in scope |
 | [L0803](L0803.md) | include file not found |

@@ -184,6 +184,9 @@ pub struct Program<'a> {
     /// process): body checks then use a sink that records nothing. Set by
     /// the driver after collection.
     pub record_reads: bool,
+    /// Region signatures for the borrow checker (W-BORROW, ARCH 5): the
+    /// signatures with their lifetimes kept, beside the erased ones above.
+    pub regions: crate::borrowck::RegionTables,
 }
 
 impl<'a> Program<'a> {
@@ -362,6 +365,43 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         TyKind::Infer(v) if v.is_int() => "{integer}".into(),
         TyKind::Infer(v) if v.is_float() => "{float}".into(),
         TyKind::Infer(_) => "_".into(),
+    }
+}
+
+/// Lifetime errors in a type alias body (W-BORROW): an alias names no
+/// lifetime params yet, so a reference must say `'static` (an elided one
+/// is rustc E0106, L0202) and any other name is undeclared (E0261, L0203).
+/// Elided lifetimes inside fn pointer types are the pointer's own.
+fn alias_lifetimes(ast: &Ast, interner: &Interner, id: ast::TyId, errs: &mut Vec<Diag>) {
+    match ast.ty(id) {
+        TyExpr::Ref { lifetime, inner, .. } => {
+            match lifetime.map(|lt| (interner.get(lt.name), lt.span)) {
+                None | Some(("_", _)) => errs.push(Diag::new(
+                    "L0202",
+                    ast.ty_span(id),
+                    "missing lifetime specifier in a type alias",
+                    "Write `&'static`, or use an owned type.",
+                )),
+                Some(("static", _)) => {}
+                Some((_, span)) => errs.push(crate::check::generics::lifetime_diag(span)),
+            }
+            alias_lifetimes(ast, interner, *inner, errs);
+        }
+        TyExpr::Tuple(elems) => elems.iter().for_each(|&e| alias_lifetimes(ast, interner, e, errs)),
+        TyExpr::Paren(i) | TyExpr::Slice(i) => alias_lifetimes(ast, interner, *i, errs),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => alias_lifetimes(ast, interner, *inner, errs),
+        TyExpr::Path(segs) => {
+            for seg in segs {
+                if let ast::GenericArgs::Angle(args) = &seg.args {
+                    for g in args {
+                        if let ast::GenericArg::Type(t) = g {
+                            alias_lifetimes(ast, interner, *t, errs);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1281,6 +1321,7 @@ pub fn collect_reuse<'a>(
         resolved,
         gx: GenTables::default(),
         record_reads: true,
+        regions: Default::default(),
     };
     p.gx.walk_instances = walk_instances;
     p.gx.reuse = std::mem::take(reuse);
@@ -1458,6 +1499,7 @@ pub fn collect_reuse<'a>(
                     continue;
                 }
                 seen_aliases.push(a.name);
+                alias_lifetimes(ast, interner, a.ty, &mut errs);
                 pending.push(a);
                 let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::TypeAlias, interner.get(a.name), 0);
                 let def = DefId { krate: p.krate, hash };
@@ -1915,7 +1957,7 @@ pub fn collect_reuse<'a>(
             let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
             scope.assoc_srcs.append(&mut srcs);
         }
-        let (params, ret, ret_borrows_from, generics, scope) = {
+        let (params, ret, ret_borrows_from, generics, scope, region_sig) = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
             generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, errs)
         };
@@ -1928,6 +1970,9 @@ pub fn collect_reuse<'a>(
             p.gx.has_generics = true;
         }
         let id = LocalDefId(p.fns.len() as u32);
+        if let Some(rs) = region_sig {
+            p.regions.fns.insert(id, rs);
+        }
         let def_id = DefId { krate: p.krate, hash };
         p.fn_defs.push(def_id);
         p.def_by_hash.entry(hash).or_insert(id);
