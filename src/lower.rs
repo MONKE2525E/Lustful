@@ -225,7 +225,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         for _ in 0..n {
             if let TyKind::Ref(_, _, inner) = self.kind(t) {
                 t = inner;
-            } else if let Some(inner) = self.body.tys.boxed_elem(t) {
+            } else if let Some(inner) = self.body.tys.smart_elem(t) {
                 t = inner;
             }
         }
@@ -367,6 +367,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                     place = place.deref();
                     t = inner;
                 }
+                // Through an `Rc<String>` the builtin still wants
+                // the `&String`: form it from the pointee place.
+                if let Some(elem) = self.body.tys.rc_elem(t) {
+                    let sp = place.deref();
+                    let rt = self.ref_ty(false, elem);
+                    let sr = self.temp(rt);
+                    self.assign(Place::local(sr), Rvalue::Ref(false, sp), span);
+                    place = Place::local(sr);
+                }
                 let tmp = self.temp(REF_STR);
                 self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(place)], Place::local(tmp), span);
                 Operand::Copy(Place::local(tmp))
@@ -388,8 +397,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let place = self.op_place(op, ty, span);
                 let mut inner = self.peel(ty, 1);
                 let mut place = place.deref();
-                // `&Box<Vec<T>>` slices through the box as well.
-                if let Some(b) = self.body.tys.boxed_elem(inner) {
+                // `&Box<Vec<T>>` and `&Rc<Vec<T>>` slice through
+                // the smart pointer as well.
+                if let Some(b) = self.body.tys.smart_elem(inner) {
                     place = place.deref();
                     inner = b;
                 }

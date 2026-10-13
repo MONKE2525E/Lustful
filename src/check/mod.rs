@@ -219,6 +219,12 @@ pub enum Builtin {
     StrIsCharBoundary,
     BoxNew,
     BoxLeak,
+    RcNew,
+    RcStrongCount,
+    RcWeakCount,
+    RcMakeMut,
+    RcGetMut,
+    RcTryUnwrap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2228,15 +2234,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let (fd, fbase) = depth(self, found);
         let (ed, _) = depth(self, expected);
-        // The mutability of the reference directly on a `Box` base,
-        // which bounds what a deref coercion through it may hand out.
+        // The mutability a deref coercion through a smart pointer
+        // may hand out: the reference directly on a `Box` bounds
+        // it; an `Rc` never hands out `&mut`.
         let box_ref_mut = |cx: &Self| -> Option<bool> {
             let mut t = found;
             loop {
                 match cx.kind(t) {
                     TyKind::Ref(_, m, inner) => {
-                        if cx.tys.boxed_elem(cx.resolve(inner)).is_some() {
+                        let inner = cx.resolve(inner);
+                        if cx.tys.boxed_elem(inner).is_some() {
                             return Some(m.is_mut());
+                        }
+                        if cx.tys.rc_elem(inner).is_some() {
+                            return Some(false);
                         }
                         t = inner;
                     }
@@ -2252,14 +2263,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
                 if self.kind(s) == TyKind::Str
-                    && self.tys.boxed_elem(self.resolve(fbase)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e))) =>
+                    && self.tys.smart_elem(self.resolve(fbase)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e))) =>
             {
                 Coerce::StrFromString
             }
             (TyKind::Ref(..), TyKind::Ref(_, em, y))
                 if ed == 1
                     && box_ref_mut(self).is_some_and(|bm| !em.is_mut() || bm)
-                    && self.tys.boxed_elem(self.resolve(fbase)).is_some_and(|e| self.unify(e, y)) =>
+                    && self.tys.smart_elem(self.resolve(fbase)).is_some_and(|e| self.unify(e, y)) =>
             {
                 Coerce::BoxToRef(fd + 1, em.is_mut())
             }
@@ -2310,7 +2321,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     && match self
                         .tys
                         .vec_elem(self.resolve(x))
-                        .or_else(|| self.tys.boxed_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
+                        .or_else(|| self.tys.smart_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
                     {
                         Some(xe) => match self.kind(y) {
                             TyKind::Slice(ye) => self.unify(xe, ye),
@@ -2395,14 +2406,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => self
                     .tys
                     .vec_elem(self.resolve(x))
-                    .or_else(|| self.tys.boxed_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
+                    .or_else(|| self.tys.smart_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
                     .is_some_and(|xe| self.ty_matchish(xe, ye)),
             },
             TyKind::Str => {
                 self.tys.is_string_ty(self.resolve(x))
-                    || self.tys.boxed_elem(self.resolve(x)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e)))
+                    || self.tys.smart_elem(self.resolve(x)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e)))
             }
-            _ => self.ty_matchish(x, y) || self.tys.boxed_elem(self.resolve(x)).is_some_and(|e| self.ty_matchish(e, y)),
+            _ => self.ty_matchish(x, y) || self.tys.smart_elem(self.resolve(x)).is_some_and(|e| self.ty_matchish(e, y)),
         }
     }
 
@@ -3224,14 +3235,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match self.kind(t) {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
-                    _ if self.tys.boxed_elem(t).is_some() => self.tys.boxed_elem(t).unwrap_or(ERROR),
+                    _ if self.tys.smart_elem(t).is_some() => self.tys.smart_elem(t).unwrap_or(ERROR),
                     _ => {
                         let tn = self.tn(t);
                         self.err(
                             "L0113",
                             span,
                             format!("type `{tn}` cannot be dereferenced"),
-                            "Only references and `Box` values can be dereferenced with `*`.",
+                            "Only references, `Box` values, and `Rc` values can be dereferenced with `*`.",
                         );
                         ERROR
                     }
@@ -3943,7 +3954,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// uniformly.
     fn autoderef_smart(&self, t: Ty) -> (u8, Ty) {
         let (mut n, mut base) = self.autoderef(t);
-        while let Some(inner) = self.tys.boxed_elem(base) {
+        while let Some(inner) = self.tys.smart_elem(base) {
             base = self.resolve(inner);
             n += 1;
             let (d, b) = self.autoderef(base);
@@ -4390,6 +4401,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Lust supports Box::new and Box::leak.",
             );
             return None;
+        }
+        if ty_name == k.Rc {
+            let b = if item == k.new {
+                Builtin::RcNew
+            } else if item == k.strong_count {
+                Builtin::RcStrongCount
+            } else if item == k.weak_count {
+                Builtin::RcWeakCount
+            } else if item == k.make_mut {
+                Builtin::RcMakeMut
+            } else if item == k.get_mut {
+                Builtin::RcGetMut
+            } else if item == k.try_unwrap {
+                Builtin::RcTryUnwrap
+            } else {
+                self.err(
+                    "L0104",
+                    span,
+                    format!("no function `Rc::{}`", self.name(item)),
+                    "Lust supports Rc::new, Rc::strong_count, Rc::weak_count, Rc::make_mut, Rc::get_mut, and Rc::try_unwrap.",
+                );
+                return None;
+            };
+            return Some(Res::Builtin(b));
         }
         // Qualified builtin variant constructors: `Option::Some(..)`,
         // `Result::Ok(..)`, `Result::Err(..)`.
@@ -5216,6 +5251,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let bx = self.tys.mk_boxed(elem);
                         let r = self.tys.mk_ref(true, elem);
                         (vec![bx], r)
+                    }
+                    Builtin::RcNew => {
+                        let generics = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs[0].type_args(),
+                            _ => Vec::new(),
+                        };
+                        let elem = match generics.first() {
+                            Some(&g) => self.resolve_written(g),
+                            None => self.new_var(false),
+                        };
+                        (vec![elem], self.tys.mk_rc(elem))
+                    }
+                    Builtin::RcStrongCount | Builtin::RcWeakCount => {
+                        let elem = self.new_var(false);
+                        let rc = self.tys.mk_rc(elem);
+                        let r = self.tys.mk_ref(false, rc);
+                        (vec![r], USIZE)
+                    }
+                    Builtin::RcMakeMut => {
+                        let elem = self.new_var(false);
+                        self.deferred_clone.push((elem, span));
+                        let rc = self.tys.mk_rc(elem);
+                        let rm = self.tys.mk_ref(true, rc);
+                        let r = self.tys.mk_ref(true, elem);
+                        (vec![rm], r)
+                    }
+                    Builtin::RcGetMut => {
+                        let elem = self.new_var(false);
+                        let rc = self.tys.mk_rc(elem);
+                        let rm = self.tys.mk_ref(true, rc);
+                        let r = self.tys.mk_ref(true, elem);
+                        let opt = self.tys.mk_option(r);
+                        (vec![rm], opt)
+                    }
+                    Builtin::RcTryUnwrap => {
+                        let elem = self.new_var(false);
+                        let rc = self.tys.mk_rc(elem);
+                        let res = self.tys.mk_result(elem, rc);
+                        (vec![rc], res)
                     }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {

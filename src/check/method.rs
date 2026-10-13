@@ -906,7 +906,7 @@ pub(super) fn generic_method_search(
         steps.push((cur, derefs));
         match cx.tys.kind(cur) {
             TyKind::Ref(_, _, inner) => cur = cx.resolve(inner),
-            _ => match cx.tys.boxed_elem(cur) {
+            _ => match cx.tys.smart_elem(cur) {
                 Some(inner) => cur = cx.resolve(inner),
                 None => break,
             },

@@ -148,7 +148,7 @@ pub const LANG_ITEMS: &[LangItemDef] = &[
     LangItemDef { item: L::String, name: "string", krate: C::Alloc, required: true },
     LangItemDef { item: L::Vec, name: "vec", krate: C::Alloc, required: true },
     LangItemDef { item: L::Box, name: "box", krate: C::Alloc, required: true },
-    LangItemDef { item: L::Rc, name: "rc", krate: C::Alloc, required: false },
+    LangItemDef { item: L::Rc, name: "rc", krate: C::Alloc, required: true },
     LangItemDef { item: L::Arc, name: "arc", krate: C::Alloc, required: false },
     LangItemDef { item: L::UnsafeCell, name: "unsafe_cell", krate: C::Core, required: false },
     LangItemDef { item: L::PhantomData, name: "phantom_data", krate: C::Core, required: false },
@@ -200,6 +200,7 @@ impl LangItems {
         items.set(LangItem::String, b.string);
         items.set(LangItem::Vec, b.vec);
         items.set(LangItem::Box, b.boxed);
+        items.set(LangItem::Rc, b.rc);
         items
     }
 
@@ -815,6 +816,7 @@ mod tests {
         assert_eq!(items.get(LangItem::String), Some(b.string));
         assert_eq!(items.get(LangItem::Vec), Some(b.vec));
         assert_eq!(items.get(LangItem::Box), Some(b.boxed));
+        assert_eq!(items.get(LangItem::Rc), Some(b.rc));
         assert!(items.required_missing().is_empty(), "required items must resolve: {:?}", items.required_missing());
     }
 

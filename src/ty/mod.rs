@@ -571,6 +571,7 @@ pub struct BuiltinDefs {
     pub option: DefId,
     pub result: DefId,
     pub boxed: DefId,
+    pub rc: DefId,
     /// `str::Chars`, the iterator from `s.chars()`.
     pub chars: DefId,
     /// `std::env::Args`.
@@ -588,6 +589,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::Option)
         } else if def == self.boxed {
             Some(BuiltinTy::Boxed)
+        } else if def == self.rc {
+            Some(BuiltinTy::Rc)
         } else if def == self.result {
             Some(BuiltinTy::Result)
         } else if def == self.chars {
@@ -609,6 +612,7 @@ pub enum BuiltinTy {
     Option,
     Result,
     Boxed,
+    Rc,
     Chars,
     Args,
 }
@@ -733,6 +737,11 @@ pub trait TyIntern {
         let def = self.builtins().boxed;
         self.mk_adt(def, &[GenericArg::Ty(elem)])
     }
+    /// `Rc<elem>` as an Adt application of the builtin def.
+    fn mk_rc(&mut self, elem: Ty) -> Ty {
+        let def = self.builtins().rc;
+        self.mk_adt(def, &[GenericArg::Ty(elem)])
+    }
     /// `Result<t, e>` as an Adt application of the builtin def. No
     /// one-arg cache: the plain intern path dedups it.
     fn mk_result(&mut self, t: Ty, e: Ty) -> Ty {
@@ -774,6 +783,15 @@ pub trait TyIntern {
     /// The pointee type of a `Box<T>`.
     fn boxed_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Boxed)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// The pointee type of an `Rc<T>`.
+    fn rc_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::Rc)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// The pointee type of a `Box<T>` or an `Rc<T>`: the smart
+    /// pointers method calls, fields, and coercions deref through.
+    fn smart_elem(&self, t: Ty) -> Option<Ty> {
+        self.boxed_elem(t).or_else(|| self.rc_elem(t))
     }
     /// The `(T, E)` type arguments of a `Result<T, E>`.
     fn result_args(&self, t: Ty) -> Option<(Ty, Ty)> {
@@ -942,6 +960,7 @@ impl GlobalTys {
             option: builtin_def(&["core", "option"], "Option"),
             result: builtin_def(&["core", "result"], "Result"),
             boxed: builtin_def(&["alloc", "boxed"], "Box"),
+            rc: builtin_def(&["alloc", "rc"], "Rc"),
             chars: builtin_def(&["core", "str"], "Chars"),
             args: builtin_def(&["std", "env"], "Args"),
         };

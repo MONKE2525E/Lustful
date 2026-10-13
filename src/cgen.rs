@@ -44,6 +44,9 @@ pub enum CTy {
     /// A `Box<T>`: a plain owning `T*` (never null, so it keeps
     /// the pointer niche).
     Boxed(Box<CTy>),
+    /// An `Rc<T>`: a pointer to the generated counted header
+    /// (`strong`, `weak`, then the value), also never null.
+    Rc(Box<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -108,6 +111,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Boxed) => CTy::Boxed(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Rc) => CTy::Rc(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Option) => CTy::Option(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Result) => {
                 let (a, b) = tys.result_args(t).unwrap_or((ERROR, ERROR));
@@ -171,6 +175,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Vec(_) => "lust_Vec".into(),
         CTy::Ref(inner) if **inner == CTy::Str => "lust_str".into(),
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
+        CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
@@ -195,6 +200,7 @@ fn mangle(t: &CTy) -> String {
         CTy::String => "S".into(),
         CTy::Vec(e) => format!("V_{}_", mangle(e)),
         CTy::Boxed(e) => format!("Bx_{}_", mangle(e)),
+        CTy::Rc(e) => format!("Rc_{}_", mangle(e)),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -253,6 +259,10 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             collect_types(r, out);
         }
         CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) => collect_types(e, out),
+        CTy::Rc(e) => {
+            out.insert(t.clone());
+            collect_types(e, out);
+        }
         _ => {}
     }
 }
@@ -260,7 +270,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) => {
+        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::Rc(_) => {
             out.push(t.clone())
         }
         // A pointer to a fn pointer still names its typedef, which has
@@ -284,7 +294,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) => true,
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -449,7 +459,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Chars => Some(plain_layout(24, 8)),
             CTy::Args => Some(plain_layout(8, 8)),
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
-            CTy::Boxed(_) => Some(layout::ptr_layout()),
+            CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
             CTy::Slice(_) => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
@@ -631,7 +641,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::Args => (8, 8),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
-            CTy::Boxed(_) => (8, 8),
+            CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
             CTy::Ref(_) => (8, 8),
             CTy::Option(e) => {
                 let (es, ea) = go(p, e, seen);
@@ -1226,6 +1236,10 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Deref, CTy::Boxed(inner)) => {
                     e = format!("(*{e})");
+                    t = *inner;
+                }
+                (Proj::Deref, CTy::Rc(inner)) => {
+                    e = format!("{e}->v");
                     t = *inner;
                 }
                 (Proj::Field(i), CTy::Adt(a)) => {
@@ -2080,6 +2094,74 @@ impl FnGen<'_, '_, '_> {
             // operand's drop flag is already clear, and the
             // pointer value is the `&mut T` result.
             B::BoxLeak => vals[0].clone(),
+            B::RcNew => {
+                let et = ctype(&tys[0]);
+                let it = format!("RcI_{}", mangle(&tys[0]));
+                let t = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 0; {t}->v = {};",
+                    vals[0]
+                );
+                t
+            }
+            B::RcStrongCount => format!("(*{})->strong", vals[0]),
+            B::RcWeakCount => format!("(*{})->weak", vals[0]),
+            B::RcGetMut => {
+                let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
+                let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
+                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem))));
+                let ot = ctype(&opt);
+                let t = self.tmp();
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let v = &vals[0];
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    if ((*{v})->strong == 1 && (*{v})->weak == 0) {{ {field} = &(*{v})->v;{some} }}");
+                t
+            }
+            B::RcMakeMut => {
+                let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
+                let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
+                let et = ctype(&elem);
+                let it = format!("RcI_{}", mangle(&elem));
+                let v = &vals[0];
+                let cloned = if is_copy_c(self.p, &elem) {
+                    format!("(*{v})->v")
+                } else {
+                    self.want(Glue::Clone, &elem);
+                    format!("clone_{}(&(*{v})->v)", mangle(&elem))
+                };
+                // Shared (or weak-held, once Weak exists): clone
+                // the value into a fresh header and leave the
+                // old count one lower, as in Rust.
+                let _ = writeln!(
+                    self.out,
+                    "    if ((*{v})->strong > 1 || (*{v})->weak > 0) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 0; n->v = {cloned}; (*{v})->strong--; *{v} = n; }}"
+                );
+                format!("&(*{v})->v")
+            }
+            B::RcTryUnwrap => {
+                let elem = match &tys[0] { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
+                let res = CTy::Result(Box::new(elem.clone()), Box::new(CTy::Rc(Box::new(elem.clone()))));
+                let rt = ctype(&res);
+                let t = self.tmp();
+                let v = &vals[0];
+                let ok_f = variant_field(self.p, &res, &t, 0, 0);
+                let err_f = variant_field(self.p, &res, &t, 1, 0);
+                let set_ok = disc_set(self.p, &res, &t, 0);
+                let set_err = disc_set(self.p, &res, &t, 1);
+                let et = ctype(&elem);
+                let it = format!("RcI_{}", mangle(&elem));
+                let _ = writeln!(self.out, "    {rt} {t};");
+                let _ = writeln!(
+                    self.out,
+                    "    if ({v}->strong == 1 && {v}->weak == 0) {{ {set_ok} {ok_f} = {v}->v; lust_dealloc((void*){v}, sizeof({it}), _Alignof({it})); }} else {{ {set_err} {err_f} = {v}; }}"
+                );
+                let _ = et;
+                t
+            }
             B::EnvArgs => "((lust_Args){ (uint64_t)lust_argc })".into(),
             B::ArgsCount => format!("{}.n", vals[0]),
             B::StrLen => format!("{}.len", vals[0]),
@@ -3309,6 +3391,10 @@ impl FnGen<'_, '_, '_> {
                     e = format!("(*{e})");
                     t = *inner;
                 }
+                CTy::Rc(inner) => {
+                    e = format!("{e}->v");
+                    t = *inner;
+                }
                 _ => break,
             }
         }
@@ -4284,6 +4370,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
+            CTy::Rc(e) => collect_types(e, &mut inner),
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| collect_types(e, &mut inner));
                 collect_types(r, &mut inner);
@@ -4321,6 +4408,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
+            CTy::Rc(e) => by_value_deps(e, &mut deps),
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| by_value_deps(e, &mut deps));
                 by_value_deps(r, &mut deps);
@@ -4387,6 +4475,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 if let Some(l) = c_layout(p, t) {
                     layout_assert(out, &ctype(t), &l);
                 }
+            }
+            CTy::Rc(e) => {
+                let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
             }
             CTy::FnPtr(ps, r) => {
                 let ct = ctype(t);
@@ -4522,6 +4613,16 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let et = ctype(e);
                     let _ = writeln!(body, "  lust_dealloc((void*)*p, sizeof({et}), _Alignof({et}));");
                 }
+                CTy::Rc(e) => {
+                    let it = format!("RcI_{}", mangle(e));
+                    let inner = if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        format!("drop_{}(&(*p)->v); ", mangle(e))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(body, "  if (--(*p)->strong == 0) {{ {inner}if ((*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it})); }}");
+                }
                 CTy::Option(e) => {
                     need(Glue::Drop, e);
                     let _ = writeln!(body, "  if ({disc_p}) drop_{}(&{pf});", mangle(e));
@@ -4604,6 +4705,9 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let et = ctype(e);
                     let c = clone_of(e, "(**p)", &mut need);
                     let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {c}; return r;");
+                }
+                CTy::Rc(_) => {
+                    body.push_str("  (*p)->strong++; return *p;\n");
                 }
                 CTy::Option(e) => {
                     let c = clone_of(e, &pf, &mut need);
@@ -4731,6 +4835,10 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let e = eq_of(inner, "(**a)", "(**b)", &mut need);
                     let _ = writeln!(body, "  return {e};");
                 }
+                CTy::Rc(inner) => {
+                    let e = eq_of(inner, "(*a)->v", "(*b)->v", &mut need);
+                    let _ = writeln!(body, "  return {e};");
+                }
                 CTy::Vec(e) => {
                     let et = ctype(e);
                     let c = eq_of(e, &format!("(({et}*)a->ptr)[i]"), &format!("(({et}*)b->ptr)[i]"), &mut need);
@@ -4841,6 +4949,10 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 }
                 CTy::Ref(inner) | CTy::Boxed(inner) => {
                     let e = dbg_of(inner, "(**p)", &mut need);
+                    let _ = writeln!(body, "  {e}");
+                }
+                CTy::Rc(inner) => {
+                    let e = dbg_of(inner, "(*p)->v", &mut need);
                     let _ = writeln!(body, "  {e}");
                 }
                 CTy::Vec(e) => {

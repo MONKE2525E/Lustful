@@ -789,7 +789,7 @@ fn compute(
         }
         TyKind::Adt(..) => match tys.builtin_of(t) {
             // String and Vec are (ptr, len, cap) words in this order for layout.
-            Some(BuiltinTy::Boxed) => Ok(ptr_layout()),
+            Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => {
                 struct_layout(&[ptr_layout(), int_layout(IntTy::Usize), int_layout(IntTy::Usize)], Repr::default())
             }

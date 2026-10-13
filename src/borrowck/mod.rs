@@ -1270,7 +1270,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for pr in &dest.proj {
             t = match (self.body.tys.kind(t), pr) {
                 (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                (_, Proj::Deref) if self.body.tys.boxed_elem(t).is_some() => self.body.tys.boxed_elem(t).unwrap(),
+                (_, Proj::Deref) if self.body.tys.smart_elem(t).is_some() => self.body.tys.smart_elem(t).unwrap(),
                 (_, Proj::Index(_)) => match self.body.tys.vec_elem(t) {
                     Some(e) => e,
                     None => return ERROR,
@@ -1862,6 +1862,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                     through_ref = true;
                     t = inner;
+                }
+                (_, Proj::Deref) if self.body.tys.rc_elem(t).is_some() => {
+                    if borrow {
+                        self.err("L0308", span, "cannot borrow data in an `Rc` as mutable".into(), "Use `Rc::make_mut` or `Rc::get_mut` for mutable access.");
+                    } else {
+                        self.err("L0309", span, "cannot assign to data in an `Rc`".into(), "Use `Rc::make_mut` or `Rc::get_mut` for mutable access.");
+                    }
+                    return;
                 }
                 (_, Proj::Deref) if self.body.tys.boxed_elem(t).is_some() => t = self.body.tys.boxed_elem(t).unwrap(),
                 (_, Proj::Index(_)) if self.body.tys.vec_elem(t).is_some() => t = self.body.tys.vec_elem(t).unwrap(),

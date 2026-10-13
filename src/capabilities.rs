@@ -210,6 +210,12 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::StrIsCharBoundary,
     Builtin::BoxNew,
     Builtin::BoxLeak,
+    Builtin::RcNew,
+    Builtin::RcStrongCount,
+    Builtin::RcWeakCount,
+    Builtin::RcMakeMut,
+    Builtin::RcGetMut,
+    Builtin::RcTryUnwrap,
 ];
 
 /// How a builtin is called.
@@ -416,6 +422,12 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
         B::StrIsCharBoundary => (&["str"], vec![k.is_char_boundary], Call::Method),
         B::BoxNew => (&["Box<T>"], vec![k.new], Call::Associated),
         B::BoxLeak => (&["Box<T>"], vec![k.leak], Call::Associated),
+        B::RcNew => (&["Rc<T>"], vec![k.new], Call::Associated),
+        B::RcStrongCount => (&["Rc<T>"], vec![k.strong_count], Call::Associated),
+        B::RcWeakCount => (&["Rc<T>"], vec![k.weak_count], Call::Associated),
+        B::RcMakeMut => (&["Rc<T>"], vec![k.make_mut], Call::Associated),
+        B::RcGetMut => (&["Rc<T>"], vec![k.get_mut], Call::Associated),
+        B::RcTryUnwrap => (&["Rc<T>"], vec![k.try_unwrap], Call::Associated),
     }
 }
 
@@ -584,7 +596,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("the `HashSet` type", "L0641"),
     ("the `BTreeMap` type", "L0641"),
     ("a Box of an unsized type", "L0641"),
-    ("the `Rc` type", "L0641"),
+    ("an Rc of an unsized type", "L0641"),
     ("the `Arc` type", "L0641"),
     ("the `RefCell` type", "L0641"),
     ("the `Cell` type", "L0641"),
