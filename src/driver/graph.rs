@@ -2,7 +2,8 @@
 // sections 4.2, 8.1, and 8.2; serial refactor S7).
 //
 // This file owns the frozen query surface of section 8.2: the `Reads` sink, its
-// keys (`Binding`, `MethodSet`, `ImplSet`, `Sig`, `Layout`, `Checked`), and the
+// keys (`Binding`, `MethodSet`, `ImplSet`, `Sig`, `Layout`, `Checked`,
+// `TraitInScope`), and the
 // query functions on `Program` that log to it. Wave A packages (W-CORELANG,
 // W-TRAITS-CORE, W-MACRO) code against these functions. Today's single-file,
 // single-module resolver sits behind them; W-RESOLVE replaces that resolver
@@ -183,6 +184,11 @@ pub enum ReadKey {
     Layout(DefId),
     /// A mono call edge to the checked body of a def (section 8.2).
     Checked(DefId),
+    /// Whether a user trait is defined in or imported into one module,
+    /// under any name (`as _` included): method probes ask it for each
+    /// candidate trait. A `use` edit flips it without touching any
+    /// binding the body names. The fingerprint is the answer.
+    TraitInScope(ModuleId, DefId),
 }
 
 /// One recorded read: the fingerprint the node had when it was read, and
@@ -683,6 +689,13 @@ fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
         BindingRes::Ambiguous => 1u8.hash(&mut h),
         BindingRes::Absent => 2u8.hash(&mut h),
     }
+    Fingerprint(h.finish())
+}
+
+/// The fingerprint of a `TraitInScope` node: its answer.
+fn trait_in_scope_fingerprint(ans: bool) -> Fingerprint {
+    let mut h = FxHasher::default();
+    ("trait-in-scope-v1", ans).hash(&mut h);
     Fingerprint(h.finish())
 }
 
@@ -1199,6 +1212,32 @@ impl<'a> Program<'a> {
         }
     }
 
+    /// Whether a user trait is defined in or imported into `module`
+    /// (under any name, `as _` included), recorded as a `TraitInScope`
+    /// read. Method probes ask this for each candidate trait; the
+    /// answer has no binding read of its own, since the import may use
+    /// any name. Without resolver tables, and for a trait the tables do
+    /// not know, every local trait counts as in scope.
+    #[allow(dead_code)] // First caller: `trait_in_scope` in check/method.rs.
+    pub fn trait_in_module(&self, reads: &mut Reads, module: ModuleId, trait_def: DefId) -> bool {
+        let ans = self.trait_in_module_answer(module, trait_def);
+        reads.record_with(ReadKey::TraitInScope(module, trait_def), !ans, || trait_in_scope_fingerprint(ans));
+        ans
+    }
+
+    /// The `trait_in_module` answer without recording. See `binding_res`.
+    fn trait_in_module_answer(&self, module: ModuleId, trait_def: DefId) -> bool {
+        use crate::resolve::imports::{BindState, ns_index};
+        let Some(res) = &self.resolved else { return true };
+        let Some(info) = res.def_info.get(&trait_def) else { return true };
+        info.module == module
+            || res.maps.get(module.0 as usize).is_some_and(|maps| {
+                maps[ns_index(Namespace::Type)]
+                    .values()
+                    .any(|s| matches!(s, BindState::One(b) if res.target_def(b.target) == trait_def))
+            })
+    }
+
     /// The kind of a def a binding resolved to, through the `Defs` table.
     /// Callers use it to tell a free fn from a struct constructor without
     /// reading the checker's name maps. Reads no node beyond the `Binding`
@@ -1239,6 +1278,10 @@ impl<'a> Program<'a> {
                 Read { fingerprint: layout_fingerprint(self, *def), failed: !known }
             }
             ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
+            ReadKey::TraitInScope(module, trait_def) => {
+                let ans = self.trait_in_module_answer(*module, *trait_def);
+                Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
+            }
         }
     }
 
