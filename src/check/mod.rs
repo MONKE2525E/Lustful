@@ -5745,10 +5745,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     .collect(),
                 _ => Vec::new(),
             };
+            // Under a `Result<&dyn Tr, _>` expectation the argument is a
+            // coercion site, as for `Some`; a dyn deeper in gets the hint.
+            let side = if turbo.len() == 2 { None } else { expected.and_then(|t| self.tys.result_args(self.resolve(t))) };
+            let side = side.map(|(ok, err)| if res == Res::ResOk { ok } else { err });
+            if let Some(want) = side.filter(|&t| self.dyn_ref_expectation(Some(t)).is_some()) {
+                self.expect_expr(args[0], want);
+                let other = self.new_var(false);
+                return if res == Res::ResOk { self.tys.mk_result(want, other) } else { self.tys.mk_result(other, want) };
+            }
             let (want, other) = if turbo.len() == 2 {
                 if res == Res::ResOk { (Some(turbo[0]), turbo[1]) } else { (Some(turbo[1]), turbo[0]) }
             } else {
-                (None, self.new_var(false))
+                (side.filter(|&t| object::mentions_dyn(&self.tys, t)), self.new_var(false))
             };
             let t = self.expr(args[0], want);
             return if res == Res::ResOk { self.tys.mk_result(t, other) } else { self.tys.mk_result(other, t) };
