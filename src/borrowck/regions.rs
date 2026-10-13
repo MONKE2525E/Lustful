@@ -395,6 +395,8 @@ impl AdtTables {
                 | BuiltinTy::Args
                 | BuiltinTy::Iter(_),
             ) => return (Variance::Co, DropMode::Owned),
+            // `fmt` types (W-STD-B) take no type args.
+            Some(BuiltinTy::Fmt(_)) => return (Variance::Inv, DropMode::Owned),
             None => {}
         }
         let v = self.variance.get(&def).and_then(|v| v.get(j)).copied().unwrap_or(Variance::Inv);
