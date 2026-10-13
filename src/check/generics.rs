@@ -3617,8 +3617,24 @@ fn find_global_ty(p: &Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
 /// types: the concrete pointee and the target dyn type.
 pub fn vtable_for(p: &Program, src: &dyn TyIntern, concrete: Ty, dyn_ty: Ty) -> Option<u32> {
     let concrete = find_global_ty(p, src, concrete)?;
-    let dyn_ty = find_global_ty(p, src, dyn_ty)?;
-    let principal = crate::check::object::principal_of(&p.tys, dyn_ty)?;
+    // The principal alone keys the vtable, so the dyn type itself need
+    // not be in the global store: mono cannot check a body that uses a
+    // static (`&X as &(dyn Tr + 'static)`), and then only the eager
+    // vtable of a plain impl exists for it.
+    let TyKind::Dyn(b, _) = src.kind(dyn_ty) else { return None };
+    let pr = src.dyn_bounds(b).principal?.value;
+    let mut args: Vec<GenericArg> = Vec::new();
+    for g in src.args(pr.args).to_vec() {
+        args.push(match g {
+            GenericArg::Ty(e) => GenericArg::Ty(find_global_ty(p, src, e)?),
+            GenericArg::Const(c) => match src.const_kind(c) {
+                ConstKind::Infer(_) => return None,
+                k => GenericArg::Const(p.tys.consts_get(k)?),
+            },
+            other => other,
+        });
+    }
+    let principal = TraitRef { def: pr.def, args: p.tys.get_args(&args)?, bindings: EMPTY_BINDINGS };
     p.gx.vtable_by_key.get(&(concrete, principal)).copied()
 }
 
