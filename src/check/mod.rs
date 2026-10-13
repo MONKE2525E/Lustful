@@ -3,6 +3,7 @@
 // Signature collection runs before body checking, in `collect`.
 pub mod closure;
 pub mod collect;
+pub mod constfn;
 pub mod convert;
 pub mod fmt;
 pub mod generics;
@@ -1147,6 +1148,14 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
     let mut out = out;
     out.tys = tys;
     out.queue_work = obl.work();
+    let mut errs = errs;
+    // A `const fn` body must also pass the const-context rules: the
+    // const evaluator only sees the calls made from const items, so a
+    // body that is never const-evaluated needs its own check.
+    if f.is_const {
+        let prior_errs = !errs.is_empty();
+        errs.extend(constfn::check_const_fn(p, &out, f, prior_errs));
+    }
     (out, errs)
 }
 

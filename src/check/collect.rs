@@ -2613,6 +2613,16 @@ pub fn collect_reuse<'a>(
                 let parent_gen = ParentGen { generics: impl_generics.clone(), scope: impl_scope };
                 let mut method_ids: Vec<LocalDefId> = Vec::new();
                 for def in &imp.fns {
+                    // Functions in trait impls cannot be declared const
+                    // (rustc E0379); inherent impl methods can.
+                    if trait_ref.is_some() && def.qual.is_const {
+                        errs.push(Diag::new(
+                            "L0632",
+                            def.name_span,
+                            "functions in trait impls cannot be declared const",
+                            "Remove the `const`, or move the method to an inherent impl.",
+                        ));
+                    }
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
                     let id = add_fn(&mut p, def, owner, Some(self_pat), Some(impl_def), &parent_gen, hash, &mut errs);
                     method_ids.push(id);
