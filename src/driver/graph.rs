@@ -165,9 +165,12 @@ pub struct ImplSetKey {
     pub head: Head,
 }
 
-/// The impl defs in one bucket, in no promised order. Empty until trait
-/// collection lands (W-TRAITS-CORE); the node and its reads exist now so an
-/// obligation that fails on an empty bucket rechecks when an impl appears.
+/// The impl defs in one bucket, in no promised order. Only the impls of a
+/// user trait (one written in this crate, with no associated const) fill
+/// buckets: those impls are outside the trait-system key (driver/
+/// gen_reuse.rs `trait_key`), so these reads are what rechecks a body when
+/// one is added, removed, or edited. Any other trait's bucket reads as
+/// empty; its impls stay under the trait-system key.
 #[derive(Clone, Debug, Default)]
 pub struct ImplSet {
     pub impls: Vec<DefId>,
@@ -819,13 +822,18 @@ fn method_set_fingerprint(p: &Program, key: &MethodSetKey, set: &MethodSet) -> F
 }
 
 /// The fingerprint of an `ImplSet` bucket: the bucket key (trait and
-/// head) plus its impl defs, sorted so the bucket's discovery order
-/// does not matter (section 8.1).
+/// head) plus each impl's def and content (`impl_content`), sorted so the
+/// bucket's discovery order does not matter (section 8.1). The content
+/// joins because an impl keeps its def through edits to its where
+/// clauses, associated types and consts, and method list.
 fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerprint {
     // The `'static` dyn flag joins each impl (check::object): flipping
     // `impl X for dyn Tr` to `+ '_` keeps the def.
-    let mut defs: Vec<(u64, u64, bool)> =
-        set.impls.iter().map(|d| (def_crate_hash(p, *d), d.hash.0, p.gx.static_dyn_impls.contains(d))).collect();
+    let mut defs: Vec<(u64, u64, bool, u64)> = set
+        .impls
+        .iter()
+        .map(|d| (def_crate_hash(p, *d), d.hash.0, p.gx.static_dyn_impls.contains(d), impl_content(p, *d)))
+        .collect();
     defs.sort_unstable();
     let mut h = FxHasher::default();
     "impl-set-v2".hash(&mut h);
@@ -836,6 +844,34 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
         d.hash(&mut h);
     }
     Fingerprint(h.finish())
+}
+
+/// The content of one impl as selection and its callers see it: header
+/// (trait ref pattern), generics and where clauses, associated type and
+/// const bindings, and each item's def and signature. Method bodies are
+/// not in it (each is its own fn, checked on its own).
+fn impl_content(p: &Program, def: DefId) -> u64 {
+    let Some((_, rec)) = p.gx.index.by_def(def) else { return 0 };
+    let mut h = FxHasher::default();
+    "impl-content-v1".hash(&mut h);
+    hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
+    hash_generics(&mut h, p, &rec.generics);
+    (rec.assoc_tys.len() as u64).hash(&mut h);
+    for (d, t) in &rec.assoc_tys {
+        hash_def_pub(&mut h, p, *d);
+        hash_ty(&mut h, p, &p.tys, *t);
+    }
+    (rec.assoc_consts.len() as u64).hash(&mut h);
+    for (d, c) in &rec.assoc_consts {
+        hash_def_pub(&mut h, p, *d);
+        hash_const(&mut h, &p.tys, *c);
+    }
+    (rec.items.len() as u64).hash(&mut h);
+    for d in &rec.items {
+        hash_def_pub(&mut h, p, *d);
+        sig_fingerprint(p, *d).0.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Folds one visibility into `h`: its form, and for `pub(in path)` the
@@ -1230,14 +1266,39 @@ impl<'a> Program<'a> {
     }
 
     /// The impl bucket for one trait and Self head, recorded at every
-    /// obligation (section 8.2). No traits are collected yet, so every
-    /// bucket is empty; the read still records, so a body whose obligation
-    /// failed here rechecks when W-TRAITS-CORE adds the first impl.
-    #[allow(dead_code)] // First caller is the obligation queue (W-TRAITS-CORE, wave A).
+    /// selection (section 8.2; `traits::solve` step 2 calls it through
+    /// `SolveCx::record_impl_set`). See `ImplSet` for which buckets fill.
     pub fn impl_set(&self, reads: &mut Reads, trait_: DefId, head: Head) -> ImplSet {
-        let set = ImplSet::default();
+        let set = self.impl_bucket(trait_, head);
         let key = ImplSetKey { trait_, head };
-        reads.record_with(ReadKey::ImplSet(key), true, || impl_set_fingerprint(self, &key, &set));
+        reads.record_with(ReadKey::ImplSet(key), set.impls.is_empty(), || impl_set_fingerprint(self, &key, &set));
+        set
+    }
+
+    /// True for a trait whose impls fill `ImplSet` buckets, and so stay out
+    /// of the trait-system key (`gen_reuse::trait_key`): a user trait (a
+    /// trait item of this crate) with no associated const. A `<T as K>::C`
+    /// path reads an impl's const with no recorded read.
+    pub(crate) fn impls_read_covered(&self, trait_: DefId) -> bool {
+        self.gx.index.trait_record(trait_).is_some_and(|r| r.local && r.assoc_items.iter().all(|&(_, _, is_type)| is_type))
+    }
+
+    /// The impls of trait `trait_` that a Self type with this head can
+    /// select: the same head after `Head::of` peels references, or a Self
+    /// pattern with no head (a blanket impl). An `Unknown` head takes every
+    /// impl. Empty unless `impls_read_covered` (see `ImplSet`).
+    fn impl_bucket(&self, trait_: DefId, head: Head) -> ImplSet {
+        let mut set = ImplSet::default();
+        if !self.impls_read_covered(trait_) {
+            return set;
+        }
+        for &id in self.gx.index.impls_of_trait(trait_) {
+            let rec = self.gx.index.get(id);
+            let h = Head::of(&self.tys, rec.self_ty(&self.tys));
+            if head == Head::Unknown || h == Head::Unknown || h == head {
+                set.impls.push(rec.def);
+            }
+        }
         set
     }
 
@@ -1344,8 +1405,8 @@ impl<'a> Program<'a> {
                 Read { fingerprint: method_set_fingerprint(self, k, &set), failed: set.candidates.is_empty() }
             }
             ReadKey::ImplSet(k) => {
-                let set = ImplSet::default();
-                Read { fingerprint: impl_set_fingerprint(self, k, &set), failed: true }
+                let set = self.impl_bucket(k.trait_, k.head);
+                Read { fingerprint: impl_set_fingerprint(self, k, &set), failed: set.impls.is_empty() }
             }
             ReadKey::Sig(def) => {
                 let known = self.local_def(def.hash).filter(|l| self.def_id(*l) == *def).is_some()
@@ -1829,8 +1890,8 @@ fn main() {}
         });
     }
 
-    /// The impl-set node exists and records before any trait does: every
-    /// bucket is empty, and the read is a failed lookup.
+    /// A def that is not a user trait reads an empty bucket, recorded as a
+    /// failed lookup.
     #[test]
     fn impl_set_records_the_empty_bucket() {
         with_program(SAMPLE, |interner, p| {
@@ -1848,6 +1909,34 @@ fn main() {}
             assert_eq!(p.layout_of(&mut reads, missing), None);
             assert_eq!(reads.get(&ReadKey::Layout(missing)).map(|r| r.failed), Some(true));
         });
+    }
+
+    /// A user trait's bucket holds the impls for the head (through
+    /// references) and the blankets, and its read moves when an impl joins
+    /// the bucket or an impl in it changes; an impl for another head does
+    /// not move it.
+    #[test]
+    fn impl_set_buckets_follow_user_trait_impls() {
+        let base = "trait Tr { fn go(&self) -> i64; }\nstruct A;\nstruct B;\nimpl Tr for A { fn go(&self) -> i64 { 1 } }\nfn main() {}\n";
+        let read = |src: &str| -> (usize, Fingerprint) {
+            let mut out = (0, Fingerprint(0));
+            with_program(src, |interner, p| {
+                let mut reads = Reads::new();
+                let tr = p.gx.trait_names[&interner.intern("Tr")];
+                let head = Head::Adt(p.def_of_adt(p.type_names[&interner.intern("A")]));
+                let n = p.impl_set(&mut reads, tr, head).impls.len();
+                out = (n, reads.get(&ReadKey::ImplSet(ImplSetKey { trait_: tr, head })).unwrap().fingerprint);
+            });
+            out
+        };
+        let (n, fp) = read(base);
+        assert_eq!(n, 1);
+        let blanket = base.replace("fn main", "impl<T: Copy> Tr for &T { fn go(&self) -> i64 { 3 } }\nfn main");
+        assert_eq!(read(&blanket).0, 2, "a blanket impl joins every bucket");
+        let other = base.replace("fn main", "impl Tr for B { fn go(&self) -> i64 { 2 } }\nfn main");
+        assert_eq!(read(&other), (1, fp), "an impl for another head keeps the read");
+        let reff = base.replace("impl Tr for A", "impl Tr for &A");
+        assert_ne!(read(&reff).1, fp, "an impl header edit moves the read");
     }
 
     /// A signature edit that keeps every name (so every DefId is the same)

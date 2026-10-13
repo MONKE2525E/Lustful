@@ -2332,7 +2332,10 @@ pub fn collect_reuse<'a>(
     // Top-level fn and method hashes by body block: the parents of fns
     // nested in bodies (`def::nested_fn_ids`).
     let mut top_hashes: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
-    for item in &ast.items {
+    // The trait of each trait impl, by item index, for the trait-system
+    // key (`gen_reuse::trait_key`).
+    let mut impl_traits: HashMap<usize, DefId> = HashMap::default();
+    for (item_idx, item) in ast.items.iter().enumerate() {
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
@@ -2415,7 +2418,10 @@ pub fn collect_reuse<'a>(
                         p.gx.has_generics = true;
                         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                         match generics::resolve_trait_ref(ast, interner, known, &cx, &mut p.tys, &impl_scope, self_pat, tref, imp.span) {
-                            Ok(tr) => Some(tr),
+                            Ok(tr) => {
+                                impl_traits.insert(item_idx, tr.def);
+                                Some(tr)
+                            }
                             Err(d) => {
                                 errs.push(d);
                                 continue;
@@ -2620,6 +2626,11 @@ pub fn collect_reuse<'a>(
     // build, the instance checks in mono) read consts, statics, and assoc
     // consts from these tables, in generic and plain bodies alike.
     eval_const_items(&mut p, &mut errs, &mut def_order.statics);
+    // The generic reuse cache holds while the trait system does (W-PERF);
+    // the key needs the resolved trait of each impl, and the cache serves
+    // the template checks and discovery that `finish_collect` runs.
+    let key = crate::driver::gen_reuse::trait_key(&p, &impl_traits);
+    p.gx.reuse.gate(key);
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);

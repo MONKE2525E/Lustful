@@ -248,8 +248,6 @@ pub(crate) struct Caches {
     /// (the item-level environment and AST fn count they were made
     /// under) holds.
     pub(crate) gen_reuse: super::gen_reuse::GenReuse,
-    /// The trait-system fingerprint of the last collect (see compile.rs).
-    pub(crate) gen_trait: Option<u64>,
     /// The instance key each instance Adt id named in the C made since
     /// the last full regeneration of a generic program. C names Adts by
     /// id, so cached C is reusable only while every id names the same
@@ -341,7 +339,6 @@ impl Session {
                 persistent,
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
-                gen_trait: None,
                 inst_ids: FxMap::default(),
             },
             std_cache: None,

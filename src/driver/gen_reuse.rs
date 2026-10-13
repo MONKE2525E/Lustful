@@ -7,12 +7,15 @@
 // replays the rest in the cold order.
 //
 // A stored result depends on three things, and holds while all three do:
-// - the trait system: trait items, impl items, type alias and const
-//   items, and derive lists (`compile.rs` `trait_system_hash`). The
-//   driver clears the cache when their fingerprint changes (and on a
-//   const fn body edit, a nested static, or a slot renumber; see
-//   `compile.rs`, "generic reuse"). No read records trait selection,
-//   so this is the only key for it.
+// - the trait system: trait items, impl items of lang and foreign
+//   traits and inherent impls, type alias and const items, and derive
+//   lists (`trait_key`). Collect drops every entry when their
+//   fingerprint changes (`GenReuse::gate`), and the driver also drops
+//   them on a const fn body edit, a nested static, or a slot renumber
+//   (`compile.rs`, "generic reuse"). Impls of user traits are not in
+//   the key: selection records an `ImplSet` read of the bucket it
+//   searched (driver/graph.rs), so an added, removed, or edited user
+//   trait impl rechecks only the bodies that read its bucket.
 // - the source: the body and head hash of the AST fn whose text the
 //   body checks, and what the body takes from other checks in this
 //   collect. An instance's source is its template's source plus the
@@ -96,6 +99,12 @@ pub struct GenReuse {
     pub discovery_reused: usize,
     /// Errors this collect's template checks reported (body errors).
     pub template_errors: usize,
+    /// The trait-system key of the last collect that reached its body
+    /// checks (`gate`).
+    trait_key: Option<u64>,
+    /// True unless this collect's trait-system key equals the last one;
+    /// then every entry was dropped, and the driver rechecks every body.
+    pub trait_changed: bool,
 }
 
 impl GenReuse {
@@ -105,8 +114,20 @@ impl GenReuse {
         self.discovery.clear();
     }
 
+    /// Drops every entry when the trait-system key moved since the last
+    /// collect. Collect calls it once the impl index is built, before any
+    /// template check or discovery runs.
+    pub fn gate(&mut self, key: u64) {
+        self.trait_changed = self.trait_key != Some(key);
+        if self.trait_changed {
+            self.clear();
+        }
+        self.trait_key = Some(key);
+    }
+
     /// Resets the per-collect state before a collect runs.
     pub fn begin(&mut self) {
+        self.trait_changed = true;
         self.memo.clear();
         self.tpl_out.clear();
         self.closure_out.clear();
@@ -335,6 +356,44 @@ impl GenReuse {
         };
         self.discovery.insert(p.def_id(f), entry);
     }
+}
+
+/// The trait-system key (see the module docs): trait items (default
+/// bodies included), impl items (headers, method heads, associated
+/// items), type alias and const items (an impl header or a bound can
+/// reach a type through them), and the derive list of each Adt that has
+/// one. An impl of a trait whose impls `ImplSet` reads cover
+/// (`Program::impls_read_covered`; `impl_traits` gives each trait impl's
+/// trait by item index) is left out.
+pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> u64 {
+    use crate::ast::ItemKind;
+    let user_trait = |d: &DefId| p.impls_read_covered(*d);
+    let mut h = FxHasher::default();
+    "trait-system-v2".hash(&mut h);
+    for (i, item) in p.ast.items.iter().enumerate() {
+        let derives = match &item.kind {
+            ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
+            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
+                (0u8, crate::driver::ast_hash::item_hash(p.ast, item)).hash(&mut h);
+                continue;
+            }
+            ItemKind::Struct(s) => (s.name, &s.derives),
+            ItemKind::Enum(e) => (e.name, &e.derives),
+            _ => continue,
+        };
+        // An Adt with no derives adds no impl: a new plain struct
+        // keeps the key.
+        if derives.1.is_empty() {
+            continue;
+        }
+        1u8.hash(&mut h);
+        p.interner.get(derives.0).hash(&mut h);
+        (derives.1.len() as u64).hash(&mut h);
+        for (d, _) in derives.1 {
+            p.interner.get(*d).hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// A check's read set plus a `Sig` read of the checked fn itself: a body

@@ -223,43 +223,6 @@ fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, 
     std::hash::Hasher::finish(&h)
 }
 
-/// The trait-system fingerprint generic reuse keys on (driver/
-/// gen_reuse.rs): every trait item (default bodies included), every
-/// impl item (headers, method heads, associated items), every type
-/// alias and const item (an impl header or bound can reach a type
-/// through them), and the derive list of every Adt that has one, in
-/// item order. Body
-/// checks read trait selection without recording it, so any edit here
-/// drops every stored generic result.
-fn trait_system_hash(ast: &Ast, interner: &Interner) -> u64 {
-    use std::hash::Hash;
-    let mut h = crate::intern::FxHasher::default();
-    "trait-system-v1".hash(&mut h);
-    for item in &ast.items {
-        let derives = match &item.kind {
-            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
-                (0u8, super::ast_hash::item_hash(ast, item)).hash(&mut h);
-                continue;
-            }
-            ItemKind::Struct(s) => (s.name, &s.derives),
-            ItemKind::Enum(e) => (e.name, &e.derives),
-            _ => continue,
-        };
-        // An Adt with no derives adds no impl: a new plain struct
-        // keeps the key.
-        if derives.1.is_empty() {
-            continue;
-        }
-        1u8.hash(&mut h);
-        interner.get(derives.0).hash(&mut h);
-        (derives.1.len() as u64).hash(&mut h);
-        for (d, _) in derives.1 {
-            interner.get(*d).hash(&mut h);
-        }
-    }
-    std::hash::Hasher::finish(&h)
-}
-
 /// Empties one slot like a dead fn: no C, no reads, no IR.
 fn wipe_slot(caches: &mut Caches, s: usize) {
     caches.out[s] = FnOut::default();
@@ -2405,31 +2368,25 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
     // Generic reuse (driver/gen_reuse.rs, W-PERF): template checks and
     // instance discovery of a generic program are stored per stable def.
-    // They hold while the trait system holds (`trait_system_hash`); an
-    // entry made under another item-level environment (item-scan hash
-    // and AST fn count) replays its recorded reads first. Anything else
-    // drops them: a const fn body edit (const values move), a nested
-    // static (its index can move), or a slot compaction (cached C
-    // carries slot numbers). The source key of an AST fn is its body
-    // and head hash.
+    // They hold while the trait system holds (collect checks
+    // `gen_reuse::trait_key` before its body checks run); an entry made
+    // under another item-level environment (item-scan hash and AST fn
+    // count) replays its recorded reads first. Anything else drops them:
+    // a const fn body edit (const values move), a nested static (its
+    // index can move), or a slot compaction (cached C carries slot
+    // numbers). The source key of an AST fn is its body and head hash.
     let gen_env = front.env_hash.map(|env| {
         let mut h = crate::intern::FxHasher::default();
         std::hash::Hash::hash(&(env, fn_count), &mut h);
         std::hash::Hasher::finish(&h)
     });
-    let gen_trait = trait_system_hash(&front.ast, &front.interner);
     let nested_static = front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
-    let gen_ok = caches.persistent
-        && gen_env.is_some()
-        && caches.gen_trait == Some(gen_trait)
-        && !const_fn_changed
-        && !nested_static
-        && !front.slots_renumbered;
-    if !gen_ok {
+    // The trait-system half of this joins after collect (`gen_ok`).
+    let gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !nested_static && !front.slots_renumbered;
+    if !gen_ok_here {
         caches.gen_reuse.clear();
     }
     front.slots_renumbered = false;
-    caches.gen_trait = Some(gen_trait);
     caches.gen_reuse.on = caches.persistent && gen_env.is_some() && !nested_static;
     caches.gen_reuse.env = gen_env.unwrap_or(0);
     caches.gen_reuse.ast_src = (0..fn_count)
@@ -2465,6 +2422,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return errors(&mut ds, &map, &src, req);
         }
     };
+    // Every body of a generic program rechecks when the trait system
+    // moved too (collect dropped the cache then).
+    let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed;
     // Persist the def order when collect grew it, like the slot
     // manifest above: the next daemon must number defs as this
     // one did or the disk objects' indices move under it.

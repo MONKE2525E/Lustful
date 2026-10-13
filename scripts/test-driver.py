@@ -60,6 +60,8 @@
 #      shadows a name an unchanged nested fn calls rechecks it.
 #  19. stable instance Adt ids: a new instance first in discovery and a
 #      new struct regenerate only the edited fn; a restart builds no unit.
+#  20. user trait impl edits leave the full generic path (ImplSet reads);
+#      a lang trait impl edit still takes it.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -842,6 +844,62 @@ def case_stable_instance_ids():
     d.kill()
 
 
+def case_user_trait_impl_edits():
+    # 20. Impls of user traits are outside the trait-system key: selection
+    # records an `ImplSet` read of the bucket it searched. An added unused
+    # impl rechecks no template and discovers almost nothing again; a used
+    # one, a removed one, and an impl that starts to override a default
+    # method answer as cold. A lang trait impl edit still takes the full
+    # generic path (every template check runs again).
+    work = tempfile.mkdtemp(prefix="lust-driver-user-impls-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    head = ("trait Tr {\n    fn go(&self) -> i64;\n    fn dflt(&self) -> i64 { 100 }\n}\n"
+            "struct A;\nstruct B;\nimpl Tr for A {\n    fn go(&self) -> i64 { 1 }\n}\n"
+            "fn generic<T: Tr>(t: &T) -> i64 { t.go() + t.dflt() }\n"
+            "fn wrap<T: Copy>(t: T) -> (T, T) { (t, t) }\n")
+    plain = "".join(f"fn p{i}(x: i64) -> i64 {{ wrap(x + {i}).0 }}\n" for i in range(30))
+    main = "fn main() {\n    println!(\"{} {}\", generic(&A), " + " + ".join(f"p{i}(1)" for i in range(30)) + ");\n    //MAIN\n}\n"
+    base = head + plain + main
+    impl_b = "impl Tr for B {\n    fn go(&self) -> i64 { 2 }\n}\n"
+    steps = [
+        ("base", base, None),
+        ("unused user trait impl", base + impl_b, "few"),
+        ("the new impl in use", (base + impl_b).replace("    //MAIN\n", "    println!(\"{}\", generic(&B));\n"), None),
+        ("default method overridden", (base + impl_b).replace("fn go(&self) -> i64 { 2 }\n}", "fn go(&self) -> i64 { 2 }\n    fn dflt(&self) -> i64 { 7 }\n}").replace("    //MAIN\n", "    println!(\"{}\", generic(&B));\n"), None),
+        ("used impl removed", base.replace("impl Tr for A {\n    fn go(&self) -> i64 { 1 }\n}\n", ""), None),
+        ("back", base, None),
+        ("lang trait impl", base + "impl Clone for B {\n    fn clone(&self) -> B { B }\n}\n", "full"),
+    ]
+
+    def cold(text):
+        cw = tempfile.mkdtemp(prefix="lust-driver-user-impls-cold-")
+        csrc = os.path.join(cw, "x.rs")
+        open(csrc, "w").write(text)
+        env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
+        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
+        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
+        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True) if b.returncode == 0 else None
+        shutil.rmtree(cw, ignore_errors=True)
+        return (c.returncode, r.stdout if r else None)
+
+    d.start()
+    for name, text, expect in steps:
+        open(src, "w").write(text)
+        c = d.run(["check", src], expect=None)
+        st = parse_stats(c.stderr)
+        b = d.run(["build", src, "-o", out], expect=None)
+        r = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+        check(f"user trait impls, {name}: warm equals cold", (c.returncode, r.stdout if r else None) == cold(text), c.stderr[-200:])
+        if expect == "few":
+            check(f"user trait impls, {name}: no template check, little discovery",
+                  st.get("templates") == 0 and st.get("discovered", 99) <= 2 and st.get("rechecked", 99) <= 2, str(st))
+        elif expect == "full":
+            check(f"user trait impls, {name}: full generic path", st.get("templates", 0) > 0, str(st))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -861,6 +919,7 @@ def main():
     case_instance_calls_moved_slot()
     case_nested_identity_and_shadowing()
     case_stable_instance_ids()
+    case_user_trait_impl_edits()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
