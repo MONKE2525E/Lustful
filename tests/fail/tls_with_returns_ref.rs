@@ -1,6 +1,6 @@
-// expect: L0820
+// expect: L0733
 // The closure's reference cannot leave `with` (rustc: lifetime may not
-// live long enough); lust rejects reference-returning closures.
+// live long enough): the closure argument is higher-ranked.
 thread_local! {
     static S: Vec<i32> = Vec::new();
 }
