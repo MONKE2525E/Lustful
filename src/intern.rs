@@ -100,19 +100,40 @@ fn slot(i: usize) -> (usize, usize) {
     (b, i - FIRST * ((1 << b) - 1))
 }
 
+/// Strings the parser and the resolver intern by literal on hot paths
+/// (`_` patterns, path keywords): interned first, and then answered from
+/// `Interner::fixed` without a lock. Before, every thread of a parallel
+/// parse or rewrite took the same few shard locks for them.
+const FIXED: [&str; 8] = ["_", "::", "crate", "self", "super", "Self", "doc", "macro_rules"];
+
 /// A `Sym` packs `(index in shard << SHARD_BITS) | shard`.
 pub struct Interner {
     shards: Vec<Shard>,
+    fixed: [Sym; FIXED.len()],
 }
 
 impl Default for Interner {
     fn default() -> Interner {
-        Interner { shards: (0..SHARDS).map(|_| Shard::default()).collect() }
+        let mut i = Interner { shards: (0..SHARDS).map(|_| Shard::default()).collect(), fixed: [Sym(0); FIXED.len()] };
+        for (k, s) in FIXED.iter().enumerate() {
+            i.fixed[k] = i.intern_locked(s);
+        }
+        i
     }
 }
 
 impl Interner {
     pub fn intern(&self, s: &str) -> Sym {
+        if s.len() <= 11
+            && let Some(k) = FIXED.iter().position(|f| *f == s)
+        {
+            return self.fixed[k];
+        }
+        self.intern_locked(s)
+    }
+
+    /// `intern` through the shard lock.
+    fn intern_locked(&self, s: &str) -> Sym {
         let mut h = FxHasher::default();
         s.hash(&mut h);
         let shard = (h.finish() >> 58) as usize & (SHARDS - 1);
@@ -156,6 +177,11 @@ mod tests {
         for (n, &s) in syms.iter().enumerate() {
             assert_eq!(i.get(s), format!("name{n}"));
             assert_eq!(i.intern(&format!("name{n}")), s);
+        }
+        // Fixed strings answer without the lock, and agree with a locked lookup.
+        for f in FIXED {
+            assert_eq!(i.intern(f), i.intern_locked(f));
+            assert_eq!(i.get(i.intern(f)), f);
         }
     }
 }
