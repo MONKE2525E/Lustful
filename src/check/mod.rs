@@ -5746,21 +5746,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // Associated consts of inherent impls (Self::A, Type::A) read
         // as their evaluated value, like free consts. Inherent items
-        // shadow trait items, as in rustc. The value is baked into this
-        // body, so the const's `Sig` read (its fingerprint folds the
-        // value) is recorded, as `const_item_pat` does.
+        // shadow trait items, as in rustc. Same-name consts of
+        // disjoint impls pick by the written Self type instance.
+        // The value is baked into this body, so the const's
+        // `Sig` read (its fingerprint folds the value) is
+        // recorded, as `const_item_pat` does.
+        let assoc_base = if segs.len() == 2 { self.assoc_const_base(segs) } else { None };
         if let Some((adt, item)) = self.assoc_const_key(segs)
-            && let Some(idx) = p.inherent_assoc_const(adt, item)
+            && let Some(picked) = assoc_base.and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
-            if let Some(&def) = p.const_defs.get(idx as usize) {
-                let _ = p.sig_of(&mut self.out.reads, def);
-            }
-            self.check_assoc_vis(adt, item, "associated constant", span);
-            let c = &p.consts[idx as usize];
-            let (v, t) = (c.value.clone(), c.ty);
-            let i = self.ei(e);
-            self.out.const_exprs[i] = Some(v);
-            return self.deep(t);
+            return match picked {
+                Some(idx) => {
+                    if let Some(&def) = p.const_defs.get(idx as usize) {
+                        let _ = p.sig_of(&mut self.out.reads, def);
+                    }
+                    self.check_assoc_vis(adt, item, "associated constant", span);
+                    let c = &p.consts[idx as usize];
+                    let (v, t) = (c.value.clone(), c.ty);
+                    let i = self.ei(e);
+                    self.out.const_exprs[i] = Some(v);
+                    self.deep(t)
+                }
+                None => ERROR,
+            };
         }
         // Associated consts of traits (`Type::C`, `T::C`,
         // `Self::C`): the value when an impl is confirmed, the
@@ -5768,7 +5776,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if segs.len() == 2
             && (self.replay_pick(e).is_some()
                 || !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item)))
-            && let Some(base) = self.assoc_const_base(segs)
+            && let Some(base) = assoc_base
             && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, None, segs[1].name, span)
         {
             if let Some(idx) = idx {
@@ -10032,10 +10040,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         if let Some((adt, item)) = self.assoc_const_key(segs)
-            && let Some(idx) = p.inherent_assoc_const(adt, item)
+            && let Some(picked) = self.assoc_const_base(segs).and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
-            self.check_assoc_vis(adt, item, "associated constant", span);
-            self.const_item_pat(pi, idx, t, span, in_match);
+            if let Some(idx) = picked {
+                self.check_assoc_vis(adt, item, "associated constant", span);
+                self.const_item_pat(pi, idx, t, span, in_match);
+            }
             return true;
         }
         // A trait associated const pattern on a concrete type
@@ -10081,19 +10091,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         if hint.is_none()
             && let Some(adt) = self.tys.local_adt(self.resolve(base))
-            && let Some(idx) = p.inherent_assoc_const(adt, name)
+            && let Some(picked) = self.inherent_assoc_pick(adt, name, base, Some(span))
         {
-            // As on a plain `Type::C` path: the value is baked in (record
-            // its `Sig` read) and the item's visibility applies.
-            if let Some(&def) = p.const_defs.get(idx as usize) {
-                let _ = p.sig_of(&mut self.out.reads, def);
-            }
-            self.check_assoc_vis(adt, name, "associated constant", span);
-            let c = &p.consts[idx as usize];
-            let (v, t) = (c.value.clone(), c.ty);
-            let i = self.ei(e);
-            self.out.const_exprs[i] = Some(v);
-            return self.deep(t);
+            return match picked {
+                Some(idx) => {
+                    // As on a plain `Type::C` path: the value is baked in
+                    // (record its `Sig` read) and visibility applies.
+                    if let Some(&def) = p.const_defs.get(idx as usize) {
+                        let _ = p.sig_of(&mut self.out.reads, def);
+                    }
+                    self.check_assoc_vis(adt, name, "associated constant", span);
+                    let c = &p.consts[idx as usize];
+                    let (v, t) = (c.value.clone(), c.ty);
+                    let i = self.ei(e);
+                    self.out.const_exprs[i] = Some(v);
+                    self.deep(t)
+                }
+                None => ERROR,
+            };
         }
         let blocked = hint.is_none()
             && self.replay_pick(e).is_none()
@@ -10391,6 +10406,73 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }?;
         Some((adt, item))
+    }
+
+    /// The pick among same-name inherent associated consts for
+    /// a written Self type instance, exactly as written
+    /// (`assoc_const_base`): an impl applies when its Self
+    /// pattern unifies with the instance under fresh impl
+    /// arguments, probed with rollback so a rejected candidate
+    /// binds nothing. The one hit replays for real (its
+    /// predicates become obligations); several hits report the
+    /// ambiguity here and act as no pick.
+    /// `None` when no candidate applies (the caller keeps
+    /// looking), `Some(None)` when several apply (reported
+    /// here; the caller must not fall through to a trait item).
+    fn inherent_assoc_pick(&mut self, adt: AdtId, item: Sym, written: Ty, span: Option<Span>) -> Option<Option<u32>> {
+        let p = self.p;
+        let cands: Vec<u32> = p.inherent_assoc_consts(adt, item).to_vec();
+        if cands.is_empty() {
+            return None;
+        }
+        let mut hits: Vec<(u32, Option<(Ty, Generics, Span)>)> = Vec::new();
+        for &idx in &cands {
+            let entry = p.gx.inherent_const_self.get(&idx).cloned();
+            let applies = match &entry {
+                None => true,
+                Some((pat, gens, _)) => {
+                    let snap = self.snapshot_vars();
+                    let obl = self.obl_len();
+                    let args = self.fresh_args(gens);
+                    let cand = subst(&mut self.tys, *pat, &args);
+                    let hit = self.unify(cand, written);
+                    self.rollback_vars(snap);
+                    self.obl_truncate(obl);
+                    hit
+                }
+            };
+            if applies {
+                hits.push((idx, entry));
+            }
+        }
+        match hits.len() {
+            0 => None,
+            1 => {
+                let (idx, entry) = hits.pop().unwrap();
+                if let Some((pat, gens, _)) = entry {
+                    let args = self.fresh_args(&gens);
+                    let cand = subst(&mut self.tys, pat, &args);
+                    if self.unify(cand, written)
+                        && let Some(span) = span
+                    {
+                        let preds = gens.predicates.clone();
+                        self.push_predicates(&preds, &args, span);
+                    }
+                }
+                Some(Some(idx))
+            }
+            _ => {
+                if let Some(span) = span {
+                    self.err(
+                        "L0110",
+                        span,
+                        format!("multiple associated constants named `{}` apply here", self.name(item)),
+                        "Write the type arguments so only one impl applies, for example `Type::<Arg>::CONST`.",
+                    );
+                }
+                Some(None)
+            }
+        }
     }
 
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
@@ -13480,10 +13562,10 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     }
     fn assoc_const_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
         // An inherent associated const read inside body const
-        // evaluation, through the same key as `path_expr`.
+        // evaluation, through the same pick as `path_expr`.
         let p = self.cx.p;
         let (adt, item) = self.cx.assoc_const_key(segs)?;
-        let idx = p.inherent_assoc_const(adt, item)?;
+        let idx = self.cx.assoc_const_base(segs).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None))??;
         let out = {
             let c = &p.consts[idx as usize];
             (c.value.clone(), c.ty)

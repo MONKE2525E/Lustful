@@ -124,10 +124,12 @@ pub struct Program<'a> {
     pub const_defs: Vec<DefId>,
     /// Each static item's stable identity, in `statics` order.
     pub static_defs: Vec<DefId>,
-    /// Associated consts of inherent impls: (Adt, name) to an index
-    /// into `consts`. They are const items like free consts, but not
-    /// in `const_names`: a plain name must never find them.
-    pub assoc_const_names: HashMap<(AdtId, Sym), u32>,
+    /// Associated consts of inherent impls: (Adt, name) to the
+    /// indexes into `consts` of every impl that defines the name
+    /// (disjoint Self patterns may share one). They are const
+    /// items like free consts, but not in `const_names`: a plain
+    /// name must never find them.
+    pub assoc_const_names: HashMap<(AdtId, Sym), Vec<u32>>,
     /// Associated const values of trait impls: (impl def, assoc
     /// def) to an index into `consts`. Filled with the other const
     /// tables in `eval_const_items`, before template checks run.
@@ -258,18 +260,20 @@ impl<'a> Program<'a> {
     pub fn const_by_def(&self, def: DefId) -> Option<u32> {
         self.const_defs.iter().position(|&d| d == def).map(|i| i as u32)
     }
-    /// The index into `consts` of an inherent associated const.
+    /// The indexes into `consts` of the inherent associated
+    /// consts with this name: one per impl that defines it.
     /// Materialized Adt instances answer through their template:
     /// the value is evaluated once per impl (an initializer that
     /// names the impl's own parameters fails evaluation and never
     /// reaches the table, so one value serves every instance).
-    pub fn inherent_assoc_const(&self, adt: AdtId, name: Sym) -> Option<u32> {
-        if let Some(&i) = self.assoc_const_names.get(&(adt, name)) {
-            return Some(i);
+    /// The caller picks by the written Self type.
+    pub fn inherent_assoc_consts(&self, adt: AdtId, name: Sym) -> &[u32] {
+        if let Some(v) = self.assoc_const_names.get(&(adt, name)) {
+            return v;
         }
-        let def = self.defs.def_of_adt(adt)?;
-        let template = self.defs.local_adt(def)?;
-        self.assoc_const_names.get(&(template, name)).copied()
+        let Some(def) = self.defs.def_of_adt(adt) else { return &[] };
+        let Some(template) = self.defs.local_adt(def) else { return &[] };
+        self.assoc_const_names.get(&(template, name)).map_or(&[], |v| v.as_slice())
     }
     /// The index of the static item with this def, if this crate defines it.
     pub fn static_by_def(&self, def: DefId) -> Option<u32> {
@@ -2457,6 +2461,7 @@ pub fn collect_reuse<'a>(
                 }
                 if trait_ref.is_none() {
                     p.gx.wf_headers.push((self_pat, impl_generics.clone(), imp.span));
+                    p.gx.inherent_impl_self.insert(impl_def, (self_pat, impl_generics.clone()));
                 }
                 // The impl's trait is an assoc source on the Self
                 // pattern inside its method signatures.
@@ -2616,8 +2621,9 @@ pub fn collect_reuse<'a>(
 
 /// Where an associated const's evaluated value lands.
 enum PendingAssoc {
-    /// An inherent impl const: `assoc_const_names` under its Adt.
-    Inherent { owner: AdtId, impl_def: DefId },
+    /// An inherent impl const: `assoc_const_names` under its
+    /// Adt, with the impl's Self pattern for use-site picks.
+    Inherent { owner: AdtId, impl_def: DefId, self_pat: Ty, generics: Generics },
     /// A trait impl const: `impl_assoc_consts` under its impl.
     TraitImpl { impl_def: DefId, assoc: DefId },
     /// A trait default: `trait_assoc_const_values`.
@@ -2713,7 +2719,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
     // Associated consts evaluate in the same pending list, so a
     // free const can read an inherent associated const (and back)
     // with the same cycle detection as free items.
-    let mut assoc_by_key: HashMap<(Sym, Sym), usize> = HashMap::default();
+    let mut assoc_by_key: HashMap<(Sym, Sym), Vec<usize>> = HashMap::default();
     register_assoc_consts(p, errs, &mut pending, &mut assoc_by_key);
     if pending.is_empty() {
         return;
@@ -2746,7 +2752,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         static_count = nested;
     }
     let n = pending.len();
-    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, errs };
+    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, errs };
     for i in 0..n {
         cx.eval_pending(i);
     }
@@ -2770,8 +2776,9 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             p.const_defs.push(def);
             p.consts.push(ConstItem { name, ty: item.ty, value });
             match assoc {
-                PendingAssoc::Inherent { owner, .. } => {
-                    p.assoc_const_names.insert((owner, name), idx);
+                PendingAssoc::Inherent { owner, self_pat, generics, .. } => {
+                    p.assoc_const_names.entry((owner, name)).or_default().push(idx);
+                    p.gx.inherent_const_self.insert(idx, (self_pat, generics, item.span));
                 }
                 PendingAssoc::TraitImpl { impl_def, assoc } => {
                     p.impl_assoc_consts.insert((impl_def, assoc), idx);
@@ -2847,11 +2854,11 @@ fn register_assoc_consts<'a>(
     p: &mut Program<'a>,
     errs: &mut Vec<Diag>,
     pending: &mut Vec<(PendingConst, PendingState)>,
-    assoc_by_key: &mut HashMap<(Sym, Sym), usize>,
+    assoc_by_key: &mut HashMap<(Sym, Sym), Vec<usize>>,
 ) {
     let ast = p.ast;
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
-    let mut inherent_seen: Vec<(AdtId, Sym)> = Vec::new();
+    let mut inherent_seen: Vec<(DefId, Sym)> = Vec::new();
     for item in &ast.items {
         let ItemKind::Impl(imp) = &item.kind else { continue };
         // The fn pass consumes one ordinal per impl header before
@@ -2927,8 +2934,13 @@ fn register_assoc_consts<'a>(
         }
         let Some(owner) = owner else { continue };
         let self_ty = p.tys.adt_ty(owner);
+        // Disjoint impls may define the same name (the overlap
+        // check in `finish_collect` rejects the ones that can
+        // both apply, methods included); two in one impl block
+        // cannot.
+        let (self_pat, impl_generics) = p.gx.inherent_impl_self.get(&impl_def).cloned().unwrap_or((self_ty, Generics::default()));
         for c in &imp.consts {
-            if inherent_seen.contains(&(owner, c.name)) || p.methods.contains_key(&(owner, c.name)) {
+            if inherent_seen.contains(&(impl_def, c.name)) {
                 errs.push(Diag::new(
                     "L0106",
                     c.name_span,
@@ -2948,8 +2960,8 @@ fn register_assoc_consts<'a>(
                 errs.push(not_yet("L0632", c.name_span, "associated consts without a value"));
                 continue;
             };
-            inherent_seen.push((owner, c.name));
-            assoc_by_key.insert((p.adts[owner.0 as usize].name, c.name), pending.len());
+            inherent_seen.push((impl_def, c.name));
+            assoc_by_key.entry((p.adts[owner.0 as usize].name, c.name)).or_default().push(pending.len());
             pending.push((
                 PendingConst {
                     name: Some(c.name),
@@ -2959,7 +2971,7 @@ fn register_assoc_consts<'a>(
                     is_static: None,
                     static_idx: 0,
                     stmt_idx: None,
-                    assoc: Some(PendingAssoc::Inherent { owner, impl_def }),
+                    assoc: Some(PendingAssoc::Inherent { owner, impl_def, self_pat, generics: impl_generics.clone() }),
                 },
                 PendingState::Todo,
             ));
@@ -2999,6 +3011,65 @@ fn register_assoc_consts<'a>(
     }
 }
 
+/// True when an impl Self pattern matches a written instance,
+/// binding the impl's parameters to the parts they name. One
+/// direction only (the pattern's parameters are variables, the
+/// written type is ground), for const evaluation picks before
+/// the checker exists.
+fn self_pat_matches(tys: &crate::ty::GlobalTys, pat: Ty, target: Ty, map: &mut Vec<(u32, Ty)>, cmap: &mut Vec<(u32, crate::ty::ConstId)>) -> bool {
+    use crate::ty::TyIntern;
+    if let TyKind::Param(p) = tys.kind(pat) {
+        return match map.iter().find(|&&(i, _)| i == p.0) {
+            Some(&(_, t)) => t == target,
+            None => {
+                map.push((p.0, target));
+                true
+            }
+        };
+    }
+    let mut args_match = |a: crate::ty::ArgsId, b: crate::ty::ArgsId, map: &mut Vec<(u32, Ty)>, cmap: &mut Vec<(u32, crate::ty::ConstId)>| {
+        let (xs, ys) = (tys.args(a), tys.args(b));
+        xs.len() == ys.len()
+            && std::iter::zip(xs.iter(), ys.iter()).all(|(x, y)| match (x, y) {
+                (crate::ty::GenericArg::Ty(x), crate::ty::GenericArg::Ty(y)) => self_pat_matches(tys, *x, *y, map, cmap),
+                (crate::ty::GenericArg::Const(x), crate::ty::GenericArg::Const(y)) => match tys.const_kind(*x) {
+                    crate::ty::ConstKind::Param(i) => match cmap.iter().find(|&&(j, _)| j == i) {
+                        Some(&(_, c)) => c == *y,
+                        None => {
+                            cmap.push((i, *y));
+                            true
+                        }
+                    },
+                    _ => x == y,
+                },
+                _ => x == y,
+            })
+    };
+    match (tys.kind(pat), tys.kind(target)) {
+        (TyKind::Adt(d, a), TyKind::Adt(e, b)) => d == e && args_match(a, b, map, cmap),
+        (TyKind::Ref(_, m, x), TyKind::Ref(_, n, y)) => m == n && self_pat_matches(tys, x, y, map, cmap),
+        (TyKind::RawPtr(m, x), TyKind::RawPtr(n, y)) => m == n && self_pat_matches(tys, x, y, map, cmap),
+        (TyKind::Slice(x), TyKind::Slice(y)) => self_pat_matches(tys, x, y, map, cmap),
+        (TyKind::Array(x, n), TyKind::Array(y, m)) => {
+            (match tys.const_kind(n) {
+                crate::ty::ConstKind::Param(i) => match cmap.iter().find(|&&(j, _)| j == i) {
+                    Some(&(_, c)) => c == m,
+                    None => {
+                        cmap.push((i, m));
+                        true
+                    }
+                },
+                _ => n == m,
+            }) && self_pat_matches(tys, x, y, map, cmap)
+        }
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            let (xs, ys) = (tys.tys_of(x), tys.tys_of(y));
+            xs.len() == ys.len() && std::iter::zip(xs.iter(), ys.iter()).all(|(a, b)| self_pat_matches(tys, *a, *b, map, cmap))
+        }
+        _ => pat == target,
+    }
+}
+
 /// The const evaluator's context over the collected tables.
 struct CollectCx<'x, 'a> {
     p: &'x mut Program<'a>,
@@ -3006,14 +3077,60 @@ struct CollectCx<'x, 'a> {
     by_name: HashMap<Sym, usize>,
     /// Pending inherent associated consts by (flat type name,
     /// const name), for `Type::CONST` reads in initializers.
-    assoc_by_key: HashMap<(Sym, Sym), usize>,
+    assoc_by_key: HashMap<(Sym, Sym), Vec<usize>>,
     /// The flat type name `Self` means while an inherent
     /// associated const evaluates (its owning Adt).
     self_name: Option<Sym>,
+    /// The Self pattern of that same inherent impl, so a
+    /// `Self::CONST` read picks this impl's const among
+    /// same-name consts of disjoint impls.
+    self_pat: Option<Ty>,
     errs: &'x mut Vec<Diag>,
 }
 
 impl CollectCx<'_, '_> {
+    /// The type instance a written `Type<...>` path head names,
+    /// for picking among same-name inherent associated consts.
+    /// `None` when the arguments are not all written (the pick
+    /// is then ambiguous in a const context too).
+    fn written_instance(&mut self, ty_name: Sym, seg: &ast::PathSeg) -> Option<Ty> {
+        let adt = self.p.type_names.get(&ty_name).copied()?;
+        let generics = self.p.gx.adt_generics.get(adt.0 as usize).cloned().unwrap_or_default();
+        let n_args = generics.params.iter().filter(|p| p.kind != ParamKind::Lifetime).count();
+        if n_args == 0 {
+            return Some(self.p.tys.adt_ty(adt));
+        }
+        let ast::GenericArgs::Angle(written) = &seg.args else { return None };
+        let mut args: Vec<crate::ty::GenericArg> = Vec::new();
+        for a in written {
+            match a {
+                ast::GenericArg::Type(t) => {
+                    let cx = self.p.gx.resolve_cx(&self.p.type_names, &self.p.aliases);
+                    let ty = crate::check::generics::resolve_scoped(
+                        self.p.ast,
+                        self.p.interner,
+                        self.p.known,
+                        &cx,
+                        &mut self.p.tys,
+                        *t,
+                        &crate::check::generics::Scope::default(),
+                    )
+                    .ok()?;
+                    args.push(crate::ty::GenericArg::Ty(ty));
+                }
+                ast::GenericArg::Const(e) => {
+                    let v = eval_array_len(self.p.ast, self.p.interner, self.p.known, *e)?;
+                    args.push(crate::ty::GenericArg::Const(self.p.tys.intern_const(crate::ty::ConstKind::Int(v))));
+                }
+                _ => {}
+            }
+        }
+        if args.len() != n_args {
+            return None;
+        }
+        Some(self.p.tys.mk_adt(self.p.def_of_adt(adt), &args))
+    }
+
     /// Evaluates one pending item, on demand from other items.
     fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
         match &self.pending[idx].1 {
@@ -3041,12 +3158,14 @@ impl CollectCx<'_, '_> {
         // initializer names its owning Adt; every other item
         // evaluates with no `Self`.
         let prev_self = self.self_name;
-        self.self_name = match self.pending[idx].0.assoc {
-            Some(PendingAssoc::Inherent { owner, .. }) => Some(self.p.adts[owner.0 as usize].name),
-            _ => None,
+        let prev_pat = self.self_pat;
+        (self.self_name, self.self_pat) = match self.pending[idx].0.assoc {
+            Some(PendingAssoc::Inherent { owner, self_pat, .. }) => (Some(self.p.adts[owner.0 as usize].name), Some(self_pat)),
+            _ => (None, None),
         };
         let evaluated = crate::ty::consteval::eval(self, expr, Some(ty));
         self.self_name = prev_self;
+        self.self_pat = prev_pat;
         match evaluated {
             Ok((v, vt)) => {
                 if self.pending[idx].0.is_static.is_some() && !static_form(self.p, &v, ty) {
@@ -3182,13 +3301,35 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         // earlier segments are module anchors the resolver has
         // already folded into the flat type name where it can.
         let [.., ty_seg, item_seg] = segs else { return None };
-        let ty_name = if ty_seg.name == self.p.known.self_type { self.self_name? } else { ty_seg.name };
-        if let Some(&i) = self.assoc_by_key.get(&(ty_name, item_seg.name)) {
+        let self_form = ty_seg.name == self.p.known.self_type;
+        let ty_name = if self_form { self.self_name? } else { ty_seg.name };
+        if let Some(cands) = self.assoc_by_key.get(&(ty_name, item_seg.name)).cloned() {
+            // Several disjoint impls may define the name: pick
+            // by the written instance (`Self` is the evaluating
+            // impl's own pattern), exactly one must match.
+            let pick = if cands.len() == 1 {
+                Some(cands[0])
+            } else {
+                let written = if self_form { self.self_pat } else { self.written_instance(ty_name, ty_seg) };
+                let written = written?;
+                let hits: Vec<usize> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&i| match self.pending[i].0.assoc {
+                        Some(PendingAssoc::Inherent { self_pat, .. }) => {
+                            self_pat_matches(&self.p.tys, self_pat, written, &mut Vec::new(), &mut Vec::new())
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                if hits.len() == 1 { Some(hits[0]) } else { None }
+            };
+            let i = pick?;
             let ty = self.pending[i].0.ty;
             return self.eval_pending(i).map(|v| (v, ty));
         }
         let adt = self.p.type_names.get(&ty_name).copied()?;
-        let idx = self.p.inherent_assoc_const(adt, item_seg.name)?;
+        let &[idx] = self.p.inherent_assoc_consts(adt, item_seg.name) else { return None };
         let c = &self.p.consts[idx as usize];
         Some((c.value.clone(), c.ty))
     }

@@ -2437,6 +2437,14 @@ pub struct GenTables<'a> {
     /// Each inherent method's impl Self pattern and impl generics,
     /// for the inherent overlap check in `finish_collect`.
     pub inherent_self_pats: FxMap<LocalDefId, (Ty, Generics)>,
+    /// Each inherent impl's Self pattern and generics, by impl
+    /// def: associated const registration reads them back (the
+    /// const tables build after the fn pass).
+    pub inherent_impl_self: FxMap<DefId, (Ty, Generics)>,
+    /// Each inherent associated const's impl Self pattern, impl
+    /// generics, and item span, by const index: use sites pick
+    /// among same-name consts by their written Self type.
+    pub inherent_const_self: FxMap<u32, (Ty, Generics, Span)>,
     /// Trait defs that declare a method of this name.
     pub traits_by_method: FxMap<Sym, Vec<DefId>>,
     /// The `Drop::drop` instance to call for one concrete Adt,
@@ -2544,6 +2552,8 @@ impl Default for GenTables<'_> {
             instance_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
             inherent_self_pats: FxMap::default(),
+            inherent_impl_self: FxMap::default(),
+            inherent_const_self: FxMap::default(),
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),
@@ -6198,6 +6208,42 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
             "L0106",
             info.def.name_span,
             format!("`{}` is defined more than once", p.display_name(info.name)),
+            "Rename one of the definitions, or narrow one impl's Self type so they cannot both apply.",
+        ));
+    }
+    // Inherent associated consts share the rule, against each
+    // other and against methods of the same name.
+    let mut const_dups: Vec<u32> = Vec::new();
+    for ((adt, name), idxs) in p.assoc_const_names.clone() {
+        let adt_def = p.gx.adt_info.get(adt.0 as usize).map(|i| i.0);
+        let methods: Vec<LocalDefId> =
+            adt_def.and_then(|d| p.gx.inherent_methods.get(&(d, name))).cloned().unwrap_or_default();
+        for (n, &idx) in idxs.iter().enumerate() {
+            let Some((pat, gens, _)) = p.gx.inherent_const_self.get(&idx).cloned() else { continue };
+            let vs_const = idxs[..n].iter().any(|&other| {
+                p.gx.inherent_const_self
+                    .get(&other)
+                    .is_some_and(|(opat, ogen, _)| p.gx.index.inherent_pair_overlaps(&mut p.tys, *opat, ogen, pat, &gens, &[], &by_construction, &is_local))
+            });
+            let vs_method = methods.iter().any(|&m| {
+                p.gx.inherent_self_pats
+                    .get(&m)
+                    .is_some_and(|(mpat, mgen)| p.gx.index.inherent_pair_overlaps(&mut p.tys, *mpat, mgen, pat, &gens, &[], &by_construction, &is_local))
+            });
+            if vs_const || vs_method {
+                const_dups.push(idx);
+            }
+        }
+    }
+    const_dups.sort_unstable();
+    const_dups.dedup();
+    for idx in const_dups {
+        let c = &p.consts[idx as usize];
+        let span = p.gx.inherent_const_self.get(&idx).map_or(Span::default(), |&(_, _, s)| s);
+        errs.push(Diag::new(
+            "L0106",
+            span,
+            format!("`{}` is defined more than once", p.display_name(c.name)),
             "Rename one of the definitions, or narrow one impl's Self type so they cannot both apply.",
         ));
     }
