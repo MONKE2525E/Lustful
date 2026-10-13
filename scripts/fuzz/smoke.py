@@ -466,6 +466,78 @@ fn grown() -> i64 { 1 }
         check("field made public again: warm check passes (fx-priv)",
               rc3 == 0, f"rc3={rc3}")
 
+        # 16. Regression (fx-vis-fp): a visibility-only edit must reach the
+        # warm answer for plain (non-generic) readers. Each kind flips one
+        # visibility and walks pub -> narrowed -> pub -> narrowed (or the
+        # reverse, `start_narrow`) under the warm daemon; every step must
+        # give the cold answer (rc and first error code). Narrowed must
+        # reject warm; widened must accept warm. The body checks record a
+        # `Sig(adt)` read whose fingerprint covers member visibility.
+        vis_pa = ('pub struct S { pub x: i32, pub y: i32 }\n'
+                  'impl S { pub fn new() -> S { S { x: 1, y: 2 } } pub fn get(&self) -> i32 { self.x } }\n'
+                  'pub fn make() -> S { S::new() }\n'
+                  'pub struct T(pub i32, pub i32);\n'
+                  'pub fn mk() -> T { T(1, 2) }\n'
+                  'pub fn f() -> i32 { 1 }\n'
+                  'pub mod inner {\n'
+                  '    pub struct R { pub z: i32 }\n'
+                  '    pub fn r() -> R { R { z: 1 } }\n'
+                  '    pub fn g() -> i32 { 2 }\n'
+                  '}\n'
+                  'pub fn read_inner() -> i32 { inner::r().z }\n'
+                  'mod hidden { pub fn h() -> i32 { 3 } }\n'
+                  'pub use self::hidden::h;\n')
+        vis_cases = [
+            # (name, reader body of `show() -> i32`, old text, new text, start_narrow)
+            ("named field read", "pa::make().x", "pub x", "x", False),
+            ("named field read, private first", "pa::make().x", "pub x", "x", True),
+            ("field write", "let mut s = pa::make(); s.y = 4; s.y", "pub y", "pub(self) y", False),
+            ("struct literal", "let s = pa::S { x: 1, y: 2 }; s.y", "pub y", "y", False),
+            ("struct pattern", "let pa::S { x, .. } = pa::make(); x", "pub x", "x", False),
+            ("functional update", "let s = pa::S { x: 5, ..pa::make() }; s.x", "pub y", "y", False),
+            ("tuple field read", "pa::mk().1", "pub i32);", "i32);", False),
+            ("tuple ctor", "let t = pa::T(3, 4); t.0", "pub i32);", "i32);", False),
+            ("tuple pattern", "let pa::T(a, _) = pa::mk(); a", "pub i32, pub i32", "i32, pub i32", False),
+            ("method call", "pa::make().get()", "pub fn get", "fn get", False),
+            ("method call, private first", "pa::make().get()", "pub fn get", "fn get", True),
+            ("method pub to pub(in crate::pa)", "pa::make().get()", "pub fn get", "pub(in crate::pa) fn get", False),
+            ("field read from the parent module", "pa::read_inner()", "pub z", "z", False),
+            ("field pub(in) narrowed", "pa::read_inner()", "pub z", "pub(in crate::pa::inner) z", False),
+            ("assoc fn path", "pa::S::new().y", "pub fn new", "fn new", False),
+            ("free fn path", "pa::f()", "pub fn f()", "fn f()", False),
+            ("fn path pub to pub(super)", "pa::inner::g()", "pub fn g()", "pub(super) fn g()", False),
+            ("module visibility", "pa::inner::g()", "pub mod inner", "mod inner", False),
+            ("re-export visibility", "pa::h()", "pub use", "use", False),
+        ]
+        vis_dir = os.path.join(work, "vis")
+        os.makedirs(vis_dir, exist_ok=True)
+
+        def first_code(s):
+            m = re.search(r"error\[(L\d+)\]", s)
+            return m.group(1) if m else None
+
+        for k, (name, body, old, new, start_narrow) in enumerate(vis_cases):
+            main_p = os.path.join(vis_dir, f"vmain{k}.rs")
+            pa_p = os.path.join(vis_dir, "pa.rs")
+            open(main_p, "w").write(
+                'mod pa;\n'
+                f'fn show() -> i32 {{ {body} }}\n'
+                'fn main() { println!("{}", show()); }\n')
+            assert old in vis_pa, old
+            narrow = vis_pa.replace(old, new, 1)
+            states = [narrow, vis_pa, narrow] if start_narrow else [vis_pa, narrow, vis_pa, narrow, vis_pa]
+            steps, ok = [], True
+            for text in states:
+                open(pa_p, "w").write(text)
+                rcw, _, errw = run_lust(["check", main_p])
+                r = subprocess.run([LUST, "check", main_p], cwd=work, env=cold_env,
+                                   capture_output=True, text=True, timeout=20)
+                want = 1 if text is narrow else 0
+                ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
+                steps.append(f"{'narrow' if text is narrow else 'pub'}: warm {rcw} {first_code(errw)} "
+                             f"cold {r.returncode} {first_code(r.stderr)}")
+            check(f"visibility edit, {name}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).

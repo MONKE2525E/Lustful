@@ -1102,11 +1102,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Field visibility (ARCH 1.5): a private field of a struct from
     /// another module is L0510. Only resolver-built programs carry the
-    /// field table; single-file programs are all one module.
+    /// field table; single-file programs are all one module. Every
+    /// member privacy check here records a `Sig(adt)` read: that
+    /// fingerprint covers the Adt's field and associated item
+    /// visibility (driver/graph.rs `hash_vis_facts`), so the dirty walk
+    /// rechecks this body when a visibility it asked about changes.
     fn check_field_vis(&mut self, a: AdtId, field: Sym, span: Span) {
         let p = self.p;
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
+        let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.field_vis.get(&def)
             && let Some(vis) = fields.get(&field)
             && !tables.visible(vis, *def_mod, self.module, p.interner)
@@ -1126,6 +1131,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
+        let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && let Some(vis) = fields.get(index as usize)
             && !tables.visible(vis, *def_mod, self.module, p.interner)
@@ -1145,6 +1151,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
+        let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, p.interner))
         {
@@ -1164,6 +1171,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let Some(tables) = &p.resolved else { return };
         let Some(a) = self.tys.local_adt(base) else { return };
         let def = p.def_of_adt(a);
+        let _ = p.sig_of(&mut self.out.reads, def);
         if let Some(methods) = tables.assoc_vis.get(&def)
             && let Some((vis, def_mod)) = methods.get(&name)
             && !tables.visible(vis, *def_mod, self.module, p.interner)

@@ -23,6 +23,7 @@ use crate::ast::SelfKind;
 use crate::check::collect::{AdtDef, FnInfo, Program, VariantShape};
 use crate::def::{DefId, DiskDefId, LocalDefId, StableCrateHash};
 use crate::intern::{FxHasher, FxMap, Sym};
+use crate::resolve::imports::{ResolvedTables, VisKind};
 use crate::ty::defs::{DefData, DefKind as DefsKind, ModuleId, ROOT_MODULE};
 use crate::ty::*;
 use std::hash::{Hash, Hasher};
@@ -705,16 +706,84 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
     Fingerprint(h.finish())
 }
 
-/// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
-/// signature types with defs in stable form. Types hash *deeply* (see
-/// `hash_ty_deep`): a field, layout, derive, or discriminant edit to a
-/// named Adt changes every signature that names it, so the dirty walk
-/// rechecks bodies that read the signature. That is what lets the walk
-/// cover type edits, not only signature text edits. Const and static
-/// defs fold their evaluated value in (a value edit that keeps the
-/// value invalidates nothing); type aliases fold their resolved target.
-/// Generics and predicates join when generic collect fills them
-/// (W-TRAITS-CORE); today they are empty for every user def.
+/// Folds one visibility into `h`: its form, and for `pub(in path)` the
+/// written path by name (never by `Sym` id).
+fn hash_vis(h: &mut FxHasher, p: &Program, vis: &VisKind) {
+    match vis {
+        VisKind::Priv => 0u8.hash(h),
+        VisKind::Pub => 1u8.hash(h),
+        VisKind::Crate => 2u8.hash(h),
+        VisKind::Super => 3u8.hash(h),
+        VisKind::In(path) => {
+            4u8.hash(h);
+            (path.len() as u64).hash(h);
+            for s in path {
+                p.name(*s).hash(h);
+            }
+        }
+    }
+}
+
+/// Folds one module into `h` by its name path from its crate root, never
+/// by its session id. Privacy answers are functions of these paths: the
+/// reader's own module is fixed by its def path, which keys its slot.
+fn hash_module_path(h: &mut FxHasher, p: &Program, t: &ResolvedTables, m: ModuleId) {
+    let path = t.modules.get(m.0 as usize).map_or(&[][..], |info| &info.path[..]);
+    (path.len() as u64).hash(h);
+    for s in path {
+        p.name(*s).hash(h);
+    }
+}
+
+/// Folds the visibility facts of one def into its `Sig` fingerprint
+/// (section 8.1: `Sig` covers vis). These are the def's own visibility
+/// and, for an Adt, the visibility of each named field, tuple field,
+/// and inherent associated item, each with its defining module. Body
+/// checking records a `Sig(adt)` read at every field, constructor, and
+/// method privacy check (`check_field_vis` and kin in check/mod.rs), so
+/// a visibility-only edit dirties those readers in the walk. Path and
+/// re-export privacy are answered by the resolver, which reruns its
+/// rewrite whenever `ResolvedTables::rewrite_epoch` moves; the own
+/// visibility here also dirties the bodies whose `Binding` reads name
+/// the def. Map entries fold order-free (their order is not a fact).
+/// Programs without resolver tables are one module: no facts to fold.
+fn hash_vis_facts(h: &mut FxHasher, p: &Program, def: DefId) {
+    let Some(t) = &p.resolved else { return };
+    if let Some(info) = t.def_info.get(&def) {
+        hash_vis(h, p, &info.vis);
+        hash_module_path(h, p, t, info.module);
+    }
+    if let Some((m, fields)) = t.field_vis.get(&def) {
+        hash_module_path(h, p, t, *m);
+        let mut acc = 0u64;
+        for (name, vis) in fields {
+            let mut e = FxHasher::default();
+            p.name(*name).hash(&mut e);
+            hash_vis(&mut e, p, vis);
+            acc = acc.wrapping_add(e.finish());
+        }
+        (fields.len() as u64, acc).hash(h);
+    }
+    if let Some((m, fields)) = t.tuple_field_vis.get(&def) {
+        hash_module_path(h, p, t, *m);
+        (fields.len() as u64).hash(h);
+        for vis in fields {
+            hash_vis(h, p, vis);
+        }
+    }
+    if let Some(items) = t.assoc_vis.get(&def) {
+        let mut acc = 0u64;
+        for (name, (vis, m)) in items {
+            let mut e = FxHasher::default();
+            p.name(*name).hash(&mut e);
+            hash_vis(&mut e, p, vis);
+            hash_module_path(&mut e, p, t, *m);
+            acc = acc.wrapping_add(e.finish());
+        }
+        (items.len() as u64, acc).hash(h);
+    }
+}
+
 /// Folds one evaluated const value into `h`. `StaticRef` indices are
 /// collect-order positions, not stable content, so they fold the
 /// referenced static's name and (depth-capped) value instead.
@@ -767,9 +836,21 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
     }
 }
 
+/// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
+/// signature types with defs in stable form, plus the def's visibility
+/// facts (`hash_vis_facts`). Types hash *deeply* (see
+/// `hash_ty_deep`): a field, layout, derive, or discriminant edit to a
+/// named Adt changes every signature that names it, so the dirty walk
+/// rechecks bodies that read the signature. That is what lets the walk
+/// cover type edits, not only signature text edits. Const and static
+/// defs fold their evaluated value in (a value edit that keeps the
+/// value invalidates nothing); type aliases fold their resolved target.
+/// Generics and predicates join when generic collect fills them
+/// (W-TRAITS-CORE); today they are empty for every user def.
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
-    "sig-v2".hash(&mut h);
+    "sig-v3".hash(&mut h);
+    hash_vis_facts(&mut h, p, def);
     hash_def_pub(&mut h, p, def);
     let mut seen: Vec<DefId> = Vec::new();
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
@@ -830,7 +911,8 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
 
 /// The fingerprint of the program's statics as the glue unit emits
 /// them: each static's `Sig` fingerprint (deep type plus evaluated
-/// value) in definition order. The driver stores the fingerprint of
+/// value; its visibility rides along, so a visibility edit costs one
+/// glue rebuild) in definition order. The driver stores the fingerprint of
 /// the statics last built into a glue unit and rebuilds that unit
 /// when a later build's statics differ. This must be a built-state
 /// comparison, not an edit trigger: a `check` request consumes the
@@ -1777,6 +1859,47 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
             assert_eq!(reads.get(&ReadKey::Layout(def)).map(|r| r.fingerprint), Some(fp));
             assert_eq!(p.read_fingerprint(&ReadKey::Layout(def)).fingerprint, fp, "replay agrees with the recording");
             assert_ne!(fp, sig_fingerprint(p, def), "layout is a separate fingerprint from sig");
+        });
+    }
+
+    /// `Sig` covers member visibility (ARCH 8.1): the field and method
+    /// privacy checks record a `Sig(adt)` read, and a visibility-only
+    /// edit moves that fingerprint (so the stored read is dirty) while
+    /// the layout stands. The tables are built by hand here; the daemon
+    /// cases in scripts/fuzz/smoke.py run the same edge end to end.
+    #[test]
+    fn sig_covers_member_visibility() {
+        let src = "struct Foo { x: i64 }\nimpl Foo { fn get(&self) -> i64 { self.x } }\n\
+                   fn make() -> Foo { Foo { x: 1 } }\nfn main() { let n = make().x + make().get(); println!(\"{}\", n); }\n";
+        with_program(src, |interner, p| {
+            let def = p.def_of_adt(p.type_names[&interner.intern("Foo")]);
+            let main_reads = |p: &Program| {
+                let (ck, errs) = check_fn(p, p.main.unwrap());
+                assert!(errs.is_empty(), "{errs:?}");
+                ck.reads.clone()
+            };
+            // No module tables: one module, no privacy check, no read.
+            assert!(!main_reads(p).contains(&ReadKey::Sig(def)));
+            let mut tables = ResolvedTables::new(interner.intern("test"));
+            tables.field_vis.insert(def, (ROOT_MODULE, [(interner.intern("x"), VisKind::Pub)].into_iter().collect()));
+            tables.assoc_vis.insert(def, [(interner.intern("get"), (VisKind::Pub, ROOT_MODULE))].into_iter().collect());
+            p.resolved = Some(Box::new(tables));
+            let stored = main_reads(p);
+            let (sig, layout) = (sig_fingerprint(p, def), layout_fingerprint(p, def));
+            assert_eq!(stored.get(&ReadKey::Sig(def)).map(|r| r.fingerprint), Some(sig), "privacy checks read Sig(Foo)");
+            assert_eq!(p.reads_dirty(&stored), 0);
+            let t = p.resolved.as_mut().unwrap();
+            t.field_vis.get_mut(&def).unwrap().1.insert(interner.intern("x"), VisKind::Priv);
+            assert_ne!(sig_fingerprint(p, def), sig, "a field visibility edit moves Sig");
+            assert_eq!(layout_fingerprint(p, def), layout, "and not the layout");
+            assert!(p.reads_dirty(&stored) > 0, "the field reader is dirty");
+            let t = p.resolved.as_mut().unwrap();
+            t.field_vis.get_mut(&def).unwrap().1.insert(interner.intern("x"), VisKind::Pub);
+            assert_eq!(sig_fingerprint(p, def), sig, "the edit back restores Sig");
+            let t = p.resolved.as_mut().unwrap();
+            t.assoc_vis.get_mut(&def).unwrap().insert(interner.intern("get"), (VisKind::Crate, ROOT_MODULE));
+            assert_ne!(sig_fingerprint(p, def), sig, "a method visibility edit moves Sig");
+            assert!(p.reads_dirty(&stored) > 0, "the method caller is dirty");
         });
     }
 
