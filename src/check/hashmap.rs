@@ -383,6 +383,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.err("L0640", self.span(*a), format!("`extend` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a map.");
             return ERROR;
         };
+        if let TyKind::Array(el, _) = self.kind(at)
+            && !self.array_iter_elem_ok(el, self.span(*a))
+        {
+            return ERROR;
+        }
         let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
         let (k, s) = (targs[0], *targs.last().unwrap_or(&UNIT));
         let want = if kind == HashTy::HashMap {

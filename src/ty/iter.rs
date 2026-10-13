@@ -93,6 +93,12 @@ pub enum IterKind {
     SetIter,
     /// `hash_set::IntoIter<T>`: item `T`.
     SetIntoIter,
+    /// `array::IntoIter<T, N>` (W-STD-B): args `[T, A]` with `A = [T;
+    /// N]`, item `T`; Copy elements only (check/iter.rs), so no element
+    /// of the stored array needs a drop.
+    ArrayIntoIter,
+    /// `iter::RepeatN<T>` (W-STD-B): args `[T]`, item `T`; Copy `T` only.
+    RepeatN,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -118,7 +124,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 34] = [
+    pub const ALL: [IterKind; 36] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -153,11 +159,13 @@ impl IterKind {
         IterKind::MapIntoValues,
         IterKind::SetIter,
         IterKind::SetIntoIter,
+        IterKind::ArrayIntoIter,
+        IterKind::RepeatN,
     ];
 
     /// True for the hashed-collection iterators.
     pub fn is_hash(self) -> bool {
-        self as usize >= IterKind::MapIter as usize
+        (IterKind::MapIter as usize..=IterKind::SetIntoIter as usize).contains(&(self as usize))
     }
 
     /// True for the hash iterators that own their table (by-value
@@ -208,6 +216,8 @@ impl IterKind {
             K::MapIntoValues => (HMAP, "IntoValues"),
             K::SetIter => (HSET, "Iter"),
             K::SetIntoIter => (HSET, "IntoIter"),
+            K::ArrayIntoIter => (&["core", "array", "iter"], "IntoIter"),
+            K::RepeatN => (&["core", "iter", "sources", "repeat_n"], "RepeatN"),
         }
     }
 
@@ -216,7 +226,7 @@ impl IterKind {
         use IterKind as K;
         match self {
             K::Map | K::FilterMap => 3,
-            K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned => 2,
+            K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned | K::ArrayIntoIter => 2,
             K::MapIter
             | K::MapIterMut
             | K::MapKeys
@@ -267,6 +277,8 @@ impl IterKind {
             K::MapIntoValues => "std::collections::hash_map::IntoValues",
             K::SetIter => "std::collections::hash_set::Iter",
             K::SetIntoIter => "std::collections::hash_set::IntoIter",
+            K::ArrayIntoIter => "std::array::IntoIter",
+            K::RepeatN => "std::iter::RepeatN",
         }
     }
 
@@ -275,7 +287,7 @@ impl IterKind {
     pub fn shown_args(self) -> usize {
         match self {
             IterKind::Map | IterKind::FilterMap => 2,
-            IterKind::Copied | IterKind::Cloned => 1,
+            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter => 1,
             k => k.n_args(),
         }
     }
@@ -314,6 +326,10 @@ impl IterKind {
             | K::MapIntoValues
             | K::SetIter
             | K::SetIntoIter => &[],
+            // (array, front, back): elements in `front..back` remain.
+            K::ArrayIntoIter => &[F::Arg(1), F::Usize, F::Usize],
+            // (element, count left).
+            K::RepeatN => &[F::Arg(0), F::Usize],
         }
     }
 }
@@ -386,6 +402,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         }
         K::MapIntoKeys | K::SetIntoIter => a[0],
         K::MapIntoValues => a[1],
+        K::ArrayIntoIter | K::RepeatN => a[0],
     })
 }
 
@@ -435,6 +452,11 @@ pub fn owning_by_path(path: &[&str]) -> Option<IterKind> {
 pub fn as_iter_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     if is_iter(tys, t) {
         return Some(t);
+    }
+    // An array by value (`array::IntoIter`; the caller checks the
+    // element is Copy).
+    if let TyKind::Array(e, _) = tys.kind(t) {
+        return Some(mk_iter(tys, IterKind::ArrayIntoIter, &[e, t]));
     }
     if let Some(it) = hash_for_iter(tys, t) {
         return it;

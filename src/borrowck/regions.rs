@@ -3690,7 +3690,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::MapKeys | K::SetIter => cat(&[&own, &args[0]]),
             K::MapValues | K::MapValuesMut => cat(&[&own, &args[1]]),
             K::MapIntoIter => cat(&[&args[0], &args[1]]),
-            K::MapIntoKeys | K::SetIntoIter => args[0].clone(),
+            K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
             K::MapIntoValues => args[1].clone(),
         })
     }
@@ -4087,7 +4087,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => false,
+            | K::SetIntoIter
+            | K::ArrayIntoIter
+            | K::RepeatN => false,
         }
     }
 

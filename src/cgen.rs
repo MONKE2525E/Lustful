@@ -307,7 +307,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::MapKeys | K::SetIter => CTy::Ref(Box::new(cty(tys, a[0]))),
         K::MapValues | K::MapValuesMut => CTy::Ref(Box::new(cty(tys, a[1]))),
         K::MapIntoIter => CTy::Tuple(vec![cty(tys, a[0]), cty(tys, a[1])]),
-        K::MapIntoKeys | K::SetIntoIter => cty(tys, a[0]),
+        K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => cty(tys, a[0]),
         K::MapIntoValues => cty(tys, a[1]),
         _ => iter_item_cty(tys, a[0]),
     }
@@ -3407,7 +3407,9 @@ impl FnGen<'_, '_, '_> {
             | B::HashIterLen
             | B::HashExtendReserve
             | B::HashReserve => unreachable!("hash builtins emit in cgen/hash.rs"),
-            B::HashExtend => unreachable!("expanded with its iterator (lower/iter.rs)"),
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN => {
+                unreachable!("expanded with its iterator (lower/iter.rs)")
+            }
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.

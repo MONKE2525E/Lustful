@@ -1340,6 +1340,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/mem/drop",
     "core/mem/swap",
     "std/mem/swap",
+    "core/iter/repeat_n",
+    "std/iter/repeat_n",
     "core/mem/replace",
     "std/mem/replace",
     "core/mem/take",

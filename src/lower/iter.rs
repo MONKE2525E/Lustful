@@ -67,6 +67,10 @@ fn expands(b: Builtin) -> bool {
             | B::IterSum
             | B::IterProduct
             | B::HashExtend
+            | B::VecExtend
+            | B::StringExtend
+            | B::IterArrayIntoIter
+            | B::IterRepeatN
     )
 }
 
@@ -521,6 +525,41 @@ impl Ex<'_, '_, '_> {
                 self.drop_local(owned);
                 self.drop_local(fl);
             }
+            B::IterArrayIntoIter => {
+                // (array, 0, N) (W-STD-B).
+                let a = arg()?;
+                let at = self.op_ty(&a)?;
+                let n = match self.body.tys.kind(at) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => n as u64,
+                        _ => return Err("iterator expansion: array length is not known".into()),
+                    },
+                    _ => return Err("iterator expansion: into_iter of a non-array".into()),
+                };
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![a, Self::usize_c(0), Self::usize_c(n)]));
+            }
+            B::IterRepeatN => {
+                let (x, n) = (arg()?, arg()?);
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![x, n]));
+            }
+            B::VecExtend | B::StringExtend => {
+                // `v.extend(src)` (W-STD-B): `src` through `IntoIterator`.
+                let (r, src) = (arg()?, arg()?);
+                let st = self.op_ty(&src)?;
+                let want = it::as_iter_ty(&mut self.body.tys, st).ok_or("iterator expansion: bad extend argument")?;
+                let iv = self.into_iter(src, want)?;
+                let (owned, ty) = self.own(iv)?;
+                let rt = self.op_ty(&r)?;
+                let rl = self.local(rt);
+                self.assign(Place::local(rl), Rvalue::Use(r));
+                if b == B::VecExtend {
+                    self.vec_extend(Place::local(owned), ty, rl)?;
+                } else {
+                    self.string_extend(Place::local(owned), ty, rl)?;
+                }
+                self.drop_local(owned);
+                self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
+            }
             B::HashExtend => {
                 // `map.extend(src)` (W-STD-B): `src` through `IntoIterator`.
                 let (r, src) = (arg()?, arg()?);
@@ -538,6 +577,105 @@ impl Ex<'_, '_, '_> {
             _ => return Err(format!("iterator expansion: unexpected builtin {b:?}")),
         }
         Ok(())
+    }
+
+    /// `Vec::extend` into the Vec behind `v` (a `&mut` local), as std's
+    /// `SpecExtend` picks: a `vec::IntoIter`, a slice iterator of `&T`
+    /// (`T: Copy`), or any `TrustedLen` iterator reserves the exact
+    /// count once (`append_elements`, `extend_trusted`); every other
+    /// iterator pushes and reserves `lower + 1` whenever full
+    /// (`extend_desugared`). `&T` items copy out.
+    fn vec_extend(&mut self, itp: Place, ty: Ty, v: Local) -> R {
+        use crate::ast::BinOp::*;
+        let vt = self.body.locals[v as usize].ty;
+        let TyKind::Ref(_, _, vec_ty) = self.body.tys.kind(vt) else { return Err("iterator expansion: extend of a non-reference".into()) };
+        let elem = self.body.tys.vec_elem(vec_ty).ok_or("iterator expansion: extend of a non-Vec")?;
+        let item = self.item(ty)?;
+        let by_ref = item != elem;
+        let push = |this: &mut Self, x: Local| {
+            let ax = if by_ref { Operand::Copy(Place::local(x).deref()) } else { this.take(Place::local(x), elem) };
+            let u = this.local(UNIT);
+            this.call_builtin(Builtin::VecPush, vec![Operand::Copy(Place::local(v)), ax], Place::local(u));
+        };
+        let exact = self.trusted_len(ty) || matches!(self.kind_args(ty), Some((IterKind::VecIntoIter | IterKind::SliceIter, _)));
+        if exact {
+            let (_, hi) = self.hint(itp.clone(), ty)?;
+            let (s, n) = self.switch_opt(&Place::local(hi));
+            self.cur = n;
+            self.term(Terminator::Panic(vec![FmtPart::Lit("capacity overflow".into())]));
+            self.cur = s;
+            let u = self.local(UNIT);
+            self.call_builtin(Builtin::VecReserve, vec![Operand::Copy(Place::local(v)), Operand::Copy(Self::payload(&Place::local(hi)))], Place::local(u));
+            return self.each(&itp, ty, &mut |this, x, _| {
+                push(this, x);
+                Ok(())
+            });
+        }
+        let join = self.block();
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let (_, n, x, _) = self.pull(&itp, ty)?;
+        let rvt = self.body.tys.mk_ref(false, vec_ty);
+        let rv = self.local(rvt);
+        self.assign(Place::local(rv), Rvalue::Ref(false, Place::local(v).deref()));
+        let (len, cap) = (self.local(USIZE), self.local(USIZE));
+        self.call_builtin(Builtin::VecLen, vec![Operand::Copy(Place::local(rv))], Place::local(len));
+        self.call_builtin(Builtin::VecCapacity, vec![Operand::Copy(Place::local(rv))], Place::local(cap));
+        let full = self.cmp(Eq, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(cap)));
+        let (grow, ok) = self.branch(full);
+        self.cur = grow;
+        let (lo, _) = self.hint(itp.clone(), ty)?;
+        let add = self.local(USIZE);
+        self.call_builtin(Builtin::SaturatingAdd, vec![Operand::Copy(Place::local(lo)), Self::usize_c(1)], Place::local(add));
+        let u = self.local(UNIT);
+        self.call_builtin(Builtin::VecReserve, vec![Operand::Copy(Place::local(v)), Operand::Copy(Place::local(add))], Place::local(u));
+        self.goto(ok);
+        self.cur = ok;
+        push(self, x);
+        self.goto(lp);
+        self.cur = n;
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// `String::extend` into the String behind `s` (a `&mut` local):
+    /// chars reserve the size hint's lower bound, then push; str-like
+    /// items (`&str`, `String`, `Box<str>`, `Cow<str>`) push_str each.
+    fn string_extend(&mut self, itp: Place, ty: Ty, s: Local) -> R {
+        let item = self.item(ty)?;
+        let chars = item == CHAR || matches!(self.body.tys.kind(item), TyKind::Ref(_, _, c) if c == CHAR);
+        if chars {
+            let (lo, _) = self.hint(itp.clone(), ty)?;
+            let u = self.local(UNIT);
+            self.call_builtin(Builtin::StringReserve, vec![Operand::Copy(Place::local(s)), Operand::Copy(Place::local(lo))], Place::local(u));
+        }
+        self.each(&itp, ty, &mut |this, x, item| {
+            let u = this.local(UNIT);
+            if item == CHAR {
+                this.call_builtin(Builtin::StringPush, vec![Operand::Copy(Place::local(s)), Operand::Copy(Place::local(x))], Place::local(u));
+            } else if chars {
+                this.call_builtin(Builtin::StringPush, vec![Operand::Copy(Place::local(s)), Operand::Copy(Place::local(x).deref())], Place::local(u));
+            } else if item == REF_STR {
+                this.call_builtin(Builtin::StringPushStr, vec![Operand::Copy(Place::local(s)), Operand::Copy(Place::local(x))], Place::local(u));
+            } else {
+                // An owned or smart str: push its `&str` view, then drop it.
+                let rx = this.ref_to(false, Place::local(x), item);
+                let sx = this.local(REF_STR);
+                let view = if this.body.tys.is_string_ty(item) {
+                    Builtin::StringAsStr
+                } else if crate::check::collect::cow_arg(&this.body.tys, item).is_some() {
+                    Builtin::CowDeref
+                } else {
+                    Builtin::ConvDeref
+                };
+                this.call_builtin(view, vec![Operand::Copy(Place::local(rx))], Place::local(sx));
+                this.call_builtin(Builtin::StringPushStr, vec![Operand::Copy(Place::local(s)), Operand::Copy(Place::local(sx))], Place::local(u));
+                this.drop_local(x);
+            }
+            Ok(())
+        })
     }
 
     /// hashbrown's `extend` into the map or set behind `table` (a `&mut`
@@ -606,6 +744,17 @@ impl Ex<'_, '_, '_> {
             IterKind::VecIntoIter => self.call_builtin(Builtin::IterVecIntoIter, vec![o], Place::local(l)),
             // A map or set (or a reference to one) makes its hash iterator.
             k if k.is_hash() => self.call_builtin(Builtin::HashIterNew, vec![o], Place::local(l)),
+            // An array by value: (array, 0, N).
+            IterKind::ArrayIntoIter => {
+                let n = match self.body.tys.kind(ot) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => n as u64,
+                        _ => return Err("iterator expansion: array length is not known".into()),
+                    },
+                    _ => return Err("iterator expansion: bad IntoIterator argument".into()),
+                };
+                self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o, Self::usize_c(0), Self::usize_c(n)]));
+            }
             IterKind::SliceIter | IterKind::SliceIterMut => {
                 let fields = it::field_tys(&mut self.body.tys, want).ok_or("iterator expansion: bad slice iterator")?;
                 let pl = self.op_place(o, ot);
@@ -681,6 +830,39 @@ impl Ex<'_, '_, '_> {
                 let r = self.ref_to(true, itp, ty);
                 let b = if back { Builtin::VecIterNextBack } else { Builtin::VecIterNext };
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
+            // `array::IntoIter` (Copy elements, W-STD-B): the element at
+            // the front (or back) index.
+            K::ArrayIntoIter => {
+                let c = self.cmp(Lt, Operand::Copy(f(1)), Operand::Copy(f(2)));
+                let (s, n) = self.branch(c);
+                self.cur = s;
+                let idx = self.local(USIZE);
+                if back {
+                    self.assign(f(2), Rvalue::Bin(Sub, Operand::Copy(f(2)), Self::usize_c(1)));
+                    self.assign(Place::local(idx), Rvalue::Use(Operand::Copy(f(2))));
+                } else {
+                    self.assign(Place::local(idx), Rvalue::Use(Operand::Copy(f(1))));
+                    self.assign(f(1), Rvalue::Bin(Add, Operand::Copy(f(1)), Self::usize_c(1)));
+                }
+                self.some(&dest, opt, Operand::Copy(f(0).project(Proj::Index(idx))));
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `iter::RepeatN` (Copy `T`, W-STD-B): the element while the
+            // count lasts, from either end.
+            K::RepeatN => {
+                let c = self.cmp(Lt, Self::usize_c(0), Operand::Copy(f(1)));
+                let (s, n) = self.branch(c);
+                self.cur = s;
+                self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                self.some(&dest, opt, Operand::Copy(f(0)));
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
                 self.goto(join);
             }
             // The hash iterators step in the core (cgen/hash.rs, W-STD-B);
@@ -2040,7 +2222,9 @@ impl Ex<'_, '_, '_> {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut => true,
+            // `array::IntoIter` is random access in Rust 1.99 (a zip with
+            // it pulls only `min` items from a mapped side).
+            K::SliceIter | K::SliceIterMut | K::ArrayIntoIter => true,
             K::Range => matches!(
                 self.body.tys.kind(a[0]),
                 TyKind::Int(IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64)
@@ -2086,6 +2270,10 @@ impl Ex<'_, '_, '_> {
             K::Zip => {
                 self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(f(3)), Operand::Copy(f(2))));
             }
+            K::ArrayIntoIter => {
+                self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(f(2)), Operand::Copy(f(1))));
+            }
+            K::RepeatN => self.assign(Place::local(out), Rvalue::Use(Operand::Copy(f(1)))),
             _ => return Err("iterator expansion: size of a non-random-access iterator".into()),
         }
         Ok(Operand::Copy(Place::local(out)))
@@ -2154,6 +2342,11 @@ impl Ex<'_, '_, '_> {
                 let ay = self.take(Place::local(y), ib);
                 self.assign(dest, Rvalue::TupleAgg(item, vec![ax, ay]));
             }
+            K::ArrayIntoIter => {
+                let j = self.local(USIZE);
+                self.assign(Place::local(j), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(i))));
+                self.assign(dest, Rvalue::Use(Operand::Copy(f(0).project(Proj::Index(j)))));
+            }
             _ => return Err("iterator expansion: get on a non-random-access iterator".into()),
         }
         Ok(())
@@ -2200,6 +2393,10 @@ impl Ex<'_, '_, '_> {
                 let n = self.local(USIZE);
                 self.call_builtin(Builtin::VecIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
                 set_exact(self, Operand::Copy(Place::local(n)));
+            }
+            K::ArrayIntoIter | K::RepeatN => {
+                let n = self.size(itp.clone(), ty)?;
+                set_exact(self, n);
             }
             // hashbrown's iterators know their remaining count exactly.
             K::MapIter
@@ -2481,6 +2678,7 @@ impl Ex<'_, '_, '_> {
             | K::MapIntoValues
             | K::SetIter
             | K::SetIntoIter => false,
+            K::ArrayIntoIter | K::RepeatN => true,
         }
     }
 

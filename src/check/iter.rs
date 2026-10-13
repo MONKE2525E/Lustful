@@ -200,6 +200,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             found = Some((B::IterVecIntoIter, j, it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el])));
                             break;
                         }
+                        // An array by value (`array::IntoIter`, W-STD-B):
+                        // Copy elements only (the store has no per-element
+                        // drop state yet).
+                        TyKind::Array(..) if j == 0 => {
+                            if !self.array_iter_elem_ok(el, span) {
+                                for &a in args {
+                                    self.expr(a, None);
+                                }
+                                return Some(ERROR);
+                            }
+                            found = Some((B::IterArrayIntoIter, 0, it::mk_iter(&mut self.tys, IterKind::ArrayIntoIter, &[el, t])));
+                            break;
+                        }
                         _ => break,
                     }
                 }
@@ -312,6 +325,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 if args.len() != 1 {
                     self.err("L0105", span, format!("`{n}` takes 1 argument"), "Pass the other iterator.");
+                }
+                if let Some((IterKind::ArrayIntoIter, ta)) = it::iter_parts(&self.tys, other)
+                    && !it::is_iter(&self.tys, at)
+                    && !self.array_iter_elem_ok(ta[0], self.span(a))
+                {
+                    return self.iter_bail(&args[1..]);
                 }
                 let oi = self.iter_item(other);
                 if n == "chain" && !self.unify(oi, item) {
@@ -604,6 +623,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.iter_bail(args)
     }
 
+    /// True when an array by value can be iterated (`array::IntoIter`,
+    /// W-STD-B): its elements are Copy (no per-element drop state
+    /// yet); an element type still unknown is checked at body end.
+    /// Otherwise reports L0640.
+    pub(super) fn array_iter_elem_ok(&mut self, el: Ty, span: Span) -> bool {
+        let el = self.deep(el);
+        if matches!(self.kind(el), TyKind::Infer(_)) {
+            self.deferred_copy.push((el, span));
+            return true;
+        }
+        if is_copy(self.p, &self.tys, el) || matches!(self.kind(el), TyKind::Error) {
+            return true;
+        }
+        let tn = self.tn(el);
+        self.err(
+            "L0640",
+            span,
+            format!("iterating an array of `{tn}` by value is not implemented yet (only Copy elements)"),
+            "Iterate with `.iter()`, or collect the array into a Vec first.",
+        );
+        false
+    }
+
     /// A fresh closure-argument type with the pending obligations of
     /// `F: FnMut(inputs..) -> output`. The closure's arguments are items
     /// (or `&item`, see `fn_mut_param_ref`): free regions, which the
@@ -645,6 +687,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(el) = self.tys.vec_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el]));
         }
+        // An array by value (`array::IntoIter`, W-STD-B); the caller
+        // owes the Copy check on its element.
+        if let TyKind::Array(el, _) = self.kind(t) {
+            return Some(it::mk_iter(&mut self.tys, IterKind::ArrayIntoIter, &[el, t]));
+        }
         let TyKind::Ref(_, m, inner) = self.kind(t) else { return None };
         let inner = self.resolve(inner);
         let el = match self.kind(inner) {
@@ -682,6 +729,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | K::MapIntoValues
             | K::SetIter
             | K::SetIntoIter => false,
+            K::ArrayIntoIter | K::RepeatN => true,
         }
     }
 

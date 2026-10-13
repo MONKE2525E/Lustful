@@ -12,6 +12,7 @@ pub mod collect;
 pub mod constfn;
 pub mod convert;
 pub mod cow;
+pub mod extend;
 pub mod defaults;
 pub mod fmt;
 pub mod generics;
@@ -484,6 +485,14 @@ pub enum Builtin {
     CowIntoOwned,
     CowToMut,
     CowDeref,
+    /// `vec.extend(iter)` and `string.extend(iter)` (check/extend.rs):
+    /// expanded with the iterator (lower/iter.rs).
+    VecExtend,
+    StringExtend,
+    /// `array.into_iter()` and `std::iter::repeat_n(x, n)` (W-STD-B):
+    /// the iterator values, built by the expansion (lower/iter.rs).
+    IterArrayIntoIter,
+    IterRepeatN,
     /// The hashed collections (W-STD-B, check/hashmap.rs, cgen/hash.rs):
     /// constructors (the result type tells map, set, or hasher), table
     /// queries, map and set methods, and the Entry methods.
@@ -8239,6 +8248,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("cmp", "max") => Some(Builtin::CmpMax),
                 ("cmp", "min") => Some(Builtin::CmpMin),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
+                ("iter", "repeat_n") => Some(Builtin::IterRepeatN),
                 _ => None,
             };
             if let Some(b) = b {
@@ -10252,6 +10262,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t, t], t)
                     }
+                    // `repeat_n(x, n)`: Copy `T` only (W-STD-B, ty/iter.rs).
+                    Builtin::IterRepeatN => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        self.deferred_copy.push((t, span));
+                        (vec![t, USIZE], crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::RepeatN, &[t]))
+                    }
                     _ => unreachable!(),
                 };
                 if let Some(want) = written_self {
@@ -11098,6 +11114,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // AsRef, AsMut, Borrow, BorrowMut, ToOwned on builtin values
             // (check/convert.rs, W-STD-B).
             if let Some(ret) = self.convert_method(e, recv, rt, name, name_span, args, expected) {
+                return ret;
+            }
+            // `extend` on Vec and String (check/extend.rs, W-STD-B).
+            if self.p.interner.get(name) == "extend"
+                && let Some(ret) = self.seq_extend(e, recv, base, derefs, name_span, args)
+            {
                 return ret;
             }
             // HashMap, HashSet, and Entry methods (check/hashmap.rs).

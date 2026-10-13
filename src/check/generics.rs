@@ -6069,7 +6069,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let ts = p.tys.intern_tys(&[ps[0], ps[1]]);
                     p.tys.intern(TyKind::Tuple(ts))
                 }
-                K::MapIntoKeys | K::SetIntoIter => ps[0],
+                K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => ps[0],
                 K::MapIntoValues => ps[1],
                 K::Enumerate => {
                     let inner = proj(p, ps[0]);

@@ -420,6 +420,10 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CowIntoOwned,
     Builtin::CowToMut,
     Builtin::CowDeref,
+    Builtin::VecExtend,
+    Builtin::StringExtend,
+    Builtin::IterArrayIntoIter,
+    Builtin::IterRepeatN,
 ];
 
 /// How a builtin is called.
@@ -777,6 +781,10 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             ],
             Call::Method,
         ),
+        B::VecExtend => (&["Vec<T>"], vec![i.intern("extend")], Call::Method),
+        B::IterArrayIntoIter => (&["[T; N]"], vec![i.intern("into_iter")], Call::Method),
+        B::IterRepeatN => (&["std::iter"], vec![i.intern("repeat_n")], Call::Function),
+        B::StringExtend => (&["String"], vec![i.intern("extend")], Call::Method),
         B::CowIntoOwned | B::CowToMut | B::CowDeref => (
             &["Cow<'a, B>"],
             vec![i.intern("into_owned"), i.intern("to_mut"), i.intern("as_ref"), i.intern("borrow"), i.intern("deref")],
