@@ -967,19 +967,24 @@ fn slot_update(
     // fingerprints; making every unchanged passing body a candidate
     // lets the dirty walk find the readers. (A brand-new const fn also
     // sets this: one needless walk, no wrong reuse.)
-    let const_fn_changed = (0..fn_count).any(|i| {
-        is_const[i]
-            && (front.slot_hash.get(front.fn_slot[i] as usize).copied().unwrap_or(0) != scan_of(front, i).0
-                || (keys[i].free && names.contains(&keys[i].name)))
-    });
-    let mut changed = Vec::new();
-    let mut mention_only = Vec::new();
     // The token scan and the Ast can disagree on the fn count for
     // unusual shapes (an impl inside a body, which collect rejects
-    // with its own diagnostic): never index past either list here.
-    // `collect` runs next and gives the real answer; the tail's
-    // count guard catches any remaining disagreement.
-    for i in 0..fn_count.min(front.fn_loc.len()) {
+    // with its own diagnostic): pair scan index i with Ast index i
+    // only where both lists have an entry, and never index past
+    // either list. `collect` runs next and gives the real answer;
+    // the tail's count guard catches any remaining disagreement.
+    // On disagreement the const-fn question answers "may have
+    // changed", so no body is reused on a guess.
+    let paired = fn_count.min(front.fn_loc.len());
+    let const_fn_changed = fn_count != front.fn_loc.len()
+        || (0..paired).any(|i| {
+            is_const[i]
+                && (front.slot_hash.get(front.fn_slot[i] as usize).copied().unwrap_or(0) != scan_of(front, i).0
+                    || (keys[i].free && names.contains(&keys[i].name)))
+        });
+    let mut changed = Vec::new();
+    let mut mention_only = Vec::new();
+    for i in 0..paired {
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
