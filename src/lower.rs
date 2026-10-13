@@ -2649,9 +2649,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             // moves included, only on the guard's success edge. A
             // failed guard then leaves the scrutinee whole for the
             // next arm. The one shape with no reference place to
-            // read through, a binding for the middle of a slice
-            // pattern, keeps the move-first order for now.
-            let by_ref_guard = arm.guard.is_some() && !self.pat_has_slice_middle_binding(arm.pat);
+            // read through, a by-value binding for the middle of
+            // an array pattern, keeps the move-first order.
+            let by_ref_guard = arm.guard.is_some() && !self.pat_has_slice_middle_move(arm.pat);
             // Under a guard, an or-pattern arm runs as one row
             // per combination of alternatives: a guard that
             // fails on one row's bindings tries the next row, as
@@ -2743,30 +2743,54 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.pop_scope(span);
     }
 
-    /// True when a slice pattern in `pat` binds its middle (`rest`
-    /// or `rest @ ..`). That binding has no single place to read by
-    /// reference for a guard, so `match_into` keeps the old
-    /// move-first order for such an arm.
-    fn pat_has_slice_middle_binding(&self, pat: PatId) -> bool {
-        fn binds(p: &Program, pat: PatId) -> bool {
-            match p.ast.pat(pat) {
-                Pat::Binding { .. } | Pat::At { .. } => true,
-                Pat::Paren(i) | Pat::Ref { inner: i, .. } => binds(p, *i),
-                _ => false,
-            }
+    /// True when a slice pattern in `pat` binds its middle by
+    /// value: an owned smaller array (`rest @ ..` on an array).
+    /// That value has no place to read by reference for a guard
+    /// without moving the elements out, so `match_into` keeps
+    /// the move-first order for such an arm (element copies on
+    /// the guard edge; a non-`Copy` middle then fails borrowck
+    /// when a later arm needs the scrutinee, as before). A
+    /// middle of slice type is a fat value instead: the guard
+    /// binds it by reference from a subslice temporary, like
+    /// every other binding.
+    fn pat_has_slice_middle_move(&self, pat: PatId) -> bool {
+        if let Pat::Slice { middle, .. } = self.p.ast.pat(pat)
+            && let Some(mid) = middle
+            && self.pat_has_binding(*mid)
+            && !matches!(self.kind(self.ck.pat_ty(*mid)), TyKind::Slice(_))
+        {
+            return true;
         }
-        fn walk(p: &Program, pat: PatId) -> bool {
-            match p.ast.pat(pat) {
-                Pat::Slice { prefix, middle, suffix } => {
-                    middle.is_some_and(|m| binds(p, m) || walk(p, m)) || prefix.iter().chain(suffix.iter()).any(|&s| walk(p, s))
-                }
-                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| walk(p, s)),
-                Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| walk(p, s)),
-                Pat::Paren(i) | Pat::Ref { inner: i, .. } | Pat::At { inner: i, .. } => walk(p, *i),
-                _ => false,
+        self.pat_children(pat).iter().any(|&s| self.pat_has_slice_middle_move(s))
+    }
+
+    /// A temporary holding the middle of a slice or array place
+    /// as a slice fat value: elements `lo_n` up to `suffix_len`
+    /// before the end.
+    fn subslice_temp(&mut self, place: &Place, lo_n: usize, suffix_len: usize, arr_len: Option<u64>, elem: Ty, mutable: bool, span: Span) -> Local {
+        let lo = self.const_usize(lo_n as u64, span);
+        let hi = match arr_len {
+            Some(n) => Operand::Const(Const::Int((n - suffix_len as u64) as u128, IntTy::Usize)),
+            None => {
+                let len = self.temp(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
+                let t = self.temp(USIZE);
+                self.assign(
+                    Place::local(t),
+                    Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(suffix_len as u128, IntTy::Usize))),
+                    span,
+                );
+                Operand::Copy(Place::local(t))
             }
-        }
-        walk(self.p, pat)
+        };
+        let slice = self.body.tys.intern(TyKind::Slice(elem));
+        let t = self.temp(slice);
+        self.assign(
+            Place::local(t),
+            Rvalue::Subslice { base: place.clone(), lo: Operand::Copy(Place::local(lo)), hi: Some(hi), inclusive: false, mutable },
+            span,
+        );
+        t
     }
 
     /// The direct sub-patterns of one pattern, in source order.
@@ -2889,8 +2913,9 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// `bind_pat` case by case, but by shared reference (see
     /// `guard_binding`). Records every bound checker local in
     /// `bound` so the caller can clear `guard_places` after the
-    /// guard. A slice middle binding never reaches here (see
-    /// `pat_has_slice_middle_binding`).
+    /// guard. A by-value array middle binding never reaches
+    /// here (see `pat_has_slice_middle_move`); a slice middle
+    /// reads through a shared subslice temporary.
     fn bind_pat_guard(&mut self, pat: PatId, place: Place, bound: &mut Vec<u32>) {
         let p = self.p;
         let place = Self::derefs(place, self.ck.pat_derefs(pat));
@@ -2924,14 +2949,18 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             (Pat::Paren(inner), _) => self.bind_pat_guard(*inner, place, bound),
-            (Pat::Slice { prefix, middle: _, suffix }, _) => {
+            (Pat::Slice { prefix, middle, suffix }, _) => {
                 let ty = self.ck.pat_ty(pat);
-                let arr_len = match self.kind(ty) {
-                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
-                        ConstKind::Int(n) => Some(n as u64),
-                        _ => None,
-                    },
-                    _ => None,
+                let (elem, arr_len) = match self.kind(ty) {
+                    TyKind::Array(e, c) => {
+                        let n = match self.body.tys.const_kind(c) {
+                            ConstKind::Int(n) => Some(n as u64),
+                            _ => None,
+                        };
+                        (e, n)
+                    }
+                    TyKind::Slice(e) => (e, None),
+                    _ => (ERROR, None),
                 };
                 for (i, &sub) in prefix.iter().enumerate() {
                     let idx = self.const_usize(i as u64, span);
@@ -2941,6 +2970,17 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let back = (suffix.len() - j) as u64;
                     let idx = self.slice_back_index(&place, back, arr_len, span);
                     self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
+                }
+                // The middle binding reads a shared subslice of
+                // the same place for the guard; the real binding
+                // makes its own (possibly mutable) one later. A
+                // by-value array middle never reaches here (see
+                // `pat_has_slice_middle_move`).
+                if let Some(mid) = middle
+                    && self.pat_has_binding(*mid)
+                {
+                    let t = self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, false, span);
+                    self.bind_pat_guard(*mid, Place::local(t), bound);
                 }
             }
             (Pat::Ref { inner, .. }, _) => self.bind_pat_guard(*inner, place.deref(), bound),
@@ -3369,7 +3409,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 if let Some(mid) = middle {
                     match p.ast.pat(*mid) {
                         Pat::Rest | Pat::Wild => {}
-                        Pat::Binding { .. } => {
+                        Pat::Binding { .. } | Pat::At { .. } => {
                             let mid_ty = self.ck.pat_ty(*mid);
                             if let (Some(n), TyKind::Array(..)) = (arr_len, self.kind(mid_ty)) {
                                 // An owned middle of an array is a smaller array
@@ -3384,43 +3424,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                                 self.bind_pat(*mid, Place::local(t));
                             } else {
                                 // A reference middle is a subslice fat value.
-                                let lo = self.const_usize(prefix.len() as u64, span);
-                                let hi = match arr_len {
-                                    Some(n) => Operand::Const(Const::Int((n - suffix.len() as u64) as u128, IntTy::Usize)),
-                                    None => {
-                                        let len = self.temp(USIZE);
-                                        self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
-                                        let t = self.temp(USIZE);
-                                        self.assign(
-                                            Place::local(t),
-                                            Rvalue::Bin(
-                                                BinOp::Sub,
-                                                Operand::Copy(Place::local(len)),
-                                                Operand::Const(Const::Int(suffix.len() as u128, IntTy::Usize)),
-                                            ),
-                                            span,
-                                        );
-                                        Operand::Copy(Place::local(t))
-                                    }
-                                };
                                 let mode = match self.ck.pat_res(*mid) {
                                     PatRes::Binding { mode, .. } => mode,
                                     _ => BindMode::Move,
                                 };
                                 let mutable = mode == BindMode::Ref(true);
-                                let slice = self.body.tys.intern(TyKind::Slice(elem));
-                                let t = self.temp(slice);
-                                self.assign(
-                                    Place::local(t),
-                                    Rvalue::Subslice {
-                                        base: place,
-                                        lo: Operand::Copy(Place::local(lo)),
-                                        hi: Some(hi),
-                                        inclusive: false,
-                                        mutable,
-                                    },
-                                    span,
-                                );
+                                let t = self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, mutable, span);
                                 self.bind_pat(*mid, Place::local(t));
                             }
                         }

@@ -3775,6 +3775,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let scope = self.scopes.len();
                     self.pattern(arm.pat, st, true);
                     if let Some(g) = arm.guard {
+                        // A by-value slice-pattern middle binds
+                        // before its guard runs (there is no
+                        // subarray place to read it through by
+                        // reference), so a failed guard would drop
+                        // the moved parts early. Copy elements are
+                        // exact already; anything else is a reject
+                        // for now rather than wrong drop order.
+                        if self.slice_middle_move_blocks_guard(arm.pat) {
+                            self.errs.push(unsupported(self.span(g), "match guards over a by-value slice-pattern middle"));
+                        }
                         self.expect_expr(g, BOOL);
                     }
                     let bt = self.expr(arm.body, expected.or(result));
@@ -10834,6 +10844,51 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let (mut has_or, mut has_tuple_rest) = (false, false);
         walk(self.p, pat, &mut has_or, &mut has_tuple_rest);
         has_or && !has_tuple_rest && self.covers(&[pat])
+    }
+
+    /// True when a guarded arm's pattern binds a slice
+    /// middle by value (an owned array) whose elements are not
+    /// `Copy`, or also binds through an or-pattern: those arms
+    /// bind before the guard runs, so drop order (and guard
+    /// retry) would differ from Rust. See the call in the
+    /// `match` check.
+    fn slice_middle_move_blocks_guard(&self, root: PatId) -> bool {
+        fn has_binding(cx: &Ctx, pat: PatId) -> bool {
+            matches!(cx.out.pat_res[(pat.0 - cx.out.pat_base) as usize], PatRes::Binding { .. })
+                || children(cx, pat).into_iter().any(|s| has_binding(cx, s))
+        }
+        fn has_or_binding(cx: &Ctx, pat: PatId) -> bool {
+            (matches!(cx.p.ast.pat(pat), Pat::Or(_)) && has_binding(cx, pat))
+                || children(cx, pat).into_iter().any(|s| has_or_binding(cx, s))
+        }
+        fn children(cx: &Ctx, pat: PatId) -> Vec<PatId> {
+            match cx.p.ast.pat(pat) {
+                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.clone(),
+                Pat::Struct { fields, .. } => fields.iter().map(|&(_, s)| s).collect(),
+                Pat::Slice { prefix, middle, suffix } => {
+                    let mut out: Vec<PatId> = prefix.clone();
+                    if let Some(m) = middle {
+                        out.push(*m);
+                    }
+                    out.extend(suffix.iter().copied());
+                    out
+                }
+                Pat::Paren(i) | Pat::Ref { inner: i, .. } | Pat::At { inner: i, .. } => vec![*i],
+                _ => Vec::new(),
+            }
+        }
+        fn walk(cx: &Ctx, root: PatId, pat: PatId) -> bool {
+            if let Pat::Slice { middle, .. } = cx.p.ast.pat(pat)
+                && let Some(mid) = middle
+                && has_binding(cx, *mid)
+                && let TyKind::Array(elem, _) = cx.kind(cx.out.pat_ty[(mid.0 - cx.out.pat_base) as usize])
+                && (!is_copy(cx.p, &cx.tys, elem) || has_or_binding(cx, root))
+            {
+                return true;
+            }
+            children(cx, pat).into_iter().any(|s| walk(cx, root, s))
+        }
+        walk(self, root, root)
     }
 
     fn irrefutable(&self, pat: PatId) -> bool {
