@@ -84,39 +84,18 @@ impl RcvProbe {
 /// named by a bound in the current param env. Without resolver
 /// tables (collect-only test paths) every local trait counts
 /// as in scope, as before.
-pub(super) fn trait_in_scope_pub(cx: &Ctx, trait_def: DefId) -> bool {
+pub(super) fn trait_in_scope_pub(cx: &mut Ctx, trait_def: DefId) -> bool {
     trait_in_scope(cx, trait_def)
 }
 
-fn trait_in_scope(cx: &Ctx, trait_def: DefId) -> bool {
+fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
     let p = cx.p;
-    if p.gx.trait_names.values().any(|&d| d == trait_def) {
-        match &p.resolved {
-            Some(res) => match res.def_info.get(&trait_def) {
-                Some(info) => {
-                    if info.module == cx.module {
-                        return true;
-                    }
-                    // Imported into this module under any name
-                    // (including `as _`): a type-namespace
-                    // binding here targets the trait.
-                    use crate::resolve::imports::{BindState, ns_index};
-                    let imported = res
-                        .maps
-                        .get(cx.module.0 as usize)
-                        .is_some_and(|maps| {
-                            maps[ns_index(Namespace::Type)]
-                                .values()
-                                .any(|s| matches!(s, BindState::One(b) if res.target_def(b.target) == trait_def))
-                        });
-                    if imported {
-                        return true;
-                    }
-                }
-                None => return true,
-            },
-            None => return true,
-        }
+    // A user trait defined in or imported into this module under any
+    // name (including `as _`). The query records a `TraitInScope` read:
+    // a `use` edit flips the answer without touching any binding this
+    // body names.
+    if p.gx.trait_names.values().any(|&d| d == trait_def) && p.trait_in_module(&mut cx.out.reads, cx.module, trait_def) {
+        return true;
     }
     let lang = &p.gx.lang;
     if [

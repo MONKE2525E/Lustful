@@ -1218,7 +1218,6 @@ impl<'a> Program<'a> {
     /// answer has no binding read of its own, since the import may use
     /// any name. Without resolver tables, and for a trait the tables do
     /// not know, every local trait counts as in scope.
-    #[allow(dead_code)] // First caller: `trait_in_scope` in check/method.rs.
     pub fn trait_in_module(&self, reads: &mut Reads, module: ModuleId, trait_def: DefId) -> bool {
         let ans = self.trait_in_module_answer(module, trait_def);
         reads.record_with(ReadKey::TraitInScope(module, trait_def), !ans, || trait_in_scope_fingerprint(ans));

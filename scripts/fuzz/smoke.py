@@ -543,7 +543,7 @@ fn grown() -> i64 { 1 }
             kind = f"{name}{', program with a trait' if generic else ''}"
             check(f"visibility edit, {kind}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
 
-        # 17. Regression (fx-vis-fp audit): `Self::item` paths from an impl
+        # 19. Regression (fx-vis-fp audit): `Self::item` paths from an impl
         # in another module check the item's visibility (rustc E0624) and
         # read `Sig(adt)`, so a warm check sees a visibility flip; and an
         # associated const read bakes the value in, so it records the
@@ -682,6 +682,46 @@ fn grown() -> i64 { 1 }
         check("nested fn re-added: warm runs the new body (fx-append-chunk)",
               rc == 0 and out == "9\n" and panics() == before_panics,
               f"rc={rc} out={out!r} err={err!r}")
+
+        # 20. Regression (fx-vis-fp, next 1c77df7): since generic reuse
+        # keeps bodies across item edits outside the trait system, a
+        # trait `use` edit must reach the warm answer. `trait_in_scope`
+        # records a `TraitInScope` read: removing the import (plain,
+        # `as _`, glob, or in another module) must reject warm like cold
+        # (L0104), and the import back must accept warm.
+        tu_dir = os.path.join(work, "traituse")
+        os.makedirs(tu_dir, exist_ok=True)
+        open(os.path.join(tu_dir, "pa.rs"), "w").write(
+            'pub trait Tr { fn tr(&self) -> i32; }\npub struct S;\nimpl Tr for S { fn tr(&self) -> i32 { 5 } }\n')
+        open(os.path.join(tu_dir, "pb.rs"), "w").write(
+            'use crate::pa::Tr;\npub fn show() -> i32 { crate::pa::S.tr() }\n')
+        tu_cases = [
+            ("plain use", "main.rs", 'mod pa;\nuse pa::Tr;\nfn main() { println!("{}", pa::S.tr()); }\n', "use pa::Tr;\n"),
+            ("use as _", "main.rs", 'mod pa;\nuse pa::Tr as _;\nfn main() { println!("{}", pa::S.tr()); }\n', "use pa::Tr as _;\n"),
+            ("glob use", "main.rs", 'mod pa;\nuse pa::*;\nfn main() { println!("{}", S.tr()); }\n', "use pa::*;\n"),
+            ("use in another module", "pb.rs", None, "use crate::pa::Tr;\n"),
+        ]
+        for k, (name, rel, main_text, use_line) in enumerate(tu_cases):
+            main_p = os.path.join(tu_dir, f"tmain{k}.rs")
+            if main_text is None:
+                main_text = 'mod pa;\nmod pb;\nfn main() { println!("{}", pb::show()); }\n'
+            open(main_p, "w").write(main_text)
+            edit_p = main_p if rel == "main.rs" else os.path.join(tu_dir, rel)
+            base = open(edit_p).read()
+            # The glob case loses `S` too; keep it nameable without the trait.
+            without = base.replace(use_line, "use pa::S;\n" if use_line == "use pa::*;\n" else "", 1)
+            steps, ok = [], True
+            for text in (base, without, base, without, base):
+                open(edit_p, "w").write(text)
+                rcw, _, errw = run_lust(["check", main_p])
+                r = subprocess.run([LUST, "check", main_p], cwd=work, env=cold_env,
+                                   capture_output=True, text=True, timeout=20)
+                want = 1 if text is without else 0
+                ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
+                steps.append(f"{'without' if text is without else 'with'}: warm {rcw} {first_code(errw)} "
+                             f"cold {r.returncode} {first_code(r.stderr)}")
+            open(edit_p, "w").write(base)
+            check(f"trait use edit, {name}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
 
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
