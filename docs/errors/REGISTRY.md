@@ -84,7 +84,8 @@ prints "reserved, not yet emitted".
 | L0722-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0722 unsupported receiver type |
 | L0730-L0732 | Regions and drop check | W-BORROW | reserved | L0730 drop check, L0731 explicit lifetime turbofish arg, L0732 placeholder region escapes |
 | L0733 | Regions and drop check | W-BORROW | in use | A region relation the signature does not give (rustc "lifetime may not live long enough") |
-| L0734-L0739 | Regions and drop check | W-BORROW | reserved | |
+| L0734 | Regions and drop check | W-BORROW | in use | An impl method's lifetimes do not fit the trait method's signature |
+| L0735-L0739 | Regions and drop check | W-BORROW | reserved | |
 | L0801-L0803 | Macros | W-MACRO | in use | L0801 expansion caps, L0802 unknown macro, L0803 include file not found |
 | L0804 | Macros | W-MACRO | reserved | L0804 proc-macro dependency |
 | L0805-L0807 | Macros | W-MACRO | in use | L0805 local ambiguity, L0806 invalid macro call or builtin input, L0807 invalid macro definition |

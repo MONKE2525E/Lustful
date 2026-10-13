@@ -390,6 +390,11 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     // universal relation can only fail through a loan or a reference value
     // that flows between parameters, which the region pass checks below.
     let own = own_sig(p, body);
+    if own.check
+        && let Some(d) = regions::impl_contract(p, body.fn_id)
+    {
+        ck.errs.push(d);
+    }
     let needs_regions = !ck.loans.is_empty() || own.n_univ > 0;
     if needs_regions {
         let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);

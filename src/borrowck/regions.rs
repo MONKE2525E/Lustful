@@ -1937,3 +1937,74 @@ fn tarjan(n: usize, start: &[u32], adj: &[u32]) -> (Vec<u32>, usize) {
     }
     (comp, n_comp as usize)
 }
+
+/// The trait-contract check of an impl method's regions (W-BORROW): the
+/// impl may promise more than the trait (a `'static` result where the
+/// trait's borrows), never less, and it may not demand more of its
+/// inputs. Without lifetime names the only difference elision leaves is
+/// `'static`, so this pairs the two region signatures and compares where
+/// each says `'static`: a covariant (output) slot the trait makes
+/// `'static` must be `'static` in the impl, a contravariant (input) one
+/// the impl makes `'static` must be `'static` in the trait, and an
+/// invariant one must agree. Returns the first mismatch as L0734.
+pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
+    let own = p.regions.fns.get(&f)?;
+    let def = p.def_id(f);
+    let impl_def = p.defs.parent_of(def)?;
+    let (_, rec) = p.gx.index.by_def(impl_def)?;
+    let info = p.fn_info(f);
+    let tmeth = p.gx.index.trait_record(rec.trait_def)?.method_by_name(info.name)?;
+    let tsig = p.regions.trait_methods.get(&tmeth)?;
+    if tsig.params.len() != own.params.len() {
+        return None;
+    }
+    let mut bad = false;
+    for (&t, &i) in tsig.params.iter().zip(&own.params) {
+        contract_walk(&p.tys, t, i, Variance::Contra, &mut bad);
+    }
+    contract_walk(&p.tys, tsig.ret, own.ret, Variance::Co, &mut bad);
+    bad.then(|| {
+        Diag::new(
+            "L0734",
+            info.def.name_span,
+            format!("lifetime mismatch: method `{}` has a lifetime `'static` where the trait's signature does not agree", p.display_name(info.name)),
+            "Match the trait method's signature: return at least what it promises, and take at least what it accepts.",
+        )
+    })
+}
+
+/// Walks a trait method type `t` and the impl's `i` in parallel, setting
+/// `bad` where a `'static` disagrees for the position's variance.
+fn contract_walk(tys: &impl TyIntern, t: Ty, i: Ty, v: Variance, bad: &mut bool) {
+    match (tys.kind(t), tys.kind(i)) {
+        (TyKind::Ref(rt, mt, it), TyKind::Ref(ri, mi, ii)) if mt == mi => {
+            let (st, si) = (rt == Region::Static, ri == Region::Static);
+            *bad |= match v {
+                Variance::Co => st && !si,
+                Variance::Contra => si && !st,
+                Variance::Inv => st != si,
+                Variance::Bi => false,
+            };
+            let iv = if mt.is_mut() { Variance::Inv } else { Variance::Co };
+            contract_walk(tys, it, ii, v.then(iv), bad);
+        }
+        (TyKind::Adt(dt, at), TyKind::Adt(di, ai)) if dt == di => {
+            let (xs, ys) = (tys.args(at).to_vec(), tys.args(ai).to_vec());
+            for (x, y) in xs.into_iter().zip(ys) {
+                if let (GenericArg::Ty(x), GenericArg::Ty(y)) = (x, y) {
+                    // Builtin containers are covariant; a user Adt's variance
+                    // is not computed here, so its args must agree exactly.
+                    let av = if tys.builtins().kind_of(dt).is_some() { Variance::Co } else { Variance::Inv };
+                    contract_walk(tys, x, y, v.then(av), bad);
+                }
+            }
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            for (x, y) in tys.tys_of(a).to_vec().into_iter().zip(tys.tys_of(b).to_vec()) {
+                contract_walk(tys, x, y, v, bad);
+            }
+        }
+        (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) => contract_walk(tys, a, b, v, bad),
+        _ => {}
+    }
+}
