@@ -174,6 +174,19 @@ fn fold_fn_text(sc: &mut scan::ChunkScan, lexed: &lexer::Lexed, src: &str) {
     }
 }
 
+/// True when a body item of the current Ast lies inside this fn's body
+/// (by span). Re-parsing such a body in bodies mode would push fresh
+/// copies of its body items next to the old ones in `stmt_items`, so
+/// the caller falls back to a full parse for that request instead.
+fn body_owns_stmt_items(ast: &Ast, item: usize, sub: Option<usize>) -> bool {
+    if ast.stmt_items.is_empty() {
+        return false;
+    }
+    let Some(body) = fn_def_at(ast, item, sub).body else { return false };
+    let span = ast.block(body).span;
+    ast.stmt_items.iter().any(|it| it.span.file == span.file && it.span.lo >= span.lo && it.span.hi <= span.hi)
+}
+
 /// The fn at one `fn_locations` entry.
 fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::ast::FnDef {
     match (item != usize::MAX, sub) {
@@ -1620,6 +1633,8 @@ fn resolved_setup(
     // reads chunk tokens, and a route change to that path drops these
     // chunks first. (Lexing the root again here cost a full serial lex.)
     let n_items = front.ast.items.len();
+    let n_stmt_items = front.ast.stmt_items.len();
+    let n_inner_attrs = front.ast.inner_attrs.len();
     front.chunks = vec![Chunk {
         start: 0,
         text: root_text,
@@ -1632,6 +1647,8 @@ fn resolved_setup(
             ends_at_boundary: true,
         },
         items: Some(0..n_items),
+        stmt_items: Some(0..n_stmt_items),
+        inner_attrs: Some(0..n_inner_attrs),
         expand_deps,
         inner_attr: false,
     }];
@@ -1969,6 +1986,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     lexed_start: 0,
                     scan: sc,
                     items: None,
+                    stmt_items: None,
+                    inner_attrs: None,
                     expand_deps: deps,
                     inner_attr,
                 }];
@@ -1998,7 +2017,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 None => {
                     let (_, (lexed, sc, deps, inner_attr)) = next_fresh.take().unwrap();
                     next_fresh = fresh.next();
-                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None, expand_deps: deps, inner_attr }
+                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None, stmt_items: None, inner_attrs: None, expand_deps: deps, inner_attr }
                 }
             };
             front.chunks.push(chunk);
@@ -2044,12 +2063,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // items that collect numbers in order, so once the Ast has one, a
     // re-parsed body adds a second copy (a fn that no slot maps to and
     // that is never checked: a warm false accept) or puts it out of
-    // file order. Such a file takes the full parse.
+    // file order. Such a file takes the full parse. (The signatures
+    // splice below does replace a re-parsed chunk's body items; this
+    // guard stays as the driver's rule until reuse there is proven.)
     let splice = front.ast.stmt_items.is_empty();
     let bodies_only = splice && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
     let changed_names =
         if bodies_only || !splice || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
-    let mode = if bodies_only {
+    let mut mode = if bodies_only {
         "bodies"
     } else if changed_names.is_some() {
         "signatures"
@@ -2057,13 +2078,29 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         "full"
     };
 
-    let (changed, mention_only, const_fn_changed): (Vec<usize>, Vec<usize>, bool) = if bodies_only {
+    // Bodies mode re-parses changed bodies into the live Ast. A body
+    // that owns body items (a nested fn, const, static, or `use`) cannot
+    // be re-parsed that way: `parse_body` appends fresh body items while
+    // the old ones stay in `stmt_items`, and collect would enumerate
+    // both. Such a request falls back to the full parse below, which
+    // rebuilds the Ast from chunks. `bodies_out` is None on that
+    // fall-back (and when bodies mode does not apply at all).
+    let bodies_out: Option<(Vec<usize>, Vec<usize>, bool)> = if bodies_only {
         let mut changed: Vec<usize> = (0..fn_count)
             .filter(|&i| {
                 let slot = front.fn_slot[i] as usize;
                 front.slot_hash[slot] != scan_of(front, i).0 || !caches.ok[slot]
             })
             .collect();
+        let owns_items = changed.iter().any(|&i| {
+            let (item, sub) = front.fn_loc[i];
+            body_owns_stmt_items(&front.ast, item, sub)
+        });
+        if owns_items {
+            mode = "full";
+            None
+        } else {
+        let mut grew_stmt_items = false;
         for &i in &changed {
             // A changed body is in a changed chunk, so its tokens are freshly lexed.
             let chunk = &front.chunks[fn_at[i].0];
@@ -2082,8 +2119,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if let Some(r) = caches.slot_reads.get_mut(slot) {
                 *r = None;
             }
+            let stmt_before = front.ast.stmt_items.len();
             match parser::parse_body(toks, &chunk.lexed.strings, &mut front.ast, &front.interner, &front.known) {
                 Ok((body, exprs, pats)) => {
+                    // The new body gained body items the old one did
+                    // not have (the pre-check above covers the old
+                    // side): bail to the full parse, which rebuilds
+                    // `stmt_items` in parser order.
+                    if front.ast.stmt_items.len() != stmt_before {
+                        grew_stmt_items = true;
+                        break;
+                    }
                     let (item, sub) = front.fn_loc[i];
                     let def = match (item != usize::MAX, sub) {
                         (false, Some(k)) => match &mut front.ast.stmt_items[k].kind {
@@ -2116,6 +2162,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         t.lap("parse changed bodies");
+        if grew_stmt_items {
+            mode = "full";
+            None
+        } else {
         // A changed const fn body can move const and static values,
         // array lengths, and discriminants that unchanged bodies baked
         // in. Make every unchanged passing body a dirty-walk candidate,
@@ -2146,7 +2196,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
         }
-        (changed, mention_only, const_fn_changed)
+        Some((changed, mention_only, const_fn_changed))
+        }
+        }
+    } else {
+        None
+    };
+    let (changed, mention_only, const_fn_changed): (Vec<usize>, Vec<usize>, bool) = if let Some(r) = bodies_out {
+        r
     } else if changed_names.is_some() {
         // Only top-level functions changed: parse just the chunks with new text, and splice their
         // items between the unchanged chunks' items.
@@ -2160,17 +2217,75 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return errors(&mut [d], &map, &src, req);
         }
         let mut new_asts: FxMap<usize, Ast> = todo.iter().copied().zip(parsed.into_iter().map(|p| p.unwrap())).collect();
+        // Splice every per-chunk list in chunk order: a re-parsed chunk
+        // replaces its old items, body items, and inner attrs. Keeping
+        // the old body items next to the new ones made collect see stale
+        // nested fns, so the program had more fns than `fn_slot` (a warm
+        // panic in the build re-emit loop). Arena nodes stay append-only
+        // in `append_chunk`; only these enumerated lists are rebuilt.
+        let old_block_count = front.ast.blocks.len();
         let mut old_items: Vec<Option<crate::ast::Item>> = std::mem::take(&mut front.ast.items).into_iter().map(Some).collect();
+        let mut old_stmt_items: Vec<Option<crate::ast::Item>> =
+            std::mem::take(&mut front.ast.stmt_items).into_iter().map(Some).collect();
+        let mut old_inner_attrs: Vec<Option<crate::ast::Attr>> =
+            std::mem::take(&mut front.ast.inner_attrs).into_iter().map(Some).collect();
+        // Old body-item index to new index, for the blocks that already
+        // exist. A replaced chunk's old entries map to the new entry at
+        // the same offset when one exists (their blocks are orphans of
+        // the old parse); the rest map to None and their statements drop.
+        let mut stmt_remap: Vec<Option<u32>> = vec![None; old_stmt_items.len()];
         let mut items = Vec::with_capacity(old_items.len());
+        let mut stmt_items = Vec::with_capacity(old_stmt_items.len());
+        let mut inner_attrs = Vec::with_capacity(old_inner_attrs.len());
         for c in 0..front.chunks.len() {
             let start = items.len();
+            let stmt_start = stmt_items.len();
+            let inner_start = inner_attrs.len();
             match new_asts.remove(&c) {
-                Some(ast) => items.extend(front.ast.append_chunk(ast)),
-                None => items.extend(front.chunks[c].items.clone().unwrap().map(|k| old_items[k].take().unwrap())),
+                Some(ast) => {
+                    let (its, sis, ias) = front.ast.append_chunk(ast, stmt_start as u32);
+                    if let Some(old_range) = front.chunks[c].stmt_items.clone() {
+                        for (k, old_idx) in old_range.enumerate() {
+                            if k < sis.len() {
+                                stmt_remap[old_idx] = Some((stmt_start + k) as u32);
+                            }
+                        }
+                    }
+                    items.extend(its);
+                    stmt_items.extend(sis);
+                    inner_attrs.extend(ias);
+                }
+                None => {
+                    items.extend(front.chunks[c].items.clone().unwrap().map(|k| old_items[k].take().unwrap()));
+                    for k in front.chunks[c].stmt_items.clone().unwrap() {
+                        stmt_remap[k] = Some(stmt_items.len() as u32);
+                        stmt_items.push(old_stmt_items[k].take().unwrap());
+                    }
+                    inner_attrs.extend(front.chunks[c].inner_attrs.clone().unwrap().map(|k| old_inner_attrs[k].take().unwrap()));
+                }
             }
             front.chunks[c].items = Some(start..items.len());
+            front.chunks[c].stmt_items = Some(stmt_start..stmt_items.len());
+            front.chunks[c].inner_attrs = Some(inner_start..inner_attrs.len());
+        }
+        // Blocks from before the splice still hold old body-item
+        // indexes; blocks the re-parsed chunks appended already hold
+        // new ones (`append_chunk` shifted them to the splice base).
+        for b in &mut front.ast.blocks[..old_block_count] {
+            b.stmts.retain_mut(|st| match st {
+                crate::ast::Stmt::Item(i) => match stmt_remap.get(*i as usize).copied().flatten() {
+                    Some(n) => {
+                        *i = n;
+                        true
+                    }
+                    None => false,
+                },
+                _ => true,
+            });
         }
         front.ast.items = items;
+        front.ast.stmt_items = stmt_items;
+        front.ast.inner_attrs = inner_attrs;
         match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
@@ -2190,10 +2305,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         });
         let ast = if parsed.iter().all(|p| p.is_ok()) {
             let mut start = 0;
+            let mut stmt_start = 0;
+            let mut inner_start = 0;
             for (c, p) in front.chunks.iter_mut().zip(&parsed) {
-                let n = p.as_ref().unwrap().items.len();
-                c.items = Some(start..start + n);
-                start += n;
+                let p = p.as_ref().unwrap();
+                c.items = Some(start..start + p.items.len());
+                start += p.items.len();
+                c.stmt_items = Some(stmt_start..stmt_start + p.stmt_items.len());
+                stmt_start += p.stmt_items.len();
+                c.inner_attrs = Some(inner_start..inner_start + p.inner_attrs.len());
+                inner_start += p.inner_attrs.len();
             }
             Ast::concat(parsed.into_iter().map(|p| p.unwrap()).collect())
         } else {
@@ -3552,6 +3673,58 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
         assert_eq!(warm.code, cold.code);
         assert_eq!(warm.stderr, cold.stderr);
         assert!(warm.stderr.contains("L0802"), "{}", warm.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk re-parse replaces that chunk's body items: check a file
+    /// with a fn nested in `main`, then change another fn's signature
+    /// and build. The old splice kept the stale nested fn in
+    /// `stmt_items` next to its fresh copy, so collect made one fn
+    /// more than `fn_slot` and the build re-emit loop panicked (found
+    /// by fx-seed658). A body-only edit of the outer fn takes the
+    /// bodies fall-back and must stay exact too.
+    #[test]
+    fn chunk_reparse_replaces_body_items() {
+        let dir = std::env::temp_dir().join(format!("lust-nest-splice-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nest.rs");
+        let key = crate::protocol::SessionKey::synthetic(&file, false);
+        let check = req_for(key.clone());
+        let build = Request { cmd: Cmd::Build, out: dir.join("nest.bin"), ..req_for(key.clone()) };
+        let mut s = Session::new(dir.join("obj"), true, key.clone());
+        std::fs::write(
+            &file,
+            "fn f0(x: i64) -> i64 {\n    x\n}\n\nfn main() {\n    let p = 1;\n    fn zed() -> i64 { 3 }\n    println!(\"{} {}\", p + f0(1), zed());\n}\n",
+        )
+        .unwrap();
+        let r = compile(&check, &mut s);
+        assert_eq!(r.code, 0, "primer: {}", r.stderr);
+        assert_eq!(s.front.ast.stmt_items.len(), 1, "one nested fn after the primer");
+        std::fs::write(
+            &file,
+            "fn f0(x: i64, _z: i64) -> i64 {\n    x\n}\n\nfn main() {\n    let p = 1;\n    fn zed() -> i64 { 3 }\n    println!(\"{} {}\", p + f0(1, 2), zed());\n}\n",
+        )
+        .unwrap();
+        let warm = compile(&build, &mut s);
+        assert_eq!(warm.code, 0, "signature edit: {}", warm.stderr);
+        assert_eq!(s.front.ast.stmt_items.len(), 1, "the re-parsed chunk replaced its body items");
+        assert_eq!(s.front.fn_slot.len(), 3, "one slot per fn, nested fn included once");
+        let out = std::process::Command::new(dir.join("nest.bin")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "2 3\n");
+        std::fs::write(
+            &file,
+            "fn f0(x: i64, _z: i64) -> i64 {\n    x\n}\n\nfn main() {\n    let p = 10;\n    fn zed() -> i64 { 3 }\n    println!(\"{} {}\", p + f0(1, 2), zed());\n}\n",
+        )
+        .unwrap();
+        let warm = compile(&build, &mut s);
+        assert_eq!(warm.code, 0, "body edit: {}", warm.stderr);
+        assert_eq!(s.front.ast.stmt_items.len(), 1, "still one nested fn after the body edit");
+        let out = std::process::Command::new(dir.join("nest.bin")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "11 3\n");
+        let cold_build = Request { out: dir.join("nest-cold.bin"), ..build };
+        let cold = compile(&cold_build, &mut Session::new(dir.join("obj2"), false, key));
+        assert_eq!((warm.code, &warm.stderr), (cold.code, &cold.stderr), "warm and cold answers match");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

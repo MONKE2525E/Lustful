@@ -1416,20 +1416,24 @@ impl Ast {
         out
     }
 
-    /// Moves another chunk's nodes into this AST (shifting their indexes) and returns its items,
-    /// for the caller to place. Nodes are only ever appended, so existing items stay valid.
-    pub fn append_chunk(&mut self, mut o: Ast) -> Vec<Item> {
+    /// Moves another chunk's arena nodes into this AST (shifting their indexes) and returns
+    /// its per-chunk lists (items, body items, inner attrs) for the caller to place. Arena
+    /// nodes are only ever appended, so existing items stay valid; the returned lists are
+    /// not merged here, because a caller that re-parses one chunk must replace that chunk's
+    /// lists, not append to them (collect enumerates `stmt_items` and `inner_attrs`, so a
+    /// stale copy would stay live). `stmt_base` is where the caller will place the returned
+    /// body items in the merged `stmt_items`: `Stmt::Item` indexes in the chunk's blocks
+    /// are shifted to that base.
+    pub fn append_chunk(&mut self, mut o: Ast, stmt_base: u32) -> (Vec<Item>, Vec<Item>, Vec<Attr>) {
         let sh = Shift {
             e: self.exprs.len() as u32,
             p: self.pats.len() as u32,
             t: self.tys.len() as u32,
             b: self.blocks.len() as u32,
             s: self.strings.len() as u32,
-            si: self.stmt_items.len() as u32,
+            si: stmt_base,
         };
         o.shift(sh);
-        self.inner_attrs.append(&mut o.inner_attrs);
-        self.stmt_items.append(&mut o.stmt_items);
         self.exprs.append(&mut o.exprs);
         self.expr_spans.append(&mut o.expr_spans);
         self.pats.append(&mut o.pats);
@@ -1438,7 +1442,7 @@ impl Ast {
         self.ty_spans.append(&mut o.ty_spans);
         self.blocks.append(&mut o.blocks);
         self.strings.append(&mut o.strings);
-        o.items
+        (o.items, o.stmt_items, o.inner_attrs)
     }
 
     /// Adds `sh` to every index stored in this chunk's nodes.
@@ -1686,5 +1690,47 @@ mod tests {
         assert!(matches!(&out.tys[2], TyExpr::Tuple(ts) if ts == &vec![TyId(1)]));
         assert!(matches!(&out.exprs[1], Expr::Tuple(es) if es == &vec![ExprId(1)]));
         assert!(matches!(&out.exprs[2], Expr::Closure { ret: Some(TyId(2)), body: ExprId(1), .. }));
+    }
+
+    /// `append_chunk` merges only the id arenas: the chunk's items, body
+    /// items, and inner attrs come back for the caller to place, and the
+    /// lists already in the base Ast stay as they are. A caller that
+    /// re-parses one chunk can then replace that chunk's lists instead
+    /// of appending a second copy next to the stale one.
+    #[test]
+    fn append_chunk_returns_per_chunk_lists() {
+        let span = Span::default();
+        let item = |name: u32| Item {
+            vis: Vis::Private,
+            attrs: Vec::new(),
+            kind: ItemKind::ExternCrate(ExternCrateDef { name: Sym(name), name_span: span, rename: None, span }),
+            span,
+        };
+        let mut base = Ast::default();
+        base.stmt_items.push(item(1));
+        base.blocks.push(Block { inner_attrs: Vec::new(), stmts: vec![Stmt::Item(0)], tail: None, tail_attrs: Vec::new(), span });
+
+        let mut chunk = Ast::default();
+        chunk.items.push(item(2));
+        chunk.stmt_items.push(item(3));
+        chunk.stmt_items.push(item(4));
+        chunk.blocks.push(Block {
+            inner_attrs: Vec::new(),
+            stmts: vec![Stmt::Item(0), Stmt::Item(1)],
+            tail: None,
+            tail_attrs: Vec::new(),
+            span,
+        });
+
+        let (items, stmt_items, inner_attrs) = base.append_chunk(chunk, 5);
+        assert_eq!(items.len(), 1);
+        assert_eq!(stmt_items.len(), 2);
+        assert!(inner_attrs.is_empty());
+        assert_eq!(base.stmt_items.len(), 1, "base body items are not appended to");
+        assert!(base.inner_attrs.is_empty(), "base inner attrs are not appended to");
+        assert_eq!(base.blocks.len(), 2, "arena blocks are appended");
+        // The chunk's block (now at index 1) points at the caller's base.
+        assert!(matches!(&base.blocks[1].stmts[..], [Stmt::Item(5), Stmt::Item(6)]));
+        assert!(matches!(&base.blocks[0].stmts[..], [Stmt::Item(0)]), "old blocks keep their indexes");
     }
 }

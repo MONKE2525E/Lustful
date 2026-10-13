@@ -145,6 +145,14 @@ pub(crate) struct Chunk {
     pub(crate) scan: scan::ChunkScan,
     /// This chunk's items in `front.ast.items`, or None if it has not been parsed yet.
     pub(crate) items: Option<std::ops::Range<usize>>,
+    /// This chunk's body items in `front.ast.stmt_items`, on the same
+    /// lifecycle as `items`. The chunk splice rebuilds `stmt_items`
+    /// from these ranges, so a re-parsed chunk's old body items are
+    /// replaced, never kept next to the new ones.
+    pub(crate) stmt_items: Option<std::ops::Range<usize>>,
+    /// This chunk's inner attrs in `front.ast.inner_attrs`, on the
+    /// same lifecycle as `items` (only the first chunk has any).
+    pub(crate) inner_attrs: Option<std::ops::Range<usize>>,
     /// Outside inputs this chunk's macro expansion read (included files
     /// with content hashes, env values; see `expand::Dep`). The chunk is
     /// dropped instead of reused when one changes (added for W-MACRO).
