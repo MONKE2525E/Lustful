@@ -2555,8 +2555,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 Coerce::StrFromString
             }
+            // Not for a dyn target: rustc commits to unsizing there
+            // (`&Box<S>` to `&dyn Tr` needs `Box<S>: Tr`, E0277).
             (TyKind::Ref(..), TyKind::Ref(_, em, y))
                 if ed == 1
+                    && !dyn_target
                     && box_ref_mut(self).is_some_and(|bm| !em.is_mut() || bm)
                     && {
                         // An exact match wins over a deref
