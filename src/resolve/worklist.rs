@@ -4724,6 +4724,13 @@ impl Rewrite<'_> {
                                         frame.std_imports.entry((name, ns_index(Namespace::Type))).or_insert(full);
                                     }
                                 }
+                                // A glob of a std enum's variants (`Ordering::*`).
+                                for v in crate::ty::lang::std_enum_variants(&p) {
+                                    let name = self.interner.intern(v);
+                                    let mut full = path.clone();
+                                    full.push(name);
+                                    frame.std_imports.entry((name, ns_index(Namespace::Value))).or_insert(full);
+                                }
                             }
                         }
                         PathRes::Done(Target::Module(src)) => {
@@ -4848,7 +4855,20 @@ impl Rewrite<'_> {
                 self.diags.push(private_diag(self.interner.get(name), span));
                 None
             }
-            _ => None,
+            // A std variant imported by name or glob (`use
+            // std::cmp::Ordering::Less;`) is a path pattern, not a
+            // binding: its full std path, as expressions expand it.
+            _ => {
+                let idx = ns_index(Namespace::Value);
+                let alias = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.std_imports.get(&(name, idx)))
+                    .or_else(|| self.tables.std_aliases.get(&(module, idx as u8, name)).map(|(_, p)| p))?;
+                let strs: Vec<&str> = alias.iter().map(|s| self.interner.get(*s)).collect();
+                (crate::ty::lang::std_path_kind(&strs) == Some(crate::ty::lang::StdPathKind::Variant))
+                    .then(|| Pat::Path(alias.iter().map(|s| PathSeg::plain(*s)).collect()))
+            }
         }
     }
 

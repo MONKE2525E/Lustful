@@ -1404,8 +1404,26 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     PathRes::Done(Target::Extern(i)) => {
                         if let Some(why) = &tables.externs[i as usize].unsupported {
                             diags.push(unsupported_diag(why, imp.span));
+                            return TryOut::Done(false);
                         }
-                        TryOut::Done(false)
+                        // `use std::cmp::Ordering::*;`: the std enum's
+                        // variants bind as std aliases (value namespace),
+                        // below any binding the module already has.
+                        let mut changed = false;
+                        if tables.externs[i as usize].is_std_lib {
+                            let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+                            for v in crate::ty::lang::std_enum_variants(&strs) {
+                                let name = interner.intern(v);
+                                let key = (imp.module, ns_index(Namespace::Value) as u8, name);
+                                if tables.lookup(imp.module, Namespace::Value, name).is_none() && !tables.std_aliases.contains_key(&key) {
+                                    let mut full = path.clone();
+                                    full.push(name);
+                                    tables.std_aliases.insert(key, (imp.vis.clone(), full));
+                                    changed = true;
+                                }
+                            }
+                        }
+                        TryOut::Done(changed)
                     }
                     PathRes::Private => {
                         diags.push(private_diag("that module", imp.span));

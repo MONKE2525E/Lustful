@@ -797,6 +797,18 @@ pub fn std_glob_imports(path: &[&str], name: &str) -> bool {
         .any(|&(crates, module, n)| n == name && path.len() == 2 && crates.contains(&path[0]) && path[1] == module)
 }
 
+/// The variant names of the std enum at `path` (`std::cmp::Ordering`
+/// gives Less, Equal, Greater), for a glob import of its variants.
+pub fn std_enum_variants(path: &[&str]) -> Vec<&'static str> {
+    STD_VARIANT_PATHS
+        .iter()
+        .filter_map(|row| {
+            let parts: Vec<&str> = row.split('/').collect();
+            (parts.len() == path.len() + 1 && parts.iter().zip(path).all(|(a, b)| a == b)).then(|| *parts.last().unwrap())
+        })
+        .collect()
+}
+
 /// True when `name` is one of `STD_IMPORTED_TYPES`.
 pub fn needs_std_use(name: &str) -> bool {
     STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name)
