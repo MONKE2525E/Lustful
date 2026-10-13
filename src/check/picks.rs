@@ -202,3 +202,39 @@ pub(super) fn replay_method(
     }
     Some(ERROR)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::check::collect::{self, Program};
+    use crate::def::{CrateIds, LOCAL_CRATE};
+    use crate::diag::FileId;
+    use crate::intern::{Interner, Known};
+    use crate::{lexer, parser};
+
+    /// Collects one sample file, then runs `run` on the program.
+    fn with_program(src: &str, run: impl FnOnce(&Interner, &Program)) {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        run(&interner, &program);
+    }
+
+    /// The template check records the call through the bound with the
+    /// bound's trait and Self one deref into `&T`, by `&self`.
+    #[test]
+    fn template_check_records_the_bound_trait() {
+        let src = "struct S;\nimpl S { fn get(&self) -> u8 { 1 } }\ntrait G { fn get(&self) -> u8; }\n\
+                   impl G for S { fn get(&self) -> u8 { 2 } }\nfn via<T: G>(t: &T) -> u8 { t.get() }\n\
+                   fn main() { println!(\"{}\", via(&S)); }\n";
+        with_program(src, |interner, p| {
+            let g = p.gx.trait_names[&interner.intern("G")];
+            let picks: Vec<_> = p.gx.trait_picks.values().collect();
+            assert_eq!(picks.len(), 1);
+            assert_eq!(picks[0].trait_def, g);
+            assert_eq!((picks[0].derefs, picks[0].form), (1, super::ReceiverForm::Ref));
+        });
+    }
+}
