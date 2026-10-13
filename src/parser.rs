@@ -1118,7 +1118,8 @@ impl<'a> Parser<'a> {
         self.scope_allows.extend(parsed.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let vis_start = self.span();
         let vis = self.vis()?;
-        let vis_span = vis_start.to(self.prev_span());
+        // Only a written visibility has a span of its own.
+        let vis_span = if vis == Vis::Private { vis_start } else { vis_start.to(self.prev_span()) };
         // A `const` item (`const NAME: Ty = ...;`), told apart from a
         // `const fn` qualifier by the name and colon after it.
         if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
