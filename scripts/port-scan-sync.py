@@ -58,7 +58,10 @@ OWNER_BY_CAUSE = {
     "closures": "W-CHECK-G",
     "dyn-trait": "W-CHECK-G",
     "iterators": "W-CHECK-G",
+    "attrs-cfg": "W-CHECK-G",
+    "macros": "W-CHECK-G",
     "lifetimes": "W-BORROW",
+    "unsafe": "wave C (shims)",
 }
 
 
@@ -281,7 +284,8 @@ def do_coverage(args):
         "when every construct the scanner sees in it maps to a supported feature.",
         "The scanner has no type data, so this is an upper bound.",
         "",
-        f"lust: `{lust_head}` on branch `next` state at scan time. ts-rust: `{ts_head}`.",
+        f"lust commit: `{lust_head}` (the scanned tree, landed on `next`). ts-rust: `{ts_head}`.",
+        "`docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.",
         f"scan: {rep['totals']['files']} files, {rep['totals']['lines']} lines, target x86_64-unknown-linux-gnu.",
         "",
         "## Core CLI scope today",
@@ -289,6 +293,10 @@ def do_coverage(args):
         "Core scope is the PLAN.md milestone 8 set, with the inventory rule:",
         "prod files active on this target whose top module is not ls, lsp, project,",
         "api, effect, format, fswatch, ipc, or contentmapper.",
+        "The inventory counted 402 files and 388,041 lines on the same ts-rust commit.",
+        "This scanner counts 406: it adds the 5 codegen tool files cargo reports as",
+        "lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is",
+        "inactive on this target.",
         "",
         f"Core: {len(core)} files, {core_lines} lines. Compiles today: {len(today)} files, {today_lines} lines"
         f" ({100.0 * len(today) / max(len(core), 1):.1f}% of files, {100.0 * today_lines / max(core_lines, 1):.1f}% of lines).",
