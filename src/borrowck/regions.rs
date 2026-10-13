@@ -1344,6 +1344,9 @@ pub(super) struct Builder<'b, 'p, 'a> {
     /// The argument slot vars of each closure created here whose
     /// arguments are free (`ClosureEntry::free_args`), by closure def.
     closure_args: FxMap<DefId, Vec<u32>>,
+    /// While a call's signature is instantiated: the erased type each
+    /// type param binds (`inst_walk`), for trait-selection checks.
+    bind_tys: FxMap<u32, Ty>,
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
@@ -1365,6 +1368,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             errs: Vec::new(),
             proj: None,
             closure_args: FxMap::default(),
+            bind_tys: FxMap::default(),
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -2666,6 +2670,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
+        self.bind_tys.clear();
         let mut ok = true;
         // A callee type that names type params (a template called in
         // check mode, a stub) has no slots where its params are: the
@@ -2699,8 +2704,98 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     self.edge(v, 0);
                 }
             }
+            // `P: Tr` proves more through trait selection: `Tr` (or a
+            // supertrait) bounded by `'static` makes `P` `'static`, and the
+            // impl selected for `P`'s type adds its own `X: 'static`
+            // where-clauses on the parts of `P` they name.
+            if let Predicate::Trait(b) = pred
+                && b.count == 0
+                && let Some(self_t) = self.p.tys.args(b.value.args).first().and_then(|g| g.as_ty())
+                && let TyKind::Param(j) = self.p.tys.kind(self_t)
+                && let Some(vs) = binds.get(&j.0).cloned()
+            {
+                if self.p.gx.dyn_infos.get(&b.value.def).is_some_and(|i| i.static_bound) {
+                    for &v in &vs {
+                        self.edge(v, 0);
+                    }
+                }
+                if let Some(&actual) = self.bind_tys.get(&j.0) {
+                    self.impl_static_edges(b.value.def, actual, &vs);
+                }
+            }
         }
         ok
+    }
+
+    /// The `X: 'static` where-clauses of the impls of `trait_def` whose Self
+    /// pattern matches `actual` (laid out in `vars`): each region of the part
+    /// `X` matches outlives `'static`.
+    fn impl_static_edges(&mut self, trait_def: DefId, actual: Ty, vars: &[u32]) {
+        let p = self.p;
+        for &id in p.gx.index.impls_of_trait(trait_def) {
+            let rec = p.gx.index.get(id);
+            let statics: Vec<u32> = rec
+                .generics
+                .predicates
+                .iter()
+                .filter_map(|pr| match pr {
+                    Predicate::TypeOutlives(x, Region::Static) => match p.tys.kind(*x) {
+                        TyKind::Param(k) => Some(k.0),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if statics.is_empty() {
+                continue;
+            }
+            let Some(pat) = p.tys.args(rec.trait_ref.args).first().and_then(|g| g.as_ty()) else { continue };
+            let mut parts: FxMap<u32, Vec<u32>> = FxMap::default();
+            if !self.match_impl_self(pat, actual, vars, &mut 0, &mut parts) {
+                continue;
+            }
+            for k in statics {
+                for &v in parts.get(&k).map(|x| x.as_slice()).unwrap_or(&[]) {
+                    self.edge(v, 0);
+                }
+            }
+        }
+    }
+
+    /// Matches an impl's Self pattern (over its params) against an erased
+    /// type whose slots are `vars` from `*at`, collecting each param's
+    /// slot vars. False when the shapes differ.
+    fn match_impl_self(&mut self, pat: Ty, actual: Ty, vars: &[u32], at: &mut usize, out: &mut FxMap<u32, Vec<u32>>) -> bool {
+        let tys = &self.body.tys;
+        match (tys.kind(pat), tys.kind(actual)) {
+            (TyKind::Param(k), _) => {
+                let n = self.sc.slots(actual) as usize;
+                out.entry(k.0).or_default().extend(vars.iter().skip(*at).take(n).copied());
+                *at += n;
+                true
+            }
+            (TyKind::Ref(_, pm, pi), TyKind::Ref(_, am, ai)) if pm == am => {
+                *at += 1;
+                self.match_impl_self(pi, ai, vars, at, out)
+            }
+            (TyKind::Adt(pd, pa), TyKind::Adt(ad, aa)) if pd == ad => {
+                *at += adt_regions(self.p, tys, actual) as usize;
+                let (xs, ys): (Vec<Ty>, Vec<Ty>) =
+                    (tys.args(pa).iter().filter_map(|g| g.as_ty()).collect(), tys.args(aa).iter().filter_map(|g| g.as_ty()).collect());
+                xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.match_impl_self(x, y, vars, at, out))
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (xs, ys) = (tys.tys_of(a).to_vec(), tys.tys_of(b).to_vec());
+                xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.match_impl_self(x, y, vars, at, out))
+            }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+                self.match_impl_self(a, b, vars, at, out)
+            }
+            _ => {
+                *at += self.sc.slots(actual) as usize;
+                pat == actual
+            }
+        }
     }
 
     fn inst_region(&mut self, r: Region, univ: &[u32]) -> u32 {
@@ -2746,6 +2841,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                         let v: Vec<u32> = (0..n).map(|_| self.fresh()).collect();
                         out.extend_from_slice(&v);
                         binds.insert(j.0, v);
+                        self.bind_tys.insert(j.0, e);
                     }
                 }
                 true
