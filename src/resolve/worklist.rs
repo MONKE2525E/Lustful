@@ -2112,11 +2112,10 @@ fn resolve_one(
         let before = discs.len();
         let mut new_queue: Vec<usize> = Vec::new();
         for di in 0..before {
-            let Some(exp) = expanded[di].clone() else { continue };
-            let outline = scan::outline(&exp, interner);
+            let Some(exp) = expanded[di].as_ref() else { continue };
+            let outline = scan::outline(exp, interner);
             let disc_module = discs[di].module;
-            let inline =
-                outline_mods(di, &outline, &exp.strings.clone(), &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
+            let inline = outline_mods(di, &outline, &exp.strings, &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
             bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
         }
         while let Some(di) = new_queue.pop() {
@@ -2158,15 +2157,14 @@ fn resolve_one(
     // first because the cache itself is serial.
     let mut order: Vec<usize> = (0..discs.len()).collect();
     order.sort_by_key(|&di| discs[di].file_id.0);
-    let lexed_of = |di: usize| -> lexer::Lexed {
-        expanded[di]
-            .clone()
-            .unwrap_or_else(|| discs[di].lexed.clone().unwrap_or_else(|| lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }))
-    };
     let exp_hashes = par_map(&order, |&di| match (expanded[di].as_ref(), discs[di].lexed.as_ref()) {
         (Some(l), _) | (None, Some(l)) => hash_lexed(l),
         (None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
     });
+    // The stream each file parses from. Nothing reads the streams after
+    // this phase, so a parse task moves its own out instead of copying it.
+    let streams: Vec<std::sync::Mutex<Option<lexer::Lexed>>> =
+        expanded.into_iter().zip(discs.iter_mut()).map(|(e, d)| std::sync::Mutex::new(e.or_else(|| d.lexed.take()))).collect();
     let mut works: Vec<Option<FileWork>> = Vec::with_capacity(order.len());
     let mut todo: Vec<usize> = Vec::new();
     for (pos, &di) in order.iter().enumerate() {
@@ -2196,7 +2194,7 @@ fn resolve_one(
     let parsed = par_map(&todo, |&pos| -> Result<(FileWork, Option<Ast>), Diag> {
         let di = order[pos];
         let disc = &discs[di];
-        let lexed = lexed_of(di);
+        let lexed = streams[di].lock().unwrap().take().unwrap_or(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() });
         let ast = parser::parse(&lexed, interner, known)?;
         let outside = reads_outside(&disc.text);
         let store = if outside { None } else { Some(ast.clone()) };
