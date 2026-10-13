@@ -66,7 +66,7 @@ def main():
         bases_dir = os.path.join(work, ".lust-cache", "bases")
 
         def base_of(binpath):
-            m = re.search(rb"libbase-[0-9a-f]+\.so", open(binpath, "rb").read())
+            m = re.search(rb"libbase-\d+-[0-9a-f]+\.so", open(binpath, "rb").read())
             return m.group(0).decode() if m else None
 
         bases_before = set(glob.glob(os.path.join(bases_dir, "libbase-*.so")))
@@ -357,6 +357,26 @@ fn grown() -> i64 { 1 }
         rc, out, err = run_lust(["run", rt, "-o", os.path.join(work, "rt.bin")])
         check("session builds after the route fall-back",
               rc == 0 and out == "route 42\n", f"rc={rc} out={out!r} err={err!r}")
+
+        # 11b. A deleted bases dir under a live session heals: outside
+        # tools may delete `.lust-cache` as a cache (the multi-file edit
+        # fuzzer rewrites the crate tree every edit, seed 7 iter 25).
+        # The next build relinks the same base from its objects. A
+        # subdirectory source keeps this check away from section 12's
+        # bases.
+        sub = os.path.join(work, "heal")
+        os.makedirs(sub)
+        heal = os.path.join(sub, "heal.rs")
+        open(heal, "w").write('fn main() { println!("heal {}", 1); }\n')
+        rc, out, err = run_lust(["build", heal, "-o", os.path.join(sub, "h1.bin")])
+        check("vanished bases dir: first build ok", rc == 0, err)
+        shutil.rmtree(os.path.join(sub, ".lust-cache", "bases"))
+        open(heal, "w").write('fn main() { println!("heal {}", 2); }\n')
+        rc, out, err = run_lust(["build", heal, "-o", os.path.join(sub, "h2.bin")])
+        check("vanished bases dir: build still works", rc == 0, err)
+        r = subprocess.run([os.path.join(sub, "h2.bin")], capture_output=True, text=True)
+        check("vanished bases dir: binary runs", r.stdout == "heal 2\n",
+              f"stdout={r.stdout!r} stderr={r.stderr!r}")
 
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases

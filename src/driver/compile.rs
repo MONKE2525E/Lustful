@@ -139,6 +139,15 @@ impl Stats {
     }
 }
 
+/// Unique temp file sequence for base-dir writes in this process. Several
+/// sessions here share one base dir (the warm session and guard workers,
+/// on several threads in one daemon), so a pid alone does not make a
+/// temp name unique.
+fn base_tmp_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// True if `out` exists and still names `soname` (an overwritten output names its newer base instead).
 fn output_names_base(out: &Path, soname: &str) -> bool {
     std::fs::read(out).is_ok_and(|bytes| bytes.windows(soname.len()).any(|w| w == soname.as_bytes()))
@@ -172,6 +181,24 @@ fn resolve_base_dir(caches: &mut Caches, src_file: &Path) -> PathBuf {
     dir
 }
 
+/// Moves a freshly linked base temp file to its final name. If the final
+/// file already exists (same content name, or a concurrent build won
+/// the rename race), the temp copy is dropped.
+fn install_base(tmp: &Path, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        let _ = std::fs::remove_file(tmp);
+        return Ok(());
+    }
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if dest.exists() => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(())
+        }
+        Err(e) => Err(format!("cannot move the base library to {}: {e}", dest.display())),
+    }
+}
+
 /// Records one executable's use of a base in `<base_dir>/manifest`
 /// (`soname <TAB> output` per line), so a later daemon can tell which
 /// base files a kept executable still needs after this daemon is gone.
@@ -183,15 +210,30 @@ fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
     }
 }
 
+/// The pid in a base file name (`libbase-<pid>-<hash>.so`): the process
+/// that built it. Base files are also unique per session instance (the
+/// session's object dir is mixed into the hash), so one session never
+/// links against, and must never delete, another live session's file.
+fn base_owner_pid(soname: &str) -> Option<u32> {
+    let rest = soname.strip_prefix("libbase-")?;
+    let pid = rest.split('-').next()?;
+    if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) { pid.parse().ok() } else { None }
+}
+
 /// Deletes base files in `base_dir` that the manifest proves dead: every
 /// recorded output for the base is gone or now names a different base.
-/// Files with no manifest entry are kept (an entry is appended right
-/// after its executable links, so an unrecorded file may be in use by a
-/// concurrent build). Also deletes half-written rebuild temp files
+/// A base whose owning process is still alive is never deleted: it may
+/// be a live session's current base, which the owner will load on its
+/// next link even if the last executable was overwritten since.
+/// `exiting_pid` names a live-but-exiting owner (this daemon at
+/// shutdown) whose files count as ownerless. Files with no manifest
+/// entry are kept (an entry is appended right after its executable
+/// links, so an unrecorded file may be in use by a concurrent build).
+/// Also deletes half-written rebuild temp files
 /// (`libbase-tmp-<pid>-*.so`) whose pid is gone. The manifest is
-/// rewritten with only the live, deduplicated entries. Called on a
+/// rewritten with only the kept, deduplicated entries. Called on a
 /// session's first base build and on daemon exit.
-pub fn sweep_bases(base_dir: &Path) {
+pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
     // Half-written temp bases from crashed builds. /proc presence is
     // the liveness probe (Linux hosts only; elsewhere the file stays).
     if let Ok(rd) = std::fs::read_dir(base_dir) {
@@ -226,9 +268,14 @@ pub fn sweep_bases(base_dir: &Path) {
             None => entries.push((soname.to_string(), vec![PathBuf::from(out)])),
         }
     }
+    let owner_alive = |soname: &str| match base_owner_pid(soname) {
+        Some(pid) if pid == exiting_pid => false,
+        Some(pid) => pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists(),
+        None => false,
+    };
     let mut kept = String::new();
     for (soname, outs) in &entries {
-        if outs.iter().any(|o| output_names_base(o, soname)) {
+        if owner_alive(soname) || outs.iter().any(|o| output_names_base(o, soname)) {
             for o in outs {
                 kept.push_str(&format!("{soname}\t{}\n", o.to_string_lossy()));
             }
@@ -236,7 +283,7 @@ pub fn sweep_bases(base_dir: &Path) {
             let _ = std::fs::remove_file(base_dir.join(soname));
         }
     }
-    let tmp = base_dir.join(format!("manifest.tmp{}", std::process::id()));
+    let tmp = base_dir.join(format!("manifest.tmp{}-{}", std::process::id(), base_tmp_seq()));
     if std::fs::write(&tmp, kept).is_ok() && std::fs::rename(&tmp, &manifest).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -2486,33 +2533,46 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // each other's base under a running executable.
         let base_dir = resolve_base_dir(caches, &req.file);
         if !caches.base_swept {
-            sweep_bases(&base_dir);
+            sweep_bases(&base_dir, 0);
             caches.base_swept = true;
         }
         let base = if rebuild_base {
             caches.base_gen += 1;
-            let tmp = base_dir.join(format!("libbase-tmp-{}-{}.so", std::process::id(), caches.base_gen));
-            let built = crate::tcc::link_shared(&all_base, &tmp, req.debug).and_then(|_| {
-                let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read {}: {e}", tmp.display()))?;
-                let (a, b) = crate::driver::cache::hash128(&[&bytes], 41);
-                caches.base_name = format!("base-{a:016x}{b:016x}");
-                let soname = format!("lib{}.so", caches.base_name);
-                let dest = base_dir.join(&soname);
-                if dest.exists() {
-                    let _ = std::fs::remove_file(&tmp);
-                } else if let Err(e) = std::fs::rename(&tmp, &dest) {
-                    // A concurrent build may have won the rename race.
-                    if dest.exists() {
-                        let _ = std::fs::remove_file(&tmp);
-                    } else {
-                        return Err(format!("cannot move the base library to {}: {e}", dest.display()));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.so", std::process::id(), caches.base_gen, base_tmp_seq()));
+            let built = std::fs::create_dir_all(&base_dir)
+                .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
+                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
+                .and_then(|_| {
+                    let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read {}: {e}", tmp.display()))?;
+                    // The object dir in the hash makes the name unique to this
+                    // session instance, and the pid names the owning process:
+                    // see `base_owner_pid`.
+                    let (a, b) = crate::driver::cache::hash128(&[&bytes, caches.obj_dir.to_string_lossy().as_bytes()], 41);
+                    caches.base_name = format!("base-{}-{a:016x}{b:016x}", std::process::id());
+                    let soname = format!("lib{}.so", caches.base_name);
+                    install_base(&tmp, &base_dir.join(&soname))?;
+                    if !caches.base_files.contains(&soname) {
+                        caches.base_files.push_back(soname);
                     }
-                }
-                if !caches.base_files.contains(&soname) {
-                    caches.base_files.push_back(soname);
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
+            if built.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            t.lap("link libbase.so");
+            built
+        } else if !caches.base_name.is_empty() && !base_dir.join(format!("lib{}.so", caches.base_name)).exists() {
+            // The base file vanished under a live session. The bases dir
+            // is in `.lust-cache`, state outside tools may delete as a
+            // cache (the edit fuzzer rewrites the crate tree every edit).
+            // The base objects still live in the session object dir, so
+            // relink the same base under the same name.
+            let dest = base_dir.join(format!("lib{}.so", caches.base_name));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.so", std::process::id(), base_tmp_seq()));
+            let built = std::fs::create_dir_all(&base_dir)
+                .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
+                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
+                .and_then(|_| install_base(&tmp, &dest));
             if built.is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
@@ -2595,6 +2655,30 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 mod tests {
     use super::*;
     use crate::intern::Known;
+
+    /// The base sweep never deletes a live owner's base (it may be a live
+    /// session's current base, found by fuzz seed 7 multi when a guard
+    /// session's first-build sweep deleted the warm session's base), but
+    /// deletes a dead owner's, and an exiting owner's when told.
+    #[test]
+    fn sweep_bases_keeps_live_owners() {
+        let dir = std::env::temp_dir().join(format!("lust-basesweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = format!("libbase-{}-aaaa.so", std::process::id());
+        let dead = "libbase-4000000003-bbbb.so";
+        for f in [&mine, &dead.to_string()] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let gone = dir.join("gone.bin");
+        std::fs::write(dir.join("manifest"), format!("{mine}\t{}\n{dead}\t{}\n", gone.display(), gone.display())).unwrap();
+        sweep_bases(&dir, 0);
+        assert!(dir.join(&mine).exists(), "live owner's base kept");
+        assert!(!dir.join(dead).exists(), "dead owner's unreferenced base swept");
+        sweep_bases(&dir, std::process::id());
+        assert!(!dir.join(&mine).exists(), "exiting owner's unreferenced base swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The driver's slot keys and `collect`'s stored def ids are computed in two
     /// places from the same source. They must agree for every function, methods

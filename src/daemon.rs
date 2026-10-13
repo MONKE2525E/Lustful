@@ -166,7 +166,7 @@ fn shutdown(sock: &Path, base: &Path, sessions: &HashMap<SessionKey, Entry>, why
         }
     }
     for dir in &base_dirs {
-        driver::sweep_bases(dir);
+        driver::sweep_bases(dir, std::process::id());
     }
     let _ = std::fs::remove_dir_all(base);
     let _ = std::fs::remove_file(sock);
