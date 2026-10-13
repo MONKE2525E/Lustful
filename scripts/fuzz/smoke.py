@@ -60,7 +60,16 @@ def main():
         check("no Sym(id) in errors", "Sym(" not in err and rc == 1, f"err={err!r}")
 
         # 4. Rebuilding the base library must not change a binary built earlier, and old
-        # base generations must be cleaned up (at most 4 kept).
+        # base generations must be cleaned up (at most 4 kept). Bases live in the
+        # persistent `.lust-cache/bases` dir under content names, not in the
+        # daemon's temp dir, so they survive the daemon (section 12).
+        bases_dir = os.path.join(work, ".lust-cache", "bases")
+
+        def base_of(binpath):
+            m = re.search(rb"libbase-[0-9a-f]+\.so", open(binpath, "rb").read())
+            return m.group(0).decode() if m else None
+
+        bases_before = set(glob.glob(os.path.join(bases_dir, "libbase-*.so")))
         prog = os.path.join(work, "prog.rs")
         open(prog, "w").write('fn val() -> i64 { 1 }\nfn main() { println!("v{}", val()); }\n')
         rc, out, err = run_lust(["build", prog, "-o", os.path.join(work, "p1.bin")])
@@ -81,14 +90,14 @@ def main():
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
         r = subprocess.run([os.path.join(work, "p2.bin")], capture_output=True, text=True)
         check("new binary has new output", r.stdout == "v9\n", r.stdout)
-        per_dir = {}
-        for b in glob.glob(os.path.join(tempfile.gettempdir(), f"lust-daemon-{daemon.pid}", "*", "libbase-*.so")):
-            per_dir.setdefault(os.path.dirname(b), []).append(b)
-        # Per session: the newest 4 generations plus any still referenced by a live binary
-        # (here libbase-1, used by p1.bin). Unreferenced old generations must be gone.
-        worst = max((len(v) for v in per_dir.values()), default=0)
-        check("base generations bounded per session", 0 < worst <= 5,
-              f"per-dir counts: {[len(v) for v in per_dir.values()]}")
+        # This session's bases: the newest 4 generations plus any still referenced by a
+        # live binary (here p1.bin's base). Unreferenced old generations must be gone.
+        new_bases = set(glob.glob(os.path.join(bases_dir, "libbase-*.so"))) - bases_before
+        p1_base = base_of(os.path.join(work, "p1.bin"))
+        check("base generations bounded per session",
+              0 < len(new_bases) <= 5 and p1_base is not None
+              and os.path.exists(os.path.join(bases_dir, p1_base)),
+              f"new bases: {sorted(os.path.basename(b) for b in new_bases)}, p1 base: {p1_base}")
 
         # 5. Regression: a chunk that ends inside a `//` comment must not be reused in front
         # of new text. The `/*` below is inside the line comment, so `b` is real code and
@@ -123,9 +132,10 @@ def main():
         # 7. Routing (S6): two feature selections of one file in one daemon
         # stay in separate sessions, and a repeat selection reuses its own.
         # Proof is the daemon's own session records: one "new session" log
-        # line per key naming a distinct session dir, plus a libbase built in
-        # each of those dirs. Since W-RESOLVE the program also branches on
-        # cfg(feature), so the two binaries must print different lines.
+        # line per key naming a distinct session dir, plus each binary
+        # naming a distinct base library. Since W-RESOLVE the program also
+        # branches on cfg(feature), so the two binaries must print
+        # different lines.
         feat = os.path.join(work, "feat.rs")
         feat_src = ('#[cfg(feature = "alpha")]\nfn which() -> i64 { 11 }\n'
                     '#[cfg(not(feature = "alpha"))]\nfn which() -> i64 { 22 }\n'
@@ -151,9 +161,12 @@ def main():
         check("routing: alpha and beta are separate sessions",
               set(dirs) == {"alpha", "beta"} and dirs.get("alpha") != dirs.get("beta"),
               f"dirs={dirs}")
-        based = {k: bool(glob.glob(os.path.join(v, "libbase-*.so"))) for k, v in dirs.items()}
-        check("routing: each session built its own base", len(based) == 2 and all(based.values()),
-              f"based={based}")
+        fa_base, fb_base = base_of(os.path.join(work, "fa.bin")), base_of(os.path.join(work, "fb.bin"))
+        check("routing: each session built its own base",
+              fa_base is not None and fb_base is not None and fa_base != fb_base
+              and os.path.exists(os.path.join(bases_dir, fa_base))
+              and os.path.exists(os.path.join(bases_dir, fb_base)),
+              f"alpha base={fa_base} beta base={fb_base}")
         r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
         r2 = subprocess.run([os.path.join(work, "fb.bin")], capture_output=True, text=True)
         check("routing: cfg(feature) differs per session",
@@ -344,6 +357,47 @@ fn grown() -> i64 { 1 }
         rc, out, err = run_lust(["run", rt, "-o", os.path.join(work, "rt.bin")])
         check("session builds after the route fall-back",
               rc == 0 and out == "route 42\n", f"rc={rc} out={out!r} err={err!r}")
+
+        # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
+        # executables built against its base libraries still run (bases
+        # live in `.lust-cache/bases`, section 4).
+        daemon_dir = os.path.join(tempfile.gettempdir(), f"lust-daemon-{daemon.pid}")
+        check("temp: daemon temp dir exists while running", os.path.isdir(daemon_dir), daemon_dir)
+        daemon.terminate()
+        daemon.wait(timeout=10)
+        check("temp: daemon temp dir removed on SIGTERM", not os.path.exists(daemon_dir), daemon_dir)
+        r = subprocess.run([os.path.join(work, "p1.bin")], capture_output=True, text=True)
+        check("temp: kept binary still runs after daemon exit", r.stdout == "v1\n",
+              f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        p1_base_path = os.path.join(bases_dir, p1_base) if p1_base else ""
+        check("temp: kept binary's base survives daemon exit",
+              bool(p1_base_path) and os.path.exists(p1_base_path), p1_base_path)
+        # Once the executable is deleted, the next daemon's first base
+        # build sweeps its base via the manifest, while bases of kept
+        # executables (fa.bin) stay.
+        os.remove(os.path.join(work, "p1.bin"))
+        sock2 = os.path.join(work, "d2.sock")
+        env2 = dict(env, LUST_DAEMON_SOCKET=sock2)
+        with open(os.path.join(work, "daemon2.log"), "w") as log2:
+            daemon2 = subprocess.Popen([LUST, "daemon"], cwd=work, env=env2, stderr=log2)
+            try:
+                t0 = time.time()
+                while not os.path.exists(sock2):
+                    if time.time() - t0 > 10 or daemon2.poll() is not None:
+                        break
+                    time.sleep(0.005)
+                open(prog, "w").write('fn val() -> i64 { 10 }\nfn main() { println!("v{}", val()); }\n')
+                r = subprocess.run([LUST, "build", prog, "-o", os.path.join(work, "p3.bin")],
+                                   cwd=work, env=env2, capture_output=True, text=True, timeout=20)
+                check("temp: second daemon builds", r.returncode == 0, r.stderr)
+            finally:
+                daemon2.terminate()
+                daemon2.wait(timeout=10)
+        check("temp: deleted binary's base swept by the next daemon",
+              bool(p1_base_path) and not os.path.exists(p1_base_path), p1_base_path)
+        r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
+        check("temp: another kept binary still runs after the sweep", r.stdout == "feat 11\n",
+              f"stdout={r.stdout!r} stderr={r.stderr!r}")
     finally:
         daemon.terminate()
         log.close()

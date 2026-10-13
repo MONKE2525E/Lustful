@@ -4,6 +4,8 @@
 #   autostart: fresh dir, first build cold and standalone, second build served
 #              by the daemon (its binary loads libbase.so). Plus LUST_NO_DAEMON,
 #              a 4-way start race, and the idle timeout.
+#   temp:      the daemon temp dir dies with the daemon (SIGTERM, SIGINT, idle),
+#              a startup sweep removes SIGKILL leftovers, kept binaries still run.
 #   cache:     hit, then miss on edit, on -g, and on a compiler id change.
 #              Eviction keeps the newest entries under the size cap.
 #   release:   single file via rustc, a tiny Cargo project via cargo (package
@@ -128,6 +130,80 @@ if [ -S "$(sock "$d")" ]; then bad "idle: socket removed on exit" "socket still 
 (cd "$d" && LUST_DAEMON_IDLE=0 "$lust" check hello.rs) >/dev/null 2>&1
 check "idle: next command works and restarts a daemon" wait_socket "$d"
 stop_daemon "$d"; sleep 0.3
+
+# ---------------------------------------------------------- temp cleanup
+# The daemon's temp dir (/tmp/lust-daemon-<pid>) must die with the daemon
+# on every exit path, and executables built against its base libraries
+# must keep running (bases live in .lust-cache/bases, not in temp space).
+# A private TMPDIR keeps these checks exact and fast.
+saved_tmpdir=${TMPDIR:-}
+export TMPDIR=$work/td; mkdir -p "$TMPDIR"
+wait_gone() { # wait_gone <path>
+  local i
+  for i in $(seq 1 100); do [ ! -e "$1" ] && return 0; sleep 0.05; done
+  return 1
+}
+wait_dead_pid() { # wait_dead_pid <pid>
+  local i
+  for i in $(seq 1 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.05; done
+  return 1
+}
+# warm_build <dir> <out> : cold build (starts a daemon), then a daemon build to <out>.
+warm_build() {
+  (cd "$1" && "$lust" build hello.rs -o warm1) >/dev/null 2>&1
+  wait_socket "$1" >/dev/null
+  (cd "$1" && "$lust" build hello.rs -o "$2") >/dev/null 2>&1
+}
+for sig in TERM INT; do
+  d=$(fresh tmp$sig); daemon_dirs+=("$d")
+  warm_build "$d" warm2
+  pid=$(cat "$(sock "$d").lock" 2>/dev/null)
+  check "temp $sig: temp dir exists while daemon runs" test -d "$TMPDIR/lust-daemon-$pid"
+  kill -"$sig" "$pid" 2>/dev/null
+  check "temp $sig: daemon exits" wait_dead_pid "$pid"
+  if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp $sig: temp dir removed on exit"; else bad "temp $sig: temp dir removed on exit" "$TMPDIR/lust-daemon-$pid remains"; fi
+  if [ -S "$(sock "$d")" ]; then bad "temp $sig: socket removed on exit" "socket still there"; else ok "temp $sig: socket removed on exit"; fi
+  check "temp $sig: daemon-built binary still runs" test "$("$d/warm2")" = "hello 42"
+done
+# Idle exit also removes the temp dir (directory checked here; the
+# socket and restart behavior are covered in the idle section above).
+d=$(fresh tmpidle); daemon_dirs+=("$d")
+(cd "$d" && LUST_DAEMON_IDLE=1 "$lust" check hello.rs) >/dev/null 2>&1
+wait_socket "$d" >/dev/null
+pid=$(cat "$(sock "$d").lock" 2>/dev/null)
+check "temp idle: daemon exits" wait_dead_pid "$pid"
+if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp idle: temp dir removed on exit"; else bad "temp idle: temp dir removed on exit" "dir remains"; fi
+# SIGKILL cannot clean up; the next daemon's startup sweep does, and a
+# kept binary survives both (its base is not in the temp dir).
+d=$(fresh tmpkill); daemon_dirs+=("$d")
+warm_build "$d" warm2
+pid=$(cat "$(sock "$d").lock" 2>/dev/null)
+kill -9 "$pid" 2>/dev/null
+wait_dead_pid "$pid" >/dev/null
+check "temp kill: temp dir left by SIGKILL" test -d "$TMPDIR/lust-daemon-$pid"
+mkdir -p "$TMPDIR/lust-daemon-4000000002" "$TMPDIR/lust-4000000002"
+touch "$TMPDIR/lust-daemon-4000000002/x.o" "$TMPDIR/lust-rustc-check-4000000002.rmeta"
+mkdir -p "$TMPDIR/lust-daemon-$$"
+d2=$(fresh tmpsweep); daemon_dirs+=("$d2")
+(cd "$d2" && "$lust" check hello.rs) >/dev/null 2>&1
+wait_socket "$d2" >/dev/null
+if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp sweep: SIGKILLed daemon dir swept at startup"; else bad "temp sweep: SIGKILLed daemon dir swept at startup" "dir remains"; fi
+if wait_gone "$TMPDIR/lust-daemon-4000000002" && wait_gone "$TMPDIR/lust-4000000002" && wait_gone "$TMPDIR/lust-rustc-check-4000000002.rmeta"; then
+  ok "temp sweep: dead-pid lust dirs and files swept"
+else
+  bad "temp sweep: dead-pid lust dirs and files swept" "a dead entry remains"
+fi
+check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$$"
+rm -rf "$TMPDIR/lust-daemon-$$"
+check "temp sweep: kept binary still runs after sweep" test "$("$d/warm2")" = "hello 42"
+stop_daemon "$d2"; sleep 0.3
+# A cold one-shot build leaves no temp dir either (the cached runtime
+# object file is intentional; only directories count here).
+d=$(fresh tmpcold)
+(cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o cold1) >/dev/null 2>&1
+if [ -z "$(find "$TMPDIR" -mindepth 1 -type d -print -quit)" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "a dir remains in TMPDIR"; fi
+check "temp cold: binary runs" test "$("$d/cold1")" = "hello 42"
+if [ -n "$saved_tmpdir" ]; then export TMPDIR=$saved_tmpdir; else unset TMPDIR; fi
 
 # -------------------------------------------------------------------- cache
 d=$(fresh cache)
