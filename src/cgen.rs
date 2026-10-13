@@ -466,6 +466,11 @@ struct FnGen<'b, 'p, 'a> {
     /// into a compile error if a future move form (for example a
     /// `Box` deref move) reaches code generation first.
     bad_move: bool,
+    /// The first fn this body calls, takes as a fn pointer, or puts
+    /// in a vtable that has no generated body (`has_generated_body`).
+    /// Its slot would stay empty, so the call would read garbage or
+    /// jump to null: `gen_fn` reports it as an internal error instead.
+    bad_callee: Option<LocalDefId>,
     /// Locals that hold one constant array index (see
     /// `borrowck::const_index_locals`): a move out of `a[c]` is a
     /// partial move like a field move.
@@ -846,6 +851,27 @@ fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
     c_size_align(p, &cty(&p.tys, p.fn_info(f).ret)).0 > 32
 }
 
+/// True when `f` gets C of its own: a plain fn, an instance, or a
+/// closure body fn, with a source body. A template or a trait
+/// method stub is never generated, and an instance of a trait method
+/// declaration has nothing to generate, so their slots stay empty.
+fn has_generated_body(p: &Program, f: LocalDefId) -> bool {
+    use crate::check::generics::FnClass;
+    let concrete = matches!(p.gx.fn_class.get(f.0 as usize), None | Some(FnClass::Plain | FnClass::Instance | FnClass::Closure));
+    concrete && p.fn_info(f).def.body.is_some()
+}
+
+/// The driver-facing message for `FnGen::bad_callee`: `f` (the body
+/// being generated or its callee) has no generated body.
+fn no_body_error(p: &Program, body: &Body, f: LocalDefId) -> String {
+    let class = p.gx.fn_class.get(f.0 as usize).copied().unwrap_or_default();
+    format!(
+        "internal: code generation for `{}`: `{}` ({class:?}) has no generated body, so its fn slot would be empty",
+        p.display_path(p.fn_info(body.fn_id).name),
+        p.display_path(p.fn_info(f).name)
+    )
+}
+
 /// `(RET (*)(PARAMS))`, the cast that calls function `f` through the table.
 /// A large return becomes `(void (*)(RET*, PARAMS))` (see `ret_is_large`).
 fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
@@ -900,6 +926,9 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
 /// file that defines it; `slots` maps every LocalDefId to its slot in `lust_fns`.
 pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
+    if !has_generated_body(p, body.fn_id) {
+        return FnOut { error: Some(no_body_error(p, body, body.fn_id)), ..Default::default() };
+    }
     // Iterator builtins become plain IR first (W-STD-A, lower/iter.rs).
     let expanded;
     let body = match crate::lower::iter::expand(p, body) {
@@ -922,6 +951,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         local_drop,
         move_paths: vec![Vec::new(); n_locals],
         bad_move: false,
+        bad_callee: None,
         const_index: crate::borrowck::const_index_locals(body),
         map,
         sig_types: HashSet::new(),
@@ -939,6 +969,9 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     g.function();
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
+    }
+    if let Some(f) = g.bad_callee {
+        return FnOut { error: Some(no_body_error(p, body, f)), ..Default::default() };
     }
     if !g.prelude.is_empty() {
         g.out = std::mem::take(&mut g.prelude) + &g.out;
@@ -1656,12 +1689,21 @@ impl FnGen<'_, '_, '_> {
 
     // ---------- Rvalues ----------
 
+    /// Records `f` as `bad_callee` when its slot will have no C: every
+    /// reference to another fn's slot goes through here first.
+    fn note_callee(&mut self, f: LocalDefId) {
+        if self.bad_callee.is_none() && !has_generated_body(self.p, f) {
+            self.bad_callee = Some(f);
+        }
+    }
+
     /// The C text of one call's result value. Every user fn call goes through
     /// `lust_fns`, so a changed function can be swapped in without relinking
     /// its callers.
     fn call_value(&mut self, target: CallTarget, args: &[Operand], dest_cty: &CTy, loc: &str, post: &mut Vec<String>) -> String {
         match target {
             CallTarget::Fn(f) => {
+                self.note_callee(f);
                 let info = self.p.fn_info(f);
                 for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
                     let ct = cty(&self.p.tys, t);
@@ -2084,6 +2126,7 @@ impl FnGen<'_, '_, '_> {
                 let t = cty(&self.body.tys, *ty);
                 match t {
                     CTy::FnPtr(..) => {
+                        self.note_callee(*f);
                         collect_types(&t, &mut self.sig_types);
                         format!("(({})lust_tramps[{}])", ctype(&t), self.slots[f.0 as usize])
                     }
@@ -2184,6 +2227,7 @@ impl FnGen<'_, '_, '_> {
     /// method's with `void *` for the receiver; dyn call sites cast the
     /// entry to that shape.
     fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId) -> String {
+        self.note_callee(f);
         let p = self.p;
         let info = p.fn_info(f);
         for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
@@ -4991,6 +5035,11 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     // (W-TRAITS-CORE through W-CGEN: the glue reads
                     // the instance from `Program::gx.drop_methods`).
                     if let Some(&drop_fn) = p.gx.drop_methods.get(a) {
+                        // Glue has no error channel: a drop fn with an
+                        // empty slot fails the C build instead.
+                        if !has_generated_body(p, drop_fn) {
+                            let _ = writeln!(body, "#error \"internal: drop glue calls a fn with no generated body\"");
+                        }
                         let _ = writeln!(body, "  ({}lust_fns[{}])(p);", fn_ptr_cast(p, drop_fn), slots[drop_fn.0 as usize]);
                     }
                     let adt = p.adt(*a);
@@ -5670,6 +5719,60 @@ mod tests {
         let err = out.error.expect("a deref part move is a code generation error");
         assert!(err.contains("drop elaboration cannot track"), "{err}");
         assert!(out.code.is_empty(), "no code is emitted for a bad move body");
+    }
+
+    /// A trait method stub and a template are never generated, so
+    /// their fn slots stay empty. A call into one (here hand-built:
+    /// check routes no call there) is an internal error in
+    /// `FnOut::error`, never C that calls an empty slot. Generating
+    /// the stub itself is the same error.
+    #[test]
+    fn call_to_fn_without_body_is_an_error() {
+        let src = "trait Tr { fn go(&self) -> i32; fn dflt(&self) -> i32 { 100 } }\nstruct A;\n\
+                   impl Tr for A { fn go(&self) -> i32 { 1 } }\nfn main() { println!(\"{}\", A.go()); }\n";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let main = program.main.unwrap();
+        let slots: Vec<u32> = (0..program.fns.len() as u32).collect();
+        let named = |class: crate::check::generics::FnClass, name: &str| {
+            (0..program.fns.len() as u32)
+                .map(LocalDefId)
+                .find(|&f| program.gx.fn_class[f.0 as usize] == class && interner.get(program.fn_info(f).name) == name)
+                .unwrap()
+        };
+        let stub = named(crate::check::generics::FnClass::Stub, "go");
+        let template = named(crate::check::generics::FnClass::Template, "dflt");
+        let lowered = || {
+            let (ck, errs) = check_fn(&program, main);
+            assert!(errs.is_empty(), "{errs:?}");
+            crate::lower::lower(&program, main, ck)
+        };
+        assert!(gen_fn(&program, &lowered(), &map, 1, &slots).error.is_none(), "the lowered body is fine");
+        for callee in [stub, template] {
+            let mut bad = lowered();
+            let mut calls = 0;
+            for b in &mut bad.blocks {
+                if let Terminator::Call { target: CallTarget::Fn(f), .. } = &mut b.term {
+                    *f = callee;
+                    calls += 1;
+                }
+            }
+            assert_eq!(calls, 1, "main calls `go` once");
+            let out = gen_fn(&program, &bad, &map, 1, &slots);
+            let err = out.error.expect("a call to a fn without a body is a code generation error");
+            assert!(err.starts_with("internal:") && err.contains("has no generated body"), "{err}");
+            assert!(out.code.is_empty(), "no code is emitted for the caller");
+        }
+        let mut own = lowered();
+        own.fn_id = stub;
+        let err = gen_fn(&program, &own, &map, 1, &slots).error.expect("a stub is never generated");
+        assert!(err.contains("has no generated body"), "{err}");
     }
 
     /// Derived glue regenerates when a field type changes under the

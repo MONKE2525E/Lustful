@@ -127,8 +127,9 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
             lw.bind_pat(pat, Place::local(arg));
         }
     }
-    // The parser only builds fns with bodies today; a declaration shape
-    // lowers to an empty return so this can never panic.
+    // A declaration shape (a trait method with no body) lowers to an
+    // empty return so this can never panic; cgen refuses to generate
+    // it or any call to it (`cgen::has_generated_body`).
     let (span, body) = match f.def.body {
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
