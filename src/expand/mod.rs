@@ -851,6 +851,11 @@ pub struct Expander<'a> {
     textual: Vec<(Sym, u32)>,
     /// Names brought in by `use` in scope here, same order rule.
     imports: Vec<(Sym, u32)>,
+    /// `use std::vec as v;` style renames of builtin macros seen
+    /// during the walk: bound name to canonical macro name.
+    builtin_imports: Vec<(Sym, Sym)>,
+    /// The same, per module, from the prescan.
+    module_builtin_alias: FxMap<(Vec<Sym>, Sym), Sym>,
     /// `#[macro_export]` macros, visible by name at the crate root.
     exported: FxMap<Sym, u32>,
     /// Macros addressable by module path (a `pub use` made them so).
@@ -888,6 +893,8 @@ impl<'a> Expander<'a> {
             defs: Vec::new(),
             textual: Vec::new(),
             imports: Vec::new(),
+            builtin_imports: Vec::new(),
+            module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
             by_path: FxMap::default(),
             module_defs: FxMap::default(),
@@ -1423,6 +1430,10 @@ impl<'a> Expander<'a> {
         for (module, segs, leading, alias, _) in &uses {
             if let Some(idx) = self.resolve_for_use(segs, *leading, module) {
                 self.module_imports.insert((module.clone(), *alias), idx);
+            } else if self.ctx.interner.get(*alias) != "_"
+                && let Some(canon) = self.std_builtin_macro(segs)
+            {
+                self.module_builtin_alias.insert((module.clone(), *alias), canon);
             }
         }
         Ok(())
@@ -2522,6 +2533,27 @@ impl<'a> Expander<'a> {
         Some(end)
     }
 
+    /// The canonical builtin macro a `use` path names, when the
+    /// path is an exact canonical std macro path lust expands by
+    /// that name (`std::vec`, `core::panic`).
+    fn std_builtin_macro(&self, segs: &[Seg]) -> Option<Sym> {
+        let path: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Macro) {
+            return None;
+        }
+        let last = segs.last()?;
+        (builtin::is_token_builtin(&last.text) || builtin::is_passthrough(&last.text)).then_some(last.sym)
+    }
+
+    /// The builtin macro a plain call name was bound to by a std
+    /// macro import rename, if any. Latest binding wins.
+    fn builtin_alias_of(&self, name: Sym) -> Option<Sym> {
+        if let Some(&(_, canon)) = self.builtin_imports.iter().rev().find(|(n, _)| *n == name) {
+            return Some(canon);
+        }
+        self.module_builtin_alias.get(&(self.module.clone(), name)).copied()
+    }
+
     /// Records `alias` for the macro `segs` names, if it names one.
     fn import_macro(&mut self, segs: &[Seg], leading_colon: bool, alias: Sym, public: bool) {
         if segs.is_empty() {
@@ -2534,6 +2566,10 @@ impl<'a> Expander<'a> {
             if public {
                 self.by_path.insert((self.module.clone(), alias), idx);
             }
+        } else if self.ctx.interner.get(alias) != "_"
+            && let Some(canon) = self.std_builtin_macro(segs)
+        {
+            self.builtin_imports.push((alias, canon));
         }
     }
 
@@ -2553,7 +2589,13 @@ impl<'a> Expander<'a> {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
         }
-        let name = call.name_text().to_string();
+        // A plain name bound by a std macro import rename expands
+        // exactly as the canonical builtin name.
+        let alias = if call.segs.len() == 1 && !call.leading_colon { self.builtin_alias_of(call.segs[0].sym) } else { None };
+        let name = match alias {
+            Some(canon) => self.ctx.interner.get(canon).to_string(),
+            None => call.name_text().to_string(),
+        };
         let std_prefixed = matches!(call.segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc"));
         if call.segs.len() == 1 || std_prefixed {
             if builtin::is_token_builtin(&name) {
@@ -2568,6 +2610,14 @@ impl<'a> Expander<'a> {
                 let cost = if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format") { 2 } else { 1 };
                 let head = &call.head[call.head.len().saturating_sub(2)..];
                 let mut out: Vec<Tt> = head.to_vec();
+                // A renamed call keeps the canonical head name:
+                // the parser owns only the plain builtin spellings.
+                if let Some(canon) = alias
+                    && let Some(Tt::Tok(tok)) = out.first_mut()
+                    && matches!(tok.tok, Tok::Ident(_))
+                {
+                    tok.tok = Tok::Ident(canon);
+                }
                 let written_lit = is_str_lit_arg(&call.inner);
                 let mut inner = self.expand_list(call.inner.clone(), depth + cost, false, false, 0)?;
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {

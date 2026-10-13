@@ -3706,6 +3706,9 @@ struct Frame {
     locals: Vec<Sym>,
     /// Function-local imports: (name, namespace index) to target.
     imports: FxMap<(Sym, usize), LocalBind>,
+    /// Function-local `use std::... [as Name]` imports, in the
+    /// shape of `ResolvedTables::std_aliases`.
+    std_imports: FxMap<(Sym, usize), Vec<Sym>>,
     /// Names bound at explicit rank in this frame, by an explicit `use`
     /// or a nested item: a second explicit binding of one name in one
     /// namespace is a duplicate, where a glob binding is not.
@@ -3753,12 +3756,12 @@ impl Rewrite<'_> {
                 crate::ast::GenericParam::Type { bounds, default, span, .. } => {
                     self.bounds(ast, bounds, *span, module);
                     if let Some(d) = *default {
-                        self.ty(ast, d, module);
+                        self.ty(ast, d, module, &[]);
                     }
                 }
                 crate::ast::GenericParam::Const { ty, .. } => {
                     let ty = *ty;
-                    self.ty(ast, ty, module);
+                    self.ty(ast, ty, module, &[]);
                 }
                 crate::ast::GenericParam::Lifetime { .. } => {}
             }
@@ -3766,7 +3769,7 @@ impl Rewrite<'_> {
         for pred in w.preds.iter_mut() {
             if let crate::ast::WherePred::Type { ty, bounds, .. } = pred {
                 let ty = *ty;
-                self.ty(ast, ty, module);
+                self.ty(ast, ty, module, &[]);
                 self.bounds(ast, bounds, w.span, module);
             }
         }
@@ -3787,7 +3790,7 @@ impl Rewrite<'_> {
                         VariantFields::Unit => Vec::new(),
                     };
                     for t in fields {
-                        self.ty(ast, t, module);
+                        self.ty(ast, t, module, &[]);
                     }
                 }
                 ItemKind::Enum(e) => {
@@ -3803,7 +3806,7 @@ impl Rewrite<'_> {
                         }
                     }
                     for t in tys {
-                        self.ty(ast, t, module);
+                        self.ty(ast, t, module, &[]);
                     }
                     let mut scopes = vec![Frame::default()];
                     for d in discs {
@@ -3816,17 +3819,17 @@ impl Rewrite<'_> {
                         let span = imp.span;
                         self.rewrite_path(&mut tr.path, Namespace::Type, span, module, &[], ast);
                     }
-                    self.ty(ast, imp.self_ty, module);
+                    self.ty(ast, imp.self_ty, module, &[]);
                     for at in imp.types.iter_mut() {
                         self.bounds(ast, &mut at.bounds, at.span, module);
                         self.generics(ast, &mut at.generics, &mut at.where_clause, module);
                         if let Some(d) = at.default {
-                            self.ty(ast, d, module);
+                            self.ty(ast, d, module, &[]);
                         }
                     }
                     let const_tys: Vec<crate::ast::TyId> = imp.consts.iter().map(|c| c.ty).collect();
                     for t in const_tys {
-                        self.ty(ast, t, module);
+                        self.ty(ast, t, module, &[]);
                     }
                     let mut fns = std::mem::take(&mut imp.fns);
                     for f in &mut fns {
@@ -3841,12 +3844,12 @@ impl Rewrite<'_> {
                         self.bounds(ast, &mut at.bounds, at.span, module);
                         self.generics(ast, &mut at.generics, &mut at.where_clause, module);
                         if let Some(d) = at.default {
-                            self.ty(ast, d, module);
+                            self.ty(ast, d, module, &[]);
                         }
                     }
                     let const_tys: Vec<crate::ast::TyId> = t.consts.iter().map(|c| c.ty).collect();
                     for ty in const_tys {
-                        self.ty(ast, ty, module);
+                        self.ty(ast, ty, module, &[]);
                     }
                     let mut fns = std::mem::take(&mut t.fns);
                     for f in &mut fns {
@@ -3855,14 +3858,14 @@ impl Rewrite<'_> {
                     t.fns = fns;
                 }
                 ItemKind::Const(c) => {
-                    self.ty(ast, c.ty, module);
+                    self.ty(ast, c.ty, module, &[]);
                     if let Some(v) = c.value {
                         let mut scopes = vec![Frame::default()];
                         self.expr(ast, v, module, &mut scopes);
                     }
                 }
                 ItemKind::Static(s) => {
-                    self.ty(ast, s.ty, module);
+                    self.ty(ast, s.ty, module, &[]);
                     if let Some(v) = s.value {
                         let mut scopes = vec![Frame::default()];
                         self.expr(ast, v, module, &mut scopes);
@@ -3870,7 +3873,7 @@ impl Rewrite<'_> {
                 }
                 ItemKind::Type(a) => {
                     self.generics(ast, &mut a.generics, &mut a.where_clause, module);
-                    self.ty(ast, a.ty, module);
+                    self.ty(ast, a.ty, module, &[]);
                 }
                 ItemKind::Mod(m) => {
                     let mut key = prefix.to_vec();
@@ -3889,10 +3892,10 @@ impl Rewrite<'_> {
         self.generics(ast, &mut def.generics, &mut def.where_clause, module);
         for p in &def.params {
             let t = p.ty;
-            self.ty(ast, t, module);
+            self.ty(ast, t, module, &[]);
         }
         if let Some(t) = def.ret {
-            self.ty(ast, t, module);
+            self.ty(ast, t, module, &[]);
         }
         if let Some(body) = def.body {
             let mut scopes = vec![Frame::default()];
@@ -4061,6 +4064,57 @@ impl Rewrite<'_> {
         }
     }
 
+    /// Expands a path whose first segment is bound by a std import
+    /// (`use std::option::Option as O2`, `use std::mem as m`) back
+    /// to the canonical written std path. Function-local target
+    /// imports and explicit module bindings already resolved by
+    /// `resolve` keep the name; a glob binding (rank 1) loses to
+    /// the explicit std import, as in Rust. The asked namespace
+    /// wins, with the others as a fallback for the paths that probe
+    /// two namespaces (variant constructors in patterns).
+    fn expand_std_alias(&self, segs: &mut Vec<PathSeg>, names: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> bool {
+        let Some(&first) = names.first() else { return false };
+        if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self") {
+            return false;
+        }
+        let asked = if names.len() > 1 { Namespace::Type } else { ns };
+        let asked_idx = ns_index(asked);
+        if scopes.iter().rev().any(|f| f.imports.contains_key(&(first, asked_idx))) {
+            return false;
+        }
+        if matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank >= 2) {
+            return false;
+        }
+        let mut order = [asked_idx; 3];
+        let mut n_order = 1;
+        for idx in [ns_index(Namespace::Type), ns_index(Namespace::Value), ns_index(Namespace::Macro)] {
+            if !order[..n_order].contains(&idx) {
+                order[n_order] = idx;
+                n_order += 1;
+            }
+        }
+        let alias = scopes
+            .iter()
+            .rev()
+            .flat_map(|f| order[..n_order].iter().filter_map(move |&idx| f.std_imports.get(&(first, idx))))
+            .next()
+            .or_else(|| {
+                order[..n_order]
+                    .iter()
+                    .filter_map(|&idx| self.tables.std_aliases.get(&(module, idx as u8, first)).map(|(_, p)| p))
+                    .next()
+            });
+        let Some(alias) = alias else { return false };
+        let mut out: Vec<PathSeg> = alias.iter().map(|s| PathSeg::plain(*s)).collect();
+        // Turbofish on the imported name belongs on the aliased item.
+        if let Some(last) = out.last_mut() {
+            last.args = segs[0].args.clone();
+        }
+        out.extend(segs.iter().skip(1).cloned());
+        *segs = out;
+        true
+    }
+
     /// Rewrites one written path (segments borrowed out of the arena by
     /// the caller, then put back through `set`).
     fn rewrite_path(&mut self, segs: &mut Vec<PathSeg>, ns: Namespace, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
@@ -4072,7 +4126,7 @@ impl Rewrite<'_> {
             collect_arg_consts(&s.args, &mut consts);
         }
         for t in tys {
-            self.ty(ast, t, module);
+            self.ty(ast, t, module, scopes);
         }
         // A const argument's paths resolve like an array length's:
         // in this module, with no locals in scope.
@@ -4096,6 +4150,9 @@ impl Rewrite<'_> {
         }
         let (res, local) = self.resolve(&names, ns, module, scopes);
         if !local {
+            if self.expand_std_alias(segs, &names, ns, module, scopes) {
+                return;
+            }
             // Lexical scope (section 1.3): an unqualified name that only
             // another module defines is not found here, even though the
             // merged flat tables could answer it. Names no module
@@ -4141,31 +4198,33 @@ impl Rewrite<'_> {
     }
 
     /// Rewrites the type at `id`, recursing into compound types.
-    fn ty(&mut self, ast: &mut Ast, id: TyId, module: ModuleId) {
+    /// Body callers pass their frames so a function-local `use`
+    /// binds in type positions too; item signatures pass none.
+    fn ty(&mut self, ast: &mut Ast, id: TyId, module: ModuleId, scopes: &[Frame]) {
         match ast.ty(id) {
             TyExpr::Path(_) => {
                 let span = ast.ty_span(id);
                 let TyExpr::Path(mut segs) = std::mem::replace(&mut ast.tys[id.0 as usize], TyExpr::Unit) else { return };
-                self.rewrite_path(&mut segs, Namespace::Type, span, module, &[], ast);
+                self.rewrite_path(&mut segs, Namespace::Type, span, module, scopes, ast);
                 ast.tys[id.0 as usize] = TyExpr::Path(segs);
             }
             TyExpr::Ref { inner, .. } => {
                 let inner = *inner;
-                self.ty(ast, inner, module);
+                self.ty(ast, inner, module, scopes);
             }
             TyExpr::Tuple(ts) => {
                 let ts = ts.clone();
                 for t in ts {
-                    self.ty(ast, t, module);
+                    self.ty(ast, t, module, scopes);
                 }
             }
             TyExpr::Slice(inner) | TyExpr::Paren(inner) | TyExpr::Ptr { inner, .. } => {
                 let inner = *inner;
-                self.ty(ast, inner, module);
+                self.ty(ast, inner, module, scopes);
             }
             TyExpr::Array { inner, len } => {
                 let (inner, len) = (*inner, *len);
-                self.ty(ast, inner, module);
+                self.ty(ast, inner, module, scopes);
                 let mut scopes = vec![Frame::default()];
                 self.expr(ast, len, module, &mut scopes);
             }
@@ -4185,18 +4244,18 @@ impl Rewrite<'_> {
                     return;
                 };
                 let (mut trait_path, segs) = (trait_path, segs);
-                self.ty(ast, self_ty, module);
-                self.rewrite_path(&mut trait_path, Namespace::Type, span, module, &[], ast);
+                self.ty(ast, self_ty, module, scopes);
+                self.rewrite_path(&mut trait_path, Namespace::Type, span, module, scopes, ast);
                 ast.tys[id.0 as usize] = TyExpr::QPath { self_ty, trait_path, segs };
             }
             TyExpr::FnPtr { inputs, ret, .. } => {
                 let ins: Vec<TyId> = inputs.iter().map(|p| p.ty).collect();
                 let ret = *ret;
                 for t in ins {
-                    self.ty(ast, t, module);
+                    self.ty(ast, t, module, scopes);
                 }
                 if let Some(r) = ret {
-                    self.ty(ast, r, module);
+                    self.ty(ast, r, module, scopes);
                 }
             }
             _ => {}
@@ -4213,7 +4272,7 @@ impl Rewrite<'_> {
             match stmt {
                 Stmt::Let { pat, ty, init, els, attrs, span } => {
                     if let Some(t) = ty {
-                        self.ty(ast, t, module);
+                        self.ty(ast, t, module, scopes);
                     }
                     if let Some(e) = init {
                         self.expr(ast, e, module, scopes);
@@ -4324,7 +4383,7 @@ impl Rewrite<'_> {
                 }
                 ImportKind::Single { path, name } => {
                     if path.len() == 1 {
-                        self.check_local_single_use(&path, name, imp.leading_colon, module, span);
+                        self.check_local_single_use(&path, name, imp.leading_colon, module, span, scopes);
                         continue;
                     }
                     // `use super::super as x;` and kin: the whole path is
@@ -4422,7 +4481,21 @@ impl Rewrite<'_> {
                                 ));
                             }
                         }
-                        PathRes::Done(Target::Extern(_)) => {}
+                        PathRes::Done(Target::Extern(i)) => {
+                            if self.tables.externs[i as usize].is_std_lib
+                                && self.tables.externs[i as usize].unsupported.is_none()
+                                && self.interner.get(name) != "_"
+                                && let Some(nss) = crate::resolve::imports::std_import_namespaces(self.interner, &path)
+                            {
+                                let mut dup = false;
+                                for ns in nss {
+                                    dup |= insert_local_std(scopes, name, ns, path.clone());
+                                }
+                                if dup {
+                                    self.push_local_dup(span, name);
+                                }
+                            }
+                        }
                         _ => {
                             self.diags.push(Diag::new(
                                 "L0506",
@@ -4506,8 +4579,10 @@ impl Rewrite<'_> {
     /// Checks a one-segment function-local import (`use a;`, `use self;`,
     /// `use crate as x;`). These bind nothing the later walk needs (the
     /// name reads through the module tables), but a bad one is still an
-    /// error in rustc, so it is validated and only that.
-    fn check_local_single_use(&mut self, path: &[Sym], name: Sym, leading: bool, module: ModuleId, span: Span) {
+    /// error in rustc, so it is validated and only that. A renamed
+    /// std crate root (`use std as s;`) is the exception: it records
+    /// a local std alias.
+    fn check_local_single_use(&mut self, path: &[Sym], name: Sym, leading: bool, module: ModuleId, span: Span, scopes: &mut [Frame]) {
         let seg = path[0];
         let self_sym = self.interner.intern("self");
         let crate_sym = self.interner.intern("crate");
@@ -4522,6 +4597,18 @@ impl Rewrite<'_> {
                 ));
             } else if !matches!(self.tables.resolve_module_path(module, path, leading, self.interner), PathRes::Done(_)) {
                 self.push_unresolved_use(span, path);
+            }
+            return;
+        }
+        if let PathRes::Done(Target::Extern(i)) =
+            self.tables.resolve_path(module, path, Namespace::Type, PathMode::Use, leading, self.interner)
+        {
+            if self.tables.externs[i as usize].is_std_lib
+                && self.tables.externs[i as usize].unsupported.is_none()
+                && self.interner.get(name) != "_"
+                && insert_local_std(scopes, name, Namespace::Type, path.to_vec())
+            {
+                self.push_local_dup(span, name);
             }
             return;
         }
@@ -4667,7 +4754,7 @@ impl Rewrite<'_> {
         match ast.exprs[id.0 as usize].kind_children() {
             ExprKids { blocks, exprs, pats_with_scope, ty } => {
                 if let Some(t) = ty {
-                    self.ty(ast, t, module);
+                    self.ty(ast, t, module, scopes);
                 }
                 for e in exprs {
                     self.expr(ast, e, module, scopes);
@@ -4731,6 +4818,20 @@ fn collect_arg_tys(args: &GenericArgs, out: &mut Vec<TyId>) {
 /// Inserts one function-local import binding. Returns true when an
 /// explicit (rank 2) import rebinds a name an earlier explicit local
 /// import already bound in this frame: a duplicate import (E0252).
+/// Records one function-local std import alias at explicit rank.
+/// Returns true when the name was already bound explicitly in
+/// this frame and namespace (the caller reports a duplicate).
+fn insert_local_std(scopes: &mut [Frame], name: Sym, ns: Namespace, path: Vec<Sym>) -> bool {
+    let Some(frame) = scopes.last_mut() else { return false };
+    let key = (name, ns_index(ns));
+    if frame.explicit.contains(&key) {
+        return true;
+    }
+    frame.explicit.push(key);
+    frame.std_imports.insert(key, path);
+    false
+}
+
 fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind, rank: u8) -> bool {
     let Some(frame) = scopes.last_mut() else { return false };
     let key = (name, ns_index(ns));
@@ -4779,7 +4880,9 @@ trait ShallowScopes {
 
 impl ShallowScopes for [Frame] {
     fn to_vec_shallow(&self) -> Vec<Frame> {
-        self.iter().map(|f| Frame { locals: f.locals.clone(), imports: f.imports.clone(), explicit: f.explicit.clone() }).collect()
+        self.iter()
+            .map(|f| Frame { locals: f.locals.clone(), imports: f.imports.clone(), std_imports: f.std_imports.clone(), explicit: f.explicit.clone() })
+            .collect()
     }
 }
 

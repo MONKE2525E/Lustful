@@ -198,6 +198,12 @@ pub struct ResolvedTables {
     /// the defining crate's root even when it is not a direct dependency
     /// of the expanding crate.
     pub crate_magic: FxMap<Sym, ModuleId>,
+    /// `use std::... [as Name]` bindings: (module, namespace index,
+    /// bound name) -> the import's visibility and the canonical
+    /// std path the name stands for. Std items have no local def
+    /// to bind, so the rewrite pass expands the name back to the
+    /// written path check reads.
+    pub std_aliases: FxMap<(ModuleId, u8, Sym), (VisKind, Vec<Sym>)>,
 }
 
 impl ResolvedTables {
@@ -228,6 +234,7 @@ impl ResolvedTables {
             flat: Default::default(),
             fn_module: Vec::new(),
             crate_magic: FxMap::default(),
+            std_aliases: FxMap::default(),
         }
     }
 
@@ -598,6 +605,17 @@ impl ResolvedTables {
             fold!(0x46, |h: &mut crate::intern::FxHasher| {
                 h.write_u64(magic.0 as u64);
                 h.write_u64(root.0 as u64);
+            });
+        }
+        for ((module, ns, name), (v, path)) in &self.std_aliases {
+            fold!(0x47, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(module.0 as u64);
+                h.write_u64(*ns as u64);
+                h.write_u64(name.0 as u64);
+                vis(h, v);
+                for s in path {
+                    h.write_u64(s.0 as u64);
+                }
             });
         }
         for (def, m) in &self.assoc_vis {
@@ -1157,6 +1175,54 @@ enum TryOut {
     Wait,
 }
 
+/// The namespaces an explicit import of a canonical std path
+/// binds, or None when the path is not a std item (or module)
+/// lust knows by full path. `std::vec` is both a module (type
+/// namespace) and a macro (macro namespace), so it binds in both.
+pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Namespace>> {
+    use crate::ty::lang::{StdPathKind, std_is_module_path, std_path_kind};
+    let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+    let mut out = match std_path_kind(&strs) {
+        Some(StdPathKind::Type | StdPathKind::Trait) => vec![Namespace::Type],
+        Some(StdPathKind::Fn | StdPathKind::Variant) => vec![Namespace::Value],
+        Some(StdPathKind::Macro) => vec![Namespace::Macro],
+        None if std_is_module_path(&strs) => vec![Namespace::Type],
+        None => return None,
+    };
+    if std_is_module_path(&strs) && !out.contains(&Namespace::Type) {
+        out.push(Namespace::Type);
+    }
+    Some(out)
+}
+
+/// Records one std import alias in the tables, with the same
+/// duplicate rules as a local explicit import: a name already
+/// bound explicitly in the module (a local item, an earlier
+/// import, or an earlier std alias) reports `dup_diag` and the
+/// first binding keeps the name. `as _` binds no usable name and
+/// records nothing (a std trait's methods do not key on the name).
+fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], name: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> bool {
+    if interner.get(name) == "_" {
+        return false;
+    }
+    let Some(namespaces) = std_import_namespaces(interner, path) else { return false };
+    let mut dup = false;
+    let mut inserted = false;
+    for ns in namespaces {
+        let key = (imp.module, ns_index(ns) as u8, name);
+        if explicit_exists(tables, imp, ns, name) || tables.std_aliases.contains_key(&key) {
+            dup = true;
+            continue;
+        }
+        tables.std_aliases.insert(key, (imp.vis.clone(), path.to_vec()));
+        inserted = true;
+    }
+    if dup {
+        diags.push(dup_diag(imp, name, interner));
+    }
+    inserted
+}
+
 /// Tries one import against the current tables.
 fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
     match &imp.kind {
@@ -1410,6 +1476,21 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     _ => TryOut::Wait,
                 };
             }
+            // `use std;` and `use std as s;`: the one segment names
+            // the extern crate root itself, so there is no module
+            // part to split off.
+            if path.len() == 1
+                && let PathRes::Done(Target::Extern(i)) =
+                    tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner)
+            {
+                let mut inserted = false;
+                if let Some(why) = &tables.externs[i as usize].unsupported {
+                    diags.push(unsupported_diag(why, imp.span));
+                } else if tables.externs[i as usize].is_std_lib {
+                    inserted = record_std_alias(tables, imp, path, *name, interner, diags);
+                }
+                return TryOut::Done(inserted);
+            }
             match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
                 PathRes::Done(Target::Module(src)) => {
                     // Bind the name in every namespace that has it.
@@ -1417,6 +1498,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut changed = false;
                     let mut saw_private = false;
                     let mut found: Vec<(Namespace, Bind)> = Vec::new();
+                    let mut alias_paths: Vec<Vec<Sym>> = Vec::new();
                     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
                         match tables.lookup(src, ns, last) {
                             Some(BindState::One(b)) => {
@@ -1434,7 +1516,21 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 let out = insert_ambiguous(tables, imp.module, ns, *name);
                                 changed |= out;
                             }
-                            None => {}
+                            // A std import in the source module binds
+                            // no target; importing it onward copies
+                            // the alias under this import's name.
+                            None => {
+                                if let Some((avis, apath)) = tables.std_aliases.get(&(src, ns_index(ns) as u8, last)).cloned() {
+                                    if tables.visible(&avis, src, imp.module, interner) {
+                                        any = true;
+                                        if !alias_paths.contains(&apath) {
+                                            alias_paths.push(apath);
+                                        }
+                                    } else {
+                                        saw_private = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     if !any {
@@ -1460,7 +1556,10 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut dup_reported = false;
                     for (ns, bind) in found {
                         let bind_name = import_bind_name(*name, bind.target, interner);
-                        let dup = explicit_exists(tables, imp, ns, bind_name);
+                        // An earlier std alias of the same name in the
+                        // same namespace is an explicit binding too.
+                        let dup = explicit_exists(tables, imp, ns, bind_name)
+                            || tables.std_aliases.contains_key(&(imp.module, ns_index(ns) as u8, bind_name));
                         let out = tables.insert(imp.module, ns, bind_name, bind);
                         if dup && interner.get(*name) != "_" {
                             if !dup_reported {
@@ -1472,21 +1571,30 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         }
                         changed |= out == InsertOut::Changed;
                     }
+                    for apath in &alias_paths {
+                        changed |= record_std_alias(tables, imp, apath, *name, interner, diags);
+                    }
                     TryOut::Done(changed)
                 }
                 PathRes::Done(Target::Extern(i)) => {
                     // `use dep::Name` where the path did not enter a
-                    // source dependency's module tree: a `std` path goes
-                    // through std compat and binds nothing here. An
-                    // unsupported dependency (adapter, shim, or other
-                    // crate with no lust form yet) rejects at the import
-                    // with L0508 naming the crate, since its item names
-                    // are unknown and a later plain use could not be
+                    // source dependency's module tree: a canonical
+                    // `std` path records an alias the rewrite pass
+                    // expands back to the full path (renames bind,
+                    // and a plain imported fn or module name works
+                    // the same way). An unsupported dependency
+                    // (adapter, shim, or other crate with no lust
+                    // form yet) rejects at the import with L0508
+                    // naming the crate, since its item names are
+                    // unknown and a later plain use could not be
                     // told from a typo.
+                    let mut inserted = false;
                     if let Some(why) = &tables.externs[i as usize].unsupported {
                         diags.push(unsupported_diag(why, imp.span));
+                    } else if tables.externs[i as usize].is_std_lib {
+                        inserted = record_std_alias(tables, imp, path, *name, interner, diags);
                     }
-                    TryOut::Done(false)
+                    TryOut::Done(inserted)
                 }
                 PathRes::Done(_) => TryOut::Wait,
                 PathRes::Private => {
