@@ -102,7 +102,7 @@ fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart
             }
             FmtPart::Arg { value, ty, debug, spec } => {
                 (1u8, debug).hash(h);
-                (spec.kind as u8, spec.fill, spec.align, spec.plus, spec.alt, spec.zero, spec.width, spec.precision).hash(h);
+                spec.hash(h);
                 hash_operand(h, p, tys, value, seen);
                 graph::hash_ty_deep(h, p, tys, *ty, seen);
             }

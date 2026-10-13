@@ -3780,7 +3780,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_debug(p, tys, e, seen),
         _ => {
-            if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::Args) {
+            // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
+            // no such rendering, so it is not Debug here (a reject).
+            if tys.is_string_ty(t) {
                 return true;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {

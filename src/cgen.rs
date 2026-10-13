@@ -12,6 +12,8 @@ use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+mod fmt;
+
 /// A body-independent type, so glue can be shared across functions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CTy {
@@ -82,6 +84,8 @@ pub enum Glue {
     Cmp,
     /// `T default_T(void)`: the value derived and core `Default` build.
     Default,
+    /// Display of a type with a user `impl Display` (cgen/fmt.rs).
+    Display,
 }
 
 /// Maps a semantic type to its body-independent C form. Builtin Adts reach this
@@ -1533,7 +1537,7 @@ impl FnGen<'_, '_, '_> {
             StmtKind::Print { stderr, newline, parts } => {
                 self.out.push_str("  {\n");
                 let mut post = Vec::new();
-                let s = self.format(parts, &loc, &mut post);
+                let s = self.format(parts, &loc, &mut post, if *stderr { 3 } else { 2 });
                 if *newline {
                     let _ = writeln!(self.out, "    lust_string_push_bytes(&{s}, \"\\n\", 1);");
                 }
@@ -1611,7 +1615,7 @@ impl FnGen<'_, '_, '_> {
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
             Terminator::Panic(parts) => {
                 self.out.push_str("  {\n");
-                let s = self.format(parts, &loc, &mut post);
+                let s = self.format(parts, &loc, &mut post, 0);
                 let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n  }}");
             }
         }
@@ -2026,7 +2030,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {n}; {i}++) {t}.v[{i}] = {xt};");
                 t
             }
-            Rvalue::Format(parts) => self.format(parts, loc, post),
+            Rvalue::Format(parts) => self.format(parts, loc, post, 0),
             Rvalue::Discriminant(pl) => {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
@@ -2585,12 +2589,8 @@ impl FnGen<'_, '_, '_> {
                 }
             }
             B::ToString => {
-                let t = self.tmp();
-                let _ = writeln!(self.out, "    lust_String {t} = lust_string_new();");
-                let ty = tys[0].clone();
-                let CTy::Ref(inner) = ty else { unreachable!() };
-                self.fmt_value(&t, &vals[0], &inner, false);
-                t
+                let CTy::Ref(inner) = tys[0].clone() else { unreachable!() };
+                self.to_string_value(&inner, &vals[0], loc)
             }
             B::WrappingAdd | B::WrappingSub | B::WrappingMul => {
                 let it = int_of(&tys[0]);
@@ -3640,178 +3640,6 @@ impl FnGen<'_, '_, '_> {
             _ => "0".into(),
         }
     }
-
-    fn format(&mut self, parts: &[FmtPart], loc: &str, post: &mut Vec<String>) -> String {
-        let s = self.tmp();
-        let _ = writeln!(self.out, "    lust_String {s} = lust_string_new();");
-        for part in parts {
-            match part {
-                FmtPart::Lit(text) => {
-                    if !text.is_empty() {
-                        let _ = writeln!(self.out, "    lust_string_push_bytes(&{s}, {}, {});", c_string_lit(text.as_bytes()), text.len());
-                    }
-                }
-                FmtPart::Arg { value, ty, debug, spec } => {
-                    let (v, _) = self.operand(value, loc, post);
-                    let t = cty(&self.body.tys, *ty);
-                    self.fmt_value_spec(&s, &v, &t, *debug, *spec);
-                }
-            }
-        }
-        s
-    }
-
-    /// Appends `*ptr` with a full format spec. Integers go through
-    /// the runtime spec formatter (radix modes read the raw bits of
-    /// the type width), floats through the float spec engine, and
-    /// everything else renders plainly into a temporary that is
-    /// truncated to the precision (strings only) and padded.
-    fn fmt_value_spec(&mut self, out: &str, ptr: &str, t: &CTy, debug: bool, spec: FmtSpec) {
-        let plain = spec == FmtSpec::default() || spec == FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
-        if plain {
-            self.fmt_value(out, ptr, t, debug);
-            return;
-        }
-        let mut e = if *t == CTy::Str { ptr.to_string() } else { format!("(*{ptr})") };
-        let mut tt = t.clone();
-        while let CTy::Ref(inner) = tt.clone() {
-            if *inner == CTy::Str {
-                break;
-            }
-            e = format!("(*{e})");
-            tt = *inner;
-        }
-        match &tt {
-            CTy::Int(i) => {
-                let mode = match spec.kind {
-                    FmtKind::LowerHex => 1,
-                    FmtKind::UpperHex => 2,
-                    FmtKind::Octal => 3,
-                    FmtKind::Binary => 4,
-                    _ => 0,
-                };
-                let width = spec.width.unwrap_or(0);
-                let (has_prec, prec) = match spec.precision {
-                    Some(p) => (1, p),
-                    None => (0, 0),
-                };
-                let align = spec.align as char;
-                let (lo, hi, neg) = if is128(*i) {
-                    if mode == 0 && i.signed() {
-                        (format!("lust_i128_mag({e}).lo"), format!("lust_i128_mag({e}).hi"), format!("((int64_t)({e}).hi < 0)"))
-                    } else {
-                        (format!("({e}).lo"), format!("({e}).hi"), "0".to_string())
-                    }
-                } else if mode == 0 && i.signed() {
-                    (
-                        format!("(uint64_t)({e} < 0 ? 0 - (uint64_t)(int64_t){e} : (uint64_t)(int64_t){e})"),
-                        "0".to_string(),
-                        format!("({e} < 0)"),
-                    )
-                } else {
-                    let mask = match i.bits() {
-                        8 => " & 0xffull",
-                        16 => " & 0xffffull",
-                        32 => " & 0xffffffffull",
-                        _ => "",
-                    };
-                    (format!("((uint64_t){e}{mask})"), "0".to_string(), "0".to_string())
-                };
-                let _ = writeln!(
-                    self.out,
-                    "    lust_fmt_int_spec(&{out}, {lo}, {hi}, {neg}, {mode}, {}, {}, {}, {width}, {}, {}, {has_prec}, {prec});",
-                    spec.plus as u8, spec.alt as u8, spec.zero as u8, spec.fill, align as u32
-                );
-            }
-            CTy::Float(f) => {
-                let mode = match spec.kind {
-                    FmtKind::Debug => 1,
-                    FmtKind::LowerExp => 2,
-                    FmtKind::UpperExp => 3,
-                    _ => 0,
-                };
-                let width = spec.width.unwrap_or(0);
-                let prec = spec.precision.unwrap_or(0xFFFF_FFFF);
-                let _ = writeln!(
-                    self.out,
-                    "    lust_fmt_{}(&{out}, {e}, (lust_float_spec){{ {prec}, {width}, {}, {}, {}, {}, {}, {mode} }});",
-                    f.name(),
-                    spec.fill,
-                    spec.align as u32,
-                    spec.plus as u8,
-                    spec.zero as u8,
-                    spec.alt as u8
-                );
-            }
-            _ => {
-                // Render plainly into a temporary, truncate to a string
-                // precision, then pad to the width. Debug renderings
-                // ignore width and precision in Rust (the impls write
-                // their text directly), so only Display pads.
-                let tmp = self.tmp();
-                let _ = writeln!(self.out, "    lust_String {tmp} = lust_string_new();");
-                self.fmt_value(&tmp, ptr, t, debug);
-                if spec.kind == FmtKind::Display
-                    && let Some(p) = spec.precision
-                    && (matches!(tt, CTy::Str | CTy::String) || matches!(&tt, CTy::Ref(inner) if **inner == CTy::Str))
-                {
-                    let _ = writeln!(self.out, "    lust_str_trunc_chars(&{tmp}, {p});");
-                }
-                let align = if spec.align == 0 { '<' as u32 } else { spec.align as u32 };
-                let width = if spec.kind == FmtKind::Display { spec.width.unwrap_or(0) } else { 0 };
-                let _ = writeln!(
-                    self.out,
-                    "    lust_fmt_pad(&{out}, lust_string_as_str(&{tmp}), {width}, {}, {align}); lust_string_drop(&{tmp});",
-                    spec.fill
-                );
-            }
-        }
-    }
-
-    /// Appends `*ptr` (of type `t`) to the String `out`, with Display or Debug formatting.
-    fn fmt_value(&mut self, out: &str, ptr: &str, t: &CTy, debug: bool) {
-        let mut e = if *t == CTy::Str { ptr.to_string() } else { format!("(*{ptr})") };
-        let mut t = t.clone();
-        loop {
-            match t.clone() {
-                CTy::Ref(inner) if *inner != CTy::Str => {
-                    e = format!("(*{e})");
-                    t = *inner;
-                }
-                CTy::Boxed(inner) => {
-                    e = format!("(*{e})");
-                    t = *inner;
-                }
-                CTy::Rc(inner) => {
-                    e = format!("{e}->v");
-                    t = *inner;
-                }
-                _ => break,
-            }
-        }
-        let line = match (&t, debug) {
-            (CTy::Int(i), _) if is128(*i) => format!("lust_fmt_{}(&{out}, {e});", int_fn(*i)),
-            (CTy::Int(i), _) if i.signed() => format!("lust_fmt_i64(&{out}, (int64_t){e});"),
-            (CTy::Int(_), _) => format!("lust_fmt_u64(&{out}, (uint64_t){e});"),
-            (CTy::Float(f), debug) => {
-                format!("lust_fmt_{}(&{out}, {e});", format!("{}{}", f.name(), if debug { "_debug" } else { "_display" }))
-            }
-            (CTy::Bool, _) => format!("lust_fmt_bool(&{out}, {e});"),
-            (CTy::Char, false) => format!("lust_string_push_char(&{out}, {e});"),
-            (CTy::Char, true) => format!("lust_fmt_char_debug(&{out}, {e});"),
-            (CTy::String, false) => format!("lust_string_push_str(&{out}, lust_string_as_str(&{e}));"),
-            (CTy::String, true) => format!("lust_fmt_str_debug(&{out}, lust_string_as_str(&{e}));"),
-            (CTy::Ref(_), false) | (CTy::Str, false) => format!("lust_string_push_str(&{out}, {e});"),
-            (CTy::Ref(_), true) | (CTy::Str, true) => format!("lust_fmt_str_debug(&{out}, {e});"),
-            (CTy::Unit, _) => format!("lust_string_push_bytes(&{out}, \"()\", 2);"),
-            (CTy::Args, _) => format!("lust_string_push_bytes(&{out}, \"Args\", 4);"),
-            _ => {
-                self.want(Glue::Debug, &t);
-                format!("dbg_{}(&{out}, &{e});", mangle(&t))
-            }
-        };
-        let _ = writeln!(self.out, "    {line}");
-    }
 }
 
 // ---------- Compilation units ----------
@@ -3985,6 +3813,8 @@ fn runtime_source(with_impls: bool) -> String {
     } else {
         header.replacen("#include \"float.c\"", "", 1)
     };
+    let fmt = include_str!("runtime/fmt.h");
+    let fmt = fmt.replacen("#include \"fmt.c\"", if with_impls { include_str!("runtime/fmt.c") } else { "" }, 1);
     // The hash core's declarations are not in the common unit header:
     // they cost about 26 KB of C per unit and no generated code calls
     // the core yet. The runtime unit carries header plus bodies, so
@@ -3998,6 +3828,7 @@ fn runtime_source(with_impls: bool) -> String {
     src.push_str(core);
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
     let src = src.replacen("#include \"float.h\"", &header, 1);
+    let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
     src.replacen("#include \"hash.h\"", &hash, 1)
 }
 
@@ -4559,7 +4390,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         let _ = writeln!(c, "  int rc = 0;");
         let _ = writeln!(
             c,
-            "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_string_push_cstr(&s, \"Error: \"); dbg_{}(&s, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}",
+            "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}",
             mangle(&ec)
         );
         if needs_drop_c(p, &rc) {
@@ -5512,146 +5343,14 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
             let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{body}}}\n");
         }
         Glue::Debug => {
-            let _ = writeln!(protos, "void dbg_{m}(lust_String *out, {ct} *p);");
-            let dbg_of = |t: &CTy, e: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
-                match t {
-                    CTy::Int(i) if is128(*i) => format!("lust_fmt_{}(out, {e});", int_fn(*i)),
-                    CTy::Int(i) if i.signed() => format!("lust_fmt_i64(out, (int64_t){e});"),
-                    CTy::Int(_) => format!("lust_fmt_u64(out, (uint64_t){e});"),
-                    CTy::Float(f) => format!("lust_fmt_{}_debug(out, {e});", f.name()),
-                    CTy::FnPtr(..) => format!("lust_fmt_fnptr_debug(out, (const void*)({e}));"),
-                    CTy::Bool => format!("lust_fmt_bool(out, {e});"),
-                    CTy::Char => format!("lust_fmt_char_debug(out, {e});"),
-                    CTy::String => format!("lust_fmt_str_debug(out, lust_string_as_str(&{e}));"),
-                    CTy::Ref(inner) if **inner == CTy::Str => format!("lust_fmt_str_debug(out, {e});"),
-                    CTy::Unit => "lust_string_push_bytes(out, \"()\", 2);".into(),
-                    _ => {
-                        need(Glue::Debug, t);
-                        format!("dbg_{}(out, &{e});", mangle(t))
-                    }
-                }
-            };
-            let lit = |s: &str| format!("lust_string_push_bytes(out, {}, {});", c_string_lit(s.as_bytes()), s.len());
-            match t {
-                CTy::Option(inner) => {
-                    let e = dbg_of(inner, &pf, &mut need);
-                    let _ = writeln!(body, "  if ({disc_p}) {{ {} {e} {} }} else {}", lit("Some("), lit(")"), lit("None"));
-                }
-                CTy::Result(x, y) => {
-                    let ea = dbg_of(x, &variant_field(p, t, "(*p)", 0, 0), &mut need);
-                    let eb = dbg_of(y, &variant_field(p, t, "(*p)", 1, 0), &mut need);
-                    let _ = writeln!(
-                        body,
-                        "  if ({disc_p}) {{ {} {eb} {} }} else {{ {} {ea} {} }}",
-                        lit("Err("),
-                        lit(")"),
-                        lit("Ok("),
-                        lit(")")
-                    );
-                }
-                CTy::Tuple(es) => {
-                    let mut s = lit("(");
-                    for (fi, ft) in es.iter().enumerate() {
-                        if fi > 0 {
-                            s.push_str(&lit(", "));
-                        }
-                        s.push_str(&dbg_of(ft, &format!("p->f{fi}"), &mut need));
-                    }
-                    if es.len() == 1 {
-                        s.push_str(&lit(","));
-                    }
-                    s.push_str(&lit(")"));
-                    let _ = writeln!(body, "  {s}");
-                }
-                CTy::Array(e, n) => {
-                    let d = dbg_of(e, "p->v[i]", &mut need);
-                    let _ = writeln!(
-                        body,
-                        "  {}\n  for (uint64_t i = 0; i < {n}; i++) {{ if (i) {} {d} }}\n  {}",
-                        lit("["),
-                        lit(", "),
-                        lit("]")
-                    );
-                }
-                CTy::Slice(e) => {
-                    let d = dbg_of(e, "p->ptr[i]", &mut need);
-                    let _ = writeln!(
-                        body,
-                        "  {}\n  for (uint64_t i = 0; i < p->len; i++) {{ if (i) {} {d} }}\n  {}",
-                        lit("["),
-                        lit(", "),
-                        lit("]")
-                    );
-                }
-                CTy::Ref(inner) | CTy::Boxed(inner) => {
-                    let e = dbg_of(inner, "(**p)", &mut need);
-                    let _ = writeln!(body, "  {e}");
-                }
-                CTy::Rc(inner) => {
-                    let e = dbg_of(inner, "(*p)->v", &mut need);
-                    let _ = writeln!(body, "  {e}");
-                }
-                CTy::Vec(e) => {
-                    let et = ctype(e);
-                    let d = dbg_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
-                    let _ = writeln!(
-                        body,
-                        "  {}\n  for (uint64_t i = 0; i < p->len; i++) {{ if (i) {} {d} }}\n  {}",
-                        lit("["),
-                        lit(", "),
-                        lit("]")
-                    );
-                }
-                CTy::Adt(a) => {
-                    let adt = p.adt(*a);
-                    let variant_body = |v: &Variant, access: &dyn Fn(usize) -> String, need: &mut dyn FnMut(Glue, &CTy)| -> String {
-                        // The struct's pseudo-variant carries the flat
-                        // name; rustc prints the source name. Enum
-                        // variant names are already source names.
-                        let mut s = lit(p.display_name(v.name));
-                        match v.shape {
-                            VariantShape::Unit => {}
-                            VariantShape::Tuple => {
-                                s.push_str(&lit("("));
-                                for (fi, f) in v.fields.iter().enumerate() {
-                                    if fi > 0 {
-                                        s.push_str(&lit(", "));
-                                    }
-                                    s.push_str(&dbg_of(&cty(&p.tys, f.ty), &access(fi), need));
-                                }
-                                s.push_str(&lit(")"));
-                            }
-                            VariantShape::Named => {
-                                if !v.fields.is_empty() {
-                                    for (fi, f) in v.fields.iter().enumerate() {
-                                        let sep = if fi == 0 { " { " } else { ", " };
-                                        s.push_str(&lit(&format!("{sep}{}: ", p.name(f.name))));
-                                        s.push_str(&dbg_of(&cty(&p.tys, f.ty), &access(fi), need));
-                                    }
-                                    s.push_str(&lit(" }"));
-                                }
-                            }
-                        }
-                        s
-                    };
-                    if adt.is_enum {
-                        let _ = writeln!(body, "  switch ({disc_p}) {{");
-                        for (vi, v) in adt.variants.iter().enumerate() {
-                            let b = variant_body(v, &|fi| format!("p->u.v{vi}.f{fi}"), &mut need);
-                            let _ = writeln!(body, "  case {vi}: {b} break;");
-                        }
-                        body.push_str("  }\n");
-                    } else {
-                        let b = variant_body(&adt.variants[0], &|fi| format!("p->f{fi}"), &mut need);
-                        let _ = writeln!(body, "  {b}");
-                    }
-                }
-                _ => {
-                    let e = dbg_of(t, "(*p)", &mut need);
-                    let _ = writeln!(body, "  {e}");
-                }
-            }
-            let _ = writeln!(defs, "void dbg_{m}(lust_String *out, {ct} *p) {{\n{body}}}\n");
+            let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
+            let body = fmt::debug_glue_body(p, t, slots, &mut need);
+            let _ = writeln!(defs, "int dbg_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
+        }
+        Glue::Display => {
+            let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
+            let body = fmt::display_glue_body(p, t, slots);
+            let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
         }
     }
 }

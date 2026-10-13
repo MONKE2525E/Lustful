@@ -8131,6 +8131,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if autoref != Autoref::None {
                     self.check_packed_borrow(recv, name_span);
                 }
+                // `to_string` binds Self where rustc's probe does: the
+                // first step whose `&Self` is the receiver (one reference
+                // peeled), else the receiver by autoref. Self picks the
+                // capacity rule (W-STD-B): `&&u8` is the generic path.
+                let derefs = if b == B::ToString { u8::from(matches!(self.tys.kind(rt), TyKind::Ref(..))) } else { derefs };
                 self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
                 self.check_args(&params, args, name_span);
                 ret
@@ -9400,12 +9405,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// One format argument against its spec: the kind must exist for
-    /// the type, and the flags must fit it, as in Rust. Errors name
-    /// the trait a kind needs (`LowerHex` and kin).
+    /// the type. Errors name the trait a kind needs (`LowerHex` and
+    /// kin). Every flag applies to every type, as in Rust: the impl
+    /// reads the ones it uses (`{:05}` on a str pads with spaces).
     fn check_fmt_arg(&mut self, t: Ty, spec: FmtSpec, span: Span) {
         let (_, base) = self.autoderef(t);
         let bk = self.kind(base);
-        let numeric = matches!(bk, TyKind::Int(_) | TyKind::Float(_)) || bk.is_int_infer() || bk.is_float_infer();
+        // Valid Rust lust has no rendering for yet: integer exponent
+        // formats, and `env::Args` Debug (`Args { inner: [..] }`).
+        let int_exp = matches!(spec.kind, FmtKind::LowerExp | FmtKind::UpperExp) && (matches!(bk, TyKind::Int(_)) || bk.is_int_infer());
+        if int_exp || (spec.kind == FmtKind::Debug && self.tys.builtin_of(base) == Some(BuiltinTy::Args)) {
+            let what = if int_exp { "an integer exponent format" } else { "Debug of `std::env::Args`" };
+            self.errs.push(not_yet("L0641", span, what));
+            return;
+        }
         let what = match spec.kind {
             FmtKind::Display => {
                 if has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() {
@@ -9474,26 +9487,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 self.err("L0112", span, format!("`{tn}` does not implement {what}"), fix);
             }
-            return;
-        }
-        // Flag fit: sign and zero padding are numeric-only, precision
-        // applies to numbers and strings, and `#` outside the radix
-        // kinds is only a float no-op in Rust.
-        let stringy = bk == TyKind::Str || self.tys.is_string_ty(base);
-        let bad = (spec.plus && !numeric)
-            || (spec.zero && !numeric)
-            || (spec.precision.is_some() && !numeric && !stringy && bk != TyKind::Char)
-            || (spec.alt
-                && !matches!(spec.kind, FmtKind::LowerHex | FmtKind::UpperHex | FmtKind::Octal | FmtKind::Binary)
-                && !matches!(bk, TyKind::Float(_)));
-        if bad && self.kind(t) != TyKind::Error {
-            let tn = self.tn(t);
-            self.err(
-                "L0112",
-                span,
-                format!("invalid format options for `{tn}`"),
-                "Sign, zero padding, and `#` only apply as in Rust: numbers and the radix formats.",
-            );
         }
     }
 

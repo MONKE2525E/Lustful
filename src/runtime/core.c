@@ -1391,6 +1391,10 @@ uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
 /* Float formatting, parsing, and casts (src/runtime/float.h). */
 #include "float.h"
 
+/* core::fmt: the Formatter, leaf impls, and Debug builders
+   (src/runtime/fmt.h, W-STD-B). */
+#include "fmt.h"
+
 /* Erased hash table core (src/runtime/hash.h): declarations in every
    unit, bodies only in the runtime unit (LUST_IMPL). */
 #include "hash.h"

@@ -3874,18 +3874,63 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Macros ----------
 
+    /// Format pieces as IR parts. A literal argument rustc inlines into
+    /// the format string (`inline_literal`) becomes literal text, merged
+    /// with its neighbours, so `format!` capacity and the panic payload
+    /// kind match rustc's (W-STD-B).
     fn fmt_parts(&mut self, args: &[ExprId], fmt: &[FmtPiece]) -> Vec<FmtPart> {
-        let mut parts = Vec::with_capacity(fmt.len());
+        let mut parts: Vec<FmtPart> = Vec::with_capacity(fmt.len());
+        let push_lit = |parts: &mut Vec<FmtPart>, text: &str| match parts.last_mut() {
+            Some(FmtPart::Lit(prev)) => prev.push_str(text),
+            _ => parts.push(FmtPart::Lit(text.to_string())),
+        };
         for piece in fmt {
             match piece {
-                FmtPiece::Lit(s) => parts.push(FmtPart::Lit(s.clone())),
+                FmtPiece::Lit(s) => push_lit(&mut parts, s),
                 FmtPiece::Arg { index, debug, spec } => {
+                    if *spec == FmtSpec::default()
+                        && let Some(text) = self.inline_literal(args[*index])
+                    {
+                        push_lit(&mut parts, &text);
+                        continue;
+                    }
                     let (value, ty) = self.borrow_of(args[*index], 0);
                     parts.push(FmtPart::Arg { value, ty, debug: *debug, spec: *spec });
                 }
             }
         }
         parts
+    }
+
+    /// The text rustc's `format_args!` lowering inlines for a `{}`
+    /// argument (`inline_literals`): a string literal, or an integer
+    /// literal in range of its type (unsuffixed is `i32`), under any
+    /// number of `&`. Other literals (char, bool, float, negative) stay
+    /// arguments, as in rustc.
+    fn inline_literal(&self, mut e: ExprId) -> Option<String> {
+        use crate::lexer::IntSuffix as S;
+        while let Expr::Ref { raw: false, expr, .. } = self.p.ast.expr(e) {
+            e = *expr;
+        }
+        match self.p.ast.expr(e) {
+            Expr::Str(i) => self.p.ast.strings.get(*i as usize).cloned(),
+            Expr::Int(v, suffix) => {
+                let max: u128 = match suffix {
+                    None | Some(S::I32) => i32::MAX as u128,
+                    Some(S::I8) => i8::MAX as u128,
+                    Some(S::I16) => i16::MAX as u128,
+                    Some(S::I64 | S::Isize) => i64::MAX as u128,
+                    Some(S::I128) => i128::MAX as u128,
+                    Some(S::U8) => u8::MAX as u128,
+                    Some(S::U16) => u16::MAX as u128,
+                    Some(S::U32) => u32::MAX as u128,
+                    Some(S::U64 | S::Usize) => u64::MAX as u128,
+                    Some(S::U128) => u128::MAX,
+                };
+                (*v <= max).then(|| v.to_string())
+            }
+            _ => None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

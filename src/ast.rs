@@ -779,7 +779,7 @@ pub enum MacroKind {
 /// Rust's grammar gives it: `[[fill]align][sign][#][0][width][.prec][kind]`.
 /// Dynamic width and precision (`w$`, `.*`) and pointer format (`p`)
 /// reject in the parser, so every field here is a literal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FmtSpec {
     pub kind: FmtKind,
     /// The fill character as a Unicode scalar value; 0 means space.
@@ -787,13 +787,18 @@ pub struct FmtSpec {
     /// 0 = default for the type, else '<', '>', or '^' as a byte.
     pub align: u8,
     pub plus: bool,
+    /// The `-` flag: no effect on std output, but `Formatter::sign_minus`
+    /// reads it (W-STD-B).
+    pub minus: bool,
     pub alt: bool,
     pub zero: bool,
+    /// `{:x?}` (1) and `{:X?}` (2): Debug with integers in hex (W-STD-B).
+    pub debug_hex: u8,
     pub width: Option<u32>,
     pub precision: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FmtKind {
     Display,
     Debug,
@@ -807,7 +812,18 @@ pub enum FmtKind {
 
 impl Default for FmtSpec {
     fn default() -> FmtSpec {
-        FmtSpec { kind: FmtKind::Display, fill: 0, align: 0, plus: false, alt: false, zero: false, width: None, precision: None }
+        FmtSpec {
+            kind: FmtKind::Display,
+            fill: 0,
+            align: 0,
+            plus: false,
+            minus: false,
+            alt: false,
+            zero: false,
+            debug_hex: 0,
+            width: None,
+            precision: None,
+        }
     }
 }
 

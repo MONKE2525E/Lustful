@@ -2304,6 +2304,10 @@ pub struct GenTables<'a> {
     /// derived bodies call the field type's impl (iface: W-CGEN
     /// reads this, like `drop_methods`).
     pub glue_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    /// The user `fmt` method instance for one concrete Adt and fmt
+    /// trait (`FmtKind as u8`: Display or Debug), for cgen's Debug and
+    /// Display glue (W-STD-B; iface: W-CGEN reads this).
+    pub fmt_methods: FxMap<(AdtId, u8), LocalDefId>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -2386,6 +2390,7 @@ impl Default for GenTables<'_> {
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),
+            fmt_methods: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),

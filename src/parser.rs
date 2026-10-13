@@ -367,7 +367,7 @@ fn token_trees(toks: &[Token]) -> Vec<TokenTree> {
 
 /// Parses one format spec (the text after the `:`). `Err(true)` is a
 /// form Rust has but the subset does not (dynamic width or precision,
-/// pointer format, alternate Debug); `Err(false)` is invalid in Rust.
+/// pointer format); `Err(false)` is invalid in Rust.
 fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
     let mut s = FmtSpec::default();
     let cs: Vec<char> = fmt.chars().collect();
@@ -395,6 +395,7 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
         s.plus = true;
         i += 1;
     } else if i < cs.len() && cs[i] == '-' {
+        s.minus = true;
         i += 1;
     }
     // [#]
@@ -439,6 +440,12 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
             i += 1;
             FmtKind::Debug
         }
+        // `x?` and `X?`: Debug with hex integers.
+        Some(&c @ ('x' | 'X')) if cs.get(i + 1) == Some(&'?') => {
+            i += 2;
+            s.debug_hex = if c == 'x' { 1 } else { 2 };
+            FmtKind::Debug
+        }
         Some('x') => {
             i += 1;
             FmtKind::LowerHex
@@ -468,10 +475,6 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
     };
     if i != cs.len() {
         return Err(false);
-    }
-    if kind == FmtKind::Debug && s.alt {
-        // Pretty Debug (`{:#?}`) is a different rendering, not done.
-        return Err(true);
     }
     s.kind = kind;
     Ok(s)

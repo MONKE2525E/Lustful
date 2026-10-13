@@ -696,7 +696,7 @@ impl Walker<'_> {
                         }
                         FmtPiece::Arg { index, debug, spec } => {
                             (1u8, *index as u64, debug).hash(h);
-                            (spec.kind as u8, spec.fill, spec.align, spec.plus, spec.alt, spec.zero, spec.width, spec.precision).hash(h);
+                            spec.hash(h);
                         }
                     }
                 }
