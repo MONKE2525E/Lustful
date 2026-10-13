@@ -3892,14 +3892,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Expr::Assign { lhs, rhs } => {
+                if self.assign_lhs_needs_expected(*lhs) {
+                    // A target with a struct form or a `..` rest gets
+                    // its element types from the right-hand side, as a
+                    // pattern gets them from its scrutinee.
+                    let rt = self.expr(*rhs, None);
+                    self.assign_lhs_expected(*lhs, rt);
+                    self.place_check(*lhs, true);
+                    return UNIT;
+                }
                 let lt = self.assign_lhs_ty(*lhs);
-                self.place_check(*lhs);
+                self.place_check(*lhs, true);
                 self.expect_expr(*rhs, lt);
                 UNIT
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 let lt = self.expr(*lhs, None);
-                self.place_check(*lhs);
+                self.place_check(*lhs, false);
                 let rt = self.expr(*rhs, Some(lt));
                 let lk = self.kind(lt);
                 if self.tys.is_string_ty(self.resolve(lt)) && *op == BinOp::Add {
@@ -4575,7 +4584,384 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    fn place_check(&mut self, e: ExprId) {
+    /// True for a bare `..` element of an assignment target. The
+    /// parser reads it as an open range expression.
+    fn is_rest_elem(&self, e: ExprId) -> bool {
+        matches!(self.p.ast.expr(e), Expr::Range { lo: None, hi: None, inclusive: false })
+    }
+
+    /// True when an assignment target contains a struct form or a
+    /// `..` rest, so its element types must come from the right-hand
+    /// side type (see `assign_lhs_expected`). Plain tuple and array
+    /// targets build their type from their places instead, which
+    /// lets the right-hand side infer against them.
+    fn assign_lhs_needs_expected(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::StructLit { .. } | Expr::Call { .. } => true,
+            Expr::Tuple(elems) | Expr::Array(elems) => {
+                elems.iter().any(|&el| self.is_rest_elem(el) || self.assign_lhs_needs_expected(el))
+            }
+            _ => false,
+        }
+    }
+
+    /// Maps target elements to source indices around a `..` rest,
+    /// like `map_tuple_elems` for patterns. None when the counts do
+    /// not fit a source of `n` elements.
+    fn map_assign_elems(&self, elems: &[ExprId], n: usize) -> Option<Vec<(usize, ExprId)>> {
+        match elems.iter().position(|&e| self.is_rest_elem(e)) {
+            None => {
+                if elems.len() != n {
+                    return None;
+                }
+                Some(elems.iter().enumerate().map(|(i, &e)| (i, e)).collect())
+            }
+            Some(r) => {
+                if elems[r + 1..].iter().any(|&e| self.is_rest_elem(e)) {
+                    return None;
+                }
+                let suffix = elems.len() - r - 1;
+                if r + suffix > n {
+                    return None;
+                }
+                let mut out: Vec<(usize, ExprId)> = elems[..r].iter().enumerate().map(|(i, &e)| (i, e)).collect();
+                for (j, &e) in elems[r + 1..].iter().enumerate() {
+                    out.push((n - suffix + j, e));
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Resolves the struct or variant an assignment target names and
+    /// unifies it with the right-hand side type, as a pattern does
+    /// with its scrutinee. Answers the Adt, the variant, and the
+    /// scrutinee's generic arguments for field substitution. An enum
+    /// variant of a multi-variant enum can fail to match, so it is
+    /// an error here (rustc E0005) but still resolves.
+    fn assign_variant(&mut self, segs: &[ast::PathSeg], want: Ty, span: Span) -> Option<(AdtId, u32, Vec<GenericArg>)> {
+        let p = self.p;
+        let target = if segs.len() == 1 {
+            let n = segs[0].name;
+            if n != p.known.self_type {
+                self.binding(Namespace::Type, n);
+            }
+            let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+            match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0)) {
+                Some(v) => Some(v),
+                None => match self.pat_ident(n) {
+                    PatIdent::Variant(a, v) => Some((a, v)),
+                    _ => None,
+                },
+            }
+        } else {
+            match self.resolve_assoc(segs, span) {
+                Some(Res::Variant(a, v)) => Some((a, v)),
+                Some(_) => {
+                    self.err("L0110", span, "expected a variant or struct in this pattern", "Use `Type::Variant`.");
+                    None
+                }
+                None => return None,
+            }
+        };
+        let Some((a, v)) = target else {
+            let last = segs.last().map(|s| s.name);
+            if last == Some(p.known.Some) || last == Some(p.known.Ok) || last == Some(p.known.Err) {
+                self.err("L0110", span, "refutable pattern in assignment", "Use `if let` or `match` for a pattern that can fail.");
+            } else {
+                self.err("L0102", span, "unknown struct or variant in pattern", "Check the name.");
+            }
+            return None;
+        };
+        let dt = self.deep(want);
+        let scrut_args: Vec<GenericArg> = match self.tys.adt_parts(dt) {
+            Some((d, aa)) if d == p.def_of_adt(a) => self.tys.args(aa).to_vec(),
+            _ => Vec::new(),
+        };
+        let (a, adt_ty) = match self.tys.local_adt(dt) {
+            Some(inst) if inst != a && p.def_of_adt(inst) == p.def_of_adt(a) => (inst, dt),
+            _ if !scrut_args.is_empty() => (a, dt),
+            _ => (a, self.tys.adt_ty(a)),
+        };
+        if !self.unify(adt_ty, want) {
+            self.mismatch(span, want, adt_ty);
+            return None;
+        }
+        if p.adt(a).is_enum && p.adt(a).variants.len() != 1 {
+            self.err("L0110", span, "refutable pattern in assignment", "Use `if let` or `match` for a pattern that can fail.");
+        }
+        Some((a, v, scrut_args))
+    }
+
+    /// Checks an assignment target against the right-hand side type,
+    /// top down, as a pattern checks against its scrutinee type.
+    /// Used for targets with a struct form or a `..` rest. Records
+    /// the target type on every sub-target, which lowering reads for
+    /// the element types of struct forms.
+    fn assign_lhs_expected(&mut self, e: ExprId, want: Ty) {
+        let p = self.p;
+        let span = self.span(e);
+        match p.ast.expr(e) {
+            Expr::Underscore => {
+                self.set(e, want);
+            }
+            Expr::Tuple(elems) => {
+                self.set(e, want);
+                match self.kind(want) {
+                    TyKind::Tuple(ts) => {
+                        let kt: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                        match self.map_assign_elems(elems, kt.len()) {
+                            Some(mapped) => {
+                                for (i, sub) in mapped {
+                                    self.assign_lhs_expected(sub, kt[i]);
+                                }
+                            }
+                            None => {
+                                self.err(
+                                    "L0110",
+                                    span,
+                                    format!("this tuple has {} element(s)", kt.len()),
+                                    "Match every element, use `_`, or skip the middle with `..`.",
+                                );
+                                for &sub in elems {
+                                    if !self.is_rest_elem(sub) {
+                                        self.assign_lhs_expected(sub, ERROR);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TyKind::Error => {
+                        for &sub in elems {
+                            if !self.is_rest_elem(sub) {
+                                self.assign_lhs_expected(sub, ERROR);
+                            }
+                        }
+                    }
+                    _ => {
+                        let vars: Vec<Ty> = elems.iter().map(|_| self.new_var(false)).collect();
+                        for (i, &sub) in elems.iter().enumerate() {
+                            if !self.is_rest_elem(sub) {
+                                self.assign_lhs_expected(sub, vars[i]);
+                            }
+                        }
+                        let ts = self.tys.intern_tys(&vars);
+                        let tt = self.tys.intern(TyKind::Tuple(ts));
+                        if !self.unify(tt, want) {
+                            self.mismatch(span, want, tt);
+                        }
+                    }
+                }
+            }
+            Expr::Array(elems) => {
+                self.set(e, want);
+                let (elem, arr_len, is_slice) = match self.kind(want) {
+                    TyKind::Array(el, c) => {
+                        let n = match self.tys.const_kind(c) {
+                            ConstKind::Int(n) => Some(n as usize),
+                            _ => None,
+                        };
+                        (el, n, false)
+                    }
+                    TyKind::Slice(el) => (el, None, true),
+                    TyKind::Error => {
+                        for &sub in elems {
+                            if !self.is_rest_elem(sub) {
+                                self.assign_lhs_expected(sub, ERROR);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        let tn = self.tn(want);
+                        self.err(
+                            "L0110",
+                            span,
+                            format!("slice pattern cannot match a value of type `{tn}`"),
+                            "Match on an array or a slice, for example `&value[..]`.",
+                        );
+                        for &sub in elems {
+                            if !self.is_rest_elem(sub) {
+                                self.assign_lhs_expected(sub, ERROR);
+                            }
+                        }
+                        return;
+                    }
+                };
+                if is_slice {
+                    // A slice can be too short, so this can fail.
+                    self.err("L0110", span, "refutable pattern in assignment", "Use `if let` or `match` for a pattern that can fail.");
+                    for &sub in elems {
+                        if !self.is_rest_elem(sub) {
+                            self.assign_lhs_expected(sub, elem);
+                        }
+                    }
+                    return;
+                }
+                match arr_len {
+                    Some(n) => match self.map_assign_elems(elems, n) {
+                        Some(mapped) => {
+                            for (_, sub) in mapped {
+                                self.assign_lhs_expected(sub, elem);
+                            }
+                        }
+                        None => {
+                            let fixed = elems.iter().filter(|&&s| !self.is_rest_elem(s)).count();
+                            self.err(
+                                "L0110",
+                                span,
+                                format!("pattern requires {fixed} element(s) but the array has {n}"),
+                                "Change the pattern length, or skip the middle with `..`.",
+                            );
+                            for &sub in elems {
+                                if !self.is_rest_elem(sub) {
+                                    self.assign_lhs_expected(sub, elem);
+                                }
+                            }
+                        }
+                    },
+                    None => {
+                        for &sub in elems {
+                            if !self.is_rest_elem(sub) {
+                                self.assign_lhs_expected(sub, elem);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::StructLit { path, fields, update } => {
+                self.set(e, want);
+                let rest = update.is_some_and(|u| self.is_rest_elem(u));
+                if let Some(u) = update {
+                    if rest {
+                        self.set(*u, ERROR);
+                    } else {
+                        self.expr(*u, None);
+                        self.err(
+                            "L0121",
+                            span,
+                            "invalid left-hand side of assignment",
+                            "Assign to a variable, a field, an index, or `*reference`.",
+                        );
+                    }
+                }
+                let Some((a, v, scrut_args)) = self.assign_variant(path, want, span) else {
+                    for &(_, _, fe) in fields {
+                        self.assign_lhs_expected(fe, ERROR);
+                    }
+                    return;
+                };
+                self.set_res(e, Res::Variant(a, v));
+                let variant = &p.adt(a).variants[v as usize];
+                if variant.shape != VariantShape::Named {
+                    self.err("L0110", span, "this variant does not have named fields", "Use the tuple form.");
+                    for &(_, _, fe) in fields {
+                        self.assign_lhs_expected(fe, ERROR);
+                    }
+                    return;
+                }
+                let mut seen = vec![false; variant.fields.len()];
+                for &(fname, fspan, fe) in fields {
+                    match variant.fields.iter().position(|f| f.name == fname) {
+                        Some(i) => {
+                            if seen[i] {
+                                self.err("L0106", fspan, format!("field `{}` is set twice", self.name(fname)), "Remove one of them.");
+                            }
+                            seen[i] = true;
+                            self.check_field_vis(a, fname, fspan);
+                            let ft = variant.fields[i].ty;
+                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                            self.assign_lhs_expected(fe, ft);
+                        }
+                        None => {
+                            self.assign_lhs_expected(fe, ERROR);
+                            self.err("L0103", fspan, format!("no field `{}` in this variant", self.name(fname)), "Check the field name.");
+                        }
+                    }
+                }
+                if !rest && seen.iter().any(|s| !s) {
+                    self.err("L0107", span, "pattern does not mention all fields", "Add the missing fields, or end the pattern with `..`.");
+                }
+            }
+            Expr::Call { callee, args } => {
+                self.set(e, want);
+                let Expr::Path(segs) = p.ast.expr(*callee) else {
+                    self.err(
+                        "L0121",
+                        span,
+                        "invalid left-hand side of assignment",
+                        "Assign to a variable, a field, an index, or `*reference`.",
+                    );
+                    for &arg in args {
+                        if !self.is_rest_elem(arg) {
+                            self.assign_lhs_expected(arg, ERROR);
+                        }
+                    }
+                    return;
+                };
+                let segs = segs.clone();
+                let Some((a, v, scrut_args)) = self.assign_variant(&segs, want, span) else {
+                    for &arg in args {
+                        if !self.is_rest_elem(arg) {
+                            self.assign_lhs_expected(arg, ERROR);
+                        }
+                    }
+                    return;
+                };
+                self.set_res(e, Res::Variant(a, v));
+                self.set_res(*callee, Res::Variant(a, v));
+                self.set(*callee, ERROR);
+                let variant = &p.adt(a).variants[v as usize];
+                if variant.shape != VariantShape::Tuple {
+                    self.err(
+                        "L0110",
+                        span,
+                        format!("this variant has {} field(s)", variant.fields.len()),
+                        "Match every field, or use `_` for the ones you do not need.",
+                    );
+                    for &arg in args {
+                        if !self.is_rest_elem(arg) {
+                            self.assign_lhs_expected(arg, ERROR);
+                        }
+                    }
+                    return;
+                }
+                if !p.adt(a).is_enum {
+                    self.check_ctor_vis(a, span);
+                }
+                match self.map_assign_elems(args, variant.fields.len()) {
+                    Some(mapped) => {
+                        for (i, sub) in mapped {
+                            let ft = variant.fields[i].ty;
+                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                            self.assign_lhs_expected(sub, ft);
+                        }
+                    }
+                    None => {
+                        self.err(
+                            "L0110",
+                            span,
+                            format!("this variant has {} field(s)", variant.fields.len()),
+                            "Match every field, use `_`, or skip the middle with `..`.",
+                        );
+                        for &arg in args {
+                            if !self.is_rest_elem(arg) {
+                                self.assign_lhs_expected(arg, ERROR);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                let t = self.expr(e, None);
+                if !self.unify(t, want) {
+                    self.mismatch(span, want, t);
+                }
+            }
+        }
+    }
+
+    fn place_check(&mut self, e: ExprId, destr: bool) {
         if let Some(idx) = self.static_root(e) {
             let s = self.span(e);
             if self.p.statics[idx as usize].mutable {
@@ -4591,12 +4977,42 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         let ok = match self.p.ast.expr(e) {
-            Expr::Path(segs) => segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)),
+            Expr::Path(segs) => {
+                (segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)))
+                    || (destr
+                        && match self.out.expr_res[self.ei(e)] {
+                            // A unit variant target (`U = make_u();`)
+                            // writes nothing. A variant of a
+                            // multi-variant enum can fail to match.
+                            Res::Variant(a, v) => {
+                                self.p.adt(a).variants[v as usize].shape == VariantShape::Unit
+                                    && (!self.p.adt(a).is_enum || self.p.adt(a).variants.len() == 1)
+                            }
+                            _ => false,
+                        })
+            }
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) | Expr::SelfValue => true,
             Expr::Underscore => true,
+            Expr::Unit => destr,
             Expr::Tuple(elems) | Expr::Array(elems) => {
                 for &el in elems {
-                    self.place_check(el);
+                    if !self.is_rest_elem(el) {
+                        self.place_check(el, destr);
+                    }
+                }
+                return;
+            }
+            Expr::StructLit { fields, .. } if destr => {
+                for &(_, _, fe) in fields {
+                    self.place_check(fe, destr);
+                }
+                return;
+            }
+            Expr::Call { args, .. } if destr && matches!(self.out.expr_res[self.ei(e)], Res::Variant(..)) => {
+                for &arg in args {
+                    if !self.is_rest_elem(arg) {
+                        self.place_check(arg, destr);
+                    }
                 }
                 return;
             }
@@ -7927,6 +8343,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // Struct update: the fields not written come from the base value.
         if let Some(u) = update {
+            if self.is_rest_elem(u) {
+                self.set(u, ERROR);
+                self.err("L0110", self.span(u), "base expression required after `..`", "Add the value to fill the rest from, as in `..base`.");
+                return ERROR;
+            }
             if p.adt(a).is_enum {
                 self.expr(u, None);
                 self.err("L0110", span, "functional record update syntax requires a struct", "Set every field of the variant.");
@@ -10906,6 +11327,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.k_place_parts(*base, env, lint),
             Expr::Deref(inner) => {
                 self.k_expr(*inner, env, lint);
+            }
+            // A destructuring target holds a place per element.
+            Expr::Tuple(elems) | Expr::Array(elems) => {
+                for &el in elems {
+                    self.k_place_parts(el, env, lint);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for &(_, _, fe) in fields {
+                    self.k_place_parts(fe, env, lint);
+                }
+            }
+            Expr::Call { args, .. } => {
+                for &arg in args {
+                    self.k_place_parts(arg, env, lint);
+                }
             }
             _ => {}
         }

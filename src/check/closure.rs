@@ -695,6 +695,35 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.cap_walk(e, false, w);
     }
 
+    /// An assignment target: every place inside a destructuring
+    /// form is mutated, so it captures as a mutable borrow of that
+    /// place. Discards and `..` rest elements capture nothing.
+    fn cap_assign_target(&mut self, e: ExprId, w: &mut CapWalk) {
+        match self.p.ast.expr(e) {
+            Expr::Tuple(elems) | Expr::Array(elems) => {
+                for &el in elems {
+                    if !matches!(self.p.ast.expr(el), Expr::Range { lo: None, hi: None, inclusive: false }) {
+                        self.cap_assign_target(el, w);
+                    }
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for &(_, _, fe) in fields {
+                    self.cap_assign_target(fe, w);
+                }
+            }
+            Expr::Call { args, .. } if matches!(self.out.expr_res[self.ei(e)], Res::Variant(..)) => {
+                for &arg in args {
+                    if !matches!(self.p.ast.expr(arg), Expr::Range { lo: None, hi: None, inclusive: false }) {
+                        self.cap_assign_target(arg, w);
+                    }
+                }
+            }
+            Expr::Underscore | Expr::Unit => {}
+            _ => self.cap_borrow(e, CaptureMode::MutRef, w),
+        }
+    }
+
     /// `borrow_expr`: `e` is borrowed (or mutated, for `MutRef`).
     fn cap_borrow(&mut self, e: ExprId, mode: CaptureMode, w: &mut CapWalk) {
         let span = self.span(e);
@@ -969,7 +998,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.cap_borrow(*expr, if *mutable { CaptureMode::MutRef } else { CaptureMode::Ref }, w);
                 }
             }
-            Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+            Expr::Assign { lhs, rhs } => {
+                self.cap_assign_target(*lhs, w);
+                self.cap_consume(*rhs, w);
+            }
+            Expr::AssignOp { lhs, rhs, .. } => {
                 self.cap_borrow(*lhs, CaptureMode::MutRef, w);
                 self.cap_consume(*rhs, w);
             }

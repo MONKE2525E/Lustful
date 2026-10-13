@@ -252,6 +252,59 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// True when the place chain of `e` is rooted in a local variable:
+    /// the parts of it a pattern does not move stay in that variable
+    /// and drop with it. A chain rooted in a value (`make().pair`,
+    /// `*make_box()`) holds the value in a temporary instead, and the
+    /// temporary drops after the pattern's moves, as a match
+    /// scrutinee temporary does in rustc.
+    fn place_root_owned(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Path(_) | Expr::SelfValue => matches!(self.ck.res(e), Res::Local(_)),
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => self.place_root_owned(*base),
+            Expr::Deref(inner) => self.place_root_owned(*inner),
+            _ => false,
+        }
+    }
+
+    /// True for a bare `..` element of an assignment target
+    /// (`[a, .., b]`, `(a, ..)`, `Pair(a, ..)`). The parser reads it
+    /// as an open range expression.
+    fn is_rest_elem(&self, e: ExprId) -> bool {
+        matches!(self.p.ast.expr(e), Expr::Range { lo: None, hi: None, inclusive: false })
+    }
+
+    /// Maps target elements to source indices, skipping the elements
+    /// a `..` rest covers. The checker reports a bad count, so a
+    /// mapping that does not fit just keeps the indices in range.
+    fn map_assign_elems(&self, elems: &[ExprId], n: usize) -> Vec<(usize, ExprId)> {
+        match elems.iter().position(|&e| self.is_rest_elem(e)) {
+            None => elems.iter().enumerate().filter(|(i, _)| *i < n).map(|(i, &e)| (i, e)).collect(),
+            Some(r) => {
+                let suffix = elems.len() - r - 1;
+                let mut out: Vec<(usize, ExprId)> = elems[..r].iter().enumerate().filter(|(i, _)| *i < n).map(|(i, &e)| (i, e)).collect();
+                for (j, &e) in elems[r + 1..].iter().enumerate() {
+                    if !self.is_rest_elem(e) && n >= suffix {
+                        out.push((n - suffix + j, e));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// True when `lhs` is a destructuring assignment target: a tuple,
+    /// array, struct, or tuple-struct form, a `_` or `()` discard, or
+    /// a unit variant path.
+    fn is_destr_assign(&self, lhs: ExprId) -> bool {
+        match self.p.ast.expr(lhs) {
+            Expr::Tuple(_) | Expr::Array(_) | Expr::Underscore | Expr::StructLit { .. } | Expr::Unit => true,
+            Expr::Call { .. } => matches!(self.ck.res(lhs), Res::Variant(..)),
+            Expr::Path(_) => matches!(self.ck.res(lhs), Res::Variant(..)),
+            _ => false,
+        }
+    }
+
     /// Evaluates `e` to a place that will be written or mutably borrowed. A `Vec` index in
     /// such a place is an `IndexMut` borrow in Rust: the mutable borrow of the container
     /// starts before the index expression runs, so `v[v.len()] = 1` and `&mut v[v.len()]`
@@ -996,18 +1049,41 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Assign { lhs, rhs } => {
-                if matches!(p.ast.expr(*lhs), Expr::Tuple(_) | Expr::Array(_) | Expr::Underscore) {
-                    // Destructuring assignment: the right-hand side
-                    // evaluates once into a temporary, then each target
-                    // element is written from it (so a swap reads both
-                    // old values), and the temporary drops what remains.
+                if self.is_destr_assign(*lhs) {
+                    // Destructuring assignment, in rustc's desugared
+                    // order: evaluate the right-hand side once, move
+                    // each written element into a binding temporary in
+                    // target order, drop what remains of a temporary
+                    // scrutinee, then write each target in order (its
+                    // place evaluates just before its own write, so a
+                    // swap reads both old values). A scrutinee that is
+                    // a place rooted in a local binds out of that place
+                    // as in a `let`: elements the target discards stay
+                    // in it and drop with its owner, they do not drop
+                    // here. Any other scrutinee (a value, or a place
+                    // rooted in a value such as `make().pair`) holds
+                    // its storage in a temporary local, and dropping
+                    // that root after the moves drops exactly the
+                    // discarded and rest elements, plus any ancestors
+                    // outside the matched projection, before the first
+                    // target place evaluates.
                     let rt = self.ty(*rhs);
-                    let tmp = Place::local(self.temp(rt));
-                    self.expr_into(*rhs, Some(&tmp));
+                    let owned = self.ck.coerce(*rhs) == Coerce::None && self.is_place_expr(*rhs) && self.place_root_owned(*rhs);
+                    let src = if self.ck.coerce(*rhs) == Coerce::None {
+                        let pl = self.place(*rhs);
+                        self.assign_pattern_place(pl, rt, *lhs, span)
+                    } else {
+                        let tmp = Place::local(self.temp(rt));
+                        self.expr_into(*rhs, Some(&tmp));
+                        tmp
+                    };
                     let mut writes = Vec::new();
-                    self.collect_assign_pattern(*lhs, tmp.clone(), rt, span, &mut writes);
-                    if needs_drop(self.p, &self.body.tys, rt) {
-                        self.push(StmtKind::Drop(tmp.local), span);
+                    self.collect_assign_pattern(*lhs, src.clone(), rt, span, &mut writes);
+                    if !owned {
+                        let root_ty = self.body.locals[src.local as usize].ty;
+                        if needs_drop(self.p, &self.body.tys, root_ty) {
+                            self.push(StmtKind::Drop(src.local), span);
+                        }
                     }
                     for (target, src, ety) in writes {
                         let pl = self.place_for_mut(target);
@@ -1880,33 +1956,107 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.assign(out, rv, span);
     }
 
+    /// True when a destructuring assignment target moves a non-Copy
+    /// element out of its source. Leaf targets carry their element
+    /// type from the checker, in both checking directions.
+    fn assign_moves_noncopy(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Underscore | Expr::Unit => false,
+            Expr::Path(_) if matches!(self.ck.res(e), Res::Variant(..)) => false,
+            Expr::Tuple(elems) | Expr::Array(elems) => elems.iter().any(|&el| !self.is_rest_elem(el) && self.assign_moves_noncopy(el)),
+            Expr::StructLit { fields, .. } => fields.iter().any(|&(_, _, fe)| self.assign_moves_noncopy(fe)),
+            Expr::Call { args, .. } if matches!(self.ck.res(e), Res::Variant(..)) => {
+                args.iter().any(|&arg| !self.is_rest_elem(arg) && self.assign_moves_noncopy(arg))
+            }
+            _ => !is_copy(self.p, &self.body.tys, self.ty(e)),
+        }
+    }
+
+    /// The source place of a destructuring assignment, with the
+    /// guard `pattern_place` puts on a pattern scrutinee: a move
+    /// out of a place that goes through a written index expression
+    /// is a move out of the reference the `Index` trait returns
+    /// (rustc E0507/E0508), not the partial move the same
+    /// projections mean when the target itself projects them.
+    fn assign_pattern_place(&mut self, place: Place, ty: Ty, lhs: ExprId, span: Span) -> Place {
+        if !place.proj.iter().any(|x| matches!(x, Proj::Index(_))) || !self.assign_moves_noncopy(lhs) {
+            return place;
+        }
+        let rt = self.ref_ty(false, ty);
+        let tmp = self.temp(rt);
+        self.assign(Place::local(tmp), Rvalue::Ref(false, place), span);
+        Place::local(tmp).deref()
+    }
+
     /// Phase one of a destructuring assignment: move each written
     /// element of the source place into its own temporary, in target
-    /// order, and collect the writes. `_` writes nothing and stays in
-    /// the source temporary, which the caller drops next: in Rust a
-    /// discarded element drops before the overwritten old values do.
+    /// order, and collect the writes. `_`, `()`, a unit variant, and
+    /// the elements a `..` rest covers write nothing and stay in the
+    /// source place: the caller drops a temporary source next, so a
+    /// discarded element of a value drops before the overwritten old
+    /// values do, and a discarded element of an owned place stays
+    /// in that place.
     fn collect_assign_pattern(&mut self, e: ExprId, src: Place, ty: Ty, span: Span, out: &mut Vec<(ExprId, Place, Ty)>) {
-        match self.p.ast.expr(e) {
-            Expr::Underscore => {}
+        let p = self.p;
+        match p.ast.expr(e) {
+            Expr::Underscore | Expr::Unit => {}
+            Expr::Path(_) if matches!(self.ck.res(e), Res::Variant(..)) => {}
             Expr::Tuple(elems) => {
                 let elem_tys: Vec<Ty> = match self.kind(ty) {
                     TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec(),
                     _ => Vec::new(),
                 };
-                for (i, &el) in elems.iter().enumerate() {
-                    if let Some(&ety) = elem_tys.get(i) {
-                        self.collect_assign_pattern(el, src.project(Proj::Field(i as u32)), ety, span, out);
-                    }
+                for (i, el) in self.map_assign_elems(elems, elem_tys.len()) {
+                    self.collect_assign_pattern(el, src.project(Proj::Field(i as u32)), elem_tys[i], span, out);
                 }
             }
             Expr::Array(elems) => {
-                let elem_ty = match self.kind(ty) {
-                    TyKind::Array(el, _) | TyKind::Slice(el) => el,
-                    _ => ERROR,
+                let (elem_ty, arr_len) = match self.kind(ty) {
+                    TyKind::Array(el, c) => {
+                        let n = match self.body.tys.const_kind(c) {
+                            ConstKind::Int(n) => Some(n as u64),
+                            _ => None,
+                        };
+                        (el, n)
+                    }
+                    TyKind::Slice(el) => (el, None),
+                    _ => (ERROR, None),
                 };
-                for (i, &el) in elems.iter().enumerate() {
+                let (prefix, suffix): (&[ExprId], &[ExprId]) = match elems.iter().position(|&e| self.is_rest_elem(e)) {
+                    Some(r) => (&elems[..r], &elems[r + 1..]),
+                    None => (elems, &[]),
+                };
+                for (i, &el) in prefix.iter().enumerate() {
                     let idx = self.const_usize(i as u64, span);
                     self.collect_assign_pattern(el, src.project(Proj::Index(idx)), elem_ty, span, out);
+                }
+                for (j, &el) in suffix.iter().enumerate() {
+                    if self.is_rest_elem(el) {
+                        continue;
+                    }
+                    let back = (suffix.len() - j) as u64;
+                    let idx = self.slice_back_index(&src, back, arr_len, span);
+                    self.collect_assign_pattern(el, src.project(Proj::Index(idx)), elem_ty, span, out);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                let Res::Variant(a, v) = self.ck.res(e) else { return };
+                let base = if p.adt(a).is_enum { src.project(Proj::Downcast(v)) } else { src };
+                let vfields = &p.adt(a).variants[v as usize].fields;
+                for &(fname, _, fe) in fields {
+                    if let Some(i) = vfields.iter().position(|f| f.name == fname) {
+                        let fty = self.ty(fe);
+                        self.collect_assign_pattern(fe, base.project(Proj::Field(i as u32)), fty, span, out);
+                    }
+                }
+            }
+            Expr::Call { args, .. } => {
+                let Res::Variant(a, v) = self.ck.res(e) else { return };
+                let base = if p.adt(a).is_enum { src.project(Proj::Downcast(v)) } else { src };
+                let n = p.adt(a).variants[v as usize].fields.len();
+                for (i, arg) in self.map_assign_elems(args, n) {
+                    let fty = self.ty(arg);
+                    self.collect_assign_pattern(arg, base.project(Proj::Field(i as u32)), fty, span, out);
                 }
             }
             _ => {

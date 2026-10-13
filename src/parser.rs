@@ -3459,8 +3459,16 @@ impl<'a> Parser<'a> {
         let mut update = None;
         while self.peek() != Tok::RBrace {
             if self.peek() == Tok::DotDot {
-                self.bump();
-                update = Some(self.expr()?);
+                let dd = self.bump().span;
+                if self.peek() == Tok::RBrace {
+                    // A bare `..` rest: only an assignment target may
+                    // use it (`S { x: place, .. } = value`). It reads
+                    // as an open range in the update slot, and the
+                    // checker rejects it in a struct literal value.
+                    update = Some(self.push_expr(Expr::Range { lo: None, hi: None, inclusive: false }, dd));
+                } else {
+                    update = Some(self.expr()?);
+                }
                 break;
             }
             // A tuple struct literal names fields by index: `T { 0: 5, ..a }`.
