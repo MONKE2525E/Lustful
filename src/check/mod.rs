@@ -5,6 +5,7 @@ pub mod collect;
 pub mod generics;
 pub mod method;
 pub mod obligations;
+pub mod picks;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
@@ -336,6 +337,9 @@ pub struct Checked<'g> {
     /// zonked args in this body's store). Mono lifts and
     /// materializes them; the driver never reads this.
     pub inst_requests: Vec<(LocalDefId, Vec<GenericArg>)>,
+    /// Trait picks of a template check (see `picks.rs`), in check
+    /// order. Mono stores them for the body's other checks.
+    pub trait_picks: Vec<(ExprId, picks::TraitPick)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -484,6 +488,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             pat_derefs: vec![0; n_pats],
             generic_args: vec![Vec::new(); n_exprs],
             inst_requests: Vec::new(),
+            trait_picks: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: Reads::new(),
@@ -4372,19 +4377,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.set_res(e, Res::DefaultVal);
             return Some(base);
         }
-        let traits: Vec<DefId> = match hint {
-            Some(tr) => vec![tr.def],
-            None => {
-                p.gx.traits_by_method
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|&d| method::trait_in_scope_pub(self, d))
-                    .collect()
-            }
+        // The trait: written, or the template check's pick, or the
+        // where clauses of a type parameter (rustc probes those as
+        // inherent candidates first), or every trait in scope.
+        let bound = if hint.is_none() { self.bound_traits_with(base, name) } else { Vec::new() };
+        let traits: Vec<DefId> = match (hint, self.replay_pick(e)) {
+            (Some(tr), _) => vec![tr.def],
+            (None, Some(pick)) => vec![pick.trait_def],
+            (None, None) if !bound.is_empty() => bound,
+            (None, None) => p
+                .gx
+                .traits_by_method
+                .get(&name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&d| method::trait_in_scope_pub(self, d))
+                .collect(),
         };
         let mut hits: Vec<(LocalDefId, Vec<Ty>, Ty)> = Vec::new();
+        let mut hit_traits: Vec<DefId> = Vec::new();
         for trait_def in traits {
             let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
             if rec.method_by_name(name).is_none() {
@@ -4410,6 +4422,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let mname = self.name(name).to_string();
                     if let Some(found) = self.method_instance_for_impl(e, id, tr, impl_args, &mname, span) {
                         hits.push(found);
+                        hit_traits.push(trait_def);
                         continue;
                     }
                 }
@@ -4422,6 +4435,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match hits.len() {
             1 => {
                 let (local, params, ret) = hits.into_iter().next().unwrap();
+                self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
                 self.set_res(e, Res::Fn(local));
                 self.check_args(&params, args, span);
                 Some(self.normalize_here(ret))
@@ -4974,12 +4988,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => None,
             })
             .collect();
+        // A call the template check resolved through a trait keeps
+        // that trait in every other check of the body (ARCH 4.1):
+        // selection on this body's Self type picks the impl, and no
+        // method lookup runs again.
+        let mut builtin_only = false;
+        if let Some(pick) = self.replay_pick(e) {
+            match picks::replay_method(self, e, rt, pick, name, name_span, args, &explicit, expected) {
+                Some(ret) => return ret,
+                None => builtin_only = true,
+            }
+        }
         // Generic and trait receivers go through the full 2.10
         // search (check/method.rs), which probes plain inherent
         // methods with the same recorded reads, in step+form
         // order. Builtin and scalar receivers stay on the path
         // below.
         if p.gx.has_generics
+            && !builtin_only
             && (self.tys.local_adt(base).is_some()
                 || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..)))
         {
@@ -4996,6 +5022,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // `W<u32>`); templates confirm inside their probe.
         let mut assoc_fn_seen = false;
         for form in ReceiverForm::PROBE_ORDER {
+            if builtin_only {
+                break;
+            }
             let set = p.method_set(&mut self.out.reads, head, name, form);
             for c in set.candidates {
                 let Some(cform) = c.receiver else {
@@ -5255,7 +5284,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             None => {
                 // Generic and trait methods over the full autoderef
                 // chain (check/method.rs).
-                if p.gx.has_generics {
+                if p.gx.has_generics && !builtin_only {
                     match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                         method::Probe::Hit(ret) => return ret,
                         method::Probe::Failed => return ERROR,

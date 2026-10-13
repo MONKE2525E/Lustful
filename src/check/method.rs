@@ -249,8 +249,34 @@ pub(super) fn trait_method_probe(
     explicit: &[Option<GenericArg>],
     expected: Option<Ty>,
 ) -> Probe {
+    trait_probe_for(cx, e, None, probes, derefs, name, name_span, args, explicit, expected)
+}
+
+/// `trait_method_probe` over every trait in scope, or over `only`
+/// when a template pick or a where clause already fixed the trait
+/// (scope was decided there). A confirmed hit is recorded as a
+/// template pick (see `picks.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn trait_probe_for(
+    cx: &mut Ctx,
+    e: ExprId,
+    only: Option<DefId>,
+    probes: &[RcvProbe],
+    derefs: u8,
+    name: Sym,
+    name_span: Span,
+    args: &[ExprId],
+    explicit: &[Option<GenericArg>],
+    expected: Option<Ty>,
+) -> Probe {
     let p = cx.p;
-    let Some(traits) = p.gx.traits_by_method.get(&name).cloned() else { return Probe::Miss };
+    let traits: Vec<DefId> = match only {
+        Some(t) => vec![t],
+        None => match p.gx.traits_by_method.get(&name) {
+            Some(t) => t.clone(),
+            None => return Probe::Miss,
+        },
+    };
     // First pass: probe every in-scope trait by selection, with
     // rollback, and count the hits at this form.
     // A hit: trait, its method template, the impl method (or
@@ -263,7 +289,7 @@ pub(super) fn trait_method_probe(
     let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>, RcvProbe, Option<(Ty, Ty)>)> =
         Vec::new();
     for trait_def in traits {
-        if !trait_in_scope(cx, trait_def) {
+        if only.is_none() && !trait_in_scope(cx, trait_def) {
             continue;
         }
         let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
@@ -388,6 +414,7 @@ pub(super) fn trait_method_probe(
                 let err_len = cx.errs.len();
                 let sites_len = cx.generic_sites.len();
                 let csites_len = cx.closure_sites.len();
+                let picks_len = cx.out.trait_picks.len();
                 let mut input_vars: Vec<Ty> = Vec::new();
                 let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
                 for _ in 0..n_inputs {
@@ -435,6 +462,7 @@ pub(super) fn trait_method_probe(
                 cx.errs.truncate(err_len);
                 cx.generic_sites.truncate(sites_len);
                 cx.closure_sites.truncate(csites_len);
+                cx.out.trait_picks.truncate(picks_len);
                 if let Some(inputs) = zonked {
                     let snap = cx.snapshot_vars();
                     let obl_len = cx.obl_len();
@@ -543,11 +571,15 @@ pub(super) fn trait_method_probe(
                     }
                     cx.set_res(e, Res::Method { f: local, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
                     cx.check_args(&params[1..], args, name_span);
+                    cx.record_pick(e, trait_def, derefs + probe.extra_derefs, probe.filter);
                     return Probe::Hit(cx.normalize_here(ret));
                 }
             };
             match confirm_method(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
-                Some(ret) => Probe::Hit(ret),
+                Some(ret) => {
+                    cx.record_pick(e, trait_def, derefs + probe.extra_derefs, probe.filter);
+                    Probe::Hit(ret)
+                }
                 None => Probe::Miss,
             }
         }
@@ -678,6 +710,10 @@ pub(super) fn generic_method_search(
                     hit => return hit,
                 }
                 match inherent_template_probe(cx, e, probe, derefs, name, name_span, args, explicit) {
+                    Probe::Miss => {}
+                    hit => return hit,
+                }
+                match super::picks::where_clause_probe(cx, e, probe, derefs, name, name_span, args, explicit, expected) {
                     Probe::Miss => {}
                     hit => return hit,
                 }

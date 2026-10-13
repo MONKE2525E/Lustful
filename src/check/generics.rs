@@ -1520,6 +1520,17 @@ pub struct GenTables<'a> {
     pub has_generics: bool,
     /// (abstract instances checked, concrete instances made).
     pub mono_counts: (usize, usize),
+    /// The template check of each template body: its canonical
+    /// abstract instance, whose trait picks are recorded.
+    pub template_checks: FxMap<LocalDefId, LocalDefId>,
+    /// Trait picks of template bodies by call expression (ARCH 4.1
+    /// `CallTrait`, see `check/picks.rs`): every check of a body other
+    /// than its template check reuses them instead of probing again.
+    pub trait_picks: FxMap<crate::ast::ExprId, crate::check::picks::TraitPick>,
+    /// The opaque Adts that stand for type parameters in template
+    /// checks (not the ones for associated types), for the
+    /// where-clause probe.
+    pub param_opaques: FxMap<AdtId, ()>,
 }
 
 impl Default for GenTables<'_> {
@@ -1554,6 +1565,9 @@ impl Default for GenTables<'_> {
             drop_methods: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
+            template_checks: FxMap::default(),
+            trait_picks: FxMap::default(),
+            param_opaques: FxMap::default(),
         }
     }
 }
@@ -3419,7 +3433,11 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
             match param.kind {
                 ParamKind::Type => {
                     let bounds = param_bound_traits(&env, &p.tys, i as u32);
-                    args.push(GenericArg::Ty(opaque_adt(p, (def, i as u32), &bounds, &mut opaque_memo, &mut ordinal)));
+                    let o = opaque_adt(p, (def, i as u32), &bounds, &mut opaque_memo, &mut ordinal);
+                    if let Some(a) = p.tys.local_adt(o) {
+                        p.gx.param_opaques.insert(a, ());
+                    }
+                    args.push(GenericArg::Ty(o));
                 }
                 ParamKind::Lifetime => args.push(GenericArg::Lifetime(Region::Erased)),
                 ParamKind::Const(ct) => {
@@ -3455,7 +3473,11 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
             match param.kind {
                 ParamKind::Type => {
                     let bounds = param_bound_traits(&tmpl.env, &p.tys, i as u32);
-                    args.push(GenericArg::Ty(opaque_adt(p, (tdef, i as u32), &bounds, &mut opaque_memo, &mut ordinal)));
+                    let o = opaque_adt(p, (tdef, i as u32), &bounds, &mut opaque_memo, &mut ordinal);
+                    if let Some(a) = p.tys.local_adt(o) {
+                        p.gx.param_opaques.insert(a, ());
+                    }
+                    args.push(GenericArg::Ty(o));
                 }
                 ParamKind::Lifetime => args.push(GenericArg::Lifetime(Region::Erased)),
                 ParamKind::Const(ct) => {
@@ -3486,6 +3508,7 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
         // impls' job now.
         let inst = fn_instance(p, t, &args, FnClass::Abstract);
         p.gx.mono_counts.0 += 1;
+        p.gx.template_checks.insert(inst, t);
         queue.push(inst);
     }
     let mut rounds = 0usize;
@@ -3496,8 +3519,9 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
         }
         let mut next_queue: Vec<LocalDefId> = Vec::new();
         for fid in std::mem::take(&mut queue) {
-            let (checked, mut body_errs) = {
+            let (checked, mut body_errs, picks) = {
                 let (c, e) = crate::check::check_fn(p, fid);
+                let picks = c.trait_picks.clone();
                 // Snapshot the requests out of the checked body.
                 let reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = c
                     .inst_requests
@@ -3525,9 +3549,14 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
                     let body = crate::lower::lower(p, fid, c);
                     e.extend(crate::borrowck::borrowck(p, &body));
                 }
-                (reqs, e)
+                (reqs, e, picks)
             };
             errs.append(&mut body_errs);
+            // Only the template check records picks (see check_fn);
+            // later writes for one call win, like the final probe.
+            for (call, pick) in picks {
+                p.gx.trait_picks.insert(call, pick);
+            }
             for (template, owned_args) in checked {
                 // Closure instances are concrete-only (see the
                 // template list above); the body was already
