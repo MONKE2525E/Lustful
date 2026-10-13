@@ -1,4 +1,4 @@
-// expect: L0202
+// expect: L0733
 fn f(slot: &mut &i32, a: &i32) {
     let mut r = a;
     r = *slot;

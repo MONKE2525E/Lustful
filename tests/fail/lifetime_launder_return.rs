@@ -1,4 +1,4 @@
-// expect: L0202
+// expect: L0733
 struct S {
     v: i32,
 }

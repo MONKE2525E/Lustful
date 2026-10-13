@@ -1,4 +1,4 @@
-// expect: L0202
+// expect: L0733
 fn f(mut a: &i64, b: &i64) {
     a = b;
     println!("{}", a);
