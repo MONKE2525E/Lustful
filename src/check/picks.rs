@@ -1,12 +1,11 @@
 // Template call picks (docs/ARCH.md section 4.1, `CallTrait`). A
 // template body is checked once against its bounds (the template
-// check, mono's canonical abstract instance). Every call there that
+// check, `generics::template_check`). Every call there that
 // resolves through a trait method records a pick: the trait, and
 // where the Self type sits relative to the receiver. Every other
-// check of the same body (concrete instances, closure instances, and
-// abstract instances made for other templates' calls) replays the
-// pick: the trait is fixed, and selection on the Self type there
-// picks the impl. Method lookup never runs again for those calls, so
+// check of the same body (concrete instances and closure instances)
+// replays the pick: the trait is fixed, and selection on the Self
+// type there picks the impl. Method lookup never runs again for those calls, so
 // an instance cannot see the inherent methods, builtin std methods,
 // or other traits of a concrete type that the template could not
 // see (rustc also resolves methods once per generic body).
@@ -19,7 +18,6 @@
 use super::method::{self, Probe, RcvProbe};
 use super::*;
 use crate::def::DefId;
-use crate::traits::index::Synthetic;
 
 /// One call a template check resolved through a trait method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +33,7 @@ pub struct TraitPick {
 impl Ctx<'_, '_> {
     /// True when this body is a template check, whose picks are
     /// recorded rather than replayed.
-    fn is_template_check(&self) -> bool {
+    pub(super) fn is_template_check(&self) -> bool {
         self.p.gx.template_checks.contains_key(&self.fid)
     }
 
@@ -55,36 +53,21 @@ impl Ctx<'_, '_> {
         }
     }
 
-    /// The traits of the where clauses on one type parameter that
-    /// declare a method `name` with a template. A `Param` Self reads
-    /// this body's env. In a template check over opaques, each bound
-    /// is made true by an `Abstract` synthetic impl for the opaque, so
-    /// those records are its where clauses. Both envs are elaborated,
-    /// so supertraits count.
+    /// The traits of the where clauses on one type parameter (or
+    /// projection) that declare a method `name` with a template, from
+    /// this body's env. The env is elaborated, so supertraits count.
     pub(super) fn bound_traits_with(&self, self_ty: Ty, name: Sym) -> Vec<DefId> {
         let p = self.p;
         let Some(traits) = p.gx.traits_by_method.get(&name) else { return Vec::new() };
         let self_ty = self.resolve(self_ty);
-        let is_bound: Box<dyn Fn(DefId) -> bool + '_> = match self.tys.kind(self_ty) {
-            TyKind::Param(_) => Box::new(move |t: DefId| {
-                self.env().iter().any(|pred| {
-                    matches!(pred, Predicate::Trait(b) if b.count == 0 && b.value.def == t
-                        && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(self_ty))
-                })
-            }),
-            _ => {
-                let Some(a) = self.tys.local_adt(self_ty) else { return Vec::new() };
-                if !p.gx.param_opaques.contains_key(&a) {
-                    return Vec::new();
-                }
-                Box::new(move |t: DefId| {
-                    p.gx.index.impls_of_trait(t).iter().any(|&id| {
-                        let r = p.gx.index.get(id);
-                        r.synthetic == Synthetic::Abstract
-                            && p.tys.args(r.trait_ref.args).first().and_then(|g| g.as_ty()).and_then(|s| p.tys.local_adt(s)) == Some(a)
-                    })
-                })
-            }
+        if !matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
+            return Vec::new();
+        }
+        let is_bound = |t: DefId| {
+            self.env().iter().any(|pred| {
+                matches!(pred, Predicate::Trait(b) if b.count == 0 && b.value.def == t
+                    && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(self_ty))
+            })
         };
         let mut out: Vec<DefId> = Vec::new();
         for &t in traits {

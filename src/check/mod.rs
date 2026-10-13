@@ -539,6 +539,9 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             .collect();
         cx.item_scopes.push(layer);
     }
+    // A template body keeps its `Param` types: the store answers
+    // the structural trait queries on them from the env (`Tys::env`).
+    cx.tys.env = p.gx.fn_scopes.get(fid.0 as usize).map_or(&[], |fs| fs.env.as_slice());
     // A closure fn checks its closure body: parameters come from
     // the closure's own parameter patterns (simple bindings only
     // in this slice) and the body is one expression.
@@ -602,12 +605,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
                     );
                 }
                 PatIdent::Static => {
-                    cx.err(
-                        "L0110",
-                        param.span,
-                        "statics cannot be used as patterns",
-                        "Rename the parameter: this name is a static item.",
-                    );
+                    cx.err("L0110", param.span, "statics cannot be used as patterns", "Rename the parameter: this name is a static item.");
                 }
                 PatIdent::Variant(a, _) if p.adt(a).is_enum => {
                     cx.err(
@@ -631,6 +629,34 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         let l = cx.add_local(param.name, f.params[pi], param.mutable, param.span);
         cx.out.param_locals.push(l);
         pi += 1;
+    }
+    // A template's parameters and return value are values of their
+    // types, which must be `Sized` under its env (rustc E0277): a
+    // `T: ?Sized` param, or `self` in a trait default body without
+    // `Self: Sized`. Collect checks the concrete forms (`[T]`, `str`).
+    if cx.is_template_check() {
+        let mut slots: Vec<(Ty, Span)> = Vec::new();
+        let mut i = 0;
+        if let Some(sp) = &def.self_param {
+            slots.push((f.params[0], sp.span));
+            i = 1;
+        }
+        for param in &def.params {
+            slots.push((f.params[i], param.span));
+            i += 1;
+        }
+        slots.push((f.ret, def.ret.map_or(def.name_span, |t| p.ast.ty_span(t))));
+        for (t, span) in slots {
+            if !cx.sized_ok(t) {
+                let tn = cx.tn(t);
+                cx.err(
+                    "L0110",
+                    span,
+                    format!("the size for values of type `{tn}` cannot be known"),
+                    "Pass the value behind a reference such as `&T`, or drop the `?Sized` bound.",
+                );
+            }
+        }
     }
     // A declaration without a body (trait or foreign fn shape) has nothing
     // to check; the parser does not build those today.
@@ -830,9 +856,7 @@ impl CaptureScan<'_> {
                     self.expr(*v, in_return);
                 }
             }
-            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) | Expr::LabeledBlock { body: b, .. } => {
-                self.block(*b, in_return)
-            }
+            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) | Expr::LabeledBlock { body: b, .. } => self.block(*b, in_return),
             Expr::If { cond, then, els } => {
                 let mark = self.bound.len();
                 self.expr(*cond, in_return);
@@ -906,7 +930,11 @@ impl CaptureScan<'_> {
                 self.expr(*lhs, in_return);
                 self.expr(*rhs, in_return);
             }
-            Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) | Expr::Await(expr)
+            Expr::Unary { expr, .. }
+            | Expr::Ref { expr, .. }
+            | Expr::Deref(expr)
+            | Expr::Try(expr)
+            | Expr::Await(expr)
             | Expr::Cast { expr, .. } => self.expr(*expr, in_return),
             Expr::StructLit { fields, update, .. } => {
                 for &(_, _, f) in fields {
@@ -1249,12 +1277,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// The `fn(params) -> ret` pointer type for a signature.
     fn fn_ptr_ty(&mut self, params: &[Ty], ret: Ty) -> Ty {
         let inputs = self.tys.intern_tys(params);
-        let sig = self.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig {
-            inputs,
-            output: ret,
-            is_unsafe: false,
-            extern_c: false,
-        }));
+        let sig =
+            self.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: ret, is_unsafe: false, extern_c: false }));
         self.tys.intern(TyKind::FnPtr(sig))
     }
 
@@ -2339,9 +2363,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // same signature (the value materializes as its trampoline).
             (TyKind::FnDef(..), TyKind::FnPtr(_))
                 if self.is_fn_item(found)
-                    && self
-                        .callable_sig(found)
-                        .is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(expected)) =>
+                    && self.callable_sig(found).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(expected)) =>
             {
                 // The expression now has the pointer type, so lowering
                 // materializes the trampoline value for it.
@@ -2740,30 +2762,52 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The enclosing fn's generic arguments in this body: the
-    /// instance args mono recorded, or none for a plain fn.
-    fn parent_generic_args(&self) -> Vec<GenericArg> {
+    /// instance args mono recorded, the template's own params in a
+    /// template check, or none for a plain fn.
+    fn parent_generic_args(&mut self) -> Vec<GenericArg> {
         if let Some(top) = self.closure_arg_stack.last() {
             return top.clone();
         }
-        match self.p.gx.instances.get(&self.fid) {
-            Some(info) => self.p.tys.args(info.args).to_vec(),
-            None => Vec::new(),
+        if let Some(info) = self.p.gx.instances.get(&self.fid) {
+            return self.p.tys.args(info.args).to_vec();
         }
+        if !self.is_template_check() {
+            return Vec::new();
+        }
+        let params = match self.p.gx.fn_templates.get(self.fid.0 as usize) {
+            Some(Some(t)) => t.generics.params.clone(),
+            _ => Vec::new(),
+        };
+        params
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d.kind {
+                ParamKind::Type => GenericArg::Ty(self.tys.intern(TyKind::Param(ParamId(i as u32)))),
+                ParamKind::Const(_) => GenericArg::Const(self.tys.intern_const(ConstKind::Param(i as u32))),
+                ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+            })
+            .collect()
     }
 
     /// The in-place closure body check. In a concrete body it
     /// is inference-only and fully isolated: its errors and
     /// sites are dropped, because the closure instance check
-    /// is authoritative. In an abstract (template) body there
-    /// is no closure instance check, so this check is
-    /// authoritative and everything it records stays. Variable
+    /// is authoritative. In a template check there is no
+    /// closure instance check, so this check is authoritative
+    /// and everything it records stays. Variable
     /// bindings stay in both modes: they are the signature
     /// inference the instance request is built from.
     /// Returns true when a method call in the body had an
     /// unbound-variable receiver (see `head_unknown_flag`).
-    fn infer_closure_body(&mut self, names: &[Option<(Sym, bool, Span)>], sig: &[Ty], body: ExprId, ret_ty: Ty, args: &[GenericArg]) -> bool {
-        let p = self.p;
-        let keep = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
+    fn infer_closure_body(
+        &mut self,
+        names: &[Option<(Sym, bool, Span)>],
+        sig: &[Ty],
+        body: ExprId,
+        ret_ty: Ty,
+        args: &[GenericArg],
+    ) -> bool {
+        let keep = self.is_template_check();
         let saved_errs = if keep { Vec::new() } else { std::mem::take(&mut self.errs) };
         let saved_obl = if keep { Vec::new() } else { self.obl.take() };
         let saved_lits = if keep { Vec::new() } else { std::mem::take(&mut self.negated_lits) };
@@ -2822,14 +2866,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// slice. The result type names the closure template with
     /// the enclosing args and signature types, and the site is
     /// recorded for mono like a generic call.
-    fn closure_expr(
-        &mut self,
-        e: ExprId,
-        params: &[ast::ClosureParam],
-        ret: Option<ast::TyId>,
-        body: ExprId,
-        span: Span,
-    ) -> Ty {
+    fn closure_expr(&mut self, e: ExprId, params: &[ast::ClosureParam], ret: Option<ast::TyId>, body: ExprId, span: Span) -> Ty {
         let p = self.p;
         let Some(&template) = p.gx.closure_by_expr.get(&e) else {
             self.err("L0820", span, "closures are not supported here yet", "Move the closure into a function body.");
@@ -2882,7 +2919,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         args.extend(var_sig.iter().map(|&t| GenericArg::Ty(t)));
         // Capture scan against the locals in scope right here.
         let outer: Vec<(Sym, CtxtId)> = self.scopes.iter().map(|&((n, c), _)| (n, c)).collect();
-        let mut scan = CaptureScan { ast: p.ast, self_sym: p.known.self_value, outer: &outer, bound: Vec::new(), capture: None, has_return: false };
+        let mut scan =
+            CaptureScan { ast: p.ast, self_sym: p.known.self_value, outer: &outer, bound: Vec::new(), capture: None, has_return: false };
         for cp in params {
             scan.bind_pat(cp.pat);
         }
@@ -2906,9 +2944,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // call sites checked after this point may have bound
             // them, and the body then binds the rest. A failed
             // head is final, as in rustc: no second pass.
-            let concrete = !matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Abstract));
+            let concrete = !self.is_template_check();
             if concrete && !bad_pattern && !failed {
-                self.deferred_closures.push(DeferredClosure { names: names.clone(), sig: sig.clone(), body, ret: ret_ty, args: args.clone() });
+                self.deferred_closures.push(DeferredClosure {
+                    names: names.clone(),
+                    sig: sig.clone(),
+                    body,
+                    ret: ret_ty,
+                    args: args.clone(),
+                });
             }
         }
         self.generic_sites.push((self.ei(e), template, args.clone()));
@@ -3646,7 +3690,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
                     _ => match self.tys.local_adt(inner) {
                         Some(a) if !p.adt(a).is_enum && p.adt(a).variants[0].shape == VariantShape::Tuple => {
-                            p.adt(a).variants[0].fields.get(*index as usize).map(|f| f.ty)
+                            // As for named fields: a generic Adt's field is
+                            // the template's, substituted with these args.
+                            p.adt(a).variants[0].fields.get(*index as usize).map(|f| match self.tys.adt_parts(inner) {
+                                Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(f.ty).contains_param() => {
+                                    let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
+                                    subst(&mut self.tys, f.ty, &gargs)
+                                }
+                                _ => f.ty,
+                            })
                         }
                         _ => None,
                     },
@@ -4300,7 +4352,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(Res::ResErr);
         }
         let adt = if ty_name == p.known.self_type {
-            self.f.owner
+            self.self_adt()
         } else {
             match ty_bound {
                 BindingRes::Def(def) => p.adt_by_def(def),
@@ -4347,6 +4399,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // binding read only names an outermost path, so a compound
         // type (`[S; 2]`, `(S, u8)`) would record nothing for `S`.
         p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+        // A template check has no layout for a type over its params;
+        // each instance answers with its own (the template body is
+        // never generated). A const context still needs the number,
+        // and its evaluator rejects the param (`ConstCx::layout`).
+        if self.is_template_check() && self.tys.flags(t).contains_param() {
+            return Res::ConstUsize(0);
+        }
         match crate::ty::layout::layout_of_ty(&self.tys, p, t) {
             Ok(l) => Res::ConstUsize(if align { l.align } else { l.size }),
             Err(()) => {
@@ -4387,6 +4446,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The Adt `Self` names in this body: the method's owner, or the
+    /// scope's Self type (a trait default assoc fn has no receiver to
+    /// name an owner).
+    fn self_adt(&self) -> Option<AdtId> {
+        self.f.owner.or_else(|| self.body_scope.self_ty.and_then(|t| self.tys.local_adt(t)))
+    }
+
     /// The Self type of `Type::name(..)` when the call goes through a
     /// trait: `Type` is an Adt with no variant and no inherent fn called
     /// `name`, or `picked` (the template check already resolved the call
@@ -4395,7 +4461,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let (ty_name, item) = (segs[0].name, segs[1].name);
         let a = if ty_name == p.known.self_type {
-            self.f.owner?
+            self.self_adt()?
         } else {
             match self.binding(Namespace::Type, ty_name) {
                 BindingRes::Def(def) => p.adt_by_def(def)?,
@@ -4471,12 +4537,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if matches!(src_kind, TyKind::Int(_) | TyKind::Char | TyKind::Bool) || src_kind.is_int_infer() || src_kind.is_float_infer() {
                 // With the input type known from the argument,
                 // selection can pick between input-specific impls
-                // (the abstract synthetics for each From bound).
+                // (or, in a template check, the bounds for each From).
                 let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(src)]);
                 let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
-                if let Selection::Impl { id, args: impl_args, .. } = self.select_obligation_at(tr, span, 0)
-                    && let Some((local, params, ret)) = self.method_instance_for_impl(e, id, tr, impl_args, "from", span)
-                {
+                let found = match self.select_obligation_at(tr, span, 0) {
+                    Selection::Impl { id, args: impl_args, .. } => self.method_instance_for_impl(e, id, tr, impl_args, "from", span),
+                    Selection::ParamEvidence(_) => self.stub_instance(e, tr, name, span),
+                    _ => None,
+                };
+                if let Some((local, params, ret)) = found {
                     self.set_res(e, Res::Fn(local));
                     self.check_args(&params, args, span);
                     return Some(self.normalize_here(ret));
@@ -4500,15 +4569,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (Some(tr), _) => vec![tr.def],
             (None, Some(pick)) => vec![pick.trait_def],
             (None, None) if !bound.is_empty() => bound,
-            (None, None) => p
-                .gx
-                .traits_by_method
-                .get(&name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|&d| method::trait_in_scope_pub(self, d))
-                .collect(),
+            (None, None) => {
+                p.gx.traits_by_method
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|&d| method::trait_in_scope_pub(self, d))
+                    .collect()
+            }
         };
         let mut hits: Vec<(LocalDefId, Vec<Ty>, Ty)> = Vec::new();
         let mut hit_traits: Vec<DefId> = Vec::new();
@@ -4536,6 +4605,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Selection::Impl { id, args: impl_args, .. } => {
                     let mname = self.name(name).to_string();
                     if let Some(found) = self.method_instance_for_impl(e, id, tr, impl_args, &mname, span) {
+                        hits.push(found);
+                        hit_traits.push(trait_def);
+                        continue;
+                    }
+                }
+                Selection::ParamEvidence(_) => {
+                    if let Some(found) = self.stub_instance(e, tr, name, span) {
                         hits.push(found);
                         hit_traits.push(trait_def);
                         continue;
@@ -4571,13 +4647,35 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The trait method's signature stub for a call the param env
+    /// proves (a template check), instantiated at the trait ref's
+    /// args and the method's own fresh ones: (stub, params, ret).
+    fn stub_instance(&mut self, e: ExprId, tr: TraitRef, name: Sym, span: Span) -> Option<(LocalDefId, Vec<Ty>, Ty)> {
+        let p = self.p;
+        let method_def = p.gx.index.trait_record(tr.def)?.method_by_name(name)?;
+        let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+        let generics = p.gx.fn_templates.get(stub.0 as usize)?.as_ref()?.generics.clone();
+        let raw: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+        let prefix: Vec<Option<GenericArg>> = raw
+            .iter()
+            .map(|&g| {
+                Some(match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(self.deep(t)),
+                    other => other,
+                })
+            })
+            .collect();
+        let (params, ret, _) = self.instantiate_template(e, stub, &generics, &prefix, span);
+        Some((stub, params, ret))
+    }
+
     /// A call through a value: a closure-typed callee calls its
     /// closure instance directly (the value is zero-sized, so
-    /// lowering passes no environment), and an opaque callee in
-    /// an abstract check calls through its Fn bound's synthetic
-    /// record. Only side-effect-free callee shapes are accepted
-    /// (a local, a closure literal, a borrow of a local):
-    /// lowering does not evaluate the callee operand.
+    /// lowering passes no environment), and a type parameter in a
+    /// template check calls through its Fn-family bound. Only
+    /// side-effect-free callee shapes are accepted (a local, a
+    /// closure literal, a borrow of a local): lowering does not
+    /// evaluate the callee operand.
     fn value_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span) -> Ty {
         let p = self.p;
         let simple = match p.ast.expr(callee) {
@@ -4640,59 +4738,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.generic_sites.push((self.ei(e), template, cargs));
                 self.normalize_here(ret)
             }
-            TyKind::Adt(..) => {
-                // Abstract check: an opaque type standing for a
-                // parameter whose Fn bound was made an Abstract
-                // synthetic record (see generics.rs).
-                let lang = p.gx.lang;
-                let mut sig: Option<(Vec<Ty>, Ty)> = None;
-                // Rust's call preference order: Fn, then FnMut,
-                // then FnOnce. The first matching record wins;
-                // supertrait records (FnMut of an Fn bound) may
-                // carry a fresh Output opaque instead of the
-                // bound's written binding.
-                'outer: for tr in [lang.fn_, lang.fn_mut, lang.fn_once] {
-                    for &id in p.gx.index.impls_of_trait(tr) {
-                        let rec = p.gx.index.get(id);
-                        if rec.synthetic != crate::traits::index::Synthetic::Abstract {
-                            continue;
-                        }
-                        let rargs = p.tys.args(rec.trait_ref.args);
-                        if rargs.first().and_then(|g| g.as_ty()) != Some(base) {
-                            continue;
-                        }
-                        let inputs = match rargs.get(1).and_then(|g| g.as_ty()) {
-                            Some(t) => match p.tys.kind(t) {
-                                TyKind::Tuple(ts) => p.tys.tys_of(ts).to_vec(),
-                                _ => Vec::new(),
-                            },
-                            None => Vec::new(),
-                        };
-                        let out = lang
-                            .output_of(tr)
-                            .and_then(|o| rec.assoc_ty(o))
-                            .unwrap_or_else(|| {
-                                let o = lang.output_of(tr).unwrap_or(tr);
-                                self.tys.intern(TyKind::Projection(AssocId(o), rec.trait_ref.args))
-                            });
-                        sig = Some((inputs, out));
-                        break 'outer;
-                    }
-                }
-                match sig {
-                    Some((params, ret)) => {
+            TyKind::Param(_) | TyKind::Projection(..) => {
+                let derefs = u8::from(matches!(self.kind(ct), TyKind::Ref(..)));
+                match self.fn_bound_call(base) {
+                    Some((stub, autoref, params, ret)) => {
                         self.check_args(&params, args, span);
-                        // Abstract bodies are lowered for borrow
-                        // checking only: give the call a default
-                        // value so its result temp is assigned.
-                        self.set_res(e, Res::DefaultVal);
+                        // Lowered as a call of the bound's method with
+                        // the callee as receiver: it borrows, mutably
+                        // borrows, or moves the callee (E0596, E0382).
+                        self.set_res(e, Res::Method { f: stub, derefs, autoref });
                         self.normalize_here(ret)
                     }
                     None => {
                         for &a in args {
                             self.expr(a, None);
                         }
-                        self.err("L0114", span, "this value is not a function", "Call a named function or a closure.");
+                        let tn = self.tn(base);
+                        self.err(
+                            "L0114",
+                            span,
+                            format!("`{tn}` is not a function: its bounds have no `Fn`, `FnMut`, or `FnOnce`"),
+                            "Add an `Fn` bound to the type parameter.",
+                        );
                         ERROR
                     }
                 }
@@ -4705,6 +4772,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ERROR
             }
         }
+    }
+
+    /// A call through an Fn-family bound of a type parameter or
+    /// projection in this body's env (a template check). Rust calls
+    /// through `Fn` when the bounds give it, else `FnMut`, else
+    /// `FnOnce`: (the trait method's stub, the receiver form, the
+    /// input types, the output type).
+    fn fn_bound_call(&mut self, callee: Ty) -> Option<(LocalDefId, Autoref, Vec<Ty>, Ty)> {
+        let p = self.p;
+        let lang = p.gx.lang;
+        for (tr, method, autoref) in
+            [(lang.fn_, "call", Autoref::Ref), (lang.fn_mut, "call_mut", Autoref::RefMut), (lang.fn_once, "call_once", Autoref::None)]
+        {
+            let Some(bound) = self.env().iter().find_map(|pred| match pred {
+                Predicate::Trait(b)
+                    if b.count == 0 && b.value.def == tr && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(callee) =>
+                {
+                    Some(b.value)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let inputs = match self.tys.args(bound.args).get(1).and_then(|g| g.as_ty()).map(|t| self.tys.kind(t)) {
+                Some(TyKind::Tuple(ts)) => self.tys.tys_of(ts).to_vec(),
+                _ => Vec::new(),
+            };
+            // The output: the bound's own binding when written there,
+            // else its projection, which the env's equalities settle.
+            let out_assoc = lang.output_of(tr)?;
+            let out = match self.tys.bindings(bound.bindings).iter().find(|(d, _)| *d == out_assoc).and_then(|(_, g)| g.as_ty()) {
+                Some(t) => t,
+                None => self.tys.intern(TyKind::Projection(AssocId(out_assoc), bound.args)),
+            };
+            let method_def = p.gx.index.trait_record(tr)?.method_by_name(p.interner.intern(method))?;
+            let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+            return Some((stub, autoref, inputs, out));
+        }
+        None
     }
 
     /// The call resolution for a callable value's type: a fn pointer
@@ -4740,7 +4846,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 || matches!(names.as_slice(), ["std" | "core", "mem", "size_of_val"]);
             if is_sov {
                 if args.len() != 1 {
-                    self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one reference.");
+                    self.err(
+                        "L0105",
+                        span,
+                        "this function takes 1 argument but a different number was given",
+                        "Pass exactly one reference.",
+                    );
                     for &a in args {
                         self.expr(a, None);
                     }
@@ -4840,10 +4951,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ERROR;
             }
             Expr::Path(segs) => {
-                // `T::assoc_fn(..)` on a type parameter: the trait
-                // comes from the bounds in scope for its type here.
+                // `T::assoc_fn(..)` on a type parameter, or `Self::f(..)`
+                // in a trait default body (Self is the trait's param):
+                // the trait comes from the bounds in scope here.
+                let param_self = self.body_scope.self_ty.filter(|&t| matches!(self.tys.kind(t), TyKind::Param(_)));
                 if segs.len() == 2
-                    && let Some((_, base)) = self.body_scope.param_tys.iter().find(|(n, _)| *n == segs[0].name).copied()
+                    && let Some(base) = self
+                        .body_scope
+                        .param_tys
+                        .iter()
+                        .find(|(n, _)| *n == segs[0].name)
+                        .map(|&(_, t)| t)
+                        .or(if segs[0].name == p.known.self_type { param_self } else { None })
                     && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
                 {
                     return t;
@@ -4913,7 +5032,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match self.callable_res(ct) {
                     Some(r) => r,
                     None => {
-                        self.err("L0114", span, "only named functions can be called", "Closures are not supported yet. Call a named function or a function pointer.");
+                        self.err(
+                            "L0114",
+                            span,
+                            "only named functions can be called",
+                            "Closures are not supported yet. Call a named function or a function pointer.",
+                        );
                         return ERROR;
                     }
                 }
@@ -5815,7 +5939,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
             None => EMPTY_BINDINGS,
         };
         let tr = TraitRef { def: trait_def, args: args_id, bindings };
-        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(tr) else { return None };
+        let (id, impl_args) = match self.select_obligation(tr) {
+            Selection::Impl { id, args, .. } => (id, args),
+            Selection::ParamEvidence(_) => {
+                // A template check: the bound proves the operator. The
+                // call is the trait method's stub; the result is the
+                // bound's `Output`, or its rigid projection.
+                let method_def = p.gx.index.trait_record(trait_def)?.method_by_name(p.interner.intern(method_name))?;
+                let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+                if let Some(assoc) = lang.output_of(trait_def) {
+                    let proj = self.tys.intern(TyKind::Projection(AssocId(assoc), args_id));
+                    let normed = self.normalize_here(proj);
+                    self.unify(out_var, normed);
+                }
+                self.set_res(e, Res::TraitBin { f: stub, ld, rd });
+                return Some(self.normalize_here(out_var));
+            }
+            _ => return None,
+        };
         let local = self.method_instance_for_impl(e, id, tr, impl_args, method_name, span)?;
         // The selected method's receiver and rhs are unified by
         // selection's probe through the trait ref above; record
@@ -5912,7 +6053,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let result = match op {
             Add | Sub | Mul | Div | Rem
-                if (matches!(lik, TyKind::Float(_)) || lik.is_float_infer()) && (matches!(rik, TyKind::Float(_)) || rik.is_float_infer()) =>
+                if (matches!(lik, TyKind::Float(_)) || lik.is_float_infer())
+                    && (matches!(rik, TyKind::Float(_)) || rik.is_float_infer()) =>
             {
                 if !self.unify(li, ri) {
                     return bad(self);
@@ -5950,7 +6092,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if n != p.known.self_type {
                 self.binding(Namespace::Type, n);
             }
-            let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
+            let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
             match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32)) {
                 Some(v) => Some(v),
                 // An imported struct-like variant (`use E::*; C { .. }`).
@@ -6128,27 +6270,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let span = self.span(iter);
         let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
         let tr = TraitRef { def: p.gx.lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
-        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(tr) else { return None };
         let lang = &p.gx.lang;
+        // The into_iter call: an impl's method, the std blanket's
+        // sentinel (no body: lowering uses the receiver as its own
+        // iterator), or in a template check the bound's stub.
+        let into_local = match self.select_obligation(tr) {
+            Selection::Impl { id, args: impl_args, .. } => {
+                if p.gx.index.get(id).items.is_empty() {
+                    LocalDefId(u32::MAX)
+                } else {
+                    self.method_instance_for_impl(for_e, id, tr, impl_args, "into_iter", span)?.0
+                }
+            }
+            Selection::ParamEvidence(_) => self.stub_instance(for_e, tr, p.interner.intern("into_iter"), span)?.0,
+            _ => return None,
+        };
         // The iterator type and item type, normalized.
         let into_iter_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_iter), args_id));
         let iter_ty = self.normalize_here(into_iter_proj);
         let item_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_item), args_id));
         let item_ty = self.normalize_here(item_proj);
-        // into_iter method instance. The std blanket
-        // (`impl<I: Iterator> IntoIterator for I`) is synthetic
-        // with no body: lowering uses the receiver as its own
-        // iterator when it sees the sentinel.
-        let into_local = if p.gx.index.get(id).items.is_empty() {
-            LocalDefId(u32::MAX)
-        } else {
-            self.method_instance_for_impl(for_e, id, tr, impl_args.clone(), "into_iter", span)?.0
-        };
         // next() on the iterator type.
         let iter_args_id = self.tys.intern_args(&[GenericArg::Ty(iter_ty)]);
         let tr2 = TraitRef { def: lang.iterator, args: iter_args_id, bindings: EMPTY_BINDINGS };
-        let Selection::Impl { id: id2, args: impl_args2, .. } = self.select_obligation(tr2) else { return None };
-        let next_local = self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0;
+        let next_local = match self.select_obligation(tr2) {
+            Selection::Impl { id: id2, args: impl_args2, .. } => self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0,
+            Selection::ParamEvidence(_) => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
+            _ => return None,
+        };
         self.set_res(for_e, Res::ForTrait { into_iter: into_local, next: next_local });
         Some(item_ty)
     }
@@ -6292,7 +6441,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.deferred_fmt.push((t, *debug, self.span(a)));
                     continue;
                 }
-                let ok = if *debug { has_debug(self.p, &self.tys, t) } else { has_display(&self.tys, t) || self.kind(t).is_int_infer() };
+                let ok =
+                    if *debug { has_debug(self.p, &self.tys, t) } else { has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() };
                 if !ok {
                     let tn = self.tn(t);
                     let (what, fix) = if *debug {
@@ -6369,8 +6519,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match val {
             CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_) => {}
             _ => {
-                let nonstructural =
-                    matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
+                let nonstructural = matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
                 if nonstructural {
                     let tn = self.tn(ct);
                     self.err(
@@ -6410,7 +6559,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.pat_res[pi] = PatRes::ConstItem(idx);
         }
     }
-
 
     /// Tries to read a path pattern as a const pattern. Returns true
     /// when the path named a const (or a static, which errors), so
@@ -6472,7 +6620,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let (ty_name, item) = (segs[0].name, segs[1].name);
         let adt = if ty_name == p.known.self_type {
-            self.f.owner
+            self.self_adt()
         } else {
             match self.binding(Namespace::Type, ty_name) {
                 BindingRes::Def(def) => p.adt_by_def(def),
@@ -6481,7 +6629,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }?;
         Some((adt, item))
     }
-
 
     fn pattern(&mut self, pat: PatId, t: Ty, in_match: bool) {
         self.pattern_mode(pat, t, BindMode::Move, in_match);
@@ -6787,7 +6934,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if n != p.known.self_type {
                         self.binding(Namespace::Type, n);
                     }
-                    let a = if n == p.known.self_type { self.f.owner } else { p.type_names.get(&n).copied() };
+                    let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
                     match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0)) {
                         Some(v) => Some(v),
                         // An imported variant in a tuple or struct pattern
@@ -7846,23 +7993,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.k_bind_pat(sub, &slot, env, lint);
                 }
             }
-            Pat::Slice { prefix, suffix, .. } => {
-                match v {
-                    Some(KVal::Agg(items)) if items.len() >= prefix.len() + suffix.len() => {
-                        for (i, &sub) in prefix.iter().enumerate() {
-                            self.k_bind_pat(sub, &items[i].clone(), env, lint);
-                        }
-                        for (j, &sub) in suffix.iter().enumerate() {
-                            self.k_bind_pat(sub, &items[items.len() - suffix.len() + j].clone(), env, lint);
-                        }
+            Pat::Slice { prefix, suffix, .. } => match v {
+                Some(KVal::Agg(items)) if items.len() >= prefix.len() + suffix.len() => {
+                    for (i, &sub) in prefix.iter().enumerate() {
+                        self.k_bind_pat(sub, &items[i].clone(), env, lint);
                     }
-                    _ => {
-                        for &sub in prefix.iter().chain(suffix.iter()) {
-                            self.k_bind_pat(sub, &None, env, lint);
-                        }
+                    for (j, &sub) in suffix.iter().enumerate() {
+                        self.k_bind_pat(sub, &items[items.len() - suffix.len() + j].clone(), env, lint);
                     }
                 }
-            }
+                _ => {
+                    for &sub in prefix.iter().chain(suffix.iter()) {
+                        self.k_bind_pat(sub, &None, env, lint);
+                    }
+                }
+            },
             Pat::Or(alts) => {
                 for &a in alts {
                     self.k_bind_pat(a, v, env, lint);
@@ -7937,7 +8082,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         match p.ast.expr(e) {
             Expr::Int(v, _) => {
-                if *v <= i128::MAX as u128 { Some(KVal::Int(*v as i128)) } else { None }
+                if *v <= i128::MAX as u128 {
+                    Some(KVal::Int(*v as i128))
+                } else {
+                    None
+                }
             }
             Expr::Bool(b) => Some(KVal::Bool(*b)),
             Expr::Char(c) => Some(KVal::Int(*c as i128)),
@@ -8162,9 +8311,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
                 let bv = self.k_expr(*base, env, lint);
                 match (bv, self.out.expr_res[self.ei(e)]) {
-                    (Some(KVal::Agg(items)), Res::Field { derefs: 0, index }) => {
-                        items.get(index as usize).cloned().unwrap_or(None)
-                    }
+                    (Some(KVal::Agg(items)), Res::Field { derefs: 0, index }) => items.get(index as usize).cloned().unwrap_or(None),
                     _ => None,
                 }
             }
@@ -8172,9 +8319,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let bv = self.k_expr(*base, env, lint);
                 let iv = self.k_expr(*index, env, lint);
                 match (bv, iv) {
-                    (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => {
-                        items.get(i as usize).cloned().unwrap_or(None)
-                    }
+                    (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => items.get(i as usize).cloned().unwrap_or(None),
                     _ => None,
                 }
             }
@@ -8296,9 +8441,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(r) if matches!(p.ast.expr(*lhs), Expr::Path(_)) => {
                         let lt = self.out.expr_ty[self.ei(*lhs)];
                         let nv = match (old, rv) {
-                            (Some(KVal::Int(a)), Some(KVal::Int(b))) => {
-                                self.k_arith(*op, a, b, lt).map(KVal::Int)
-                            }
+                            (Some(KVal::Int(a)), Some(KVal::Int(b))) => self.k_arith(*op, a, b, lt).map(KVal::Int),
                             _ => None,
                         };
                         Self::k_set(env, lint, r, nv);
@@ -8366,11 +8509,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             BinOp::Sub => a.checked_sub(b)?,
             BinOp::Mul => a.checked_mul(b)?,
             BinOp::Div => {
-                if b == 0 { return None; }
+                if b == 0 {
+                    return None;
+                }
                 a.checked_div(b)?
             }
             BinOp::Rem => {
-                if b == 0 { return None; }
+                if b == 0 {
+                    return None;
+                }
                 a.checked_rem(b)?
             }
             BinOp::BitAnd => a & b,
@@ -8450,7 +8597,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     BinOp::Sub => a.checked_sub(b),
                     _ => a.checked_mul(b),
                 };
-                let suppressed = lint.suppress == Some((e, u32::MAX)) || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
+                let suppressed = lint.suppress == Some((e, u32::MAX))
+                    || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
                 match r {
                     Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
                     _ => {
@@ -8647,7 +8795,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Deferred format tests, with types as bound by now.
         for (t, debug, span) in std::mem::take(&mut self.deferred_fmt) {
             let t = self.deep(t);
-            let ok = if debug { has_debug(self.p, &self.tys, t) } else { has_display(&self.tys, t) || self.kind(t).is_int_infer() };
+            let ok = if debug { has_debug(self.p, &self.tys, t) } else { has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() };
             if !ok && self.kind(t) != TyKind::Error {
                 let tn = self.tn(t);
                 let (what, fix) = if debug {

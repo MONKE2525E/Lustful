@@ -7,10 +7,10 @@
 // form: types may contain `Param` and `Projection`, never `Infer`.
 // Non-generic items are templates with no parameters, and their one
 // instance is themselves, so the old concrete pipeline is the
-// degenerate case of this one. Check, lower, and codegen only ever
-// see concrete instances (mono materializes them into the compat
-// `AdtDef`/`FnInfo` tables), plus one abstract instance per
-// template that checking uses and codegen never sees.
+// degenerate case of this one. Codegen only ever sees concrete
+// instances (mono materializes them into the compat `AdtDef`/`FnInfo`
+// tables). Each generic fn template is also checked once as written,
+// with its `Param` types rigid under its bounds (`template_check`).
 use crate::ast::{self, Ast, GenericArg as AstArg, GenericArgs, TraitBound, TyExpr};
 use crate::check::collect::Program;
 use crate::def::{DefId, LocalDefId};
@@ -374,7 +374,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
     vec![
         rec(lang.sized, "Sized", 0, vec![], vec![], &[]),
         rec(lang.copy, "Copy", 0, vec![self_pred(tys, lang.clone, &[])], vec![], &[]),
-        rec(lang.clone, "Clone", 0, vec![], vec![], &["clone"]),
+        rec(lang.clone, "Clone", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["clone"]),
         rec(lang.debug, "Debug", 0, vec![], vec![], &["fmt"]),
         rec(lang.display, "Display", 0, vec![], vec![], &["fmt"]),
         rec(lang.partial_eq, "PartialEq", 1, vec![], vec![], &["eq", "ne"]),
@@ -382,7 +382,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.partial_ord, "PartialOrd", 1, vec![self_pred(tys, lang.partial_eq, &[0])], vec![], &["partial_cmp"]),
         rec(lang.ord, "Ord", 0, vec![self_pred(tys, lang.eq, &[]), self_pred(tys, lang.partial_ord, &[0])], vec![], &["cmp"]),
         rec(lang.hash, "Hash", 0, vec![], vec![], &["hash"]),
-        rec(lang.default, "Default", 0, vec![], vec![], &["default"]),
+        rec(lang.default, "Default", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["default"]),
         rec(lang.drop, "Drop", 0, vec![], vec![], &["drop"]),
         rec(lang.send, "Send", 0, vec![], vec![], &[]),
         rec(lang.sync, "Sync", 0, vec![], vec![], &[]),
@@ -424,8 +424,8 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         ),
         rec(lang.from_iterator, "FromIterator", 1, vec![], vec![], &["from_iter"]),
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
-        rec(lang.from, "From", 1, vec![], vec![], &["from"]),
-        rec(lang.into, "Into", 1, vec![], vec![], &["into"]),
+        rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
+        rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
         rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![(lang.output_of(lang.fn_).unwrap(), "Output")], &["call"]),
         rec(
             lang.fn_mut,
@@ -1422,16 +1422,15 @@ pub struct TraitMethodTemplate<'a> {
 
 /// What one entry of `Program::fns` is, for the driver: only
 /// `Plain` and `Instance` fns are checked, lowered, and codegen'd
-/// by the driver. Templates are checked once per template by
-/// mono (through abstract instances), stubs only carry
-/// signatures for abstract checks.
+/// by the driver. Templates are checked once each by mono, against
+/// their param env (`template_check`); stubs only carry the
+/// signatures of trait methods for template bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FnClass {
     #[default]
     Plain,
     Template,
     Instance,
-    Abstract,
     Stub,
 }
 
@@ -1501,8 +1500,6 @@ pub struct GenTables<'a> {
     /// `TyKind::Closure` names).
     pub closure_by_def: FxMap<DefId, LocalDefId>,
     pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
-    /// Abstract (template-check) instances by the same key.
-    pub abstract_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
     /// Inherent method templates by (Adt template def, name), in
     /// registration order; disjoint Self patterns may share a name.
     pub inherent_methods: FxMap<(DefId, Sym), Vec<LocalDefId>>,
@@ -1518,19 +1515,19 @@ pub struct GenTables<'a> {
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
     pub has_generics: bool,
-    /// (abstract instances checked, concrete instances made).
+    /// (templates checked, concrete instances made).
     pub mono_counts: (usize, usize),
-    /// The template check of each template body: its canonical
-    /// abstract instance, whose trait picks are recorded.
+    /// The template checks, by checked fn: each template body is
+    /// checked as itself (`template_check`), and its trait picks
+    /// are recorded there.
     pub template_checks: FxMap<LocalDefId, LocalDefId>,
     /// Trait picks of template bodies by call expression (ARCH 4.1
     /// `CallTrait`, see `check/picks.rs`): every check of a body other
     /// than its template check reuses them instead of probing again.
     pub trait_picks: FxMap<crate::ast::ExprId, crate::check::picks::TraitPick>,
-    /// The opaque Adts that stand for type parameters in template
-    /// checks (not the ones for associated types), for the
-    /// where-clause probe.
-    pub param_opaques: FxMap<AdtId, ()>,
+    /// The signature stub of each trait method (`add_trait_method_stubs`),
+    /// by method def: the callee of calls a template's env proves.
+    pub trait_method_stubs: FxMap<DefId, LocalDefId>,
 }
 
 impl Default for GenTables<'_> {
@@ -1558,7 +1555,6 @@ impl Default for GenTables<'_> {
             closure_by_expr: FxMap::default(),
             closure_by_def: FxMap::default(),
             instance_by_key: FxMap::default(),
-            abstract_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
             inherent_self_pats: FxMap::default(),
             traits_by_method: FxMap::default(),
@@ -1567,7 +1563,7 @@ impl Default for GenTables<'_> {
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
             trait_picks: FxMap::default(),
-            param_opaques: FxMap::default(),
+            trait_method_stubs: FxMap::default(),
         }
     }
 }
@@ -2760,6 +2756,20 @@ pub fn add_synthetic_impls(p: &mut Program) {
     let ref_p0 = p.tys.mk_ref(false, p0);
     insert_synthetic(p, &mut ordinal, lang.copy, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     insert_synthetic(p, &mut ordinal, lang.clone, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    // Display: the std scalars, str, and String, and `&T` and `&mut T`
+    // through T, so a `T: Display` bound holds at those types.
+    let mut shown: Vec<Ty> = IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect();
+    shown.extend([BOOL, CHAR, STR, STRING]);
+    shown.extend([p.tys.float_ty(FloatTy::F32), p.tys.float_ty(FloatTy::F64)]);
+    for t in shown {
+        insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    let mut_p0 = p.tys.mk_ref(true, p0);
+    for self_pat in [ref_p0, mut_p0] {
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.display);
+        insert_synthetic(p, &mut ordinal, lang.display, self_pat, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+    }
     // String and the generic builtin containers.
     for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default] {
         insert_synthetic(p, &mut ordinal, tr, STRING, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -3082,526 +3092,178 @@ pub fn instance_for(p: &Program, src: &dyn TyIntern, template: LocalDefId, args:
     None
 }
 
-/// One opaque abstract type: a fresh unit Adt standing for one
-/// type parameter in a template check. Its derives come from the
-/// parameter's bounds, so the structural derive queries answer
-/// for it exactly what the bounds promise.
-fn opaque_adt(p: &mut Program, key: (DefId, u32), bounds: &[DefId], memo: &mut FxMap<(DefId, u32), AdtId>, ordinal: &mut u32) -> Ty {
-    if let Some(&a) = memo.get(&key) {
-        return p.tys.adt_ty(a);
-    }
+/// The signature of one lang trait method as a fn over the trait's
+/// generics (Self at 0, then the inputs): (receiver form, params with
+/// the receiver first, return type, which param a returned reference
+/// borrows from). None for methods a body cannot call through a bound
+/// in this subset (`fmt`, `hash`, `cmp`, `partial_cmp`, `drop`).
+fn lang_method_sig(p: &mut Program, trait_def: DefId, method: &str) -> Option<(Option<ast::SelfKind>, Vec<Ty>, Ty, Option<usize>)> {
+    use ast::SelfKind::{Ref, RefMut, Value};
     let lang = p.gx.lang;
-    let derives = crate::check::collect::Derives {
-        debug: bounds.contains(&lang.debug),
-        clone: bounds.contains(&lang.clone) || bounds.contains(&lang.copy),
-        copy: bounds.contains(&lang.copy),
-        partial_eq: bounds.contains(&lang.partial_eq) || bounds.contains(&lang.eq),
-        eq: bounds.contains(&lang.eq),
-        hash: bounds.contains(&lang.hash),
+    let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
+    let p1 = p.tys.intern(TyKind::Param(ParamId(1)));
+    let r0 = p.tys.mk_ref(false, p0);
+    let m0 = p.tys.mk_ref(true, p0);
+    let proj = |p: &mut Program, assoc: DefId, args: &[Ty]| {
+        let a: Vec<GenericArg> = args.iter().map(|&t| GenericArg::Ty(t)).collect();
+        let a = p.tys.intern_args(&a);
+        p.tys.intern(TyKind::Projection(AssocId(assoc), a))
     };
-    let id = AdtId(p.adts.len() as u32);
-    let def = DefId {
-        krate: p.krate,
-        hash: crate::def::item_hash(p.stable_crate, &["<abstract>"], crate::def::DefKind::Adt, &format!("Opaque{}", *ordinal), 0),
-    };
-    *ordinal += 1;
-    let name = p.interner.intern("Opaque");
-    p.adts.push(crate::check::collect::AdtDef {
-        name,
-        is_enum: false,
-        repr: crate::ty::layout::Repr::default(),
-        variants: vec![crate::check::collect::Variant {
-            name,
-            shape: crate::check::collect::VariantShape::Unit,
-            fields: Vec::new(),
-            disc: 0,
-        }],
-        derives,
-        span: Span::default(),
-    });
-    p.tys.register_adt(def, id);
-    p.defs.insert_adt(
-        def,
-        id,
-        crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Struct, None, name, crate::ty::defs::Vis::Priv, Span::default()),
-    );
-    p.gx.adt_info.push((def, 0));
-    p.gx.adt_generics.push(Generics::default());
-    p.gx.adt_envs.push(Vec::new());
-    p.gx.adt_scopes.push(Scope::default());
-    p.gx.adt_instance_of.push(None);
-    memo.insert(key, id);
-    p.tys.adt_ty(id)
+    Some(match method {
+        "clone" if trait_def == lang.clone => (Some(Ref), vec![r0], p0, None),
+        "next" if trait_def == lang.iterator => {
+            let item = proj(p, lang.assoc_item, &[p0]);
+            (Some(RefMut), vec![m0], p.tys.mk_option(item), None)
+        }
+        "into_iter" if trait_def == lang.into_iterator => (Some(Value), vec![p0], proj(p, lang.assoc_into_iter, &[p0]), None),
+        "deref" if trait_def == lang.deref => {
+            let t = proj(p, lang.assoc_target, &[p0]);
+            (Some(Ref), vec![r0], p.tys.mk_ref(false, t), Some(0))
+        }
+        "deref_mut" if trait_def == lang.deref_mut => {
+            let t = proj(p, lang.assoc_target, &[p0]);
+            (Some(RefMut), vec![m0], p.tys.mk_ref(true, t), Some(0))
+        }
+        "from" if trait_def == lang.from => (None, vec![p1], p0, None),
+        "into" if trait_def == lang.into => (Some(Value), vec![p0], p1, None),
+        "default" if trait_def == lang.default => (None, Vec::new(), p0, None),
+        "eq" | "ne" if trait_def == lang.partial_eq => {
+            let r1 = p.tys.mk_ref(false, p1);
+            (Some(Ref), vec![r0, r1], BOOL, None)
+        }
+        "len" if trait_def == lang.exact_size_iterator => (Some(Ref), vec![r0], USIZE, None),
+        "index" if trait_def == lang.index => {
+            let o = proj(p, lang.assoc_index_output, &[p0, p1]);
+            (Some(Ref), vec![r0, p1], p.tys.mk_ref(false, o), Some(0))
+        }
+        "index_mut" if trait_def == lang.index_mut => {
+            let o = proj(p, lang.assoc_index_output, &[p0, p1]);
+            (Some(RefMut), vec![m0, p1], p.tys.mk_ref(true, o), Some(0))
+        }
+        "call" | "call_mut" | "call_once" => {
+            let out = proj(p, lang.output_of(trait_def)?, &[p0, p1]);
+            let recv = match method {
+                "call" => (Some(Ref), r0),
+                "call_mut" => (Some(RefMut), m0),
+                _ => (Some(Value), p0),
+            };
+            (recv.0, vec![recv.1, p1], out, None)
+        }
+        _ => {
+            let out = lang.output_of(trait_def)?;
+            let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len() - 1;
+            if n_inputs == 1 {
+                // Binary operators: `fn add(self, rhs: Rhs) -> Self::Output`.
+                (Some(Value), vec![p0, p1], proj(p, out, &[p0, p1]), None)
+            } else {
+                // Unary operators: `fn neg(self) -> Self::Output`.
+                (Some(Value), vec![p0], proj(p, out, &[p0]), None)
+            }
+        }
+    })
 }
 
-/// The bounds on one parameter of a template, as trait defs.
-fn param_bound_traits(env: &[Predicate], tys: &impl TyIntern, idx: u32) -> Vec<DefId> {
-    let mut out = Vec::new();
-    for pred in env {
-        if let Predicate::Trait(b) = pred
-            && tys.args(b.value.args)[0].as_ty().is_some_and(|t| matches!(tys.kind(t), TyKind::Param(p) if p.0 == idx))
-        {
-            out.push(b.value.def);
+/// One signature fn per method of each trait a template's env names,
+/// for the calls a template check proves through its param env
+/// (`t.m()` with `T: Tr` in the bounds, no impl to select). It is the callee that lowering and borrowck
+/// see in template bodies, and the trait method that instance checks
+/// replay as a pick. Its generics are the trait's (Self first), then
+/// the method's own; its signature is the trait method's. Stubs are
+/// never checked, instantiated, or generated.
+fn add_trait_method_stubs(p: &mut Program) {
+    // Only a trait some template's env names can prove a call there:
+    // stubs of other traits would only take driver slots.
+    let mut bound: Vec<DefId> = Vec::new();
+    for (i, class) in p.gx.fn_class.iter().enumerate() {
+        if *class == FnClass::Template {
+            for pred in &p.gx.fn_scopes[i].env {
+                if let Predicate::Trait(b) = pred
+                    && !bound.contains(&b.value.def)
+                {
+                    bound.push(b.value.def);
+                }
+            }
         }
     }
-    out
-}
-
-/// A stub fn for one trait method on abstract types: the trait
-/// method template substituted with the bound's trait ref,
-/// projections replaced by the synthetic impl's assoc bindings
-/// (or fresh opaques). Stubs carry signatures only; abstract
-/// checks call them but never check or generate their bodies.
-fn abstract_stub(
-    p: &mut Program,
-    method_def: DefId,
-    trait_args: &[GenericArg],
-    assoc_tys: &[(DefId, Ty)],
-    memo: &mut FxMap<(DefId, ArgsId), LocalDefId>,
-) -> LocalDefId {
-    let args_id = p.tys.intern_args(trait_args);
-    if let Some(&existing) = memo.get(&(method_def, args_id)) {
-        return existing;
-    }
-    let tmpl = match p.gx.trait_methods.get(&method_def).cloned() {
-        Some(t) => t,
-        None => return lang_stub(p, method_def, trait_args, assoc_tys, memo, args_id),
-    };
-    // Substitute trait params, then renumber the method's own
-    // params down to 0-based for the stub's own generics.
-    let trait_n = trait_args.len();
-    let mut full: Vec<GenericArg> = trait_args.to_vec();
-    let own_n = tmpl.generics.params.len().saturating_sub(trait_n);
-    for j in 0..own_n {
-        let t = p.tys.intern(TyKind::Param(ParamId((trait_n + j) as u32)));
-        full.push(GenericArg::Ty(t));
-    }
-    let subst_all = |p: &mut Program, t: Ty| -> Ty {
-        let t = subst(&mut p.tys, t, &full);
-        let t = rewrite_impl_projections(p, t, assoc_tys);
-        // Renumber own params: Param(trait_n + j) -> Param(j).
-        let remap: Vec<GenericArg> = (0..(trait_n + own_n) as u32)
-            .map(|i| {
-                let ni = if (i as usize) >= trait_n { i - trait_n as u32 } else { i };
-                GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(ni))))
-            })
-            .collect();
-        subst(&mut p.tys, t, &remap)
-    };
-    let params: Vec<Ty> = tmpl.params.iter().map(|&t| subst_all(p, t)).collect();
-    let ret = subst_all(p, tmpl.ret);
-    let own_generics =
-        Generics { parent: None, params: tmpl.generics.params[trait_n.min(tmpl.generics.params.len())..].to_vec(), predicates: Vec::new() };
-    let id = LocalDefId(p.fns.len() as u32);
-    let def_id = DefId {
-        krate: p.krate,
-        hash: crate::def::item_hash(p.stable_crate, &["<abstract>"], crate::def::DefKind::Method, &format!("stub#{}", id.0), 0),
-    };
-    p.fn_defs.push(def_id);
-    p.def_by_hash.entry(def_id.hash).or_insert(id);
-    p.fns.push(crate::check::collect::FnInfo {
-        name: tmpl.name,
-        def: tmpl.def,
-        owner: None,
-        self_kind: tmpl.self_kind,
-        params,
-        ret,
-        ret_borrows_from: tmpl.ret_borrows_from,
-        is_const: tmpl.def.qual.is_const,
-    });
-    let is_template = !own_generics.params.is_empty();
-    p.gx.fn_templates.push(if is_template { Some(FnTemplate { generics: own_generics, env: Vec::new() }) } else { None });
-    p.gx.fn_scopes.push(FnScope::default());
-    p.gx.fn_class.push(FnClass::Stub);
-    memo.insert((method_def, args_id), id);
-    id
-}
-
-/// A stub for one lang trait method (lang traits have no method
-/// templates; the few signatures abstract checks call are built
-/// here from the trait ref). Signatures use projections for the
-/// assoc types, rewritten through the synthetic impl's bindings.
-fn lang_stub(
-    p: &mut Program,
-    method_def: DefId,
-    trait_args: &[GenericArg],
-    assoc_tys: &[(DefId, Ty)],
-    memo: &mut FxMap<(DefId, ArgsId), LocalDefId>,
-    args_id: ArgsId,
-) -> LocalDefId {
-    let lang = p.gx.lang;
-    let self_ty = trait_args[0].as_ty().unwrap_or(ERROR);
-    let trait_def = p.gx.index.trait_of_method(method_def).unwrap_or(DefId::PLACEHOLDER);
-    let proj = |p: &mut Program, assoc: DefId, args: &[GenericArg]| -> Ty {
-        let a = p.tys.intern_args(args);
-        let t = p.tys.intern(TyKind::Projection(AssocId(assoc), a));
-        rewrite_impl_projections(p, t, assoc_tys)
-    };
-    let ref_of = |p: &mut Program, mutable: bool, t: Ty| p.tys.mk_ref(mutable, t);
-    let (self_kind, params, ret): (ast::SelfKind, Vec<Ty>, Ty) = if trait_def == lang.iterator {
-        let item = proj(p, lang.assoc_item, trait_args);
-        let opt = p.tys.mk_option(item);
-        (ast::SelfKind::RefMut, vec![ref_of(p, true, self_ty)], opt)
-    } else if trait_def == lang.into_iterator {
-        let into = proj(p, lang.assoc_into_iter, trait_args);
-        (ast::SelfKind::Value, vec![self_ty], into)
-    } else if trait_def == lang.clone {
-        (ast::SelfKind::Ref, vec![ref_of(p, false, self_ty)], self_ty)
-    } else if trait_def == lang.deref {
-        let target = proj(p, lang.assoc_target, trait_args);
-        let r = ref_of(p, false, target);
-        (ast::SelfKind::Ref, vec![ref_of(p, false, self_ty)], r)
-    } else if trait_def == lang.deref_mut {
-        let target = proj(p, lang.assoc_target, trait_args);
-        let r = ref_of(p, true, target);
-        (ast::SelfKind::RefMut, vec![ref_of(p, true, self_ty)], r)
-    } else if trait_def == lang.from {
-        let input = trait_args.get(1).and_then(|g| g.as_ty()).unwrap_or(ERROR);
-        (ast::SelfKind::Value, vec![input], self_ty)
-    } else if trait_def == lang.default {
-        (ast::SelfKind::Value, Vec::new(), self_ty)
-    } else if trait_def == lang.drop {
-        (ast::SelfKind::RefMut, vec![ref_of(p, true, self_ty)], UNIT)
-    } else if lang.output_of(trait_def).is_some() {
-        // Binary and unary operators and the Fn family: the
-        // receiver form follows the std signatures closely
-        // enough for abstract checking (by value for operators).
-        let out = proj(p, lang.output_of(trait_def).unwrap(), trait_args);
-        let rhs = trait_args.get(1).and_then(|g| g.as_ty()).unwrap_or(self_ty);
-        (ast::SelfKind::Value, vec![self_ty, rhs], out)
-    } else {
-        (ast::SelfKind::Ref, vec![ref_of(p, false, self_ty)], UNIT)
-    };
-    // The stub's FnInfo needs an AST def; lang methods have none,
-    // so point it at any existing one: stubs are never checked,
-    // only their signatures are read. Use the first fn's def.
-    let any_def = p.fns.first().map(|f| f.def).expect("a program with abstract checks has fns");
-    let name =
-        p.gx.index
-            .trait_record(trait_def)
-            .and_then(|r| r.methods.iter().find(|(d, _)| *d == method_def).map(|(_, n)| *n))
-            .unwrap_or(Sym(0));
-    let id = LocalDefId(p.fns.len() as u32);
-    let def_id = DefId {
-        krate: p.krate,
-        hash: crate::def::item_hash(p.stable_crate, &["<abstract>"], crate::def::DefKind::Method, &format!("langstub#{}", id.0), 0),
-    };
-    p.fn_defs.push(def_id);
-    p.def_by_hash.entry(def_id.hash).or_insert(id);
-    p.fns.push(crate::check::collect::FnInfo {
-        name,
-        def: any_def,
-        is_const: false,
-        owner: None,
-        self_kind: if trait_def == lang.from || trait_def == lang.default { None } else { Some(self_kind) },
-        params,
-        ret,
-        ret_borrows_from: None,
-    });
-    p.gx.fn_templates.push(None);
-    p.gx.fn_scopes.push(FnScope::default());
-    p.gx.fn_class.push(FnClass::Stub);
-    memo.insert((method_def, args_id), id);
-    id
-}
-
-/// Synthetic impls that make one template's bounds true for its
-/// abstract instance: for every env trait predicate (substituted
-/// with the abstract args) that selection cannot already prove,
-/// insert an impl record whose methods are stubs.
-fn abstract_synthetic_impls(
-    p: &mut Program,
-    env: &[Predicate],
-    subst_args: &[GenericArg],
-    stub_memo: &mut FxMap<(DefId, ArgsId), LocalDefId>,
-    ordinal: &mut u32,
-) {
-    use crate::traits::index::{ImplRecord, Synthetic, pattern_head};
-    let lang = p.gx.lang;
-    let mut done: Vec<TraitRef> = Vec::new();
-    for &pred in env {
-        let Predicate::Trait(b) = pred else { continue };
-        if b.count != 0 {
-            continue;
-        }
-        let tr = crate::traits::index::subst_trait_ref_pub(&mut p.tys, b.value, subst_args);
-        if tr.def == lang.sized || lang.is_auto(tr.def) {
-            continue;
-        }
-        if done.contains(&tr) {
-            continue;
-        }
-        done.push(tr);
-        // Already made true by an earlier abstract synthetic?
-        // (A real impl header matching is not enough: its where
-        // clauses may not hold for the opaque types, which is
-        // exactly what the synthetic replaces.)
-        if p.gx.index.impls_of_trait(tr.def).iter().any(|&id| {
-            let r = p.gx.index.get(id);
-            r.synthetic == crate::traits::index::Synthetic::Abstract && r.trait_ref == tr
-        }) {
-            continue;
-        }
-        let Some(rec) = p.gx.index.trait_record(tr.def).cloned() else { continue };
-        // Assoc bindings: equalities in the env, else the
-        // trait ref's own bindings, else a fresh opaque.
-        let mut assoc_tys: Vec<(DefId, Ty)> = Vec::new();
-        for &(assoc, _n, is_type) in &rec.assoc_items {
-            if !is_type {
+    let mut methods: Vec<(DefId, DefId, Sym)> = Vec::new();
+    for traits in p.gx.traits_by_method.values() {
+        for &t in traits {
+            if !bound.contains(&t) {
                 continue;
             }
-            let bound = p.tys.bindings(tr.bindings).iter().find(|(d, _)| *d == assoc).and_then(|(_, g)| g.as_ty()).or_else(|| {
-                env.iter().find_map(|ep| match ep {
-                    Predicate::AssocEq(eq) if eq.value.assoc == assoc => Some(subst(&mut p.tys, eq.value.ty, subst_args)),
-                    _ => None,
-                })
-            });
-            let bound = match bound {
-                Some(t) => t,
-                None => {
-                    let mut memo: FxMap<(DefId, u32), AdtId> = FxMap::default();
-                    opaque_adt(p, (assoc, *ordinal), &[], &mut memo, ordinal)
-                }
-            };
-            assoc_tys.push((assoc, bound));
-        }
-        let trait_args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
-        let mut items: Vec<DefId> = Vec::new();
-        for (method_def, _mname) in &rec.methods {
-            let stub = abstract_stub(p, *method_def, &trait_args, &assoc_tys, stub_memo);
-            items.push(p.def_id(stub));
-        }
-        let self_pat = trait_args[0].as_ty().unwrap_or(ERROR);
-        let Some((head, blanket)) = pattern_head(&p.tys, self_pat, &[]) else { continue };
-        let def = synthetic_impl_def(p, *ordinal);
-        *ordinal += 1;
-        let assoc_tys2 = assoc_tys.clone();
-        p.gx.index.insert_impl(ImplRecord {
-            def,
-            trait_def: tr.def,
-            trait_ref: tr,
-            generics: Generics::default(),
-            assoc_tys,
-            assoc_consts: Vec::new(),
-            items,
-            synthetic: Synthetic::Abstract,
-            local: true,
-            span: Span::default(),
-            head,
-            blanket,
-        });
-        // Associated bounds of this trait (`type It: Iter`) must
-        // also hold for the bindings just chosen, or calls
-        // through them in the abstract body find no impl.
-        let bound_preds: Vec<Predicate> = rec
-            .generics
-            .predicates
-            .iter()
-            .map(|&pred| {
-                let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
-                let sub = crate::traits::index::subst_predicate(&mut p.tys, pred, &args);
-                match sub {
-                    Predicate::Trait(b) => {
-                        let self_ty = b.value.args;
-                        let raw: Vec<GenericArg> = p.tys.args(self_ty).to_vec();
-                        let rewritten: Vec<GenericArg> = raw
-                            .iter()
-                            .map(|&g| match g {
-                                GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, &assoc_tys2)),
-                                other => other,
-                            })
-                            .collect();
-                        let args2 = p.tys.intern_args(&rewritten);
-                        Predicate::Trait(Binder { count: b.count, value: TraitRef { args: args2, ..b.value } })
+            if let Some(rec) = p.gx.index.trait_record(t) {
+                for &(m, name) in &rec.methods {
+                    if !methods.iter().any(|x| x.1 == m) {
+                        methods.push((t, m, name));
                     }
-                    other => other,
                 }
-            })
-            .collect();
-        abstract_synthetic_impls(p, &bound_preds, subst_args, stub_memo, ordinal);
+            }
+        }
+    }
+    methods.sort_by_key(|x| x.1.hash.0);
+    for (trait_def, method_def, name) in methods {
+        let (def, self_kind, params, ret, ret_borrows_from, generics) = match p.gx.trait_methods.get(&method_def) {
+            Some(t) => (t.def, t.self_kind, t.params.clone(), t.ret, t.ret_borrows_from, t.generics.clone()),
+            None => {
+                let mname = p.name(name).to_string();
+                let Some((self_kind, params, ret, rb)) = lang_method_sig(p, trait_def, &mname) else { continue };
+                let Some(rec) = p.gx.index.trait_record(trait_def) else { continue };
+                let generics = Generics { parent: None, params: rec.generics.params.clone(), predicates: Vec::new() };
+                // Lang methods have no AST def; stubs are never
+                // checked, so any def stands in for the FnInfo slot.
+                let Some(any_def) = p.fns.first().map(|f| f.def) else { return };
+                (any_def, self_kind, params, ret, rb, generics)
+            }
+        };
+        let id = LocalDefId(p.fns.len() as u32);
+        let def_id = DefId {
+            krate: p.krate,
+            hash: crate::def::item_hash(p.stable_crate, &["<stub>"], crate::def::DefKind::Method, &format!("{}", method_def.hash.0), 0),
+        };
+        p.fn_defs.push(def_id);
+        p.def_by_hash.entry(def_id.hash).or_insert(id);
+        p.fns.push(crate::check::collect::FnInfo { name, def, owner: None, self_kind, params, ret, ret_borrows_from, is_const: false });
+        p.gx.fn_templates.push(Some(FnTemplate { generics, env: Vec::new() }));
+        p.gx.fn_scopes.push(FnScope::default());
+        p.gx.fn_class.push(FnClass::Stub);
+        p.gx.trait_method_stubs.insert(method_def, id);
     }
 }
 
-/// The abstract check of every template (ARCH 4.1's soundness
-/// argument, in this pipeline's form): instantiate each generic
-/// Adt and fn once with fresh opaque types standing for its
-/// parameters, make its bounds true with synthetic impls, and
-/// check the bodies. An error here is a real template error
-/// rustc also reports, because the opaque types have exactly
-/// the operations the bounds promise and no others. Concrete
-/// instances are then sound to check on their own.
-fn abstract_check(p: &mut Program) -> Vec<Diag> {
-    let mut errs: Vec<Diag> = Vec::new();
-    let mut opaque_memo: FxMap<(DefId, u32), AdtId> = FxMap::default();
-    let mut stub_memo: FxMap<(DefId, ArgsId), LocalDefId> = FxMap::default();
-    let mut ordinal = 1_000_000u32;
-    // Abstract Adt instances first (their fields are already
-    // resolved; this makes the types other templates name).
-    let n_adts = p.gx.adt_info.len();
-    for a in 0..n_adts {
-        let (def, n_params) = p.gx.adt_info[a];
-        if n_params == 0 {
-            continue;
-        }
-        let env = p.gx.adt_envs[a].clone();
-        let mut args: Vec<GenericArg> = Vec::new();
-        for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
-            match param.kind {
-                ParamKind::Type => {
-                    let bounds = param_bound_traits(&env, &p.tys, i as u32);
-                    let o = opaque_adt(p, (def, i as u32), &bounds, &mut opaque_memo, &mut ordinal);
-                    if let Some(a) = p.tys.local_adt(o) {
-                        p.gx.param_opaques.insert(a, ());
-                    }
-                    args.push(GenericArg::Ty(o));
-                }
-                ParamKind::Lifetime => args.push(GenericArg::Lifetime(Region::Erased)),
-                ParamKind::Const(ct) => {
-                    let c = match p.tys.kind(ct) {
-                        TyKind::Bool => p.tys.intern_const(ConstKind::Bool(false)),
-                        TyKind::Char => p.tys.intern_const(ConstKind::Char('\0')),
-                        _ => p.tys.intern_const(ConstKind::Int(1)),
-                    };
-                    args.push(GenericArg::Const(c));
-                }
-            }
-        }
-        abstract_synthetic_impls(p, &env, &args, &mut stub_memo, &mut ordinal);
-        adt_instance(p, AdtId(a as u32), &args);
-    }
-    // Abstract fn instances, then check them to a fixpoint like
-    // the concrete loop, but collecting real errors. Closure
-    // templates get no abstract instance: a closure signature
-    // is inferred, not universally quantified, so arbitrary
-    // opaques would be wrong types for the body. The enclosing
-    // abstract body checks the closure body in place instead
-    // (see `closure_expr`), which is where its errors report.
+/// The template check (ARCH 4.1): every generic fn, method, and
+/// trait default body is checked once as written, against its param
+/// env. Its `Param` and projection types are rigid: they have exactly
+/// the traits the bounds give them (`Tys::env`), they have no layout,
+/// and const params stay symbolic. Each body is borrow-checked too: a
+/// second move of a non-Copy param, or a call through an `FnMut`
+/// bound on an immutable binding, is the template error this pass
+/// exists to catch. A call the env proves resolves to the trait
+/// method's stub, and its pick is recorded for the instances.
+/// Closure templates are checked in place by their enclosing body.
+fn template_check(p: &mut Program) -> Vec<Diag> {
     let templates: Vec<LocalDefId> = (0..p.fns.len() as u32)
         .map(LocalDefId)
-        .filter(|&f| p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) && !p.gx.closure_fns.contains_key(&f))
+        .filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Template) && !p.gx.closure_fns.contains_key(&f))
         .collect();
-    let mut queue: Vec<LocalDefId> = Vec::new();
-    for t in templates {
-        let tmpl = p.gx.fn_templates[t.0 as usize].clone().unwrap();
-        let tdef = p.def_id(t);
-        let mut args: Vec<GenericArg> = Vec::new();
-        for (i, param) in tmpl.generics.params.iter().enumerate() {
-            match param.kind {
-                ParamKind::Type => {
-                    let bounds = param_bound_traits(&tmpl.env, &p.tys, i as u32);
-                    let o = opaque_adt(p, (tdef, i as u32), &bounds, &mut opaque_memo, &mut ordinal);
-                    if let Some(a) = p.tys.local_adt(o) {
-                        p.gx.param_opaques.insert(a, ());
-                    }
-                    args.push(GenericArg::Ty(o));
-                }
-                ParamKind::Lifetime => args.push(GenericArg::Lifetime(Region::Erased)),
-                ParamKind::Const(ct) => {
-                    let c = match p.tys.kind(ct) {
-                        TyKind::Bool => p.tys.intern_const(ConstKind::Bool(false)),
-                        TyKind::Char => p.tys.intern_const(ConstKind::Char('\0')),
-                        _ => p.tys.intern_const(ConstKind::Int(1)),
-                    };
-                    args.push(GenericArg::Const(c));
-                }
-            }
-        }
-        abstract_synthetic_impls(p, &tmpl.env, &args, &mut stub_memo, &mut ordinal);
-        // A trait method body may call the trait's own methods
-        // on Self: make the trait itself true for the abstract
-        // Self type the same way.
-        if p.gx.trait_methods.contains_key(&tdef)
-            && let Some(trait_def) = p.gx.index.trait_of_method(tdef)
-        {
-            let trait_n = p.gx.index.trait_record(trait_def).map_or(0, |r| r.generics.params.len());
-            let tr_args: Vec<GenericArg> = args.iter().take(trait_n).copied().collect();
-            let tr_args_id = p.tys.intern_args(&tr_args);
-            let self_pred = Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args: tr_args_id, bindings: EMPTY_BINDINGS }));
-            abstract_synthetic_impls(p, &[self_pred], &args, &mut stub_memo, &mut ordinal);
-        }
-        // The abstract instance's env keeps only equalities and
-        // structural facts; trait bounds are the synthetic
-        // impls' job now.
-        let inst = fn_instance(p, t, &args, FnClass::Abstract);
-        p.gx.mono_counts.0 += 1;
-        p.gx.template_checks.insert(inst, t);
-        queue.push(inst);
+    for &t in &templates {
+        p.gx.template_checks.insert(t, t);
     }
-    let mut rounds = 0usize;
-    while !queue.is_empty() {
-        rounds += 1;
-        if rounds > 512 {
-            break;
-        }
-        let mut next_queue: Vec<LocalDefId> = Vec::new();
-        for fid in std::mem::take(&mut queue) {
-            let (checked, mut body_errs, picks) = {
-                let (c, e) = crate::check::check_fn(p, fid);
-                let picks = c.trait_picks.clone();
-                // Snapshot the requests out of the checked body.
-                let reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = c
-                    .inst_requests
-                    .iter()
-                    .filter_map(|(t, raw)| {
-                        let mut owned = Vec::new();
-                        for g in raw {
-                            match g {
-                                GenericArg::Ty(e) => owned.push(OwnedArg::Ty(snapshot_ty(&c.tys, *e)?)),
-                                GenericArg::Const(k) => match c.tys.const_kind(*k) {
-                                    ConstKind::Infer(_) => return None,
-                                    kk => owned.push(OwnedArg::Const(kk)),
-                                },
-                                GenericArg::Lifetime(r) => owned.push(OwnedArg::Lifetime(*r)),
-                            }
-                        }
-                        Some((*t, owned))
-                    })
-                    .collect();
-                // Borrow checking runs on abstract bodies too:
-                // a move of a non-Copy opaque is exactly the
-                // template error this pass exists to catch.
-                let mut e = e;
-                if e.is_empty() {
-                    let body = crate::lower::lower(p, fid, c);
-                    e.extend(crate::borrowck::borrowck(p, &body));
-                }
-                (reqs, e, picks)
-            };
-            errs.append(&mut body_errs);
-            // Only the template check records picks (see check_fn);
-            // later writes for one call win, like the final probe.
-            for (call, pick) in picks {
-                p.gx.trait_picks.insert(call, pick);
+    let mut errs: Vec<Diag> = Vec::new();
+    for t in templates {
+        let (body_errs, picks) = {
+            let (c, mut e) = crate::check::check_fn(p, t);
+            let picks = c.trait_picks.clone();
+            if e.is_empty() {
+                let body = crate::lower::lower(p, t, c);
+                e.extend(crate::borrowck::borrowck(p, &body));
             }
-            for (template, owned_args) in checked {
-                // Closure instances are concrete-only (see the
-                // template list above); the body was already
-                // checked in place.
-                if p.gx.closure_fns.contains_key(&template) {
-                    continue;
-                }
-                let mut lifted: Vec<GenericArg> = Vec::new();
-                for a in &owned_args {
-                    lifted.push(match a {
-                        OwnedArg::Ty(e) => {
-                            let gt = build_owned_ty(p, e);
-                            GenericArg::Ty(normalize_global(p, gt))
-                        }
-                        OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
-                        OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
-                    });
-                }
-                let template_def = p.def_id(template);
-                let args_id = p.tys.intern_args(&lifted);
-                if p.gx.abstract_by_key.contains_key(&(template_def, args_id)) {
-                    continue;
-                }
-                let inst = fn_instance(p, template, &lifted, FnClass::Abstract);
-                p.gx.mono_counts.0 += 1;
-                next_queue.push(inst);
-            }
+            (e, picks)
+        };
+        errs.extend(body_errs);
+        for (call, pick) in picks {
+            p.gx.trait_picks.insert(call, pick);
         }
-        queue = next_queue;
+        p.gx.mono_counts.0 += 1;
     }
     errs
 }
@@ -3701,19 +3363,11 @@ fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKin
     None
 }
 
-/// Creates (or finds) one fn instance. `class` is Instance for
-/// concrete code, Abstract for template checks.
-fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class: FnClass) -> LocalDefId {
+/// Creates (or finds) the concrete instance of one template.
+fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
     let template_def = p.def_id(template);
     let args_id = p.tys.intern_args(args);
-    if class == FnClass::Instance
-        && let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id))
-    {
-        return existing;
-    }
-    if class == FnClass::Abstract
-        && let Some(&existing) = p.gx.abstract_by_key.get(&(template_def, args_id))
-    {
+    if let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id)) {
         return existing;
     }
     let (def, name, self_kind) = {
@@ -3753,10 +3407,19 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class
     p.fns.push(crate::check::collect::FnInfo { name, def, owner, self_kind, params, ret, ret_borrows_from, is_const: def.qual.is_const });
     p.gx.fn_templates.push(None);
     // The body scope of an instance: no parameters, the concrete
-    // Self type, and the template's assoc sources substituted.
+    // Self type, and the template's assoc sources substituted. Self
+    // comes from the template's scope (a trait default assoc fn has
+    // no receiver to name an owner), else from the owner.
     let scope = {
         let mut sc = Scope::default();
-        sc.self_ty = owner.map(|a| p.tys.adt_ty(a));
+        let tmpl_self = p.gx.fn_scopes.get(template.0 as usize).and_then(|ts| ts.scope.self_ty);
+        sc.self_ty = match tmpl_self {
+            Some(t) => {
+                let t = subst(&mut p.tys, t, args);
+                Some(normalize_global(p, t))
+            }
+            None => owner.map(|a| p.tys.adt_ty(a)),
+        };
         if let Some(ts) = p.gx.fn_scopes.get(template.0 as usize) {
             for src in &ts.scope.assoc_srcs {
                 let self_ty = subst(&mut p.tys, src.self_ty, args);
@@ -3771,25 +3434,20 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class
         sc
     };
     p.gx.fn_scopes.push(FnScope { env: Vec::new(), scope });
-    p.gx.fn_class.push(class);
+    p.gx.fn_class.push(FnClass::Instance);
     if let Some(cf) = p.gx.closure_fns.get(&template).copied() {
         p.gx.closure_fns.insert(id, cf);
     }
     p.gx.instances.insert(id, InstanceInfo { template_def, template_local: Some(template), args: args_id });
-    if class == FnClass::Abstract {
-        p.gx.abstract_by_key.insert((template_def, args_id), id);
-    }
-    if class == FnClass::Instance {
-        p.gx.instance_by_key.insert((template_def, args_id), id);
-        p.gx.mono_counts.1 += 1;
-        // Inherent instances join the compat method table.
-        if let Some(owner) = owner
-            && p.gx.inherent_methods.values().any(|ts| ts.contains(&template))
-        {
-            let cands = p.methods.entry((owner, name)).or_default();
-            if !cands.contains(&id) {
-                cands.push(id);
-            }
+    p.gx.instance_by_key.insert((template_def, args_id), id);
+    p.gx.mono_counts.1 += 1;
+    // Inherent instances join the compat method table.
+    if let Some(owner) = owner
+        && p.gx.inherent_methods.values().any(|ts| ts.contains(&template))
+    {
+        let cands = p.methods.entry((owner, name)).or_default();
+        if !cands.contains(&id) {
+            cands.push(id);
         }
     }
     id
@@ -3885,7 +3543,7 @@ fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     let drop_fn = if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
         let raw: Vec<GenericArg> = impl_args;
         let before = p.fns.len();
-        let inst = fn_instance(p, local, &raw, FnClass::Instance);
+        let inst = fn_instance(p, local, &raw);
         if inst.0 as usize >= before {
             queue.push(inst);
         }
@@ -3906,11 +3564,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     if !p.gx.has_generics {
         return Vec::new();
     }
-    // Templates check once abstractly first; a template error
-    // rejects the program before any instance is made.
-    let abstract_errs = abstract_check(p);
-    if !abstract_errs.is_empty() {
-        return abstract_errs;
+    // Templates check once against their param env first; a
+    // template error rejects the program before any instance is made.
+    add_trait_method_stubs(p);
+    let template_errs = template_check(p);
+    if !template_errs.is_empty() {
+        return template_errs;
     }
     let mut errs: Vec<Diag> = Vec::new();
     // Adt instances named by plain signatures and fields first.
@@ -4008,7 +3667,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 if p.gx.instance_by_key.contains_key(&(template_def, args_id)) {
                     continue;
                 }
-                let inst = fn_instance(p, template, &lifted, FnClass::Instance);
+                let inst = fn_instance(p, template, &lifted);
                 depths.insert(inst, depth + 1);
                 next_queue.push(inst);
             }
@@ -4090,8 +3749,27 @@ pub fn append_trait_default_templates(p: &mut Program) {
             ret_borrows_from: tmpl.ret_borrows_from,
             is_const: tmpl.def.qual.is_const,
         });
-        p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: tmpl.env.clone() }));
-        p.gx.fn_scopes.push(FnScope { env: tmpl.env.clone(), scope: tmpl.scope.clone() });
+        // The body may call the trait's own methods on Self: its env
+        // has `Self: Trait<..>` over the trait's params, as in rustc.
+        let mut env = tmpl.env.clone();
+        if let Some(td) = p.gx.index.trait_of_method(method_def)
+            && let Some(n) = p.gx.index.trait_record(td).map(|r| r.generics.params.len())
+        {
+            let own: Vec<GenericArg> = tmpl.generics.params[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, d)| match d.kind {
+                    ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+                    ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                    ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+                })
+                .collect();
+            let args = p.tys.intern_args(&own);
+            env.push(Predicate::Trait(Binder::plain(TraitRef { def: td, args, bindings: EMPTY_BINDINGS })));
+            env = elaborate_env(&mut p.tys, &p.gx.index, &env);
+        }
+        p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: env.clone() }));
+        p.gx.fn_scopes.push(FnScope { env, scope: tmpl.scope.clone() });
         p.gx.fn_class.push(FnClass::Template);
     }
 }

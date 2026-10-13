@@ -65,9 +65,6 @@ pub enum Synthetic {
     /// A `#[derive]` expansion (section 2.2). The payload is the
     /// derive name (`Clone`, `Debug`, ...).
     Derive(Sym),
-    /// An abstract-check fact for an opaque type (mono's
-    /// template check): the bound made true by construction.
-    Abstract,
     /// A lang-trait fact for a builtin type (for example the
     /// `IntoIterator` blanket, `From<T> for T`, slice `Index`).
     /// These records exist so selection and coherence see one impl

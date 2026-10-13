@@ -2428,8 +2428,23 @@ fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>
 // The queries below follow the old fixed rules, now read through the v2 compat
 // helpers: builtin Adts answer through `BuiltinTy`, user Adts through their derives.
 
+/// True when the param env of the body `tys` belongs to (see
+/// `Tys::env`) has the bound `t: trait_def`, with `rhs` as the
+/// second trait argument when given. The answer for a `Param` or
+/// projection type: it has exactly the traits its bounds give it.
+fn env_proves(tys: &impl TyIntern, t: Ty, trait_def: DefId, rhs: Option<Ty>) -> bool {
+    tys.param_env().iter().any(|pred| match pred {
+        Predicate::Trait(b) if b.count == 0 && b.value.def == trait_def => {
+            let a = tys.args(b.value.args);
+            a.first().and_then(|g| g.as_ty()) == Some(t) && rhs.is_none_or(|r| a.get(1).and_then(|g| g.as_ty()) == Some(r))
+        }
+        _ => false,
+    })
+}
+
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.copy, None),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         // Fn items, fn pointers, and (non-capturing) closures are Copy.
         TyKind::FnDef(..) | TyKind::FnPtr(_) | TyKind::Closure(..) => true,
@@ -2459,6 +2474,7 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => return env_proves(tys, t, p.gx.lang.clone, None),
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| has_clone(p, tys, e)),
         TyKind::Array(e, _) => return has_clone(p, tys, e),
         _ => {}
@@ -2487,6 +2503,7 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// lexicographic expansion). Arrays, slices, and Adts stay rejects.
 pub fn has_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_ord, Some(t)),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_ord(p, tys, e),
@@ -2497,6 +2514,7 @@ pub fn has_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_eq, Some(t)),
         // Fn pointers compare by address in Rust; fn items do not.
         TyKind::FnPtr(_) => true,
         TyKind::Float(_) => true,
@@ -2529,6 +2547,7 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
@@ -2557,19 +2576,22 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-pub fn has_display(tys: &impl TyIntern, t: Ty) -> bool {
+pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.display, None),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
-        TyKind::Ref(_, _, e) => has_display(tys, e),
+        TyKind::Ref(_, _, e) => has_display(p, tys, e),
         _ => tys.is_string_ty(t),
     }
 }
 
 /// True if values of this type own heap memory and need a drop call.
+/// A `Param` or projection type may (rustc's drop check assumes so).
 pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => return true,
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop(p, tys, e)),
         TyKind::Array(e, _) => return needs_drop(p, tys, e),
         _ => {}

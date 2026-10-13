@@ -627,6 +627,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
             Expr::Call { callee, args } => {
                 let res = self.ck.res(e);
+                // A call through an Fn-family bound of a type parameter
+                // (template checks): a method call of the bound's trait
+                // with the callee as its receiver.
+                if let Res::Method { .. } = res {
+                    self.method_into(e, *callee, args, dest, span);
+                    return;
+                }
                 // An indirect call reads the callee value before the
                 // arguments run, as Rust evaluates the callee first.
                 let indirect_local = if res == Res::Indirect {

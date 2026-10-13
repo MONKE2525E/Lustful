@@ -1905,7 +1905,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // through W-DRIVER): collect appends materialized instances
     // after the AST fns. They get append-only slots keyed by their
     // instance disk identity, exactly like AST fns in slot_update;
-    // templates and abstract instances are emptied like dead slots
+    // templates and trait-method stubs are emptied like dead slots
     // so only plain fns and instances are checked and generated.
     // A generic program always runs its whole concrete work set:
     // instance discovery is a whole-program walk, and the

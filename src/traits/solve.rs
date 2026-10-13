@@ -140,6 +140,18 @@ fn self_ty_of(cx: &impl TyIntern, tr: &TraitRef) -> Ty {
 /// argument, and every associated binding present on both sides.
 /// A binding written on one side only is an extra fact (an
 /// `AssocEq` after elaboration), not a mismatch.
+/// True for a rigid Self type of a template check: a type parameter,
+/// or a projection over no inference variable (normalization already
+/// had its chance). Only the param env and blanket impls can match
+/// one, and that set is final, so selection need not defer.
+fn is_rigid(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(_) => true,
+        TyKind::Projection(..) => !tys.flags(t).contains_infer(),
+        _ => false,
+    }
+}
+
 fn unify_trait_refs<C: SolveCx>(cx: &mut C, a: TraitRef, b: TraitRef) -> bool {
     let (aa, ba): (Vec<GenericArg>, Vec<GenericArg>) = (cx.tys().args(a.args).to_vec(), cx.tys().args(b.args).to_vec());
     if aa.len() != ba.len() {
@@ -307,7 +319,7 @@ impl Solver {
     /// form, so variables inside a fixed constructor cannot.
     fn head_is_settled<C: SolveCx>(&self, cx: &mut C, self_ty: Ty) -> bool {
         let resolved = cx.deep_resolve(self_ty);
-        head_of(cx.tys(), resolved, &|t| t).is_some()
+        head_of(cx.tys(), resolved, &|t| t).is_some() || is_rigid(cx.tys(), resolved)
     }
 
     /// Selects evidence for one obligation (the algorithm of
@@ -382,7 +394,7 @@ impl Solver {
             let self_ty = self_ty_of(cx.tys(), &obl);
             let deep = cx.deep_resolve(self_ty);
             let numeric_var = matches!(cx.tys().kind(deep), TyKind::Infer(v) if v.is_int() || v.is_float());
-            if head_of(cx.tys(), deep, &|t| t).is_none() && !numeric_var {
+            if head_of(cx.tys(), deep, &|t| t).is_none() && !numeric_var && !is_rigid(cx.tys(), deep) {
                 return Selection::Ambiguous;
             }
         }
@@ -1161,11 +1173,12 @@ mod tests {
         let obl = trait_ref(&mut cx.tys, from_tr, &[p0, u8_ty()]);
         assert_eq!(Solver::new().select(&mut cx, &index, &env, obl), Selection::ParamEvidence(0));
 
-        // A bare parameter Self with no env match defers; it is
-        // never NoImpl, because mono may still prove it.
+        // A bare parameter Self is rigid: with no env match and no
+        // blanket impl, nothing can prove it (the template check is
+        // authoritative, ARCH 4.1; rustc reports E0277 there).
         let mut cx = PureCx::new(&g);
         let obl = trait_ref(&mut cx.tys, from_tr, &[p0, BOOL]);
-        assert_eq!(Solver::new().select(&mut cx, &index, &env, obl), Selection::Ambiguous);
+        assert_eq!(Solver::new().select(&mut cx, &index, &env, obl), Selection::NoImpl);
     }
 
     /// Step 3 binds inference: one `FromIter` candidate fixes the

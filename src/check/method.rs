@@ -2,7 +2,7 @@
 // (docs/ARCH.md section 2.10; W-TRAITS-CORE in wave A,
 // W-CHECK-G after). The builtin and plain inherent dispatch stays
 // in `check/mod.rs`; this module is the candidate search used when
-// a receiver is a generic Adt application, an abstract opaque, a
+// a receiver is a generic Adt application, a type parameter, a
 // projection, or a dyn type, and for every trait method.
 //
 // Probe order is section 2.10 step 2, interleaved with the
@@ -390,6 +390,7 @@ pub(super) fn trait_probe_for(
                         }
                     }
                 }
+                Selection::ParamEvidence(_) => param_env_hit(cx, method_def, tr).map(|(l, a)| (l, a, None)),
                 _ => None,
             };
             let zonked_inputs: Option<Vec<Ty>> = if found.is_some() && !input_vars.is_empty() {
@@ -487,6 +488,7 @@ pub(super) fn trait_probe_for(
                                 None => p.local_def(method_def.hash).map(|l| (l, tr_args.clone())),
                             }
                         }
+                        Selection::ParamEvidence(_) => param_env_hit(cx, method_def, tr),
                         _ => None,
                     };
                     cx.rollback_vars(snap);
@@ -713,6 +715,22 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
         }
         cx.set_res(d.e, Res::Method { f: local, derefs: d.derefs, autoref: d.autoref });
     }
+}
+
+/// A call the param env proves (a template check: `t.m()` with
+/// `T: Tr` in the bounds): the trait method's signature stub, with
+/// the trait ref's args (resolved after selection) as its prefix.
+fn param_env_hit(cx: &mut Ctx, method_def: DefId, tr: TraitRef) -> Option<(LocalDefId, Vec<GenericArg>)> {
+    let stub = *cx.p.gx.trait_method_stubs.get(&method_def)?;
+    let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+    let prefix = raw
+        .iter()
+        .map(|&g| match g {
+            GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
+            other => other,
+        })
+        .collect();
+    Some((stub, prefix))
 }
 
 /// True when `local` is a method written in an impl (not a trait
