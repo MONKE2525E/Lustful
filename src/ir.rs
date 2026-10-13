@@ -150,6 +150,11 @@ pub enum Rvalue {
     /// size or the align of the value behind it (`size_of_val` and
     /// `align_of_val` on a dyn value; word indexes in `check::object`).
     DynMeta { ptr: Operand, word: u32 },
+    /// `dst.write_fmt(format_args!(..))` (W-STD-B): formats the parts
+    /// into `dst` (a `&mut Formatter` or `&mut String`) with a fresh
+    /// Formatter over its sink, stopping at the first error; the value
+    /// is the `fmt::Result`.
+    WriteFmt(Operand, Vec<FmtPart>),
 }
 
 #[derive(Clone, Debug)]

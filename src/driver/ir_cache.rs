@@ -275,6 +275,11 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             (25u8, word).hash(h);
             hash_operand(h, p, tys, ptr, seen);
         }
+        Rvalue::WriteFmt(dst, parts) => {
+            40u8.hash(h);
+            hash_operand(h, p, tys, dst, seen);
+            hash_fmt(h, p, tys, parts, seen);
+        }
     }
 }
 
@@ -560,6 +565,7 @@ enum CachedRvalue {
     MakeDyn(CachedOperand, u32, u32),
     DynUpcast(CachedOperand, Vec<u32>),
     DynMeta(CachedOperand, u32),
+    WriteFmt(CachedOperand, Vec<CachedFmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -868,6 +874,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::MakeDyn { ptr, src, dyn_ty } => CachedRvalue::MakeDyn(cache_operand(b, p, ptr), b.ty(*src), b.ty(*dyn_ty)),
         Rvalue::DynUpcast { ptr, path } => CachedRvalue::DynUpcast(cache_operand(b, p, ptr), path.clone()),
         Rvalue::DynMeta { ptr, word } => CachedRvalue::DynMeta(cache_operand(b, p, ptr), *word),
+        Rvalue::WriteFmt(dst, parts) => CachedRvalue::WriteFmt(cache_operand(b, p, dst), cache_fmt(b, p, parts)),
     }
 }
 
@@ -1043,6 +1050,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             }
             CachedRvalue::DynUpcast(o, path) => Rvalue::DynUpcast { ptr: operand(intern, tys, strings, o)?, path: path.clone() },
             CachedRvalue::DynMeta(o, word) => Rvalue::DynMeta { ptr: operand(intern, tys, strings, o)?, word: *word },
+            CachedRvalue::WriteFmt(o, parts) => Rvalue::WriteFmt(operand(intern, tys, strings, o)?, fmt(intern, tys, strings, parts)?),
         })
     }
     let mut blocks = Vec::with_capacity(cached.blocks.len());

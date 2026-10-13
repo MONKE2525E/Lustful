@@ -3666,6 +3666,7 @@ impl<'a> Parser<'a> {
             (k.assert_ne, MacroKind::AssertNe),
             (k.todo, MacroKind::Todo),
             (k.unreachable, MacroKind::Unreachable),
+            (k.format_args, MacroKind::FormatArgs),
         ];
         if self.interner.get(name) == "offset_of" {
             return self.offset_of_body(start);
@@ -3711,7 +3712,7 @@ impl<'a> Parser<'a> {
                 return Err(syntax(self.span(), "too few arguments for this macro"));
             }
             // `print!`, `eprint!`, and `format!` need a format string; `println!` and kin do not.
-            let needs_str = matches!(kind, MacroKind::Print | MacroKind::Eprint | MacroKind::Format);
+            let needs_str = matches!(kind, MacroKind::Print | MacroKind::Eprint | MacroKind::Format | MacroKind::FormatArgs);
             if needs_str && !matches!(self.peek(), Tok::Str(_)) {
                 return Err(syntax(self.span(), "expected a format string literal"));
             }

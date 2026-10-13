@@ -337,6 +337,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Rc) => format!("Rc<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
+            Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -1471,6 +1472,9 @@ pub fn collect_reuse<'a>(
         insert_builtin(&mut p, b.result, DefsKind::Enum, known.Result, two_ty_params);
         insert_builtin(&mut p, b.chars, DefsKind::Struct, interner.intern("Chars"), Generics::default());
         insert_builtin(&mut p, b.args, DefsKind::Struct, interner.intern("Args"), Generics::default());
+        for k in crate::ty::fmt::FmtTy::ALL {
+            insert_builtin(&mut p, b.fmt_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), Generics::default());
+        }
         for k in crate::ty::iter::IterKind::ALL {
             let params = (0..k.n_args())
                 .map(|i| ParamDef { name: interner.intern(["I", "F", "B"][i]), kind: ParamKind::Type, span: dummy })
@@ -1519,6 +1523,11 @@ pub fn collect_reuse<'a>(
         || p.gx.trait_names.contains_key(&ordering_name)
         || ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Type(a) if a.name == ordering_name));
     adt_srcs.push((usize::MAX, ordering_name, Span::default(), true, generics::ordering_def().hash));
+    // `core::fmt::Error`, the unit struct of `fmt::Result` (W-STD-B):
+    // always present, never in the flat name table (only `fmt::Error`
+    // paths reach it; see `generics::resolve_fmt_path`).
+    let fmt_error_name = interner.intern("Error");
+    adt_srcs.push((usize::MAX - 1, fmt_error_name, Span::default(), false, generics::fmt_error_def().hash));
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -1544,6 +1553,38 @@ pub fn collect_reuse<'a>(
     }
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
+        if item_idx == usize::MAX - 1 {
+            // The synthetic `fmt::Error` unit struct (see above), with
+            // core's derives; its Display is the runtime's.
+            let id = AdtId(adt_base as u32 + rank);
+            let def = generics::fmt_error_def();
+            p.adts[id.0 as usize] = AdtDef {
+                name,
+                is_enum: false,
+                variants: vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+                // core: `#[derive(Copy, Clone, Debug, Default, Eq, Hash,
+                // Ord, PartialEq, PartialOrd)]`.
+                derives: Derives {
+                    debug: true,
+                    clone: true,
+                    copy: true,
+                    partial_eq: true,
+                    eq: true,
+                    hash: true,
+                    partial_ord: true,
+                    ord: true,
+                    default: true,
+                    default_variant: None,
+                },
+                span,
+                repr: crate::ty::layout::Repr::default(),
+            };
+            p.gx.adt_info[id.0 as usize] = (def, 0);
+            p.tys.register_adt(def, id);
+            p.defs.insert_adt(def, id, DefData::skeleton(DefsKind::Struct, None, name, Vis::Pub, span));
+            p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
+            continue;
+        }
         if item_idx == usize::MAX {
             // The synthetic `Ordering` Adt (see above): variants and
             // derives are core's, written here directly (no AST item).
@@ -2039,6 +2080,7 @@ pub fn collect_reuse<'a>(
     }
 
     // Derived traits need every field type to have the trait too.
+    let mut deferred_debug: Vec<(Ty, Span)> = Vec::new();
     for i in 0..p.adts.len() {
         let adt = &p.adts[i];
         let d = adt.derives;
@@ -2063,8 +2105,15 @@ pub fn collect_reuse<'a>(
                 }
                 // `PartialEq` fields are checked in finish_collect too.
                 if d.debug {
-                    checks[n_checks] = (has_debug(&p, &p.tys, f.ty), "Debug");
-                    n_checks += 1;
+                    // A field of a type with a written `impl Debug` waits
+                    // for the impl index: finish_collect proves it (W-STD-B).
+                    let ok = has_debug(&p, &p.tys, f.ty);
+                    if !ok && crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
+                        deferred_debug.push((f.ty, adt.span));
+                    } else {
+                        checks[n_checks] = (ok, "Debug");
+                        n_checks += 1;
+                    }
                 }
                 for &(ok, name) in &checks[..n_checks] {
                     if !ok {
@@ -2079,6 +2128,8 @@ pub fn collect_reuse<'a>(
             }
         }
     }
+
+    p.gx.deferred_debug_fields.extend(deferred_debug);
 
     // Fields must be sized: a bare slice or str cannot sit in a struct.
     for adt in &p.adts {
@@ -3792,7 +3843,10 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
                 return glue_debug(p, tys, a, seen) && glue_debug(p, tys, b, seen);
             }
             match tys.local_adt(t) {
-                Some(a) => p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_debug(p, tys, f, seen)),
+                Some(a) => {
+                    (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
+                        || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
+                }
                 None => false,
             }
         }
@@ -3806,7 +3860,12 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_display(p, tys, e),
-        _ => tys.is_string_ty(t) || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e)),
+        _ => {
+            tys.is_string_ty(t)
+                || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
+                || tys.adt_parts(t).is_some_and(|(d, _)| d == crate::check::generics::fmt_error_def())
+                || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))
+        }
     }
 }
 

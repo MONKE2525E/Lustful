@@ -57,6 +57,9 @@ pub enum CTy {
     /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
     /// the moved-in buffer plus the front index of what it still owns.
     VecIter(Box<CTy>),
+    /// A `core::fmt` struct (W-STD-B): the runtime's `lust_Formatter`
+    /// or Debug builder (src/runtime/fmt.h).
+    Fmt(crate::ty::fmt::FmtTy),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -137,6 +140,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::Chars) => CTy::Chars,
             Some(BuiltinTy::Args) => CTy::Args,
             Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
+            Some(BuiltinTy::Fmt(k)) => CTy::Fmt(k),
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -255,6 +259,29 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Float(f) => (*f).name().replace("f64", "double").replace("f32", "float"),
         CTy::FnPtr(..) => format!("Fp_{}", mangle(t)),
         CTy::Dyn => "lust_dyn".into(),
+        CTy::Fmt(k) => fmt_ctype(*k).into(),
+    }
+}
+
+/// The (size, align) of the runtime struct of one `core::fmt` type
+/// (src/runtime/fmt.h, x86_64 and aarch64 alike).
+fn fmt_size_align(k: crate::ty::fmt::FmtTy) -> (u64, u64) {
+    use crate::ty::fmt::FmtTy as F;
+    match k {
+        F::Formatter | F::Arguments | F::DebugTuple => (24, 8),
+        F::DebugStruct | F::DebugList | F::DebugSet | F::DebugMap => (16, 8),
+    }
+}
+
+/// The runtime struct of one `core::fmt` type.
+fn fmt_ctype(k: crate::ty::fmt::FmtTy) -> &'static str {
+    use crate::ty::fmt::FmtTy as F;
+    match k {
+        F::Formatter | F::Arguments => "lust_Formatter",
+        F::DebugStruct => "lust_DebugStruct",
+        F::DebugTuple => "lust_DebugTuple",
+        F::DebugList | F::DebugSet => "lust_DebugList",
+        F::DebugMap => "lust_DebugMap",
     }
 }
 
@@ -285,6 +312,7 @@ fn mangle(t: &CTy) -> String {
             format!("fp{ps}r{}_", mangle(r))
         }
         CTy::Dyn => "dyn".into(),
+        CTy::Fmt(k) => format!("Fmt{}", *k as u8),
     }
 }
 
@@ -539,6 +567,10 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 .ok()
             }
             CTy::Chars => Some(plain_layout(24, 8)),
+            CTy::Fmt(k) => {
+                let (size, align) = fmt_size_align(*k);
+                Some(plain_layout(size, align))
+            }
             CTy::Args => Some(plain_layout(8, 8)),
             CTy::VecIter(_) => layout::struct_layout(
                 &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)],
@@ -728,6 +760,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::VecIter(_) => (32, 8),
             CTy::Args => (8, 8),
+            CTy::Fmt(k) => fmt_size_align(*k),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
             CTy::Ref(_) => (8, 8),
@@ -2031,6 +2064,7 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             Rvalue::Format(parts) => self.format(parts, loc, post, 0),
+            Rvalue::WriteFmt(dst, parts) => self.write_fmt(dst, parts, loc, post),
             Rvalue::Discriminant(pl) => {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
@@ -2332,6 +2366,9 @@ impl FnGen<'_, '_, '_> {
         // method receiver arrived: `&Vec` (pointer to lust_Vec),
         // `&[T]` (the fat slice value), `&&[T]` (pointer to it),
         // `&[T; N]` (pointer to the array), or a by-value array.
+        if let Some(v) = self.fmt_builtin(b, &vals, &tys, loc) {
+            return v;
+        }
         let slice_like = |t: &CTy, val: &str| -> (CTy, String, String) {
             match t {
                 CTy::Ref(inner) => match &**inner {
@@ -2346,6 +2383,34 @@ impl FnGen<'_, '_, '_> {
             }
         };
         match b {
+            // Emitted by `fmt_builtin` above (cgen/fmt.rs).
+            B::FmtWriteStr
+            | B::FmtWriteChar
+            | B::FmtPad
+            | B::FmtPadIntegral
+            | B::FmtWidth
+            | B::FmtPrecision
+            | B::FmtFill
+            | B::FmtAlternate
+            | B::FmtSignPlus
+            | B::FmtSignMinus
+            | B::FmtSignAwareZeroPad
+            | B::FmtDebugStruct
+            | B::FmtDebugTuple
+            | B::FmtDebugList
+            | B::FmtDebugSet
+            | B::FmtDebugMap
+            | B::DsField
+            | B::DtField
+            | B::DlEntry
+            | B::DmEntry
+            | B::DmKey
+            | B::DmValue
+            | B::FmtFinish
+            | B::FmtFinishNonExhaustive
+            | B::FmtWriteFmt
+            | B::FmtCallDisplay
+            | B::FmtCallDebug => unreachable!("fmt builtins emit in cgen/fmt.rs"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.
@@ -5411,6 +5476,14 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
                 op(value);
             }
         }),
+        Rvalue::WriteFmt(dst, parts) => {
+            op(dst);
+            parts.iter().for_each(|p| {
+                if let FmtPart::Arg { value, .. } = p {
+                    op(value);
+                }
+            })
+        }
         Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => pl(p),
         Rvalue::Subslice { base, lo, hi, .. } => {
             pl(base);

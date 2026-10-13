@@ -947,6 +947,8 @@ fn predicted_def_ids(
     // (check/collect.rs pass 1), always (a user type of that name only
     // shadows its flat name): predict the same extra hash.
     adt_hashes.push(crate::check::generics::ordering_def().hash);
+    // And `core::fmt::Error`, always (W-STD-B).
+    adt_hashes.push(crate::check::generics::fmt_error_def().hash);
     let to_map = |hashes: &[crate::def::DefPathHash], ranks: Vec<u32>| -> FxMap<crate::def::DefPathHash, u32> {
         hashes.iter().copied().zip(ranks).collect()
     };
@@ -3115,6 +3117,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 cgen::CTy::Args => 10u8.hash(h),
                 cgen::CTy::Chars => 11u8.hash(h),
+                cgen::CTy::Fmt(k) => (40u8, *k as u8).hash(h),
                 cgen::CTy::Tuple(ts) => {
                     12u8.hash(h);
                     (ts.len() as u64).hash(h);
@@ -3539,10 +3542,12 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
             let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
             let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
             for (hash, &id) in &adts {
-                // The synthetic `Ordering` Adt carries its builtin
-                // def, not a local-crate one (check/collect.rs).
+                // The synthetic `Ordering` and `fmt::Error` Adts carry
+                // their builtin defs, not local-crate ones (check/collect.rs).
                 let def = if *hash == crate::check::generics::ordering_def().hash {
                     crate::check::generics::ordering_def()
+                } else if *hash == crate::check::generics::fmt_error_def().hash {
+                    crate::check::generics::fmt_error_def()
                 } else {
                     crate::def::DefId { krate: ids.local, hash: *hash }
                 };

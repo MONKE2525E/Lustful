@@ -192,6 +192,10 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
 /// Display glue (every other Display type is a leaf in `fmt_expr`).
 pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
     match t {
+        // `impl Display for fmt::Error`: str Display of core's text.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
+            format!("  return lust_f_pad(f, {});\n", lit("an error occurred when formatting an argument"))
+        }
         CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots) {
             Some(call) => format!("  {call}\n"),
             None => "  abort();\n".to_string(),
@@ -405,5 +409,182 @@ impl FnGen<'_, '_, '_> {
             let _ = writeln!(self.out, "    lust_String {s} = lust_string_from(lust_string_as_str(&{buf})); lust_string_drop(&{buf});");
         }
         s
+    }
+}
+
+/// The C form of `fmt::Result` (`Result<(), fmt::Error>`).
+fn fmt_result_cty(p: &Program) -> CTy {
+    let e = p.tys.local_adt_of(crate::check::generics::fmt_error_def()).map_or(CTy::Unit, CTy::Adt);
+    CTy::Result(Box::new(CTy::Unit), Box::new(e))
+}
+
+impl FnGen<'_, '_, '_> {
+    /// The `fmt::Result` value of a runtime result int.
+    fn fmt_result_of(&mut self, e: &str) -> String {
+        let t = fmt_result_cty(self.p);
+        let err_ty = match &t {
+            CTy::Result(_, b) => (**b).clone(),
+            _ => CTy::Unit,
+        };
+        let ok = self.make_variant(&t, 0, &["((lust_Unit){})".to_string()]);
+        let err = self.make_variant(&t, 1, &[zero_lit(self.p, &err_ty)]);
+        format!("(({e}) ? {err} : {ok})")
+    }
+
+    /// One `core::fmt` builtin call (check/fmt.rs) over the operand
+    /// values and C types, or None for every other builtin.
+    pub(super) fn fmt_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> Option<String> {
+        use crate::ty::fmt::FmtTy as F;
+        use Builtin as B;
+        let opt_usize = CTy::Option(Box::new(CTy::Int(IntTy::Usize)));
+        let recv_kind = match tys.first() {
+            Some(CTy::Ref(inner)) => match &**inner {
+                CTy::Fmt(k) => Some(*k),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut want: Vec<(Glue, CTy)> = Vec::new();
+        let value = |i: usize, f: &str, want: &mut Vec<(Glue, CTy)>| -> String {
+            let inner = match &tys[i] {
+                CTy::Ref(inner) => (**inner).clone(),
+                t => t.clone(),
+            };
+            fmt_expr(&inner, FmtKind::Debug, f, &vals[i], &mut |g, t| want.push((g, t.clone())))
+        };
+        let on_string = matches!(tys.first(), Some(CTy::Ref(inner)) if **inner == CTy::String);
+        let out = match b {
+            // `<String as fmt::Write>`: append, always Ok.
+            B::FmtWriteStr if on_string => self.fmt_result_of(&format!("(lust_string_push_str({}, {}), 0)", vals[0], vals[1])),
+            B::FmtWriteChar if on_string => self.fmt_result_of(&format!("(lust_string_push_char({}, {}), 0)", vals[0], vals[1])),
+            B::FmtWriteStr => self.fmt_result_of(&format!("lust_f_write_str({}, {})", vals[0], vals[1])),
+            B::FmtWriteChar => self.fmt_result_of(&format!("lust_f_write_char({}, {})", vals[0], vals[1])),
+            B::FmtPad => self.fmt_result_of(&format!("lust_f_pad({}, {})", vals[0], vals[1])),
+            B::FmtPadIntegral => self.fmt_result_of(&format!("lust_f_pad_integral({}, {}, {}, {})", vals[0], vals[1], vals[2], vals[3])),
+            B::FmtWidth | B::FmtPrecision => {
+                let (flag, field) = if b == B::FmtWidth { ("LUST_FLAG_WIDTH", "width") } else { ("LUST_FLAG_PREC", "prec") };
+                let some = self.make_variant(&opt_usize, 1, &[format!("(uint64_t){}->{field}", vals[0])]);
+                let none = self.make_variant(&opt_usize, 0, &[]);
+                format!("(({}->flags & {flag}) ? {some} : {none})", vals[0])
+            }
+            B::FmtFill => format!("({}->fill)", vals[0]),
+            B::FmtAlternate => format!("(({}->flags & LUST_FLAG_ALT) != 0)", vals[0]),
+            B::FmtSignPlus => format!("(({}->flags & LUST_FLAG_PLUS) != 0)", vals[0]),
+            B::FmtSignMinus => format!("(({}->flags & LUST_FLAG_MINUS) != 0)", vals[0]),
+            B::FmtSignAwareZeroPad => format!("(({}->flags & LUST_FLAG_ZERO) != 0)", vals[0]),
+            B::FmtDebugStruct | B::FmtDebugTuple | B::FmtDebugList | B::FmtDebugSet | B::FmtDebugMap => {
+                let t = self.tmp();
+                let line = match b {
+                    B::FmtDebugStruct => format!("lust_DebugStruct {t}; lust_dstruct_new(&{t}, {}, {});", vals[0], vals[1]),
+                    B::FmtDebugTuple => format!("lust_DebugTuple {t}; lust_dtuple_new(&{t}, {}, {});", vals[0], vals[1]),
+                    B::FmtDebugList => format!("lust_DebugList {t}; lust_dlist_new(&{t}, {}, 0);", vals[0]),
+                    B::FmtDebugSet => format!("lust_DebugList {t}; lust_dlist_new(&{t}, {}, 1);", vals[0]),
+                    _ => format!("lust_DebugMap {t}; lust_dmap_new(&{t}, {});", vals[0]),
+                };
+                let _ = writeln!(self.out, "    {line}");
+                t
+            }
+            B::DsField => {
+                let e = value(2, "w", &mut want);
+                let _ = writeln!(
+                    self.out,
+                    "    {{ lust_fmt_slot s; lust_Formatter *w = lust_dstruct_field({}, &s, {}); if (w) lust_dstruct_field_end({}, &s, {e}); }}",
+                    vals[0], vals[1], vals[0]
+                );
+                vals[0].clone()
+            }
+            B::DtField | B::DlEntry => {
+                let e = value(1, "w", &mut want);
+                let (begin, end) = if b == B::DtField { ("dtuple_field", "dtuple_field_end") } else { ("dlist_entry", "dlist_entry_end") };
+                let _ = writeln!(
+                    self.out,
+                    "    {{ lust_fmt_slot s; lust_Formatter *w = lust_{begin}({}, &s); if (w) lust_{end}({}, &s, {e}); }}",
+                    vals[0], vals[0]
+                );
+                vals[0].clone()
+            }
+            B::DmKey | B::DmValue | B::DmEntry => {
+                let steps: &[(usize, &str)] = match b {
+                    B::DmKey => &[(1, "key")],
+                    B::DmValue => &[(1, "value")],
+                    _ => &[(1, "key"), (2, "value")],
+                };
+                for &(i, which) in steps {
+                    let e = value(i, "w", &mut want);
+                    let _ = writeln!(
+                        self.out,
+                        "    {{ lust_fmt_slot s; lust_Formatter *w = lust_dmap_{which}({}, &s, {loc}); if (w) lust_dmap_{which}_end({}, &s, {e}); }}",
+                        vals[0], vals[0]
+                    );
+                }
+                vals[0].clone()
+            }
+            B::FmtFinish | B::FmtFinishNonExhaustive => {
+                let ne = if b == B::FmtFinishNonExhaustive { "_ne" } else { "" };
+                let call = match recv_kind {
+                    Some(F::DebugStruct) => format!("lust_dstruct_finish{ne}({})", vals[0]),
+                    Some(F::DebugTuple) => format!("lust_dtuple_finish{ne}({})", vals[0]),
+                    Some(F::DebugMap) => format!("lust_dmap_finish{ne}({}, {loc})", vals[0]),
+                    _ => format!("lust_dlist_finish{ne}({})", vals[0]),
+                };
+                self.fmt_result_of(&call)
+            }
+            B::FmtCallDisplay | B::FmtCallDebug => {
+                let kind = if b == B::FmtCallDisplay { FmtKind::Display } else { FmtKind::Debug };
+                let inner = match &tys[0] {
+                    CTy::Ref(inner) => (**inner).clone(),
+                    t => t.clone(),
+                };
+                let e = fmt_expr(&inner, kind, &vals[1], &vals[0], &mut |g, t| want.push((g, t.clone())));
+                self.fmt_result_of(&e)
+            }
+            _ => return None,
+        };
+        for (g, t) in want {
+            self.want(g, &t);
+        }
+        Some(out)
+    }
+
+    /// `Rvalue::WriteFmt`: the parts into `dst`'s sink through a fresh
+    /// Formatter (Formatter::write_fmt and `<String as fmt::Write>`),
+    /// stopping at the first error; the value is the `fmt::Result`.
+    pub(super) fn write_fmt(&mut self, dst: &Operand, parts: &[FmtPart], loc: &str, post: &mut Vec<String>) -> String {
+        let (d, dt) = self.operand(dst, loc, post);
+        let s = self.tmp();
+        let on_string = matches!(&dt, CTy::Ref(inner) if **inner == CTy::String);
+        if on_string {
+            let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, {d}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
+        } else {
+            let _ = writeln!(self.out, "    lust_Formatter {s}f; lust_f_init(&{s}f, ({d})->buf); int {s}e = 0;");
+        }
+        for part in parts {
+            match part {
+                FmtPart::Lit(text) => {
+                    if !text.is_empty() {
+                        let _ = writeln!(self.out, "    if (!{s}e) {s}e = lust_f_write(&{s}f, {}, {});", c_string_lit(text.as_bytes()), text.len());
+                    }
+                }
+                FmtPart::Arg { value, ty, spec, .. } => {
+                    let (v, vt) = self.operand(value, loc, post);
+                    let t = cty(&self.body.tys, *ty);
+                    let ptr = if matches!(self.body.tys.kind(*ty), TyKind::Str | TyKind::Slice(_)) {
+                        let tmp = self.tmp();
+                        let _ = writeln!(self.out, "    {} {tmp} = {v};", ctype(&vt));
+                        format!("(&{tmp})")
+                    } else {
+                        v
+                    };
+                    let mut want: Vec<(Glue, CTy)> = Vec::new();
+                    let e = fmt_expr(&t, spec.kind, &format!("(&{s}f)"), &ptr, &mut |g, t| want.push((g, t.clone())));
+                    for (g, t) in want {
+                        self.want(g, &t);
+                    }
+                    let (fill, align, flags, width, prec) = spec_words(spec);
+                    let _ = writeln!(self.out, "    if (!{s}e) {{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
+                }
+            }
+        }
+        self.fmt_result_of(&format!("{s}e"))
     }
 }

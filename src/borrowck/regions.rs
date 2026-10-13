@@ -386,6 +386,8 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     use crate::ty::iter::IterKind;
     match tys.builtin_of(t) {
         Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)) => return 1,
+        // A Debug builder holds `&mut Formatter` (W-STD-B).
+        Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
         Some(_) => return 0,
         None => {}
     }
@@ -1713,6 +1715,21 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     self.edge(class, y);
                 }
             }
+            _ if matches!(target, CallTarget::Builtin(b) if fmt_builder_builtin(b)) => {
+                // A Debug builder (W-STD-B) borrows only what its receiver
+                // does: `debug_struct(&mut self, &str)` and `entry(&mut
+                // self, &dyn Debug) -> &mut Self` format their other
+                // arguments at once and never store them.
+                if let Some((rt, rv)) = avs.first() {
+                    let (rt, rv) = (*rt, rv.clone());
+                    // `&mut Self` back: the receiver's own regions, slot
+                    // by slot; a new builder: what the `&mut Formatter`
+                    // borrow allows.
+                    if !self.relate(rt, &rv, dt, &dv, Variance::Co) {
+                        self.flow_all(&rv, &dv);
+                    }
+                }
+            }
             _ if matches!(target, CallTarget::Builtin(b) if item_builtin(b)) => {
                 // An iterator item (or a collection of items) borrows what
                 // the iterator's sources borrow: not the temporary `&mut`
@@ -2113,6 +2130,26 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 
 /// The builtin iterator calls whose result is an item (or a collection
 /// of items): their regions come from the iterator's sources.
+/// The `core::fmt` builtins whose result borrows from the receiver
+/// alone (a builder, or `&mut Self` of one).
+fn fmt_builder_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(
+        b,
+        B::FmtDebugStruct
+            | B::FmtDebugTuple
+            | B::FmtDebugList
+            | B::FmtDebugSet
+            | B::FmtDebugMap
+            | B::DsField
+            | B::DtField
+            | B::DlEntry
+            | B::DmEntry
+            | B::DmKey
+            | B::DmValue
+    )
+}
+
 fn item_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(

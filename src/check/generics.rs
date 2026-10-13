@@ -478,6 +478,24 @@ pub fn ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(ordering_def(), EMPTY_ARGS))
 }
 
+/// The def of `core::fmt::Error`, the unit struct of `fmt::Result`
+/// (W-STD-B). Collect registers a local Adt for it like `Ordering`,
+/// but never under a bare name: only `fmt::Error` paths reach it.
+pub fn fmt_error_def() -> DefId {
+    lang_def(&["core", "fmt"], crate::def::DefKind::Adt, "Error")
+}
+
+/// The `core::fmt::Error` type.
+pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(fmt_error_def(), EMPTY_ARGS))
+}
+
+/// `fmt::Result`: `Result<(), fmt::Error>`.
+pub fn fmt_result_ty(tys: &mut impl TyIntern) -> Ty {
+    let e = fmt_error_ty(tys);
+    tys.mk_result(UNIT, e)
+}
+
 /// The signature of one lang trait method over the trait's generics
 /// (Self at 0, then the inputs): receiver form, parameter types
 /// with the receiver first, return type, and which parameter a
@@ -499,8 +517,8 @@ pub struct LangMethodSig {
 /// a method only ever gets its own trait's signature; the operator
 /// families are the closed list of lang operator traits. Methods
 /// with no entry are ones a body cannot call through a bound in
-/// this subset: `fmt` and `hash` name types lust has no def for
-/// yet (`Formatter`, `Hasher`), `from_iter` has a method-level
+/// this subset: `hash` names a type lust has no def for yet
+/// (`Hasher`), `from_iter` has a method-level
 /// generic the stub form cannot state, and `drop` is not callable.
 pub fn lang_method_sigs(
     lang: &LangTraits,
@@ -589,6 +607,13 @@ pub fn lang_method_sigs(
                 }
                 (d, "cmp") if d == lang.ord => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None }
+                }
+                (d, "fmt") if d == lang.debug || d == lang.display => {
+                    // `fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result` (W-STD-B).
+                    let f = crate::ty::fmt::fmt_ty(tys, crate::ty::fmt::FmtTy::Formatter);
+                    let fm = tys.mk_ref(true, f);
+                    let ret = fmt_result_ty(tys);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, fm], ret, ret_borrows_from: None }
                 }
                 (d, "max" | "min") if d == lang.ord => {
                     LangMethodSig { self_kind: Some(Value), params: vec![p0, p0], ret: p0, ret_borrows_from: None }
@@ -1582,6 +1607,11 @@ fn resolve_path_ty(
             if path[1..] == ["cmp", "Ordering"] && !segs[2].has_args() {
                 return Ok(ordering_ty(tys));
             }
+            // `core::fmt` types are known by their full path only:
+            // `Error` and `Result` must never match a bare name.
+            if path.len() == 3 && path[1] == "fmt" {
+                return resolve_fmt_path(tys, path[2], segs.last().unwrap(), span);
+            }
         } else {
             return Err(not_yet("L0505", span, "module paths in types"));
         }
@@ -1782,6 +1812,30 @@ fn resolve_path_ty(
         return Err(not_yet("L0641", span, &format!("the `{n}` type")));
     }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
+}
+
+/// A `core::fmt` type by its last path segment (W-STD-B): the
+/// Formatter family (lifetime arguments only), `fmt::Result`, and
+/// `fmt::Error`.
+fn resolve_fmt_path(tys: &mut impl TyIntern, name: &str, seg: &ast::PathSeg, span: Span) -> Result<Ty, Diag> {
+    let only_lifetimes = match &seg.args {
+        GenericArgs::None => true,
+        GenericArgs::Angle(a) => a.iter().all(|g| matches!(g, ast::GenericArg::Lifetime(_))),
+        GenericArgs::Parenthesized { .. } => false,
+    };
+    if !only_lifetimes {
+        return Err(Diag::new("L0110", span, "this type takes no type arguments", "Remove the `<...>` part."));
+    }
+    match name {
+        "Result" if seg.has_args() => Err(Diag::new("L0110", span, "`fmt::Result` takes no generic arguments", "Remove the `<...>` part.")),
+        "Result" => Ok(fmt_result_ty(tys)),
+        "Error" if seg.has_args() => Err(Diag::new("L0110", span, "`fmt::Error` takes no generic arguments", "Remove the `<...>` part.")),
+        "Error" => Ok(fmt_error_ty(tys)),
+        _ => match crate::ty::fmt::FmtTy::by_name(name) {
+            Some(k) => Ok(crate::ty::fmt::fmt_ty(tys, k)),
+            None => Err(Diag::new("L0102", span, format!("unknown type `{name}`"), "Check the spelling, or define the type.")),
+        },
+    }
 }
 
 /// Converts one written bound on `lhs` into predicates. `?Sized`
@@ -2308,6 +2362,10 @@ pub struct GenTables<'a> {
     /// trait (`FmtKind as u8`: Display or Debug), for cgen's Debug and
     /// Display glue (W-STD-B; iface: W-CGEN reads this).
     pub fmt_methods: FxMap<(AdtId, u8), LocalDefId>,
+    /// Field types of `#[derive(Debug)]` Adts that name a local Adt the
+    /// structural rules could not answer at collect (a written `impl
+    /// Debug` is not in the index yet): proven in `finish_collect`.
+    pub deferred_debug_fields: Vec<(Ty, Span)>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -2391,6 +2449,7 @@ impl Default for GenTables<'_> {
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),
             fmt_methods: FxMap::default(),
+            deferred_debug_fields: Vec::new(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
@@ -3251,6 +3310,7 @@ pub fn finish_trait_impl(
         }
     }
     check_impl_rules(p, imp, &impl_generics, self_pat, tr, errs);
+    crate::check::fmt::check_fmt_impl(p, imp, tr, self_pat, method_ids, errs);
     // Method validation against the trait's templates.
     let impl_parent_n = impl_generics.params.len();
     for (method_def, mname) in &rec.methods {
@@ -4905,6 +4965,53 @@ fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     p.gx.drop_methods.insert(adt, drop_fn);
 }
 
+/// The user `fmt` method instances of one concrete Adt, for cgen's
+/// Display and Debug glue (`gx.fmt_methods`, W-STD-B): for each of the
+/// two traits, selection on the Adt's full type, and the selected
+/// written impl's `fmt` (instantiated when the impl is generic). A
+/// derived or absent impl records nothing; glue then uses the derive.
+fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
+    use crate::traits::index::Synthetic;
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    if p.tys.flags(self_ty).contains_param() {
+        return;
+    }
+    for (trait_def, kind) in [(p.gx.lang.display, ast::FmtKind::Display), (p.gx.lang.debug, ast::FmtKind::Debug)] {
+        if p.gx.fmt_methods.contains_key(&(adt, kind as u8)) {
+            continue;
+        }
+        let args_id = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        let sel = {
+            let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+            let mut solver = Solver::new();
+            solver.select(&mut cx, &p.gx.index, &[], tr)
+        };
+        let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
+        let record = p.gx.index.get(id).clone();
+        // An impl whose where clauses fail here has no instance: the
+        // format site already reports the unproven bound (L0612).
+        if record.synthetic != Synthetic::None || !prove_goal(p, &[], tr) {
+            continue;
+        }
+        let Some(local) = record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "fmt"))
+        else {
+            continue;
+        };
+        let f = if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+            let before = p.fns.len();
+            let inst = fn_instance(p, local, &impl_args);
+            if inst.0 as usize >= before {
+                queue.push(inst);
+            }
+            inst
+        } else {
+            local
+        };
+        p.gx.fmt_methods.insert((adt, kind as u8), f);
+    }
+}
+
 /// Materializes every reachable instance (section 4.1's mono
 /// half for wave A): check plain fns for requests, create the
 /// instances they name, check those, to a fixpoint. Discovery
@@ -5078,6 +5185,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             drop_done = p.adts.len() as u32;
             for a in adt_ids {
                 ensure_drop_method(p, a, &mut next_queue);
+                ensure_fmt_methods(p, a, &mut next_queue);
             }
         }
         queue = next_queue;
@@ -5632,6 +5740,22 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// The `#[derive(Debug)]` field types collect deferred (see
+/// `deferred_debug_fields`): each must implement Debug, through the
+/// impl index now that every written impl is in it (W-STD-B).
+fn check_deferred_debug_fields(p: &mut Program, errs: &mut Vec<Diag>) {
+    for (ty, span) in std::mem::take(&mut p.gx.deferred_debug_fields) {
+        if !prove_field_trait(p, &[], p.gx.lang.debug, ty) {
+            errs.push(Diag::new(
+                "L0112",
+                span,
+                format!("cannot derive Debug: field type `{}` does not implement Debug", crate::check::collect::ty_name(p, &p.tys, ty)),
+                "Derive Debug on the field type too, or remove Debug from the derive list.",
+            ));
+        }
+    }
+}
+
 /// The first index of each def in `adt_info`, built once per
 /// pass. It answers exactly what a linear `position` scan over
 /// `adt_info` answers (first match wins, duplicates included),
@@ -5806,6 +5930,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_impl_obligations(p, errs);
     check_copy_impls(p, errs);
     check_derive_bounds(p, errs);
+    check_deferred_debug_fields(p, errs);
     check_written_wf(p, errs);
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;

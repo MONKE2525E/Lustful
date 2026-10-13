@@ -1,4 +1,5 @@
-// expect: L0401
+// A user Display impl that writes through write! (was a reject before
+// user fmt impls landed).
 struct S;
 
 impl std::fmt::Display for S {

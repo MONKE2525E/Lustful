@@ -266,6 +266,33 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CharsNextBack,
     Builtin::DefaultGlue,
     Builtin::OptUnwrapOrDefault,
+    Builtin::FmtWriteStr,
+    Builtin::FmtWriteChar,
+    Builtin::FmtPad,
+    Builtin::FmtPadIntegral,
+    Builtin::FmtWidth,
+    Builtin::FmtPrecision,
+    Builtin::FmtFill,
+    Builtin::FmtAlternate,
+    Builtin::FmtSignPlus,
+    Builtin::FmtSignMinus,
+    Builtin::FmtSignAwareZeroPad,
+    Builtin::FmtDebugStruct,
+    Builtin::FmtDebugTuple,
+    Builtin::FmtDebugList,
+    Builtin::FmtDebugSet,
+    Builtin::FmtDebugMap,
+    Builtin::DsField,
+    Builtin::DtField,
+    Builtin::DlEntry,
+    Builtin::DmEntry,
+    Builtin::DmKey,
+    Builtin::DmValue,
+    Builtin::FmtFinish,
+    Builtin::FmtFinishNonExhaustive,
+    Builtin::FmtWriteFmt,
+    Builtin::FmtCallDisplay,
+    Builtin::FmtCallDebug,
 ];
 
 /// How a builtin is called.
@@ -528,6 +555,36 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
         B::DefaultGlue => (&["any Default type"], vec![k.default], Call::Associated),
         B::OptUnwrapOrDefault => (&["Option<T>"], vec![k.unwrap_or_default], Call::Method),
+        B::FmtWriteStr => (&["fmt::Formatter"], vec![i.intern("write_str")], Call::Method),
+        B::FmtWriteChar => (&["fmt::Formatter"], vec![i.intern("write_char")], Call::Method),
+        B::FmtPad => (&["fmt::Formatter"], vec![i.intern("pad")], Call::Method),
+        B::FmtPadIntegral => (&["fmt::Formatter"], vec![i.intern("pad_integral")], Call::Method),
+        B::FmtWidth => (&["fmt::Formatter"], vec![i.intern("width")], Call::Method),
+        B::FmtPrecision => (&["fmt::Formatter"], vec![i.intern("precision")], Call::Method),
+        B::FmtFill => (&["fmt::Formatter"], vec![i.intern("fill")], Call::Method),
+        B::FmtAlternate => (&["fmt::Formatter"], vec![i.intern("alternate")], Call::Method),
+        B::FmtSignPlus => (&["fmt::Formatter"], vec![i.intern("sign_plus")], Call::Method),
+        B::FmtSignMinus => (&["fmt::Formatter"], vec![i.intern("sign_minus")], Call::Method),
+        B::FmtSignAwareZeroPad => (&["fmt::Formatter"], vec![i.intern("sign_aware_zero_pad")], Call::Method),
+        B::FmtDebugStruct => (&["fmt::Formatter"], vec![i.intern("debug_struct")], Call::Method),
+        B::FmtDebugTuple => (&["fmt::Formatter"], vec![i.intern("debug_tuple")], Call::Method),
+        B::FmtDebugList => (&["fmt::Formatter"], vec![i.intern("debug_list")], Call::Method),
+        B::FmtDebugSet => (&["fmt::Formatter"], vec![i.intern("debug_set")], Call::Method),
+        B::FmtDebugMap => (&["fmt::Formatter"], vec![i.intern("debug_map")], Call::Method),
+        B::DsField => (&["fmt::DebugStruct"], vec![i.intern("field")], Call::Method),
+        B::DtField => (&["fmt::DebugTuple"], vec![i.intern("field")], Call::Method),
+        B::DlEntry => (&["fmt::DebugList", "fmt::DebugSet"], vec![i.intern("entry")], Call::Method),
+        B::DmEntry => (&["fmt::DebugMap"], vec![i.intern("entry")], Call::Method),
+        B::DmKey => (&["fmt::DebugMap"], vec![i.intern("key")], Call::Method),
+        B::DmValue => (&["fmt::DebugMap"], vec![i.intern("value")], Call::Method),
+        B::FmtFinish => (&["fmt::DebugStruct", "fmt::DebugTuple", "fmt::DebugList", "fmt::DebugSet", "fmt::DebugMap"], vec![i.intern("finish")], Call::Method),
+        B::FmtFinishNonExhaustive => (
+            &["fmt::DebugStruct", "fmt::DebugTuple", "fmt::DebugList", "fmt::DebugSet", "fmt::DebugMap"],
+            vec![i.intern("finish_non_exhaustive")],
+            Call::Method,
+        ),
+        B::FmtWriteFmt => (&["fmt::Formatter", "String"], vec![i.intern("write_fmt")], Call::Method),
+        B::FmtCallDisplay | B::FmtCallDebug => (&["builtin Display and Debug types"], vec![i.intern("fmt")], Call::Method),
     }
 }
 
@@ -575,6 +632,7 @@ const ALL_MACROS: &[MacroKind] = &[
     MacroKind::AssertNe,
     MacroKind::Todo,
     MacroKind::Unreachable,
+    MacroKind::FormatArgs,
 ];
 
 fn macro_name(m: MacroKind, k: &Known) -> Sym {
@@ -591,6 +649,7 @@ fn macro_name(m: MacroKind, k: &Known) -> Sym {
         MacroKind::AssertNe => k.assert_ne,
         MacroKind::Todo => k.todo,
         MacroKind::Unreachable => k.unreachable,
+        MacroKind::FormatArgs => k.format_args,
     }
 }
 

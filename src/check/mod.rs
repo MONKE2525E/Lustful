@@ -3,6 +3,7 @@
 // Signature collection runs before body checking, in `collect`.
 pub mod closure;
 pub mod collect;
+pub mod fmt;
 pub mod generics;
 pub mod iter;
 pub mod method;
@@ -286,6 +287,36 @@ pub enum Builtin {
     /// `Option::unwrap_or_default`: the payload, or the `default`
     /// glue's value of the payload type on `None`.
     OptUnwrapOrDefault,
+    /// `core::fmt` (W-STD-B, check/fmt.rs): Formatter methods, the Debug
+    /// builders (`FmtFinish` and kin serve every builder; the receiver
+    /// type tells which), `write_fmt`, and `fmt` on a builtin value.
+    FmtWriteStr,
+    FmtWriteChar,
+    FmtPad,
+    FmtPadIntegral,
+    FmtWidth,
+    FmtPrecision,
+    FmtFill,
+    FmtAlternate,
+    FmtSignPlus,
+    FmtSignMinus,
+    FmtSignAwareZeroPad,
+    FmtDebugStruct,
+    FmtDebugTuple,
+    FmtDebugList,
+    FmtDebugSet,
+    FmtDebugMap,
+    DsField,
+    DtField,
+    DlEntry,
+    DmEntry,
+    DmKey,
+    DmValue,
+    FmtFinish,
+    FmtFinishNonExhaustive,
+    FmtWriteFmt,
+    FmtCallDisplay,
+    FmtCallDebug,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -734,6 +765,9 @@ struct Ctx<'p, 'a> {
     /// the format check ran: (type, spec, span). The format test
     /// re-runs at finish (W-TRAITS-CORE).
     deferred_fmt: Vec<(Ty, FmtSpec, Span)>,
+    /// `format_args!` expressions checked as the argument of a
+    /// `write_fmt` call (check/fmt.rs); any other is a reject.
+    format_args_ok: Vec<ExprId>,
     /// Element types a builtin Vec or slice method needs to be
     /// Clone (`extend_from_slice`, `resize`, `to_vec`), re-tested
     /// at finish like the format traits: the element type can
@@ -924,6 +958,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
+        format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
@@ -5803,6 +5838,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Some(Res::Builtin(Builtin::F32FromBits));
             }
         }
+        // `fmt::Error`, the unit struct value (W-STD-B).
+        if names.len() == 3
+            && (names[0] == k.std || names[0] == k.core)
+            && self.name(names[1]) == "fmt"
+            && self.name(names[2]) == "Error"
+            && let Some(a) = p.tys.local_adt_of(generics::fmt_error_def())
+        {
+            return Some(Res::Variant(a, 0));
+        }
         // `std::cmp::Ordering::Less` and kin: the one four-segment
         // value path in the subset today (the enum is the synthetic
         // Adt collect registers under its builtin def).
@@ -7813,6 +7857,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(ret) = self.iter_method(e, recv, rt, base, derefs, name, name_span, args, turbofish, expected) {
             return ret;
         }
+        // `write!` (`write_fmt(format_args!(..))`), Formatter and builder
+        // methods, and `fmt` on builtin values (check/fmt.rs, W-STD-B).
+        if turbofish.is_empty() {
+            if self.p.interner.get(name) == "write_fmt"
+                && let Some(ret) = self.write_fmt_call(e, recv, base, derefs, name_span, args)
+            {
+                return ret;
+            }
+            if let Some(ret) = self.fmt_method(e, recv, rt, base, derefs, name, name_span, args) {
+                return ret;
+            }
+        }
         use Builtin as B;
         // Builtin methods dispatch on the v2 builtin def in the first slot and on
         // the general kind in the second; user Adts were handled above.
@@ -9420,15 +9476,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         let what = match spec.kind {
+            // A type with a user fmt impl in it proves the trait through
+            // the obligation queue (check/fmt.rs `require_fmt`).
             FmtKind::Display => {
-                if has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() {
+                if has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() || self.require_fmt(t, FmtKind::Display, span) {
                     None
                 } else {
                     Some("Display")
                 }
             }
             FmtKind::Debug => {
-                if has_debug(self.p, &self.tys, t) {
+                if has_debug(self.p, &self.tys, t) || self.require_fmt(t, FmtKind::Debug, span) {
                     None
                 } else {
                     Some("Debug")
@@ -9566,6 +9624,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             MacroKind::Println | MacroKind::Print | MacroKind::Eprintln | MacroKind::Eprint => UNIT,
             MacroKind::Format => STRING,
+            MacroKind::FormatArgs => {
+                if !self.format_args_ok.contains(&e) {
+                    self.err(
+                        "L0401",
+                        span,
+                        "this macro call has no expanded form yet: `format_args!` outside `write!` and `write_fmt`",
+                        "Use `format!` for a String, or pass the arguments to `write!`.",
+                    );
+                }
+                crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments)
+            }
             MacroKind::Panic | MacroKind::Todo | MacroKind::Unreachable => NEVER,
         };
         for piece in fmt {

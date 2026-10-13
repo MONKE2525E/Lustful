@@ -281,7 +281,10 @@ mod tests {
             assert!(sig_of(lang.add, "add").is_some());
             assert!(sig_of(lang.add_assign, "add_assign").is_some());
             assert!(sig_of(lang.hash, "hash").is_none());
-            assert!(sig_of(lang.debug, "fmt").is_none());
+            // `fmt` has its sig since user fmt impls (W-STD-B): `(&self,
+            // &mut Formatter) -> fmt::Result`.
+            let fmt = sig_of(lang.debug, "fmt").expect("fmt sig");
+            assert_eq!(fmt.params.len(), 2);
             assert!(sig_of(lang.drop, "drop").is_none());
         });
     }

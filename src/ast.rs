@@ -773,6 +773,9 @@ pub enum MacroKind {
     AssertNe,
     Todo,
     Unreachable,
+    /// `format_args!`: an `fmt::Arguments` value, accepted only as the
+    /// argument of `write_fmt` (the `write!` shape; W-STD-B).
+    FormatArgs,
 }
 
 /// One parsed format spec (the text after `:` in a placeholder), as

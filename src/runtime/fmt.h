@@ -97,6 +97,10 @@ typedef struct {
     uint8_t state;
 } lust_DebugMap;
 
+/* Sizes the compiler's layout tables assume (cgen fmt_size_align). */
+_Static_assert(sizeof(lust_Formatter) == 24 && sizeof(lust_DebugTuple) == 24, "fmt layout");
+_Static_assert(sizeof(lust_DebugStruct) == 16 && sizeof(lust_DebugList) == 16 && sizeof(lust_DebugMap) == 16, "fmt layout");
+
 /* A sink over a String, and a Formatter with default options over a
    sink (Formatter::new: fill ' ', no alignment, no flags). */
 void lust_sink_string(lust_sink *k, lust_String *s);

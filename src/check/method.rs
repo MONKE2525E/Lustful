@@ -98,11 +98,16 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         return true;
     }
     let lang = &p.gx.lang;
+    // Display and Debug are in scope as in rustc: a `use` of the std
+    // path or the impl's own trait (W-STD-B, check/fmt.rs); bounds below.
+    if (trait_def == lang.display && cx.fmt_trait_in_scope(crate::ast::FmtKind::Display))
+        || (trait_def == lang.debug && cx.fmt_trait_in_scope(crate::ast::FmtKind::Debug))
+    {
+        return true;
+    }
     if [
         lang.copy,
         lang.clone,
-        lang.debug,
-        lang.display,
         lang.partial_eq,
         lang.eq,
         lang.partial_ord,

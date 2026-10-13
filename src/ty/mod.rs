@@ -13,6 +13,7 @@
 // and kin), never by matching on a builtin `TyKind` case.
 pub mod consteval;
 pub mod defs;
+pub mod fmt;
 pub mod iter;
 pub mod lang;
 pub mod layout;
@@ -589,6 +590,8 @@ pub struct BuiltinDefs {
     pub args: DefId,
     /// The builtin iterator structs, by `IterKind` index (ty/iter.rs).
     pub iters: [DefId; iter::IterKind::ALL.len()],
+    /// The `core::fmt` structs, by `FmtTy` index (ty/fmt.rs).
+    pub fmt_tys: [DefId; fmt::FmtTy::ALL.len()],
 }
 
 impl BuiltinDefs {
@@ -612,6 +615,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::Args)
         } else if def.krate != BUILTIN_CRATE {
             None
+        } else if let Some(i) = self.fmt_tys.iter().position(|&d| d == def) {
+            Some(BuiltinTy::Fmt(fmt::FmtTy::ALL[i]))
         } else {
             self.iters.iter().position(|&d| d == def).map(|i| BuiltinTy::Iter(iter::IterKind::ALL[i]))
         }
@@ -632,6 +637,8 @@ pub enum BuiltinTy {
     Args,
     /// A std iterator struct (ty/iter.rs).
     Iter(iter::IterKind),
+    /// A `core::fmt` struct (ty/fmt.rs).
+    Fmt(fmt::FmtTy),
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -993,6 +1000,7 @@ impl GlobalTys {
             chars: builtin_def(&["core", "str"], "Chars"),
             args: builtin_def(&["std", "env"], "Args"),
             iters: iter::IterKind::ALL.map(iter::iter_def),
+            fmt_tys: fmt::FmtTy::ALL.map(fmt::fmt_def),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

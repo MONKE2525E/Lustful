@@ -348,6 +348,7 @@ known_syms!(
     assert_ne,
     todo,
     unreachable,
+    format_args,
     derive,
     test,
     allow,

@@ -2141,6 +2141,10 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
+        if let Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, .. } = self.ck.res(e) {
+            self.write_fmt_into(e, recv, args, derefs, dest, span);
+            return;
+        }
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
             self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
             return;
@@ -3902,6 +3906,29 @@ impl<'p, 'a> Lower<'p, 'a> {
         parts
     }
 
+    /// `dst.write_fmt(format_args!(..))` (W-STD-B): a two-phase `&mut`
+    /// of the receiver around the borrows of the format arguments, then
+    /// one `WriteFmt` rvalue. An argument that borrows the receiver again
+    /// is live at the activation, so borrowck rejects it as rustc does.
+    fn write_fmt_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
+        let recv_ty = self.peel(self.ty(recv), derefs);
+        let pl = self.place_for_mut(recv);
+        let pl = Self::derefs(pl, derefs);
+        let st = self.ref_ty(false, recv_ty);
+        let reserve = self.temp(st);
+        self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+        let parts = match args.first().map(|&a| self.p.ast.expr(a)) {
+            Some(Expr::Macro { args: fa, fmt, .. }) => self.fmt_parts(fa, fmt),
+            _ => Vec::new(),
+        };
+        self.push(StmtKind::FakeRead(reserve), span);
+        let mt = self.ref_ty(true, recv_ty);
+        let t = self.temp(mt);
+        self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+        let ty = self.ty(e);
+        self.set_or_temp(dest, Rvalue::WriteFmt(Operand::Move(Place::local(t)), parts), ty, span);
+    }
+
     /// The text rustc's `format_args!` lowering inlines for a `{}`
     /// argument (`inline_literals`): a string literal, or an integer
     /// literal in range of its type (unsuffixed is `i32`), under any
@@ -3965,6 +3992,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Panic(parts), span);
             }
             MacroKind::Todo => self.terminate(Terminator::Panic(vec![FmtPart::Lit("not yet implemented".into())]), span),
+            // Checked only as a `write_fmt` argument, which lowers it in
+            // `write_fmt_into`; the checker rejects any other.
+            MacroKind::FormatArgs => self.unit(dest, span),
             MacroKind::Unreachable => {
                 self.terminate(Terminator::Panic(vec![FmtPart::Lit("internal error: entered unreachable code".into())]), span)
             }

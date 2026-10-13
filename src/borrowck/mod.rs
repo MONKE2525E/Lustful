@@ -440,6 +440,10 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
                 f(value)
             }
         }),
+        Rvalue::WriteFmt(dst, parts) => {
+            f(dst);
+            parts_operands(parts, f);
+        }
         Rvalue::Ref(..)
         | Rvalue::Discriminant(_)
         | Rvalue::SliceOf(_)
