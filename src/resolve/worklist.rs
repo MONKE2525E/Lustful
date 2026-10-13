@@ -2470,6 +2470,10 @@ fn resolve_one(
     }
     for w in works.iter() {
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
+        check_vis_restrictions(&w.ast.items, w.module, interner, tables, &mut inner_diags);
+    }
+    if !inner_diags.is_empty() {
+        return Err(OneError { diags: inner_diags, seen, needs_std });
     }
     lap!("resolve: strip+register");
     // The tables are frozen now. Every file whose cached final
@@ -3648,6 +3652,55 @@ fn record_adt(
     }
     if let VariantFields::Tuple(fs) = fields {
         tables.tuple_field_vis.insert(def, (module, fs.iter().map(|f| vis_from_ast(&f.vis, interner)).collect()));
+    }
+}
+
+/// Reports every written restricted visibility in `items` (at `module`)
+/// that names no enclosing module (`ResolvedTables::restriction_ok`):
+/// on items, struct fields, and inherent impl items, recursing into
+/// inline modules as `collect_assoc_vis` does.
+fn check_vis_restrictions(items: &[Item], module: ModuleId, interner: &Interner, tables: &ResolvedTables, diags: &mut Vec<Diag>) {
+    let check = |v: &Vis, diags: &mut Vec<Diag>| {
+        if let Vis::Restricted { span, .. } = v
+            && !tables.restriction_ok(&vis_from_ast(v, interner), module, interner)
+        {
+            diags.push(Diag::new(
+                "L0511",
+                *span,
+                "this visibility names no enclosing module",
+                "Write `pub(crate)`, or `pub(in path)` with a path from `crate`, `self`, or `super` to an enclosing module.",
+            ));
+        }
+    };
+    for item in items {
+        check(&item.vis, diags);
+        match &item.kind {
+            ItemKind::Struct(s) => {
+                if let VariantFields::Tuple(fs) | VariantFields::Struct(fs) = &s.fields {
+                    for f in fs {
+                        check(&f.vis, diags);
+                    }
+                }
+            }
+            ItemKind::Impl(imp) if imp.trait_ref.is_none() => {
+                for f in &imp.fns {
+                    check(&f.vis, diags);
+                }
+                for c in &imp.consts {
+                    check(&c.vis, diags);
+                }
+            }
+            ItemKind::Mod(m) => {
+                if let Some(body) = &m.body {
+                    let mut full = tables.modules[module.0 as usize].path.clone();
+                    full.push(m.name);
+                    if let Some(child) = tables.module_by_path_in(tables.root_of(module), &full) {
+                        check_vis_restrictions(body, child, interner, tables, diags);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

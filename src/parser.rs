@@ -480,6 +480,17 @@ fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
 }
 
+/// A visibility written where Rust permits none (rustc E0449): on an
+/// `impl` block, a trait item, or an item of a trait impl.
+fn vis_not_permitted(span: Span) -> Diag {
+    Diag::new(
+        "L0001",
+        span,
+        "visibility qualifiers are not permitted here",
+        "Remove the visibility: these items take the visibility of their trait or type.",
+    )
+}
+
 /// True when `attr` is a plain `#[allow(..)]` (the only attribute the
 /// parser propagates from an enclosing scope onto each `FnDef` in it).
 fn is_allow(attr: &Attr, known: &Known) -> bool {
@@ -1105,7 +1116,9 @@ impl<'a> Parser<'a> {
         // over the functions inside it (see `scope_allows`).
         let scope_mark = self.scope_allows.len();
         self.scope_allows.extend(parsed.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
+        let vis_start = self.span();
         let vis = self.vis()?;
+        let vis_span = vis_start.to(self.prev_span());
         // A `const` item (`const NAME: Ty = ...;`), told apart from a
         // `const fn` qualifier by the name and colon after it.
         if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
@@ -1171,6 +1184,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Struct if !has_qual => ItemKind::Struct(self.struct_def(derives)?),
             Tok::Enum if !has_qual => ItemKind::Enum(self.enum_def(derives)?),
+            Tok::Impl if vis != Vis::Private => return Err(vis_not_permitted(vis_span)),
             Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => ItemKind::Impl(self.impl_def(true)?),
             Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def(false)?),
             Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
@@ -1864,7 +1878,12 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // A trait item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
+            // Trait items are as visible as their trait.
+            let vis_start = self.span();
             let vis = self.vis()?;
+            if vis != Vis::Private {
+                return Err(vis_not_permitted(vis_start.to(self.prev_span())));
+            }
             match self.peek() {
                 Tok::Fn => {
                     let mut def = self.fn_def_inner(true)?;
@@ -1944,7 +1963,12 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // An impl item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
+            // Trait impl items take the trait's visibility.
+            let vis_start = self.span();
             let vis = self.vis()?;
+            if trait_ref.is_some() && vis != Vis::Private {
+                return Err(vis_not_permitted(vis_start.to(self.prev_span())));
+            }
             match self.peek() {
                 Tok::Fn => {
                     let mut def = self.fn_def()?;

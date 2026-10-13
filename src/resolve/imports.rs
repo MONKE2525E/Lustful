@@ -316,6 +316,25 @@ impl ResolvedTables {
         }
     }
 
+    /// True when a written restricted visibility at `module` is one rustc
+    /// accepts: `pub(super)` needs a parent module (E0433 at a crate
+    /// root), and `pub(in path)` must start with `crate`, `self`, or
+    /// `super` and name `module` or one of its ancestors (E0742).
+    pub fn restriction_ok(&self, vis: &VisKind, module: ModuleId, interner: &Interner) -> bool {
+        match vis {
+            VisKind::Super => self.modules[module.0 as usize].parent.is_some(),
+            // `pub(in $crate::..)` from another crate's macro starts with a
+            // magic segment that `resolve_in_path` does not place; it is
+            // not checked here.
+            VisKind::In(path) if path.first().is_some_and(|s| self.crate_magic.contains_key(s)) => true,
+            VisKind::In(path) => {
+                matches!(path.first().map(|s| interner.get(*s)), Some("crate" | "self" | "super"))
+                    && self.resolve_in_path(path, module, interner).is_some_and(|m| self.is_within(module, m))
+            }
+            VisKind::Priv | VisKind::Pub | VisKind::Crate => true,
+        }
+    }
+
     /// The set of modules a visibility reaches, as a region for the
     /// re-export subset check: everywhere (pub), the whole crate, or one
     /// module subtree.

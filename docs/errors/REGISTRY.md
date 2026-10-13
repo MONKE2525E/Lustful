@@ -44,7 +44,8 @@ prints "reserved, not yet emitted".
 | L0508 | Modules and imports | W-RESOLVE | in use | Dependency crate has no lust source, adapter, or shim form yet |
 | L0509 | Modules and imports | W-RESOLVE | reserved | |
 | L0510 | Visibility | W-RESOLVE | in use | Item or field is private |
-| L0511-L0519 | Visibility | W-RESOLVE | reserved | |
+| L0511 | Visibility | W-RESOLVE | in use | Restricted visibility names no enclosing module |
+| L0512-L0519 | Visibility | W-RESOLVE | reserved | |
 | L0520 | cfg and attributes | W-RESOLVE | in use | Unknown cfg name |
 | L0521 | cfg and attributes | W-MACRO | reserved | Unknown attribute |
 | L0522 | cfg and attributes | W-MACRO | in use | Known attribute (cfg, repr, path, inline, and kin) is not supported yet (S3b parser reject) |
