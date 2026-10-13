@@ -3257,6 +3257,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             self.not_general_enough();
             return;
         }
+        // A tied slot is paired: the bound says exactly what flows in.
+        let mut paired = vec![false; vars.len()];
         for (idx, k) in kinds.iter().enumerate() {
             if let BoundSlot::Tie(u) = *k
                 && slots.get(idx).is_some_and(|(r, _)| r.is_some())
@@ -3264,9 +3266,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             {
                 self.edge(v, u);
                 self.edge(u, v);
+                paired[idx] = true;
             }
         }
-        let mut paired = vec![false; vars.len()];
         let mut at_slot = 0usize;
         for (i, &it) in inputs.iter().enumerate() {
             let n = self.sc.slots(it) as usize;

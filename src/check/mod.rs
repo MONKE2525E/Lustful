@@ -1963,9 +1963,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// expected type), records how the closure's arguments get their
     /// regions (`ClosureInfo::free_args`): an input that is a type param
     /// or projection is free (the caller's type); `&` over one has a
-    /// higher-ranked outer reference (the bound writes it); any other
-    /// input with regions makes every argument higher-ranked (no entry).
-    fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg]) {
+    /// higher-ranked outer reference (the bound writes it), unless the
+    /// callee's regioned bound (`fn_bounds`, `RegionSig::fn_bounds`)
+    /// names that lifetime (`&'static Message`, `&'a T`: free, and
+    /// borrowck ties it); any other input with regions makes every
+    /// argument higher-ranked (no entry).
+    fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg], fn_bounds: &[(u32, Vec<Ty>)]) {
         let p = self.p;
         for pred in preds {
             let Predicate::Trait(b) = pred else { continue };
@@ -1980,10 +1983,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let TyKind::Infer(v) = self.kind(target) else { continue };
             let TyKind::Tuple(ts) = p.tys.kind(inputs) else { continue };
             let opaque = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..)) || !bound_type_has_regions(p, t);
+            let n_in = p.tys.tys_of(ts).len();
+            let regioned = fn_bounds.iter().find(|(jj, ins)| *jj == j.0 && ins.len() == n_in).map(|(_, ins)| ins.as_slice());
+            let named_ref = |i: usize| {
+                regioned.and_then(|ins| ins.get(i)).is_some_and(|&rt| matches!(p.tys.kind(rt), TyKind::Ref(Region::Static | Region::Param(_), _, _)))
+            };
             let mut flags = Vec::new();
             let mut ok = true;
-            for &t in p.tys.tys_of(ts) {
+            for (i, &t) in p.tys.tys_of(ts).iter().enumerate() {
                 match p.tys.kind(t) {
+                    TyKind::Ref(_, _, inner) if opaque(inner) && named_ref(i) => flags.push(false),
                     TyKind::Ref(_, _, inner) if opaque(inner) => flags.push(true),
                     _ if opaque(t) => flags.push(false),
                     _ => ok = false,
@@ -1999,7 +2008,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// trait predicates as obligations, equalities as `AssocEq`
     /// obligations.
     fn push_predicates(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span) {
-        self.note_closure_bounds(preds, subst_args);
+        self.push_predicates_with(preds, subst_args, span, &[]);
+    }
+
+    /// `push_predicates` for a fn template whose region signature keeps
+    /// its `Fn` bounds with regions (`note_closure_bounds`).
+    fn push_predicates_with(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span, fn_bounds: &[(u32, Vec<Ty>)]) {
+        self.note_closure_bounds(preds, subst_args, fn_bounds);
         let mut out: Vec<obligations::Obligation> = Vec::new();
         for &pred in preds {
             let pred = crate::traits::index::subst_predicate(&mut self.tys, pred, subst_args);
@@ -3756,7 +3771,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &args)).collect();
         let ret = subst(&mut self.tys, info.ret, &args);
         let preds = generics.predicates.clone();
-        self.push_predicates(&preds, &args, span);
+        let fn_bounds = p.regions.fns.get(&template).map(|s| s.fn_bounds.clone()).unwrap_or_default();
+        self.push_predicates_with(&preds, &args, span, &fn_bounds);
         self.generic_sites.push((self.ei(e), template, args.clone()));
         (params, ret, args)
     }
