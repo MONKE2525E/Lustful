@@ -548,8 +548,15 @@ impl Evaluator {
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
                 let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
                 let i = usize::try_from(i).map_err(|_| outside(span, "this index"))?;
+                // A slice value at a `&[T]` type is its backing
+                // aggregate, so an index reads the type through the
+                // reference as well as off an array or slice directly.
                 let elem = match cx.tys_ref().kind(t) {
-                    TyKind::Array(el, _) => el,
+                    TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                    TyKind::Ref(_, _, inner) => match cx.tys_ref().kind(inner) {
+                        TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                        _ => return Err(outside(span, "this index")),
+                    },
                     _ => return Err(outside(span, "this index")),
                 };
                 let got = match v {
@@ -650,7 +657,9 @@ impl Evaluator {
                 (ConstValue::Int(off as i128), USIZE)
             }
             Expr::Call { callee, args } => return Ok(Flow::Val(self.call(cx, env, *callee, args, span)?)),
-            Expr::MethodCall { .. } => return Err(outside(span, "method calls")),
+            Expr::MethodCall { recv, name, args, .. } => {
+                return Ok(Flow::Val(self.method_call(cx, env, *recv, *name, args, expected, span)?));
+            }
             Expr::If { cond, then, els } => {
                 let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
                 let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
@@ -1186,6 +1195,60 @@ impl Evaluator {
                 return Ok((ConstValue::Float(bits, f), t));
             }
         }
+        // `char::from_u32(n)` (also `core::char::from_u32`) is a
+        // const fn answering an `Option<char>`.
+        if let Expr::Path(segs) = cx.ast().expr(callee) {
+            let names: Vec<String> = segs.iter().map(|s| cx.sym_text(s.name).to_string()).collect();
+            let tail2: Vec<&str> = names.iter().rev().take(2).rev().map(|s| s.as_str()).collect();
+            if tail2 == ["char", "from_u32"] && (names.len() == 2 || (names.len() == 3 && matches!(names[0].as_str(), "std" | "core" | "alloc"))) && args.len() == 1 {
+                let n = self.int_arg(cx, env, args[0], super::int(IntTy::U32), span)?;
+                let v = u32::try_from(n).ok().and_then(char::from_u32).map(ConstValue::Char);
+                return Ok(self.opt_value(cx, CHAR, v));
+            }
+            if tail2 == ["char", "from_u32_unchecked"]
+                && (names.len() == 2 || (names.len() == 3 && matches!(names[0].as_str(), "std" | "core" | "alloc")))
+                && args.len() == 1
+            {
+                let n = self.int_arg(cx, env, args[0], super::int(IntTy::U32), span)?;
+                return match u32::try_from(n).ok().and_then(char::from_u32) {
+                    Some(c) => Ok((ConstValue::Char(c), CHAR)),
+                    None => Err(outside(span, "this `from_u32_unchecked` (invalid char)")),
+                };
+            }
+            // Integer byte-order associated fns: `u32::from_be_bytes`,
+            // `i64::from_le`, and friends, by written names.
+            if names.len() == 2 && args.len() == 1 {
+                if let Some(it) = IntTy::ALL.iter().find(|i| i.name() == names[0].as_str()).copied() {
+                    let width = it.bits();
+                    let mask: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+                    let t = super::int(it);
+                    match names[1].as_str() {
+                        "from_be_bytes" | "from_le_bytes" | "from_ne_bytes" => {
+                            let (v, _) = self.value(cx, env, args[0], None)?;
+                            let Some(bs) = self.seq_bytes(&v) else { return Err(outside(span, "this call")) };
+                            if bs.len() as u32 != width / 8 {
+                                return Err(outside(span, "this call"));
+                            }
+                            let be = names[1] == "from_be_bytes" || (names[1] == "from_ne_bytes" && cfg!(target_endian = "big"));
+                            let mut bits: u128 = 0;
+                            for (i, &b) in bs.iter().enumerate() {
+                                let shift = if be { 8 * (bs.len() - 1 - i) } else { 8 * i };
+                                bits |= (b as u128) << shift;
+                            }
+                            return Ok((ConstValue::Int(int_from_bits(bits & mask, it)), t));
+                        }
+                        "from_be" | "from_le" => {
+                            let n = self.int_arg(cx, env, args[0], t, span)?;
+                            let xb = int_bits(n, it);
+                            let swap = xb.swap_bytes() >> (128 - width);
+                            let want_swap = (names[1] == "from_be") == cfg!(target_endian = "little");
+                            return Ok((ConstValue::Int(int_from_bits((if want_swap { swap } else { xb }) & mask, it)), t));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         match cx.call_target(callee) {
             CallTarget::SizeOf(t) => {
                 let l = cx.layout(t).ok_or_else(|| {
@@ -1272,6 +1335,697 @@ impl Evaluator {
             }
             CallTarget::NonConst => Err(nonconst(span, "this function")),
             CallTarget::Unknown => Err(outside(span, "this call")),
+        }
+    }
+
+    /// The element count of a slice or array const value, through a
+    /// promoted reference if the value carries one.
+    fn seq_len(&self, v: &ConstValue) -> Option<usize> {
+        match v {
+            ConstValue::Aggregate(vals) => Some(vals.len()),
+            ConstValue::Repeat(_, n) => Some(*n as usize),
+            ConstValue::Ref(inner) => self.seq_len(inner),
+            _ => None,
+        }
+    }
+
+    /// The elements of a slice or array const value as bytes, when
+    /// every element is a `u8` integer.
+    fn seq_bytes(&self, v: &ConstValue) -> Option<Vec<u8>> {
+        match v {
+            ConstValue::Aggregate(vals) => {
+                let mut out = Vec::with_capacity(vals.len());
+                for x in vals {
+                    match x {
+                        ConstValue::Int(i) => out.push(u8::try_from(*i).ok()?),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            ConstValue::Repeat(x, n) => match **x {
+                ConstValue::Int(i) => Some(vec![u8::try_from(i).ok()?; *n as usize]),
+                _ => None,
+            },
+            ConstValue::Ref(inner) => self.seq_bytes(inner),
+            _ => None,
+        }
+    }
+
+    /// An `Option` const value at a fresh `Option<elem>` type.
+    fn opt_value<'a, C: ConstCx<'a>>(&self, cx: &mut C, elem: Ty, v: Option<ConstValue>) -> TypedValue {
+        let t = cx.tys().mk_option(elem);
+        match v {
+            Some(v) => (ConstValue::Variant(1, vec![v]), t),
+            None => (ConstValue::Variant(0, Vec::new()), t),
+        }
+    }
+
+    /// Primitive method calls in const position: the `str`, slice,
+    /// integer, char, float, and `Option` methods rustc marks const
+    /// (inherent ones; conditionally-const trait methods such as
+    /// `Ord::max` and `From::from` stay rejected, as rustc rejects
+    /// them in plain constants). Anything else keeps the outside
+    /// error, so a wrong receiver or a non-const method never
+    /// evaluates to a made-up value.
+    fn method_call<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        recv_e: ExprId,
+        name: Sym,
+        args: &[ExprId],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Result<TypedValue, Diag> {
+        let outside_err = || outside(span, "method calls");
+        let name = cx.sym_text(name).to_string();
+        let (rv, rt) = self.value(cx, env, recv_e, None)?;
+        let no_args = |args: &[ExprId]| args.is_empty();
+        match &rv {
+            ConstValue::Str(i) => {
+                let text = cx.ast().strings[*i as usize].clone();
+                let bytes = text.as_bytes();
+                match name.as_str() {
+                    "len" if no_args(args) => Ok((ConstValue::Int(bytes.len() as i128), USIZE)),
+                    "is_empty" if no_args(args) => Ok((ConstValue::Bool(bytes.is_empty()), BOOL)),
+                    "is_ascii" if no_args(args) => Ok((ConstValue::Bool(bytes.iter().all(|b| b.is_ascii())), BOOL)),
+                    "as_bytes" if no_args(args) => {
+                        let vals: Vec<ConstValue> = bytes.iter().map(|&b| ConstValue::Int(b as i128)).collect();
+                        let slice = cx.tys().intern(TyKind::Slice(super::int(IntTy::U8)));
+                        let t = cx.tys().mk_ref(false, slice);
+                        Ok((ConstValue::Aggregate(vals), t))
+                    }
+                    _ => Err(outside_err()),
+                }
+            }
+            ConstValue::Int(x) => {
+                let x = *x;
+                self.int_method(cx, env, x, rt, &name, args, expected, span)
+            }
+            ConstValue::Char(c) => {
+                let c = *c;
+                self.char_method(cx, env, c, &name, args, span)
+            }
+            ConstValue::Float(bits, f) => {
+                let (bits, f) = (*bits, *f);
+                match name.as_str() {
+                    "to_bits" if no_args(args) => {
+                        let it = if f == FloatTy::F32 { IntTy::U32 } else { IntTy::U64 };
+                        Ok((ConstValue::Int(bits as i128), super::int(it)))
+                    }
+                    "abs" if no_args(args) => {
+                        let sign = if f == FloatTy::F32 { 1u64 << 31 } else { 1u64 << 63 };
+                        Ok((ConstValue::Float(bits & !sign, f), rt))
+                    }
+                    "max" | "min" if args.len() == 1 => {
+                        let (av, _) = self.value(cx, env, args[0], Some(rt))?;
+                        let ConstValue::Float(ab, _) = av else { return Err(outside_err()) };
+                        let r = match f {
+                            FloatTy::F64 => {
+                                let (x, y) = (f64::from_bits(bits), f64::from_bits(ab));
+                                if name == "max" { x.max(y).to_bits() } else { x.min(y).to_bits() }
+                            }
+                            FloatTy::F32 => {
+                                let (x, y) = (f32::from_bits(bits as u32), f32::from_bits(ab as u32));
+                                if name == "max" { x.max(y).to_bits() as u64 } else { x.min(y).to_bits() as u64 }
+                            }
+                        };
+                        Ok((ConstValue::Float(r, f), rt))
+                    }
+                    _ => Err(outside_err()),
+                }
+            }
+            ConstValue::Variant(variant, vals) if cx.tys_ref().option_elem(rt).is_some() => {
+                let (variant, vals) = (*variant, vals.clone());
+                let elem = cx.tys_ref().option_elem(rt).unwrap_or(ERROR);
+                match name.as_str() {
+                    "is_some" if no_args(args) => Ok((ConstValue::Bool(variant == 1), BOOL)),
+                    "is_none" if no_args(args) => Ok((ConstValue::Bool(variant != 1), BOOL)),
+                    "unwrap" if no_args(args) => {
+                        if variant == 1 && vals.len() == 1 {
+                            Ok((vals.into_iter().next().unwrap(), elem))
+                        } else {
+                            Err(outside(span, "this `unwrap` on `None`"))
+                        }
+                    }
+                    "expect" if args.len() == 1 => {
+                        let _ = self.value(cx, env, args[0], None)?;
+                        if variant == 1 && vals.len() == 1 {
+                            Ok((vals.into_iter().next().unwrap(), elem))
+                        } else {
+                            Err(outside(span, "this `expect` on `None`"))
+                        }
+                    }
+                    _ => Err(outside_err()),
+                }
+            }
+            ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Ref(_) => {
+                // A slice or array receiver. The element type comes
+                // from the receiver type, through its reference.
+                let elem = match cx.tys_ref().kind(rt) {
+                    TyKind::Array(el, _) | TyKind::Slice(el) => Some(el),
+                    TyKind::Ref(_, _, inner) => match cx.tys_ref().kind(inner) {
+                        TyKind::Array(el, _) | TyKind::Slice(el) => Some(el),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(elem) = elem else { return Err(outside_err()) };
+                let _ = elem;
+                match name.as_str() {
+                    "len" if no_args(args) => match self.seq_len(&rv) {
+                        Some(n) => Ok((ConstValue::Int(n as i128), USIZE)),
+                        None => Err(outside_err()),
+                    },
+                    "is_empty" if no_args(args) => match self.seq_len(&rv) {
+                        Some(n) => Ok((ConstValue::Bool(n == 0), BOOL)),
+                        None => Err(outside_err()),
+                    },
+                    "is_ascii" if no_args(args) && self.int_ty_of(cx, elem) == Some(IntTy::U8) => match self.seq_bytes(&rv) {
+                        Some(bs) => Ok((ConstValue::Bool(bs.iter().all(|b| b.is_ascii())), BOOL)),
+                        None => Err(outside_err()),
+                    },
+                    _ => Err(outside_err()),
+                }
+            }
+            _ => Err(outside_err()),
+        }
+    }
+
+    /// One integer argument of a const method call, evaluated at
+    /// the argument's own type.
+    fn int_arg<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        e: ExprId,
+        ty: Ty,
+        span: Span,
+    ) -> Result<i128, Diag> {
+        let (v, _) = self.value(cx, env, e, Some(ty))?;
+        match v {
+            ConstValue::Int(i) => Ok(i),
+            _ => Err(outside(span, "method calls")),
+        }
+    }
+
+    /// Inherent integer methods in const position. Every operation
+    /// runs at the receiver's own width, like `int_op`: the plain
+    /// forms error on overflow (rustc E0080), the `checked_` forms
+    /// answer `None`, and the `saturating_` and `wrapping_` forms
+    /// clamp and wrap. Signed-only methods reject unsigned
+    /// receivers and the reverse, so a call rustc would not type
+    /// never evaluates here either.
+    fn int_method<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        x: i128,
+        rt: Ty,
+        name: &str,
+        args: &[ExprId],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Result<TypedValue, Diag> {
+        let outside_err = || outside(span, "method calls");
+        // `u8` methods that are not integer methods at all.
+        if self.int_ty_of(cx, rt) == Some(IntTy::U8) && (name.starts_with("is_ascii") || name.starts_with("to_ascii")) {
+            if args.is_empty() {
+                let b = x as u8;
+                let bool_v = |v: bool| Ok((ConstValue::Bool(v), BOOL));
+                return match name {
+                    "is_ascii" => bool_v(b.is_ascii()),
+                    "is_ascii_alphabetic" => bool_v(b.is_ascii_alphabetic()),
+                    "is_ascii_alphanumeric" => bool_v(b.is_ascii_alphanumeric()),
+                    "is_ascii_digit" => bool_v(b.is_ascii_digit()),
+                    "is_ascii_whitespace" => bool_v(b.is_ascii_whitespace()),
+                    "is_ascii_uppercase" => bool_v(b.is_ascii_uppercase()),
+                    "is_ascii_lowercase" => bool_v(b.is_ascii_lowercase()),
+                    "is_ascii_hexdigit" => bool_v(b.is_ascii_hexdigit()),
+                    "is_ascii_punctuation" => bool_v(b.is_ascii_punctuation()),
+                    "is_ascii_graphic" => bool_v(b.is_ascii_graphic()),
+                    "is_ascii_control" => bool_v(b.is_ascii_control()),
+                    "to_ascii_lowercase" => Ok((ConstValue::Int(b.to_ascii_lowercase() as i128), rt)),
+                    "to_ascii_uppercase" => Ok((ConstValue::Int(b.to_ascii_uppercase() as i128), rt)),
+                    _ => Err(outside_err()),
+                };
+            }
+        }
+        // The receiver type runs the operation. A wide (i128)
+        // receiver from an unsuffixed literal keeps running wide,
+        // like `int_op`; the item coercion range-checks the result
+        // where it meets its declared type.
+        let _ = expected;
+        let it = self.int_ty_of(cx, rt).unwrap_or(IntTy::I128);
+        let signed = it.signed();
+        let width = it.bits();
+        let mask: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+        let xb = int_bits(x, it);
+        let xs = truncate_to_int(x, it);
+        let lo = int_min(it);
+        let hi_s: i128 = if width >= 128 { i128::MAX } else { (1i128 << (width - 1)) - 1 };
+        let over = || outside(span, "this method call (overflow or division by zero)");
+        let int_v = |v: i128| Ok((ConstValue::Int(v), rt));
+        let bits_v = |u: u128| Ok((ConstValue::Int(int_from_bits(u & mask, it)), rt));
+        let bool_v = |b: bool| Ok((ConstValue::Bool(b), BOOL));
+        let u32_v = |v: u32| Ok((ConstValue::Int(v as i128), super::int(IntTy::U32)));
+        // The unsigned counterpart type, for `unsigned_abs` and `abs_diff`.
+        let unsigned_it = match it {
+            IntTy::I8 => IntTy::U8,
+            IntTy::I16 => IntTy::U16,
+            IntTy::I32 => IntTy::U32,
+            IntTy::I64 => IntTy::U64,
+            IntTy::Isize => IntTy::Usize,
+            IntTy::I128 => IntTy::U128,
+            u => u,
+        };
+        if args.is_empty() {
+            return match name {
+                "abs" if signed => {
+                    if xs == lo {
+                        Err(over())
+                    } else {
+                        int_v(xs.abs())
+                    }
+                }
+                "unsigned_abs" if signed => Ok((ConstValue::Int(int_from_bits(xs.unsigned_abs(), unsigned_it)), super::int(unsigned_it))),
+                "signum" if signed => int_v(xs.signum()),
+                "is_positive" if signed => bool_v(xs > 0),
+                "is_negative" if signed => bool_v(xs < 0),
+                "count_ones" => u32_v(xb.count_ones()),
+                "count_zeros" => u32_v(width - xb.count_ones()),
+                "leading_zeros" => u32_v(xb.leading_zeros() - (128 - width)),
+                "trailing_zeros" => u32_v(if xb == 0 { width } else { xb.trailing_zeros() }),
+                "leading_ones" => u32_v((!xb & mask).leading_zeros() - (128 - width)),
+                "trailing_ones" => u32_v(if (!xb & mask) == 0 { width } else { (!xb & mask).trailing_zeros() }),
+                "reverse_bits" => bits_v(xb.reverse_bits() >> (128 - width)),
+                "swap_bytes" => bits_v(xb.swap_bytes() >> (128 - width)),
+                "to_be" => bits_v(if cfg!(target_endian = "little") { xb.swap_bytes() >> (128 - width) } else { xb }),
+                "to_le" => bits_v(if cfg!(target_endian = "little") { xb } else { xb.swap_bytes() >> (128 - width) }),
+                "to_be_bytes" | "to_le_bytes" | "to_ne_bytes" => {
+                    let n = (width / 8) as usize;
+                    let be = name == "to_be_bytes" || (name == "to_ne_bytes" && cfg!(target_endian = "big"));
+                    let vals: Vec<ConstValue> = (0..n)
+                        .map(|i| {
+                            let shift = if be { 8 * (n - 1 - i) } else { 8 * i };
+                            ConstValue::Int(((xb >> shift) & 0xFF) as i128)
+                        })
+                        .collect();
+                    let c = cx.tys().intern_const(super::ConstKind::Int(n as u128));
+                    let t = cx.tys().intern(TyKind::Array(super::int(IntTy::U8), c));
+                    Ok((ConstValue::Aggregate(vals), t))
+                }
+                "checked_neg" => {
+                    let r = if signed {
+                        if xs == lo { None } else { Some(-xs) }
+                    } else if xb == 0 {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "saturating_neg" => {
+                    if signed {
+                        int_v(if xs == lo { hi_s } else { -xs })
+                    } else {
+                        int_v(0)
+                    }
+                }
+                "wrapping_neg" => bits_v(0u128.wrapping_sub(xb)),
+                "checked_abs" if signed => {
+                    let r = if xs == lo { None } else { Some(xs.abs()) };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "saturating_abs" if signed => int_v(if xs == lo { hi_s } else { xs.abs() }),
+                "wrapping_abs" if signed => int_v(if xs == lo { lo } else { xs.abs() }),
+                "isqrt" if !signed => bits_v(xb.isqrt()),
+                "is_power_of_two" if !signed => bool_v(xb != 0 && (xb & (xb - 1)) == 0),
+                "next_power_of_two" if !signed => {
+                    if xb == 0 {
+                        bits_v(1)
+                    } else {
+                        let p = 1u128.checked_shl(128 - (xb - 1).leading_zeros()).unwrap_or(0);
+                        if p == 0 || p > mask {
+                            Err(over())
+                        } else {
+                            bits_v(p)
+                        }
+                    }
+                }
+                "ilog2" | "ilog10" => {
+                    if xb == 0 || (signed && xs < 0) {
+                        Err(outside(span, "this method call (logarithm of a non-positive value)"))
+                    } else if name == "ilog2" {
+                        u32_v(127 - xb.leading_zeros())
+                    } else {
+                        u32_v(xb.ilog10())
+                    }
+                }
+                "checked_ilog2" | "checked_ilog10" => {
+                    let r = if xb == 0 || (signed && xs < 0) {
+                        None
+                    } else if name == "checked_ilog2" {
+                        Some(127 - xb.leading_zeros())
+                    } else {
+                        Some(xb.ilog10())
+                    };
+                    Ok(self.opt_value(cx, super::int(IntTy::U32), r.map(|v| ConstValue::Int(v as i128))))
+                }
+                _ => Err(outside_err()),
+            };
+        }
+        if args.len() != 1 {
+            return Err(outside_err());
+        }
+        self.int_method_arg(cx, env, it, rt, xs, xb, name, args[0], span)
+    }
+
+    /// The one-argument integer methods: the arithmetic families,
+    /// shifts and rotates, and the euclid and difference forms.
+    #[allow(clippy::too_many_arguments)]
+    fn int_method_arg<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        it: IntTy,
+        rt: Ty,
+        xs: i128,
+        xb: u128,
+        name: &str,
+        arg: ExprId,
+        span: Span,
+    ) -> Result<TypedValue, Diag> {
+        let outside_err = || outside(span, "method calls");
+        let over = || outside(span, "this method call (overflow or division by zero)");
+        let signed = it.signed();
+        let width = it.bits();
+        let mask: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+        let lo = int_min(it);
+        let hi_s: i128 = if width >= 128 { i128::MAX } else { (1i128 << (width - 1)) - 1 };
+        let int_v = |v: i128| Ok((ConstValue::Int(v), rt));
+        let bits_v = |u: u128| Ok((ConstValue::Int(int_from_bits(u & mask, it)), rt));
+        // Shifts, rotates, powers, and logarithms take a `u32`.
+        if matches!(
+            name,
+            "pow" | "checked_pow" | "saturating_pow" | "wrapping_pow" | "checked_shl" | "checked_shr" | "wrapping_shl"
+                | "wrapping_shr" | "rotate_left" | "rotate_right" | "ilog" | "checked_ilog"
+        ) {
+            let a = self.int_arg(cx, env, arg, super::int(IntTy::U32), span)?;
+            let amt = u32::try_from(a).map_err(|_| outside_err())?;
+            return match name {
+                "pow" => {
+                    let r = if signed { xs.checked_pow(amt).filter(|&r| fits(r, it)) } else { None };
+                    let r = if signed { r } else { xb.checked_pow(amt).filter(|&r| r <= mask).map(|r| int_from_bits(r, it)) };
+                    match r {
+                        Some(r) => int_v(r),
+                        None => Err(over()),
+                    }
+                }
+                "checked_pow" => {
+                    let r = if signed {
+                        xs.checked_pow(amt).filter(|&r| fits(r, it))
+                    } else {
+                        xb.checked_pow(amt).filter(|&r| r <= mask).map(|r| int_from_bits(r, it))
+                    };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "saturating_pow" => {
+                    if signed {
+                        match xs.checked_pow(amt) {
+                            Some(r) if fits(r, it) => int_v(r),
+                            _ => int_v(if xs < 0 && amt % 2 == 1 { lo } else { hi_s }),
+                        }
+                    } else {
+                        match xb.checked_pow(amt) {
+                            Some(r) if r <= mask => bits_v(r),
+                            _ => bits_v(mask),
+                        }
+                    }
+                }
+                "wrapping_pow" => {
+                    let (mut base, mut acc, mut e) = (xb, 1u128, amt);
+                    while e > 0 {
+                        if e & 1 == 1 {
+                            acc = acc.wrapping_mul(base) & mask;
+                        }
+                        base = base.wrapping_mul(base) & mask;
+                        e >>= 1;
+                    }
+                    bits_v(acc)
+                }
+                "checked_shl" => {
+                    let r = if amt >= width { None } else { Some(int_from_bits(xb << amt, it)) };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "checked_shr" => {
+                    let r = if amt >= width {
+                        None
+                    } else if signed {
+                        Some(xs >> amt)
+                    } else {
+                        Some(int_from_bits(xb >> amt, it))
+                    };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "wrapping_shl" => bits_v(xb << (amt % width)),
+                "wrapping_shr" => {
+                    if signed {
+                        int_v(xs >> (amt % width))
+                    } else {
+                        bits_v(xb >> (amt % width))
+                    }
+                }
+                "rotate_left" | "rotate_right" => {
+                    let r = amt % width;
+                    if r == 0 {
+                        bits_v(xb)
+                    } else if name == "rotate_left" {
+                        bits_v((xb << r) | (xb >> (width - r)))
+                    } else {
+                        bits_v((xb >> r) | (xb << (width - r)))
+                    }
+                }
+                "ilog" | "checked_ilog" => {
+                    let ok = amt >= 2 && xb != 0 && (!signed || xs > 0);
+                    if name == "ilog" {
+                        if ok {
+                            Ok((ConstValue::Int(xb.ilog(amt as u128) as i128), super::int(IntTy::U32)))
+                        } else {
+                            Err(outside(span, "this method call (logarithm of a non-positive value)"))
+                        }
+                    } else {
+                        let r = if ok { Some(xb.ilog(amt as u128)) } else { None };
+                        Ok(self.opt_value(cx, super::int(IntTy::U32), r.map(|v| ConstValue::Int(v as i128))))
+                    }
+                }
+                _ => Err(outside_err()),
+            };
+        }
+        let y = self.int_arg(cx, env, arg, rt, span)?;
+        let yb = int_bits(y, it);
+        let ys = truncate_to_int(y, it);
+        // One checked operation per family letter: `a`dd, `s`ub,
+        // `m`ul, `d`iv, `r`em, each at the receiver width.
+        let checked = |op: u8| -> Option<i128> {
+            if signed {
+                let r = match op {
+                    b'a' => xs.checked_add(ys),
+                    b's' => xs.checked_sub(ys),
+                    b'm' => xs.checked_mul(ys),
+                    b'd' => {
+                        if ys == 0 || (xs == lo && ys == -1) {
+                            None
+                        } else {
+                            Some(xs / ys)
+                        }
+                    }
+                    b'r' => {
+                        if ys == 0 || (xs == lo && ys == -1) {
+                            None
+                        } else {
+                            Some(xs % ys)
+                        }
+                    }
+                    _ => None,
+                };
+                r.filter(|&r| fits(r, it))
+            } else {
+                let r = match op {
+                    b'a' => xb.checked_add(yb),
+                    b's' => xb.checked_sub(yb),
+                    b'm' => xb.checked_mul(yb),
+                    b'd' => xb.checked_div(yb),
+                    b'r' => xb.checked_rem(yb),
+                    _ => None,
+                };
+                r.filter(|&r| r <= mask).map(|r| int_from_bits(r, it))
+            }
+        };
+        let fam = |name: &str| -> Option<(u8, u8)> {
+            let (kind, op) = name.split_once('_')?;
+            let k = match kind {
+                "checked" => b'c',
+                "saturating" => b't',
+                "wrapping" => b'w',
+                _ => return None,
+            };
+            let o = match op {
+                "add" => b'a',
+                "sub" => b's',
+                "mul" => b'm',
+                "div" => b'd',
+                "rem" => b'r',
+                _ => return None,
+            };
+            Some((k, o))
+        };
+        if let Some((kind, op)) = fam(name) {
+            return match kind {
+                b'c' => Ok(self.opt_value(cx, rt, checked(op).map(ConstValue::Int))),
+                b'w' => {
+                    match op {
+                        b'a' => bits_v(xb.wrapping_add(yb)),
+                        b's' => bits_v(xb.wrapping_sub(yb)),
+                        b'm' => bits_v(xb.wrapping_mul(yb)),
+                        b'd' => {
+                            if yb == 0 {
+                                Err(over())
+                            } else if signed {
+                                int_v(if xs == lo && ys == -1 { lo } else { xs / ys })
+                            } else {
+                                bits_v(xb / yb)
+                            }
+                        }
+                        _ => {
+                            if yb == 0 {
+                                Err(over())
+                            } else if signed {
+                                int_v(if xs == lo && ys == -1 { 0 } else { xs % ys })
+                            } else {
+                                bits_v(xb % yb)
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Saturating: division by zero still panics in
+                    // rustc, so it stays an error here.
+                    if matches!(op, b'd' | b'r') && yb == 0 {
+                        return Err(over());
+                    }
+                    match checked(op) {
+                        Some(r) => int_v(r),
+                        None => {
+                            if signed {
+                                // Overflow direction: a negative
+                                // operand pairing saturates low.
+                                let low = match op {
+                                    b'a' => xs < 0,
+                                    b's' => xs < 0 || ys > 0 && xs < ys,
+                                    b'm' => (xs < 0) != (ys < 0),
+                                    b'd' => (xs < 0) != (ys < 0),
+                                    _ => false,
+                                };
+                                int_v(if low { lo } else { hi_s })
+                            } else {
+                                bits_v(if op == b's' { 0 } else { mask })
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        match name {
+            "div_euclid" | "rem_euclid" | "checked_div_euclid" | "checked_rem_euclid" => {
+                let r: Option<i128> = if yb == 0 || (signed && xs == lo && ys == -1) {
+                    None
+                } else if signed {
+                    Some(if name.ends_with("div_euclid") { xs.div_euclid(ys) } else { xs.rem_euclid(ys) })
+                } else {
+                    Some(int_from_bits(if name.ends_with("div_euclid") { xb / yb } else { xb % yb }, it))
+                };
+                if name.starts_with("checked") {
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                } else {
+                    match r {
+                        Some(r) => int_v(r),
+                        None => Err(over()),
+                    }
+                }
+            }
+            "abs_diff" => {
+                let d = xb.abs_diff(yb);
+                // For signed receivers the bits difference equals
+                // the value difference, at the unsigned counterpart.
+                let d = if signed { xs.abs_diff(ys) } else { d };
+                let ut = match it {
+                    IntTy::I8 => IntTy::U8,
+                    IntTy::I16 => IntTy::U16,
+                    IntTy::I32 => IntTy::U32,
+                    IntTy::I64 => IntTy::U64,
+                    IntTy::Isize => IntTy::Usize,
+                    IntTy::I128 => IntTy::U128,
+                    u => u,
+                };
+                Ok((ConstValue::Int(int_from_bits(d, ut)), super::int(ut)))
+            }
+            "midpoint" => {
+                if signed {
+                    int_v(xs.midpoint(ys))
+                } else {
+                    bits_v(xb.midpoint(yb))
+                }
+            }
+            "eq_ignore_ascii_case" if it == IntTy::U8 => Ok((ConstValue::Bool((xb as u8).eq_ignore_ascii_case(&(yb as u8))), BOOL)),
+            _ => Err(outside_err()),
+        }
+    }
+
+    /// `char` and `u8` ASCII predicates and case maps, plus the
+    /// other const `char` methods. The host `char` and `u8`
+    /// implementations carry rustc's own results.
+    fn char_method<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        c: char,
+        name: &str,
+        args: &[ExprId],
+        span: Span,
+    ) -> Result<TypedValue, Diag> {
+        let outside_err = || outside(span, "method calls");
+        let bool_v = |b: bool| Ok((ConstValue::Bool(b), BOOL));
+        match name {
+            "is_ascii" if args.is_empty() => bool_v(c.is_ascii()),
+            "is_ascii_alphabetic" if args.is_empty() => bool_v(c.is_ascii_alphabetic()),
+            "is_ascii_alphanumeric" if args.is_empty() => bool_v(c.is_ascii_alphanumeric()),
+            "is_ascii_digit" if args.is_empty() => bool_v(c.is_ascii_digit()),
+            "is_ascii_whitespace" if args.is_empty() => bool_v(c.is_ascii_whitespace()),
+            "is_ascii_uppercase" if args.is_empty() => bool_v(c.is_ascii_uppercase()),
+            "is_ascii_lowercase" if args.is_empty() => bool_v(c.is_ascii_lowercase()),
+            "is_ascii_hexdigit" if args.is_empty() => bool_v(c.is_ascii_hexdigit()),
+            "is_ascii_punctuation" if args.is_empty() => bool_v(c.is_ascii_punctuation()),
+            "is_ascii_graphic" if args.is_empty() => bool_v(c.is_ascii_graphic()),
+            "is_ascii_control" if args.is_empty() => bool_v(c.is_ascii_control()),
+            "to_ascii_lowercase" if args.is_empty() => Ok((ConstValue::Char(c.to_ascii_lowercase()), CHAR)),
+            "to_ascii_uppercase" if args.is_empty() => Ok((ConstValue::Char(c.to_ascii_uppercase()), CHAR)),
+            "len_utf8" if args.is_empty() => Ok((ConstValue::Int(c.len_utf8() as i128), USIZE)),
+            "len_utf16" if args.is_empty() => Ok((ConstValue::Int(c.len_utf16() as i128), USIZE)),
+            "to_digit" if args.len() == 1 => {
+                let (av, _) = self.value(cx, env, args[0], Some(super::int(IntTy::U32)))?;
+                let ConstValue::Int(r) = av else { return Err(outside_err()) };
+                // `to_digit` panics above radix 36; a const panic is
+                // a reject here (and the host call must not run).
+                let radix = u32::try_from(r).map_err(|_| outside_err())?;
+                if radix > 36 {
+                    return Err(outside(span, "this `to_digit` radix (above 36)"));
+                }
+                let v = c.to_digit(radix).map(|d| ConstValue::Int(d as i128));
+                Ok(self.opt_value(cx, super::int(IntTy::U32), v))
+            }
+            _ => Err(outside_err()),
         }
     }
 
@@ -1756,6 +2510,12 @@ impl Evaluator {
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
                 let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
                 let slot = self.place_slot(cx, env, *base, span)?;
+                // A `[x; n]` local starts as a repeat value; writing
+                // one element first spreads it into an aggregate.
+                if let ConstValue::Repeat(x, n) = &*slot {
+                    let agg = ConstValue::Aggregate(vec![(**x).clone(); *n as usize]);
+                    *slot = agg;
+                }
                 match slot {
                     ConstValue::Aggregate(vals) => {
                         let Some(cell) = usize::try_from(i).ok().and_then(|i| vals.get_mut(i)) else {
