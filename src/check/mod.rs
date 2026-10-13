@@ -8,7 +8,7 @@ pub mod method;
 pub mod obligations;
 pub mod picks;
 
-use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
+use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
 use crate::check::generics::Scope;
 use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
@@ -490,9 +490,9 @@ struct Ctx<'p, 'a> {
     /// `binary`).
     deferred_binops: Vec<ExprId>,
     /// Format arguments whose type was still a variable when
-    /// the format check ran: (type, wants Debug, span). The
-    /// Display/Debug test re-runs at finish (W-TRAITS-CORE).
-    deferred_fmt: Vec<(Ty, bool, Span)>,
+    /// the format check ran: (type, spec, span). The format test
+    /// re-runs at finish (W-TRAITS-CORE).
+    deferred_fmt: Vec<(Ty, FmtSpec, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -6312,6 +6312,97 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some((local, params, ret))
     }
 
+    /// One format argument against its spec: the kind must exist for
+    /// the type, and the flags must fit it, as in Rust. Errors name
+    /// the trait a kind needs (`LowerHex` and kin).
+    fn check_fmt_arg(&mut self, t: Ty, spec: FmtSpec, span: Span) {
+        let (_, base) = self.autoderef(t);
+        let bk = self.kind(base);
+        let numeric = matches!(bk, TyKind::Int(_) | TyKind::Float(_)) || bk.is_int_infer() || bk.is_float_infer();
+        let what = match spec.kind {
+            FmtKind::Display => {
+                if has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() {
+                    None
+                } else {
+                    Some("Display")
+                }
+            }
+            FmtKind::Debug => {
+                if has_debug(self.p, &self.tys, t) {
+                    None
+                } else {
+                    Some("Debug")
+                }
+            }
+            FmtKind::LowerHex => {
+                if matches!(bk, TyKind::Int(_)) || bk.is_int_infer() {
+                    None
+                } else {
+                    Some("LowerHex")
+                }
+            }
+            FmtKind::UpperHex => {
+                if matches!(bk, TyKind::Int(_)) || bk.is_int_infer() {
+                    None
+                } else {
+                    Some("UpperHex")
+                }
+            }
+            FmtKind::Octal => {
+                if matches!(bk, TyKind::Int(_)) || bk.is_int_infer() {
+                    None
+                } else {
+                    Some("Octal")
+                }
+            }
+            FmtKind::Binary => {
+                if matches!(bk, TyKind::Int(_)) || bk.is_int_infer() {
+                    None
+                } else {
+                    Some("Binary")
+                }
+            }
+            FmtKind::LowerExp => {
+                if matches!(bk, TyKind::Float(_)) || bk.is_float_infer() {
+                    None
+                } else {
+                    Some("LowerExp")
+                }
+            }
+            FmtKind::UpperExp => {
+                if matches!(bk, TyKind::Float(_)) || bk.is_float_infer() {
+                    None
+                } else {
+                    Some("UpperExp")
+                }
+            }
+        };
+        if let Some(what) = what {
+            if self.kind(t) != TyKind::Error {
+                let tn = self.tn(t);
+                let fix = match what {
+                    "Debug" => "Add #[derive(Debug)] to the type.",
+                    "Display" => "Use `{:?}` with #[derive(Debug)], or format the fields yourself.",
+                    _ => "This format only applies to integer or float types, as written.",
+                };
+                self.err("L0112", span, format!("`{tn}` does not implement {what}"), fix);
+            }
+            return;
+        }
+        // Flag fit: sign and zero padding are numeric-only, precision
+        // applies to numbers and strings, and `#` outside the radix
+        // kinds is only a float no-op in Rust.
+        let stringy = bk == TyKind::Str || self.tys.is_string_ty(base);
+        let bad = (spec.plus && !numeric)
+            || (spec.zero && !numeric)
+            || (spec.precision.is_some() && !numeric && !stringy && bk != TyKind::Char)
+            || (spec.alt && !matches!(spec.kind, FmtKind::LowerHex | FmtKind::UpperHex | FmtKind::Octal | FmtKind::Binary) && !matches!(bk, TyKind::Float(_)));
+        if bad && self.kind(t) != TyKind::Error {
+            let tn = self.tn(t);
+            self.err("L0112", span, format!("invalid format options for `{tn}`"), "Sign, zero padding, and `#` only apply as in Rust: numbers and the radix formats.");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn macro_expr(
         &mut self,
@@ -6391,7 +6482,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             MacroKind::Panic | MacroKind::Todo | MacroKind::Unreachable => NEVER,
         };
         for piece in fmt {
-            if let FmtPiece::Arg { index, debug } = piece {
+            if let FmtPiece::Arg { index, spec, .. } = piece {
                 let a = args[*index];
                 let t = self.expr(a, None);
                 let t = self.deep(t);
@@ -6399,21 +6490,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // finish: its type may be a closure signature
                 // that only the second inference pass binds.
                 if matches!(self.kind(t), TyKind::Infer(_)) && !self.kind(t).is_int_infer() {
-                    self.deferred_fmt.push((t, *debug, self.span(a)));
+                    self.deferred_fmt.push((t, *spec, self.span(a)));
                     continue;
                 }
-                let ok =
-                    if *debug { has_debug(self.p, &self.tys, t) } else { has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() };
-                if !ok {
-                    let tn = self.tn(t);
-                    let (what, fix) = if *debug {
-                        ("Debug", "Add #[derive(Debug)] to the type.")
-                    } else {
-                        ("Display", "Use `{:?}` with #[derive(Debug)], or format the fields yourself.")
-                    };
-                    let s = self.span(a);
-                    self.err("L0112", s, format!("`{tn}` does not implement {what}"), fix);
-                }
+                let s = self.span(a);
+                self.check_fmt_arg(t, *spec, s);
             }
         }
         // Arguments not referenced by the format string (only possible in assert macros).
@@ -9205,18 +9286,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         // Deferred format tests, with types as bound by now.
-        for (t, debug, span) in std::mem::take(&mut self.deferred_fmt) {
+        for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
             let t = self.deep(t);
-            let ok = if debug { has_debug(self.p, &self.tys, t) } else { has_display(self.p, &self.tys, t) || self.kind(t).is_int_infer() };
-            if !ok && self.kind(t) != TyKind::Error {
-                let tn = self.tn(t);
-                let (what, fix) = if debug {
-                    ("Debug", "Add #[derive(Debug)] to the type.")
-                } else {
-                    ("Display", "Use `{:?}` with #[derive(Debug)], or format the fields yourself.")
-                };
-                self.err("L0112", span, format!("`{tn}` does not implement {what}"), fix);
-            }
+            self.check_fmt_arg(t, spec, span);
         }
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];

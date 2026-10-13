@@ -287,6 +287,118 @@ fn token_trees(toks: &[Token]) -> Vec<TokenTree> {
     build(toks, &mut pos, None, 0)
 }
 
+/// Parses one format spec (the text after the `:`). `Err(true)` is a
+/// form Rust has but the subset does not (dynamic width or precision,
+/// pointer format, alternate Debug); `Err(false)` is invalid in Rust.
+fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
+    let mut s = FmtSpec::default();
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut i = 0usize;
+    let digit_run = |cs: &[char], mut j: usize| -> (Option<u32>, usize) {
+        let mut v: u64 = 0;
+        let start = j;
+        while j < cs.len() && cs[j].is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add(cs[j] as u64 - '0' as u64);
+            j += 1;
+        }
+        (if j > start { Some(v.min(u32::MAX as u64) as u32) } else { None }, j)
+    };
+    // [[fill]align]
+    if i + 1 < cs.len() && matches!(cs[i + 1], '<' | '>' | '^') && cs[i] != '{' && cs[i] != '}' {
+        s.fill = cs[i] as u32;
+        s.align = cs[i + 1] as u8;
+        i += 2;
+    } else if i < cs.len() && matches!(cs[i], '<' | '>' | '^') {
+        s.align = cs[i] as u8;
+        i += 1;
+    }
+    // [sign]
+    if i < cs.len() && cs[i] == '+' {
+        s.plus = true;
+        i += 1;
+    } else if i < cs.len() && cs[i] == '-' {
+        i += 1;
+    }
+    // [#]
+    if i < cs.len() && cs[i] == '#' {
+        s.alt = true;
+        i += 1;
+    }
+    // [0]
+    if i < cs.len() && cs[i] == '0' {
+        s.zero = true;
+        i += 1;
+    }
+    // [width]
+    if i < cs.len() && cs[i].is_ascii_digit() {
+        let (w, j) = digit_run(&cs, i);
+        if j < cs.len() && cs[j] == '$' {
+            return Err(true);
+        }
+        s.width = w;
+        i = j;
+    }
+    // [.precision]
+    if i < cs.len() && cs[i] == '.' {
+        i += 1;
+        if i < cs.len() && cs[i] == '*' {
+            return Err(true);
+        }
+        let (p, j) = digit_run(&cs, i);
+        if p.is_none() {
+            return Err(false);
+        }
+        if j < cs.len() && cs[j] == '$' {
+            return Err(true);
+        }
+        s.precision = p;
+        i = j;
+    }
+    // [kind]
+    let kind = match cs.get(i) {
+        None => FmtKind::Display,
+        Some('?') => {
+            i += 1;
+            FmtKind::Debug
+        }
+        Some('x') => {
+            i += 1;
+            FmtKind::LowerHex
+        }
+        Some('X') => {
+            i += 1;
+            FmtKind::UpperHex
+        }
+        Some('o') => {
+            i += 1;
+            FmtKind::Octal
+        }
+        Some('b') => {
+            i += 1;
+            FmtKind::Binary
+        }
+        Some('e') => {
+            i += 1;
+            FmtKind::LowerExp
+        }
+        Some('E') => {
+            i += 1;
+            FmtKind::UpperExp
+        }
+        Some('p') => return Err(true),
+        Some(_) => return Err(false),
+    };
+    if i != cs.len() {
+        return Err(false);
+    }
+    if kind == FmtKind::Debug && s.alt {
+        // Pretty Debug (`{:#?}`) is a different rendering, not done.
+        return Err(true);
+    }
+    s.kind = kind;
+    Ok(s)
+}
+
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
 }
@@ -3251,11 +3363,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 let (name, fmt) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
-                let debug = match fmt {
-                    "" => false,
-                    "?" => true,
-                    _ => return Err(not_yet(C_LIT, span, &format!("format spec `{{:{fmt}}}`"))),
+                let fspec = match parse_fmt_spec(fmt) {
+                    Ok(s) => s,
+                    Err(true) => return Err(not_yet(C_LIT, span, &format!("format spec `{{:{fmt}}}`"))),
+                    Err(false) => return Err(syntax(span, format!("invalid format specification `{{:{fmt}}}`"))),
                 };
+                let debug = fspec.kind == FmtKind::Debug;
                 let index = if name.is_empty() {
                     next += 1;
                     next - 1
@@ -3281,7 +3394,7 @@ impl<'a> Parser<'a> {
                 if !lit.is_empty() {
                     pieces.push(FmtPiece::Lit(std::mem::take(&mut lit)));
                 }
-                pieces.push(FmtPiece::Arg { index: base + index, debug });
+                pieces.push(FmtPiece::Arg { index: base + index, debug, spec: fspec });
             } else if c == '}' {
                 return Err(syntax(span, "unmatched `}` in format string"));
             } else {

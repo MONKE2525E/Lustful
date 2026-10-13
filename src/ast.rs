@@ -759,11 +759,47 @@ pub enum MacroKind {
     Unreachable,
 }
 
+/// One parsed format spec (the text after `:` in a placeholder), as
+/// Rust's grammar gives it: `[[fill]align][sign][#][0][width][.prec][kind]`.
+/// Dynamic width and precision (`w$`, `.*`) and pointer format (`p`)
+/// reject in the parser, so every field here is a literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FmtSpec {
+    pub kind: FmtKind,
+    /// The fill character as a Unicode scalar value; 0 means space.
+    pub fill: u32,
+    /// 0 = default for the type, else '<', '>', or '^' as a byte.
+    pub align: u8,
+    pub plus: bool,
+    pub alt: bool,
+    pub zero: bool,
+    pub width: Option<u32>,
+    pub precision: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FmtKind {
+    Display,
+    Debug,
+    LowerHex,
+    UpperHex,
+    Octal,
+    Binary,
+    LowerExp,
+    UpperExp,
+}
+
+impl Default for FmtSpec {
+    fn default() -> FmtSpec {
+        FmtSpec { kind: FmtKind::Display, fill: 0, align: 0, plus: false, alt: false, zero: false, width: None, precision: None }
+    }
+}
+
 /// A parsed format string. `Arg` holds an index into the macro's argument list.
 #[derive(Clone, Debug)]
 pub enum FmtPiece {
     Lit(String),
-    Arg { index: usize, debug: bool },
+    Arg { index: usize, debug: bool, spec: FmtSpec },
 }
 
 #[derive(Clone)]

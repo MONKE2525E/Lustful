@@ -1,5 +1,5 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
-use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt};
+use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, MacroKind, Pat, PatId, Stmt};
 use crate::check::collect::*;
 use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, PrimCmpKind, Res};
 use crate::diag::Span;
@@ -2417,9 +2417,9 @@ impl<'p, 'a> Lower<'p, 'a> {
         for piece in fmt {
             match piece {
                 FmtPiece::Lit(s) => parts.push(FmtPart::Lit(s.clone())),
-                FmtPiece::Arg { index, debug } => {
+                FmtPiece::Arg { index, debug, spec } => {
                     let (value, ty) = self.borrow_of(args[*index], 0);
-                    parts.push(FmtPart::Arg { value, ty, debug: *debug });
+                    parts.push(FmtPart::Arg { value, ty, debug: *debug, spec: *spec });
                 }
             }
         }
@@ -2514,9 +2514,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                     parts.extend(msg);
                 }
                 parts.push(FmtPart::Lit("\n  left: ".into()));
-                parts.push(FmtPart::Arg { value: a, ty: t, debug: true });
+                let dbg = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
+                parts.push(FmtPart::Arg { value: a, ty: t, debug: true, spec: dbg });
                 parts.push(FmtPart::Lit("\n right: ".into()));
-                parts.push(FmtPart::Arg { value: b, ty: tb, debug: true });
+                parts.push(FmtPart::Arg { value: b, ty: tb, debug: true, spec: dbg });
                 self.terminate(Terminator::Panic(parts), span);
                 self.cur = ok;
                 self.unit(dest, span);

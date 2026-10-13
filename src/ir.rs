@@ -1,6 +1,6 @@
 // Lust IR: a small control-flow graph per function, in the style of Rust's MIR but flatter.
 // The borrow checker and the C backend both read it.
-use crate::ast::{BinOp, UnOp};
+use crate::ast::{BinOp, FmtSpec, UnOp};
 use crate::check::Builtin;
 use crate::def::LocalDefId;
 use crate::diag::Span;
@@ -65,7 +65,7 @@ pub enum Operand {
 #[derive(Clone, Debug)]
 pub enum FmtPart {
     Lit(String),
-    Arg { value: Operand, ty: Ty, debug: bool },
+    Arg { value: Operand, ty: Ty, debug: bool, spec: FmtSpec },
 }
 
 #[derive(Clone, Debug)]

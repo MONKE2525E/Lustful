@@ -21,7 +21,7 @@
 // while their file's text stands (spans stay valid); the caller
 // checks that through `CachedBody::file_hash`.
 use super::graph;
-use crate::ast::{BinOp, UnOp};
+use crate::ast::{BinOp, FmtSpec, UnOp};
 use crate::check::collect::Program;
 use crate::check::Builtin;
 use crate::def::{DefId, DiskDefId, LocalDefId};
@@ -100,8 +100,9 @@ fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart
                 0u8.hash(h);
                 s.hash(h);
             }
-            FmtPart::Arg { value, ty, debug } => {
+            FmtPart::Arg { value, ty, debug, spec } => {
                 (1u8, debug).hash(h);
+                (spec.kind as u8, spec.fill, spec.align, spec.plus, spec.alt, spec.zero, spec.width, spec.precision).hash(h);
                 hash_operand(h, p, tys, value, seen);
                 graph::hash_ty_deep(h, p, tys, *ty, seen);
             }
@@ -469,7 +470,7 @@ enum CachedConst {
 #[derive(Clone, Debug)]
 enum CachedFmt {
     Lit(String),
-    Arg { value: CachedOperand, ty: u32, debug: bool },
+    Arg { value: CachedOperand, ty: u32, debug: bool, spec: FmtSpec },
 }
 
 #[derive(Clone, Debug)]
@@ -757,7 +758,9 @@ fn cache_fmt(b: &mut TreeBuilder, p: &Program, parts: &[FmtPart]) -> Vec<CachedF
         .iter()
         .map(|part| match part {
             FmtPart::Lit(s) => CachedFmt::Lit(s.clone()),
-            FmtPart::Arg { value, ty, debug } => CachedFmt::Arg { value: cache_operand(b, p, value), ty: b.ty(*ty), debug: *debug },
+            FmtPart::Arg { value, ty, debug, spec } => {
+                CachedFmt::Arg { value: cache_operand(b, p, value), ty: b.ty(*ty), debug: *debug, spec: *spec }
+            }
         })
         .collect()
 }
@@ -901,8 +904,8 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             .iter()
             .map(|part| match part {
                 CachedFmt::Lit(s) => Some(FmtPart::Lit(s.clone())),
-                CachedFmt::Arg { value, ty, debug } => {
-                    Some(FmtPart::Arg { value: operand(intern, tys, strings, value)?, ty: intern.ty(tys, *ty)?, debug: *debug })
+                CachedFmt::Arg { value, ty, debug, spec } => {
+                    Some(FmtPart::Arg { value: operand(intern, tys, strings, value)?, ty: intern.ty(tys, *ty)?, debug: *debug, spec: *spec })
                 }
             })
             .collect()

@@ -1033,6 +1033,99 @@ void lust_fmt_i128(lust_String *out, lust_i128 v) LUST_BODY({
     }
 })
 
+/* Integer formatting with a format spec, as Rust renders it. `lo` and
+   `hi` are the magnitude (already negated by the caller for decimal,
+   raw two's-complement bits truncated to the type width for the radix
+   modes, with `negative` clear). Modes: 0 decimal, 1 lower hex,
+   2 upper hex, 3 octal, 4 binary. `align` is '<', '>', or '^', and
+   0 for the numeric default (right). Precision is a minimum digit
+   count; zero padding fills after the sign and radix prefix and is
+   ignored when a precision is given, as in Rust. */
+void lust_fmt_int_spec(lust_String *out, uint64_t lo, uint64_t hi, int negative, int mode, int plus, int alt, int zero_pad, uint32_t width, uint32_t fill, int align, int has_prec, uint32_t prec) LUST_BODY({
+    static const char lo_digits[] = "0123456789abcdef";
+    static const char up_digits[] = "0123456789ABCDEF";
+    const char *digs = mode == 2 ? up_digits : lo_digits;
+    uint64_t base = mode == 1 || mode == 2 ? 16 : mode == 3 ? 8 : mode == 4 ? 2 : 10;
+    char rev[130];
+    int nd = 0;
+    lust_u128 v;
+    v.lo = lo;
+    v.hi = hi;
+    if (!v.lo && !v.hi) {
+        rev[nd++] = '0';
+    } else {
+        while (v.lo || v.hi) {
+            uint64_t r;
+            v = lust_u128_divmod64(v, base, &r);
+            rev[nd++] = digs[r];
+        }
+    }
+    const char *prefix = "";
+    if (alt) prefix = mode == 1 ? "0x" : mode == 2 ? "0X" : mode == 3 ? "0o" : mode == 4 ? "0b" : "";
+    uint64_t prefix_len = 0;
+    while (prefix[prefix_len]) prefix_len++;
+    int sign = negative ? '-' : plus ? '+' : 0;
+    /* Precision is ignored for integers in Rust (it neither pads
+       digits nor disables the zero flag). */
+    uint32_t lead = 0;
+    (void)has_prec; (void)prec;
+    uint32_t total = (sign ? 1 : 0) + (uint32_t)prefix_len + lead + (uint32_t)nd;
+    uint32_t zeros = 0;
+    uint32_t left = 0, right = 0;
+    if (zero_pad && total < width) {
+        zeros = width - total;
+        total = width;
+    } else if (total < width) {
+        uint32_t pad = width - total;
+        if (align == '<') right = pad;
+        else if (align == '^') { left = pad / 2; right = pad - left; }
+        else left = pad;
+    }
+    uint32_t fill_cp = fill ? fill : ' ';
+    for (uint32_t k = 0; k < left; k++) lust_string_push_char(out, fill_cp);
+    if (sign) { char sc = (char)sign; lust_string_push_bytes(out, &sc, 1); }
+    if (prefix_len) lust_string_push_bytes(out, prefix, prefix_len);
+    for (uint32_t k = 0; k < zeros + lead; k++) lust_string_push_bytes(out, "0", 1);
+    for (int k = nd - 1; k >= 0; k--) lust_string_push_bytes(out, &rev[k], 1);
+    for (uint32_t k = 0; k < right; k++) lust_string_push_char(out, fill_cp);
+})
+
+/* The char count of a UTF-8 string view (non-continuation bytes). */
+uint64_t lust_str_char_count(lust_str s) LUST_BODY({
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < s.len; i++) if ((s.ptr[i] & 0xC0) != 0x80) n++;
+    return n;
+})
+
+/* Appends `body` padded with `fill` to `width` chars: align '<'
+   pads right, '^' centers (the larger half goes right, as in
+   Rust), and anything else pads left. */
+void lust_fmt_pad(lust_String *out, lust_str body, uint32_t width, uint32_t fill, int align) LUST_BODY({
+    uint64_t count = lust_str_char_count(body);
+    if (count >= width) { lust_string_push_str(out, body); return; }
+    uint32_t pad = width - (uint32_t)count;
+    uint32_t left = 0, right = 0;
+    if (align == '<') right = pad;
+    else if (align == '^') { left = pad / 2; right = pad - left; }
+    else left = pad;
+    uint32_t fill_cp = fill ? fill : ' ';
+    for (uint32_t k = 0; k < left; k++) lust_string_push_char(out, fill_cp);
+    lust_string_push_str(out, body);
+    for (uint32_t k = 0; k < right; k++) lust_string_push_char(out, fill_cp);
+})
+
+/* Truncates a string to at most `chars` Unicode scalar values,
+   cutting on a char boundary (a format precision for strings). */
+void lust_str_trunc_chars(lust_String *s, uint32_t chars) LUST_BODY({
+    uint32_t seen = 0;
+    for (uint64_t i = 0; i < s->len; i++) {
+        if ((s->ptr[i] & 0xC0) != 0x80) {
+            if (seen == chars) { s->len = i; return; }
+            seen++;
+        }
+    }
+})
+
 /* ---------- Vec insert/remove ---------- */
 
 void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, lust_loc loc) LUST_BODY({

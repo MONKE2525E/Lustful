@@ -682,7 +682,10 @@ impl Walker<'_> {
                             0u8.hash(h);
                             s.hash(h);
                         }
-                        FmtPiece::Arg { index, debug } => (1u8, *index as u64, debug).hash(h),
+                        FmtPiece::Arg { index, debug, spec } => {
+                            (1u8, *index as u64, debug).hash(h);
+                            (spec.kind as u8, spec.fill, spec.align, spec.plus, spec.alt, spec.zero, spec.width, spec.precision).hash(h);
+                        }
                     }
                 }
             }

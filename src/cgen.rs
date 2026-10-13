@@ -1,6 +1,6 @@
 // C backend. Each function is generated on its own (in parallel). Type helpers ("glue": drop, clone,
 // eq, debug) are requested by structural type and generated once, after all functions.
-use crate::ast::{BinOp, UnOp};
+use crate::ast::{BinOp, FmtKind, FmtSpec, UnOp};
 use crate::check::Builtin;
 use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
@@ -2776,14 +2776,121 @@ impl FnGen<'_, '_, '_> {
                         let _ = writeln!(self.out, "    lust_string_push_bytes(&{s}, {}, {});", c_string_lit(text.as_bytes()), text.len());
                     }
                 }
-                FmtPart::Arg { value, ty, debug } => {
+                FmtPart::Arg { value, ty, debug, spec } => {
                     let (v, _) = self.operand(value, loc, post);
                     let t = cty(&self.body.tys, *ty);
-                    self.fmt_value(&s, &v, &t, *debug);
+                    self.fmt_value_spec(&s, &v, &t, *debug, *spec);
                 }
             }
         }
         s
+    }
+
+    /// Appends `*ptr` with a full format spec. Integers go through
+    /// the runtime spec formatter (radix modes read the raw bits of
+    /// the type width), floats through the float spec engine, and
+    /// everything else renders plainly into a temporary that is
+    /// truncated to the precision (strings only) and padded.
+    fn fmt_value_spec(&mut self, out: &str, ptr: &str, t: &CTy, debug: bool, spec: FmtSpec) {
+        let plain = spec == FmtSpec::default() || spec == FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
+        if plain {
+            self.fmt_value(out, ptr, t, debug);
+            return;
+        }
+        let mut e = if *t == CTy::Str { ptr.to_string() } else { format!("(*{ptr})") };
+        let mut tt = t.clone();
+        while let CTy::Ref(inner) = tt.clone() {
+            if *inner == CTy::Str {
+                break;
+            }
+            e = format!("(*{e})");
+            tt = *inner;
+        }
+        match &tt {
+            CTy::Int(i) => {
+                let mode = match spec.kind {
+                    FmtKind::LowerHex => 1,
+                    FmtKind::UpperHex => 2,
+                    FmtKind::Octal => 3,
+                    FmtKind::Binary => 4,
+                    _ => 0,
+                };
+                let width = spec.width.unwrap_or(0);
+                let (has_prec, prec) = match spec.precision {
+                    Some(p) => (1, p),
+                    None => (0, 0),
+                };
+                let align = spec.align as char;
+                let (lo, hi, neg) = if is128(*i) {
+                    if mode == 0 && i.signed() {
+                        (format!("lust_i128_mag({e}).lo"), format!("lust_i128_mag({e}).hi"), format!("((int64_t)({e}).hi < 0)"))
+                    } else {
+                        (format!("({e}).lo"), format!("({e}).hi"), "0".to_string())
+                    }
+                } else if mode == 0 && i.signed() {
+                    (
+                        format!("(uint64_t)({e} < 0 ? 0 - (uint64_t)(int64_t){e} : (uint64_t)(int64_t){e})"),
+                        "0".to_string(),
+                        format!("({e} < 0)"),
+                    )
+                } else {
+                    let mask = match i.bits() {
+                        8 => " & 0xffull",
+                        16 => " & 0xffffull",
+                        32 => " & 0xffffffffull",
+                        _ => "",
+                    };
+                    (format!("((uint64_t){e}{mask})"), "0".to_string(), "0".to_string())
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_fmt_int_spec(&{out}, {lo}, {hi}, {neg}, {mode}, {}, {}, {}, {width}, {}, {}, {has_prec}, {prec});",
+                    spec.plus as u8, spec.alt as u8, spec.zero as u8, spec.fill, align as u32
+                );
+            }
+            CTy::Float(f) => {
+                let mode = match spec.kind {
+                    FmtKind::Debug => 1,
+                    FmtKind::LowerExp => 2,
+                    FmtKind::UpperExp => 3,
+                    _ => 0,
+                };
+                let width = spec.width.unwrap_or(0);
+                let prec = spec.precision.unwrap_or(0xFFFF_FFFF);
+                let _ = writeln!(
+                    self.out,
+                    "    lust_fmt_{}(&{out}, {e}, (lust_float_spec){{ {prec}, {width}, {}, {}, {}, {}, {}, {mode} }});",
+                    f.name(),
+                    spec.fill,
+                    spec.align as u32,
+                    spec.plus as u8,
+                    spec.zero as u8,
+                    spec.alt as u8
+                );
+            }
+            _ => {
+                // Render plainly into a temporary, truncate to a string
+                // precision, then pad to the width. Debug renderings
+                // ignore width and precision in Rust (the impls write
+                // their text directly), so only Display pads.
+                let tmp = self.tmp();
+                let _ = writeln!(self.out, "    lust_String {tmp} = lust_string_new();");
+                self.fmt_value(&tmp, ptr, t, debug);
+                if spec.kind == FmtKind::Display
+                    && let Some(p) = spec.precision
+                    && (matches!(tt, CTy::Str | CTy::String) || matches!(&tt, CTy::Ref(inner) if **inner == CTy::Str))
+                {
+                    let _ = writeln!(self.out, "    lust_str_trunc_chars(&{tmp}, {p});");
+                }
+                let align = if spec.align == 0 { '<' as u32 } else { spec.align as u32 };
+                let width = if spec.kind == FmtKind::Display { spec.width.unwrap_or(0) } else { 0 };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_fmt_pad(&{out}, lust_string_as_str(&{tmp}), {width}, {}, {align}); lust_string_drop(&{tmp});",
+                    spec.fill
+                );
+            }
+        }
     }
 
     /// Appends `*ptr` (of type `t`) to the String `out`, with Display or Debug formatting.
@@ -4616,7 +4723,7 @@ mod tests {
             kind: StmtKind::Print {
                 stderr: false,
                 newline: true,
-                parts: vec![FmtPart::Arg { value: Operand::Copy(Place::local(l)), ty, debug: false }],
+                parts: vec![FmtPart::Arg { value: Operand::Copy(Place::local(l)), ty, debug: false, spec: FmtSpec::default() }],
             },
             span,
         };
