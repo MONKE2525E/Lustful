@@ -1509,6 +1509,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             let skip = usize::from(fat_local(&self.body.tys, t));
             let inner = vars[skip..].to_vec();
             self.implied_edges(t, &inner, &mut 0, &mut Vec::new());
+            self.static_bound_edges(t, &inner, &mut 0);
             regs.clear();
             self.sc.slot_regions(t, &mut regs);
             for (i, r) in regs.iter().enumerate() {
@@ -2169,6 +2170,55 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.inst_walk(a, b, univ, binds, out)
             }
             _ => self.sc.slots(e) == 0,
+        }
+    }
+
+    /// Edges for the `T: 'static` bounds of the user Adts inside a type
+    /// (rustc's well-formedness: `S<&'a i32>` with `struct S<T: 'static>`
+    /// needs `'a: 'static`): every slot of such an argument outlives
+    /// `'static`. `at` walks the slots in order.
+    fn static_bound_edges(&mut self, t: Ty, vars: &[u32], at: &mut usize) {
+        let tys = &self.body.tys;
+        match tys.kind(t) {
+            TyKind::Ref(_, _, inner) => {
+                *at += 1;
+                self.static_bound_edges(inner, vars, at);
+            }
+            TyKind::Adt(def, args) => {
+                *at += adt_regions(self.p, tys, t) as usize;
+                let statics: Vec<u32> = match self.p.adt_by_def(def).and_then(|a| self.p.gx.adt_generics.get(a.0 as usize)) {
+                    Some(g) => g
+                        .predicates
+                        .iter()
+                        .filter_map(|pr| match pr {
+                            Predicate::TypeOutlives(x, Region::Static) => match self.p.tys.kind(*x) {
+                                TyKind::Param(j) => Some(j.0),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for (j, g) in tys.args(args).to_vec().into_iter().enumerate() {
+                    if let GenericArg::Ty(e) = g {
+                        let start = *at;
+                        self.static_bound_edges(e, vars, at);
+                        if statics.contains(&(j as u32)) {
+                            for &v in vars.get(start..*at).unwrap_or(&[]) {
+                                self.edge(v, 0);
+                            }
+                        }
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in tys.tys_of(ts).to_vec() {
+                    self.static_bound_edges(e, vars, at);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.static_bound_edges(e, vars, at),
+            _ => *at += self.sc.slots(t) as usize,
         }
     }
 
