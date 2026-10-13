@@ -228,6 +228,14 @@ pub struct ImplIndex {
     traits: FxMap<DefId, TraitRecord>,
     /// Associated item def to its trait def.
     assoc_trait: FxMap<DefId, DefId>,
+    /// Traits answered by type structure, never by impl records
+    /// (`Sized` and the auto traits, ARCH 2.7): an empty bucket says
+    /// nothing about them.
+    pub structural: Vec<DefId>,
+    /// The derive-family lang traits (`Clone`, `PartialEq`, ...):
+    /// core implements them for tuples, arrays, slices, references,
+    /// and closures by structure, with no impl records for those.
+    pub derive_family: Vec<DefId>,
 }
 
 impl ImplIndex {
@@ -643,15 +651,40 @@ fn strip_fundamental(tys: &impl TyIntern, map: &FxMap<ParamId, Ty>, mut t: Ty, f
 
 impl ImplIndex {
     /// True when no impl in the index can match this trait ref
-    /// pattern: no candidate header unifies with it. Pattern
-    /// variables in `tr` are the caller's merged variable space;
-    /// each candidate's own parameters are renamed above it.
-    fn no_impl_can_match(&self, tys: &mut impl TyIntern, tr: TraitRef, vars_in_use: u32) -> bool {
+    /// pattern: every candidate header either fails to unify with
+    /// it or has a where clause that cannot hold under that
+    /// unification (one level per `depth`, as the selection-side
+    /// provably-false check recurses: `Box<My>: Clone` dies through
+    /// core's `impl<T: Clone> Clone for Box<T>` when `My: Clone`
+    /// cannot hold). Pattern variables in `tr` are the caller's
+    /// merged variable space; each candidate's own parameters are
+    /// renamed above it.
+    #[allow(clippy::too_many_arguments)]
+    fn no_impl_can_match(
+        &self,
+        tys: &mut impl TyIntern,
+        tr: TraitRef,
+        vars_in_use: u32,
+        depth: u32,
+        fundamental: &[DefId],
+        by_construction: &[DefId],
+        is_local: &dyn Fn(DefId) -> bool,
+    ) -> bool {
         for &id in self.impls_of_trait(tr.def) {
-            let rec = self.get(id);
-            let cand = rename_trait_ref(tys, rec.trait_ref, rec.generics.params.len(), vars_in_use);
+            let rec = self.get(id).clone();
+            let n = rec.generics.params.len();
+            let cand = rename_trait_ref(tys, rec.trait_ref, n, vars_in_use);
             let mut map: FxMap<ParamId, Ty> = FxMap::default();
-            if unify_pattern_args(tys, &mut map, cand.args, tr.args) {
+            if !unify_pattern_args(tys, &mut map, cand.args, tr.args) {
+                continue;
+            }
+            // A matching header is live unless one of its clauses
+            // cannot hold; past the depth cap it counts as live.
+            let dead = depth < 4
+                && trait_clauses_of(tys, &rec, vars_in_use).into_iter().any(|clause| {
+                    self.clause_cannot_hold_at(tys, &map, clause, vars_in_use as usize + n, depth + 1, fundamental, by_construction, is_local)
+                });
+            if !dead {
                 return false;
             }
         }
@@ -680,6 +713,23 @@ impl ImplIndex {
         by_construction: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
     ) -> bool {
+        self.clause_cannot_hold_at(tys, map, clause, n_vars, 0, fundamental, by_construction, is_local)
+    }
+
+    /// `clause_cannot_hold` at one recursion depth (see
+    /// `no_impl_can_match`).
+    #[allow(clippy::too_many_arguments)]
+    fn clause_cannot_hold_at(
+        &self,
+        tys: &mut impl TyIntern,
+        map: &FxMap<ParamId, Ty>,
+        clause: TraitRef,
+        n_vars: usize,
+        depth: u32,
+        fundamental: &[DefId],
+        by_construction: &[DefId],
+        is_local: &dyn Fn(DefId) -> bool,
+    ) -> bool {
         if by_construction.contains(&clause.def) {
             return false;
         }
@@ -693,7 +743,7 @@ impl ImplIndex {
             return false;
         }
         let local_side = is_local(clause.def) || ref_has_local_side(tys, clause.args, fundamental, is_local);
-        local_side && self.no_impl_can_match(tys, clause, n_vars as u32)
+        local_side && self.no_impl_can_match(tys, clause, n_vars as u32, depth, fundamental, by_construction, is_local)
     }
 
     /// Every overlapping pair of impls (section 2.6), as impl ids in

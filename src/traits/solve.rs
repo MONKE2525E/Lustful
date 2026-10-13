@@ -60,6 +60,15 @@ pub trait SolveCx {
     fn closure_output(&mut self, _assoc: DefId, _self_ty: Ty) -> Option<Ty> {
         None
     }
+    /// The structural answer for a trait ref the impl index has no
+    /// records for (`Sized` and the auto traits; the derive family
+    /// on tuples, arrays, slices, and references): Some(holds) when
+    /// this context knows it, None to leave it open. The
+    /// provably-false check (section 2.4) asks before it reads an
+    /// empty bucket as "no".
+    fn structural(&mut self, _tr: TraitRef) -> Option<bool> {
+        None
+    }
 }
 
 /// The answer of one selection (section 2.4).
@@ -372,6 +381,19 @@ impl Solver {
             None => {}
         }
 
+        // A general inference variable as Self selects nothing, not
+        // even from the param env: an impl could answer once inference
+        // names the type (`?U: Send` with `T: Send` in the env must
+        // not bind `?U = T`; the argument may make it `&T`). Defer,
+        // as rustc does (ARCH 2.4 step 6).
+        {
+            let self_ty = self_ty_of(cx.tys(), &obl);
+            let deep = cx.deep_resolve(self_ty);
+            if matches!(cx.tys().kind(deep), TyKind::Infer(v) if !v.is_int() && !v.is_float()) {
+                return Selection::Ambiguous;
+            }
+        }
+
         // Step 1: param-env evidence wins over impls. Two matching
         // predicates defer; the first match is never taken.
         let mut env_hits: Vec<usize> = Vec::new();
@@ -533,6 +555,21 @@ impl Solver {
         let self_ty = self_ty_of(cx.tys(), &tr);
         let self_deep = cx.deep_resolve(self_ty);
         if head_of(cx.tys(), self_deep, &|t| t).is_none() {
+            return false;
+        }
+        // Traits answered by structure: an empty bucket is no answer.
+        if let Some(holds) = cx.structural(tr) {
+            return !holds;
+        }
+        if index.structural.contains(&tr.def) {
+            return false;
+        }
+        if index.derive_family.contains(&tr.def)
+            && matches!(
+                cx.tys().kind(self_deep),
+                TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::Closure(..)
+            )
+        {
             return false;
         }
         let cands = index.candidates(cx.tys(), tr.def, self_deep, &|t| t);

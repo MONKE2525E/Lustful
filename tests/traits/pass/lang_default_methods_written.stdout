@@ -1,0 +1,13 @@
+eq 1 2
+eq 1 1
+true false
+pcmp 1 2
+pcmp 3 3
+pcmp 2 1
+true true true
+pcmp 2 1
+pcmp 2 1
+pcmp 0 5
+pcmp 9 0
+pcmp 9 5
+V(2) V(1) V(5)

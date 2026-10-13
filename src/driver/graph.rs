@@ -630,6 +630,9 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     adt.repr.align.hash(h);
     let d = adt.derives;
     (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
+    // The written impls derive glue calls for a value of this type.
+    let glue = |tr: DefId| p.gx.glue_methods.contains_key(&(a, tr));
+    (glue(p.gx.lang.clone), glue(p.gx.lang.default), glue(p.gx.lang.partial_eq)).hash(h);
     // A generic Adt's parameters and bounds: a bound edit changes what
     // every use of the type must prove (generic reuse, W-PERF).
     if let Some(g) = p.gx.adt_generics.get(a.0 as usize) {

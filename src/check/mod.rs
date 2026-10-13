@@ -283,6 +283,9 @@ pub enum Builtin {
     /// structure (`has_default`): the `default` glue of the call's
     /// destination type.
     DefaultGlue,
+    /// `Option::unwrap_or_default`: the payload, or the `default`
+    /// glue's value of the payload type on `None`.
+    OptUnwrapOrDefault,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -365,6 +368,41 @@ pub enum Res {
         ld: u8,
         rd: u8,
     },
+    /// A comparison operator through a written `PartialEq` or
+    /// `PartialOrd` impl: `f` is the impl's method (a template until
+    /// mono rewrites it through `Checked::generic_args`), called with
+    /// both operands borrowed; `via` turns its result into the
+    /// operator's answer (core's default bodies for `ne`, `lt`, and
+    /// kin).
+    TraitCmp {
+        f: LocalDefId,
+        ld: u8,
+        rd: u8,
+        via: CmpVia,
+    },
+    /// The same in method form (`a.ne(&b)`, `a.lt(&b)`): the receiver
+    /// is borrowed after `derefs` derefs; the argument is `&Rhs`.
+    TraitCmpMethod {
+        f: LocalDefId,
+        derefs: u8,
+        via: CmpVia,
+    },
+    /// `Ord::max`, `min`, or `clamp` by core's default bodies on a
+    /// receiver taken by value: compare with Self's `PartialOrd`
+    /// (`f` and `via` for a written impl, by structure when `f` is
+    /// None), move the answer out, and drop the other values.
+    OrdPick {
+        kind: OrdPickKind,
+        f: Option<LocalDefId>,
+        via: CmpVia,
+    },
+    /// A method of `core::cmp::Ordering` (`is_lt`, `reverse`, `then`,
+    /// and kin) on a receiver reached through `derefs` derefs:
+    /// lowering reads its variant and computes the answer.
+    OrderingOp {
+        kind: OrderingOpKind,
+        derefs: u8,
+    },
     /// A numeric `From::from` call, lowered as a cast to the
     /// call's type. Widening conversions only (checked).
     FromCast,
@@ -429,6 +467,43 @@ pub enum PrimCmpKind {
     Total(AdtId),
     /// `eq`/`ne`/`lt`/`le`/`gt`/`ge` -> `bool`, the binary comparison.
     Op(ast::BinOp),
+}
+
+/// How a written comparison method answers an operator or a
+/// default method (`Res::TraitCmp`, `Res::OrdPick`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpVia {
+    /// The impl's own method for the operator (`eq`, `ne`, `lt`,
+    /// `le`, `gt`, `ge`).
+    Direct,
+    /// `ne` by core's default body: the negated `eq`.
+    NotEq,
+    /// `lt`/`le`/`gt`/`ge` by core's default bodies: the impl's
+    /// `partial_cmp`, tested for `Some(Less)` and kin.
+    Partial(ast::BinOp),
+}
+
+/// Which `Ordering` method a `Res::OrderingOp` call computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderingOpKind {
+    IsEq,
+    IsNe,
+    IsLt,
+    IsGt,
+    IsLe,
+    IsGe,
+    Reverse,
+    Then,
+    /// `then_with(f)`: `f` is a closure called through `FnOnce`.
+    ThenWith,
+}
+
+/// Which `Ord` default method a `Res::OrdPick` call runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrdPickKind {
+    Max,
+    Min,
+    Clamp,
 }
 
 /// Which scalar operation a `Res::PrimOp` call computes.
@@ -1733,10 +1808,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if trait_def == lang.copy {
             is_copy(p, &self.tys, self_ty)
         } else if trait_def == lang.clone {
+            self.record_glue_reads(trait_def, self_ty);
             has_clone(p, &self.tys, self_ty)
         } else if trait_def == lang.debug {
             has_debug(p, &self.tys, self_ty)
         } else if trait_def == lang.partial_eq || trait_def == lang.eq {
+            self.record_glue_reads(trait_def, self_ty);
             has_eq(p, &self.tys, self_ty)
         } else if trait_def == lang.partial_ord {
             has_ord(p, &self.tys, self_ty)
@@ -1745,6 +1822,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         } else if trait_def == lang.hash {
             has_hash(p, &self.tys, self_ty)
         } else if trait_def == lang.default {
+            self.record_glue_reads(trait_def, self_ty);
             has_default(p, &self.tys, self_ty)
         } else {
             false
@@ -1792,92 +1870,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
-        let lang = &self.p.gx.lang;
-        let t = self.resolve(t);
-        if seen.contains(&t) {
-            return Some(true);
-        }
-        match self.tys.kind(t) {
-            TyKind::Error => Some(true),
-            TyKind::Infer(_) | TyKind::Projection(..) => None,
-            TyKind::Param(_) => {
-                let env = self.env();
-                Some(env.iter().any(|pred| {
-                    matches!(pred, Predicate::Trait(b) if b.value.def == trait_def
-                        && self.tys.args(b.value.args)[0].as_ty() == Some(t))
-                }))
-            }
-            TyKind::RawPtr(..) => Some(trait_def == lang.unpin),
-            // A dyn type has the auto traits its bounds name, plus the
-            // ones its principal's supertraits require (ARCH 2.7).
-            TyKind::Dyn(..) => {
-                let a = object::dyn_auto(self.p, &self.tys, t);
-                Some(if trait_def == lang.send {
-                    a.send
-                } else if trait_def == lang.sync {
-                    a.sync
-                } else {
-                    a.unpin
-                })
-            }
-            TyKind::Ref(_, m, e) => {
-                seen.push(t);
-                let need = if trait_def == lang.send && !m.is_mut() { lang.sync } else { trait_def };
-                if trait_def == lang.unpin {
-                    return Some(true);
-                }
-                self.auto_inner(need, e, seen)
-            }
-            TyKind::Slice(e) | TyKind::Array(e, _) => {
-                seen.push(t);
-                self.auto_inner(trait_def, e, seen)
-            }
-            TyKind::Tuple(ts) => {
-                seen.push(t);
-                let elems: Vec<Ty> = self.tys.tys_of(ts).to_vec();
-                let mut unknown = false;
-                for e in elems {
-                    match self.auto_inner(trait_def, e, seen) {
-                        Some(false) => return Some(false),
-                        None => unknown = true,
-                        _ => {}
-                    }
-                }
-                if unknown { None } else { Some(true) }
-            }
-            _ => {
-                if let Some(e) = self.tys.vec_elem(t).or_else(|| self.tys.option_elem(t)) {
-                    seen.push(t);
-                    return self.auto_inner(trait_def, e, seen);
-                }
-                if let Some((a, b)) = self.tys.result_args(t) {
-                    seen.push(t);
-                    let mut unknown = false;
-                    for e in [a, b] {
-                        match self.auto_inner(trait_def, e, seen) {
-                            Some(false) => return Some(false),
-                            None => unknown = true,
-                            _ => {}
-                        }
-                    }
-                    return if unknown { None } else { Some(true) };
-                }
-                if let Some(a) = self.tys.local_adt(t) {
-                    seen.push(t);
-                    let fields: Vec<Ty> = self.p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
-                    let mut unknown = false;
-                    for f in fields {
-                        match self.auto_inner(trait_def, f, seen) {
-                            Some(false) => return Some(false),
-                            None => unknown = true,
-                            _ => {}
-                        }
-                    }
-                    return if unknown { None } else { Some(true) };
-                }
-                Some(true)
-            }
-        }
+        let t = self.deep(t);
+        let env = self.env();
+        crate::check::collect::auto_structural(self.p, &mut self.tys, env, trait_def, t, seen)
     }
 
     /// Pushes the predicates of one instantiated item bound set:
@@ -4033,7 +4028,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
                     (UnOp::Not, k) if k.is_int_infer() => inner,
                     (_, TyKind::Error) => ERROR,
-                    _ => match self.trait_unop(e, *op, inner, d, span) {
+                    // A user operator impl answers for the operand type as
+                    // written (core's `Neg for &i32` and kin are scalar
+                    // only): `-&v` needs `impl Neg for &V`.
+                    _ => match self.trait_unop(e, *op, t, 0, span) {
                         Some(t) => t,
                         None => {
                             let tn = self.tn(t);
@@ -4204,7 +4202,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // Through the assignment trait, like the binary
                     // operators: a bound proves it in a template, the
                     // unique impl answers in an instance.
-                    if !rmut && self.trait_assign_op(e, *op, lt, rinner, rd, span) {
+                    // The right side as written (no peeled reference):
+                    // `a += &b` needs `impl AddAssign<&B> for A`.
+                    if !rmut && self.trait_assign_op(e, *op, lt, rt, 0, span) {
                         return UNIT;
                     }
                     let (a, b) = (self.tn(lt), self.tn(rt));
@@ -6366,6 +6366,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         match hits.len() {
             0 if default_glue && hit_traits.len() == 1 => {
+                self.record_glue_reads(p.gx.lang.default, base);
                 self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
                 self.set_res(callee, Res::DefaultVal);
                 self.set_res(e, Res::DefaultVal);
@@ -6393,6 +6394,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(ERROR)
             }
         }
+    }
+
+    /// Records the reads behind a structural answer of the derive
+    /// glue (`has_clone`, `has_default`): the layout of every Adt in
+    /// `t`, whose fingerprint covers derives, nested field types, and
+    /// the written impls the glue calls (`glue_methods`), so a warm
+    /// body rechecks when one of those changes (section 8.2; the
+    /// predicates themselves record nothing).
+    fn record_glue_reads(&mut self, _trait_def: DefId, t: Ty) {
+        let t = self.deep(t);
+        self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
     }
 
     /// `Default::default()` and `From::from(x)` written through the
@@ -7247,12 +7259,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::MemTake => {
                         let t = elem_of(self, 0);
                         let k = self.tys.kind(t);
+                        // The default glue builds any value `has_default`
+                        // accepts (derived `Default` included).
                         let ok = matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit)
                             || k.is_int_infer()
                             || k.is_float_infer()
-                            || self.tys.is_string_ty(t)
-                            || self.tys.vec_elem(t).is_some()
-                            || self.tys.option_elem(t).is_some();
+                            || (!matches!(k, TyKind::Param(_) | TyKind::Projection(..)) && has_default(self.p, &self.tys, t));
+                        if ok {
+                            self.record_glue_reads(self.p.gx.lang.default, t);
+                        }
                         if !ok {
                             self.errs.push(unsupported(span, "`mem::take` on this type"));
                         }
@@ -7503,6 +7518,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // Other types compare by structure when every part does
             // (strings, tuples, containers, derived impls): lowering
             // uses the `eq` and `cmp` glue for them.
+            self.record_glue_reads(p.gx.lang.partial_eq, base);
             let ok = match self.name(name) {
                 "partial_cmp" | "lt" | "le" | "gt" | "ge" => has_ord(p, &self.tys, base),
                 "cmp" => has_total_ord(p, &self.tys, base),
@@ -7653,6 +7669,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 None => builtin_only = true,
             }
         }
+        // The inherent methods of `core::cmp::Ordering` (no user
+        // impl can add inherent methods to it).
+        if let Some(ret) = self.ordering_method(e, base, derefs, name, name_span, args) {
+            return ret;
+        }
         // Generic and trait receivers go through the full 2.10
         // search (check/method.rs), which probes plain inherent
         // methods with the same recorded reads, in step+form
@@ -7751,6 +7772,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // `clone` on a reference to a non-Clone type clones the reference.
         if name == k.clone {
             if !has_clone(p, &self.tys, base) && derefs > 0 {
+                self.record_glue_reads(p.gx.lang.clone, base);
                 // Peel all but the last reference; the clone copies that reference.
                 let mut cur = self.resolve(rt);
                 for _ in 0..derefs - 1 {
@@ -7764,6 +7786,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return cur;
             }
             if has_clone(p, &self.tys, base) {
+                self.record_glue_reads(p.gx.lang.clone, base);
                 self.check_packed_borrow(recv, name_span);
                 self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs, autoref: Autoref::Ref });
                 self.check_args(&[], args, name_span);
@@ -8007,6 +8030,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::OptExpect, Autoref::None, vec![REF_STR], inner))
                 } else if name == k.unwrap_or {
                     Some((B::OptUnwrapOr, Autoref::None, vec![inner], inner))
+                } else if name == k.unwrap_or_default && has_default(p, &self.tys, inner) {
+                    // `T: Default`: the `default` glue builds the value
+                    // only on `None`.
+                    self.record_glue_reads(p.gx.lang.default, inner);
+                    Some((B::OptUnwrapOrDefault, Autoref::None, vec![], inner))
                 } else {
                     None
                 }
@@ -8081,6 +8109,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         method::Probe::Miss => {}
                     }
                 }
+                // `Ord::clamp` holds for every integer type.
+                if self.name(name) == "clamp"
+                    && let Some(ret) = self.ord_pick_method(e, recv, base, derefs, name, name_span, args)
+                {
+                    return ret;
+                }
                 self.err(
                     "L0111",
                     name_span,
@@ -8110,6 +8144,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         method::Probe::Failed => return ERROR,
                         method::Probe::Miss => {}
                     }
+                }
+                if let Some(ret) = self.lang_default_method(e, recv, base, derefs, name, name_span, args) {
+                    return ret;
                 }
                 for &a in args {
                     self.expr(a, None);
@@ -8532,6 +8569,238 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(self.normalize_here(out_var))
     }
 
+    /// A comparison operator through a written `PartialEq` or
+    /// `PartialOrd` impl (`l` and `r` are the operand types with the
+    /// same number of references peeled, as core's reference impls
+    /// forward): records `Res::TraitCmp`. None when no written impl
+    /// or bound applies; derived and core impls compare by structure
+    /// (`has_eq`, `has_ord`) before this runs.
+    #[allow(clippy::too_many_arguments)]
+    fn trait_cmp(&mut self, e: ExprId, op: BinOp, l: Ty, r: Ty, ld: u8, rd: u8, span: Span) -> Option<Ty> {
+        let lang = &self.p.gx.lang;
+        let trait_def = if matches!(op, BinOp::Eq | BinOp::Ne) { lang.partial_eq } else { lang.partial_ord };
+        let (f, via) = self.written_cmp_method(e, trait_def, op, l, r, span)?;
+        self.set_res(e, Res::TraitCmp { f, ld, rd, via });
+        Some(BOOL)
+    }
+
+    /// The method that answers comparison `op` between `l` and `r`
+    /// through `trait_def` (`PartialEq` or `PartialOrd`): a written
+    /// impl's own method for the operator, else the method core's
+    /// default body calls (`eq` for `ne`, `partial_cmp` for `lt` and
+    /// kin); in a template, the bound's stub. None for derived and
+    /// core impls (they compare by structure) and when nothing applies.
+    fn written_cmp_method(&mut self, e: ExprId, trait_def: DefId, op: BinOp, l: Ty, r: Ty, span: Span) -> Option<(LocalDefId, CmpVia)> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let direct = match op {
+            BinOp::Eq => "eq",
+            BinOp::Ne => "ne",
+            BinOp::Lt => "lt",
+            BinOp::Le => "le",
+            BinOp::Gt => "gt",
+            _ => "ge",
+        };
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(l), GenericArg::Ty(r)]);
+        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        match self.select_obligation_at(tr, span, 0) {
+            Selection::Impl { id, args: impl_args, .. } => {
+                let rec = p.gx.index.get(id).clone();
+                if rec.synthetic != Synthetic::None {
+                    return None;
+                }
+                let has = |n: &str| rec.items.iter().any(|d| p.local_def(d.hash).is_some_and(|f| p.name(p.fn_info(f).name) == n));
+                let (method, via) = if has(direct) {
+                    (direct, CmpVia::Direct)
+                } else if op == BinOp::Ne {
+                    ("eq", CmpVia::NotEq)
+                } else if op == BinOp::Eq {
+                    return None;
+                } else {
+                    ("partial_cmp", CmpVia::Partial(op))
+                };
+                let (f, _, _) = self.method_instance_for_impl(e, id, tr, impl_args, method, span)?;
+                Some((f, via))
+            }
+            Selection::ParamEvidence(i) if i != usize::MAX => {
+                let method_def = p.gx.index.trait_record(trait_def)?.method_by_name(p.interner.intern(direct))?;
+                let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+                Some((stub, CmpVia::Direct))
+            }
+            _ => None,
+        }
+    }
+
+    /// Core's default bodies of the comparison traits, for a method
+    /// call no impl method answers: `ne` through `eq` and `lt`/`le`/
+    /// `gt`/`ge` through `partial_cmp` of a written impl
+    /// (`Res::TraitCmpMethod`), and `Ord::max`/`min`/`clamp`
+    /// (`Res::OrdPick`), which compare with Self's `PartialOrd`. None
+    /// when another form or no impl applies (the caller reports the
+    /// missing method). `base` is the receiver after `derefs` derefs.
+    #[allow(clippy::too_many_arguments)]
+    fn lang_default_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        let p = self.p;
+        let lang = p.gx.lang;
+        let op = match self.name(name) {
+            "ne" => BinOp::Ne,
+            "lt" => BinOp::Lt,
+            "le" => BinOp::Le,
+            "gt" => BinOp::Gt,
+            "ge" => BinOp::Ge,
+            "max" | "min" | "clamp" => return self.ord_pick_method(e, recv, base, derefs, name, name_span, args),
+            _ => return None,
+        };
+        if args.len() != 1 || matches!(self.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Error) {
+            return None;
+        }
+        // The argument is `&Rhs`: its type names Rhs.
+        let at = self.expr(args[0], None);
+        let at = self.deep(at);
+        let TyKind::Ref(_, _, rhs) = self.kind(at) else { return None };
+        let rhs = self.deep(rhs);
+        let trait_def = if op == BinOp::Ne { lang.partial_eq } else { lang.partial_ord };
+        let (f, via) = self.written_cmp_method(e, trait_def, op, base, rhs, name_span)?;
+        let want = self.tys.mk_ref(false, rhs);
+        self.coerce_expr(args[0], at, want);
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::TraitCmpMethod { f, derefs, via });
+        Some(BOOL)
+    }
+
+    /// The inherent methods of `core::cmp::Ordering` lust computes in
+    /// lowering (`Res::OrderingOp`): `is_eq`, `is_ne`, `is_lt`,
+    /// `is_gt`, `is_le`, `is_ge`, `reverse`, and `then`. All take
+    /// `self` by value (`Ordering` is `Copy`). None for another
+    /// receiver, a user type named `Ordering`, or another name.
+    fn ordering_method(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        if self.tys.adt_parts(base).map(|(d, _)| d) != Some(generics::ordering_def()) {
+            return None;
+        }
+        use OrderingOpKind as K;
+        let kind = match self.name(name) {
+            "is_eq" => K::IsEq,
+            "is_ne" => K::IsNe,
+            "is_lt" => K::IsLt,
+            "is_gt" => K::IsGt,
+            "is_le" => K::IsLe,
+            "is_ge" => K::IsGe,
+            "reverse" => K::Reverse,
+            "then" => K::Then,
+            "then_with" => K::ThenWith,
+            _ => return None,
+        };
+        // A local trait method of the same name could apply to a
+        // reference receiver first, by rustc's probe order; that
+        // mix is not supported (a reject, never a guess).
+        let p = self.p;
+        if p.gx.traits_by_method.get(&name).is_some_and(|ts| ts.iter().any(|t| p.gx.index.trait_record(*t).is_some_and(|r| r.local))) {
+            for &a in args {
+                self.expr(a, None);
+            }
+            self.errs.push(not_yet("L0720", name_span, "a local trait method named like an `Ordering` method"));
+            return Some(ERROR);
+        }
+        let (params, ret) = match kind {
+            K::Reverse => (vec![], base),
+            K::Then => (vec![base], base),
+            // `F: FnOnce() -> Ordering`; lowering calls closures only.
+            K::ThenWith => {
+                let lang = p.gx.lang;
+                let f = self.new_var(false);
+                let unit_args = self.tys.intern_tys(&[]);
+                let unit = self.tys.intern(TyKind::Tuple(unit_args));
+                let args_id = self.tys.intern_args(&[GenericArg::Ty(f), GenericArg::Ty(unit)]);
+                self.obl.push(obligations::Obligation::Trait {
+                    trait_ref: TraitRef { def: lang.fn_once, args: args_id, bindings: EMPTY_BINDINGS },
+                    span: name_span,
+                    depth: 0,
+                });
+                if let Some(out) = lang.output_of(lang.fn_once) {
+                    self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc: out, trait_args: args_id, ty: base }, span: name_span });
+                }
+                (vec![f], base)
+            }
+            _ => (vec![], BOOL),
+        };
+        self.check_args(&params, args, name_span);
+        if kind == K::ThenWith
+            && let Some(&f) = params.first()
+        {
+            let at = self.deep(f);
+            if !matches!(self.kind(at), TyKind::Closure(..) | TyKind::Error | TyKind::Infer(_)) {
+                self.errs.push(not_yet("L0820", name_span, "`then_with` with an argument other than a closure"));
+                return Some(ERROR);
+            }
+        }
+        self.set_res(e, Res::OrderingOp { kind, derefs });
+        Some(ret)
+    }
+
+    /// `Ord::max`, `min`, and `clamp` by core's default bodies
+    /// (`Res::OrdPick`): Self must be `Ord`; the bodies compare with
+    /// `PartialOrd::lt` (`clamp`: `le`, `lt`, `gt`) on Self, through a
+    /// written impl's method or by structure. A written impl that
+    /// replaces several of those methods is not supported for
+    /// `clamp`. The receiver must be the value itself (no autoderef:
+    /// core's `Ord for &A` would answer a reference receiver).
+    #[allow(clippy::too_many_arguments)]
+    fn ord_pick_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let lang = p.gx.lang;
+        let kind = match self.name(name) {
+            "max" => OrdPickKind::Max,
+            "min" => OrdPickKind::Min,
+            _ => OrdPickKind::Clamp,
+        };
+        let n_args = if kind == OrdPickKind::Clamp { 2 } else { 1 };
+        let bk = self.kind(base);
+        let int_var = bk.is_int_infer();
+        if derefs != 0
+            || args.len() != n_args
+            || (!int_var && matches!(bk, TyKind::Param(_) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Error))
+        {
+            return None;
+        }
+        let _ = recv;
+        // An integer variable is `Ord` at every type it can take.
+        let ord_args = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        let ord_tr = TraitRef { def: lang.ord, args: ord_args, bindings: EMPTY_BINDINGS };
+        if !int_var && !matches!(self.select_obligation_at(ord_tr, name_span, 0), Selection::Impl { .. } | Selection::ParamEvidence(_)) {
+            return None;
+        }
+        self.record_glue_reads(lang.partial_ord, base);
+        let (f, via) = if has_ord(p, &self.tys, base) {
+            (None, CmpVia::Partial(BinOp::Lt))
+        } else {
+            let po_args = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(base)]);
+            let po = TraitRef { def: lang.partial_ord, args: po_args, bindings: EMPTY_BINDINGS };
+            let Selection::Impl { id, args: impl_args, .. } = self.select_obligation_at(po, name_span, 0) else { return None };
+            let rec = p.gx.index.get(id).clone();
+            if rec.synthetic != Synthetic::None {
+                return None;
+            }
+            let has = |n: &str| rec.items.iter().any(|d| p.local_def(d.hash).is_some_and(|f| p.name(p.fn_info(f).name) == n));
+            let (method, via) = if kind == OrdPickKind::Clamp {
+                if ["lt", "le", "gt", "ge"].iter().any(|m| has(m)) {
+                    return None;
+                }
+                ("partial_cmp", CmpVia::Partial(BinOp::Lt))
+            } else if has("lt") {
+                ("lt", CmpVia::Direct)
+            } else {
+                ("partial_cmp", CmpVia::Partial(BinOp::Lt))
+            };
+            let (f, _, _) = self.method_instance_for_impl(e, id, po, impl_args, method, name_span)?;
+            (Some(f), via)
+        };
+        let params = vec![base; n_args];
+        self.check_args(&params, args, name_span);
+        self.set_res(e, Res::OrdPick { kind, f, via });
+        Some(base)
+    }
+
     /// One unary operator through its operator trait, like
     /// `trait_binop` with no right side. The result type is the
     /// bound's `Output`, normalized.
@@ -8691,7 +8960,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !matches!(op, Eq | Ne) && self.ref_layers(lt) != self.ref_layers(rt) {
                 return bad(self);
             }
-            if ld != rd || !self.unify(lb, rb) {
+            if ld != rd {
+                return bad(self);
+            }
+            let snap = self.snapshot_vars();
+            if !self.unify(lb, rb) {
+                // Operands of two types compare only through a
+                // written impl (`impl PartialEq<u8> for P`).
+                self.rollback_vars(snap);
+                let (lb, rb) = (self.deep(lb), self.deep(rb));
+                if let Some(t) = self.trait_cmp(e, op, lb, rb, ld, rd, span) {
+                    return t;
+                }
                 return bad(self);
             }
             let lb = self.deep(lb);
@@ -8701,12 +8981,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ if matches!(op, Eq | Ne) => has_eq(self.p, &self.tys, lb),
                 _ => has_ord(self.p, &self.tys, lb),
             };
+            if !ok && let Some(t) = self.trait_cmp(e, op, lb, lb, ld, rd, span) {
+                return t;
+            }
+            // A structural answer depends on derives and on the written
+            // `eq` impls the glue calls: both are in the Adt layouts read.
+            if ok {
+                self.record_glue_reads(self.p.gx.lang.partial_eq, lb);
+            }
             if !ok {
                 let tn = self.tn(lb);
                 let fix = if matches!(op, Eq | Ne) {
                     "Add #[derive(PartialEq)] to the type."
                 } else {
-                    "Ordering is only supported for integers, floats, bool, char, strings, and tuples of those."
+                    "Add #[derive(PartialOrd)] to the type, or implement `PartialOrd` for it."
                 };
                 self.err("L0112", span, format!("type `{tn}` cannot be compared with `{}`", op.symbol()), fix);
             }
@@ -8729,9 +9017,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
         // Operator traits on non-scalars (section 2.5): the
         // builtin scalar path above stays first, as ARCH requires.
-        if !int_like(lik)
-            && !matches!(lik, TyKind::Bool)
-            && let Some(t) = self.trait_binop(e, op, li, ri, ld, rd, span)
+        // A scalar left side with a user type on the right (`2 * v`
+        // through `impl Mul<V> for i32`) also goes through the trait.
+        let user_rhs = self.tys.local_adt(self.resolve(ri)).is_some();
+        if (user_rhs || (!int_like(lik) && !matches!(lik, TyKind::Bool)))
+            && let Some(t) = self.trait_binop(e, op, lt, rt, 0, 0, span)
         {
             return t;
         }
@@ -13160,6 +13450,27 @@ impl<'p> SolveCx for Ctx<'p, '_> {
     }
     fn closure_output(&mut self, assoc: DefId, self_ty: Ty) -> Option<Ty> {
         self.closure_output_impl(assoc, self_ty)
+    }
+    fn structural(&mut self, tr: TraitRef) -> Option<bool> {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        let self_ty = self.tys.args(tr.args).first().and_then(|g| g.as_ty())?;
+        let self_ty = self.deep(self_ty);
+        if matches!(self.kind(self_ty), TyKind::Infer(_)) {
+            return None;
+        }
+        if tr.def == lang.sized {
+            return Some(self.sized_ok(self_ty));
+        }
+        if lang.is_auto(tr.def) {
+            return self.auto_holds(tr.def, self_ty);
+        }
+        if p.gx.index.derive_family.contains(&tr.def)
+            && matches!(self.kind(self_ty), TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::Closure(..))
+        {
+            return Some(self.derive_query_holds(tr.def, self_ty));
+        }
+        None
     }
     fn record_impl_set(&mut self, trait_def: DefId, self_ty: Ty, _failed: bool) {
         let p = self.p;

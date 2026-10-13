@@ -944,18 +944,9 @@ fn predicted_def_ids(
     }
     fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Static(_)));
     // Collect also numbers the synthetic `core::cmp::Ordering` Adt
-    // (check/collect.rs pass 1) unless a user type, alias, or trait
-    // of that name shadows it: predict the same extra hash.
-    let ordering_taken = ast.items.iter().any(|item| match &item.kind {
-        ItemKind::Struct(s) => interner.get(s.name) == "Ordering",
-        ItemKind::Enum(e) => interner.get(e.name) == "Ordering",
-        ItemKind::Trait(t) => interner.get(t.name) == "Ordering",
-        ItemKind::Type(a) => interner.get(a.name) == "Ordering",
-        _ => false,
-    });
-    if !ordering_taken {
-        adt_hashes.push(crate::check::generics::ordering_def().hash);
-    }
+    // (check/collect.rs pass 1), always (a user type of that name only
+    // shadows its flat name): predict the same extra hash.
+    adt_hashes.push(crate::check::generics::ordering_def().hash);
     let to_map = |hashes: &[crate::def::DefPathHash], ranks: Vec<u32>| -> FxMap<crate::def::DefPathHash, u32> {
         hashes.iter().copied().zip(ranks).collect()
     };

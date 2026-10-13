@@ -545,6 +545,11 @@ pub fn resolve_ty(
                     let n = interner.get(segs.last().unwrap().name);
                     return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
                 }
+                // `std::cmp::Ordering` is the core enum even where a
+                // user type named `Ordering` owns the flat name.
+                if path[1..] == ["cmp", "Ordering"] && !segs[2].has_args() {
+                    return Ok(generics::ordering_ty(tys));
+                }
                 segs.last().unwrap()
             } else if segs.len() == 1 {
                 &segs[0]
@@ -1506,14 +1511,14 @@ pub fn collect_reuse<'a>(
     // are the plain enum machinery). It takes part in the same stable
     // ranking as user Adts (the driver predicts the same set: see
     // `predicted_def_ids`). A user type, alias, or trait of the same
-    // name shadows it in the flat name table, as with any name here.
+    // name shadows it in the flat name table, as with any name here;
+    // the Adt itself always exists, so `cmp`, `partial_cmp`, and the
+    // full `std::cmp::Ordering` paths still name the core type.
     let ordering_name = interner.intern("Ordering");
     let ordering_taken = adt_srcs.iter().any(|s| s.1 == ordering_name)
         || p.gx.trait_names.contains_key(&ordering_name)
         || ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Type(a) if a.name == ordering_name));
-    if !ordering_taken {
-        adt_srcs.push((usize::MAX, ordering_name, Span::default(), true, generics::ordering_def().hash));
-    }
+    adt_srcs.push((usize::MAX, ordering_name, Span::default(), true, generics::ordering_def().hash));
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -1564,7 +1569,9 @@ pub fn collect_reuse<'a>(
                 repr: crate::ty::layout::Repr::default(),
             };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            p.type_names.insert(name, id);
+            if !ordering_taken {
+                p.type_names.insert(name, id);
+            }
             p.tys.register_adt(def, id);
             p.defs.insert_adt(def, id, DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span));
             p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
@@ -1825,9 +1832,8 @@ pub fn collect_reuse<'a>(
                 )),
             }
         }
-        if d.copy && !d.clone {
-            errs.push(Diag::new("L0112", p.adts[id.0 as usize].span, "deriving Copy requires Clone", "Add Clone to the derive list."));
-        }
+        // `Copy` needs a `Clone` impl, derived or written: checked in
+        // finish_collect (`check_derive_bounds`), once impls exist.
         // `#[default]` variants (rustc's rules): only with a `Default`
         // derive, exactly one per enum, and only on a unit variant.
         if let ItemKind::Enum(e) = &item.kind {
@@ -2048,18 +2054,14 @@ pub fn collect_reuse<'a>(
                 // are pure, so skipping the others changes no result.
                 let mut checks: [(bool, &str); 4] = [(true, ""); 4];
                 let mut n_checks = 0;
-                if d.clone {
-                    checks[n_checks] = (has_clone(&p, &p.tys, f.ty), "Clone");
-                    n_checks += 1;
-                }
+                // `Clone` fields are checked in finish_collect
+                // (`check_derive_bounds`): a field type with a written
+                // `Clone` impl needs the impl index first.
                 if d.copy {
                     checks[n_checks] = (is_copy(&p, &p.tys, f.ty), "Copy");
                     n_checks += 1;
                 }
-                if d.partial_eq {
-                    checks[n_checks] = (has_eq(&p, &p.tys, f.ty), "PartialEq");
-                    n_checks += 1;
-                }
+                // `PartialEq` fields are checked in finish_collect too.
                 if d.debug {
                     checks[n_checks] = (has_debug(&p, &p.tys, f.ty), "Debug");
                     n_checks += 1;
@@ -3408,13 +3410,18 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_clone(p, tys, t, &mut Vec::new())
+}
+
+/// The walk behind `has_clone`; `seen` stops recursive generic types.
+fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => return env_proves(tys, t, p.gx.lang.clone, None),
-        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| has_clone(p, tys, e)),
+        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| glue_clone(p, tys, e, seen)),
         // A closure is Clone when its captures are; only the Copy
         // case is supported (a clone of a closure is a copy then).
         TyKind::Closure(..) => return is_copy(p, tys, t),
-        TyKind::Array(e, _) => return has_clone(p, tys, e),
+        TyKind::Array(e, _) => return glue_clone(p, tys, e, seen),
         _ => {}
     }
     if tys.is_string_ty(t) {
@@ -3424,16 +3431,18 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         return true;
     }
     if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
-        return has_clone(p, tys, e);
+        return glue_clone(p, tys, e, seen);
     }
     if let Some((a, b)) = tys.result_args(t) {
-        return has_clone(p, tys, a) && has_clone(p, tys, b);
+        return glue_clone(p, tys, a, seen) && glue_clone(p, tys, b, seen);
     }
     match tys.local_adt(t) {
         Some(a) => {
-            p.adt(a).derives.clone
-                && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
-                    || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_clone(p, tys, f.ty))))
+            // A written non-generic impl: the glue calls its method.
+            if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
+                return true;
+            }
+            p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_clone(p, tys, f, seen))
         }
         None => is_copy(p, tys, t),
     }
@@ -3503,6 +3512,22 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
     }
 }
 
+/// True when `ok` holds for every field type of a materialized
+/// generic Adt instance `a` (type `t`); a non-generic Adt or a
+/// template answers true (collect checked the derive's fields, and
+/// a template's instances answer for themselves). `seen` stops
+/// recursion through recursive generic types.
+fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+    let instance = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
+    if !instance || seen.contains(&t) {
+        return true;
+    }
+    seen.push(t);
+    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen)));
+    seen.pop();
+    all
+}
+
 /// True when `ok` holds for every field type of Adt `a` (the Adt of
 /// type `t`), or when the fields are a generic template's (a template
 /// body: its instances answer with their own substituted fields).
@@ -3517,6 +3542,110 @@ fn adt_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn
     let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen)));
     seen.pop();
     all
+}
+
+/// An auto trait (`Send`, `Sync`, `Unpin`) of `t` by structure (ARCH
+/// 2.7), shared by body checks (`Ctx::auto_holds`, on resolved
+/// types) and collect-time proofs: a parameter answers from `env`,
+/// references and raw pointers by the fixed table, compound types
+/// and Adts through their parts (a generic Adt's fields substituted
+/// with this application's args), closures through their captures,
+/// `dyn` through its bounds, and the builtin std types by std's own
+/// impls (`Rc` and `env::Args` are neither Send nor Sync; `Vec`,
+/// `Box`, and `Rc` are Unpin for every element type). None when an
+/// inference variable, a projection, or another form leaves it open.
+/// `seen` holds the types on the walk: a cycle counts as holding.
+pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
+    let lang = &p.gx.lang;
+    if seen.contains(&t) {
+        return Some(true);
+    }
+    let all = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<Ty>| -> Option<bool> {
+        let mut unknown = false;
+        for e in parts {
+            match auto_structural(p, tys, env, trait_def, e, seen) {
+                Some(false) => return Some(false),
+                None => unknown = true,
+                _ => {}
+            }
+        }
+        if unknown { None } else { Some(true) }
+    };
+    match tys.kind(t) {
+        TyKind::Error => Some(true),
+        TyKind::Infer(_) | TyKind::Projection(..) => None,
+        TyKind::Param(_) => Some(env.iter().any(|pred| {
+            matches!(pred, Predicate::Trait(b) if b.value.def == trait_def && tys.args(b.value.args)[0].as_ty() == Some(t))
+        })),
+        TyKind::RawPtr(..) => Some(trait_def == lang.unpin),
+        TyKind::Dyn(..) => {
+            let a = crate::check::object::dyn_auto(p, tys, t);
+            Some(if trait_def == lang.send {
+                a.send
+            } else if trait_def == lang.sync {
+                a.sync
+            } else {
+                a.unpin
+            })
+        }
+        TyKind::Ref(_, m, e) => {
+            if trait_def == lang.unpin {
+                return Some(true);
+            }
+            seen.push(t);
+            // `&T: Send` needs `T: Sync`; every other pair keeps the trait.
+            let need = if trait_def == lang.send && !m.is_mut() { lang.sync } else { trait_def };
+            auto_structural(p, tys, env, need, e, seen)
+        }
+        TyKind::Slice(e) | TyKind::Array(e, _) => {
+            seen.push(t);
+            auto_structural(p, tys, env, trait_def, e, seen)
+        }
+        TyKind::Tuple(ts) => {
+            seen.push(t);
+            let elems = tys.tys_of(ts).to_vec();
+            all(tys, elems, seen)
+        }
+        TyKind::Closure(_, a) => {
+            seen.push(t);
+            let caps = closure_fields(tys, a);
+            all(tys, caps, seen)
+        }
+        TyKind::Int(_)
+        | TyKind::Float(_)
+        | TyKind::Bool
+        | TyKind::Char
+        | TyKind::Unit
+        | TyKind::Str
+        | TyKind::Never
+        | TyKind::FnDef(..)
+        | TyKind::FnPtr(_) => Some(true),
+        _ => {
+            match tys.builtin_of(t) {
+                Some(BuiltinTy::String) | Some(BuiltinTy::Chars) => return Some(true),
+                Some(BuiltinTy::Args) | Some(BuiltinTy::Rc) => return Some(trait_def == lang.unpin),
+                Some(BuiltinTy::Vec) | Some(BuiltinTy::Boxed) if trait_def == lang.unpin => return Some(true),
+                _ => {}
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
+                seen.push(t);
+                return auto_structural(p, tys, env, trait_def, e, seen);
+            }
+            if let Some((a, b)) = tys.result_args(t) {
+                seen.push(t);
+                return all(tys, vec![a, b], seen);
+            }
+            if let Some(a) = tys.local_adt(t) {
+                seen.push(t);
+                let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                let fields: Vec<Ty> =
+                    raw.into_iter().map(|f| if args.is_empty() || !tys.flags(f).contains_param() { f } else { subst(tys, f, &args) }).collect();
+                return all(tys, fields, seen);
+            }
+            None
+        }
+    }
 }
 
 /// True when `t` implements `Hash` by structure: scalars other than
@@ -3583,6 +3712,10 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
             }
             match tys.local_adt(t) {
                 Some(a) => {
+                    // A written non-generic impl: the glue calls its method.
+                    if p.gx.glue_methods.contains_key(&(a, p.gx.lang.default)) {
+                        return true;
+                    }
                     let adt = p.adt(a);
                     if !adt.derives.default {
                         return false;
@@ -3597,6 +3730,11 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
 }
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_eq(p, tys, t, &mut Vec::new())
+}
+
+/// The walk behind `has_eq`; `seen` stops recursive generic types.
+fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_eq, Some(t)),
         // Fn pointers compare by address in Rust; fn items do not.
@@ -3604,25 +3742,23 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
-        TyKind::Ref(_, _, e) => has_eq(p, tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_eq(p, tys, e)),
-        TyKind::Array(e, _) | TyKind::Slice(e) => has_eq(p, tys, e),
+        TyKind::Ref(_, _, e) => glue_eq(p, tys, e, seen),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_eq(p, tys, e, seen)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => glue_eq(p, tys, e, seen),
         _ => {
             if tys.is_string_ty(t) {
                 return true;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
-                return has_eq(p, tys, e);
+                return glue_eq(p, tys, e, seen);
             }
             if let Some((a, b)) = tys.result_args(t) {
-                return has_eq(p, tys, a) && has_eq(p, tys, b);
+                return glue_eq(p, tys, a, seen) && glue_eq(p, tys, b, seen);
             }
             match tys.local_adt(t) {
-                Some(a) => {
-                    p.adt(a).derives.partial_eq
-                        && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
-                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_eq(p, tys, f.ty))))
-                }
+                // A written non-generic impl: the glue calls its `eq`.
+                Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
+                Some(a) => p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_eq(p, tys, f, seen)),
                 None => false,
             }
         }
@@ -3630,30 +3766,31 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_debug(p, tys, t, &mut Vec::new())
+}
+
+/// The walk behind `has_debug`; `seen` stops recursive generic types.
+fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
-        TyKind::Ref(_, _, e) => has_debug(p, tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_debug(p, tys, e)),
-        TyKind::Array(e, _) | TyKind::Slice(e) => has_debug(p, tys, e),
+        TyKind::Ref(_, _, e) => glue_debug(p, tys, e, seen),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => glue_debug(p, tys, e, seen),
         _ => {
             if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::Args) {
                 return true;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
-                return has_debug(p, tys, e);
+                return glue_debug(p, tys, e, seen);
             }
             if let Some((a, b)) = tys.result_args(t) {
-                return has_debug(p, tys, a) && has_debug(p, tys, b);
+                return glue_debug(p, tys, a, seen) && glue_debug(p, tys, b, seen);
             }
             match tys.local_adt(t) {
-                Some(a) => {
-                    p.adt(a).derives.debug
-                        && (p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
-                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| has_debug(p, tys, f.ty))))
-                }
+                Some(a) => p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_debug(p, tys, f, seen)),
                 None => false,
             }
         }

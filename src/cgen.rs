@@ -2738,6 +2738,20 @@ impl FnGen<'_, '_, '_> {
                 }
                 variant_field(self.p, &tys[0], &t, 1, 0)
             }
+            B::OptUnwrapOrDefault => {
+                let CTy::Option(inner) = &tys[0] else { unreachable!() };
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = {};", ctype(&tys[0]), vals[0]);
+                let disc = disc_call(self.p, &tys[0], &format!("(&{t})"));
+                let d = match &**inner {
+                    CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(self.p, inner),
+                    other => {
+                        self.want(Glue::Default, other);
+                        format!("default_{}()", mangle(other))
+                    }
+                };
+                format!("({disc} ? {} : {d})", variant_field(self.p, &tys[0], &t, 1, 0))
+            }
             B::OptUnwrapOr => {
                 let CTy::Option(inner) = &tys[0] else { unreachable!() };
                 let (t, d) = (self.tmp(), self.tmp());
@@ -4959,6 +4973,21 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
     out.push('\n');
 }
 
+/// The body of a glue fn that returns what written impl method `f`
+/// returns for `args` (the method's C arguments, comma separated),
+/// called through the fn table with the large-return out pointer
+/// when the method uses one (see `FnGen::call_value`).
+fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str) -> String {
+    let callee = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize]);
+    if ret_is_large(p, f) {
+        let ret = ctype(&cty(&p.tys, p.fn_info(f).ret));
+        let pre = if args.is_empty() { String::new() } else { format!(", {args}") };
+        format!("  {ret} r; {callee}(&r{pre});\n  return r;\n")
+    } else {
+        format!("  return {callee}({args});\n")
+    }
+}
+
 fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, defs: &mut String, more: &mut Vec<(Glue, CTy)>) {
     let m = mangle(t);
     let ct = ctype(t);
@@ -5083,14 +5112,25 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
         }
         Glue::Clone => {
             let _ = writeln!(protos, "{ct} clone_{m}({ct} *p);");
+            // A field type with a written `Clone` impl clones through
+            // that impl even when it is `Copy` (rustc's derived bodies
+            // call `Clone::clone` on each field).
+            let written = |t: &CTy| matches!(t, CTy::Adt(a) if p.gx.glue_methods.contains_key(&(*a, p.gx.lang.clone)));
             let clone_of = |t: &CTy, e: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
-                if is_copy_c(p, t) {
+                if is_copy_c(p, t) && !written(t) {
                     e.to_string()
                 } else {
                     need(Glue::Clone, t);
                     format!("clone_{}(&{e})", mangle(t))
                 }
             };
+            if let CTy::Adt(a) = t
+                && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.clone))
+            {
+                let call = written_glue_call(p, slots, f, "p");
+                let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n{call}}}\n");
+                return;
+            }
             match t {
                 CTy::String => body.push_str("  return lust_string_clone(p);\n"),
                 CTy::Boxed(e) => {
@@ -5179,6 +5219,13 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
         }
         Glue::Eq => {
             let _ = writeln!(protos, "uint8_t eq_{m}({ct} *a, {ct} *b);");
+            if let CTy::Adt(adt_id) = t
+                && let Some(&f) = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_eq))
+            {
+                let call = written_glue_call(p, slots, f, "a, b");
+                let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{call}}}\n");
+                return;
+            }
             let eq_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
                     CTy::Unit => "1".into(),
@@ -5389,6 +5436,13 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
         }
         Glue::Default => {
             let _ = writeln!(protos, "{ct} default_{m}(void);");
+            if let CTy::Adt(a) = t
+                && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.default))
+            {
+                let call = written_glue_call(p, slots, f, "");
+                let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
+                return;
+            }
             let def_of = |t: &CTy, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
                     CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(p, t),

@@ -406,7 +406,14 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
             vec![],
             &["partial_cmp", "lt", "le", "gt", "ge"],
         ),
-        rec(lang.ord, "Ord", 0, vec![self_pred(tys, lang.eq, &[]), self_pred(tys, lang.partial_ord, &[0])], vec![], &["cmp"]),
+        rec(
+            lang.ord,
+            "Ord",
+            0,
+            vec![self_pred(tys, lang.eq, &[]), self_pred(tys, lang.partial_ord, &[0])],
+            vec![],
+            &["cmp", "max", "min", "clamp"],
+        ),
         rec(lang.hash, "Hash", 0, vec![], vec![], &["hash"]),
         rec(lang.default, "Default", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["default"]),
         rec(lang.drop, "Drop", 0, vec![], vec![], &["drop"]),
@@ -582,6 +589,12 @@ pub fn lang_method_sigs(
                 }
                 (d, "cmp") if d == lang.ord => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None }
+                }
+                (d, "max" | "min") if d == lang.ord => {
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0, p0], ret: p0, ret_borrows_from: None }
+                }
+                (d, "clamp") if d == lang.ord => {
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0, p0, p0], ret: p0, ret_borrows_from: None }
                 }
                 (d, "len") if d == lang.exact_size_iterator => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: USIZE, ret_borrows_from: None }
@@ -1564,6 +1577,11 @@ fn resolve_path_ty(
                 let n = interner.get(segs.last().unwrap().name);
                 return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
             }
+            // `std::cmp::Ordering` is the core enum even where a user
+            // type named `Ordering` owns the flat name.
+            if path[1..] == ["cmp", "Ordering"] && !segs[2].has_args() {
+                return Ok(ordering_ty(tys));
+            }
         } else {
             return Err(not_yet("L0505", span, "module paths in types"));
         }
@@ -2279,6 +2297,13 @@ pub struct GenTables<'a> {
     /// The `Drop::drop` instance to call for one concrete Adt,
     /// for cgen's drop glue (iface: W-CGEN reads this).
     pub drop_methods: FxMap<AdtId, LocalDefId>,
+    /// The written `Clone::clone`, `Default::default`, and
+    /// `PartialEq::eq` methods of non-generic impls on non-generic
+    /// local Adts, by (Adt, trait):
+    /// derived glue calls them for a field of that type, as rustc's
+    /// derived bodies call the field type's impl (iface: W-CGEN
+    /// reads this, like `drop_methods`).
+    pub glue_methods: FxMap<(AdtId, DefId), LocalDefId>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -2360,6 +2385,7 @@ impl Default for GenTables<'_> {
             inherent_self_pats: FxMap::default(),
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
+            glue_methods: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
@@ -2425,6 +2451,10 @@ pub fn init_lang(p: &mut Program) {
         }
         p.gx.index.insert_trait(rec);
     }
+    let lang = p.gx.lang;
+    p.gx.index.structural = vec![lang.sized, lang.send, lang.sync, lang.unpin];
+    p.gx.index.derive_family =
+        vec![lang.copy, lang.clone, lang.debug, lang.partial_eq, lang.eq, lang.partial_ord, lang.ord, lang.hash, lang.default];
 }
 
 /// How many type/const parameters an AST generics list declares
@@ -3150,6 +3180,9 @@ pub fn finish_trait_impl(
                 Ok(got) => {
                     let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
                     let want = subst(&mut p.tys, want, &args);
+                    // `Self::A` in the declared type is this impl's
+                    // binding for `A` (as for method signatures).
+                    let want = rewrite_impl_projections(p, want, &assoc_tys);
                     if got != want {
                         errs.push(Diag::new(
                             "L0110",
@@ -3201,7 +3234,9 @@ pub fn finish_trait_impl(
     {
         let rec_scoped = p.gx.index.get(impl_id).clone();
         let is_local = |d: DefId| d.krate == p.krate;
-        if !p.gx.index.orphan_ok(&p.tys, &rec_scoped, &[], &is_local) {
+        // `Box` is fundamental: `Box<Local>` counts as local.
+        let fundamental = [p.tys.builtins().boxed];
+        if !p.gx.index.orphan_ok(&p.tys, &rec_scoped, &fundamental, &is_local) {
             errs.push(Diag::new(
                 "L0616",
                 imp.span,
@@ -5146,8 +5181,7 @@ pub fn append_trait_default_templates(p: &mut Program) {
 /// are used). A goal the solver can only defer counts as not
 /// proved: at collect the bound must be in the env or in an impl.
 fn prove_trait_ref(
-    index: &crate::traits::ImplIndex,
-    lang: &LangTraits,
+    p: &Program,
     solver: &mut crate::traits::solve::Solver,
     cx: &mut crate::traits::solve::PureCx,
     env: &[Predicate],
@@ -5155,15 +5189,21 @@ fn prove_trait_ref(
     depth: u32,
 ) -> bool {
     use crate::traits::solve::Selection;
+    let (index, lang) = (&p.gx.index, &p.gx.lang);
     if depth > 24 {
         return false;
     }
-    if tr.def == lang.sized || lang.is_auto(tr.def) {
+    if tr.def == lang.sized {
         return true;
+    }
+    // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
+    if lang.is_auto(tr.def) {
+        let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
+        return crate::check::collect::auto_structural(p, &mut cx.tys, env, tr.def, t, &mut Vec::new()) == Some(true);
     }
     match solver.select(cx, index, env, tr) {
         Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
-            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(index, lang, solver, cx, env, b.value, depth + 1),
+            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1),
             _ => true,
         }),
         Selection::ParamEvidence(_) => true,
@@ -5207,7 +5247,7 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
 fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {
     let mut cx = crate::traits::solve::PureCx::new(&p.tys);
     let mut solver = crate::traits::solve::Solver::new();
-    prove_trait_ref(&p.gx.index, &p.gx.lang, &mut solver, &mut cx, env, tr, 0)
+    prove_trait_ref(p, &mut solver, &mut cx, env, tr, 0)
 }
 
 /// The obligations one written impl owes its trait: the trait's
@@ -5385,6 +5425,62 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// Fills `glue_methods`: the written `Clone`, `Default`, and
+/// `PartialEq` (with `Rhs = Self` and no `ne` of its own) methods
+/// derived glue may call. Only non-generic impls on non-generic
+/// local Adts qualify (their method is a plain fn with a slot); a
+/// field type with any other written impl keeps the derive rejected
+/// where it is used.
+fn compute_glue_methods(p: &mut Program) {
+    use crate::traits::index::Synthetic;
+    let lang = p.gx.lang;
+    let mut out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
+    for (_, rec) in p.gx.index.all_impls() {
+        if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
+            continue;
+        }
+        let name = if rec.trait_def == lang.clone {
+            "clone"
+        } else if rec.trait_def == lang.default {
+            "default"
+        } else if rec.trait_def == lang.partial_eq {
+            "eq"
+        } else {
+            continue;
+        };
+        let self_ty = rec.self_ty(&p.tys);
+        let TyKind::Adt(d, args) = p.tys.kind(self_ty) else { continue };
+        if args != EMPTY_ARGS {
+            continue;
+        }
+        let Some(a) = p.tys.local_adt_of(d) else { continue };
+        // A `Copy` type with a written `Clone`: core and derived code
+        // copy it in some places and call its `clone` in others; the
+        // glue does not model that, so such a field stays rejected.
+        if rec.trait_def == lang.clone
+            && (p.adt(a).derives.copy
+                || p.gx.index.impls_of_trait(lang.copy).iter().any(|&id| p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)) == TyKind::Adt(d, EMPTY_ARGS)))
+        {
+            continue;
+        }
+        let has = |n: &str| rec.items.iter().any(|&m| p.local_def(m.hash).is_some_and(|l| p.name(p.fn_info(l).name) == n));
+        // `PartialEq` with `Rhs = Self` and core's `ne`: the eq glue
+        // answers `!=` as `!eq`, which is then exactly core's default.
+        if rec.trait_def == lang.partial_eq
+            && (has("ne") || p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()) != Some(self_ty))
+        {
+            continue;
+        }
+        let found = rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == name));
+        let Some(f) = found else { continue };
+        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            continue;
+        }
+        out.insert((a, rec.trait_def), f);
+    }
+    p.gx.glue_methods = out;
+}
+
 /// The derived traits that need more than the field checks in
 /// collect (rustc E0277 for the generated impls): `Eq` needs
 /// `PartialEq` on the type, `PartialOrd` needs `PartialEq`, `Ord`
@@ -5404,6 +5500,50 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
             let a = p.adt(adt_id);
             (a.derives, a.span, a.is_enum, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
         };
+        // Derived `Copy` needs a `Clone` impl on the type, derived or
+        // written; derived `Clone` needs every field to clone by
+        // structure or through a written non-generic impl the glue
+        // can call (`glue_methods`). Generic fields carry the bound
+        // on the synthetic impl instead (checked per instance).
+        if derives.copy {
+            let has_clone_impl = derives.clone
+                || p.gx.index.impls_of_trait(lang.clone).iter().any(|&id| {
+                    matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def)
+                });
+            if !has_clone_impl {
+                errs.push(Diag::new("L0112", span, "deriving Copy requires Clone", "Add Clone to the derive list."));
+            }
+        }
+        if derives.partial_eq {
+            for &ft in &field_tys {
+                if p.tys.flags(ft).contains_param() || crate::check::collect::has_eq(p, &p.tys, ft) {
+                    continue;
+                }
+                let tn = crate::check::collect::ty_name(p, &p.tys, ft);
+                errs.push(Diag::new(
+                    "L0112",
+                    span,
+                    format!("cannot derive PartialEq: field type `{tn}` does not implement PartialEq"),
+                    "Derive PartialEq on the field type too, or remove PartialEq from the derive list.",
+                ));
+                break;
+            }
+        }
+        if derives.clone {
+            for &ft in &field_tys {
+                if p.tys.flags(ft).contains_param() || crate::check::collect::has_clone(p, &p.tys, ft) {
+                    continue;
+                }
+                let tn = crate::check::collect::ty_name(p, &p.tys, ft);
+                errs.push(Diag::new(
+                    "L0112",
+                    span,
+                    format!("cannot derive Clone: field type `{tn}` does not implement Clone"),
+                    "Derive Clone on the field type too, or remove Clone from the derive list.",
+                ));
+                break;
+            }
+        }
         if !(derives.eq || derives.hash || derives.partial_ord || derives.ord || derives.default) {
             continue;
         }
@@ -5652,6 +5792,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
     add_synthetic_impls(p);
+    compute_glue_methods(p);
     // Dyn compatibility needs the finished trait tables; the dyn
     // type checks over signatures run before mono builds vtables.
     p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
@@ -5664,9 +5805,10 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;
     let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];
-    // No fundamental Adts exist yet (`Box` and `Pin` are not
-    // supported types); the reference wrappers are structural.
-    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &by_construction, &is_local);
+    // `Box` is the one fundamental Adt lust has (`Pin` is not a
+    // supported type); the reference wrappers are structural.
+    let fundamental = [p.tys.builtins().boxed];
+    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local);
     for (_, later) in pairs {
         let rec = p.gx.index.get(later);
         let trait_name = p.gx.index.trait_record(rec.trait_def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));

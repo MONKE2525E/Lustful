@@ -265,6 +265,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CharsBytesLeft,
     Builtin::CharsNextBack,
     Builtin::DefaultGlue,
+    Builtin::OptUnwrapOrDefault,
 ];
 
 /// How a builtin is called.
@@ -526,6 +527,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::CharsBytesLeft => (&["str::Chars"], vec![i.intern("size_hint")], Call::Method),
         B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
         B::DefaultGlue => (&["any Default type"], vec![k.default], Call::Associated),
+        B::OptUnwrapOrDefault => (&["Option<T>"], vec![k.unwrap_or_default], Call::Method),
     }
 }
 

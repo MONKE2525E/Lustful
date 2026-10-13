@@ -429,6 +429,7 @@ known_syms!(
     make_mut,
     try_unwrap,
     default,
+    unwrap_or_default,
 );
 
 impl Known {

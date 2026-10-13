@@ -1,7 +1,7 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, MacroKind, Pat, PatId, Stmt};
 use crate::check::collect::*;
-use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, PrimCmpKind, PrimOpKind, Res};
+use crate::check::{Autoref, BindMode, Builtin, Checked, CmpVia, Coerce, OrdPickKind, OrderingOpKind, PatRes, PrimCmpKind, PrimOpKind, Res};
 use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
@@ -967,8 +967,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                     }
                     Res::Builtin(Builtin::MemTake) => {
                         // Check limited `take` to types whose `Default`
-                        // value is one of the synthesized forms below:
-                        // fill a slot with it, then byte-replace.
+                        // value is one of the forms below (or the
+                        // default glue): fill a slot with it, then
+                        // byte-replace.
                         let slot = self.temp(ty);
                         match self.kind(ty) {
                             TyKind::Int(it) => self.assign(Place::local(slot), Rvalue::Use(Operand::Const(Const::Int(0, it))), span),
@@ -982,7 +983,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                             _ if self.body.tys.vec_elem(ty).is_some() => {
                                 self.assign(Place::local(slot), Rvalue::VecLit(self.peel_vec(ty), Vec::new()), span)
                             }
-                            _ => self.assign(Place::local(slot), Rvalue::Opt(ty, None), span),
+                            _ if self.body.tys.option_elem(ty).is_some() => self.assign(Place::local(slot), Rvalue::Opt(ty, None), span),
+                            // Every other type the checker allowed has
+                            // its value in the default glue.
+                            _ => self.call_into(CallTarget::Builtin(Builtin::DefaultGlue), Vec::new(), Place::local(slot), span),
                         }
                         let fill = self.operand_from(Place::local(slot), ty);
                         let mut ops = ops;
@@ -1840,6 +1844,262 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// Calls a written comparison method `f` on the borrowed sides `a`
+    /// and `b` and writes the answer `via` asks for into `out`: the
+    /// method's own `bool`, its negation (`ne` through `eq`), or a
+    /// test of its `Option<Ordering>` (`lt` and kin through
+    /// `partial_cmp`, as core's default bodies).
+    fn trait_cmp_call(&mut self, f: LocalDefId, a: Operand, b: Operand, via: CmpVia, out: Place, span: Span) {
+        match via {
+            CmpVia::Direct => self.call_into(CallTarget::Fn(f), vec![a, b], out, span),
+            CmpVia::NotEq => {
+                let t = self.temp(BOOL);
+                self.call_into(CallTarget::Fn(f), vec![a, b], Place::local(t), span);
+                self.assign(out, Rvalue::Un(crate::ast::UnOp::Not, Operand::Copy(Place::local(t))), span);
+            }
+            CmpVia::Partial(op) => {
+                let ret = self.p.fn_info(f).ret;
+                let t = self.temp(ret);
+                self.call_into(CallTarget::Fn(f), vec![a, b], Place::local(t), span);
+                self.ordering_test(Place::local(t), op, out, span);
+            }
+        }
+    }
+
+    /// Writes `opt <op> Some(Equal)` for an `Option<Ordering>` place
+    /// into `out`, as `PartialOrd::lt` and kin answer from
+    /// `partial_cmp`: false on `None`, else the variant index of the
+    /// `Ordering` (Less 0, Equal 1, Greater 2) against Equal's.
+    fn ordering_test(&mut self, opt: Place, op: BinOp, out: Place, span: Span) {
+        let u32_ty = int(IntTy::U32);
+        let d = self.temp(u32_ty);
+        self.assign(Place::local(d), Rvalue::Discriminant(opt.clone()), span);
+        let (some_b, none_b, end) = (self.new_block(), self.new_block(), self.new_block());
+        let b = &mut self.body.blocks[self.cur.0 as usize];
+        b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, some_b)], none_b);
+        b.term_span = span;
+        self.cur = none_b;
+        self.assign(out.clone(), Rvalue::Use(Operand::Const(Const::Bool(false))), span);
+        self.goto(end, span);
+        self.cur = some_b;
+        let k = self.temp(u32_ty);
+        self.assign(Place::local(k), Rvalue::Discriminant(opt.project(Proj::Downcast(1)).project(Proj::Field(0))), span);
+        self.assign(out, Rvalue::Bin(op, Operand::Copy(Place::local(k)), Operand::Const(Const::Int(1, IntTy::U32))), span);
+        self.goto(end, span);
+    }
+
+    /// A `core::cmp::Ordering` method (`Res::OrderingOp`): the
+    /// receiver's variant index (Less 0, Equal 1, Greater 2) decides.
+    /// `then` evaluates its argument after the receiver, as a call
+    /// does, and keeps the receiver unless it is `Equal`.
+    #[allow(clippy::too_many_arguments)]
+    fn ordering_op_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span, kind: OrderingOpKind, derefs: u8) {
+        use OrderingOpKind as K;
+        let ty = self.ty(e);
+        let ord_ty = self.peel(self.ty(recv), derefs);
+        let Some(adt) = self.body.tys.local_adt(ord_ty) else { return };
+        let r = self.temp(ord_ty);
+        let op = self.operand_derefs(recv, derefs);
+        self.assign(Place::local(r), Rvalue::Use(op), span);
+        let u32_ty = int(IntTy::U32);
+        let d = self.temp(u32_ty);
+        self.assign(Place::local(d), Rvalue::Discriminant(Place::local(r)), span);
+        let out = self.call_dest(dest, ty);
+        let test = |op: BinOp| Rvalue::Bin(op, Operand::Copy(Place::local(d)), Operand::Const(Const::Int(1, IntTy::U32)));
+        match kind {
+            K::IsEq => self.assign(out, test(BinOp::Eq), span),
+            K::IsNe => self.assign(out, test(BinOp::Ne), span),
+            K::IsLt => self.assign(out, test(BinOp::Lt), span),
+            K::IsGt => self.assign(out, test(BinOp::Gt), span),
+            K::IsLe => self.assign(out, test(BinOp::Le), span),
+            K::IsGe => self.assign(out, test(BinOp::Ge), span),
+            K::Reverse => {
+                let (b0, b1, b2, end) = (self.new_block(), self.new_block(), self.new_block(), self.new_block());
+                let b = &mut self.body.blocks[self.cur.0 as usize];
+                b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, b0), (1, b1)], b2);
+                b.term_span = span;
+                for (blk, v) in [(b0, 2u32), (b1, 1), (b2, 0)] {
+                    self.cur = blk;
+                    self.assign(out.clone(), Rvalue::Aggregate(adt, v, Vec::new()), span);
+                    self.goto(end, span);
+                }
+            }
+            K::ThenWith => {
+                // The closure moves into a local; it runs only on Equal.
+                let fty = self.ty(args[0]);
+                let c = self.temp(fty);
+                self.expr_into(args[0], Some(&Place::local(c)));
+                let eq = self.temp(BOOL);
+                self.assign(Place::local(eq), test(BinOp::Eq), span);
+                let (t, f, end) = (self.new_block(), self.new_block(), self.new_block());
+                let b = &mut self.body.blocks[self.cur.0 as usize];
+                b.term = Terminator::If(Operand::Copy(Place::local(eq)), t, f);
+                b.term_span = span;
+                self.cur = t;
+                self.call_closure_once(Place::local(c), fty, out.clone(), span);
+                self.goto(end, span);
+                self.cur = f;
+                self.assign(out, Rvalue::Use(Operand::Copy(Place::local(r))), span);
+                if needs_drop(self.p, &self.body.tys, fty) {
+                    self.push(StmtKind::Drop(c), span);
+                }
+                self.goto(end, span);
+            }
+            K::Then => {
+                let o = self.temp(ord_ty);
+                self.expr_into(args[0], Some(&Place::local(o)));
+                let eq = self.temp(BOOL);
+                self.assign(Place::local(eq), test(BinOp::Eq), span);
+                let (t, f, end) = (self.new_block(), self.new_block(), self.new_block());
+                let b = &mut self.body.blocks[self.cur.0 as usize];
+                b.term = Terminator::If(Operand::Copy(Place::local(eq)), t, f);
+                b.term_span = span;
+                self.cur = t;
+                self.assign(out.clone(), Rvalue::Use(Operand::Copy(Place::local(o))), span);
+                self.goto(end, span);
+                self.cur = f;
+                self.assign(out, Rvalue::Use(Operand::Copy(Place::local(r))), span);
+                self.goto(end, span);
+            }
+        }
+    }
+
+    /// Calls the closure value at `place` (type `fty`) with no
+    /// arguments through `FnOnce`, into `dest`: an `FnOnce` closure
+    /// takes its env by value, the others by reference (the value
+    /// itself then drops after the call, as the moved callee would).
+    fn call_closure_once(&mut self, place: Place, fty: Ty, dest: Place, span: Span) {
+        use crate::check::closure::ClosureKind;
+        let TyKind::Closure(def, _) = self.kind(fty) else { return };
+        let Some(entry) = self.p.gx.closures.get(&def) else { return };
+        let (body_fn, kind) = (entry.body_fn, entry.kind);
+        let env = match kind {
+            ClosureKind::FnOnce => self.operand_from(place.clone(), fty),
+            ClosureKind::Fn | ClosureKind::FnMut => {
+                let mutable = kind == ClosureKind::FnMut;
+                let rt = self.ref_ty(mutable, fty);
+                let t = self.temp(rt);
+                self.assign(Place::local(t), Rvalue::Ref(mutable, place.clone()), span);
+                Operand::Move(Place::local(t))
+            }
+        };
+        self.call_into(CallTarget::Fn(body_fn), vec![env], dest, span);
+        if kind != ClosureKind::FnOnce && needs_drop(self.p, &self.body.tys, fty) {
+            self.push(StmtKind::Drop(place.local), span);
+        }
+    }
+
+    /// One `PartialOrd` test `a <op> b` between two places of type
+    /// `ty` for `Res::OrdPick`, into a fresh `bool` local: through the
+    /// written method `f` (`via`), or by structure.
+    fn pick_cmp(&mut self, f: Option<LocalDefId>, via: CmpVia, op: BinOp, a: &Place, b: &Place, ty: Ty, span: Span) -> Local {
+        let c = self.temp(BOOL);
+        let rt = self.ref_ty(false, ty);
+        let (ra, rb) = (self.temp(rt), self.temp(rt));
+        self.assign(Place::local(ra), Rvalue::Ref(false, a.clone()), span);
+        self.assign(Place::local(rb), Rvalue::Ref(false, b.clone()), span);
+        let (ra, rb) = (Operand::Copy(Place::local(ra)), Operand::Copy(Place::local(rb)));
+        match f {
+            Some(f) => {
+                // `max`/`min` may call the impl's own `lt`; every other
+                // test goes through `partial_cmp`.
+                let via = if op == BinOp::Lt { via } else { CmpVia::Partial(op) };
+                self.trait_cmp_call(f, ra, rb, via, Place::local(c), span);
+            }
+            None => {
+                let rv = match self.kind(ty) {
+                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
+                        Rvalue::Bin(op, Operand::Copy(a.clone()), Operand::Copy(b.clone()))
+                    }
+                    _ => Rvalue::Cmp { op, a: ra, b: rb, ty },
+                };
+                self.assign(Place::local(c), rv, span);
+            }
+        }
+        c
+    }
+
+    /// `Ord::max`, `min`, and `clamp` (`Res::OrdPick`) by core's
+    /// default bodies: the receiver and the arguments move into
+    /// locals in order, the comparisons run as in core
+    /// (`max`/`min`: `other < self`; `clamp`: `assert!(min <= max)`,
+    /// then `self < min`, then `self > max`), the answer moves out,
+    /// and the other values drop right there, in reverse parameter
+    /// order, as the callee's parameters would.
+    #[allow(clippy::too_many_arguments)]
+    fn ord_pick_into(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        args: &[ExprId],
+        dest: Option<&Place>,
+        span: Span,
+        kind: OrdPickKind,
+        f: Option<LocalDefId>,
+        via: CmpVia,
+    ) {
+        let ty = self.ty(e);
+        let mut vals: Vec<Local> = Vec::with_capacity(args.len() + 1);
+        for &x in std::iter::once(&recv).chain(args) {
+            let l = self.temp(ty);
+            self.expr_into(x, Some(&Place::local(l)));
+            vals.push(l);
+        }
+        let out = self.call_dest(dest, ty);
+        let pl = |l: Local| Place::local(l);
+        // Moves value `win` into `out`, then drops the others in
+        // reverse parameter order.
+        let finish = |this: &mut Self, win: usize, vals: &[Local], end: Bb| {
+            let op = this.operand_from(pl(vals[win]), ty);
+            this.assign(out.clone(), Rvalue::Use(op), span);
+            for (i, &l) in vals.iter().enumerate().rev() {
+                if i != win && needs_drop(this.p, &this.body.tys, ty) {
+                    this.push(StmtKind::Drop(l), span);
+                }
+            }
+            this.goto(end, span);
+        };
+        let end = self.new_block();
+        let branch = |this: &mut Self, c: Local| -> (Bb, Bb) {
+            let (t, f) = (this.new_block(), this.new_block());
+            let b = &mut this.body.blocks[this.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), t, f);
+            b.term_span = span;
+            (t, f)
+        };
+        match kind {
+            OrdPickKind::Max | OrdPickKind::Min => {
+                // `other < self`: Max keeps self, Min keeps other.
+                let c = self.pick_cmp(f, via, BinOp::Lt, &pl(vals[1]), &pl(vals[0]), ty, span);
+                let (t, el) = branch(self, c);
+                let (on_true, on_false) = if kind == OrdPickKind::Max { (0, 1) } else { (1, 0) };
+                self.cur = t;
+                finish(self, on_true, &vals, end);
+                self.cur = el;
+                finish(self, on_false, &vals, end);
+            }
+            OrdPickKind::Clamp => {
+                let ok = self.pick_cmp(f, via, BinOp::Le, &pl(vals[1]), &pl(vals[2]), ty, span);
+                let (good, bad) = branch(self, ok);
+                self.cur = bad;
+                self.terminate(Terminator::Panic(vec![FmtPart::Lit("assertion failed: min <= max".into())]), span);
+                self.cur = good;
+                let below = self.pick_cmp(f, via, BinOp::Lt, &pl(vals[0]), &pl(vals[1]), ty, span);
+                let (t, el) = branch(self, below);
+                self.cur = t;
+                finish(self, 1, &vals, end);
+                self.cur = el;
+                let above = self.pick_cmp(f, via, BinOp::Gt, &pl(vals[0]), &pl(vals[2]), ty, span);
+                let (t2, el2) = branch(self, above);
+                self.cur = t2;
+                finish(self, 2, &vals, end);
+                self.cur = el2;
+                finish(self, 0, &vals, end);
+            }
+        }
+        self.cur = end;
+    }
+
     /// A scalar operator trait method (`Res::PrimOp`): the
     /// operation itself on the receiver value (by-value `self`),
     /// a unary operation, or a compound assignment into the
@@ -1883,6 +2143,27 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
             self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
+            return;
+        }
+        if let Res::TraitCmpMethod { f, derefs, via } = self.ck.res(e) {
+            let f = self.resolve_generic_fn(e, f);
+            let recv_ty = self.peel(self.ty(recv), derefs);
+            let pl = Self::derefs(self.place(recv), derefs);
+            let rt_ty = self.ref_ty(false, recv_ty);
+            let rt = self.temp(rt_ty);
+            self.assign(Place::local(rt), Rvalue::Ref(false, pl), span);
+            let b = self.operand(args[0]);
+            let out = self.call_dest(dest, BOOL);
+            self.trait_cmp_call(f, Operand::Copy(Place::local(rt)), b, via, out, span);
+            return;
+        }
+        if let Res::OrderingOp { kind, derefs } = self.ck.res(e) {
+            self.ordering_op_into(e, recv, args, dest, span, kind, derefs);
+            return;
+        }
+        if let Res::OrdPick { kind, f, via } = self.ck.res(e) {
+            let f = f.map(|f| self.resolve_generic_fn(e, f));
+            self.ord_pick_into(e, recv, args, dest, span, kind, f, via);
             return;
         }
         if let Res::PrimOp { kind, derefs } = self.ck.res(e) {
@@ -2018,6 +2299,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             let a = self.operand_derefs(lhs, ld);
             let b = self.operand_derefs(rhs, rd);
             self.call_into(CallTarget::Fn(f), vec![a, b], out, span);
+            return;
+        }
+        if let Res::TraitCmp { f, ld, rd, via } = self.ck.res(e) {
+            let f = self.resolve_generic_fn(e, f);
+            let (a, _) = self.borrow_of(lhs, ld);
+            let (b, _) = self.borrow_of(rhs, rd);
+            self.trait_cmp_call(f, a, b, via, out, span);
             return;
         }
         if matches!(op, BinOp::And | BinOp::Or) {
