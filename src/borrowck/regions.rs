@@ -714,6 +714,9 @@ pub(super) struct OwnSig {
     /// bodies: rustc checks the template, and lust's call rules are coarser
     /// than a template's opaque type params).
     pub check: bool,
+    /// A closure body: its universals are the closure rule's, not its
+    /// parent's named lifetimes.
+    pub closure: bool,
 }
 
 /// The universal of a regioned signature region.
@@ -732,7 +735,7 @@ impl OwnSig {
     /// conservative inside the body, and callers use the same signature.
     pub fn build<'p, 'a>(p: &'p Program<'a>, body: &Body<'p>, sig: Option<&RegionSig>, closure: bool, check: bool) -> OwnSig {
         let mut sc = SlotCx::new(&body.tys, p);
-        let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check };
+        let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check, closure };
         if closure {
             own.closure_sig(p, body, &mut sc);
             return own;
@@ -1032,6 +1035,8 @@ pub(super) struct Builder<'b, 'p, 'a> {
     /// The loan created by each statement, by body-wide statement index.
     loan_at: &'b [u32],
     stmt_base: &'b [usize],
+    /// Errors the constraint walk finds (annotations it cannot follow).
+    errs: Vec<Diag>,
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
@@ -1050,6 +1055,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             loan_at,
             stmt_base,
             own,
+            errs: Vec::new(),
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -1413,6 +1419,36 @@ enum Callee<'s> {
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
+    /// The region of each slot of erased type `e` under its regioned
+    /// annotation `r` (`Erased` where the annotation left it free). False
+    /// when the two shapes differ.
+    fn annotation_regions(&mut self, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
+        let et = &self.body.tys;
+        match (et.kind(r), et.kind(e)) {
+            (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
+                out.push(rr);
+                self.annotation_regions(ri, ei, out)
+            }
+            (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
+                let lts: Vec<Region> = et.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                for k in 0..adt_regions(self.p, et, e) as usize {
+                    out.push(lts.get(k).copied().unwrap_or(Region::Erased));
+                }
+                let rargs: Vec<Ty> = et.args(ra).iter().filter_map(|g| g.as_ty()).collect();
+                let eargs: Vec<Ty> = et.args(ea).iter().filter_map(|g| g.as_ty()).collect();
+                rargs.len() == eargs.len() && rargs.into_iter().zip(eargs).all(|(x, y)| self.annotation_regions(x, y, out))
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (xs, ys) = (et.tys_of(a).to_vec(), et.tys_of(b).to_vec());
+                xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.annotation_regions(x, y, out))
+            }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+                self.annotation_regions(a, b, out)
+            }
+            _ => r == e || self.sc.slots(e) == 0,
+        }
+    }
+
     /// The vars of an operand (empty for constants, which hold only
     /// `'static` data) and its erased type (`ERROR` for constants).
     fn operand(&mut self, o: &Operand, out: &mut Vec<u32>) -> Ty {
@@ -1465,6 +1501,44 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     && let Some(&v) = inner.get(i)
                 {
                     self.edge(v, 0);
+                }
+            }
+        }
+        // `let` annotations with explicit lifetimes (W-BORROW): the local's
+        // regions equal the written ones (`'static`, or a named lifetime of
+        // the fn); an elided one is free.
+        for &(l, r) in &self.body.annotations.clone() {
+            self.local_vars(l, &mut vars);
+            let t = self.body.locals[l as usize].ty;
+            let mut regs = Vec::new();
+            let ok = !fat_local(&self.body.tys, t) && self.annotation_regions(r, t, &mut regs) && regs.len() == vars.len();
+            if !ok {
+                self.errs.push(Diag::new(
+                    "L0203",
+                    self.p.fn_info(self.body.fn_id).def.name_span,
+                    "an explicit lifetime in a `let` annotation here is not supported yet",
+                    "Drop the lifetime from the annotation, or write `'_`.",
+                ));
+                continue;
+            }
+            for (i, reg) in regs.into_iter().enumerate() {
+                match reg {
+                    Region::Static => self.edge(vars[i], 0),
+                    Region::Param(k) if self.own.closure => {
+                        let _ = k;
+                        self.errs.push(Diag::new(
+                            "L0203",
+                            self.p.fn_info(self.body.fn_id).def.name_span,
+                            "a named lifetime in a `let` annotation inside a closure is not supported yet",
+                            "Drop the lifetime from the annotation, or write `'_`.",
+                        ));
+                    }
+                    Region::Param(k) if k < self.own.n_univ => {
+                        let u = k + 1;
+                        self.edge(vars[i], u);
+                        self.edge(u, vars[i]);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2132,7 +2206,7 @@ impl Builder<'_, '_, '_> {
             univ: vec![false; n_loans],
             to_ret: vec![false; n_loans],
             drop_live: vec![false; nl],
-            errs: Vec::new(),
+            errs: self.errs.clone(),
         };
         for (i, &lv) in self.loan_var.iter().enumerate() {
             let c = scc[lv as usize] as usize;

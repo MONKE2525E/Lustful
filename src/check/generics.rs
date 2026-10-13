@@ -678,6 +678,9 @@ pub struct Scope {
     /// The regioned associated types of the impl whose items resolve here,
     /// so `Self::Assoc` keeps its regions in a region signature.
     pub assoc_regioned: Vec<(Sym, Ty)>,
+    /// A `let` annotation in a body whose regions the checker records for
+    /// the borrow checker: explicit lifetimes are allowed there (W-BORROW).
+    pub annotation: bool,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -787,7 +790,7 @@ fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, s
     let named = lt.and_then(|lt| scope.lifetimes.iter().find(|(n, _)| *n == lt.name).map(|&(_, i)| i));
     match &scope.regions {
         RegionMode::Erase => {
-            if (name == Some("static") || named.is_some()) && scope.infer_cell.is_some() {
+            if (name == Some("static") || named.is_some()) && scope.infer_cell.is_some() && !scope.annotation {
                 return Err(Diag::new(
                     "L0203",
                     lt.map_or(span, |l| l.span),
@@ -852,7 +855,7 @@ fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) 
 
 /// True when a written type names a lifetime other than `'_` anywhere
 /// (fn pointer types cannot carry one yet, W-BORROW).
-fn names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+pub fn names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
     let named = |lt: &ast::Lifetime| interner.get(lt.name) != "_";
     let in_args = |args: &GenericArgs| match args {
         GenericArgs::Angle(a) => a.iter().any(|g| match g {
@@ -1723,6 +1726,7 @@ fn resolve_path_ty(
             _ => Vec::new(),
         };
         if scope.infer_cell.is_some()
+            && !scope.annotation
             && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
         {
             return Err(Diag::new(

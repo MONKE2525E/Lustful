@@ -2922,9 +2922,11 @@ L0733; L0734.
 
 Stated subset cuts (valid Rust lust rejects, tests/reject):
 
-- L0203: explicit lifetimes in body type annotations (the
-  annotation's regions are not kept yet); lifetimes in fn
-  pointer types; lifetimes in a dyn type's trait args;
+- L0203: explicit lifetimes in body types other than a
+  `let` annotation on plain names or tuples of names (a
+  `let` annotation's regions are kept: the binding's slots
+  equal `'static` or the fn's named lifetime); lifetimes in
+  fn pointer types; lifetimes in a dyn type's trait args;
   lifetime params on traits; `T: 'a` bounds on named
   lifetimes and `'a: 'static`.
 - L0731: any explicit lifetime turbofish arg (rustc also
@@ -2945,7 +2947,8 @@ the gate shapes (`lifetime_gate_parser`,
 `lifetime_gate_json_decoder`, `lifetime_gate_rule_context`).
 Each case runs against rustc 1.99 in difftest.
 
-Known gaps: regions of body annotations; fn pointer and
+Known gaps: regions of body types other than `let`
+annotations (casts, turbofish, closure params); fn pointer and
 dyn regions; closure capture precision (one class) and
 expected closure signatures; `T: 'a`; Adt inferred outlives
 facts (missing facts reject, never accept); precise

@@ -43,7 +43,16 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
     let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
     let reads = std::mem::take(&mut ck.reads);
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
-    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads, lower_errs: Vec::new() };
+    let body = Body {
+        fn_id: fid,
+        tys,
+        locals: Vec::new(),
+        blocks: vec![entry],
+        arg_count: f.params.len(),
+        reads,
+        lower_errs: Vec::new(),
+        annotations: Vec::new(),
+    };
     let info = ck.closures.iter().find(|c| c.def == def).cloned();
     let poisoned = ck.poisoned;
     let mut lw = Lower {
@@ -130,6 +139,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
     lw.emit_drops(&root, span);
     lw.terminate(Terminator::Return, span);
     lw.rewrite_upvars();
+    lw.map_annotations();
     lw.body
 }
 

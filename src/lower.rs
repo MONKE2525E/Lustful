@@ -71,7 +71,16 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
     let reads = std::mem::take(&mut ck.reads);
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
-    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads, lower_errs: Vec::new() };
+    let body = Body {
+        fn_id: fid,
+        tys,
+        locals: Vec::new(),
+        blocks: vec![entry],
+        arg_count: f.params.len(),
+        reads,
+        lower_errs: Vec::new(),
+        annotations: Vec::new(),
+    };
     let mut lw = Lower {
         p,
         ck,
@@ -130,6 +139,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     let root = lw.scopes.pop().unwrap();
     lw.emit_drops(&root, span);
     lw.terminate(Terminator::Return, span);
+    lw.map_annotations();
     lw.body
 }
 
@@ -160,6 +170,18 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// names a template, through the zonked generic args the
     /// checker recorded for this expression (W-TRAITS-CORE through
     /// the lower owner). Plain fns answer themselves.
+    /// The checker's regioned `let` annotations (W-BORROW) on the IR
+    /// locals their bindings lowered to.
+    fn map_annotations(&mut self) {
+        for &(cl, t) in &self.ck.annotations {
+            if let Some(&l) = self.local_map.get(cl as usize)
+                && l != u32::MAX
+            {
+                self.body.annotations.push((l, t));
+            }
+        }
+    }
+
     fn resolve_generic_fn(&self, e: ExprId, f: LocalDefId) -> LocalDefId {
         if self.p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
             return f;

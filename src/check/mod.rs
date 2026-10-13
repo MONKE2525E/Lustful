@@ -562,6 +562,10 @@ pub struct Checked<'g> {
     /// True when this is a closure body fn whose parent failed to
     /// check: the parent reports the errors, lowering emits nothing.
     pub poisoned: bool,
+    /// The regioned type a `let` annotation with an explicit lifetime
+    /// gives each binding it covers, by checker local (W-BORROW): the
+    /// borrow checker relates the binding's regions to it.
+    pub annotations: Vec<(u32, Ty)>,
 }
 
 impl Checked<'_> {
@@ -821,6 +825,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             closures: Vec::new(),
             closure_calls: Vec::new(),
             poisoned: false,
+            annotations: Vec::new(),
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
@@ -3237,7 +3242,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, ty, init, els, .. } => {
-                    let declared = ty.map(|t| self.resolve_written(t));
+                    let annotated = ty.filter(|&t| generics::names_lifetime(self.p.ast, self.p.interner, t));
+                    let declared = ty.map(|t| if annotated.is_some() { self.resolve_annotation(t) } else { self.resolve_written(t) });
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {
                             let t = self.expr(*init, Some(d));
@@ -3334,6 +3340,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             }
                         }
                     }
+                    if let Some(t) = annotated {
+                        self.record_annotation(*pat, t);
+                    }
                 }
                 // Body items and statement macros are rejected by the parser today.
                 Stmt::Item(_) | Stmt::Macro { .. } => {}
@@ -3356,6 +3365,66 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.scopes.truncate(scope);
         self.item_scopes.pop();
         t
+    }
+
+    /// A `let` annotation that names a lifetime (W-BORROW): resolved like
+    /// any written type, with explicit lifetimes allowed, since
+    /// `record_annotation` keeps their regions for the borrow checker.
+    fn resolve_annotation(&mut self, t: ast::TyId) -> Ty {
+        let saved = self.body_scope.annotation;
+        self.body_scope.annotation = true;
+        let ty = self.resolve_written(t);
+        self.body_scope.annotation = saved;
+        ty
+    }
+
+    /// Records the regioned form of `let` annotation `t` for each binding
+    /// pattern `pat` covers (W-BORROW): `'static` and the fn's named
+    /// lifetimes keep their regions, elided ones are free. A pattern
+    /// shape this cannot follow (by-ref bindings, `_`, nested patterns
+    /// other than tuples) would drop the annotation's constraints, so it is
+    /// a reject (L0203).
+    fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId) {
+        let p = self.p;
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let mut sc = self.body_scope.clone();
+        sc.annotation = true;
+        sc.infer_cell = None;
+        sc.regions = generics::RegionMode::Keep { next: None, elided: Some(Region::Erased) };
+        let Ok(r) = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &sc) else {
+            // `_` inside the annotation (no region form without inference).
+            let s = p.ast.ty_span(t);
+            self.err("L0203", s, "an explicit lifetime in a type annotation with `_` is not supported yet", "Write the full type, or drop the lifetime.");
+            return;
+        };
+        if !self.annotate_pat(pat, r) {
+            let s = p.ast.pat_span(pat);
+            self.err(
+                "L0203",
+                s,
+                "an explicit lifetime in the annotation of this pattern is not supported yet",
+                "Bind a plain name (`let x: T = ..`), or a tuple of names.",
+            );
+        }
+    }
+
+    fn annotate_pat(&mut self, pat: ast::PatId, r: Ty) -> bool {
+        let pi = (pat.0 - self.out.pat_base) as usize;
+        match (self.p.ast.pat(pat), self.out.pat_res.get(pi).copied()) {
+            (Pat::Binding { .. }, Some(PatRes::Binding { local, mode: BindMode::Move })) => {
+                self.out.annotations.push((local, r));
+                true
+            }
+            (Pat::Tuple(elems), _) => match self.tys.kind(r) {
+                TyKind::Tuple(ts) => {
+                    let parts: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                    let elems = elems.clone();
+                    elems.len() == parts.len() && elems.iter().zip(parts).all(|(&e, t)| self.annotate_pat(e, t))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn resolve_written(&mut self, t: ast::TyId) -> Ty {

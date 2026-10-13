@@ -1,6 +1,5 @@
-// expect: L0203
-// rustc E0597. Lust does not keep regions of body annotations yet, so an
-// explicit `'static` in one is rejected (see tests/reject/body_static_annotation.rs).
+// expect: L0306
+// rustc E0597: the annotation's `'static` keeps `s` borrowed past its scope.
 fn main() {
     let r: &'static str;
     {

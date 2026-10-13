@@ -249,6 +249,11 @@ pub struct Body<'g> {
     /// covers). Borrow checking reports them first; such a body is
     /// never generated.
     pub lower_errs: Vec<crate::diag::Diag>,
+    /// `let` annotations with explicit lifetimes (W-BORROW): each local
+    /// and the regioned type its annotation gives it. Borrowck relates
+    /// the local's regions to it; a cached body has none (it is never
+    /// borrow-checked again).
+    pub annotations: Vec<(Local, Ty)>,
 }
 
 impl Body<'_> {
