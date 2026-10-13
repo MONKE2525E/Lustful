@@ -1096,6 +1096,43 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         t
     }
 
+    /// True when a place goes through a dereference of a reference or raw
+    /// pointer: the value it names is not owned by its root local, so it
+    /// outlives the local's storage. A deref of a `Box` (or another owning
+    /// pointer) stays inside the local: dropping the local frees it.
+    fn through_ref(&self, p: &Place) -> bool {
+        let tys = &self.body.tys;
+        let mut t = self.body.locals[p.local as usize].ty;
+        let mut variant = 0;
+        for pr in &p.proj {
+            t = match *pr {
+                Proj::Deref => match tys.kind(t) {
+                    TyKind::Ref(..) | TyKind::RawPtr(..) => return true,
+                    _ => tys.adt_first_ty_arg(t).unwrap_or(ERROR),
+                },
+                Proj::Field(i) => {
+                    let f = self.step_field_ty(t, variant, i);
+                    variant = 0;
+                    f
+                }
+                Proj::Downcast(v) => {
+                    variant = v;
+                    t
+                }
+                Proj::Index(_) => match tys.kind(t) {
+                    TyKind::Array(e, _) | TyKind::Slice(e) => e,
+                    _ => tys.vec_elem(t).unwrap_or(ERROR),
+                },
+            };
+            if t == ERROR {
+                // Unknown below here: a deref in the rest still means the
+                // value may live elsewhere (the old rule).
+                return p.proj.contains(&Proj::Deref);
+            }
+        }
+        false
+    }
+
     /// True when a type has region slots (unknown types count).
     fn has_regions(&self, t: Ty) -> bool {
         let tys = &self.body.tys;
@@ -1597,7 +1634,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         None => return,
                     }
                 }
-                _ => return,
             }
         }
         let moved = self.head_resolve(cur, &env);
@@ -1888,13 +1924,13 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             let loan = &self.loans[li];
             // A write to a whole local is shallow: writing a reference local itself does
             // not touch the value behind it, so a loan on `*a` does not block `a = ...`.
-            if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) {
+            if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) && self.through_ref(&loan.place) {
                 continue;
             }
             let conflict = match kind {
                 Access::Read | Access::BorrowShared => loan.mutable && overlap(p, &loan.place),
                 Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place),
-                Access::Dead => loan.place.local == p.local && !loan.place.proj.contains(&Proj::Deref),
+                Access::Dead => loan.place.local == p.local && !self.through_ref(&loan.place),
             };
             if !conflict {
                 continue;
@@ -1963,7 +1999,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let in_scope: Vec<usize> = bit_iter(&self.scope[q * wl..(q + 1) * wl]).collect();
         for li in in_scope {
             let loan = &self.loans[li];
-            if loan.place.proj.contains(&Proj::Deref) {
+            if self.through_ref(&loan.place) {
                 continue;
             }
             let name = self.local_name(loan.place.local);
