@@ -121,6 +121,9 @@ pub struct RegionTables {
     /// per field, with the Adt's lifetime params as `Region::Param(i)`.
     pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
     adts: std::sync::OnceLock<AdtTables>,
+    /// The trait method of each trait method stub (the reverse of
+    /// `GenTables::trait_method_stubs`), built on first use.
+    stub_methods: std::sync::OnceLock<FxMap<LocalDefId, DefId>>,
 }
 
 /// Per user Adt template: variance and drop mode of each generic param, by
@@ -139,6 +142,11 @@ impl RegionTables {
     /// The Adt tables, computed once from the program's Adt templates.
     fn adts(&self, p: &Program) -> &AdtTables {
         self.adts.get_or_init(|| AdtTables::compute(p))
+    }
+
+    /// The trait method a stub fn stands for (a stub has its own def).
+    fn stub_method(&self, p: &Program, f: LocalDefId) -> Option<DefId> {
+        self.stub_methods.get_or_init(|| p.gx.trait_method_stubs.iter().map(|(&m, &s)| (s, m)).collect()).get(&f).copied()
     }
 }
 
@@ -1680,7 +1688,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             return Callee::Sig(s);
         }
         if p.gx.fn_class.get(f.0 as usize) == Some(&crate::check::generics::FnClass::Stub)
-            && let Some(s) = p.regions.trait_methods.get(&p.def_id(f))
+            && let Some(m) = p.regions.stub_method(p, f)
+            && let Some(s) = p.regions.trait_methods.get(&m)
         {
             return Callee::Sig(s);
         }
@@ -1713,7 +1722,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if let Some(tsig) = p.regions.trait_methods.get(&tmeth) {
             let info = p.fn_info(f);
             self.proj = Some(FxMap::default());
-            let ok = self.call_sig_with(tsig, &info.params, info.ret, avs, dt, dv);
+            let preds = p.gx.trait_methods.get(&tmeth).map_or(&[][..], |t| &t.generics.predicates[..]);
+            let ok = self.call_sig_with(tsig, &info.params, info.ret, avs, dt, dv, preds);
             self.proj = None;
             if !ok {
                 self.call_opaque(avs, dt, dv);
@@ -1749,7 +1759,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             && let Some(sig) = self.p.regions.trait_methods.get(&def)
             && let Some(t) = self.p.gx.trait_methods.get(&def)
         {
-            if !self.call_sig_with(sig, &t.params, t.ret, &avs, dt, &dv) {
+            if !self.call_sig_with(sig, &t.params, t.ret, &avs, dt, &dv, &[]) {
                 self.call_opaque(&avs, dt, &dv);
             }
             return;
@@ -2006,35 +2016,66 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// `ret <: dest`, plus the callee's facts and implied bounds. False when
     /// the signature cannot be paired with the call's types.
     fn call_sig(&mut self, f: LocalDefId, sig: &RegionSig, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
-        let info = self.p.fn_info(f);
-        self.call_sig_with(sig, &info.params, info.ret, avs, dt, dv)
+        let p = self.p;
+        let info = p.fn_info(f);
+        // The callee's bounds name the template's params, like `sig`.
+        let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+        let preds = p.gx.fn_templates.get(src.0 as usize).and_then(|t| t.as_ref()).map_or(&[][..], |t| &t.generics.predicates[..]);
+        self.call_sig_with(sig, &info.params, info.ret, avs, dt, dv, preds)
     }
 
-    /// `call_sig` over the callee's erased param and return types.
-    fn call_sig_with(&mut self, sig: &RegionSig, params: &[Ty], ret: Ty, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    /// `call_sig` over the callee's erased param and return types. A
+    /// `T: 'static` bound makes every region bound to `T` outlive
+    /// `'static` (check proves the rest of the bound; regions are here).
+    #[allow(clippy::too_many_arguments)]
+    fn call_sig_with(
+        &mut self,
+        sig: &RegionSig,
+        params: &[Ty],
+        ret: Ty,
+        avs: &[(Ty, Vec<u32>)],
+        dt: Ty,
+        dv: &[u32],
+        preds: &[Predicate],
+    ) -> bool {
         if params.len() != sig.params.len() || avs.len() != sig.params.len() {
             return false;
         }
         let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         let mut ok = true;
+        // A callee type that names type params (a template called in
+        // check mode, a stub) has no slots where its params are: the
+        // call's own types give them, so the params bind their slots.
+        let has_param = |t: Ty| self.p.tys.flags(t).contains_param();
         for i in 0..avs.len() {
-            let et = params[i];
+            let (at, av) = &avs[i];
+            let et = if has_param(params[i]) { *at } else { params[i] };
             let mut pv = Vec::new();
             ok &= self.inst(sig.params[i], et, &univ, &mut binds, &mut pv);
-            let (at, av) = &avs[i];
             if !av.is_empty() {
                 ok &= self.relate(*at, av, et, &pv, Variance::Co);
             }
         }
+        let er = if has_param(ret) { dt } else { ret };
         let mut rv = Vec::new();
-        ok &= self.inst(sig.ret, ret, &univ, &mut binds, &mut rv);
+        ok &= self.inst(sig.ret, er, &univ, &mut binds, &mut rv);
         if !dv.is_empty() {
-            ok &= self.relate(ret, &rv, dt, dv, Variance::Co);
+            ok &= self.relate(er, &rv, dt, dv, Variance::Co);
         }
         for &(a, b) in &sig.facts {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
             self.edge(x, y);
+        }
+        for pred in preds {
+            if let Predicate::TypeOutlives(t, Region::Static) = pred
+                && let TyKind::Param(j) = self.p.tys.kind(*t)
+                && let Some(vs) = binds.get(&j.0)
+            {
+                for &v in vs {
+                    self.edge(v, 0);
+                }
+            }
         }
         ok
     }
