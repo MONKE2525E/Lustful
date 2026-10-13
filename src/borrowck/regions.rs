@@ -377,7 +377,21 @@ impl AdtTables {
             // `slice::IterMut<'a, T>` holds `&'a mut [T]`: invariant in `T`.
             Some(BuiltinTy::Iter(IterKind::SliceIterMut)) => return (Variance::Inv, DropMode::None),
             Some(BuiltinTy::Iter(IterKind::SliceIter)) => return (Variance::Co, DropMode::None),
-            Some(_) => return (Variance::Co, DropMode::Owned),
+            // Owning containers and the other iterators: covariant, their
+            // drop may reach the elements. Exhaustive on purpose: a new
+            // builtin picks its variance here (a `Cell`-like type is
+            // invariant; covariance there would be unsound).
+            Some(
+                BuiltinTy::String
+                | BuiltinTy::Vec
+                | BuiltinTy::Option
+                | BuiltinTy::Result
+                | BuiltinTy::Boxed
+                | BuiltinTy::Rc
+                | BuiltinTy::Chars
+                | BuiltinTy::Args
+                | BuiltinTy::Iter(_),
+            ) => return (Variance::Co, DropMode::Owned),
             None => {}
         }
         let v = self.variance.get(&def).and_then(|v| v.get(j)).copied().unwrap_or(Variance::Inv);
