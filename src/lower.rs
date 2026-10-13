@@ -633,10 +633,19 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let ct = self.ty(*callee);
                     let op = self.operand(*callee);
                     match op {
-                        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() => Some(pl.local),
+                        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() && !matches!(self.kind(ct), TyKind::Ref(..)) => {
+                            Some(pl.local)
+                        }
                         Operand::Copy(pl) | Operand::Move(pl) => {
-                            let t = self.temp(ct);
-                            let op2 = self.operand_from(pl, ct);
+                            // A callee behind a reference loads through
+                            // it first, so the call local holds the fn
+                            // pointer itself.
+                            let (vt, pl) = match self.kind(ct) {
+                                TyKind::Ref(_, _, inner) => (inner, pl.deref()),
+                                _ => (ct, pl),
+                            };
+                            let t = self.temp(vt);
+                            let op2 = self.operand_from(pl, vt);
                             self.assign(Place::local(t), Rvalue::Use(op2), span);
                             Some(t)
                         }
@@ -716,7 +725,14 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Cast { expr, .. } => {
                 let o = self.operand(*expr);
                 if let Some(d) = dest {
-                    self.assign(d.clone(), Rvalue::Cast(o, ty), span);
+                    // A cast to a fn pointer already holds the pointer
+                    // value (the coercion on the inner expression made
+                    // the trampoline, or it was a fn pointer already).
+                    if matches!(self.kind(ty), TyKind::FnPtr(_)) {
+                        self.assign(d.clone(), Rvalue::Use(o), span);
+                    } else {
+                        self.assign(d.clone(), Rvalue::Cast(o, ty), span);
+                    }
                 }
             }
             Expr::Ref { mutable, expr, .. } => {

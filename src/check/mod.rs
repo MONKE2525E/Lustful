@@ -2322,6 +2322,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// True when the fn item to fn pointer coercion takes `f` to `e`.
+    /// Pure: no unification (the same test `coerce_at` applies).
+    fn fn_coercible(&mut self, f: Ty, e: Ty) -> bool {
+        matches!(self.kind(e), TyKind::FnPtr(_))
+            && self.is_fn_item(f)
+            && self.callable_sig(f).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(e))
+    }
+
     /// Coercion inside an aggregate value whose producer is in hand: a
     /// tuple literal, or a one-argument variant call such as `Some(&v)`
     /// where `&[u8]` is wanted. The inner coercions record on the inner
@@ -2337,7 +2345,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if xs.len() != ys.len() || elems.len() != xs.len() {
                     return false;
                 }
-                if !xs.iter().zip(&ys).all(|(&x, &y)| self.ty_matchish(x, y) || self.ref_coercible(x, y)) {
+                if !xs.iter().zip(&ys).all(|(&x, &y)| self.ty_matchish(x, y) || self.ref_coercible(x, y) || self.fn_coercible(x, y)) {
                     return false;
                 }
                 elems.iter().zip(xs.iter().zip(&ys)).all(|(&el, (&x, &y))| self.coerce_at(x, y, span, Some(el)))
@@ -2348,7 +2356,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return false;
                 }
                 let (Some(x), Some(y)) = (fa[0].as_ty(), ea[0].as_ty()) else { return false };
-                if !self.ref_coercible(x, y) {
+                if !self.ref_coercible(x, y) && !self.fn_coercible(x, y) {
                     return false;
                 }
                 // The producer must be a one-argument variant call
@@ -3135,11 +3143,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(a) => p.adt(a).is_enum && p.adt(a).variants.iter().all(|v| v.shape == VariantShape::Unit),
                     None => false,
                 };
+                // A fn item casts to a fn pointer of the same signature,
+                // and a fn pointer casts to itself. The item form goes
+                // through the coercion path, which gives the inner
+                // expression the pointer type for lowering.
+                let fn_cast = match (self.kind(t), self.kind(target)) {
+                    (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) => {
+                        self.callable_sig(t).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(target))
+                            && self.coerce_at(t, target, span, Some(*expr))
+                    }
+                    (TyKind::FnPtr(_), TyKind::FnPtr(_)) => match (self.callable_sig(t), self.callable_sig(target)) {
+                        (Some((pa, ra)), Some((pb, rb))) => {
+                            pa.len() == pb.len() && pa.iter().zip(&pb).all(|(&a, &b)| self.unify(a, b)) && self.unify(ra, rb)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
                 // The `as` table rustc enforces (E0054, E0604, E0606): bool
                 // and char never cast to a float, only `u8` casts to char,
                 // nothing casts to bool, a fieldless enum casts only to an
                 // integer. A same-kind cast (`bool as bool`) is fine.
-                let ok = match (self.kind(t), self.kind(target)) {
+                let ok = fn_cast || match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
                     (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,

@@ -2393,6 +2393,8 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
+        // Fn pointers compare by address in Rust; fn items do not.
+        TyKind::FnPtr(_) => true,
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
