@@ -447,6 +447,10 @@ struct Ctx<'p, 'a> {
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
+    /// Operators whose result waits on an `Output` obligation because
+    /// an operand was a general variable at their first check (see
+    /// `binary`).
+    deferred_binops: Vec<ExprId>,
     /// Format arguments whose type was still a variable when
     /// the format check ran: (type, wants Debug, span). The
     /// Display/Debug test re-runs at finish (W-TRAITS-CORE).
@@ -518,6 +522,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closure_arg_stack: Vec::new(),
         deferred_closures: Vec::new(),
         deferred_methods: Vec::new(),
+        deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
         head_unknown_flag: false,
         in_norm: false,
@@ -6072,10 +6077,46 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if (int_like(lik) && (int_like(rik) || matches!(rik, TyKind::Infer(_))))
                     || (int_like(rik) && matches!(lik, TyKind::Infer(_))) =>
             {
+                let general = |k: TyKind| matches!(k, TyKind::Infer(v) if !v.is_int() && !v.is_float());
+                // A second check of a closure body (`deferred_closures`)
+                // sees the operand fixed by then; rustc checks the body
+                // once, so an operator deferred there stays deferred.
+                let deferred = general(lik) || general(rik) || self.deferred_binops.contains(&e);
+                if deferred && !self.deferred_binops.contains(&e) {
+                    self.deferred_binops.push(e);
+                }
                 if !self.unify(li, ri) {
                     return bad(self);
                 }
-                li
+                if deferred {
+                    // An operand that is a general variable (a closure
+                    // parameter not known yet): rustc resolves the
+                    // operator through `Op<Rhs>` selection, so the
+                    // result is that impl's `Output`, known once the
+                    // operand is (after literal fallback at the
+                    // latest), not the operand itself. `|x| x + 1`
+                    // called with a literal into a `u64` is then
+                    // `i32 + i32`: a mismatch (rustc E0271).
+                    let lang = &self.p.gx.lang;
+                    let tr = match op {
+                        Add => lang.add,
+                        Sub => lang.sub,
+                        Mul => lang.mul,
+                        Div => lang.div,
+                        Rem => lang.rem,
+                        BitAnd => lang.bit_and,
+                        BitOr => lang.bit_or,
+                        _ => lang.bit_xor,
+                    };
+                    let out = self.new_var(false);
+                    if let Some(assoc) = lang.output_of(tr) {
+                        let trait_args = self.tys.intern_args(&[GenericArg::Ty(li), GenericArg::Ty(ri)]);
+                        self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc, trait_args, ty: out }, span });
+                    }
+                    out
+                } else {
+                    li
+                }
             }
             _ => return bad(self),
         };
