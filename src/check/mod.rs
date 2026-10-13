@@ -2190,13 +2190,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, _))
                 if fd > ed && {
-                    let mut t = found;
-                    for _ in 0..fd - ed {
-                        if let TyKind::Ref(_, _, inner) = self.kind(t) {
-                            t = inner;
+                    // An exact structural match wins over a deref
+                    // coercion: `&&S` against `&T` binds `T = &S`,
+                    // never `T = S` through `*`. rustc coerces only
+                    // when the types do not already unify, so try
+                    // the plain unify first (rolled back; the
+                    // fallback arm redoes it for real).
+                    let snap_vars = self.snapshot_vars();
+                    let obl_len = self.obl_len();
+                    let exact = self.unify(found, expected);
+                    self.rollback_vars(snap_vars);
+                    self.obl_truncate(obl_len);
+                    !exact && {
+                        let mut t = found;
+                        for _ in 0..fd - ed {
+                            if let TyKind::Ref(_, _, inner) = self.kind(t) {
+                                t = inner;
+                            }
                         }
+                        matches!(self.kind(t), TyKind::Ref(_, Mut::Shared, _)) && self.unify(t, expected)
                     }
-                    matches!(self.kind(t), TyKind::Ref(_, Mut::Shared, _)) && self.unify(t, expected)
                 } =>
             {
                 Coerce::Deref(fd - ed)
