@@ -328,6 +328,10 @@ pub enum Builtin {
     ConvArraySlice,
     ConvDeref,
     ConvRcInner,
+    /// The cmp glue's three-way code for two references to one
+    /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
+    /// an `i8`: `partial_cmp` and `cmp` read it once.
+    CmpCode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1931,6 +1935,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
         let t = self.deep(t);
+        // The answer reads the fields of every Adt in `t` (their
+        // layouts' fingerprints cover nested field types).
+        self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
         let env = self.env();
         crate::check::collect::auto_structural(self.p, &mut self.tys, env, trait_def, t, seen)
     }
@@ -6086,9 +6093,85 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.check_assoc_vis(a, item, what, span);
             return Some(Res::Fn(f));
         }
+        // A trait's function of a non-generic type as a value
+        // (`S::mk`, `.map(S::from)`): the written impl's own fn.
+        if p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty()) {
+            let base = self.tys.adt_ty(a);
+            if let Some(f) = self.trait_fn_value(base, None, item, span) {
+                return f.map(Res::Fn);
+            }
+        }
         let tn = self.name(ty_name).to_string();
         self.err("L0104", span, format!("no variant or associated function `{}` on `{tn}`", self.name(item)), "Check the name.");
         None
+    }
+
+    /// A trait's function as a value on a concrete type (`S::mk`,
+    /// `<S as Tr>::mk`): the trait (written in `hint`, else every
+    /// trait in scope with a method of that name) selects a written
+    /// impl, and its fn is the value. None when nothing applies;
+    /// Some(None) after reporting an ambiguity. Generic impl fns and
+    /// core's synthetic impls have no fn to name here (a reject).
+    fn trait_fn_value(&mut self, base: Ty, hint: Option<TraitRef>, name: Sym, span: Span) -> Option<Option<LocalDefId>> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let traits: Vec<DefId> = match hint {
+            Some(tr) => vec![tr.def],
+            None => p.gx.traits_by_method.get(&name).cloned().unwrap_or_default().into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
+        };
+        let mut hits: Vec<LocalDefId> = Vec::new();
+        for trait_def in traits {
+            let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
+            if rec.method_by_name(name).is_none() {
+                continue;
+            }
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let tr = match hint {
+                Some(t) => t,
+                None => {
+                    let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                    for _ in 1..rec.generics.params.len() {
+                        tr_args.push(GenericArg::Ty(self.new_var(false)));
+                    }
+                    let args_id = self.tys.intern_args(&tr_args);
+                    TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
+                }
+            };
+            let found = match self.select_obligation_at(tr, span, 0) {
+                Selection::Impl { id, ref unbound, .. } if unbound.is_empty() => {
+                    let rec_impl = p.gx.index.get(id);
+                    if rec_impl.synthetic != Synthetic::None {
+                        None
+                    } else {
+                        rec_impl
+                            .items
+                            .iter()
+                            .find_map(|&d| p.local_def(d.hash).filter(|&l| p.fn_info(l).name == name))
+                            .filter(|&l| p.gx.fn_templates.get(l.0 as usize).is_none_or(|t| t.is_none()))
+                    }
+                }
+                _ => None,
+            };
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+            if let Some(f) = found {
+                hits.push(f);
+            }
+        }
+        match hits.len() {
+            0 => None,
+            1 => Some(Some(hits[0])),
+            _ => {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple trait functions named `{}` apply here", self.name(name)),
+                    "Name the trait with a qualified path, such as `<Type as Trait>::name`.",
+                );
+                Some(None)
+            }
+        }
     }
 
     /// The one turbofish type argument on a path callee's last
@@ -7675,7 +7758,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         expected: Option<Ty>,
         builtin_only: bool,
     ) -> Option<Ty> {
-        if !turbofish.is_empty() || self.name(name) != "into" {
+        // Core's blanket `Into` applies at the first autoderef step, so
+        // on a receiver reached through a deref Self is the reference
+        // (or Box) type, which no scalar `From` impl takes (rustc E0277
+        // for `let x: i64 = (&3i32).into()`).
+        if !turbofish.is_empty() || self.name(name) != "into" || derefs > 0 {
             return None;
         }
         let dst = self.deep(expected?);
@@ -7926,6 +8013,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Some(ret) = self.convert_method(e, recv, rt, name, name_span, args, expected) {
                 return ret;
             }
+        }
+        // `Ord::max`/`min`/`clamp` on a receiver reached through a
+        // deref resolve at the first autoderef step when the receiver
+        // type itself is `Ord` (`&A`, `Box<A>`): Self is that type, so
+        // the arguments and the result have it too (`(&3).max(5)` is
+        // rustc E0308). A user trait with a method of the name could
+        // also apply there (rustc E0034); that case stays unsupported.
+        if derefs > 0 && matches!(self.name(name), "max" | "min" | "clamp") && has_total_ord(p, &self.tys, rt) {
+            let user_trait = p.gx.traits_by_method.get(&name).is_some_and(|ds| ds.iter().any(|&d| d != p.gx.lang.ord));
+            if !user_trait && let Some(ret) = self.ord_pick_method(e, recv, rt, 0, name, name_span, args) {
+                return ret;
+            }
+            for &a in args {
+                self.expr(a, None);
+            }
+            self.errs.push(not_yet("L0614", name_span, "`Ord` methods on this receiver type"));
+            return ERROR;
         }
         use Builtin as B;
         // Builtin methods dispatch on the v2 builtin def in the first slot and on
@@ -10019,6 +10123,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             } else {
                 return ERROR;
             }
+        }
+        // A trait's function as a value: `<S as Tr>::mk`.
+        if let Some(found) = self.trait_fn_value(self.resolve(base), hint, name, span) {
+            let Some(f) = found else { return ERROR };
+            self.set_res(e, Res::Fn(f));
+            return self.fn_value_ty(f, span);
         }
         self.err(
             "L0104",

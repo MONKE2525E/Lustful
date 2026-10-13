@@ -298,6 +298,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::ConvArraySlice,
     Builtin::ConvDeref,
     Builtin::ConvRcInner,
+    Builtin::CmpCode,
 ];
 
 /// How a builtin is called.
@@ -595,6 +596,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             vec![i.intern("as_ref"), i.intern("as_mut"), i.intern("borrow"), i.intern("borrow_mut")],
             Call::Method,
         ),
+        B::CmpCode => (&["any Ord type"], vec![i.intern("cmp")], Call::Method),
     }
 }
 

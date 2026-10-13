@@ -3576,6 +3576,9 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
                 return glue_cmp(p, tys, a, total, seen) && glue_cmp(p, tys, b, total, seen);
             }
             match tys.local_adt(t) {
+                // A written non-generic `PartialOrd` (and no `Ord`): the
+                // glue calls its `partial_cmp`.
+                Some(a) if !total && p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_ord)) => true,
                 Some(a) => {
                     let d = p.adt(a).derives;
                     if !(if total { d.ord } else { d.partial_ord }) {

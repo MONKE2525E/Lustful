@@ -2402,9 +2402,9 @@ pub struct GenTables<'a> {
     /// The `Drop::drop` instance to call for one concrete Adt,
     /// for cgen's drop glue (iface: W-CGEN reads this).
     pub drop_methods: FxMap<AdtId, LocalDefId>,
-    /// The written `Clone::clone`, `Default::default`, and
-    /// `PartialEq::eq` methods of non-generic impls on non-generic
-    /// local Adts, by (Adt, trait):
+    /// The written `Clone::clone`, `Default::default`,
+    /// `PartialEq::eq`, and `PartialOrd::partial_cmp` methods of
+    /// non-generic impls on non-generic local Adts, by (Adt, trait):
     /// derived glue calls them for a field of that type, as rustc's
     /// derived bodies call the field type's impl (iface: W-CGEN
     /// reads this, like `drop_methods`).
@@ -5727,6 +5727,8 @@ fn compute_glue_methods(p: &mut Program) {
             "default"
         } else if rec.trait_def == lang.partial_eq {
             "eq"
+        } else if rec.trait_def == lang.partial_ord {
+            "partial_cmp"
         } else {
             continue;
         };
@@ -5750,6 +5752,19 @@ fn compute_glue_methods(p: &mut Program) {
         // answers `!=` as `!eq`, which is then exactly core's default.
         if rec.trait_def == lang.partial_eq
             && (has("ne") || p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()) != Some(self_ty))
+        {
+            continue;
+        }
+        // `PartialOrd` with `Rhs = Self`, core's `lt`/`le`/`gt`/`ge`,
+        // and no `Ord` impl at all: then every ordering of this type,
+        // alone or inside a tuple, slice, or derived body, is one
+        // `partial_cmp` call per comparison, which is what the cmp
+        // glue makes (`partial_cmp`/`cmp` read the glue once).
+        if rec.trait_def == lang.partial_ord
+            && (["lt", "le", "gt", "ge"].iter().any(|m| has(m))
+                || p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()) != Some(self_ty)
+                || p.adt(a).derives.ord
+                || p.gx.index.impls_of_trait(lang.ord).iter().any(|&id| p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)) == TyKind::Adt(d, EMPTY_ARGS)))
         {
             continue;
         }

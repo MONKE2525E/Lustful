@@ -2808,6 +2808,17 @@ impl FnGen<'_, '_, '_> {
                 }
                 variant_field(self.p, &tys[0], &t, 1, 0)
             }
+            B::CmpCode => {
+                // Both operands are references to the compared type (a
+                // slice operand is the fat value itself).
+                let (t, a, b) = match &tys[0] {
+                    CTy::Slice(_) => (tys[0].clone(), format!("(&{})", vals[0]), format!("(&{})", vals[1])),
+                    CTy::Ref(inner) => ((**inner).clone(), vals[0].clone(), vals[1].clone()),
+                    other => (other.clone(), format!("(&{})", vals[0]), format!("(&{})", vals[1])),
+                };
+                self.want(Glue::Cmp, &t);
+                format!("cmp_{}({a}, {b})", mangle(&t))
+            }
             B::OptUnwrapOrDefault => {
                 let CTy::Option(inner) = &tys[0] else { unreachable!() };
                 let t = self.tmp();
@@ -5217,6 +5228,28 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
         }
         Glue::Cmp => {
             let _ = writeln!(protos, "int8_t cmp_{m}({ct} *a, {ct} *b);");
+            // A written `partial_cmp` (see `glue_methods`): its
+            // `Option<Ordering>` becomes the glue's code.
+            if let CTy::Adt(adt_id) = t
+                && let Some(&f) = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_ord))
+                && let Some(ord) = p.tys.local_adt_of(crate::check::generics::ordering_def())
+            {
+                let opt = CTy::Option(Box::new(CTy::Adt(ord)));
+                let callee = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize]);
+                let ot = ctype(&opt);
+                if ret_is_large(p, f) {
+                    let _ = writeln!(body, "  {ot} r; {callee}(&r, a, b);");
+                } else {
+                    let _ = writeln!(body, "  {ot} r = {callee}(a, b);");
+                }
+                let some = disc_call(p, &opt, "(&r)");
+                let pay = variant_field(p, &opt, "r", 1, 0);
+                let ord_ct = ctype(&CTy::Adt(ord));
+                let idx = disc_call(p, &CTy::Adt(ord), "(&o)");
+                let _ = writeln!(body, "  if (!{some}) return 2;\n  {ord_ct} o = {pay};\n  return (int8_t)((int)({idx}) - 1);");
+                let _ = writeln!(defs, "int8_t cmp_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
+                return;
+            }
             // One field pair `x`, `y` (C lvalues): scalars inline, the
             // rest through their own glue.
             let cmp_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {

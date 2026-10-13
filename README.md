@@ -99,7 +99,7 @@ Release builds go through the real Rust toolchain on the same source, and lust p
 ## Supported subset
 
 - Items: `fn`, `struct` (named fields or unit), `enum` (unit, tuple, and struct variants), inherent `impl` blocks, `use`.
-- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default` (with `#[default]` enum variants). The derived bodies are structural glue; a field type with a written non-generic `Clone`, `Default`, or `PartialEq` impl (with no `ne` of its own) is called through that impl, and other written field impls are rejected where the derived method is used. `Hash` answers bounds only; nothing hashes yet.
+- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default` (with `#[default]` enum variants). The derived bodies are structural glue; a field type with a written non-generic `Clone`, `Default`, `PartialEq` (with no `ne` of its own), or `PartialOrd` (with no `Ord` and no `lt`/`le`/`gt`/`ge` of its own) impl is called through that impl, and other written field impls are rejected where the derived method is used. `Hash` answers bounds only; nothing hashes yet.
 - Comparison operators and core's default methods (`ne`, `lt`/`le`/`gt`/`ge`, `Ord::max`/`min`/`clamp`) work through written `PartialEq`/`PartialOrd`/`Ord` impls; `Ordering` has `is_*`, `reverse`, `then`, and `then_with` (with a closure).
 - Types: integers (no 128-bit), `bool`, `char`, `String`, `&str`, `Vec<T>`, `Option<T>`, `&T`, `&mut T`.
 - Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns, default binding modes), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.

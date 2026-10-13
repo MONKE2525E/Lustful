@@ -1,4 +1,3 @@
-// expect: L0104
 trait Tr {
     fn mk() -> i32;
 }

@@ -1,4 +1,4 @@
-// expect: L0104
+// expect: L0110
 // rustc E0308: lt takes &Rhs.
 use std::cmp::Ordering;
 struct P(u8);

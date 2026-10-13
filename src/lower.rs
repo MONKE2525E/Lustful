@@ -1399,12 +1399,26 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Closure { .. } => self.closure_value(e, dest, span),
             Expr::Try(inner) => self.try_into(e, *inner, dest, ty, span),
             // AST v2 expression forms the parser still rejects.
+            // A qualified path fn value (`<S as Tr>::mk`), lowered as
+            // the plain path's fn value; a qualified const lowered
+            // above from its value.
+            Expr::QPath { .. } => {
+                if let Res::Fn(f) = self.ck.res(e) {
+                    let want = match dest {
+                        Some(d) if d.proj.is_empty() => {
+                            let dt = self.body.locals[d.local as usize].ty;
+                            if matches!(self.kind(dt), TyKind::FnPtr(_)) { dt } else { ty }
+                        }
+                        _ => ty,
+                    };
+                    self.set_or_temp(dest, Rvalue::FnValue(f, want), ty, span)
+                }
+            }
             Expr::Float(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
             | Expr::Let { .. }
-            | Expr::QPath { .. }
             | Expr::ConstBlock(_)
             | Expr::Underscore
             | Expr::MacroCall(_) => {}
@@ -1763,6 +1777,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         let scalar = matches!(self.kind(recv_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char);
         let is_str = self.kind(recv_ty) == TyKind::Str;
         let (a_ref, b_ref) = (Operand::Copy(Place::local(rt)), Operand::Copy(b_pl.clone()));
+        let (code_a, code_b) = (a_ref.clone(), b_ref.clone());
         let rv = move |op: BinOp| -> Rvalue {
             if scalar {
                 Rvalue::Bin(op, Operand::Copy(Place::local(rt).deref()), Operand::Copy(b_pl.deref()))
@@ -1778,14 +1793,36 @@ impl<'p, 'a> Lower<'p, 'a> {
             Ck::Op(op) => self.assign(out, rv(op), span),
             Ck::Total(adt) | Ck::Partial(adt) => {
                 let partial = matches!(kind, Ck::Partial(_));
+                // A structural type compares once, through the cmp
+                // glue's code (-1, 0, 1, or 2 for unordered); the
+                // tests below then read that code.
+                let code = if scalar || is_str {
+                    None
+                } else {
+                    let i8_ty = int(IntTy::I8);
+                    let c = self.temp(i8_ty);
+                    self.call_into(CallTarget::Builtin(Builtin::CmpCode), vec![code_a, code_b], Place::local(c), span);
+                    Some(c)
+                };
                 let cmp = |this: &mut Self, op: BinOp| {
                     let t = this.temp(BOOL);
-                    this.assign(Place::local(t), rv(op), span);
+                    let r = match code {
+                        Some(c) => {
+                            let want: i128 = match op {
+                                BinOp::Lt => -1,
+                                BinOp::Gt => 1,
+                                _ => 0,
+                            };
+                            Rvalue::Bin(BinOp::Eq, Operand::Copy(Place::local(c)), Operand::Const(Const::Int(want as u128, IntTy::I8)))
+                        }
+                        None => rv(op),
+                    };
+                    this.assign(Place::local(t), r, span);
                     t
                 };
                 let lt = cmp(self, BinOp::Lt);
                 let gt = cmp(self, BinOp::Gt);
-                let eq = if partial { Some(cmp(self, if scalar || is_str { BinOp::Eq } else { BinOp::Le })) } else { None };
+                let eq = if partial { Some(cmp(self, BinOp::Eq)) } else { None };
                 let (ord_ty, ord_pl) = if partial {
                     let t = self.body.tys.option_elem(out_ty).unwrap_or(out_ty);
                     (t, Place::local(self.temp(t)))
@@ -2007,10 +2044,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.trait_cmp_call(f, ra, rb, via, Place::local(c), span);
             }
             None => {
+                // `Ord for &A` compares the pointees.
+                let (mut a, mut b, mut ty, mut ra, mut rb) = (a.clone(), b.clone(), ty, ra, rb);
+                while let TyKind::Ref(_, _, inner) = self.kind(ty) {
+                    (ra, rb) = (Operand::Copy(a.clone()), Operand::Copy(b.clone()));
+                    (a, b, ty) = (a.deref(), b.deref(), inner);
+                }
                 let rv = match self.kind(ty) {
-                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
-                        Rvalue::Bin(op, Operand::Copy(a.clone()), Operand::Copy(b.clone()))
-                    }
+                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => Rvalue::Bin(op, Operand::Copy(a), Operand::Copy(b)),
                     _ => Rvalue::Cmp { op, a: ra, b: rb, ty },
                 };
                 self.assign(Place::local(c), rv, span);

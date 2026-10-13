@@ -289,6 +289,39 @@ mod tests {
         });
     }
 
+    /// Derived glue calls a written impl only where the glue models
+    /// rustc's calls exactly (`glue_methods`): non-generic impls on
+    /// non-generic types; not a `Copy` type's `Clone`, not a
+    /// `PartialEq` that writes `ne`, not a `PartialOrd` next to an
+    /// `Ord` impl or with its own `lt`.
+    #[test]
+    fn glue_methods_take_only_modelled_impls() {
+        let src = "use std::cmp::Ordering;\n\
+                   struct A(u8);\nimpl Clone for A { fn clone(&self) -> A { A(self.0) } }\n\
+                   #[derive(Copy)] struct B(u8);\nimpl Clone for B { fn clone(&self) -> B { *self } }\n\
+                   struct C(u8);\nimpl PartialEq for C { fn eq(&self, o: &C) -> bool { self.0 == o.0 } fn ne(&self, o: &C) -> bool { self.0 != o.0 } }\n\
+                   struct D(u8);\nimpl PartialEq for D { fn eq(&self, o: &D) -> bool { self.0 == o.0 } }\n\
+                   impl PartialOrd for D { fn partial_cmp(&self, o: &D) -> Option<Ordering> { self.0.partial_cmp(&o.0) } }\n\
+                   #[derive(PartialEq, Eq)] struct F(u8);\n\
+                   impl PartialOrd for F { fn partial_cmp(&self, o: &F) -> Option<Ordering> { Some(self.cmp(o)) } }\n\
+                   impl Ord for F { fn cmp(&self, o: &F) -> Ordering { self.0.cmp(&o.0) } }\n\
+                   struct G<T>(T);\nimpl<T> Default for G<T> { fn default() -> G<T> { loop {} } }\n\
+                   struct H(u8);\nimpl Default for H { fn default() -> H { H(1) } }\n\
+                   fn main() {}\n";
+        with_program(src, |interner, p| {
+            let lang = &p.gx.lang;
+            let has = |n: &str, tr| p.gx.glue_methods.contains_key(&(p.type_names[&interner.intern(n)], tr));
+            assert!(has("A", lang.clone));
+            assert!(!has("B", lang.clone));
+            assert!(!has("C", lang.partial_eq));
+            assert!(has("D", lang.partial_eq));
+            assert!(has("D", lang.partial_ord));
+            assert!(!has("F", lang.partial_ord));
+            assert!(!has("G", lang.default));
+            assert!(has("H", lang.default));
+        });
+    }
+
     /// `lust check` makes closure body fns (they check closure bodies)
     /// but no generic fn instances; a build makes both (ARCH 4.1).
     #[test]

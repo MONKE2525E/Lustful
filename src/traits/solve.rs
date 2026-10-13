@@ -157,6 +157,17 @@ fn deep_trait_ref<C: SolveCx>(cx: &mut C, tr: TraitRef) -> TraitRef {
     TraitRef { def: tr.def, args, bindings }
 }
 
+/// True when a where-bound names no generic parameter (rustc's
+/// "global" bound). The bound itself is proved where it is written
+/// (L0612), so selection may answer it from impls.
+fn is_global_bound(tys: &impl TyIntern, tr: TraitRef) -> bool {
+    tys.args(tr.args).iter().all(|g| match *g {
+        GenericArg::Ty(t) => !tys.flags(t).contains_param(),
+        GenericArg::Const(c) => !matches!(tys.const_kind(c), ConstKind::Param(_)),
+        GenericArg::Lifetime(_) => true,
+    })
+}
+
 /// The Self type of a trait ref (`args[0]`).
 fn self_ty_of(cx: &impl TyIntern, tr: &TraitRef) -> Ty {
     cx.args(tr.args)[0].as_ty().expect("trait ref args start with the Self type")
@@ -395,8 +406,13 @@ impl Solver {
         }
 
         // Step 1: param-env evidence wins over impls. Two matching
-        // predicates defer; the first match is never taken.
+        // predicates defer; the first match is never taken. A global
+        // bound (one that names no generic parameter, like `A: Tr` on
+        // a plain fn) does not win: as in rustc's winnowing, a
+        // matching impl answers it, and the bound is used only when
+        // no impl matches. A global and a non-global match defer.
         let mut env_hits: Vec<usize> = Vec::new();
+        let mut global_hit: Option<usize> = None;
         for (i, pred) in env.iter().enumerate() {
             let Predicate::Trait(b) = pred else { continue };
             if b.count != 0 || b.value.def != obl.def {
@@ -405,12 +421,17 @@ impl Solver {
             let snap = cx.snapshot();
             let ok = unify_trait_refs(cx, b.value, obl);
             cx.rollback(snap);
-            if ok {
+            if !ok {
+                continue;
+            }
+            if is_global_bound(cx.tys(), b.value) {
+                global_hit.get_or_insert(i);
+            } else {
                 env_hits.push(i);
             }
         }
         match env_hits.len() {
-            1 => {
+            1 if global_hit.is_none() => {
                 let i = env_hits[0];
                 if let Predicate::Trait(b) = env[i] {
                     unify_trait_refs(cx, b.value, obl);
@@ -418,7 +439,7 @@ impl Solver {
                 self.memo.insert(obl, MemoSel::Param(i));
                 return Selection::ParamEvidence(i);
             }
-            2.. => return Selection::Ambiguous,
+            1.. => return Selection::Ambiguous,
             _ => {}
         }
 
@@ -505,6 +526,14 @@ impl Solver {
                 let id = matched[0];
                 self.memo.insert(obl, MemoSel::Impl(id));
                 self.confirm_impl(cx, index, env, id, obl)
+            }
+            0 if global_hit.is_some() => {
+                let i = global_hit.unwrap_or_default();
+                if let Predicate::Trait(b) = env[i] {
+                    unify_trait_refs(cx, b.value, obl);
+                }
+                self.memo.insert(obl, MemoSel::Param(i));
+                Selection::ParamEvidence(i)
             }
             0 => {
                 // Step 5 or step 6, by whether inference can still
