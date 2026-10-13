@@ -53,7 +53,9 @@ pub fn eager_vtables(p: &mut Program, made: &mut Vec<LocalDefId>) {
         if !rec.local || rec.synthetic != crate::traits::index::Synthetic::None || !rec.generics.params.is_empty() {
             continue;
         }
-        if !wanted.contains(&rec.trait_def) || p.gx.dyn_infos.get(&rec.trait_def).is_none_or(|i| i.violation.is_some() || i.unsupported.is_some()) {
+        if !wanted.contains(&rec.trait_def)
+            || p.gx.dyn_infos.get(&rec.trait_def).is_none_or(|i| i.violation.is_some() || i.unsupported.is_some())
+        {
             continue;
         }
         let self_ty = rec.self_ty(&p.tys);

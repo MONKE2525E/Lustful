@@ -1963,7 +1963,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(&p.tys, p.fn_info(f).ret),
                 Res::DynMethod { owner, slot, .. } => {
                     let info = p.gx.dyn_infos.get(&owner);
-                    let m = info.and_then(|info| (0..info.methods.len()).find(|&j| info.method_slot(j) == slot).map(|j| info.methods[j].def));
+                    let m =
+                        info.and_then(|info| (0..info.methods.len()).find(|&j| info.method_slot(j) == slot).map(|j| info.methods[j].def));
                     m.and_then(|d| p.gx.trait_methods.get(&d)).is_none_or(|tm| object::has_erased_dyn(&p.tys, tm.ret))
                 }
                 Res::Indirect => {
@@ -2330,7 +2331,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::Dyn(x, _), TyKind::Dyn(y, _)) => {
                 let (bx, by) = (self.tys.dyn_bounds(x).clone(), self.tys.dyn_bounds(y).clone());
                 match (bx.principal, by.principal) {
-                    (Some(px), Some(py)) => bx.auto == by.auto && px.value.def == py.value.def && self.unify_args(px.value.args, py.value.args),
+                    (Some(px), Some(py)) => {
+                        bx.auto == by.auto && px.value.def == py.value.def && self.unify_args(px.value.args, py.value.args)
+                    }
                     _ => false,
                 }
             }
@@ -5402,7 +5405,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Ok((slot, _)) => slot,
             Err(why) => {
                 let tn = self.tn(base);
-                self.err("L0703", span, format!("the method `{}` cannot be called on `{tn}`: {why}", self.name(name)), "Call it on a concrete type.");
+                self.err(
+                    "L0703",
+                    span,
+                    format!("the method `{}` cannot be called on `{tn}`: {why}", self.name(name)),
+                    "Call it on a concrete type.",
+                );
                 return Some(ERROR);
             }
         };

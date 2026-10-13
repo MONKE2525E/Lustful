@@ -478,7 +478,11 @@ impl<'p, 'a> Lower<'p, 'a> {
         // its slot path exist; a miss here would call the wrong vtable.
         let Some(c) = cands.into_iter().find(|c| c.owner.def == owner) else { unreachable!() };
         let Some(path) = object::upcast_path(self.p, &mut self.body.tys, principal, c.owner) else { unreachable!() };
-        let bounds = self.body.tys.intern_dyn_bounds(DynBounds { principal: Some(Binder::plain(c.owner)), supertraits: Box::new([]), auto: AutoTraits::default() });
+        let bounds = self.body.tys.intern_dyn_bounds(DynBounds {
+            principal: Some(Binder::plain(c.owner)),
+            supertraits: Box::new([]),
+            auto: AutoTraits::default(),
+        });
         let owner_dyn = self.body.tys.intern(TyKind::Dyn(bounds, Region::Erased));
         let rt = self.ref_ty(mutable, owner_dyn);
         let t = self.temp(rt);

@@ -379,14 +379,18 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
         }
         TyKind::Adt(d, a) => {
             // A dyn arg for a param that needs `Sized` (`Vec<dyn Tr>`).
-            let sized_param = |i: usize| match p.adt_by_def(d) {
-                Some(adt) => p.gx.adt_generics.get(adt.0 as usize).is_none_or(|g| {
-                    g.predicates.iter().any(|pred| {
-                        matches!(pred, Predicate::Trait(b) if b.value.def == p.gx.lang.sized
-                            && matches!(p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|t| p.tys.kind(t)), Some(TyKind::Param(q)) if q.0 as usize == i))
+            let sized_param = |i: usize| {
+                let Some(adt) = p.adt_by_def(d) else { return true };
+                let is_param_i = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(q) if q.0 as usize == i);
+                p.gx.adt_generics.get(adt.0 as usize).is_none_or(|g| {
+                    g.predicates.iter().any(|pred| match pred {
+                        Predicate::Trait(b) => {
+                            let first = p.tys.args(b.value.args).first().and_then(|g| g.as_ty());
+                            b.value.def == p.gx.lang.sized && first.is_some_and(is_param_i)
+                        }
+                        _ => false,
                     })
-                }),
-                None => true,
+                })
             };
             tys.args(a).iter().enumerate().find_map(|(i, g)| {
                 let e = g.as_ty()?;

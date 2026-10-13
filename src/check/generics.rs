@@ -3599,7 +3599,10 @@ fn find_global_ty(p: &Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
                             other => other,
                         });
                     }
-                    Some(Binder { count: pr.count, value: TraitRef { def: pr.value.def, args: g.get_args(&out)?, bindings: EMPTY_BINDINGS } })
+                    Some(Binder {
+                        count: pr.count,
+                        value: TraitRef { def: pr.value.def, args: g.get_args(&out)?, bindings: EMPTY_BINDINGS },
+                    })
                 }
                 None => None,
             };

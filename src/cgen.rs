@@ -1589,7 +1589,8 @@ impl FnGen<'_, '_, '_> {
                 let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
                 if c_size_align(self.p, &ret).0 > 32 {
                     let t = self.tmp();
-                    let _ = writeln!(self.out, "    {rc} {t}; ((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
+                    let _ =
+                        writeln!(self.out, "    {rc} {t}; ((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
                     t
                 } else {
                     format!("(({rc} (*)({}))({rt}.vt[{k}]))({rt}.data{pre})", tys.join(", "))
@@ -2076,7 +2077,10 @@ impl FnGen<'_, '_, '_> {
                 "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out, ({recv})self{names}); }}"
             );
         } else {
-            let _ = writeln!(self.prelude, "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])(({recv})self{names}); }}");
+            let _ = writeln!(
+                self.prelude,
+                "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])(({recv})self{names}); }}"
+            );
         }
         name
     }

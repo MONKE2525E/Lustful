@@ -911,7 +911,12 @@ pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, na
         && form_of(p.fn_info(f).self_kind).is_none()
     {
         if form == ReceiverForm::Value {
-            cx.err("L0104", name_span, format!("`{}` is an associated function, not a method", cx.name(name)), "Call it as `<dyn Trait>::name(...)`.");
+            cx.err(
+                "L0104",
+                name_span,
+                format!("`{}` is an associated function, not a method", cx.name(name)),
+                "Call it as `<dyn Trait>::name(...)`.",
+            );
             return Probe::Failed;
         }
         return Probe::Miss;
