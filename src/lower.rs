@@ -33,6 +33,11 @@ struct Lower<'p, 'a> {
     drop_ty: crate::intern::FxMap<Ty, bool>,
     /// Set while lowering a closure body fn (see `lower::closure`).
     upvars: Option<closure::Upvars>,
+    /// While a match guard lowers, the place each of the arm's
+    /// pattern bindings reads through (see `bind_pat_guard`):
+    /// parallel to the checker's locals, `None` outside a guard.
+    /// `place` consults it before `local_map`.
+    guard_places: Vec<Option<Place>>,
 }
 
 /// Lowers one checked function body to IR.
@@ -58,9 +63,11 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         mut_index: 0,
         drop_ty: Default::default(),
         upvars: None,
+        guard_places: Vec::new(),
     };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
+    lw.guard_places = vec![None; lw.ck.locals.len()];
     for i in 0..lw.ck.param_locals.len() {
         let cl = lw.ck.param_locals[i];
         let info = &lw.ck.locals[cl as usize];
@@ -258,7 +265,12 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// Evaluates `e` to a place. A value expression goes into a new temporary.
     fn place(&mut self, e: ExprId) -> Place {
         match (self.p.ast.expr(e), self.ck.res(e)) {
-            (Expr::Path(_) | Expr::SelfValue, Res::Local(l)) => Place::local(self.local_map[l as usize]),
+            (Expr::Path(_) | Expr::SelfValue, Res::Local(l)) => match &self.guard_places[l as usize] {
+                // A match guard reads its arm's bindings through a
+                // shared reference (see `bind_pat_guard`).
+                Some(p) => p.clone(),
+                None => Place::local(self.local_map[l as usize]),
+            },
             (Expr::Field { base, .. }, Res::Field { derefs, index }) => {
                 let b = self.place(*base);
                 Self::derefs(b, derefs).project(Proj::Field(index))
@@ -421,12 +433,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             _ if self.is_place_expr(e) => {
                 let p = self.place(e);
                 // An index expression reads through the `Index` trait in
-                // Rust, so moving its (non-Copy) value out is moving out
-                // of a reference and an error (E0507/E0508). Route the
-                // read through a shared borrow temporary so the borrow
-                // checker reports exactly that. Pattern bindings project
-                // indexes directly and are not affected.
-                if matches!(self.p.ast.expr(e), Expr::Index { .. }) && !is_copy(self.p, &self.body.tys, ty) {
+                // Rust, so moving its (non-Copy) value out, or a field
+                // below it, is moving out of a reference and an error
+                // (E0507/E0508). Route the read through a shared borrow
+                // temporary so the borrow checker reports exactly that.
+                // Pattern bindings project indexes directly and are not
+                // affected (they do not come through here).
+                if p.proj.iter().any(|x| matches!(x, Proj::Index(_))) && !is_copy(self.p, &self.body.tys, ty) {
                     let span = self.span(e);
                     let rt = self.ref_ty(false, ty);
                     let tmp = self.temp(rt);
@@ -535,9 +548,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let pl = self.place(e);
                 if let Some(d) = dest {
                     // Index reads go through the `Index` trait (see
-                    // `operand_raw`): a non-Copy move out of one is a
-                    // move out of a reference.
-                    let op = if matches!(p.ast.expr(e), Expr::Index { .. }) && !is_copy(self.p, &self.body.tys, ty) {
+                    // `operand_raw`): a non-Copy move out of a place
+                    // below one is a move out of a reference.
+                    let op = if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) && !is_copy(self.p, &self.body.tys, ty) {
                         let rt = self.ref_ty(false, ty);
                         let tmp = self.temp(rt);
                         self.assign(Place::local(tmp), Rvalue::Ref(false, pl), span);
@@ -1115,6 +1128,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let (pat, scrut) = (*pat, *scrut);
                     let es = self.span(el);
                     let sp = self.place(scrut);
+                    let sp = self.pattern_place(sp, self.ty(scrut), &[pat], es);
                     let fail = self.new_block();
                     let live = self.scopes.last().cloned().unwrap_or_default();
                     self.test_pat(pat, sp.clone(), fail);
@@ -1274,6 +1288,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         // dropping them: the projections name them.
                         let temps = self.scopes.pop().unwrap();
                         self.scopes.last_mut().unwrap().extend(temps);
+                        let pl = self.pattern_place(pl, self.ty(init), &[pat], span);
                         self.bind_pat(pat, pl);
                     } else {
                         let tty = self.ty(init);
@@ -1970,6 +1985,47 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.unit(dest, span);
     }
 
+    /// True when `pat` has a binding that moves a non-Copy part
+    /// out of the value it matches.
+    fn pat_moves_noncopy(&self, pat: PatId) -> bool {
+        let binding_moves = |this: &Self, pat: PatId| {
+            matches!(this.ck.pat_res(pat), PatRes::Binding { mode: BindMode::Move, .. })
+                && !is_copy(this.p, &this.body.tys, this.ck.pat_ty(pat))
+        };
+        match self.p.ast.pat(pat) {
+            Pat::Binding { .. } => binding_moves(self, pat),
+            Pat::At { inner, .. } => binding_moves(self, pat) || self.pat_moves_noncopy(*inner),
+            Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| self.pat_moves_noncopy(s)),
+            Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.pat_moves_noncopy(s)),
+            Pat::Slice { prefix, middle, suffix } => {
+                middle.is_some_and(|m| self.pat_moves_noncopy(m))
+                    || prefix.iter().chain(suffix.iter()).any(|&s| self.pat_moves_noncopy(s))
+            }
+            Pat::Paren(i) | Pat::Ref { inner: i, .. } => self.pat_moves_noncopy(*i),
+            _ => false,
+        }
+    }
+
+    /// The place a pattern binds out of, when `place` came from a
+    /// place expression. A move out of a place that goes through
+    /// an index expression is a move out of the reference the
+    /// `Index` trait returns (rustc E0507/E0508), not the partial
+    /// move the same projections mean when a pattern projects
+    /// them: route such a place through a shared borrow temporary
+    /// so the borrow checker reports the move, as `operand_raw`
+    /// does for operand reads. When no pattern in `pats` moves a
+    /// non-Copy part (tests only, `ref` bindings, Copy bindings),
+    /// the direct place stays, so those matches work as before.
+    fn pattern_place(&mut self, place: Place, ty: Ty, pats: &[PatId], span: Span) -> Place {
+        if !place.proj.iter().any(|x| matches!(x, Proj::Index(_))) || !pats.iter().any(|&pat| self.pat_moves_noncopy(pat)) {
+            return place;
+        }
+        let rt = self.ref_ty(false, ty);
+        let tmp = self.temp(rt);
+        self.assign(Place::local(tmp), Rvalue::Ref(false, place), span);
+        Place::local(tmp).deref()
+    }
+
     // ---------- Match ----------
 
     fn match_into(&mut self, scrut: ExprId, arms: &[ast::Arm], dest: Option<&Place>, span: Span) {
@@ -1979,19 +2035,42 @@ impl<'p, 'a> Lower<'p, 'a> {
         // arm that moves a part is a partial move of that place, and
         // the rest drops with it (codegen elaborates the drop).
         let sp = self.place(scrut);
+        let arm_pats: Vec<PatId> = arms.iter().map(|a| a.pat).collect();
+        let sp = self.pattern_place(sp, self.ty(scrut), &arm_pats, span);
         let end = self.new_block();
         for arm in arms {
             let next = self.new_block();
             self.test_pat(arm.pat, sp.clone(), next);
             self.scopes.push(Vec::new());
-            self.bind_pat(arm.pat, sp.clone());
+            // A guard reads the arm's bindings by shared reference
+            // (rustc binds pattern variables by reference for the
+            // guard, then by their declared mode in the arm body):
+            // bind for the guard first, and do the real binding,
+            // moves included, only on the guard's success edge. A
+            // failed guard then leaves the scrutinee whole for the
+            // next arm. The one shape with no reference place to
+            // read through, a binding for the middle of a slice
+            // pattern, keeps the move-first order for now.
+            let by_ref_guard = arm.guard.is_some() && !self.pat_has_slice_middle_binding(arm.pat);
+            let mut guard_bound: Vec<u32> = Vec::new();
+            if by_ref_guard {
+                self.scopes.push(Vec::new());
+                self.bind_pat_guard(arm.pat, sp.clone(), &mut guard_bound);
+            } else {
+                self.bind_pat(arm.pat, sp.clone());
+            }
             if let Some(g) = arm.guard {
                 let gspan = self.span(g);
                 self.scopes.push(Vec::new());
                 let c = self.operand(g);
-                let cl = self.new_local(BOOL, false, None);
+                // Mutable: the same local is written again on every
+                // pass when the match sits in a loop.
+                let cl = self.new_local(BOOL, true, None);
                 self.assign(Place::local(cl), Rvalue::Use(c), gspan);
                 self.pop_scope(gspan);
+                for l in &guard_bound {
+                    self.guard_places[*l as usize] = None;
+                }
                 let (ok, fail) = (self.new_block(), self.new_block());
                 let b = &mut self.body.blocks[self.cur.0 as usize];
                 b.term = Terminator::If(Operand::Copy(Place::local(cl)), ok, fail);
@@ -2000,6 +2079,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.emit_drops(&arm_locals, gspan);
                 self.goto(next, gspan);
                 self.cur = ok;
+                if by_ref_guard {
+                    // End the guard bindings' storage before the
+                    // real binding moves out of the same places.
+                    self.emit_drops(&arm_locals, gspan);
+                    self.scopes.pop();
+                    self.bind_pat(arm.pat, sp.clone());
+                }
             }
             self.expr_into(arm.body, dest);
             self.pop_scope(span);
@@ -2009,6 +2095,123 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.terminate(Terminator::Unreachable, span);
         self.cur = end;
         self.pop_scope(span);
+    }
+
+    /// True when a slice pattern in `pat` binds its middle (`rest`
+    /// or `rest @ ..`). That binding has no single place to read by
+    /// reference for a guard, so `match_into` keeps the old
+    /// move-first order for such an arm.
+    fn pat_has_slice_middle_binding(&self, pat: PatId) -> bool {
+        fn binds(p: &Program, pat: PatId) -> bool {
+            match p.ast.pat(pat) {
+                Pat::Binding { .. } | Pat::At { .. } => true,
+                Pat::Paren(i) | Pat::Ref { inner: i, .. } => binds(p, *i),
+                _ => false,
+            }
+        }
+        fn walk(p: &Program, pat: PatId) -> bool {
+            match p.ast.pat(pat) {
+                Pat::Slice { prefix, middle, suffix } => {
+                    middle.is_some_and(|m| binds(p, m) || walk(p, m))
+                        || prefix.iter().chain(suffix.iter()).any(|&s| walk(p, s))
+                }
+                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| walk(p, s)),
+                Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| walk(p, s)),
+                Pat::Paren(i) | Pat::Ref { inner: i, .. } | Pat::At { inner: i, .. } => walk(p, *i),
+                _ => false,
+            }
+        }
+        walk(self.p, pat)
+    }
+
+    /// Records one pattern binding for guard evaluation: a fresh
+    /// shared-reference local that borrows `place`, with
+    /// `guard_places` set so the guard reads the binding through
+    /// it. A move binding reads the value at `*tmp` (a move out of
+    /// it in the guard is then a move out of a reference, and a
+    /// mutable borrow of it borrows through a shared reference:
+    /// both errors, as in rustc); a `ref` binding, whose value is
+    /// itself a reference, reads as the local holding a shared
+    /// borrow of the same place. The temporaries go in the
+    /// innermost scope and need no drop.
+    fn guard_binding(&mut self, local: u32, mode: BindMode, value_ty: Ty, place: Place, span: Span, bound: &mut Vec<u32>) {
+        let name = self.p.name(self.ck.locals[local as usize].name).to_string();
+        let rt = self.ref_ty(false, value_ty);
+        let t = self.new_local(rt, false, Some(name));
+        self.scopes.last_mut().unwrap().push(t);
+        self.assign(Place::local(t), Rvalue::Ref(false, place), span);
+        self.guard_places[local as usize] = Some(match mode {
+            BindMode::Move => Place::local(t).deref(),
+            BindMode::Ref(_) => Place::local(t),
+        });
+        bound.push(local);
+    }
+
+    /// Binds an already-tested pattern for a match guard, mirroring
+    /// `bind_pat` case by case, but by shared reference (see
+    /// `guard_binding`). Records every bound checker local in
+    /// `bound` so the caller can clear `guard_places` after the
+    /// guard. A slice middle binding never reaches here (see
+    /// `pat_has_slice_middle_binding`).
+    fn bind_pat_guard(&mut self, pat: PatId, place: Place, bound: &mut Vec<u32>) {
+        let p = self.p;
+        let place = Self::derefs(place, self.ck.pat_derefs(pat));
+        let span = p.ast.pat_span(pat);
+        match (p.ast.pat(pat), self.ck.pat_res(pat)) {
+            (Pat::Binding { .. }, PatRes::Binding { local, mode }) => {
+                self.guard_binding(local, mode, self.ck.pat_ty(pat), place, span, bound);
+            }
+            (Pat::TupleStruct { elems, .. }, PatRes::Opt(true)) => {
+                self.bind_pat_guard(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)), bound);
+            }
+            (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
+                self.bind_pat_guard(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), bound);
+            }
+            (Pat::TupleStruct { .. } | Pat::Struct { .. }, PatRes::Variant(a, v)) => {
+                let base = if p.adt(a).is_enum { place.project(Proj::Downcast(v)) } else { place };
+                for (i, sub) in self.sub_pats(pat, a, v) {
+                    self.bind_pat_guard(sub, base.project(Proj::Field(i)), bound);
+                }
+            }
+            (Pat::Tuple(elems), _) => {
+                let ty = self.ck.pat_ty(pat);
+                let n = match self.kind(ty) {
+                    TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
+                    _ => elems.len(),
+                };
+                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                    for (i, sub) in mapped {
+                        self.bind_pat_guard(sub, place.project(Proj::Field(i as u32)), bound);
+                    }
+                }
+            }
+            (Pat::Paren(inner), _) => self.bind_pat_guard(*inner, place, bound),
+            (Pat::Slice { prefix, middle: _, suffix }, _) => {
+                let ty = self.ck.pat_ty(pat);
+                let arr_len = match self.kind(ty) {
+                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => Some(n as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                for (i, &sub) in prefix.iter().enumerate() {
+                    let idx = self.const_usize(i as u64, span);
+                    self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
+                }
+                for (j, &sub) in suffix.iter().enumerate() {
+                    let back = (suffix.len() - j) as u64;
+                    let idx = self.slice_back_index(&place, back, arr_len, span);
+                    self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
+                }
+            }
+            (Pat::Ref { inner, .. }, _) => self.bind_pat_guard(*inner, place.deref(), bound),
+            (Pat::At { inner, .. }, PatRes::Binding { local, mode }) => {
+                self.bind_pat_guard(*inner, place.clone(), bound);
+                self.guard_binding(local, mode, self.ck.pat_ty(pat), place, span, bound);
+            }
+            _ => {}
+        }
     }
 
     fn lit_operand(&mut self, l: ExprId, ty: Ty) -> Operand {
