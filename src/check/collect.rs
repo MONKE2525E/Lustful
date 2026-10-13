@@ -1620,6 +1620,11 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         }
                     }
                 };
+                // An impl for a projection (`impl Tr for
+                // <S as X>::A`) stands for the normalized type
+                // when the projection resolves through impls
+                // already collected.
+                let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
                 // The owner template Adt, when the Self pattern is a
                 // local Adt application (inherent and trait impls).

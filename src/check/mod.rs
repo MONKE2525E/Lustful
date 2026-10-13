@@ -4678,6 +4678,44 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 {
                     return t;
                 }
+                // `Trait::method(self_arg, ..)`: the trait name
+                // heads the path and the first argument is the
+                // receiver. The Self type comes from that
+                // argument (trial-checked, then rechecked by the
+                // assoc call itself).
+                if segs.len() == 2 && !args.is_empty() {
+                    let cxr = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    if let Some(tdef) = cxr.trait_by_name(p.interner, segs[0].name)
+                        && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
+                        && rec.method_by_name(segs[1].name).is_some()
+                    {
+                        let snap = self.snapshot_vars();
+                        let obl_len = self.obl_len();
+                        let sites_len = self.generic_sites.len();
+                        let err_len = self.errs.len();
+                        let at = self.expr(args[0], None);
+                        let at = self.deep(at);
+                        self.rollback_vars(snap);
+                        self.obl_truncate(obl_len);
+                        self.generic_sites.truncate(sites_len);
+                        self.errs.truncate(err_len);
+                        let mut bases = vec![at];
+                        if let TyKind::Ref(_, _, inner) = self.tys.kind(at) {
+                            bases.insert(0, self.deep(inner));
+                        }
+                        for base in bases {
+                            let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                            for _ in 1..rec.generics.params.len() {
+                                tr_args.push(GenericArg::Ty(self.new_var(false)));
+                            }
+                            let args_id = self.tys.intern_args(&tr_args);
+                            let hint = TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS };
+                            if let Some(t) = self.assoc_call(e, callee, base, Some(hint), segs[1].name, args, span) {
+                                return t;
+                            }
+                        }
+                    }
+                }
                 let cs = self.span(callee);
                 match self.resolve_assoc(segs, cs) {
                     Some(r) => r,

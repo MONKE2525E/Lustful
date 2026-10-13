@@ -3548,7 +3548,7 @@ fn abstract_check(p: &mut Program) -> Vec<Diag> {
 /// Normalizes one global type through the solver, lifting the
 /// result back into the global store when normalization rewrote
 /// it in the solver's overlay.
-fn normalize_global(p: &mut Program, t: Ty) -> Ty {
+pub fn normalize_global(p: &mut Program, t: Ty) -> Ty {
     if !p.tys.flags(t).contains_projection() {
         return t;
     }
