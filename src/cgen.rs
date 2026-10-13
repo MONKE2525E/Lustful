@@ -41,6 +41,17 @@ pub enum CTy {
     FnPtr(Vec<CTy>, Box<CTy>),
 }
 
+/// One step of a move path in codegen (see `FnGen::move_paths`): a
+/// field of a struct, tuple, `Option` payload, or of the variant a
+/// `Downcast` chose; a variant view; or an array element at a
+/// constant index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Field(u32),
+    Downcast(u32),
+    Elem(u64),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Glue {
     Drop,
@@ -285,6 +296,17 @@ struct FnGen<'b, 'p, 'a> {
     glue: HashSet<(Glue, CTy)>,
     local_cty: Vec<CTy>,
     local_drop: Vec<bool>,
+    /// Per local, the field paths the body moves out of it (partial
+    /// moves) whose value needs a drop. Each has a C flag
+    /// `m{local}_{index}` that a move clears; drops of the local
+    /// read the flags and drop only what it still owns (Rust's drop
+    /// elaboration). A zeroed field cannot stand for "moved": a type
+    /// with a user `Drop` impl would run it on the zero value.
+    move_paths: Vec<Vec<Vec<Step>>>,
+    /// Locals that hold one constant array index (see
+    /// `borrowck::const_index_locals`): a move out of `a[c]` is a
+    /// partial move like a field move.
+    const_index: std::collections::HashMap<Local, u64>,
     map: &'b SourceMap,
     /// Types in the signatures of called functions, needed for the call casts.
     sig_types: HashSet<CTy>,
@@ -690,6 +712,7 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
 pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
     let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
     let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
+    let n_locals = local_cty.len();
     let mut g = FnGen {
         p,
         body,
@@ -697,6 +720,8 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         glue: HashSet::new(),
         local_cty,
         local_drop,
+        move_paths: vec![Vec::new(); n_locals],
+        const_index: crate::borrowck::const_index_locals(body),
         map,
         sig_types: HashSet::new(),
         base_line,
@@ -704,6 +729,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         tmp: 0,
         ret_large: ret_is_large(p, body.fn_id),
     };
+    g.collect_move_paths();
     g.function();
     g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
     let mut types = std::mem::take(&mut g.sig_types);
@@ -754,6 +780,9 @@ impl FnGen<'_, '_, '_> {
             if self.local_drop[i] {
                 flags.push(format!("d{i} = {}", is_param as u8));
             }
+            for k in 0..self.move_paths[i].len() {
+                flags.push(format!("m{i}_{k} = 1"));
+            }
         }
         for (ct, names) in &by_type {
             // In C, `T* a, b` makes only `a` a pointer, so every declarator gets its own stars.
@@ -790,6 +819,245 @@ impl FnGen<'_, '_, '_> {
             self.term(&block.term, block.term_span, next);
         }
         self.out.push_str("}\n\n");
+    }
+
+    /// For an assignment to `dest` of a type that needs drop: the C
+    /// statements that drop the old value first, and the ones that
+    /// mark the place owned again after the write. Each starts with
+    /// a space. A whole local drops through its flag and elaboration;
+    /// a part drops through elaboration when moves went through it
+    /// (Rust lets a moved field be assigned again), else always.
+    fn drop_old_value(&mut self, dest: &Place, d: &str, dt: &CTy) -> (String, String) {
+        let l = dest.local;
+        if dest.proj.is_empty() {
+            let old = self.elab_drop(l, &[]);
+            return (format!(" if (d{l}) {{{old} }}"), format!(" d{l} = 1;{}", self.reset_move_flags(l, &[])));
+        }
+        if let Some(path) = self.steps_of(dest)
+            && self.move_paths[l as usize].iter().any(|p| p.starts_with(&path))
+        {
+            return (self.elab_drop(l, &path), self.reset_move_flags(l, &path));
+        }
+        self.want(Glue::Drop, dt);
+        (format!(" drop_{}(&{d});", mangle(dt)), String::new())
+    }
+
+    // ---------- Drop elaboration ----------
+
+    /// The move path of a place: its projections as `Step`s, or None
+    /// when it goes through a reference or a non-constant index.
+    fn steps_of(&self, pl: &Place) -> Option<Vec<Step>> {
+        pl.proj
+            .iter()
+            .map(|pr| match pr {
+                Proj::Field(i) => Some(Step::Field(*i)),
+                Proj::Downcast(v) => Some(Step::Downcast(*v)),
+                Proj::Index(l) => self.const_index.get(l).map(|&c| Step::Elem(c)),
+                Proj::Deref => None,
+            })
+            .collect()
+    }
+
+    /// Fills `move_paths` from every `Move` of a part of a local.
+    fn collect_move_paths(&mut self) {
+        let body = self.body;
+        let mut moved: Vec<&Place> = Vec::new();
+        for b in &body.blocks {
+            for s in &b.stmts {
+                match &s.kind {
+                    StmtKind::Assign(_, rv) => rvalue_moves(rv, &mut moved),
+                    StmtKind::Print { parts, .. } => parts_moves(parts, &mut moved),
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Terminator::If(o, ..) | Terminator::Switch(o, ..) => operand_moves(o, &mut moved),
+                Terminator::Call { args, .. } => args.iter().for_each(|o| operand_moves(o, &mut moved)),
+                Terminator::Panic(parts) => parts_moves(parts, &mut moved),
+                _ => {}
+            }
+        }
+        for pl in moved {
+            let l = pl.local as usize;
+            let Some(path) = self.steps_of(pl) else { continue };
+            if path.is_empty() || !self.local_drop[l] || self.move_paths[l].contains(&path) {
+                continue;
+            }
+            if needs_drop_c(self.p, &self.path_place(pl.local, &path).1) {
+                self.move_paths[l].push(path);
+            }
+        }
+    }
+
+    /// The C expression and type of one move path of local `l`
+    /// (`place` for the projections a path can hold).
+    fn path_place(&self, l: Local, path: &[Step]) -> (String, CTy) {
+        let mut e = format!("l{l}");
+        let mut t = self.local_cty[l as usize].clone();
+        let mut variant: Option<u32> = None;
+        for step in path {
+            match (*step, t.clone()) {
+                (Step::Downcast(v), _) => variant = Some(v),
+                (Step::Field(i), CTy::Adt(a)) => {
+                    let v = variant.take();
+                    e = match v {
+                        Some(v) => format!("{e}.u.v{v}.f{i}"),
+                        None => format!("{e}.f{i}"),
+                    };
+                    t = cty(&self.p.tys, self.p.adt(a).variants[v.unwrap_or(0) as usize].fields[i as usize].ty);
+                }
+                (Step::Field(i), CTy::Tuple(es)) => {
+                    e = format!("{e}.f{i}");
+                    t = es[i as usize].clone();
+                }
+                (Step::Field(_), CTy::Option(inner)) => {
+                    variant = None;
+                    e = variant_field(self.p, &t, &e, 1, 0);
+                    t = *inner;
+                }
+                (Step::Elem(c), CTy::Array(el, _)) => {
+                    e = format!("{e}.v[{c}]");
+                    t = *el;
+                }
+                _ => panic!("bad move path in codegen"),
+            }
+        }
+        (e, t)
+    }
+
+    /// The flag index of one moved path of local `l`.
+    fn move_flag(&self, l: Local, path: &[Step]) -> Option<usize> {
+        self.move_paths[l as usize].iter().position(|p| p == path)
+    }
+
+    /// C statements that set every move flag of `l` at or below
+    /// `prefix` (the part an assignment just filled again).
+    fn reset_move_flags(&self, l: Local, prefix: &[Step]) -> String {
+        let mut s = String::new();
+        for (k, path) in self.move_paths[l as usize].iter().enumerate() {
+            if path.starts_with(prefix) {
+                let _ = write!(s, " m{l}_{k} = 1;");
+            }
+        }
+        s
+    }
+
+    /// C statements that drop the part of local `l` at `prefix` that
+    /// the function still owns: a moved path drops only while its
+    /// flag is set, a place above moved paths drops part by part in
+    /// Rust's order (an enum only in the variant the paths go
+    /// through), and any other place drops whole. Rust forbids moving
+    /// out of a type with a `Drop` impl (E0509, borrowck), so no place
+    /// split here has one.
+    fn elab_drop(&mut self, l: Local, prefix: &[Step]) -> String {
+        let paths = &self.move_paths[l as usize];
+        let own = paths.iter().position(|p| p == prefix);
+        let deeper = paths.iter().any(|p| p.len() > prefix.len() && p.starts_with(prefix));
+        let (e, t) = self.path_place(l, prefix);
+        let inner = if deeper {
+            self.elab_parts(l, prefix, &e, &t)
+        } else if needs_drop_c(self.p, &t) {
+            self.want(Glue::Drop, &t);
+            format!(" drop_{}(&{e});", mangle(&t))
+        } else {
+            String::new()
+        };
+        match own {
+            Some(k) => format!(" if (m{l}_{k}) {{{inner} }}"),
+            None => inner,
+        }
+    }
+
+    /// `elab_drop` one level down: the fields of a struct, tuple, or
+    /// (after a `Downcast`) enum variant in order, the elements of an
+    /// array in order, or a switch over the enum variants the moved
+    /// paths go through.
+    fn elab_parts(&mut self, l: Local, prefix: &[Step], e: &str, t: &CTy) -> String {
+        let next_steps: Vec<Step> = {
+            let mut v: Vec<Step> = Vec::new();
+            for p in &self.move_paths[l as usize] {
+                if p.len() > prefix.len() && p.starts_with(prefix) && !v.contains(&p[prefix.len()]) {
+                    v.push(p[prefix.len()]);
+                }
+            }
+            v
+        };
+        let sub = |s: Step| {
+            let mut p = prefix.to_vec();
+            p.push(s);
+            p
+        };
+        let mut out = String::new();
+        let variant = match prefix.last() {
+            Some(Step::Downcast(v)) => Some(*v as usize),
+            _ => None,
+        };
+        let is_enum = match t {
+            CTy::Adt(a) => self.p.adt(*a).is_enum,
+            CTy::Option(_) => true,
+            _ => false,
+        };
+        match t {
+            CTy::Array(el, n) if variant.is_none() => {
+                // rustc's open drop of an array (`open_drop_for_array`):
+                // a run of elements with no move path drops as one
+                // subslice (in index order), an element with one drops
+                // on its own, and the runs and elements go in reverse.
+                let kept: Vec<u64> = next_steps.iter().filter_map(|s| if let Step::Elem(c) = s { Some(*c) } else { None }).collect();
+                let mut parts: Vec<Result<(u64, u64), u64>> = Vec::new();
+                let (mut dropping, mut start) = (true, 0);
+                for i in 0..*n {
+                    let keep = kept.contains(&i);
+                    if dropping && keep {
+                        parts.push(Ok((start, i)));
+                        dropping = false;
+                    } else if !dropping && !keep {
+                        dropping = true;
+                        start = i;
+                    }
+                    if keep {
+                        parts.push(Err(i));
+                    }
+                }
+                if dropping {
+                    parts.push(Ok((start, *n)));
+                }
+                for part in parts.into_iter().rev() {
+                    match part {
+                        Ok((a, b)) if b > a => {
+                            let i = self.tmp();
+                            self.want(Glue::Drop, el);
+                            let _ = write!(out, " for (uint64_t {i} = {a}; {i} < {b}; {i}++) drop_{}(&{e}.v[{i}]);", mangle(el));
+                        }
+                        Ok(_) => {}
+                        Err(c) => out += &self.elab_drop(l, &sub(Step::Elem(c))),
+                    }
+                }
+            }
+            _ if is_enum && variant.is_none() => {
+                let _ = write!(out, " switch ({}) {{", disc_call(self.p, t, &format!("(&{e})")));
+                for s in next_steps {
+                    if let Step::Downcast(v) = s {
+                        let body = self.elab_drop(l, &sub(s));
+                        let _ = write!(out, " case {v}: {{{body} }} break;");
+                    }
+                }
+                self.want(Glue::Drop, t);
+                let _ = write!(out, " default: drop_{}(&{e}); break; }}", mangle(t));
+            }
+            _ => {
+                let n = match t {
+                    CTy::Tuple(es) => es.len(),
+                    CTy::Adt(a) => self.p.adt(*a).variants.get(variant.unwrap_or(0)).map_or(0, |v| v.fields.len()),
+                    CTy::Option(_) => usize::from(variant == Some(1)),
+                    _ => 0,
+                };
+                for f in 0..n {
+                    out += &self.elab_drop(l, &sub(Step::Field(f as u32)));
+                }
+            }
+        }
+        out
     }
 
     // ---------- Places and operands ----------
@@ -858,12 +1126,12 @@ impl FnGen<'_, '_, '_> {
                     if pl.proj.is_empty() {
                         // Moving the whole local: it owns nothing now.
                         post.push(format!("d{} = 0;", pl.local));
-                    } else if pl.proj.iter().all(|x| matches!(x, Proj::Field(_) | Proj::Downcast(_) | Proj::Index(_))) {
-                        // Moving one field or array element out (a partial move, or an
-                        // enum payload). Zero the slot so the local's later drop skips
-                        // it (a zero `String` or `Vec` drops as a no-op) but still
-                        // drops every other field.
-                        post.push(format!("{e} = {};", zero_lit(self.p, &t)));
+                    } else if let Some(path) = self.steps_of(pl)
+                        && let Some(k) = self.move_flag(pl.local, &path)
+                    {
+                        // Moving one field out (a partial move, or an enum payload): the
+                        // local's later drops skip this path (see `elab_drop`).
+                        post.push(format!("m{}_{k} = 0;", pl.local));
                     }
                 }
                 (e, t)
@@ -922,18 +1190,17 @@ impl FnGen<'_, '_, '_> {
         if drop && dest.proj.is_empty() && !mentions {
             // The old value is dropped before the new one is written. Safe because the
             // rvalue does not read the destination.
-            self.want(Glue::Drop, &dt);
-            let (m, l) = (mangle(&dt), dest.local);
+            let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
             if self.out.len() == body_start {
                 self.out.truncate(mark);
-                let _ = write!(self.out, "  if (d{l}) drop_{m}(&{d}); {d} = {value}; d{l} = 1;");
+                let _ = write!(self.out, " {drop_old} {d} = {value};{refill}");
                 for p in &post {
                     let _ = write!(self.out, " {p}");
                 }
                 self.out.push('\n');
                 return;
             }
-            let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {value};\n    d{l} = 1;");
+            let _ = writeln!(self.out, "   {drop_old}\n    {d} = {value};\n   {refill}");
             for p in &post {
                 let _ = writeln!(self.out, "    {p}");
             }
@@ -946,14 +1213,8 @@ impl FnGen<'_, '_, '_> {
             for p in &post {
                 let _ = writeln!(self.out, "    {p}");
             }
-            self.want(Glue::Drop, &dt);
-            let m = mangle(&dt);
-            if dest.proj.is_empty() {
-                let l = dest.local;
-                let _ = writeln!(self.out, "    if (d{l}) drop_{m}(&{d});\n    {d} = {t};\n    d{l} = 1;");
-            } else {
-                let _ = writeln!(self.out, "    drop_{m}(&{d});\n    {d} = {t};");
-            }
+            let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
+            let _ = writeln!(self.out, "   {drop_old}\n    {d} = {t};\n   {refill}");
         } else {
             if dt == CTy::Str {
                 panic!("unsized assignment");
@@ -995,10 +1256,9 @@ impl FnGen<'_, '_, '_> {
                 });
             }
             StmtKind::Drop(l) => {
-                let t = self.local_cty[*l as usize].clone();
                 if self.local_drop[*l as usize] {
-                    self.want(Glue::Drop, &t);
-                    let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0; drop_{}(&l{l}); }}", mangle(&t));
+                    let what = self.elab_drop(*l, &[]);
+                    let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0;{what} }}");
                 }
             }
             StmtKind::StorageDead(_) | StmtKind::FakeRead(_) => {}
@@ -3917,6 +4177,54 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
 
 fn place_mentions(p: &Place, l: Local) -> bool {
     p.local == l || p.proj.iter().any(|x| matches!(x, Proj::Index(i) if *i == l))
+}
+
+/// Collects the place of `o` when it is a move.
+fn operand_moves<'r>(o: &'r Operand, out: &mut Vec<&'r Place>) {
+    if let Operand::Move(pl) = o {
+        out.push(pl);
+    }
+}
+
+fn parts_moves<'r>(parts: &'r [FmtPart], out: &mut Vec<&'r Place>) {
+    for part in parts {
+        if let FmtPart::Arg { value, .. } = part {
+            operand_moves(value, out);
+        }
+    }
+}
+
+/// Collects the moved places among the operands of one rvalue.
+fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
+    match rv {
+        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::ArrayRepeat(_, o, _) => operand_moves(o, out),
+        Rvalue::Subslice { lo, hi, .. } => {
+            operand_moves(lo, out);
+            if let Some(h) = hi {
+                operand_moves(h, out);
+            }
+        }
+        Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
+            operand_moves(a, out);
+            operand_moves(b, out);
+        }
+        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
+            ops.iter().for_each(|o| operand_moves(o, out))
+        }
+        Rvalue::Opt(_, o) => {
+            if let Some(o) = o {
+                operand_moves(o, out);
+            }
+        }
+        Rvalue::Format(parts) => parts_moves(parts, out),
+        Rvalue::Ref(..)
+        | Rvalue::Discriminant(_)
+        | Rvalue::SliceOf(_)
+        | Rvalue::LenOf(_)
+        | Rvalue::StaticLoad(_)
+        | Rvalue::StaticRef(_)
+        | Rvalue::FnValue(..) => {}
+    }
 }
 
 fn operand_mentions(o: &Operand, l: Local) -> bool {

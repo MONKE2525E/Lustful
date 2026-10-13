@@ -1,7 +1,5 @@
-// expect: L9001
-// Valid Rust. Lust codegen zeroes a moved-out field and drops the husk
-// at scope exit, which would run the field's Drop impl on the zeroed
-// value, so the partial move rejects until drop elaboration lands.
+// A field with a Drop impl moved out of a struct drops once, with its
+// new owner; the struct's other fields still drop at scope exit.
 struct Guard {
     name: String,
 }

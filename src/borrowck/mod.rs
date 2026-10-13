@@ -95,7 +95,7 @@ type Path = Vec<u64>;
 /// temporaries pattern and loop lowering make for fixed array slots.
 /// A constant index into an array names one element like a field does,
 /// so moves out of it are partial moves; any other index is not exact.
-fn const_index_locals(body: &Body) -> std::collections::HashMap<Local, u64> {
+pub(crate) fn const_index_locals(body: &Body) -> std::collections::HashMap<Local, u64> {
     let mut writes: std::collections::HashMap<Local, u32> = Default::default();
     let mut value: std::collections::HashMap<Local, u64> = Default::default();
     let mut note_write = |dest: &Place, v: Option<u64>| {
@@ -1212,10 +1212,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 // partial move: sibling fields stay usable, but the moved field and every
                 // value that contains it do not, until the field is assigned again. Rust
                 // also forbids partial moves out of a type with a `Drop` impl (E0509);
-                // `check_partial_move` enforces that, plus one lust limit: codegen
-                // zeroes a moved-out field and drops the husk later, which is exact
-                // for `String`/`Vec` fields but would run a user `Drop` impl on the
-                // zeroed value, so such moves reject until drop elaboration lands.
+                // `check_partial_move` enforces that. Codegen drops only the parts a
+                // partially moved local still owns (`cgen::FnGen::elab_drop`).
                 let (path, exact) = self.prefix_of(p);
                 if exact && !path.is_empty() {
                     self.check_partial_move(p, span);
@@ -1262,49 +1260,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 
-    /// True if dropping a zeroed value of type `t` (in `env` terms) can
-    /// run a user `Drop` impl. Codegen zeroes a moved-out field so the
-    /// husk drop skips it; that is exact for `String` and `Vec` (a zero
-    /// length drops nothing) but a user `Drop` impl runs on the zero
-    /// value, which rustc never does. Unknown params count as yes.
-    fn zero_drop_observable(&self, t: Ty, env: &[Ty], depth: u32) -> bool {
-        if depth > 64 {
-            return true;
-        }
-        let t = self.head_resolve(t, env);
-        match self.body.tys.kind(t) {
-            TyKind::Param(_) => true,
-            TyKind::Tuple(ts) => self.body.tys.tys_of(ts).iter().any(|&e| self.zero_drop_observable(e, env, depth + 1)),
-            TyKind::Array(e, _) => self.zero_drop_observable(e, env, depth + 1),
-            TyKind::Adt(..) => {
-                if self.body.tys.is_string_ty(t) || self.body.tys.vec_elem(t).is_some() {
-                    return false;
-                }
-                if let Some(e) = self.body.tys.option_elem(t) {
-                    return self.zero_drop_observable(e, env, depth + 1);
-                }
-                match self.body.tys.local_adt(t) {
-                    Some(a) => {
-                        if let Some((def, _)) = self.body.tys.adt_parts(t) {
-                            if self.drop_heads.contains(&def) {
-                                return true;
-                            }
-                        }
-                        let inner = self.adt_env(t, env);
-                        self.p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| self.zero_drop_observable(f.ty, &inner, depth + 1)))
-                    }
-                    None => false,
-                }
-            }
-            _ => false,
-        }
-    }
-
-    /// The two partial-move gates on an exact field path: Rust's E0509
-    /// (no field move out of a type with a `Drop` impl, at any step of
-    /// the path) and the lust zeroed-husk limit (`zero_drop_observable`
-    /// on the moved type). Copy fields are exempt: copying out is legal
-    /// in Rust even from a `Drop` type, and has no husk drop.
+    /// Rust's E0509 on an exact field path: no field moves out of a
+    /// type with a `Drop` impl, at any step of the path. Copy fields
+    /// are exempt: copying out is legal even from a `Drop` type.
     fn check_partial_move(&mut self, p: &Place, span: Span) {
         if !self.report {
             return;
@@ -1352,8 +1310,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
                 Proj::Index(_) => {
                     // A constant index into an array is a partial move
-                    // like a field: the array container does not carry a
-                    // user Drop of its own, but the husk rule below does.
+                    // like a field; an array has no `Drop` impl of its own.
                     let container = self.head_resolve(cur, &env);
                     match self.body.tys.kind(container) {
                         TyKind::Array(e, _) => cur = e,
@@ -1383,10 +1340,6 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     "Borrow the field with `&`, clone it, or use `std::mem::replace` (not yet supported) style code.",
                 );
             }
-            return;
-        }
-        if self.zero_drop_observable(cur, &env, 0) && self.seen.insert(("L9001", span)) {
-            self.errs.push(unsupported(span, "moving a field whose type contains a `Drop` impl out of a struct, enum, tuple, or `Option`"));
         }
     }
 
