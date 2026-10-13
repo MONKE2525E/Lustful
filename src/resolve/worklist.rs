@@ -3522,13 +3522,12 @@ fn register_items(
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Adt, flat, module, vis: vis() });
                 tables.variants.insert(def, e.variants.iter().map(|v| v.name).collect());
                 tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+                // Enum variant fields have no visibility of their own
+                // in Rust: they take the enum's visibility.
                 for v in &e.variants {
                     if let VariantFields::Struct(fs) = &v.fields {
                         let entry = tables.field_vis.entry(def).or_insert_with(|| (module, FxMap::default()));
                         for f in fs {
-                            // Variant fields carry no visibility of
-                            // their own in Rust: they are visible
-                            // wherever the enum is.
                             entry.1.insert(f.name, vis());
                         }
                     }
