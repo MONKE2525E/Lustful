@@ -993,6 +993,9 @@ pub(super) fn dyn_probe(
     let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut cx.tys, t, &sargs)).collect();
     let ret = subst(&mut cx.tys, tret, &sargs);
     cx.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs, autoref: probe.autoref });
+    if c.needs_static && !object::dyn_is_static(p, &cx.tys, step) {
+        cx.obl.push(crate::check::obligations::Obligation::DynStatic { span: name_span });
+    }
     cx.check_args(&params[1.min(params.len())..], args, name_span);
     Probe::Hit(cx.normalize_here(ret))
 }

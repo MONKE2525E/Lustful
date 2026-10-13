@@ -1955,24 +1955,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         let skip_self = usize::from(self.f.def.self_param.is_some() && p.gx.static_dyn_fns.contains(&self.fid));
-        if self.f.params.iter().skip(skip_self).any(|&t| object::has_erased_dyn(&p.tys, t)) {
+        if self.f.params.iter().skip(skip_self).any(|&t| object::has_erased_dyn(p, &p.tys, t)) {
             return false;
         }
         for i in 0..self.out.expr_res.len() {
             let erased = match self.out.expr_res[i] {
-                Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(&p.tys, p.fn_info(f).ret),
+                Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(p, &p.tys, p.fn_info(f).ret),
                 Res::DynMethod { owner, slot, .. } => {
                     let info = p.gx.dyn_infos.get(&owner);
                     let m =
                         info.and_then(|info| (0..info.methods.len()).find(|&j| info.method_slot(j) == slot).map(|j| info.methods[j].def));
-                    m.and_then(|d| p.gx.trait_methods.get(&d)).is_none_or(|tm| object::has_erased_dyn(&p.tys, tm.ret))
+                    m.and_then(|d| p.gx.trait_methods.get(&d)).is_none_or(|tm| object::has_erased_dyn(p, &p.tys, tm.ret))
                 }
                 Res::Indirect => {
                     let e = ExprId(self.out.expr_base + i as u32);
                     let Expr::Call { callee, .. } = p.ast.expr(e) else { continue };
                     let ct = self.out.expr_ty[self.ei(*callee)];
                     let ct = self.deep(ct);
-                    object::has_erased_dyn(&self.tys, ct)
+                    object::has_erased_dyn(p, &self.tys, ct)
                 }
                 _ => continue,
             };
@@ -2738,7 +2738,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.mismatch(span, expected, found);
                 return None;
             }
-            if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && !matches!(self.tys.kind(x), TyKind::Dyn(_, Region::Static)) {
+            if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && !object::dyn_is_static(p, &self.tys, x) {
                 self.obl.push(obligations::Obligation::DynStatic { span });
             }
             return Some(Coerce::Unsize(expected));
@@ -5437,6 +5437,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut self.tys, t, &sargs)).collect();
         let ret = subst(&mut self.tys, tret, &sargs);
         self.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs: 0, autoref: Autoref::None });
+        if c.needs_static && !object::dyn_is_static(p, &self.tys, base) {
+            self.obl.push(obligations::Obligation::DynStatic { span });
+        }
         self.check_args(&params, args, span);
         Some(self.normalize_here(ret))
     }

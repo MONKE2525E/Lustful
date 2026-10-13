@@ -49,6 +49,9 @@ pub struct DynMethod {
     pub def: DefId,
     pub name: Sym,
     pub recv: DynRecv,
+    /// The method has `where Self: 'static`: a call through dyn needs a
+    /// `'static` object lifetime (rustc E0521 otherwise).
+    pub needs_static: bool,
 }
 
 /// The dyn view of one user trait.
@@ -69,6 +72,9 @@ pub struct DynInfo {
     /// Methods that exist but cannot be called through dyn: the name,
     /// its def, and why.
     pub uncallable: Vec<(Sym, DefId, &'static str)>,
+    /// The trait or a supertrait bounds `Self` by `'static`: every dyn
+    /// type with this principal is `'static` (see `dyn_is_static`).
+    pub static_bound: bool,
 }
 
 impl DynInfo {
@@ -103,7 +109,32 @@ pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
     for d in defs {
         info_of(p, d, &mut memo, &mut Vec::new());
     }
+    // Collect drops lifetime bounds, so the `'static` ones come from
+    // the AST; supertraits pass them down.
+    let own: Vec<DefId> = p
+        .ast
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            crate::ast::ItemKind::Trait(t) if trait_static_bound(p, t) => p.gx.trait_names.get(&t.name).copied(),
+            _ => None,
+        })
+        .collect();
+    fn via(memo: &FxMap<DefId, DynInfo>, own: &[DefId], d: DefId, depth: u32) -> bool {
+        own.contains(&d) || (depth < 64 && memo.get(&d).is_some_and(|i| i.supers.iter().any(|s| via(memo, own, s.def, depth + 1))))
+    }
+    let flags: Vec<(DefId, bool)> = memo.keys().map(|&d| (d, via(&memo, &own, d, 0))).collect();
+    for (d, f) in flags {
+        memo.get_mut(&d).unwrap().static_bound = f;
+    }
     memo
+}
+
+/// True when a trait declaration bounds `Self` by `'static` (`trait T:
+/// 'static`, `where Self: 'static`).
+fn trait_static_bound(p: &Program, t: &crate::ast::TraitDef) -> bool {
+    use crate::ast::TraitBound;
+    t.bounds.iter().any(|b| matches!(b, TraitBound::Lifetime(lt) if p.name(lt.name) == "static")) || where_self_static(p, &t.where_clause)
 }
 
 /// Lang traits whose definition requires `Self: Sized` in std.
@@ -286,9 +317,10 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             Predicate::Outlives(..) => false,
         };
         // rustc keeps the trait dyn compatible under `where Self: Send`
-        // (an auto trait) and under any type-outlives bound (collect
-        // drops `'static` bounds today); lust does not check those
-        // bounds at dyn calls, so they are unsupported, not violations.
+        // (an auto trait) and under any type-outlives bound. Collect
+        // drops `'static` bounds (`self_static_bound` reads them for dyn
+        // calls); lust does not check the others at dyn calls, so they
+        // are unsupported, not violations.
         let rustc_allows = |pred: &&Predicate| match pred {
             Predicate::Trait(b) => {
                 let a = p.tys.args(b.value.args);
@@ -309,7 +341,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             continue;
         }
         match recv {
-            Some(recv) => info.methods.push(DynMethod { def: mdef, name: mname, recv }),
+            Some(recv) => info.methods.push(DynMethod { def: mdef, name: mname, recv, needs_static: where_self_static(p, &tm.def.where_clause) }),
             None if tm.self_kind.is_some() => {
                 info.uncallable.push((mname, mdef, "it takes `self` by value, and a `dyn` value has no size"))
             }
@@ -321,6 +353,19 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
 }
 
 /// The trait name for messages.
+/// True when a `where` clause bounds `Self` by `'static`. Collect drops
+/// lifetime bounds, so this reads the AST.
+fn where_self_static(p: &Program, w: &crate::ast::WhereClause) -> bool {
+    use crate::ast::{TraitBound, TyExpr, WherePred};
+    w.preds.iter().any(|pred| match pred {
+        WherePred::Type { ty, bounds, .. } => {
+            matches!(p.ast.ty(*ty), TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == p.known.self_type)
+                && bounds.iter().any(|b| matches!(b, TraitBound::Lifetime(lt) if p.name(lt.name) == "static"))
+        }
+        WherePred::Lifetime { .. } => false,
+    })
+}
+
 pub fn trait_name(p: &Program, def: DefId) -> String {
     p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| p.name(r.name).to_string())
 }
@@ -550,6 +595,8 @@ pub struct ObjectCand {
     pub owner: TraitRef,
     pub def: DefId,
     pub call: Result<(u32, DynRecv), &'static str>,
+    /// See `DynMethod::needs_static`.
+    pub needs_static: bool,
 }
 
 /// The object method candidates named `name` across the principal and
@@ -568,9 +615,9 @@ pub fn object_cands(p: &Program, tys: &mut impl TyIntern, principal: TraitRef, n
         let Some(info) = p.gx.dyn_infos.get(&tr.def) else { continue };
         if let Some(j) = info.methods.iter().position(|m| m.name == name) {
             let m = &info.methods[j];
-            out.push(ObjectCand { owner: tr, def: m.def, call: Ok((info.method_slot(j), m.recv)) });
+            out.push(ObjectCand { owner: tr, def: m.def, call: Ok((info.method_slot(j), m.recv)), needs_static: m.needs_static });
         } else if let Some(&(_, def, why)) = info.uncallable.iter().find(|u| u.0 == name) {
-            out.push(ObjectCand { owner: tr, def, call: Err(why) });
+            out.push(ObjectCand { owner: tr, def, call: Err(why), needs_static: false });
         }
         let args: Vec<GenericArg> = tys.args(tr.args).to_vec();
         let supers: Vec<TraitRef> = info.supers.iter().map(|s| crate::traits::index::subst_trait_ref_pub(tys, *s, &args)).collect();
@@ -616,15 +663,17 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
 }
 
 // Object lifetimes. Lust has no lifetime names, so a dyn type's object
-// lifetime is `'static` (written `+ 'static`, or under `&'static`) or
-// erased. An erased one written in a signature (`d: &dyn Tr`, `-> &dyn
-// Tr`) is a caller's lifetime; one in a body annotation is inferred,
-// and rustc may pick `'static` for it. Uses that need `'static` (an
-// `impl dyn Tr` method, an `impl X for dyn Tr`, a coercion to `dyn Tr +
-// 'static`) queue a `DynStatic` obligation. At body end, those pass only
-// when no dyn value in the body can come from a non-`'static` source
-// (`Ctx::dyn_static_clean`); otherwise they are L0705. That rejects
-// some programs rustc accepts, never the reverse.
+// lifetime is `'static` (written `+ 'static`, under `&'static`, or a
+// principal trait bounded by `'static`, see `dyn_is_static`) or erased.
+// An erased one written in a signature (`d: &dyn Tr`, `-> &dyn Tr`) is
+// a caller's lifetime; one in a body annotation is inferred, and rustc
+// may pick `'static` for it. Uses that need `'static` (an `impl dyn Tr`
+// method, an `impl X for dyn Tr`, a coercion to `dyn Tr + 'static`, a
+// dyn call to a method with `where Self: 'static`) queue a `DynStatic`
+// obligation. At body end, those pass only when no dyn value in the
+// body can come from a non-`'static` source (`Ctx::dyn_static_clean`);
+// otherwise they are L0705. That rejects some programs rustc accepts,
+// never the reverse.
 
 /// True when a dyn type an impl header names as its Self type has a
 /// `'static` object lifetime: `impl dyn Tr` and `impl X for dyn Tr` (the
@@ -645,19 +694,30 @@ pub fn header_dyn_is_static(ast: &crate::ast::Ast, interner: &crate::intern::Int
     }
 }
 
+/// True when a dyn type's object lifetime is `'static`: written (`+
+/// 'static`, `&'static dyn`), or implied by a `'static` bound on its
+/// principal trait, which rustc takes as the default even behind `&'a`.
+pub fn dyn_is_static(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Dyn(_, Region::Static) => true,
+        TyKind::Dyn(..) => principal_of(tys, t).is_some_and(|pr| p.gx.dyn_infos.get(&pr.def).is_some_and(|i| i.static_bound)),
+        _ => false,
+    }
+}
+
 /// True when a dyn type in `t` has an erased object lifetime: written in
 /// a signature, that is a caller's lifetime, not `'static`.
-pub fn has_erased_dyn(tys: &impl TyIntern, t: Ty) -> bool {
+pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Dyn(_, r) => r != Region::Static,
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_erased_dyn(tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_erased_dyn(tys, e)),
+        TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_erased_dyn(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_erased_dyn(p, tys, e)),
         TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Projection(_, a) => {
-            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_erased_dyn(tys, e)))
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_erased_dyn(p, tys, e)))
         }
         TyKind::FnPtr(sig) => {
             let s = tys.sig(sig).value;
-            has_erased_dyn(tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_erased_dyn(tys, e))
+            has_erased_dyn(p, tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_erased_dyn(p, tys, e))
         }
         _ => false,
     }
@@ -670,7 +730,7 @@ pub fn has_erased_dyn(tys: &impl TyIntern, t: Ty) -> bool {
 pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Ref(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) => true,
-        TyKind::Dyn(_, r) => r != Region::Static,
+        TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
         TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow(p, tys, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow(p, tys, e)),
         TyKind::Adt(_, a) | TyKind::Closure(_, a) => {
