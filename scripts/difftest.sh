@@ -6,9 +6,10 @@
 #                      A `// panic: <text>` comment also requires <text> in lust's stderr.
 #                      Rustc's panic text is not compared (see DESIGN.md).
 #     tests/fail/*.rs: rustc must reject the program, and `lust check` must report the code
-#                      named on the first line (`// expect: L0301`).
+#                      named on the first line (`// expect: L0301`); `lust build` must reject it too.
 #     tests/reject/*.rs: valid Rust that lust rejects on purpose (lifetimes, user macros).
-#                      rustc must accept it, and `lust check` must report the expected code.
+#                      rustc must accept it, `lust check` must report the expected code, and
+#                      `lust build` must reject it.
 #   PANIC=unwind (rustc -C panic=unwind, overflow checks on):
 #     tests/unwind/*.rs plus the panic cases in tests/pass (files with a
 #     `// panic:` line). Abort mode cannot test recovered panics, poison,
@@ -204,6 +205,10 @@ for f in "$root"/tests/fail/*.rs "$root"/tests/reject/*.rs; do
     report bad "$name" "lust accepted it (expected $expect)"
   elif ! grep -q "\"code\":\"$expect\"" <<<"$out"; then
     report bad "$name" "expected $expect, got: $(grep -o '"code":"L[0-9]*"' <<<"$out" | tr '\n' ' ')"
+  elif run_cc "$lust" build "$f" -o "$work/$name.lust" >/dev/null 2>&1; then
+    # `build` checks bodies after mono, where a call can reach an
+    # instance directly: it must reject what `check` rejects.
+    report bad "$name" "lust check rejected it, but lust build accepted it"
   else
     report ok "$name"
   fi
