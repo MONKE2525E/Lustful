@@ -2943,6 +2943,40 @@ pub fn add_synthetic_impls(p: &mut Program) {
     let scalar_traits = [lang.copy, lang.clone, lang.debug, lang.eq, lang.hash, lang.default];
     let mut scalars: Vec<Ty> = IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect();
     scalars.extend([BOOL, CHAR, UNIT]);
+    // Operator traits on scalars, exactly core's impl sets (the
+    // operations themselves stay on the builtin scalar path; these
+    // records answer selection and associated-type normalization,
+    // so an over-broad set would prove bounds rustc rejects).
+    // Ints have every operator except that `Neg` is signed-only;
+    // bool has the bit operators and `Not`; char and unit have none.
+    let op_impls = |p: &mut Program, ordinal: &mut u32, t: Ty, binops: &[DefId], unops: &[DefId], assigns: &[DefId]| {
+        for &tr in binops {
+            if let Some(out) = lang.output_of(tr) {
+                insert_synthetic(p, ordinal, tr, t, &[t], g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+            }
+        }
+        for &tr in unops {
+            if let Some(out) = lang.output_of(tr) {
+                insert_synthetic(p, ordinal, tr, t, &[], g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+            }
+        }
+        for &tr in assigns {
+            insert_synthetic(p, ordinal, tr, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    };
+    let int_binops = [lang.add, lang.sub, lang.mul, lang.div, lang.rem, lang.bit_and, lang.bit_or, lang.bit_xor, lang.shl, lang.shr];
+    let int_assigns = [
+        lang.add_assign,
+        lang.sub_assign,
+        lang.mul_assign,
+        lang.div_assign,
+        lang.rem_assign,
+        lang.bit_and_assign,
+        lang.bit_or_assign,
+        lang.bit_xor_assign,
+        lang.shl_assign,
+        lang.shr_assign,
+    ];
     for t in scalars {
         for tr in scalar_traits {
             insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -2950,27 +2984,18 @@ pub fn add_synthetic_impls(p: &mut Program) {
         insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(p, &mut ordinal, lang.partial_ord, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(p, &mut ordinal, lang.ord, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
-        // Operator traits on scalars, for associated-type
-        // normalization (`<i64 as Add>::Output`): the operations
-        // themselves stay on the builtin scalar path.
-        for (tr, two) in [
-            (lang.add, true),
-            (lang.sub, true),
-            (lang.mul, true),
-            (lang.div, true),
-            (lang.rem, true),
-            (lang.bit_and, true),
-            (lang.bit_or, true),
-            (lang.bit_xor, true),
-            (lang.shl, true),
-            (lang.shr, true),
-            (lang.neg, false),
-            (lang.not, false),
-        ] {
-            if let Some(out) = lang.output_of(tr) {
-                let rest: &[Ty] = if two { &[t] } else { &[] };
-                insert_synthetic(p, &mut ordinal, tr, t, rest, g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
-            }
+        match p.tys.kind(t) {
+            TyKind::Int(i) if i.signed() => op_impls(p, &mut ordinal, t, &int_binops, &[lang.neg, lang.not], &int_assigns),
+            TyKind::Int(_) => op_impls(p, &mut ordinal, t, &int_binops, &[lang.not], &int_assigns),
+            TyKind::Bool => op_impls(
+                p,
+                &mut ordinal,
+                t,
+                &[lang.bit_and, lang.bit_or, lang.bit_xor],
+                &[lang.not],
+                &[lang.bit_and_assign, lang.bit_or_assign, lang.bit_xor_assign],
+            ),
+            _ => {}
         }
     }
     // Floats have the scalar facts except Eq, Ord, Hash, and the
@@ -2982,12 +3007,14 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
         insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(p, &mut ordinal, lang.partial_ord, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
-        for (tr, two) in [(lang.add, true), (lang.sub, true), (lang.mul, true), (lang.div, true), (lang.rem, true), (lang.neg, false)] {
-            if let Some(out) = lang.output_of(tr) {
-                let rest: &[Ty] = if two { &[t] } else { &[] };
-                insert_synthetic(p, &mut ordinal, tr, t, rest, g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
-            }
-        }
+        op_impls(
+            p,
+            &mut ordinal,
+            t,
+            &[lang.add, lang.sub, lang.mul, lang.div, lang.rem],
+            &[lang.neg],
+            &[lang.add_assign, lang.sub_assign, lang.mul_assign, lang.div_assign, lang.rem_assign],
+        );
     }
     let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
     let p1 = p.tys.intern(TyKind::Param(ParamId(1)));
@@ -3370,6 +3397,13 @@ fn add_trait_method_stubs(p: &mut Program) {
                 }
             }
         }
+    }
+    // A `for` loop over an `IntoIterator` bound also calls
+    // `Iterator::next` on the `IntoIter` projection; no env
+    // predicate names `Iterator` there (assoc-type bounds of a
+    // trait definition are not elaborated), so stub it too.
+    if bound.contains(&p.gx.lang.into_iterator) && !bound.contains(&p.gx.lang.iterator) {
+        bound.push(p.gx.lang.iterator);
     }
     let mut methods: Vec<(DefId, DefId, Sym)> = Vec::new();
     for traits in p.gx.traits_by_method.values() {

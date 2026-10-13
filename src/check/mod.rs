@@ -281,6 +281,13 @@ pub enum Res {
         kind: PrimCmpKind,
         derefs: u8,
     },
+    /// An operator trait method (`add`, `neg`, `add_assign`, and
+    /// kin) on a scalar receiver: lowering emits the scalar
+    /// operation directly, as the operators do.
+    PrimOp {
+        kind: PrimOpKind,
+        derefs: u8,
+    },
     /// A binary operator through an operator trait: the trait
     /// method to call (a template until mono rewrites it through
     /// `Checked::generic_args`), with operand deref counts.
@@ -340,6 +347,17 @@ pub enum PrimCmpKind {
     Total(AdtId),
     /// `eq`/`ne`/`lt`/`le`/`gt`/`ge` -> `bool`, the binary comparison.
     Op(ast::BinOp),
+}
+
+/// Which scalar operation a `Res::PrimOp` call computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimOpKind {
+    /// A binary operator trait method: `recv.op(rhs)`.
+    Bin(ast::BinOp),
+    /// A unary operator trait method: `recv.neg()` / `recv.not()`.
+    Un(ast::UnOp),
+    /// An assignment operator trait method: `recv.op_assign(rhs)`.
+    Assign(ast::BinOp),
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -3045,17 +3063,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
                     (UnOp::Not, k) if k.is_int_infer() => inner,
                     (_, TyKind::Error) => ERROR,
-                    _ => {
-                        let tn = self.tn(t);
-                        let sym = if *op == UnOp::Neg { "-" } else { "!" };
-                        self.err(
-                            "L0113",
-                            span,
-                            format!("cannot apply unary `{sym}` to type `{tn}`"),
-                            "Use a signed integer type for `-`, or a bool or integer for `!`.",
-                        );
-                        ERROR
-                    }
+                    _ => match self.trait_unop(e, *op, inner, d, span) {
+                        Some(t) => t,
+                        None => {
+                            let tn = self.tn(t);
+                            let sym = if *op == UnOp::Neg { "-" } else { "!" };
+                            self.err(
+                                "L0113",
+                                span,
+                                format!("cannot apply unary `{sym}` to type `{tn}`"),
+                                "Use a signed integer type for `-`, or a bool or integer for `!`.",
+                            );
+                            ERROR
+                        }
+                    },
                 }
             }
             Expr::Cast { expr, ty } => {
@@ -3191,6 +3212,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         _ => false,
                     };
                 if !ok {
+                    // Through the assignment trait, like the binary
+                    // operators: a bound proves it in a template, the
+                    // unique impl answers in an instance.
+                    if !rmut && self.trait_assign_op(e, *op, lt, rinner, rd, span) {
+                        return UNIT;
+                    }
                     let (a, b) = (self.tn(lt), self.tn(rt));
                     self.err(
                         "L0113",
@@ -5140,6 +5167,165 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The ambiguity guard of the scalar lang-method probes: a
+    /// second in-scope trait with an impl of the same method name
+    /// for this receiver makes the call ambiguous in rustc
+    /// (E0034). Reports it and returns true. (Declining instead
+    /// would let the generic search take the other trait alone:
+    /// the lang candidate has no impl method fn there, so the
+    /// generic search would silently accept.)
+    fn prim_lang_guard(&mut self, name: Sym, name_span: Span, args: &[ExprId], trait_def: DefId, base: Ty) -> bool {
+        let p = self.p;
+        let others: Vec<DefId> = p
+            .gx
+            .traits_by_method
+            .get(&name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&d| d != trait_def && method::trait_in_scope_pub(self, d))
+            .collect();
+        for other in others {
+            let Some(rec) = p.gx.index.trait_record(other) else { continue };
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+            for _ in 1..rec.generics.params.len() {
+                tr_args.push(GenericArg::Ty(self.new_var(false)));
+            }
+            let args_id = self.tys.intern_args(&tr_args);
+            let tr = TraitRef { def: other, args: args_id, bindings: EMPTY_BINDINGS };
+            let hits = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+            if hits {
+                self.err(
+                    "L0720",
+                    name_span,
+                    format!("multiple trait methods named `{}` apply here", self.name(name)),
+                    "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
+                );
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// An operator trait method on a scalar receiver in method
+    /// form (`a.add(b)`, `a.neg()`, `a.add_assign(b)`): the same
+    /// shape as `prim_cmp_method`, through `Res::PrimOp`. The
+    /// operator traits are not in the prelude, so without a pick
+    /// replay the trait must be in scope, as in rustc. Operand
+    /// sets are core's exactly (see the synthetic impls in
+    /// `generics::add_synthetic_impls`): arithmetic on ints and
+    /// floats, bit operators on ints and bool, shifts on ints
+    /// with any int right side, `Neg` on signed ints and floats,
+    /// `Not` on ints and bool.
+    #[allow(clippy::too_many_arguments)]
+    fn prim_op_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        builtin_only: bool,
+    ) -> Option<Ty> {
+        if !turbofish.is_empty() {
+            return None;
+        }
+        let p = self.p;
+        let lang = &p.gx.lang;
+        // `String::add(&str)`: the one non-scalar operator impl
+        // with a builtin body (the same value `String + &str`
+        // builds). Scope and ambiguity follow the scalar rules.
+        if self.name(name) == "add" && self.tys.is_string_ty(self.resolve(base)) {
+            if !builtin_only && !method::trait_in_scope_pub(self, lang.add) {
+                return None;
+            }
+            if !builtin_only && self.prim_lang_guard(name, name_span, args, lang.add, base) {
+                return Some(ERROR);
+            }
+            self.check_args(&[REF_STR], args, name_span);
+            self.set_res(e, Res::PrimOp { kind: PrimOpKind::Bin(BinOp::Add), derefs });
+            return Some(STRING);
+        }
+        let bk = self.kind(base);
+        let intlike = matches!(bk, TyKind::Int(_)) || bk.is_int_infer();
+        let floatlike = matches!(bk, TyKind::Float(_)) || bk.is_float_infer();
+        let signed = matches!(bk, TyKind::Int(i) if i.signed());
+        let arith = intlike || floatlike;
+        let bits = intlike || matches!(bk, TyKind::Bool);
+        use BinOp::*;
+        use PrimOpKind as K;
+        let (kind, trait_def) = match self.name(name) {
+            "add" if arith => (K::Bin(Add), lang.add),
+            "sub" if arith => (K::Bin(Sub), lang.sub),
+            "mul" if arith => (K::Bin(Mul), lang.mul),
+            "div" if arith => (K::Bin(Div), lang.div),
+            "rem" if arith => (K::Bin(Rem), lang.rem),
+            "bitand" if bits => (K::Bin(BitAnd), lang.bit_and),
+            "bitor" if bits => (K::Bin(BitOr), lang.bit_or),
+            "bitxor" if bits => (K::Bin(BitXor), lang.bit_xor),
+            "shl" if intlike => (K::Bin(Shl), lang.shl),
+            "shr" if intlike => (K::Bin(Shr), lang.shr),
+            "neg" if floatlike || signed || bk.is_int_infer() => (K::Un(ast::UnOp::Neg), lang.neg),
+            "not" if bits => (K::Un(ast::UnOp::Not), lang.not),
+            "add_assign" if arith => (K::Assign(Add), lang.add_assign),
+            "sub_assign" if arith => (K::Assign(Sub), lang.sub_assign),
+            "mul_assign" if arith => (K::Assign(Mul), lang.mul_assign),
+            "div_assign" if arith => (K::Assign(Div), lang.div_assign),
+            "rem_assign" if arith => (K::Assign(Rem), lang.rem_assign),
+            "bitand_assign" if bits => (K::Assign(BitAnd), lang.bit_and_assign),
+            "bitor_assign" if bits => (K::Assign(BitOr), lang.bit_or_assign),
+            "bitxor_assign" if bits => (K::Assign(BitXor), lang.bit_xor_assign),
+            "shl_assign" if intlike => (K::Assign(Shl), lang.shl_assign),
+            "shr_assign" if intlike => (K::Assign(Shr), lang.shr_assign),
+            _ => return None,
+        };
+        if !builtin_only && !method::trait_in_scope_pub(self, trait_def) {
+            return None;
+        }
+        if !builtin_only && self.prim_lang_guard(name, name_span, args, trait_def, base) {
+            return Some(ERROR);
+        }
+        // An unsuffixed literal receiver of `neg` can still bind
+        // to an unsigned type from context; the bound then has no
+        // impl in rustc. Queue the obligation so body end (after
+        // fallback settles the type) makes that call.
+        if matches!(kind, K::Un(ast::UnOp::Neg)) && bk.is_int_infer() {
+            let args_id = self.tys.intern_args(&[GenericArg::Ty(base)]);
+            let tr = TraitRef { def: lang.neg, args: args_id, bindings: EMPTY_BINDINGS };
+            self.obl.push_trait_at(tr, name_span, 0);
+        }
+        let ret = match kind {
+            K::Bin(op) => {
+                // Shifts take any int right side; the rest take Self.
+                let rhs_ty = if matches!(op, Shl | Shr) { self.new_var(true) } else { base };
+                self.check_args(&[rhs_ty], args, name_span);
+                base
+            }
+            K::Un(_) => {
+                self.check_args(&[], args, name_span);
+                base
+            }
+            K::Assign(op) => {
+                self.check_packed_borrow(recv, name_span);
+                let rhs_ty = if matches!(op, Shl | Shr) { self.new_var(true) } else { base };
+                self.check_args(&[rhs_ty], args, name_span);
+                UNIT
+            }
+        };
+        self.set_res(e, Res::PrimOp { kind, derefs });
+        Some(ret)
+    }
+
     /// A comparison trait method on a scalar receiver in method
     /// form (`a.partial_cmp(b)`, `a.cmp(b)`, `a.eq(b)`, `a.lt(b)`,
     /// and kin): core's impls for the scalar types are the scalar
@@ -5186,49 +5372,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             "ge" => (PrimCmpKind::Op(BinOp::Ge), lang.partial_ord),
             _ => return None,
         };
-        if !builtin_only {
-            // Prelude traits are always in scope; a second in-scope
-            // trait with an impl for this receiver would make the
-            // call ambiguous (rustc E0034), never silently this one.
-            let others: Vec<DefId> = p
-                .gx
-                .traits_by_method
-                .get(&name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|&d| d != trait_def && method::trait_in_scope_pub(self, d))
-                .collect();
-            for other in others {
-                let Some(rec) = p.gx.index.trait_record(other) else { continue };
-                let snap = self.snapshot_vars();
-                let obl_len = self.obl_len();
-                let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
-                for _ in 1..rec.generics.params.len() {
-                    tr_args.push(GenericArg::Ty(self.new_var(false)));
-                }
-                let args_id = self.tys.intern_args(&tr_args);
-                let tr = TraitRef { def: other, args: args_id, bindings: EMPTY_BINDINGS };
-                let hits = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
-                self.rollback_vars(snap);
-                self.obl_truncate(obl_len);
-                if hits {
-                    // Declining would let the generic search below
-                    // take the other trait alone (the lang candidate
-                    // has no impl method fn there), which accepts a
-                    // call rustc rejects as ambiguous: report it here.
-                    self.err(
-                        "L0720",
-                        name_span,
-                        format!("multiple trait methods named `{}` apply here", self.name(name)),
-                        "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
-                    );
-                    for &a in args {
-                        self.expr(a, None);
-                    }
-                    return Some(ERROR);
-                }
-            }
+        if !builtin_only && self.prim_lang_guard(name, name_span, args, trait_def, base) {
+            return Some(ERROR);
         }
         self.check_packed_borrow(recv, name_span);
         let other_ty = self.tys.mk_ref(false, base);
@@ -5416,6 +5561,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // form): the template side is the lang stub, the instance
         // side is the scalar comparison itself.
         if let Some(ret) = self.prim_cmp_method(e, recv, base, derefs, name, name_span, args, turbofish, builtin_only) {
+            return ret;
+        }
+        // Operator trait methods on a scalar receiver, likewise.
+        if let Some(ret) = self.prim_op_method(e, recv, base, derefs, name, name_span, args, turbofish, builtin_only) {
             return ret;
         }
         use Builtin as B;
@@ -6160,6 +6309,89 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(self.normalize_here(out_var))
     }
 
+    /// One unary operator through its operator trait, like
+    /// `trait_binop` with no right side. The result type is the
+    /// bound's `Output`, normalized.
+    fn trait_unop(&mut self, e: ExprId, op: ast::UnOp, inner: Ty, ld: u8, span: Span) -> Option<Ty> {
+        let p = self.p;
+        if !p.gx.has_generics {
+            return None;
+        }
+        let lang = &p.gx.lang;
+        let (trait_def, method_name) = match op {
+            ast::UnOp::Neg => (lang.neg, "neg"),
+            ast::UnOp::Not => (lang.not, "not"),
+        };
+        let out_var = self.new_var(false);
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(inner)]);
+        let bindings = match lang.output_of(trait_def) {
+            Some(assoc) => self.tys.intern_bindings(&[(assoc, GenericArg::Ty(out_var))]),
+            None => EMPTY_BINDINGS,
+        };
+        let tr = TraitRef { def: trait_def, args: args_id, bindings };
+        let (id, impl_args) = match self.select_obligation(tr) {
+            Selection::Impl { id, args, .. } => (id, args),
+            Selection::ParamEvidence(_) => {
+                let method_def = p.gx.index.trait_record(trait_def)?.method_by_name(p.interner.intern(method_name))?;
+                let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+                if let Some(assoc) = lang.output_of(trait_def) {
+                    let proj = self.tys.intern(TyKind::Projection(AssocId(assoc), args_id));
+                    let normed = self.normalize_here(proj);
+                    self.unify(out_var, normed);
+                }
+                self.set_res(e, Res::TraitBin { f: stub, ld, rd: 0 });
+                return Some(self.normalize_here(out_var));
+            }
+            _ => return None,
+        };
+        let local = self.method_instance_for_impl(e, id, tr, impl_args, method_name, span)?;
+        self.set_res(e, Res::TraitBin { f: local.0, ld, rd: 0 });
+        Some(self.normalize_here(out_var))
+    }
+
+    /// One compound assignment through its assignment trait
+    /// (`a += b` as `AddAssign::add_assign(&mut a, b)`). True
+    /// when the trait path applies; the call is recorded as a
+    /// `TraitBin` like the binary operators.
+    fn trait_assign_op(&mut self, e: ExprId, op: BinOp, lt: Ty, rinner: Ty, rd: u8, span: Span) -> bool {
+        use BinOp::*;
+        let p = self.p;
+        if !p.gx.has_generics {
+            return false;
+        }
+        let lang = &p.gx.lang;
+        let (trait_def, method_name) = match op {
+            Add => (lang.add_assign, "add_assign"),
+            Sub => (lang.sub_assign, "sub_assign"),
+            Mul => (lang.mul_assign, "mul_assign"),
+            Div => (lang.div_assign, "div_assign"),
+            Rem => (lang.rem_assign, "rem_assign"),
+            BitAnd => (lang.bit_and_assign, "bitand_assign"),
+            BitOr => (lang.bit_or_assign, "bitor_assign"),
+            BitXor => (lang.bit_xor_assign, "bitxor_assign"),
+            Shl => (lang.shl_assign, "shl_assign"),
+            Shr => (lang.shr_assign, "shr_assign"),
+            _ => return false,
+        };
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(lt), GenericArg::Ty(rinner)]);
+        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        let local = match self.select_obligation(tr) {
+            Selection::Impl { id, args, .. } => self.method_instance_for_impl(e, id, tr, args, method_name, span).map(|l| l.0),
+            Selection::ParamEvidence(_) => {
+                let method_def = p.gx.index.trait_record(trait_def).and_then(|r| r.method_by_name(p.interner.intern(method_name)));
+                method_def.and_then(|m| p.gx.trait_method_stubs.get(&m).copied())
+            }
+            _ => None,
+        };
+        match local {
+            Some(f) => {
+                self.set_res(e, Res::TraitBin { f, ld: 0, rd });
+                true
+            }
+            None => false,
+        }
+    }
+
     fn binary(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span) -> Ty {
         use BinOp::*;
         if matches!(op, And | Or) {
@@ -6535,7 +6767,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The into_iter call: an impl's method, the std blanket's
         // sentinel (no body: lowering uses the receiver as its own
         // iterator), or in a template check the bound's stub.
-        let into_local = match self.select_obligation(tr) {
+        let into_sel = self.select_obligation(tr);
+        let into_from_env = matches!(into_sel, Selection::ParamEvidence(_));
+        let into_local = match into_sel {
             Selection::Impl { id, args: impl_args, .. } => {
                 if p.gx.index.get(id).items.is_empty() {
                     LocalDefId(u32::MAX)
@@ -6557,6 +6791,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let next_local = match self.select_obligation(tr2) {
             Selection::Impl { id: id2, args: impl_args2, .. } => self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0,
             Selection::ParamEvidence(_) => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
+            // A template bound `T: IntoIterator` proves into_iter from
+            // the env, but no env predicate states `Iterator` for the
+            // `IntoIter` projection (assoc-type bounds of a trait
+            // definition are not elaborated into the env). The bound
+            // still proves `next` exists, so the stub answers here;
+            // instances re-select with concrete types.
+            _ if into_from_env => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
             _ => return None,
         };
         self.set_res(for_e, Res::ForTrait { into_iter: into_local, next: next_local });

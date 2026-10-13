@@ -140,6 +140,35 @@ fn trait_in_scope(cx: &Ctx, trait_def: DefId) -> bool {
         lang.deref_mut,
         lang.index,
         lang.index_mut,
+        // The operator traits are not in rustc's prelude (a method
+        // call needs the trait in scope), but no record of
+        // `use std::ops::..` reaches check today, and bounds and
+        // impl headers already resolve these traits by flat name
+        // (`trait_by_name`), with or without the use. Method calls
+        // follow the same flat rule until resolver use-scope for
+        // lang traits lands (W-RESOLVE).
+        lang.add,
+        lang.sub,
+        lang.mul,
+        lang.div,
+        lang.rem,
+        lang.neg,
+        lang.not,
+        lang.bit_and,
+        lang.bit_or,
+        lang.bit_xor,
+        lang.shl,
+        lang.shr,
+        lang.add_assign,
+        lang.sub_assign,
+        lang.mul_assign,
+        lang.div_assign,
+        lang.rem_assign,
+        lang.bit_and_assign,
+        lang.bit_or_assign,
+        lang.bit_xor_assign,
+        lang.shl_assign,
+        lang.shr_assign,
     ]
     .contains(&trait_def)
     {

@@ -15,6 +15,20 @@
 // (`where_clause_probe`): they win over a blanket impl of another
 // trait at the same probe, and they match by receiver type, so a
 // by-value probe at `&T` takes a `&self` bound method of `T`.
+//
+// Operators (`a + b`, `-a`, `a += b`) and `for` loops record no
+// pick: their instance checks re-select, and that is equal by
+// construction. An operator names exactly one lang trait, so
+// selection in an instance can only find the one impl coherence
+// allows for the operand types (or the builtin scalar path, whose
+// `Output`/`Rhs` are core's own scalar impls); a bound that fixes
+// `Output` is checked again at the call site, so an instance
+// whose impl disagrees with the bound never gets built. A `for`
+// loop is the same shape through `IntoIterator`: the blanket
+// `impl<I: Iterator> IntoIterator for I` overlaps any direct
+// impl, so the template proof and the instance selection name
+// the same impl. The tests `operator_pick_*` and
+// `for_loop_pick_*` in tests/pass pin both shapes.
 use super::method::{self, Probe, RcvProbe};
 use super::*;
 use crate::def::DefId;

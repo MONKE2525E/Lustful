@@ -1,7 +1,7 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, MacroKind, Pat, PatId, Stmt};
 use crate::check::collect::*;
-use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, PrimCmpKind, Res};
+use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, PrimCmpKind, PrimOpKind, Res};
 use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
@@ -799,6 +799,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                     }
                     return;
                 }
+                if let Res::TraitBin { f, ld, .. } = self.ck.res(e) {
+                    let f = self.resolve_generic_fn(e, f);
+                    let o = self.operand_derefs(*expr, ld);
+                    let d = self.call_dest(dest, ty);
+                    self.call_into(CallTarget::Fn(f), vec![o], d, span);
+                    return;
+                }
                 let ld = match self.ck.res(e) {
                     Res::Bin { ld, .. } => ld,
                     _ => 0,
@@ -878,6 +885,19 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 let lt = self.ty(*lhs);
+                if let Res::TraitBin { f, rd, .. } = self.ck.res(e) {
+                    // Through the assignment trait: `add_assign(&mut place, rhs)`.
+                    let f = self.resolve_generic_fn(e, f);
+                    let r = self.operand_derefs(*rhs, rd);
+                    let pl = self.place_for_mut(*lhs);
+                    let mt = self.ref_ty(true, lt);
+                    let t = self.temp(mt);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    let u = self.temp(UNIT);
+                    self.call_into(CallTarget::Fn(f), vec![Operand::Move(Place::local(t)), r], Place::local(u), span);
+                    self.unit(dest, span);
+                    return;
+                }
                 if self.body.tys.is_string_ty(lt) {
                     let pl = self.place_for_mut(*lhs);
                     let r = self.operand(*rhs);
@@ -1457,9 +1477,49 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// A scalar operator trait method (`Res::PrimOp`): the
+    /// operation itself on the receiver value (by-value `self`),
+    /// a unary operation, or a compound assignment into the
+    /// receiver place, exactly as the operators lower.
+    fn prim_op_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span, kind: PrimOpKind, derefs: u8) {
+        use PrimOpKind as K;
+        match kind {
+            K::Bin(op) => {
+                if args.is_empty() {
+                    return;
+                }
+                let a = self.operand_derefs(recv, derefs);
+                let b = self.operand(args[0]);
+                let recv_ty = self.peel(self.ty(recv), derefs);
+                if op == BinOp::Add && self.body.tys.is_string_ty(recv_ty) {
+                    self.set_or_temp(dest, Rvalue::StringAdd(a, b), self.ty(e), span);
+                } else {
+                    self.set_or_temp(dest, Rvalue::Bin(op, a, b), self.ty(e), span);
+                }
+            }
+            K::Un(op) => {
+                let a = self.operand_derefs(recv, derefs);
+                self.set_or_temp(dest, Rvalue::Un(op, a), self.ty(e), span);
+            }
+            K::Assign(op) => {
+                if args.is_empty() {
+                    return;
+                }
+                let r = self.operand(args[0]);
+                let pl = Self::derefs(self.place_for_mut(recv), derefs);
+                self.assign(pl.clone(), Rvalue::Bin(op, Operand::Copy(pl), r), span);
+                self.unit(dest, span);
+            }
+        }
+    }
+
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
             self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
+            return;
+        }
+        if let Res::PrimOp { kind, derefs } = self.ck.res(e) {
+            self.prim_op_into(e, recv, args, dest, span, kind, derefs);
             return;
         }
         let (callee, derefs, autoref) = match self.ck.res(e) {
