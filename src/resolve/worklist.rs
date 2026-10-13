@@ -789,45 +789,10 @@ fn hash_lexed(l: &lexer::Lexed) -> u64 {
     h.finish()
 }
 
-/// Runs `f` for each item on all cores, results in input order. The
-/// worklist's own copy of the driver's batching rule (small batches
-/// over one atomic counter), kept here so resolve does not depend on
-/// the driver's private helpers.
+/// Runs `f` for each item on all cores, results in input order, on the
+/// compiler's persistent pool (src/pool.rs).
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let n = std::env::var("LUST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores).min(items.len().max(1));
-    if n <= 1 {
-        return items.iter().map(f).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let batch = (items.len() / (n * 8)).clamp(1, 16);
-    let chunks: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut out = Vec::new();
-                    loop {
-                        let start = next.fetch_add(batch, Ordering::Relaxed);
-                        if start >= items.len() {
-                            break;
-                        }
-                        let end = (start + batch).min(items.len());
-                        out.extend(items[start..end].iter().enumerate().map(|(k, item)| (start + k, f(item))));
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut all: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
-    for chunk in chunks {
-        for (i, r) in chunk {
-            all[i] = Some(r);
-        }
-    }
-    all.into_iter().map(|r| r.unwrap()).collect()
+    crate::pool::par_map(items, f)
 }
 
 /// Workspace-session shared state: session-global file ids and the
@@ -2439,46 +2404,28 @@ fn resolve_one(
     }
     lap!("resolve: epoch");
     // Rewrite paths to flat names, checking visibility. The tables
-    // are frozen at this point and each file's Ast is its own, so
-    // the pass runs in parallel across files; diagnostics merge
-    // back in file order.
-    let rw_diags = {
-        fn rewrite_chunk(
-            works: &mut [FileWork],
-            base: usize,
-            depth: u32,
-            tables: &ResolvedTables,
-            interner: &Interner,
-            list_module: &FxMap<ItemListKey, ModuleId>,
-            local_names: &FxMap<Sym, ()>,
-            skip: &[bool],
-        ) -> Vec<Diag> {
-            if works.len() <= 1 || depth == 0 {
-                let mut rw = Rewrite { tables, interner, list_module, local_names, diags: Vec::new() };
-                for (i, w) in works.iter_mut().enumerate() {
-                    if skip[base + i] {
-                        continue;
-                    }
-                    let module = w.module;
-                    rw.file_items(&mut w.ast, base + i, module, &[]);
-                }
-                return rw.diags;
-            }
-            let mid = works.len() / 2;
-            let (left, right) = works.split_at_mut(mid);
-            std::thread::scope(|s| {
-                let handle = s.spawn(|| rewrite_chunk(left, base, depth - 1, tables, interner, list_module, local_names, skip));
-                let mut right_diags = rewrite_chunk(right, base + mid, depth - 1, tables, interner, list_module, local_names, skip);
-                let mut diags = handle.join().unwrap();
-                diags.append(&mut right_diags);
-                diags
-            })
-        }
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let depth = (usize::BITS - cores.leading_zeros()).min(5);
+    // are frozen at this point and each work's Ast is its own (a file,
+    // or an item segment of one), so the pass runs in parallel on the
+    // compiler's pool; diagnostics merge back in work order. Each work
+    // sits behind its own lock, taken once, so one task can own it
+    // mutably. A work whose final chunk is cached is skipped.
+    let rw_diags: Vec<Diag> = {
+        let tables: &ResolvedTables = tables;
         let local_names = tables.local_named_set();
-        let skip: Vec<bool> = final_hits.iter().map(|h| h.is_some()).collect();
-        rewrite_chunk(&mut works, 0, depth, tables, interner, &list_module, &local_names, &skip)
+        let cells: Vec<(usize, std::sync::Mutex<&mut FileWork>)> = works
+            .iter_mut()
+            .enumerate()
+            .filter(|(fi, _)| final_hits[*fi].is_none())
+            .map(|(fi, w)| (fi, std::sync::Mutex::new(w)))
+            .collect();
+        let per_work = par_map(&cells, |(fi, cell)| {
+            let mut w = cell.lock().unwrap();
+            let module = w.module;
+            let mut rw = Rewrite { tables, interner, list_module: &list_module, local_names: &local_names, diags: Vec::new() };
+            rw.file_items(&mut w.ast, *fi, module, &[]);
+            rw.diags
+        });
+        per_work.into_iter().flatten().collect()
     };
     if !rw_diags.is_empty() {
         return Err(OneError { diags: rw_diags, seen, needs_std });

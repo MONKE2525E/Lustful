@@ -33,7 +33,6 @@ use crate::scan;
 use crate::{borrowck, check, ir, lower, parser};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// The session's one source file in its source map. A crate is one file today, so every
@@ -289,42 +288,10 @@ pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
     }
 }
 
-/// Runs `f` for each item on all cores. Results keep the input order.
+/// Runs `f` for each item on all cores, on the persistent pool (src/pool.rs).
+/// Results keep the input order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let n = std::env::var("LUST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores).min(items.len().max(1));
-    if n <= 1 {
-        return items.iter().map(f).collect();
-    }
-    let next = AtomicUsize::new(0);
-    // Batches amortize the atomic counter, but stay small enough to keep every thread busy.
-    let batch = (items.len() / (n * 8)).clamp(1, 16);
-    let chunks: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut out = Vec::new();
-                    loop {
-                        let start = next.fetch_add(batch, Ordering::Relaxed);
-                        if start >= items.len() {
-                            break;
-                        }
-                        let end = (start + batch).min(items.len());
-                        out.extend(items[start..end].iter().enumerate().map(|(k, item)| (start + k, f(item))));
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut all: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
-    for chunk in chunks {
-        for (i, r) in chunk {
-            all[i] = Some(r);
-        }
-    }
-    all.into_iter().map(|r| r.unwrap()).collect()
+    crate::pool::par_map(items, f)
 }
 
 /// Splits source into chunks of whole top-level items, about `2 * cores` of them. Boundaries are

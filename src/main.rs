@@ -27,6 +27,7 @@ mod lower;
 #[allow(dead_code)] // Instance discovery is called from collect and the driver as W-TRAITS-CORE lands in increments.
 mod mono;
 mod parser;
+mod pool;
 mod protocol;
 #[allow(dead_code)] // Wired into the driver by the worklist increment.
 mod resolve;
@@ -44,22 +45,15 @@ use protocol::Invocation;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Deletes a one-shot session's object directory. A serial walk costs 3 to 6 ms on a cold
-/// build (one unlink per object and C file), so many files are unlinked in parallel. The
-/// final remove_dir_all handles subdirectories and anything the parallel pass missed.
+/// build (one unlink per object and C file), so many files are unlinked in parallel on the
+/// thread pool. The final remove_dir_all handles subdirectories and anything the parallel
+/// pass missed.
 fn remove_obj_dir(dir: &std::path::Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         let files: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
         if files.len() > 16 {
-            let n = 8usize;
-            std::thread::scope(|s| {
-                for k in 0..n {
-                    let files = &files;
-                    s.spawn(move || {
-                        for f in files.iter().skip(k).step_by(n) {
-                            let _ = std::fs::remove_file(f);
-                        }
-                    });
-                }
+            pool::par_map(&files, |f| {
+                let _ = std::fs::remove_file(f);
             });
         }
     }

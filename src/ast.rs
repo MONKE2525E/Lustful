@@ -1312,7 +1312,7 @@ impl Shift {
 }
 
 impl Ast {
-    /// Merges chunk ASTs in order. Index shifting runs in parallel, one chunk per thread.
+    /// Merges chunk ASTs in order. Index shifting runs in parallel, one chunk per task.
     pub fn concat(mut chunks: Vec<Ast>) -> Ast {
         let mut sh = Shift { e: 0, p: 0, t: 0, b: 0, s: 0, si: 0 };
         let mut shifts = Vec::with_capacity(chunks.len());
@@ -1327,11 +1327,11 @@ impl Ast {
                 si: sh.si + c.stmt_items.len() as u32,
             };
         }
-        std::thread::scope(|scope| {
-            for (c, &s) in chunks.iter_mut().zip(&shifts).skip(1) {
-                scope.spawn(move || c.shift(s));
-            }
-        });
+        // Each chunk shifts on the compiler's thread pool; a chunk sits
+        // behind its own lock, taken once, so one task can own it mutably.
+        let cells: Vec<(std::sync::Mutex<&mut Ast>, Shift)> =
+            chunks.iter_mut().zip(&shifts).skip(1).map(|(c, &s)| (std::sync::Mutex::new(c), s)).collect();
+        crate::pool::par_map(&cells, |(c, s)| c.lock().unwrap().shift(*s));
         let mut out = Ast {
             items: Vec::with_capacity(chunks.iter().map(|c| c.items.len()).sum()),
             stmt_items: Vec::with_capacity(sh.si as usize),

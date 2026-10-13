@@ -268,7 +268,9 @@ pub struct MemRun {
 /// into user code happens in a forked child, so a panic or crash in the program cannot kill
 /// this process (which may be the daemon), exit codes match the file-based path, and the
 /// child's C stdio buffering sees the same fds a real executable would. All compiler threads
-/// must be joined before this call (the fork would not copy them).
+/// must be joined before this call (the fork would not copy them). The persistent thread pool
+/// is stopped here (`pool::stop`: every pool thread joined) and stays stopped until this call
+/// returns; never call this from inside a `par_map` task.
 ///
 /// In capture mode the child's stdout and stderr go to pipes and come back in the result
 /// (for a daemon, whose own stdout is not the user's terminal). Otherwise the child inherits
@@ -327,6 +329,8 @@ pub fn run_in_memory(
                 }
             }
         }
+        // No pool thread may live across the fork; the pool restarts on the next phase.
+        let _pool_stopped = crate::pool::stop();
         // Flush Rust and C buffers before the fork, so the child does not write them twice.
         {
             use std::io::Write as _;
@@ -335,7 +339,8 @@ pub fn run_in_memory(
             // SAFETY: fflush(NULL) flushes all C streams.
             unsafe { fflush(std::ptr::null_mut()) };
         }
-        // SAFETY: no other threads run now; the child only calls main and _exit.
+        // SAFETY: no other compiler threads run now (the pool is stopped above); the child
+        // only calls main and _exit.
         let pid = unsafe { fork() };
         if pid < 0 {
             // SAFETY: the fds came from pipe above and are closed once. -1 is not passed here.
