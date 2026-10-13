@@ -101,7 +101,7 @@ source when the generic std pipeline can carry it.
 |---|---|---|
 | Iterators over Vec, slices, arrays, ranges, Chars (21 kinds, adapters and consumers) | ty/iter.rs, check/iter.rs, lower/iter.rs | Expanded into IR after borrowck. Pull counts, Zip, and collect capacity follow core and alloc. |
 | `sort`, `sort_unstable`, `binary_search` families | runtime/sort.h | C port of driftsort and ipnsort: same comparator calls and order of equal elements. |
-| `Rc`, `rc::Weak`, `RefCell` (with `Ref`/`RefMut`), `Cell` | check/cells.rs, cgen.rs | Implicit weak count; borrow panics as Rust; region rules in borrowck/regions.rs. |
+| `Rc`, `rc::Weak`, `RefCell` (with `Ref`/`RefMut`), `Cell` | check/cells.rs, cgen.rs | Implicit weak count; borrow panics as Rust; `take`, `into_inner`, `unwrap_or_clone`; region rules in borrowck/regions.rs. |
 | `process::ExitCode` | check/process.rs | `main` may return it, or `Result<ExitCode, E>`. |
 | `String::from_utf8`, `str::from_utf8`, `FromUtf8Error`, `Utf8Error` | check/utf8.rs, runtime core.c | The error types are synthetic std Adts (check/collect.rs), so derived Debug/Clone/Eq are the struct machinery. |
 | `Box<[T]>` | cgen.rs `CTy::BoxSlice` | `into_boxed_slice`, `into_vec`, by-value iteration (`vec::IntoIter`), deref to `[T]`. No `Box<[T; N]>` coercion yet. |

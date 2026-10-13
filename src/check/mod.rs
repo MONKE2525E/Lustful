@@ -261,6 +261,9 @@ pub enum Builtin {
     RcMakeMut,
     RcGetMut,
     RcTryUnwrap,
+    /// `Rc::into_inner` and `Rc::unwrap_or_clone` (W-STD-A phase 3).
+    RcIntoInner,
+    RcUnwrapOrClone,
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and
@@ -7531,12 +7534,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Builtin::RcGetMut
             } else if item == k.try_unwrap {
                 Builtin::RcTryUnwrap
+            } else if self.name(item) == "into_inner" {
+                Builtin::RcIntoInner
+            } else if self.name(item) == "unwrap_or_clone" {
+                Builtin::RcUnwrapOrClone
             } else {
                 self.err(
                     "L0104",
                     span,
                     format!("no function `Rc::{}`", self.name(item)),
-                    "Lust supports Rc::new, Rc::strong_count, Rc::weak_count, Rc::make_mut, Rc::get_mut, and Rc::try_unwrap.",
+                    "Lust supports Rc::new, Rc::strong_count, Rc::weak_count, Rc::make_mut, Rc::get_mut, Rc::try_unwrap, Rc::into_inner, and Rc::unwrap_or_clone.",
                 );
                 return None;
             };
@@ -9082,6 +9089,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let rc = self.tys.mk_rc(elem);
                         let res = self.tys.mk_result(elem, rc);
                         (vec![rc], res)
+                    }
+                    Builtin::RcIntoInner => {
+                        let elem = self.new_var(false);
+                        let rc = self.tys.mk_rc(elem);
+                        (vec![rc], self.tys.mk_option(elem))
+                    }
+                    Builtin::RcUnwrapOrClone => {
+                        let elem = self.new_var(false);
+                        let rc = self.tys.mk_rc(elem);
+                        self.deferred_clone.push((elem, span));
+                        (vec![rc], elem)
                     }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {

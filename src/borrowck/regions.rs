@@ -2637,6 +2637,17 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
+            // `Rc::downgrade(&Rc<T>) -> Weak<T>` and `Weak::upgrade(&Weak<T>)
+            // -> Option<Rc<T>>` share `T`; the borrow of the argument is
+            // not part of the result (rustc's signatures).
+            _ if let CallTarget::Builtin(crate::check::Builtin::RcDowngrade | crate::check::Builtin::WeakUpgrade) = target
+                && let [(at, av)] = avs.as_slice()
+                && let TyKind::Ref(_, _, inner) = self.body.tys.kind(*at)
+                && let Some(el) = self.body.tys.rc_elem(inner).or_else(|| self.body.tys.weak_elem(inner))
+                && let Some(rl) = self.body.tys.weak_elem(dt).or_else(|| self.body.tys.option_elem(dt).and_then(|o| self.body.tys.rc_elem(o)))
+                && rl == el
+                && !av.is_empty()
+                && self.relate(el, &av[1..], rl, &dv, Variance::Co) => {}
             _ if let CallTarget::Builtin(b) = target
                 && self.call_cell(b, &avs, dt, &dv) => {}
             _ => {

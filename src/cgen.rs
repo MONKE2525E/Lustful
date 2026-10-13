@@ -3074,6 +3074,38 @@ impl FnGen<'_, '_, '_> {
                 let _ = et;
                 t
             }
+            B::RcIntoInner | B::RcUnwrapOrClone => {
+                // The last strong Rc gives up its value (the header stays
+                // while Weak refs do); any other just drops its count:
+                // into_inner answers None, unwrap_or_clone a clone.
+                let CTy::Rc(elem) = &tys[0] else { unreachable!("into_inner on an Rc") };
+                let elem = (**elem).clone();
+                let it = format!("RcI_{}", mangle(&elem));
+                let v = self.tmp();
+                let _ = writeln!(self.out, "    {it}* {v} = {};", vals[0]);
+                let free = format!("{v}->strong = 0; if (--{v}->weak == 0) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it}));");
+                if b == B::RcIntoInner {
+                    let opt = CTy::Option(Box::new(elem.clone()));
+                    let t = self.tmp();
+                    let (f, some, none) = (variant_field(self.p, &opt, &t, 1, 0), disc_set(self.p, &opt, &t, 1), disc_set(self.p, &opt, &t, 0));
+                    let _ = writeln!(
+                        self.out,
+                        "    {} {t}; if ({v}->strong == 1) {{ {f} = {v}->v; {some} {free} }} else {{ {v}->strong--; {none} }}",
+                        ctype(&opt)
+                    );
+                    t
+                } else {
+                    let c = if is_copy_c(self.p, &elem) {
+                        format!("{v}->v")
+                    } else {
+                        self.want(Glue::Clone, &elem);
+                        format!("clone_{}(&{v}->v)", mangle(&elem))
+                    };
+                    let t = self.tmp();
+                    let _ = writeln!(self.out, "    {} {t}; if ({v}->strong == 1) {{ {t} = {v}->v; {free} }} else {{ {t} = {c}; {v}->strong--; }}", ctype(&elem));
+                    t
+                }
+            }
             B::EnvArgs => "((lust_Args){ (uint64_t)lust_argc })".into(),
             B::ArgsCount => format!("{}.n", vals[0]),
             B::StrLen => format!("{}.len", vals[0]),
