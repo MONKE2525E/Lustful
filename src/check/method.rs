@@ -889,8 +889,19 @@ pub(super) fn plain_inherent_probe(
 /// principal and its supertraits, which need no import) are both
 /// inherent here, as in rustc, so two of them at one receiver form are
 /// ambiguous (rustc E0034). An object method calls through the vtable.
+/// With `only`, a replayed template pick: just the object candidates of
+/// that trait, as the generic body resolved `<T as Tr>::m` (picks.rs).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
+pub(super) fn dyn_probe(
+    cx: &mut Ctx,
+    e: ExprId,
+    probe: RcvProbe,
+    derefs: u8,
+    name: Sym,
+    name_span: Span,
+    args: &[ExprId],
+    only: Option<DefId>,
+) -> Probe {
     use crate::check::object::{self, DynRecv};
     let p = cx.p;
     // At step `&dyn P` the by-value group's pointee variant probes
@@ -906,7 +917,7 @@ pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, na
         None => None,
     };
     let key = object::erase_dyn_region(&mut cx.tys, step);
-    let inherent = p.gx.dyn_inherent.get(&(key, name)).copied();
+    let inherent = if only.is_some() { None } else { p.gx.dyn_inherent.get(&(key, name)).copied() };
     if let Some(f) = inherent
         && form_of(p.fn_info(f).self_kind).is_none()
     {
@@ -924,6 +935,7 @@ pub(super) fn dyn_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, na
     let inherent = inherent.filter(|&f| form_of(p.fn_info(f).self_kind) == Some(form));
     let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut cx.tys, principal, name)
         .into_iter()
+        .filter(|c| only.is_none_or(|t| c.owner.def == t))
         .filter(|c| match c.call {
             Ok((_, DynRecv::Ref)) => form == ReceiverForm::Ref,
             Ok((_, DynRecv::RefMut)) => form == ReceiverForm::RefMut,
@@ -1055,7 +1067,7 @@ pub(super) fn generic_method_search(
         let groups = [by_value, vec![RcvProbe::at(cx, step, ReceiverForm::Ref)], vec![RcvProbe::at(cx, step, ReceiverForm::RefMut)]];
         for group in &groups {
             for &probe in group {
-                match dyn_probe(cx, e, probe, derefs, name, name_span, args) {
+                match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {
                     Probe::Miss => {}
                     hit => return hit,
                 }

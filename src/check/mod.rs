@@ -5374,17 +5374,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// A path call on a dyn Self type: the `impl dyn P` method of that
     /// name, else the one object candidate (of the hinted trait, when
-    /// written), called through the vtable with the receiver as the
-    /// first argument. None when `base` is not a dyn type or nothing
-    /// matches (the caller reports).
+    /// written, or of the template's pick when this body replays one),
+    /// called through the vtable with the receiver as the first
+    /// argument. None when `base` is not a dyn type or nothing matches
+    /// (the caller reports).
     fn dyn_assoc_call(&mut self, e: ExprId, base: Ty, hint: Option<TraitRef>, name: Sym, args: &[ExprId], span: Span) -> Option<Ty> {
         let p = self.p;
         let base = self.resolve(base);
         let principal = object::principal_of(&self.tys, base)?;
         let key = object::erase_dyn_region(&mut self.tys, base);
-        if hint.is_none()
+        let only = hint.map(|h| h.def).or_else(|| self.replay_pick(e).map(|pick| pick.trait_def));
+        if only.is_none()
             && let Some(&f) = p.gx.dyn_inherent.get(&(key, name))
         {
+            // Object candidates are inherent too, so a trait method of
+            // the same name makes the path ambiguous (rustc E0034).
+            if !object::object_cands(p, &mut self.tys, principal, name).is_empty() {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple applicable items named `{}` are in scope for this `dyn` type", self.name(name)),
+                    "Name the trait: `<dyn Trait as Trait>::method(receiver)`.",
+                );
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
             let (params, ret) = {
                 let info = p.fn_info(f);
                 (info.params.clone(), info.ret)
@@ -5395,7 +5411,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut self.tys, principal, name)
             .into_iter()
-            .filter(|c| hint.is_none_or(|h| h.def == c.owner.def))
+            .filter(|c| only.is_none_or(|t| t == c.owner.def))
             .collect();
         if cands.len() != 1 {
             return None;
