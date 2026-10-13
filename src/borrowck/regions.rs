@@ -124,6 +124,9 @@ pub struct RegionTables {
     /// The trait method of each trait method stub (the reverse of
     /// `GenTables::trait_method_stubs`), built on first use.
     stub_methods: std::sync::OnceLock<FxMap<LocalDefId, DefId>>,
+    /// Per trait, its impls with `X: 'static` where-clauses (the impl and
+    /// those params), built on first use (`Builder::impl_static_edges`).
+    static_impls: std::sync::OnceLock<FxMap<DefId, Vec<(crate::traits::index::ImplId, Vec<u32>)>>>,
 }
 
 /// Per user Adt template: variance and drop mode of each generic param, by
@@ -142,6 +145,32 @@ impl RegionTables {
     /// The Adt tables, computed once from the program's Adt templates.
     fn adts(&self, p: &Program) -> &AdtTables {
         self.adts.get_or_init(|| AdtTables::compute(p))
+    }
+
+    /// The impls of `trait_def` with `X: 'static` where-clauses.
+    fn static_impls(&self, p: &Program, trait_def: DefId) -> &[(crate::traits::index::ImplId, Vec<u32>)] {
+        let all = self.static_impls.get_or_init(|| {
+            let mut m: FxMap<DefId, Vec<(crate::traits::index::ImplId, Vec<u32>)>> = FxMap::default();
+            for (id, rec) in p.gx.index.all_impls() {
+                let ks: Vec<u32> = rec
+                    .generics
+                    .predicates
+                    .iter()
+                    .filter_map(|pr| match pr {
+                        Predicate::TypeOutlives(x, Region::Static) => match p.tys.kind(*x) {
+                            TyKind::Param(k) => Some(k.0),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !ks.is_empty() {
+                    m.entry(rec.trait_def).or_default().push((id, ks));
+                }
+            }
+            m
+        });
+        all.get(&trait_def).map_or(&[], |v| v.as_slice())
     }
 
     /// The trait method a stub fn stands for (a stub has its own def).
@@ -2732,23 +2761,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// `X` matches outlives `'static`.
     fn impl_static_edges(&mut self, trait_def: DefId, actual: Ty, vars: &[u32]) {
         let p = self.p;
-        for &id in p.gx.index.impls_of_trait(trait_def) {
+        for (id, statics) in p.regions.static_impls(p, trait_def).to_vec() {
             let rec = p.gx.index.get(id);
-            let statics: Vec<u32> = rec
-                .generics
-                .predicates
-                .iter()
-                .filter_map(|pr| match pr {
-                    Predicate::TypeOutlives(x, Region::Static) => match p.tys.kind(*x) {
-                        TyKind::Param(k) => Some(k.0),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-            if statics.is_empty() {
-                continue;
-            }
             let Some(pat) = p.tys.args(rec.trait_ref.args).first().and_then(|g| g.as_ty()) else { continue };
             let mut parts: FxMap<u32, Vec<u32>> = FxMap::default();
             if !self.match_impl_self(pat, actual, vars, &mut 0, &mut parts) {
