@@ -2074,8 +2074,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         },
                     };
                     def.body = Some(body);
-                    def.exprs = exprs;
-                    def.pats = pats;
+                    // Parameter patterns were parsed with the old
+                    // range and are not part of the new body: keep
+                    // the old range start so their nodes stay
+                    // inside it (the arena only appends).
+                    if def.params.iter().any(|p| p.pat.is_some()) {
+                        def.exprs = (def.exprs.0.min(exprs.0), exprs.1);
+                        def.pats = (def.pats.0.min(pats.0), pats.1);
+                    } else {
+                        def.exprs = exprs;
+                        def.pats = pats;
+                    }
                 }
                 Err(d) => {
                     caches.ok[slot] = false;
