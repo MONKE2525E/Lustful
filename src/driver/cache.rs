@@ -259,6 +259,28 @@ impl Cache {
         Some(map)
     }
 
+    /// The def-order file for one session selection, next to its
+    /// slot manifest under the same session hash.
+    fn def_order_path(&self, session: &SessionKey) -> PathBuf {
+        let (a, _) = hash128(&[session.describe().as_bytes()], 31);
+        self.dir.join(format!("defs-{a:016x}.bin"))
+    }
+
+    /// The stored def order for `session`, if a previous daemon or
+    /// build left a valid one for this crate identity (`stable`).
+    /// A missing, bad, or foreign-crate file is `None`; the caller
+    /// then numbers defs fresh.
+    pub fn load_def_order(&self, session: &SessionKey, stable: crate::def::StableCrateHash) -> Option<crate::check::collect::DefOrder> {
+        let bytes = std::fs::read(self.def_order_path(session)).ok()?;
+        super::session::decode_def_order(&bytes, stable)
+    }
+
+    /// Stores the def order for `session` (atomic, as every write here).
+    pub fn store_def_order(&self, session: &SessionKey, order: &crate::check::collect::DefOrder, stable: crate::def::StableCrateHash) {
+        let bytes = super::session::encode_def_order(order, stable);
+        self.write(&self.def_order_path(session), &bytes);
+    }
+
     /// Stores the slot manifest for `session` (atomic, as every write here).
     pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>) {
         let bytes = super::session::encode_slot_manifest(slot_of);

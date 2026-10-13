@@ -25,6 +25,11 @@
 #      recorded reads changed, with matching program output.
 #   8. slot compaction: renumbered survivors re-emit C from cached
 #      IR (reemitted counter) with correct output.
+#   9. restart with an added file in the middle: the persisted def
+#      order keeps Adt and static numbering across a daemon
+#      restart, so old units still hit the disk cache and output
+#      stays exact. A corrupted def-order file is a cache miss:
+#      the new daemon numbers fresh and output stays exact.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -325,6 +330,61 @@ def case_compaction_reemit():
     d.kill()
 
 
+def case_restart_add_file():
+    # 9. Restart with a file added in the middle (W-DRIVER phase 4):
+    # the def order persists to disk, so a restarted daemon numbers
+    # Adts and statics as the old daemon did. The new file's defs
+    # append; old units keep valid indices and hit the disk cache.
+    work = tempfile.mkdtemp(prefix="lust-driver-restart-add-")
+    d = Daemon(work)
+    main_rs = os.path.join(work, "main.rs")
+    out = os.path.join(work, "x")
+    open(main_rs, "w").write(
+        "mod a;\nmod z;\n\nfn main() {\n    println!(\"{}\", a::get() + z::get());\n}\n")
+    open(os.path.join(work, "a.rs"), "w").write(
+        "pub struct Alpha {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "pub static ABASE: i64 = 100;\n\n"
+        "pub fn get() -> i64 {\n    let a = Alpha { x: 1, y: 2 };\n    a.x * 10 + a.y + ABASE\n}\n")
+    open(os.path.join(work, "z.rs"), "w").write(
+        "pub struct Zed {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "pub static ZBASE: i64 = 1000;\n\n"
+        "pub fn get() -> i64 {\n    let z = Zed { x: 3, y: 4 };\n    z.x * 10 + z.y + ZBASE\n}\n")
+    d.start()
+    _, prog = d.build(main_rs, out)
+    check("restart-add cold output", prog.stdout.strip() == "1146", prog.stdout)
+    d.kill()
+
+    def_order_files = glob.glob(os.path.join(work, "cache", "**", "defs-*.bin"), recursive=True)
+    check("def order persisted to disk", len(def_order_files) == 1, str(def_order_files))
+
+    # New file in the middle of the mod list, with new Adts and a
+    # static, then a fresh daemon on the same cache dir.
+    open(os.path.join(work, "m.rs"), "w").write(
+        "pub struct Mid1 {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "pub struct Mid2 {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "pub struct Mid3 {\n    pub x: i64,\n    pub y: i64,\n}\n\n"
+        "pub static MBASE: i64 = 7;\n\n"
+        "pub fn get() -> i64 {\n    let a = Mid1 { x: 0, y: 0 };\n    let b = Mid2 { x: 5, y: 6 };\n"
+        "    let c = Mid3 { x: 0, y: 0 };\n    a.x + b.x * 10 + b.y + c.y + MBASE\n}\n")
+    text = open(main_rs).read()
+    open(main_rs, "w").write(text.replace("mod a;\nmod z;", "mod a;\nmod m;\nmod z;")
+                             .replace("a::get() + z::get()", "a::get() + m::get() + z::get()"))
+    d.start()
+    st, prog = d.build(main_rs, out)
+    check("restart-add output after restart", prog.stdout.strip() == "1209", prog.stdout)
+    check("restart-add old units hit the disk cache", (st.get("unit_cache_hits") or 0) >= 1, str(st))
+    d.kill()
+
+    # A corrupted def-order file falls back to fresh numbering:
+    # output stays exact (only hits may drop).
+    for path in glob.glob(os.path.join(work, "cache", "**", "defs-*.bin"), recursive=True):
+        open(path, "wb").write(b"garbage, not a def order")
+    d.start()
+    _, prog = d.build(main_rs, out)
+    check("corrupt def order falls back, output exact", prog.stdout.strip() == "1209", prog.stdout)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -333,6 +393,7 @@ def main():
     case_graph_refresh_and_std()
     case_multi_incremental()
     case_compaction_reemit()
+    case_restart_add_file()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

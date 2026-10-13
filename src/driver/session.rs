@@ -27,6 +27,19 @@ pub(crate) struct Front {
     /// cached outputs that carry those indices (`FnOut::types`,
     /// the glue set) survive such edits.
     pub(crate) def_order: crate::check::collect::DefOrder,
+    /// How many `def_order` entries (Adts plus statics) the disk
+    /// def-order file already holds. Like the slot manifest, the
+    /// order is persisted so a restarted daemon numbers defs as
+    /// the previous one did; a fresh numbering would sort added
+    /// defs into the middle and move the indices disk objects
+    /// were built under.
+    pub(crate) def_order_stored: usize,
+    /// True while `def_order` came from the disk file and has not
+    /// yet been checked against a parsed crate. The first slot
+    /// update drops a loaded order that names none of the crate's
+    /// current defs (a stale file for a different def set) and
+    /// numbers fresh; see `slot_update`.
+    pub(crate) def_order_loaded: bool,
     /// The Adt index of every Adt def at the last parse, by def
     /// hash. The slot update compares the next parse's predicted
     /// indices against these: cached output is reusable only when
@@ -224,6 +237,8 @@ impl Session {
                 ast: Ast::default(),
                 env_hash: None,
                 def_order: crate::check::collect::DefOrder::default(),
+                def_order_stored: 0,
+                def_order_loaded: false,
                 prev_adt_ids: FxMap::default(),
                 prev_static_ids: FxMap::default(),
                 prev_order_fragile: false,
@@ -317,6 +332,59 @@ pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
     out
 }
 
+/// The def-order file byte shape: magic, the stable crate hash the
+/// hashes were numbered under, Adt count, static count, then each
+/// def hash in order (Adts first). Only stable def hashes are
+/// stored (each already mixes in the stable crate hash), so a
+/// restarted daemon recovers the same Adt and static numbering
+/// (see `collect::DefOrder`). The stored crate hash lets a reader
+/// reject a file written for a different crate identity instead of
+/// numbering this crate's defs by a foreign order.
+const DEF_ORDER_MAGIC: &[u8; 4] = b"LSDO";
+
+/// Serializes a def order. See `DEF_ORDER_MAGIC`.
+pub(crate) fn encode_def_order(order: &crate::check::collect::DefOrder, stable: crate::def::StableCrateHash) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + (order.adts.len() + order.statics.len()) * 8);
+    out.extend_from_slice(DEF_ORDER_MAGIC);
+    out.extend_from_slice(&stable.0.to_le_bytes());
+    out.extend_from_slice(&(order.adts.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(order.statics.len() as u32).to_le_bytes());
+    for h in order.adts.iter().chain(&order.statics) {
+        out.extend_from_slice(&h.0.to_le_bytes());
+    }
+    out
+}
+
+/// Reads bytes written by `encode_def_order`. None on any shape
+/// error, on a stable crate hash other than `stable`, or on a hash
+/// listed twice (in one list, or as both an Adt and a static), so
+/// a bad or stale file is a cache miss and the caller numbers defs
+/// fresh, never by a wrong order.
+pub(crate) fn decode_def_order(b: &[u8], stable: crate::def::StableCrateHash) -> Option<crate::check::collect::DefOrder> {
+    if b.get(..4)? != DEF_ORDER_MAGIC {
+        return None;
+    }
+    if u64::from_le_bytes(b.get(4..12)?.try_into().ok()?) != stable.0 {
+        return None;
+    }
+    let na = u32::from_le_bytes(b.get(12..16)?.try_into().ok()?) as usize;
+    let ns = u32::from_le_bytes(b.get(16..20)?.try_into().ok()?) as usize;
+    let n = na.checked_add(ns)?;
+    if b.len() != n.checked_mul(8)?.checked_add(20)? {
+        return None;
+    }
+    let mut order = crate::check::collect::DefOrder::default();
+    for i in 0..n {
+        let at = 20 + i * 8;
+        let h = crate::def::DefPathHash(u64::from_le_bytes(b[at..at + 8].try_into().ok()?));
+        if order.adts.contains(&h) || order.statics.contains(&h) {
+            return None;
+        }
+        if i < na { &mut order.adts } else { &mut order.statics }.push(h);
+    }
+    Some(order)
+}
+
 /// Reads bytes written by `encode_slot_manifest`. None on any shape error (bad
 /// magic, a truncated or trailing byte, or one slot claimed twice), so a bad
 /// file is a cache miss, never a wrong slot.
@@ -384,6 +452,39 @@ mod tests {
         assert_eq!(back, m);
         let empty: FxMap<DiskDefId, u32> = FxMap::default();
         assert_eq!(decode_slot_manifest(&encode_slot_manifest(&empty)), Some(empty));
+    }
+
+    /// The def order round-trips (a restarted daemon numbers defs
+    /// as the previous one did), and bad bytes decode to None, so
+    /// the caller falls back to a fresh numbering.
+    #[test]
+    fn def_order_round_trips_and_rejects_bad_bytes() {
+        let stable = StableCrateHash(42);
+        let mut order = crate::check::collect::DefOrder::default();
+        order.adts = vec![DefPathHash(30), DefPathHash(10), DefPathHash(20)];
+        order.statics = vec![DefPathHash(7), DefPathHash(9)];
+        let bytes = encode_def_order(&order, stable);
+        let back = decode_def_order(&bytes, stable).unwrap();
+        assert_eq!(back.adts, order.adts);
+        assert_eq!(back.statics, order.statics);
+        // Every prefix and a trailing byte are shape errors.
+        for cut in 0..bytes.len() {
+            assert!(decode_def_order(&bytes[..cut], stable).is_none(), "prefix {cut}");
+        }
+        let mut tail = bytes.clone();
+        tail.push(0);
+        assert!(decode_def_order(&tail, stable).is_none(), "trailing byte");
+        // A file for a different crate identity is not trusted.
+        assert!(decode_def_order(&bytes, StableCrateHash(43)).is_none(), "other crate");
+        let mut wrong = bytes.clone();
+        wrong[0] = b'X';
+        assert!(decode_def_order(&wrong, stable).is_none(), "magic");
+        // A hash listed twice is bad, in one list or across both.
+        let mut dup = encode_def_order(&order, stable);
+        dup[20..28].copy_from_slice(&20u64.to_le_bytes());
+        assert!(decode_def_order(&dup, stable).is_none(), "duplicate hash");
+        order.statics = vec![DefPathHash(30)];
+        assert!(decode_def_order(&encode_def_order(&order, stable), stable).is_none(), "hash in both lists");
     }
 
     /// A bad manifest never decodes to wrong slots.

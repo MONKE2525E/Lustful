@@ -782,6 +782,23 @@ fn ids_kept(prev: &FxMap<crate::def::DefPathHash, u32>, new: &FxMap<crate::def::
     prev.iter().all(|(h, id)| new.get(h) == Some(id))
 }
 
+/// True when a disk-loaded `order` names none of this parse's defs:
+/// a stale file for a different def set. The file's stable crate
+/// hash already matched at decode, so zero overlap means the
+/// crate's types were replaced wholesale; the caller drops the
+/// order and numbers fresh. An empty order or an empty parse is
+/// never stale (nothing to distrust, or nothing to number yet).
+fn def_order_stale(
+    order: &collect::DefOrder,
+    adt_ids: &FxMap<crate::def::DefPathHash, u32>,
+    static_ids: &FxMap<crate::def::DefPathHash, u32>,
+) -> bool {
+    let loaded_any = !order.adts.is_empty() || !order.statics.is_empty();
+    let current_any = !adt_ids.is_empty() || !static_ids.is_empty();
+    let overlap = order.adts.iter().any(|h| adt_ids.contains_key(h)) || order.statics.iter().any(|h| static_ids.contains_key(h));
+    loaded_any && current_any && !overlap
+}
+
 /// True when the non-fn item hash sequence differs between two item
 /// lists (a type, impl, const, or structure edit happened).
 fn nonfn_items_changed(old: &[scan::ItemScan], new: &[scan::ItemScan]) -> bool {
@@ -829,7 +846,17 @@ fn slot_update(
     // order), except that growth in a fragile program (generics,
     // nested statics) can shift derived indices the maps do not
     // name, so growth there still clears.
-    let (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+    let (mut adt_ids, mut static_ids, mut fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+    // A def order loaded from disk is trusted only when it names at
+    // least one def of this parse (`def_order_stale`).
+    if front.def_order_loaded {
+        front.def_order_loaded = false;
+        if def_order_stale(&front.def_order, &adt_ids, &static_ids) {
+            front.def_order = collect::DefOrder::default();
+            front.def_order_stored = 0;
+            (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+        }
+    }
     let grew = adt_ids.len() > front.prev_adt_ids.len() || static_ids.len() > front.prev_static_ids.len();
     let ids_stable = had_env
         && ids_kept(&front.prev_adt_ids, &adt_ids)
@@ -1469,6 +1496,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             session.front.slot_manifest_stored = manifest.len();
             session.front.slot_of = manifest;
         }
+        if session.front.def_order.adts.is_empty()
+            && session.front.def_order.statics.is_empty()
+            && let Some(cache) = &session.disk_cache
+            && let Some(order) = cache.load_def_order(&session.key, crate_ids.stable)
+        {
+            session.front.def_order_stored = order.adts.len() + order.statics.len();
+            session.front.def_order = order;
+            session.front.def_order_loaded = true;
+        }
     }
     let session_key = session.key.clone();
     let Session { front, caches, std_cache, disk_cache, .. } = session;
@@ -1938,6 +1974,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return errors(&mut ds, &map, &src, req);
         }
     };
+    // Persist the def order when collect grew it, like the slot
+    // manifest above: the next daemon must number defs as this
+    // one did or the disk objects' indices move under it.
+    front.def_order_loaded = false;
+    if front.def_order.adts.len() + front.def_order.statics.len() != front.def_order_stored {
+        if let Some(cache) = disk_cache {
+            cache.store_def_order(&session_key, &front.def_order, crate_ids.stable);
+        }
+        front.def_order_stored = front.def_order.adts.len() + front.def_order.statics.len();
+    }
     if let Some(tables) = resolved_tables {
         program.resolved = Some(Box::new(tables));
     }
@@ -2837,6 +2883,23 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
         assert_eq!(a1[2], a2[2], "Zed keeps its index");
         assert_eq!(s1[1], s2[1], "SM keeps its index");
         assert_eq!(s1[2], s2[2], "SZ keeps its index");
+    }
+
+    /// A disk-loaded def order is stale only when it names none of
+    /// the current defs; any overlap (the same crate, edited) keeps
+    /// it, and empty sides never count as stale.
+    #[test]
+    fn loaded_def_order_stale_only_without_overlap() {
+        use crate::def::DefPathHash as H;
+        let ids = |hs: &[u64]| -> FxMap<H, u32> { hs.iter().enumerate().map(|(i, h)| (H(*h), i as u32)).collect() };
+        let mut order = collect::DefOrder::default();
+        assert!(!def_order_stale(&order, &ids(&[1]), &ids(&[])), "empty order");
+        order.adts = vec![H(10), H(20)];
+        order.statics = vec![H(30)];
+        assert!(def_order_stale(&order, &ids(&[1, 2]), &ids(&[3])), "no overlap");
+        assert!(!def_order_stale(&order, &ids(&[20, 2]), &ids(&[3])), "Adt overlap");
+        assert!(!def_order_stale(&order, &ids(&[1]), &ids(&[30])), "static overlap");
+        assert!(!def_order_stale(&order, &ids(&[]), &ids(&[])), "empty parse");
     }
 
     fn req_for(key: crate::protocol::SessionKey) -> Request {
