@@ -936,7 +936,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::MethodCall { recv, args, .. } => {
                 match res {
-                    Res::Method { derefs, autoref, .. } | Res::BuiltinMethod { derefs, autoref, .. } => {
+                    // A dyn method call through the vtable borrows its
+                    // receiver like any other method call.
+                    Res::Method { derefs, autoref, .. }
+                    | Res::BuiltinMethod { derefs, autoref, .. }
+                    | Res::DynMethod { derefs, autoref, .. } => {
                         self.cap_receiver(*recv, derefs, autoref, w);
                     }
                     // A call that failed to resolve already reported its error.
