@@ -113,7 +113,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let r = self.tys.mk_ref(true, el);
                     (B::RefCellGetMut, Autoref::RefMut, vec![], r)
                 }
-                "try_borrow" | "try_borrow_mut" | "take" | "replace_with" | "try_borrow_unguarded" | "undo_leak" => {
+                "take" => {
+                    self.deferred_default.push((el, span));
+                    (B::RefCellTake, Autoref::Ref, vec![], el)
+                }
+                "try_borrow" | "try_borrow_mut" | "replace_with" | "try_borrow_unguarded" | "undo_leak" => {
                     self.err("L0640", span, format!("`RefCell::{n}` is not implemented yet"), "Use `borrow`, `borrow_mut`, or `replace`.");
                     return Some(self.iter_bail(args));
                 }
@@ -136,7 +140,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let r = self.tys.mk_ref(false, base);
                     (B::CellSwap, Autoref::Ref, vec![r], UNIT)
                 }
-                "take" | "update" | "as_ptr" | "from_mut" | "as_slice_of_cells" => {
+                "take" => {
+                    self.deferred_default.push((el, span));
+                    (B::CellTake, Autoref::Ref, vec![], el)
+                }
+                "update" | "as_ptr" | "from_mut" | "as_slice_of_cells" => {
                     self.err("L0640", span, format!("`Cell::{n}` is not implemented yet"), "Use `get`, `set`, or `replace`.");
                     return Some(self.iter_bail(args));
                 }

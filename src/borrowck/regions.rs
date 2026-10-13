@@ -2765,7 +2765,16 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         use crate::check::Builtin as B;
         if !matches!(
             b,
-            B::RefCellBorrow | B::RefCellBorrowMut | B::CellGet | B::CellSet | B::CellReplace | B::RefCellReplace | B::CellSwap | B::RefCellSwap
+            B::RefCellBorrow
+                | B::RefCellBorrowMut
+                | B::CellGet
+                | B::CellSet
+                | B::CellReplace
+                | B::RefCellReplace
+                | B::CellSwap
+                | B::RefCellSwap
+                | B::CellTake
+                | B::RefCellTake
         ) {
             return false;
         }
@@ -2795,8 +2804,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
             _ => {
-                // `set` and `replace` store their argument; `get` and
-                // `replace` hand back a value out of the cell.
+                // `set` and `replace` store their argument; `get`,
+                // `replace`, and `take` hand back a value out of the cell.
                 if let Some((xt, xv)) = avs.get(1)
                     && !self.relate(*xt, xv, elem, &tv, Variance::Co)
                 {

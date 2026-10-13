@@ -393,6 +393,9 @@ pub enum Builtin {
     CellIntoInner,
     CellGetMut,
     CellSwap,
+    /// `Cell::take` and `RefCell::take`: replace with `T::default()`.
+    CellTake,
+    RefCellTake,
     /// `ExitCode::from(u8)` (check/process.rs).
     ExitCodeFrom,
     /// `Vec::into_boxed_slice`, `Box<[T]>::into_vec`, and by-value
@@ -959,6 +962,8 @@ struct Ctx<'p, 'a> {
     deferred_ord: Vec<(Ty, Span)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
+    /// Types a `take` builds with `Default::default()`.
+    deferred_default: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -1177,6 +1182,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
         deferred_debug: Vec::new(),
+        deferred_default: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -15072,6 +15078,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_default) {
+            let t = self.deep(t);
+            if !has_default(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("`{tn}` does not implement Default, or lust cannot build its default yet"), "Use `replace` with a value.");
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_debug) {

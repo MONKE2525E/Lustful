@@ -3598,6 +3598,34 @@ impl FnGen<'_, '_, '_> {
             B::CellNew | B::CellIntoInner => vals[0].clone(),
             B::CellGet => format!("(*{})", vals[0]),
             B::CellGetMut => vals[0].clone(),
+            B::CellTake | B::RefCellTake => {
+                // `replace(T::default())` (core); RefCell's panics if borrowed.
+                let CTy::Ref(cell) = &tys[0] else { unreachable!("take on a &Cell") };
+                let el = match &**cell {
+                    CTy::Cell(e) | CTy::RefCell(e) => (**e).clone(),
+                    _ => unreachable!("take on a cell"),
+                };
+                let def = match &el {
+                    CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(self.p, &el),
+                    t => {
+                        self.want(Glue::Default, t);
+                        format!("default_{}()", mangle(t))
+                    }
+                };
+                let (c, old) = (self.tmp(), self.tmp());
+                let et = ctype(&el);
+                if b == B::RefCellTake {
+                    let _ = writeln!(
+                        self.out,
+                        "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {et} {old} = {c}->f1; {c}->f1 = {def};",
+                        ctype(cell),
+                        vals[0]
+                    );
+                } else {
+                    let _ = writeln!(self.out, "    {et}* {c} = {}; {et} {old} = *{c}; *{c} = {def};", vals[0]);
+                }
+                old
+            }
             B::CellSet | B::CellReplace => {
                 let (c, old) = (self.tmp(), self.tmp());
                 let et = ctype(&tys[1]);
