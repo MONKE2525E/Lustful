@@ -3891,6 +3891,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Plain)).collect();
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
+    let mut drop_done = 0u32;
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -3990,8 +3991,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 depths.insert(inst, depth + 1);
                 next_queue.push(inst);
             }
-            // Drop glue for Adt instances this round made.
-            let adt_ids: Vec<AdtId> = (0..p.adts.len() as u32).map(AdtId).collect();
+            // Drop glue for Adt instances made since the last pass. An
+            // Adt's Drop selection cannot change while materialize runs
+            // (the impl index is fixed), so each Adt is asked once, in
+            // the same order as asking all of them after every body.
+            let adt_ids: Vec<AdtId> = (drop_done..p.adts.len() as u32).map(AdtId).collect();
+            drop_done = p.adts.len() as u32;
             for a in adt_ids {
                 ensure_drop_method(p, a, &mut next_queue);
             }
