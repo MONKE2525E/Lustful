@@ -229,6 +229,12 @@ impl<'a> Program<'a> {
     pub fn fn_info(&self, id: LocalDefId) -> &FnInfo<'a> {
         &self.fns[id.0 as usize]
     }
+    /// The return type a caller (or the fn's own body) checks against:
+    /// `FnInfo::ret`, except that a plain fn whose `impl Trait` return
+    /// was revealed for codegen keeps its opaque type here.
+    pub fn ret_view(&self, id: LocalDefId) -> Ty {
+        self.gx.opaque_ret_of.get(&id).copied().unwrap_or(self.fns[id.0 as usize].ret)
+    }
     /// A function's stable identity in this crate.
     #[allow(dead_code)] // First production readers are S3a defs and mono instance keys; tests use it now.
     pub fn def_id(&self, id: LocalDefId) -> DefId {
@@ -2439,10 +2445,14 @@ pub fn collect_reuse<'a>(
             let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
             scope.assoc_srcs.append(&mut srcs);
         }
-        let (params, ret, ret_borrows_from, generics, scope, region_sig) = {
+        let (params, ret, ret_borrows_from, generics, scope, region_sig, opaque) = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, errs)
+            let owner = DefId { krate: p.krate, hash };
+            generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, Some(owner), errs)
         };
+        if let Some((od, info)) = opaque {
+            p.gx.opaques.insert(od, info);
+        }
         if def.self_param.is_some() && self_ty.is_none() {
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
         }

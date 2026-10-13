@@ -12,6 +12,7 @@ pub mod iter;
 pub mod method;
 pub mod object;
 pub mod obligations;
+pub mod opaque;
 pub mod picks;
 pub mod stdtypes;
 pub mod variance;
@@ -708,6 +709,9 @@ pub struct Checked<'g> {
     /// run round takes them all; `Obligations::work`). A work count for
     /// tests that guard against selection blow-ups.
     pub queue_work: usize,
+    /// The hidden type of each `impl Trait` this body defines
+    /// (`check::opaque`), by opaque def.
+    pub opaque_hidden: Vec<(DefId, Ty)>,
 }
 
 impl Checked<'_> {
@@ -830,6 +834,11 @@ struct Ctx<'p, 'a> {
     /// Return types of the closure bodies being checked, innermost last:
     /// `return` inside a closure returns from the closure.
     closure_rets: Vec<Ty>,
+    /// The return type this body checks against (`defining_ret`).
+    fn_ret: Ty,
+    /// This body's own `impl Trait` returns: (opaque def, its args, the
+    /// variable standing for the hidden type).
+    own_opaques: Vec<(DefId, ArgsId, Ty)>,
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
     /// The closure-argument type vars of iterator methods (`iter.rs`
@@ -978,6 +987,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             poisoned: false,
             annotations: Vec::new(),
             queue_work: 0,
+            opaque_hidden: Vec::new(),
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
@@ -1011,6 +1021,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         next_const_id: generics::INFER_MARKER_BASE,
         closures: Vec::new(),
         closure_rets: Vec::new(),
+        fn_ret: f.ret,
+        own_opaques: Vec::new(),
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
         open_binops: Vec::new(),
@@ -1147,16 +1159,22 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
     }
     // A declaration without a body (trait or foreign fn shape) has nothing
     // to check; the parser does not build those today.
+    cx.fn_ret = cx.defining_ret();
+    let ret_span = def.ret.map_or(def.name_span, |t| p.ast.ty_span(t));
     if let Some(body) = def.body {
-        let body_ty = cx.block(body, Some(f.ret));
+        let fn_ret = cx.fn_ret;
+        let body_ty = cx.block(body, Some(fn_ret));
         let body_span = p.ast.block(body).span;
         if let Some(tail) = p.ast.block(body).tail {
-            cx.coerce_expr(tail, body_ty, f.ret);
+            cx.coerce_expr(tail, body_ty, fn_ret);
         } else {
-            cx.coerce_at(body_ty, f.ret, body_span, None);
+            cx.coerce_at(body_ty, fn_ret, body_span, None);
         }
     }
+    cx.push_opaque_bounds(ret_span);
     cx.finish();
+    cx.finish_opaques(ret_span);
+    cx.reject_opaque_uses();
     let Ctx { out, tys, errs, obl, .. } = cx;
     let mut out = out;
     out.tys = tys;
@@ -1647,7 +1665,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else {
                     let f = p.local_def(def.hash)?;
                     match p.sig_of(&mut self.out.reads, def) {
-                        SigOf::Fn(info) => Some((info.params.clone(), info.ret)),
+                        SigOf::Fn(info) => Some((info.params.clone(), p.ret_view(f))),
                         _ => {
                             let _ = f;
                             None
@@ -2808,6 +2826,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let (a, b) = (self.resolve(a), self.resolve(b));
         if a == b {
             return true;
+        }
+        // Inside its defining body an `impl Trait` is its hidden type (a
+        // recursive call returns it too), as in rustc.
+        if !self.own_opaques.is_empty() {
+            let (ma, mb) = (self.map_own_opaque(a), self.map_own_opaque(b));
+            if ma != a || mb != b {
+                return self.unify(ma, mb);
+            }
         }
         // A projection that normalizes now unifies through its
         // normal form (section 2.5). Only when its args hold no
@@ -4637,7 +4663,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 NEVER
             }
             Expr::Return(val) => {
-                let ret = self.closure_rets.last().copied().unwrap_or(self.f.ret);
+                let ret = self.closure_rets.last().copied().unwrap_or(self.fn_ret);
                 match val {
                     Some(v) => {
                         self.expect_expr(*v, ret);
@@ -4924,7 +4950,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let it0 = self.expr(inner, None);
         self.run_obligations(false);
         let it = self.resolve(it0);
-        let ret = self.closure_rets.last().copied().unwrap_or(self.f.ret);
+        let ret = self.closure_rets.last().copied().unwrap_or(self.fn_ret);
         let ret = self.resolve(ret);
         let general_var = |cx: &Self, t: Ty| matches!(cx.tys.kind(t), TyKind::Infer(v) if !v.is_int() && !v.is_float());
         if let Some(elem) = self.tys.option_elem(it) {
@@ -7034,7 +7060,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.check_dyn_method_vis(f, span);
             let (params, ret) = {
                 let info = p.fn_info(f);
-                (info.params.clone(), info.ret)
+                (info.params.clone(), p.ret_view(f))
             };
             self.set_res(e, Res::Fn(f));
             self.check_args(&params, args, span);
@@ -7480,7 +7506,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return self.normalize_here(ret);
                 }
                 let (params, ret) = match p.sig_of(&mut self.out.reads, p.def_id(f)) {
-                    SigOf::Fn(info) => (info.params.clone(), info.ret),
+                    SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
                     _ => return ERROR,
                 };
                 self.check_args(&params, args, span);
@@ -8267,7 +8293,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 let probe = method::RcvProbe::at(self, base, cform);
                 let (params, ret) = match p.sig_of(&mut self.out.reads, c.def) {
-                    SigOf::Fn(info) => (info.params.clone(), info.ret),
+                    SigOf::Fn(info) => (info.params.clone(), p.local_def(c.def.hash).map_or(info.ret, |f| p.ret_view(f))),
                     _ => return ERROR,
                 };
                 let snap_vars = self.snapshot_vars();
@@ -10015,7 +10041,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         )?;
         let Some(Some(tmpl)) = p.gx.fn_templates.get(local.0 as usize).cloned() else {
             let info = p.fn_info(local);
-            return Some((local, info.params.clone(), info.ret));
+            return Some((local, info.params.clone(), p.ret_view(local)));
         };
         // Prefix: impl args for an impl method, trait ref args
         // for a trait default (its template generics are the

@@ -2664,6 +2664,22 @@ pub struct ClosureEntry {
     pub output_region: Option<Ty>,
 }
 
+/// One return-position `impl Trait` (ARCH 2.11): the fn that defines it
+/// and its written bounds, over the fn's params with the opaque itself as
+/// one more param (`Param(n)` for a fn with `n` params). Callers see only
+/// these bounds; the defining body gives the hidden type (`check::opaque`).
+#[derive(Clone, Debug)]
+pub struct OpaqueInfo {
+    pub owner: DefId,
+    pub bounds: Vec<Predicate>,
+    pub span: Span,
+}
+
+/// The def of the return-position `impl Trait` of one fn.
+pub fn opaque_def(owner: DefId) -> DefId {
+    DefId { krate: owner.krate, hash: crate::def::child_hash(owner.hash, crate::def::DefKind::Assoc, "{opaque}", 0) }
+}
+
 /// A template's capture analysis without types: (root local,
 /// projections, mode) per capture, in capture order.
 pub type CaptureShape = (u32, Vec<crate::ir::Proj>, crate::check::closure::CaptureMode);
@@ -2836,6 +2852,12 @@ pub struct GenTables<'a> {
     /// def: the finish-side WF check proves them, and the driver folds
     /// them into the def's `Sig` fingerprint.
     pub param_defaults: FxMap<DefId, Vec<Option<GenericArg>>>,
+    /// Return-position `impl Trait` types by opaque def (ARCH 2.11).
+    pub opaques: FxMap<DefId, OpaqueInfo>,
+    /// The return type callers check against, for a plain fn whose
+    /// `FnInfo::ret` was revealed to its hidden type for codegen
+    /// (`check::opaque::reveal_plain`): the opaque type itself.
+    pub opaque_ret_of: FxMap<LocalDefId, Ty>,
 }
 
 impl Default for GenTables<'_> {
@@ -2896,6 +2918,8 @@ impl Default for GenTables<'_> {
             adt_created: Vec::new(),
             item_index: FxMap::default(),
             param_defaults: FxMap::default(),
+            opaques: FxMap::default(),
+            opaque_ret_of: FxMap::default(),
         }
     }
 }
@@ -3079,6 +3103,7 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
 /// (params with self first, ret, ret_borrows_from, generics, scope,
 /// region signature for the borrow checker).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn resolve_fn_sig(
     ast: &Ast,
     interner: &Interner,
@@ -3089,8 +3114,9 @@ pub fn resolve_fn_sig(
     mut generics: Generics,
     scope: &Scope,
     self_ty: Option<Ty>,
+    owner: Option<DefId>,
     errs: &mut Vec<Diag>,
-) -> (Vec<Ty>, Ty, Option<usize>, Generics, Scope, Option<crate::borrowck::RegionSig>) {
+) -> (Vec<Ty>, Ty, Option<usize>, Generics, Scope, Option<crate::borrowck::RegionSig>, Option<(DefId, OpaqueInfo)>) {
     let mut scope = scope.clone();
     if scope.self_ty.is_none() {
         scope.self_ty = self_ty;
@@ -3155,9 +3181,58 @@ pub fn resolve_fn_sig(
             }
         }
     }
-    let ret = match def.ret {
-        None => UNIT,
-        Some(t) => resolve_scoped(ast, interner, known, cx, tys, t, &scope).unwrap_or_else(|d| {
+    // A return-position `impl Trait` (ARCH 2.11) is an opaque type over
+    // every param in scope (edition 2024 captures them all). Inside a
+    // trait (no owner here) it is not supported yet.
+    let mut opaque: Option<(DefId, OpaqueInfo)> = None;
+    let ret = match (def.ret, owner) {
+        (None, _) => UNIT,
+        (Some(t), owner) if matches!(ast.ty(t), TyExpr::ImplTrait { .. }) => {
+            let TyExpr::ImplTrait { bounds } = ast.ty(t) else { unreachable!() };
+            match owner {
+                None => {
+                    errs.push(not_yet("L0602", ast.ty_span(t), "`impl Trait` in a trait method's return type"));
+                    ERROR
+                }
+                Some(owner) => {
+                    let od = opaque_def(owner);
+                    let args: Vec<GenericArg> = generics
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, prm)| match prm.kind {
+                            ParamKind::Const(_) => GenericArg::Const(tys.intern_const(ConstKind::Param(i as u32))),
+                            _ => GenericArg::Ty(tys.intern(TyKind::Param(ParamId(i as u32)))),
+                        })
+                        .collect();
+                    let args = tys.intern_args(&args);
+                    let oty = tys.intern(TyKind::Opaque(od, args));
+                    // The bounds' Self is one more param after the fn's
+                    // own, so a use substitutes `args ++ [self]`.
+                    let self_param = tys.intern(TyKind::Param(ParamId(generics.params.len() as u32)));
+                    let mut preds: Vec<Predicate> = Vec::new();
+                    let mut relaxed: Vec<u32> = Vec::new();
+                    for b in bounds {
+                        bound_predicates(ast, interner, known, cx, tys, &scope, self_param, b, &mut preds, &mut relaxed, errs);
+                    }
+                    let span = ast.ty_span(t);
+                    if !relaxed.is_empty() {
+                        errs.push(not_yet("L0602", span, "`?Sized` on an `impl Trait` return type"));
+                    }
+                    if !preds.iter().any(|pr| matches!(pr, Predicate::Trait(_))) {
+                        errs.push(Diag::new(
+                            "L0110",
+                            span,
+                            "at least one trait must be specified in an `impl Trait` type",
+                            "Write the trait the returned value implements, such as `impl Iterator<Item = u8>`.",
+                        ));
+                    }
+                    opaque = Some((od, OpaqueInfo { owner, bounds: preds, span }));
+                    oty
+                }
+            }
+        }
+        (Some(t), _) => resolve_scoped(ast, interner, known, cx, tys, t, &scope).unwrap_or_else(|d| {
             errs.push(d);
             ERROR
         }),
@@ -3186,7 +3261,7 @@ pub fn resolve_fn_sig(
         }
     }
     let region_sig = region_sig(ast, interner, known, tys, cx, def, &scope, self_ty, &params, errs);
-    (params, ret, ret_borrows_from, generics, scope, region_sig)
+    (params, ret, ret_borrows_from, generics, scope, region_sig, opaque)
 }
 
 /// The region signature of one fn (W-BORROW, ARCH 5.2): its params and
@@ -3524,9 +3599,9 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
-            let (params, ret, ret_borrows_from, combined, mscope, region_sig) = {
+            let (params, ret, ret_borrows_from, combined, mscope, region_sig, _) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, errs)
+                resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
             };
             if let Some(rs) = region_sig {
                 p.regions.trait_methods.insert(method_def, rs);
@@ -4697,7 +4772,7 @@ pub(crate) enum OwnedArg {
 /// holds an inference variable or the error type (a variable the
 /// zonk could not resolve): such a type names no instance, and the
 /// body that made it has an error report of its own.
-fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
+pub(crate) fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
     Some(match src.kind(t) {
         TyKind::Infer(_) | TyKind::Error => return None,
         TyKind::Ref(r, m, e) => OwnedTy::Ref(r, m, Box::new(snapshot_ty(src, e)?)),
@@ -4762,7 +4837,7 @@ fn snapshot_arg(src: &dyn TyIntern, g: GenericArg) -> Option<OwnedArg> {
     })
 }
 
-fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
+pub(crate) fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
     match t {
         OwnedTy::Leaf(kind) => p.tys.intern(*kind),
         OwnedTy::Ref(r, m, e) => {
@@ -6799,8 +6874,10 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
         ));
     }
     // Mono runs last: it checks bodies against the finished
-    // tables and appends every reachable instance.
+    // tables and appends every reachable instance. Plain fns that
+    // return `impl Trait` get their hidden types first.
     if errs.is_empty() {
+        crate::check::opaque::reveal_plain(p);
         errs.extend(materialize(p));
     }
 }

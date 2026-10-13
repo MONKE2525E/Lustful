@@ -671,7 +671,7 @@ pub(super) fn trait_probe_for(
                     // A plain (non-generic) impl method.
                     let (params, ret) = {
                         let info = p.fn_info(local);
-                        (info.params.clone(), info.ret)
+                        (info.params.clone(), p.ret_view(local))
                     };
                     let want_recv = params[0];
                     if !cx.unify(want_recv, probe.recv_ty) {
@@ -854,7 +854,7 @@ pub(super) fn plain_inherent_probe(
             continue;
         }
         let (params, ret) = match p.sig_of(&mut cx.out.reads, c.def) {
-            SigOf::Fn(info) => (info.params.clone(), info.ret),
+            SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
             _ => continue,
         };
         // The candidate set is keyed by the reference-peeled head
@@ -960,7 +960,7 @@ pub(super) fn dyn_probe(
         cx.check_dyn_method_vis(f, name_span);
         let (params, ret) = {
             let info = p.fn_info(f);
-            (info.params.clone(), info.ret)
+            (info.params.clone(), p.ret_view(f))
         };
         cx.set_res(e, Res::Method { f, derefs, autoref: probe.autoref });
         cx.check_args(&params[1.min(params.len())..], args, name_span);
