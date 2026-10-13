@@ -34,6 +34,10 @@
 #      generic template slots have the same instance content, but each
 #      registers under its own unit number; a restarted daemon must
 #      not serve one unit the other's disk object.
+#  11. panic positions in reused bodies: an edit that only moves text
+#      (spaces inside a body, comment lines above a fn) keeps a warm
+#      build's panic line and column equal to a cold build's, on the
+#      single-file and the multi-file path.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -411,6 +415,40 @@ def case_empty_units_restart():
     d.kill()
 
 
+def case_positions():
+    # 11. Body hashes cover each fn's own text, not only its tokens.
+    work = tempfile.mkdtemp(prefix="lust-driver-positions-")
+    d = Daemon(work)
+    main_rs = os.path.join(work, "main.rs")
+    a_rs = os.path.join(work, "a.rs")
+    single = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    open(single, "w").write("fn other() -> u8 {\n    250\n}\n\nfn main() {\n    let a = other();\n    let r = a + 9;\n    println!(\"{}\", r);\n}\n")
+    open(main_rs, "w").write("mod a;\nfn main() {\n    println!(\"{}\", a::f(250));\n}\n")
+    open(a_rs, "w").write("pub fn f(a: u8) -> u8 {\n    let r = a + 9;\n    r\n}\n")
+
+    def edit(path, old, new):
+        text = open(path).read()
+        assert old in text, old
+        open(path, "w").write(text.replace(old, new, 1))
+
+    def cold(src):
+        env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
+        cout = os.path.join(work, "xc")
+        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
+        return subprocess.run([cout], capture_output=True, text=True).stderr
+
+    d.start()
+    for src, path, old, new in [(single, single, "    let r = a + 9;", "    let r =     a + 9;"),
+                                (single, single, "fn other() -> u8 {", "// one\n\nfn other() -> u8 {"),
+                                (main_rs, a_rs, "    let r = a + 9;", "    let r =   a + 9;")]:
+        d.build(src, out)
+        edit(path, old, new)
+        _, prog = d.build(src, out)
+        check(f"positions after {new.strip()!r}: warm panic equals cold", prog.stderr == cold(src), prog.stderr)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -421,6 +459,7 @@ def main():
     case_compaction_reemit()
     case_restart_add_file()
     case_empty_units_restart()
+    case_positions()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

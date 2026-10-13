@@ -157,6 +157,62 @@ fn generic_work(p: &collect::Program) -> (usize, usize) {
     (p.gx.mono_counts.0, p.gx.fn_class.iter().filter(|c| matches!(c, FnClass::Plain | FnClass::Instance)).count())
 }
 
+/// Folds each fn's own source text, from the start of its first line
+/// to the end of its body, into its scan body hash. The token hash
+/// misses whitespace and comment edits that move a panic site's line or
+/// column inside the body, and a reused body's C embeds those positions
+/// (relative to its first line). `src` is the text the tokens index.
+fn fold_fn_text(sc: &mut scan::ChunkScan, lexed: &lexer::Lexed, src: &str) {
+    for f in &mut sc.fns {
+        let Some(last) = f.body.end.checked_sub(1).and_then(|k| lexed.tokens.get(k)) else { continue };
+        let (lo, hi) = (f.fn_offset as usize, last.span.hi as usize);
+        if lo > hi || hi > src.len() || !src.is_char_boundary(lo) || !src.is_char_boundary(hi) {
+            continue;
+        }
+        let start = src[..lo].rfind('\n').map_or(0, |i| i + 1);
+        let mut h = crate::intern::FxHasher::default();
+        std::hash::Hash::hash(&f.body_hash, &mut h);
+        std::hash::Hash::hash(&src.as_bytes()[start..hi], &mut h);
+        f.body_hash = std::hash::Hasher::finish(&h);
+    }
+}
+
+/// The fn at one `fn_locations` entry.
+fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::ast::FnDef {
+    match (item != usize::MAX, sub) {
+        (false, Some(k)) => match &ast.stmt_items[k].kind {
+            ItemKind::Fn(d) => d,
+            _ => unreachable!("fn_loc out of date"),
+        },
+        _ => match (&ast.items[item].kind, sub) {
+            (ItemKind::Fn(d), None) => d,
+            (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
+            _ => unreachable!("fn_loc out of date"),
+        },
+    }
+}
+
+/// `fold_fn_text` for a resolver-path fn: `hash` folded with the fn's
+/// text from the start of its name's line to the end of its body, and
+/// with the distance from its base line (`line`, the line of its `fn`
+/// keyword) to its name's line. A fn with no body or no kept file text
+/// keeps `hash` as is.
+fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, hash: u64) -> u64 {
+    let Some(body) = def.body else { return hash };
+    let (head, end) = (def.name_span, ast.blocks[body.0 as usize].span);
+    let Some(text) = map.text(head.file) else { return hash };
+    let (lo, hi) = (head.lo as usize, end.hi as usize);
+    if end.file != head.file || lo > hi || hi > text.len() || !text.is_char_boundary(lo) || !text.is_char_boundary(hi) {
+        return hash;
+    }
+    let start = text[..lo].rfind('\n').map_or(0, |i| i + 1);
+    let mut h = crate::intern::FxHasher::default();
+    std::hash::Hash::hash(&hash, &mut h);
+    std::hash::Hash::hash(&map.line_col(head).0.wrapping_sub(line), &mut h);
+    std::hash::Hash::hash(&text.as_bytes()[start..hi], &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
 /// Unique temp file sequence for base-dir writes in this process. Several
 /// sessions here share one base dir (the warm session and guard workers,
 /// on several threads in one daemon), so a pid alone does not make a
@@ -1424,7 +1480,15 @@ fn resolved_setup(
         front.env_hash = None;
         return Err(Response { stderr: "error: internal: resolver function count mismatch; run again\n".into(), code: 3, ..Default::default() });
     }
-    let body_hashes: Vec<u64> = scans.bodies.iter().map(|b| b.0).collect();
+    // Each fn's own text joins its structural body hash, for the
+    // same reason as `fold_fn_text` on the chunk path: the structural
+    // hash has no positions, and a reused body's C embeds them.
+    let body_hashes: Vec<u64> = fn_locations(&front.ast)
+        .iter()
+        .zip(&scans.bodies)
+        .zip(&fn_lines)
+        .map(|((&(item, sub), b), &line)| fn_text_hash(&front.ast, &map, fn_def_at(&front.ast, item, sub), line, b.0))
+        .collect();
     let mut item_scans = scans.items;
     item_scans.push(scan::ItemScan { hash: structure_hash, fn_name: None });
     t.lap("ast scan");
@@ -1750,7 +1814,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let (a, b) = ranges[i];
         lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)).map(
             |(l, deps)| {
-                let sc = scan::scan(&l);
+                let mut sc = scan::scan(&l);
+                fold_fn_text(&mut sc, &l, &src);
                 (l, sc, deps)
             },
         )
@@ -1766,7 +1831,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok((whole, deps)) => {
-                let sc = scan::scan(&whole);
+                let mut sc = scan::scan(&whole);
+                fold_fn_text(&mut sc, &whole, &src);
                 front.chunks =
                     vec![Chunk { start: 0, text: src.clone(), lexed: whole, lexed_start: 0, scan: sc, items: None, expand_deps: deps }];
             }
