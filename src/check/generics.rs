@@ -3412,7 +3412,15 @@ fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
         TyKind::Dyn(b, r) => {
             let bounds = src.dyn_bounds(b).clone();
             let principal = match bounds.principal {
-                Some(pr) => Some((pr.value.def, snapshot_args(src, pr.value.args)?)),
+                // Slot 0 is the erased Self (`DYN_SELF`, the error type by
+                // design), kept as is: only the args after it must be known.
+                Some(pr) => {
+                    let mut args = vec![OwnedArg::Ty(OwnedTy::Leaf(TyKind::Error))];
+                    for g in src.args(pr.value.args)[1..].to_vec() {
+                        args.push(snapshot_arg(src, g)?);
+                    }
+                    Some((pr.value.def, args))
+                }
                 None => None,
             };
             OwnedTy::Dyn(principal, bounds.auto, r)
@@ -3422,18 +3430,18 @@ fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
 }
 
 fn snapshot_args(src: &dyn TyIntern, a: ArgsId) -> Option<Vec<OwnedArg>> {
-    let mut out = Vec::new();
-    for g in src.args(a).to_vec() {
-        out.push(match g {
-            GenericArg::Ty(e) => OwnedArg::Ty(snapshot_ty(src, e)?),
-            GenericArg::Const(c) => match src.const_kind(c) {
-                ConstKind::Infer(_) => return None,
-                k => OwnedArg::Const(k),
-            },
-            GenericArg::Lifetime(r) => OwnedArg::Lifetime(r),
-        });
-    }
-    Some(out)
+    src.args(a).to_vec().into_iter().map(|g| snapshot_arg(src, g)).collect()
+}
+
+fn snapshot_arg(src: &dyn TyIntern, g: GenericArg) -> Option<OwnedArg> {
+    Some(match g {
+        GenericArg::Ty(e) => OwnedArg::Ty(snapshot_ty(src, e)?),
+        GenericArg::Const(c) => match src.const_kind(c) {
+            ConstKind::Infer(_) => return None,
+            k => OwnedArg::Const(k),
+        },
+        GenericArg::Lifetime(r) => OwnedArg::Lifetime(r),
+    })
 }
 
 fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
