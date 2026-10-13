@@ -1177,6 +1177,167 @@ int lust_is_space(uint32_t c) LUST_BODY({
            c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 })
 
+lust_str lust_str_trim_start(lust_str s) LUST_BODY({
+    uint64_t a = 0;
+    while (a < s.len) { uint64_t j = a; if (!lust_is_space(lust_utf8_next(s.ptr, &j))) break; a = j; }
+    lust_str r; r.ptr = s.ptr + a; r.len = s.len - a;
+    return r;
+})
+
+lust_str lust_str_trim_end(lust_str s) LUST_BODY({
+    uint64_t b = s.len;
+    while (b > 0) {
+        uint64_t k = b - 1;
+        while (k > 0 && (s.ptr[k] & 0xC0) == 0x80) k--;
+        uint64_t j = k;
+        if (!lust_is_space(lust_utf8_next(s.ptr, &j))) break;
+        b = k;
+    }
+    lust_str r; r.ptr = s.ptr; r.len = b;
+    return r;
+})
+
+/* The one-byte-pattern exact-capacity path of Rust's replace,
+   the general push-in-pieces path, and the empty-pattern
+   boundary inserts, with capacities as Rust leaves them. */
+lust_String lust_str_replace(lust_str s, lust_str from, lust_str to) LUST_BODY({
+    if (from.len == 1) {
+        uint64_t count = 0;
+        for (uint64_t i = 0; i < s.len; i++) if (s.ptr[i] == from.ptr[0]) count++;
+        if (!count) return lust_string_from(s);
+        uint64_t final_len = s.len - count + count * to.len;
+        lust_String r = lust_string_with_capacity(final_len);
+        for (uint64_t i = 0; i < s.len; i++) {
+            if (s.ptr[i] == from.ptr[0]) { memcpy(r.ptr + r.len, to.ptr, to.len); r.len += to.len; }
+            else r.ptr[r.len++] = s.ptr[i];
+        }
+        return r;
+    }
+    /* First match, or an exact copy when there is none. */
+    int64_t first = -1;
+    if (from.len == 0) first = 0;
+    else for (uint64_t i = 0; i + from.len <= s.len; i++)
+        if (s.ptr[i] == from.ptr[0] && memcmp(s.ptr + i, from.ptr, from.len) == 0) { first = (int64_t)i; break; }
+    if (first < 0) return lust_string_from(s);
+    lust_String r = lust_string_new();
+    uint64_t last = 0;
+    if (from.len == 0) {
+        /* Insert at every char boundary, both ends included. */
+        lust_string_push_str(&r, to);
+        uint64_t i = 0;
+        while (i < s.len) {
+            uint64_t j = i;
+            lust_utf8_next(s.ptr, &j);
+            lust_string_push_bytes(&r, s.ptr + i, j - i);
+            lust_string_push_str(&r, to);
+            i = j;
+        }
+        return r;
+    }
+    for (uint64_t i = (uint64_t)first; i + from.len <= s.len;) {
+        if (s.ptr[i] == from.ptr[0] && memcmp(s.ptr + i, from.ptr, from.len) == 0) {
+            lust_string_push_bytes(&r, s.ptr + last, i - last);
+            lust_string_push_str(&r, to);
+            i += from.len;
+            last = i;
+        } else i++;
+    }
+    lust_string_push_bytes(&r, s.ptr + last, s.len - last);
+    return r;
+})
+
+lust_String lust_str_repeat(lust_str s, uint64_t n, lust_loc loc) LUST_BODY({
+    if (s.len && n > (uint64_t)9223372036854775807ull / s.len) lust_panic_cstr("capacity overflow", loc);
+    uint64_t total = s.len * n;
+    lust_String r = lust_string_with_capacity(total);
+    for (uint64_t i = 0; i < n; i++) { memcpy(r.ptr + r.len, s.ptr, s.len); r.len += s.len; }
+    return r;
+})
+
+void lust_string_shrink_to(lust_String *s, uint64_t min_cap) LUST_BODY({
+    uint64_t target = min_cap > s->len ? min_cap : s->len;
+    if (s->cap <= target) return;
+    if (!target) {
+        free(s->ptr);
+        s->ptr = (uint8_t *)(uintptr_t)1;
+        s->cap = 0;
+        return;
+    }
+    s->ptr = lust_realloc(s->ptr, s->cap, 1, target);
+    s->cap = target;
+})
+
+/* The byte offset where the char at byte `end` starts searching
+   backward; `end` is one past that char and must be > 0. */
+static uint64_t lust_str_prev_start(const uint8_t *p, uint64_t end) {
+    uint64_t k = end - 1;
+    while (k > 0 && (p[k] & 0xC0) == 0x80) k--;
+    return k;
+}
+
+uint32_t lust_string_pop(lust_String *s) LUST_BODY({
+    uint64_t k = lust_str_prev_start(s->ptr, s->len);
+    uint64_t j = k;
+    uint32_t c = lust_utf8_next(s->ptr, &j);
+    s->len = k;
+    return c;
+})
+
+static void lust_string_check_boundary(lust_String *s, uint64_t idx, lust_loc loc) {
+    if (idx > s->len) lust_panic_cstr("byte index out of bounds", loc);
+    if (idx < s->len && (s->ptr[idx] & 0xC0) == 0x80) lust_panic_cstr("byte index is not a char boundary", loc);
+}
+
+uint32_t lust_string_remove(lust_String *s, uint64_t idx, lust_loc loc) LUST_BODY({
+    if (idx >= s->len) lust_panic_cstr("byte index out of bounds", loc);
+    lust_string_check_boundary(s, idx, loc);
+    uint64_t j = idx;
+    uint32_t c = lust_utf8_next(s->ptr, &j);
+    memmove(s->ptr + idx, s->ptr + j, s->len - j);
+    s->len -= j - idx;
+    return c;
+})
+
+void lust_string_insert_bytes(lust_String *s, uint64_t idx, const uint8_t *p, uint64_t n, lust_loc loc) LUST_BODY({
+    lust_string_check_boundary(s, idx, loc);
+    /* Copy the inserted bytes first: they may view this String. */
+    uint8_t small[4];
+    uint8_t *tmp = small;
+    if (n > sizeof small) { tmp = lust_alloc(n, 1); }
+    memcpy(tmp, p, n);
+    lust_string_reserve(s, n);
+    memmove(s->ptr + idx + n, s->ptr + idx, s->len - idx);
+    memcpy(s->ptr + idx, tmp, n);
+    if (tmp != small) free(tmp);
+    s->len += n;
+})
+
+void lust_string_insert_char(lust_String *s, uint64_t idx, uint32_t c, lust_loc loc) LUST_BODY({
+    uint8_t b[4];
+    int n;
+    if (c < 0x80) { b[0] = c; n = 1; }
+    else if (c < 0x800) { b[0] = 0xC0 | (c >> 6); b[1] = 0x80 | (c & 0x3F); n = 2; }
+    else if (c < 0x10000) { b[0] = 0xE0 | (c >> 12); b[1] = 0x80 | ((c >> 6) & 0x3F); b[2] = 0x80 | (c & 0x3F); n = 3; }
+    else { b[0] = 0xF0 | (c >> 18); b[1] = 0x80 | ((c >> 12) & 0x3F); b[2] = 0x80 | ((c >> 6) & 0x3F); b[3] = 0x80 | (c & 0x3F); n = 4; }
+    lust_string_insert_bytes(s, idx, b, (uint64_t)n, loc);
+})
+
+void lust_string_truncate(lust_String *s, uint64_t n, lust_loc loc) LUST_BODY({
+    if (n < s->len) {
+        lust_string_check_boundary(s, n, loc);
+        s->len = n;
+    }
+})
+
+lust_String lust_string_split_off(lust_String *s, uint64_t at, lust_loc loc) LUST_BODY({
+    lust_string_check_boundary(s, at, loc);
+    lust_String r = lust_string_with_capacity(s->len - at);
+    memcpy(r.ptr, s->ptr + at, s->len - at);
+    r.len = s->len - at;
+    s->len = at;
+    return r;
+})
+
 lust_str lust_str_trim(lust_str s) LUST_BODY({
     uint64_t a = 0, b = s.len;
     while (a < b) { uint64_t j = a; if (!lust_is_space(lust_utf8_next(s.ptr, &j))) break; a = j; }

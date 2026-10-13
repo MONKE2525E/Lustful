@@ -409,6 +409,17 @@ known_syms!(
     as_mut_slice,
     to_vec,
     drop,
+    insert_str,
+    as_bytes,
+    into_bytes,
+    strip_prefix,
+    strip_suffix,
+    replace,
+    repeat,
+    trim_start,
+    trim_end,
+    is_char_boundary,
+    from_utf8,
 );
 
 impl Known {

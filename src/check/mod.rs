@@ -196,6 +196,27 @@ pub enum Builtin {
     SliceToVec,
     VecFrom,
     MemDrop,
+    StringCapacity,
+    StringReserve,
+    StringReserveExact,
+    StringShrinkToFit,
+    StringShrinkTo,
+    StringPop,
+    StringRemove,
+    StringInsert,
+    StringInsertStr,
+    StringTruncate,
+    StringClear,
+    StringSplitOff,
+    StringAsBytes,
+    StringIntoBytes,
+    StrStripPrefix,
+    StrStripSuffix,
+    StrTrimStart,
+    StrTrimEnd,
+    StrReplace,
+    StrRepeat,
+    StrIsCharBoundary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5011,7 +5032,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Res::Builtin(b) => {
                 let (params, ret): (Vec<Ty>, Ty) = match b {
                     Builtin::StringNew => (vec![], STRING),
-                    Builtin::StringFrom => (vec![REF_STR], STRING),
+                    Builtin::StringFrom => {
+                        // The forms lust takes: `&str` (and `&String`
+                        // through deref), a String by value, and a
+                        // char. Picked from the argument's type;
+                        // `check_args` then checks it as itself.
+                        let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
+                        let at = self.resolve(at);
+                        if at == CHAR || at == STRING {
+                            (vec![at], STRING)
+                        } else {
+                            (vec![REF_STR], STRING)
+                        }
+                    }
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
                     Builtin::EnvArgs => (vec![], ARGS),
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
@@ -5402,6 +5435,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::StringAsStr, Autoref::Ref, vec![], REF_STR))
                 } else if name == k.to_string {
                     Some((B::ToString, Autoref::Ref, vec![], STRING))
+                } else if name == k.capacity {
+                    Some((B::StringCapacity, Autoref::Ref, vec![], USIZE))
+                } else if name == k.reserve {
+                    Some((B::StringReserve, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.reserve_exact {
+                    Some((B::StringReserveExact, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.shrink_to_fit {
+                    Some((B::StringShrinkToFit, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.shrink_to {
+                    Some((B::StringShrinkTo, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.pop {
+                    let opt = self.tys.mk_option(CHAR);
+                    Some((B::StringPop, Autoref::RefMut, vec![], opt))
+                } else if name == k.remove {
+                    Some((B::StringRemove, Autoref::RefMut, vec![USIZE], CHAR))
+                } else if name == k.insert {
+                    Some((B::StringInsert, Autoref::RefMut, vec![USIZE, CHAR], UNIT))
+                } else if name == k.insert_str {
+                    Some((B::StringInsertStr, Autoref::RefMut, vec![USIZE, REF_STR], UNIT))
+                } else if name == k.truncate {
+                    Some((B::StringTruncate, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.clear {
+                    Some((B::StringClear, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.split_off {
+                    Some((B::StringSplitOff, Autoref::RefMut, vec![USIZE], STRING))
+                } else if name == k.as_bytes {
+                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+                    let r = self.tys.mk_ref(false, sl);
+                    Some((B::StringAsBytes, Autoref::Ref, vec![], r))
+                } else if name == k.into_bytes {
+                    let v = self.tys.mk_vec(int(IntTy::U8));
+                    Some((B::StringIntoBytes, Autoref::None, vec![], v))
                 } else {
                     // String derefs to str, so it has every str method.
                     self.str_method(name)
@@ -6019,6 +6084,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use Builtin as B;
         let k = self.p.known;
         let chars = CHARS;
+        let opt_str = self.tys.mk_option(REF_STR);
         let table = [
             (k.contains, B::StrContains, vec![REF_STR], BOOL),
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),
@@ -6027,6 +6093,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (k.to_uppercase, B::StrToUppercase, vec![], STRING),
             (k.to_lowercase, B::StrToLowercase, vec![], STRING),
             (k.chars, B::StrChars, vec![], chars),
+            (k.strip_prefix, B::StrStripPrefix, vec![REF_STR], opt_str),
+            (k.strip_suffix, B::StrStripSuffix, vec![REF_STR], opt_str),
+            (k.trim_start, B::StrTrimStart, vec![], REF_STR),
+            (k.trim_end, B::StrTrimEnd, vec![], REF_STR),
+            (k.replace, B::StrReplace, vec![REF_STR, REF_STR], STRING),
+            (k.repeat, B::StrRepeat, vec![USIZE], STRING),
+            (k.is_char_boundary, B::StrIsCharBoundary, vec![USIZE], BOOL),
         ];
         table.into_iter().find(|(n, ..)| *n == name).map(|(_, b, params, ret)| (b, Autoref::Ref, params, ret))
     }
@@ -6944,6 +7017,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(is_some) = opt {
             let inner = self.new_var(false);
             let ot = self.tys.mk_option(inner);
+            if std::env::var_os("LUST_DEBUG_PAT").is_some() {
+                eprintln!("PAT opt scrutinee ty={} kind={:?} fn={} params={:?}", self.tn(t), self.tys.kind(t), self.name(self.f.name), self.f.params.iter().map(|&x| self.tn(x)).collect::<Vec<_>>());
+            }
             if !self.unify(ot, t) {
                 self.mismatch(span, t, ot);
                 return;

@@ -2019,7 +2019,20 @@ impl FnGen<'_, '_, '_> {
                 "((lust_Unit){})".into()
             }
             B::StringNew => "lust_string_new()".into(),
-            B::StringFrom => format!("lust_string_from({})", vals[0]),
+            B::StringFrom => match &tys[0] {
+                CTy::Char => {
+                    // Rust allocates exactly the char's UTF-8 length.
+                    let t = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    lust_String {t} = lust_string_with_capacity({0} < 0x80u ? 1 : {0} < 0x800u ? 2 : {0} < 0x10000u ? 3 : 4); lust_string_push_char(&{t}, {0});",
+                        vals[0]
+                    );
+                    t
+                }
+                CTy::String => vals[0].clone(),
+                _ => format!("lust_string_from({})", vals[0]),
+            },
             B::StringWithCapacity => format!("lust_string_with_capacity({})", vals[0]),
             B::VecNew | B::VecWithCapacity => unreachable!("lowered to VecLit"),
             B::EnvArgs => "((lust_Args){ (uint64_t)lust_argc })".into(),
@@ -2056,6 +2069,91 @@ impl FnGen<'_, '_, '_> {
                 "((lust_Unit){})".into()
             }
             B::StringAsStr => format!("lust_string_as_str({})", vals[0]),
+            B::StringCapacity => format!("({})->cap", vals[0]),
+            B::StringReserve | B::StringReserveExact | B::StringShrinkToFit | B::StringShrinkTo => {
+                let vv = &vals[0];
+                let call = match b {
+                    B::StringReserve => format!("lust_string_reserve({vv}, {})", vals[1]),
+                    B::StringReserveExact => format!("lust_string_reserve_exact({vv}, {})", vals[1]),
+                    B::StringShrinkToFit => format!("lust_string_shrink_to({vv}, 0)"),
+                    _ => format!("lust_string_shrink_to({vv}, {})", vals[1]),
+                };
+                let _ = writeln!(self.out, "    {call};");
+                "((lust_Unit){})".into()
+            }
+            B::StringPop => {
+                let t = self.tmp();
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    if ({0}->len) {{ {field} = lust_string_pop({0});{some} }}", vals[0]);
+                t
+            }
+            B::StringRemove => format!("lust_string_remove({}, {}, {loc})", vals[0], vals[1]),
+            B::StringInsert => {
+                let _ = writeln!(self.out, "    lust_string_insert_char({}, {}, {}, {loc});", vals[0], vals[1], vals[2]);
+                "((lust_Unit){})".into()
+            }
+            B::StringInsertStr => {
+                let _ = writeln!(
+                    self.out,
+                    "    lust_string_insert_bytes({}, {}, ({2}).ptr, ({2}).len, {loc});",
+                    vals[0], vals[1], vals[2]
+                );
+                "((lust_Unit){})".into()
+            }
+            B::StringTruncate => {
+                let _ = writeln!(self.out, "    lust_string_truncate({}, {}, {loc});", vals[0], vals[1]);
+                "((lust_Unit){})".into()
+            }
+            B::StringClear => {
+                let _ = writeln!(self.out, "    {}->len = 0;", vals[0]);
+                "((lust_Unit){})".into()
+            }
+            B::StringSplitOff => format!("lust_string_split_off({}, {}, {loc})", vals[0], vals[1]),
+            B::StringAsBytes => {
+                let sl = CTy::Slice(Box::new(CTy::Int(IntTy::U8)));
+                let (st, t) = (ctype(&sl), self.tmp());
+                let _ = writeln!(self.out, "    {st} {t} = {{ {0}->ptr, {0}->len }};", vals[0]);
+                t
+            }
+            B::StringIntoBytes => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    lust_Vec {t} = {{ (void*){0}.ptr, {0}.len, {0}.cap }};", vals[0]);
+                t
+            }
+            B::StrStripPrefix | B::StrStripSuffix => {
+                let a = str_of(&vals[0], &tys[0]);
+                let (sa, sp) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    lust_str {sa} = {a}; lust_str {sp} = {};", vals[1]);
+                let t = self.tmp();
+                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(CTy::Str))));
+                let ot = ctype(&opt);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let (cond, val) = if b == B::StrStripPrefix {
+                    (format!("lust_str_starts_with({sa}, {sp})"), format!("(lust_str){{ {sa}.ptr + {sp}.len, {sa}.len - {sp}.len }}"))
+                } else {
+                    (format!("lust_str_ends_with({sa}, {sp})"), format!("(lust_str){{ {sa}.ptr, {sa}.len - {sp}.len }}"))
+                };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {val};{some} }}");
+                t
+            }
+            B::StrTrimStart => format!("lust_str_trim_start({})", str_of(&vals[0], &tys[0])),
+            B::StrTrimEnd => format!("lust_str_trim_end({})", str_of(&vals[0], &tys[0])),
+            B::StrReplace => format!("lust_str_replace({}, {}, {})", str_of(&vals[0], &tys[0]), vals[1], vals[2]),
+            B::StrRepeat => format!("lust_str_repeat({}, {}, {loc})", str_of(&vals[0], &tys[0]), vals[1]),
+            B::StrIsCharBoundary => {
+                let sa = self.tmp();
+                let a = str_of(&vals[0], &tys[0]);
+                let _ = writeln!(self.out, "    lust_str {sa} = {a};");
+                format!("({0} <= {sa}.len && ({0} == {sa}.len || ({sa}.ptr[{0}] & 0xC0) != 0x80))", vals[1])
+            }
             B::VecPush => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
