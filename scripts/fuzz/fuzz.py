@@ -856,6 +856,56 @@ pub fn value() -> i64 {
 }
 
 
+# multi2: the multi seed plus plain readers in the crate root of a.rs
+# fields, tuple fields, a tuple constructor, and patterns, so visibility
+# pulses reach every member privacy check. Plain multi keeps its seed.
+MULTI2_SEED = dict(MULTI_SEED)
+MULTI2_SEED["a.rs"] = MULTI_SEED["a.rs"] + """
+pub struct Pair(pub i64, pub i64);
+
+pub fn pair() -> Pair {
+    Pair(1, 2)
+}
+
+pub fn origin() -> Point {
+    Point { x: 0, y: 0 }
+}
+"""
+MULTI2_SEED["main.rs"] = MULTI_SEED["main.rs"].replace("fn main() {", """fn reads() -> i64 {
+    let o = a::origin();
+    let a::Pair(l, _) = a::pair();
+    let Point { y, .. } = a::origin();
+    o.x + a::pair().1 + l + y + a::Pair(5, 6).0
+}
+
+fn main() {""", 1).replace('println!("multi {} {} {} {} {} {}", p.sum(),', 'println!("multi {} {} {} {} {} {} {}", reads(), p.sum(),', 1)
+
+# Visibility pulse sites: every written visibility, and the empty one in
+# front of a private item at a line start.
+VIS_PUB = re.compile(r"\bpub(?:\([^)\n]*\))?[ \t]+")
+VIS_PRIVATE_ITEM = re.compile(r"^[ \t]*()(?=(?:const|static|fn|struct|enum|mod|use|trait|type)\b)", re.M)
+VIS_FORMS = ["", "pub ", "pub(crate) ", "pub(super) ", "pub(self) ", "pub(in crate::a) "]
+
+
+def vis_flip(rng, fs):
+    """One visibility edit for the multi crates: a written visibility (on an
+    item, field, tuple field, method, `mod`, or `use`) or a private item's
+    empty one takes another form from VIS_FORMS. Returns (files, op), or
+    (None, op) when the files have no site."""
+    sites = []
+    for rel in sorted(fs):
+        sites += [(rel, m.start(), m.end()) for m in VIS_PUB.finditer(fs[rel])]
+        sites += [(rel, m.start(1), m.end(1)) for m in VIS_PRIVATE_ITEM.finditer(fs[rel])]
+    if not sites:
+        return None, "vis_flip:none"
+    rel, s, e = rng.choice(sites)
+    old = fs[rel][s:e].strip()
+    new = rng.choice([v for v in VIS_FORMS if v.strip() != old])
+    out = dict(fs)
+    out[rel] = fs[rel][:s] + new + fs[rel][e:]
+    return out, f"vis_flip:{rel}:{old or 'private'}->{new.strip() or 'private'}"
+
+
 def cmd_run_multi(a, rename=False):
     """Multi-file mode (W-RESOLVE): the seed crate is a small module tree.
     Each edit applies the single-file edit ops to one random file, or a
@@ -864,15 +914,20 @@ def cmd_run_multi(a, rename=False):
     the fresh-session guard must never fire. Failure pairs are saved as
     one bundle of files per side (replay/shrink stay single-file tools).
     With rename=True (crate multi2), a module rename also fires on a
-    fixed cadence from its own RNG; plain multi keeps its old stream.
+    fixed cadence from its own RNG, and the seed has more readers
+    (MULTI2_SEED); plain multi keeps its old stream. Both run a
+    visibility pulse on a fixed cadence from a third RNG (see the
+    loop): the pulse restores the files, so the stream stays the same.
     """
     rng = random.Random(a.seed)
     frng = random.Random(a.seed ^ 0xFEA7)
+    vrng = random.Random(a.seed ^ 0x715)
+    seed_files = MULTI2_SEED if rename else MULTI_SEED
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
     base = os.path.join(h.work, "multi")
     h.crate = os.path.join(base, "main.rs")
-    files = dict(MULTI_SEED)
+    files = dict(seed_files)
     snapshots = [dict(files)]
     failures = 0
     ops, bad_ops = Counter(), Counter()
@@ -974,7 +1029,7 @@ def cmd_run_multi(a, rename=False):
                 save_bundle(f"crash-{it}", prev, files)
                 print(f"FAIL daemon dead before iter {it} op {op}", flush=True)
                 h.start_daemon()
-                files = dict(MULTI_SEED)
+                files = dict(seed_files)
                 write_all(files)
                 h.run_cmd("check", True)
                 continue
@@ -995,7 +1050,7 @@ def cmd_run_multi(a, rename=False):
                 if why in ("daemon hang", "daemon died"):
                     h.kill_daemon()
                     h.start_daemon()
-                files = dict(MULTI_SEED)
+                files = dict(seed_files)
                 write_all(files)
                 h.run_cmd("check", True)
                 if a.stop_first:
@@ -1020,11 +1075,44 @@ def cmd_run_multi(a, rename=False):
                     if why in ("daemon hang", "daemon died"):
                         h.kill_daemon()
                         h.start_daemon()
-                        files = dict(MULTI_SEED)
+                        files = dict(seed_files)
                         write_all(files)
                         h.run_cmd("check", True)
                     if a.stop_first:
                         break
+            # Visibility pulse: one visibility flips (vis_flip), then the
+            # exact files come back, and both states must get the cold
+            # answer: a narrowed member rejects warm, the widened one
+            # accepts warm, from whatever state the stream reached.
+            if it % 7 == 3:
+                vfiles, vop = vis_flip(vrng, files)
+                ops["vis_flip"] += 1
+                steps = [] if vfiles is None else [(files, vfiles, vop), (vfiles, files, vop + ":back")]
+                for before, state, vtag in steps:
+                    write_all(state)
+                    ok, why, da, co = compare(h, "check", a.strict)
+                    h.wait_guard_idle()
+                    g = h.guard_count()
+                    if g > seen_guard:
+                        save_bundle(f"guard-{it}v", before, state)
+                        print(f"GUARD iter {it} op {vtag}: warm answer differed; bundle guard-{it}v saved", flush=True)
+                        seen_guard = g
+                    if not ok:
+                        failures += 1
+                        bad_ops[why] += 1
+                        save_bundle(f"bad-{it}v", before, state)
+                        print(f"FAIL[{why}] iter {it} op {vtag}\n"
+                              f"  daemon={da[0]} {da[2][:200]!r}\n"
+                              f"  cold  ={co[0] if co else '-'} {(co[2][:200] if co else '')!r}", flush=True)
+                        if why in ("daemon hang", "daemon died"):
+                            h.kill_daemon()
+                            h.start_daemon()
+                        files = dict(seed_files)
+                        write_all(files)
+                        h.run_cmd("check", True)
+                        break
+                if failures and a.stop_first:
+                    break
             if (it + 1) % 250 == 0:
                 print(f"... {it + 1}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
         h.wait_guard_idle()
