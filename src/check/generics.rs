@@ -1958,6 +1958,43 @@ pub fn elaborate_env(tys: &mut impl TyIntern, index: &ImplIndex, written: &[Pred
     crate::traits::solve::elaborate_in(tys, index, written)
 }
 
+/// The env a body is checked under (its `FnScope`): the elaborated
+/// env minus the global predicates (`is_global_pred`). A global
+/// predicate such as `where A: Tr` must hold outright where its item
+/// is written (`check_written_wf`); in the body an impl proves it, as
+/// in rustc, where a global where-bound never beats an impl, guides
+/// inference, or brings its trait into scope. Kept in the env, it
+/// selected as param evidence and sent a concrete call to the trait
+/// method's stub, which has no body.
+pub fn body_env(tys: &mut impl TyIntern, index: &ImplIndex, written: &[Predicate]) -> Vec<Predicate> {
+    let mut env = elaborate_env(tys, index, written);
+    env.retain(|pred| !is_global_pred(tys, pred));
+    env
+}
+
+/// True for rustc's global predicate: not higher-ranked, and no type
+/// or const parameter anywhere in it (args and bindings). Regions do
+/// not count: selection erases them, and the subset has no named
+/// lifetime parameters. Outlives predicates are never global here:
+/// they pick no callee, and region checks read them.
+pub fn is_global_pred(tys: &impl TyIntern, pred: &Predicate) -> bool {
+    let ty_free = |t: Ty| !tys.flags(t).contains_param();
+    let args_free = |a: ArgsId| {
+        tys.args(a).iter().all(|g| match g {
+            GenericArg::Ty(t) => ty_free(*t),
+            GenericArg::Const(c) => !matches!(tys.const_kind(*c), ConstKind::Param(_)),
+            GenericArg::Lifetime(_) => true,
+        })
+    };
+    match pred {
+        Predicate::Trait(b) => {
+            b.count == 0 && args_free(b.value.args) && tys.bindings(b.value.bindings).iter().all(|(_, g)| g.as_ty().is_none_or(ty_free))
+        }
+        Predicate::AssocEq(b) => b.count == 0 && args_free(b.value.trait_args) && ty_free(b.value.ty),
+        Predicate::Outlives(..) | Predicate::TypeOutlives(..) => false,
+    }
+}
+
 /// The associated sources a set of predicates gives a scope: one
 /// per trait predicate, for `Self::Assoc` and `T::Assoc`
 /// resolution in the item's other signatures.
@@ -3115,7 +3152,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             if let Some(rs) = region_sig {
                 p.regions.trait_methods.insert(method_def, rs);
             }
-            let menv = elaborate_env(&mut p.tys, &p.gx.index, &combined.predicates);
+            let menv = body_env(&mut p.tys, &p.gx.index, &combined.predicates);
             p.gx.trait_methods.insert(
                 method_def,
                 TraitMethodTemplate {
@@ -5448,7 +5485,7 @@ pub fn append_trait_default_templates(p: &mut Program) {
                 .collect();
             let args = p.tys.intern_args(&own);
             env.push(Predicate::Trait(Binder::plain(TraitRef { def: td, args, bindings: EMPTY_BINDINGS })));
-            env = elaborate_env(&mut p.tys, &p.gx.index, &env);
+            env = body_env(&mut p.tys, &p.gx.index, &env);
         }
         p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: env.clone() }));
         p.gx.fn_scopes.push(FnScope { env, scope: tmpl.scope.clone() });

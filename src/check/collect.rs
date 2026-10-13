@@ -2243,7 +2243,7 @@ pub fn collect_reuse<'a>(
         if def.self_param.is_some() && self_ty.is_none() {
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
         }
-        let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
+        let env = generics::body_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let is_template = !generics.params.is_empty();
         if is_template {
             p.gx.has_generics = true;
