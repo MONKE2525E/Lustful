@@ -945,6 +945,11 @@ impl FnGen<'_, '_, '_> {
                     e = variant_field(self.p, &t, &e, 1, 0);
                     t = *inner;
                 }
+                (Step::Field(_), CTy::Result(a, b)) => {
+                    let v = variant.take().unwrap_or(0);
+                    e = variant_field(self.p, &t, &e, v as usize, 0);
+                    t = if v == 0 { *a } else { *b };
+                }
                 (Step::Elem(c), CTy::Array(el, _)) => {
                     e = format!("{e}.v[{c}]");
                     t = *el;
@@ -1024,7 +1029,7 @@ impl FnGen<'_, '_, '_> {
         };
         let is_enum = match t {
             CTy::Adt(a) => self.p.adt(*a).is_enum,
-            CTy::Option(_) => true,
+            CTy::Option(_) | CTy::Result(..) => true,
             _ => false,
         };
         match t {
@@ -1080,6 +1085,7 @@ impl FnGen<'_, '_, '_> {
                     CTy::Tuple(es) => es.len(),
                     CTy::Adt(a) => self.p.adt(*a).variants.get(variant.unwrap_or(0)).map_or(0, |v| v.fields.len()),
                     CTy::Option(_) => usize::from(variant == Some(1)),
+                    CTy::Result(..) => usize::from(variant.is_some()),
                     _ => 0,
                 };
                 for f in 0..n {
@@ -4328,6 +4334,7 @@ fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
                 operand_moves(o, out);
             }
         }
+        Rvalue::Res(_, _, o) => operand_moves(o, out),
         Rvalue::Format(parts) => parts_moves(parts, out),
         Rvalue::Ref(..)
         | Rvalue::Discriminant(_)
