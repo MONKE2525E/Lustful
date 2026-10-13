@@ -6714,6 +6714,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `W::<u8>::new()`: type arguments written on the type segment
     /// of a path call fix the Self type of the inherent impl, and so
     /// the impl's parameters in the method's template args.
+    /// In an instance of a generic body, the template's one bound on
+    /// `self_ty` whose trait declares `method`, substituted at the
+    /// instance's args: what a `T::method(..)` call meant in the
+    /// template, where a type param resolves only through its bounds
+    /// (see `instance_bound_arg` for the conversion methods). None
+    /// outside instances, or when no bound or several bounds match.
+    fn instance_bound_ref(&mut self, method: Sym, self_ty: Ty) -> Option<TraitRef> {
+        let p = self.p;
+        let info = p.gx.instances.get(&self.fid)?;
+        let tl = info.template_local?;
+        let env = p.gx.fn_scopes.get(tl.0 as usize)?.env.clone();
+        let args: Vec<GenericArg> = p.tys.args(info.args).to_vec();
+        let self_ty = self.resolve(self_ty);
+        let mut found: Option<TraitRef> = None;
+        for pred in env {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 || p.gx.index.trait_record(b.value.def).and_then(|r| r.method_by_name(method)).is_none() {
+                continue;
+            }
+            let tr = crate::traits::index::subst_trait_ref_pub(&mut self.tys, b.value, &args);
+            if self.tys.args(tr.args).first().and_then(|g| g.as_ty()) != Some(self_ty) {
+                continue;
+            }
+            if found.is_some_and(|f| f != tr) {
+                return None;
+            }
+            found = Some(tr);
+        }
+        found
+    }
+
     fn unify_written_self(&mut self, callee: ExprId, f: LocalDefId, inst_args: &[GenericArg], span: Span) {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return };
@@ -7410,9 +7441,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         .find(|(n, _)| *n == segs[0].name)
                         .map(|&(_, t)| t)
                         .or(if segs[0].name == p.known.self_type { param_self } else { None })
-                    && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
                 {
-                    return t;
+                    // In an instance, the template's bound fixes the trait
+                    // args (`U: From<u8>` at U = u16 calls `<u16 as
+                    // From<u8>>::from`); a builtin Self's own impls can be
+                    // ambiguous (`u16: From<{integer}>`).
+                    let hint = self.instance_bound_ref(segs[1].name, base);
+                    if let Some(t) = self.assoc_call(e, callee, base, hint, segs[1].name, args, span) {
+                        return t;
+                    }
                 }
                 // `Trait::method(self_arg, ..)`: the trait name
                 // heads the path and the first argument is the
