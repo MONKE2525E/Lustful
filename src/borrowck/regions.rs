@@ -1914,8 +1914,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
         let dt = self.place(dest, &mut dv, &mut d);
+        // Free closure arguments first: a closure with no captures has no
+        // creating statement, so its argument vars are made here.
+        if matches!(target, CallTarget::Builtin(_) | CallTarget::Fn(_)) {
+            self.link_closure_args(&avs);
+        }
         // A closure argument that returns borrows: whatever the callee
-        // returns may hold the closure's captured sources (its output).
+        // returns may hold the closure's captured sources and free
+        // argument regions (its output).
         let mut srcs: Vec<u32> = Vec::new();
         for (t, v) in &avs {
             self.closure_sources(*t, v, &mut 0, &mut srcs);
@@ -1935,9 +1941,6 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.call_opaque(&avs, dt, &dv);
             }
             return;
-        }
-        if matches!(target, CallTarget::Builtin(_)) {
-            self.link_closure_args(&avs);
         }
         let callee = match target {
             CallTarget::Fn(f) => Some((f, self.callee(f))),
@@ -2358,6 +2361,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                         if src && let Some(&v) = vars.get(*at + i) {
                             out.push(v);
                         }
+                    }
+                    // Its free argument regions too: the output may
+                    // borrow from an argument (`opt.map(|e| &e.1)`).
+                    if let Some(av) = self.closure_args.get(&def) {
+                        out.extend(av.iter().copied());
                     }
                 }
                 *at += n;

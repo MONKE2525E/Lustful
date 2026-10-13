@@ -812,9 +812,10 @@ struct Ctx<'p, 'a> {
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
     /// The closure-argument type vars of iterator methods (`iter.rs`
-    /// `fn_mut_param`), each with one flag per argument: true when the
-    /// argument is `&item` (W-BORROW: the closure's argument regions are
-    /// the items', free; see `ClosureInfo::free_args`).
+    /// `fn_mut_param`) and of generic calls whose `Fn` bound takes type
+    /// params (`note_closure_bounds`), each with one flag per argument:
+    /// true when its outer reference is higher-ranked (`&item`). W-BORROW:
+    /// the other argument regions are free; see `ClosureInfo::free_args`.
     iter_closure_args: std::collections::HashMap<u32, Vec<bool>>,
     /// Scalar operators checked while both operand types were still
     /// open (a closure's `|a, b| a + b`): (expr, op, operand type).
@@ -1948,10 +1949,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
         crate::check::collect::auto_structural(self.p, &mut self.tys, env, trait_def, t, seen)
     }
 
+    /// W-BORROW: for each `Fn`-family bound whose self type is a param the
+    /// call instantiates with an inference var (a closure argument's
+    /// expected type), records how the closure's arguments get their
+    /// regions (`ClosureInfo::free_args`): an input that is a type param
+    /// or projection is free (the caller's type); `&` over one has a
+    /// higher-ranked outer reference (the bound writes it); any other
+    /// input with regions makes every argument higher-ranked (no entry).
+    fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg]) {
+        let p = self.p;
+        for pred in preds {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 || !p.gx.lang.is_fn_family(b.value.def) {
+                continue;
+            }
+            let args: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+            let (Some(self_t), Some(inputs)) = (args.first().and_then(|g| g.as_ty()), args.get(1).and_then(|g| g.as_ty())) else { continue };
+            let TyKind::Param(j) = p.tys.kind(self_t) else { continue };
+            let Some(target) = subst_args.get(j.0 as usize).and_then(|g| g.as_ty()) else { continue };
+            let target = self.resolve(target);
+            let TyKind::Infer(v) = self.kind(target) else { continue };
+            let TyKind::Tuple(ts) = p.tys.kind(inputs) else { continue };
+            let opaque = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..)) || !bound_type_has_regions(p, t);
+            let mut flags = Vec::new();
+            let mut ok = true;
+            for &t in p.tys.tys_of(ts) {
+                match p.tys.kind(t) {
+                    TyKind::Ref(_, _, inner) if opaque(inner) => flags.push(true),
+                    _ if opaque(t) => flags.push(false),
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                self.iter_closure_args.insert(v.0, flags);
+            }
+        }
+    }
+
     /// Pushes the predicates of one instantiated item bound set:
     /// trait predicates as obligations, equalities as `AssocEq`
     /// obligations.
     fn push_predicates(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span) {
+        self.note_closure_bounds(preds, subst_args);
         let mut out: Vec<obligations::Obligation> = Vec::new();
         for &pred in preds {
             let pred = crate::traits::index::subst_predicate(&mut self.tys, pred, subst_args);
@@ -13797,5 +13836,24 @@ impl<'p> SolveCx for Ctx<'p, '_> {
         let resolved = self.resolve(self_ty);
         let head = Head::of(&self.tys, resolved);
         p.impl_set(&mut self.out.reads, trait_def, head);
+    }
+}
+
+/// W-BORROW (`note_closure_bounds`): true when a bound's type has a region
+/// position of its own (a reference, an Adt with lifetime params, a
+/// borrowing builtin, `dyn`, a closure or fn pointer), not counting type
+/// params and projections.
+fn bound_type_has_regions(p: &Program, t: Ty) -> bool {
+    use crate::ty::iter::IterKind;
+    match p.tys.kind(t) {
+        TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Opaque(..) => true,
+        TyKind::Adt(def, args) => {
+            matches!(p.tys.builtin_of(t), Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)))
+                || p.gx.adt_lifetimes.get(&def).is_some_and(|v| !v.is_empty())
+                || p.tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| bound_type_has_regions(p, e)))
+        }
+        TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().any(|&e| bound_type_has_regions(p, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => bound_type_has_regions(p, e),
+        _ => false,
     }
 }
