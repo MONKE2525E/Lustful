@@ -61,9 +61,38 @@ const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p =
-        Parser { toks: &lexed.tokens, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
-    p.ast.strings = lexed.strings.clone();
+    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known)
+}
+
+/// Parses the whole items in `lexed.tokens[range]` into their own `Ast`, as `parse` parses
+/// them in place. The resolver parses a big file in item segments in parallel this way
+/// (`resolve::worklist::item_segments`). The `Ast` holds only the strings its tokens name
+/// (`Tok::string_index`), re-indexed from zero, so it stands alone like any chunk `Ast`.
+pub fn parse_items(lexed: &Lexed, range: std::ops::Range<usize>, interner: &Interner, known: &Known) -> PResult<Ast> {
+    let toks = &lexed.tokens[range];
+    let lo = toks.iter().filter_map(|t| t.tok.string_index()).min().unwrap_or(0);
+    let hi = toks.iter().filter_map(|t| t.tok.string_index()).max().map_or(lo, |i| i + 1);
+    let mut v: Vec<Token> = toks
+        .iter()
+        .map(|&t| {
+            let mut t = t;
+            if let Some(i) = t.tok.string_index_mut() {
+                *i -= lo;
+            }
+            t
+        })
+        .collect();
+    if v.last().map(|t| t.tok) != Some(Tok::Eof) {
+        let end = v.last().map_or(Span::default(), |t| t.span);
+        v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
+    }
+    parse_tokens(&v, lexed.strings[lo as usize..hi as usize].to_vec(), interner, known)
+}
+
+/// The item loop of `parse` over one token list (ending in `Eof`) and its string table.
+fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known) -> PResult<Ast> {
+    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
+    p.ast.strings = strings;
     while p.peek() != Tok::Eof {
         let before = p.pos;
         let item = match p.item() {

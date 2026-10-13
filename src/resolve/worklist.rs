@@ -221,6 +221,67 @@ fn join_lexed(parts: Vec<lexer::Lexed>) -> lexer::Lexed {
     out
 }
 
+/// Item-aligned token ranges for parsing one big file in parallel (one-shot
+/// resolves only; see the parse phase). A cut sits between a `}` or `;` at
+/// bracket depth zero and a token that can only begin an item there (an
+/// attribute, `pub`, `fn`, `struct`, `enum`, `impl`, `trait`, `mod`, `use`,
+/// `const`, `static`, `type`), so every range holds whole items and
+/// `parser::parse_items` parses each as `parse` would in place. Cutting stops
+/// at the first unbalanced closer. One range for a file under about 200 KB
+/// (the parse phase already runs files in parallel, and segments of a small
+/// file would only nest), and for a file whose items do not stand alone: one
+/// with an inner attribute anywhere (`#` then `!` as tokens; strip reads a
+/// file-level cfg from the first item, and the parser takes `#!` before any
+/// item) or one that mentions `macro_rules`.
+fn item_segments(text: &str, toks: &[lexer::Token]) -> Vec<std::ops::Range<usize>> {
+    use crate::lexer::Tok;
+    const MIN_SEGMENT: usize = 4096;
+    if toks.len() < 16 * MIN_SEGMENT
+        || text.contains("macro_rules")
+        || toks.windows(2).any(|w| w[0].tok == Tok::Pound && w[1].tok == Tok::Bang)
+    {
+        return vec![0..toks.len()];
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let target = (toks.len() / (cores * 4)).max(MIN_SEGMENT);
+    let mut out = Vec::new();
+    let (mut start, mut depth) = (0usize, 0i64);
+    for i in 0..toks.len().saturating_sub(1) {
+        match toks[i].tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+            Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            break;
+        }
+        if depth == 0
+            && i + 1 - start >= target
+            && matches!(toks[i].tok, Tok::RBrace | Tok::Semi)
+            && matches!(
+                toks[i + 1].tok,
+                Tok::Pound
+                    | Tok::Pub
+                    | Tok::Fn
+                    | Tok::Struct
+                    | Tok::Enum
+                    | Tok::Impl
+                    | Tok::Trait
+                    | Tok::Mod
+                    | Tok::Use
+                    | Tok::Const
+                    | Tok::Static
+                    | Tok::Type
+            )
+        {
+            out.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    out.push(start..toks.len());
+    out
+}
+
 /// The lexed form of `needs_resolve`, for callers that already lexed.
 pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     use crate::lexer::Tok;
@@ -266,14 +327,19 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     false
 }
 
-/// One file during resolution.
+/// One file during resolution, or one item segment of a big file (see
+/// `item_segments`): the segments of a file are adjacent works, and every
+/// step treats a segment as a list of whole items of that file.
 struct FileWork {
     path: PathBuf,
+    /// The file text, on its first segment only.
     text: String,
     file_id: FileId,
     ast: Ast,
     /// The module this file's top-level items belong to.
     module: ModuleId,
+    /// The segment's index in its file; 0 for an unsegmented file.
+    segment: usize,
     /// The `ResolveCache` key and text hash of this file, for the
     /// final-chunk lookup and store at flatten time.
     key: String,
@@ -2185,7 +2251,8 @@ fn resolve_one(
     // this phase, so a parse task moves its own out instead of copying it.
     let streams: Vec<std::sync::Mutex<Option<lexer::Lexed>>> =
         expanded.into_iter().zip(discs.iter_mut()).map(|(e, d)| std::sync::Mutex::new(e.or_else(|| d.lexed.take()))).collect();
-    let mut works: Vec<Option<FileWork>> = Vec::with_capacity(order.len());
+    // Each file's works: one, or one per item segment (see below).
+    let mut works: Vec<Vec<FileWork>> = Vec::with_capacity(order.len());
     let mut todo: Vec<usize> = Vec::new();
     for (pos, &di) in order.iter().enumerate() {
         let disc = &discs[di];
@@ -2194,59 +2261,82 @@ fn resolve_one(
         let outside = reads_outside(&disc.text);
         let hit = if outside { None } else { cache.parsed(&key, text_hash, disc.file_id, exp_hashes[pos]) };
         match hit {
-            Some(ast) => works.push(Some(FileWork {
+            Some(ast) => works.push(vec![FileWork {
                 path: disc.path.clone(),
                 text: disc.text.clone(),
                 file_id: disc.file_id,
                 ast,
                 module: disc.module,
+                segment: 0,
                 key,
                 text_hash,
                 outside,
                 exp_hash: exp_hashes[pos],
-            })),
+            }]),
             None => {
-                works.push(None);
+                works.push(Vec::new());
                 todo.push(pos);
             }
         }
     }
-    let parsed = par_map(&todo, |&pos| -> Result<(FileWork, Option<Ast>), Diag> {
+    let parsed = par_map(&todo, |&pos| -> Result<(Vec<FileWork>, Option<Ast>), Diag> {
         let di = order[pos];
         let disc = &discs[di];
         let lexed = streams[di].lock().unwrap().take().unwrap_or(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() });
-        let ast = parser::parse(&lexed, interner, known)?;
+        // A one-shot resolve parses a big file in item segments in
+        // parallel, and each segment is its own work through strip,
+        // register, rewrite, and flatten. The per-file caches of a
+        // daemon session key whole files, so it parses whole files. On
+        // any segment error the file parses again in one piece: a cut
+        // can move where an error in bad text shows (an item cut before
+        // its missing `;` ends at the cut), and the answer must be the
+        // one-piece answer.
+        let segments = if keep { vec![0..lexed.tokens.len()] } else { item_segments(&disc.text, &lexed.tokens) };
+        let asts: Vec<Ast> = if segments.len() == 1 {
+            vec![parser::parse(&lexed, interner, known)?]
+        } else {
+            match par_map(&segments, |r| parser::parse_items(&lexed, r.clone(), interner, known)).into_iter().collect() {
+                Ok(asts) => asts,
+                Err(_) => vec![parser::parse(&lexed, interner, known)?],
+            }
+        };
         let outside = reads_outside(&disc.text);
-        let store = if outside || !keep { None } else { Some(ast.clone()) };
+        let store = if outside || !keep { None } else { Some(asts[0].clone()) };
         let key = format!("{}#{}", modules::canonical_string(&disc.path), disc.module.0);
-        Ok((
-            FileWork {
+        let text_hash = hash_str(&disc.text);
+        let works = asts
+            .into_iter()
+            .enumerate()
+            .map(|(k, ast)| FileWork {
                 path: disc.path.clone(),
-                text: disc.text.clone(),
+                text: if k == 0 { disc.text.clone() } else { String::new() },
                 file_id: disc.file_id,
                 ast,
                 module: disc.module,
-                key,
-                text_hash: hash_str(&disc.text),
+                segment: k,
+                key: key.clone(),
+                text_hash,
                 outside,
                 exp_hash: 0,
-            },
-            store,
-        ))
+            })
+            .collect();
+        Ok((works, store))
     });
     for (&pos, r) in todo.iter().zip(parsed) {
         match r {
-            Ok((mut w, store)) => {
+            Ok((mut ws, store)) => {
                 if let Some(ast) = store {
-                    cache.put_parsed(&w.key, w.text_hash, w.file_id, exp_hashes[pos], ast);
+                    cache.put_parsed(&ws[0].key, ws[0].text_hash, ws[0].file_id, exp_hashes[pos], ast);
                 }
-                w.exp_hash = exp_hashes[pos];
-                works[pos] = Some(w);
+                for w in &mut ws {
+                    w.exp_hash = exp_hashes[pos];
+                }
+                works[pos] = ws;
             }
             Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
         }
     }
-    let mut works: Vec<FileWork> = works.into_iter().map(|w| w.expect("every file parsed or ready")).collect();
+    let mut works: Vec<FileWork> = works.into_iter().flatten().collect();
     lap!("resolve: expand+parse");
     // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
@@ -2388,9 +2478,28 @@ fn resolve_one(
         nested_hashes: Vec<u64>,
         fn_module_paths: Vec<Vec<Sym>>,
         nested_module_paths: Vec<Vec<Sym>>,
-        structure: u64,
+        /// The file's structure hash, on its first work; None on the
+        /// later segments of a file.
+        structure: Option<u64>,
         scan: Option<crate::driver::ast_hash::AstScans>,
     }
+    // Module/import structure per file, hashed before flattening drops
+    // it: the file path, then its `mod`, `use`, and `extern crate`
+    // items over all its segments in order, so a file parsed in
+    // segments hashes exactly as one piece.
+    let structures: Vec<Option<u64>> = (0..works.len())
+        .map(|k| {
+            (works[k].segment == 0 && final_hits[k].is_none()).then(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = crate::intern::FxHasher::default();
+                works[k].path.to_string_lossy().hash(&mut h);
+                for w in std::iter::once(&works[k]).chain(works[k + 1..].iter().take_while(|w| w.segment > 0)) {
+                    structure_items(&w.ast.items, &mut h);
+                }
+                h.finish()
+            })
+        })
+        .collect();
     let mut pendings: Vec<Pending> = Vec::with_capacity(works.len());
     for ((fi, mut w), hit) in works.into_iter().enumerate().zip(final_hits) {
         if let Some(c) = hit {
@@ -2407,7 +2516,7 @@ fn resolve_one(
                 nested_hashes: c.nested_hashes,
                 fn_module_paths: c.fn_module_paths,
                 nested_module_paths: c.nested_module_paths,
-                structure: c.structure,
+                structure: Some(c.structure),
                 scan: Some(crate::driver::ast_hash::AstScans {
                     items: c.scan_items,
                     bodies: c.scan_bodies.into_iter().chain(c.nested_bodies).collect(),
@@ -2415,15 +2524,7 @@ fn resolve_one(
             });
             continue;
         }
-        // Module/import structure of this file, hashed before
-        // flattening drops it.
-        let structure = {
-            use std::hash::{Hash, Hasher};
-            let mut h = crate::intern::FxHasher::default();
-            w.path.to_string_lossy().hash(&mut h);
-            structure_items(&w.ast.items, &mut h);
-            h.finish()
-        };
+        let structure = structures[fi];
         let mut flat_items = Vec::new();
         let mut flat_mods: Vec<ModuleId> = Vec::new();
         flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], &list_module, &mut flat_items, &mut flat_mods);
@@ -2490,7 +2591,10 @@ fn resolve_one(
     // Store the fresh chunks under this epoch for the next request.
     // A chunk scan lists nested bodies after its own top-level
     // bodies; split at the top-level count for storage.
+    // (Segments exist only in one-shot resolves, which store nothing: a
+    // stored chunk is always a whole file with its own structure hash.)
     for pd in pendings.iter().filter(|pd| pd.cacheable) {
+        let Some(structure) = pd.structure else { continue };
         let scan = pd.scan.as_ref().expect("every pending chunk is scanned");
         let top = pd.fn_lines.len().min(scan.bodies.len());
         cache.put_final(
@@ -2507,7 +2611,7 @@ fn resolve_one(
                 nested_hashes: pd.nested_hashes.clone(),
                 fn_module_paths: pd.fn_module_paths.clone(),
                 nested_module_paths: pd.nested_module_paths.clone(),
-                structure: pd.structure,
+                structure,
                 scan_items: scan.items.clone(),
                 scan_bodies: scan.bodies[..top].to_vec(),
                 nested_bodies: scan.bodies[top..].to_vec(),
@@ -2531,7 +2635,9 @@ fn resolve_one(
     for pd in pendings {
         {
             use std::hash::Hash;
-            pd.structure.hash(&mut structure);
+            if let Some(s) = pd.structure {
+                s.hash(&mut structure);
+            }
         }
         let top = pd.fn_lines.len();
         fn_lines.extend(pd.fn_lines);
@@ -4639,6 +4745,49 @@ mod tests {
         assert!(later(|t| matches!(t, lexer::Tok::ByteChar(_))));
         assert!(later(|t| matches!(t, lexer::Tok::Float(_))));
         assert!(later(|t| matches!(t, lexer::Tok::DocStr(_))));
+    }
+
+    /// A one-shot resolve parses a big file in item segments; the crate it
+    /// returns equals the whole-file resolve of a daemon (persistent) cache:
+    /// fn lines, body hashes, the structure hash, and every item and body
+    /// scan. Scans hash string, float, byte string, and byte char literals,
+    /// so a literal that read another segment's string would show.
+    #[test]
+    fn segmented_resolve_matches_whole_file() {
+        let mut text = String::from("mod m {\n    pub fn g() -> i64 { 1 }\n}\nuse m::g;\n");
+        for i in 0..6000 {
+            text += &format!(
+                "fn f{i}() -> usize {{ let s = \"s{i}\"; let b = b\"b{i}\"; let c = b'x'; let f = {i}.5; s.len() + b.len() + c as usize + f as usize + g() as usize }}\n"
+            );
+        }
+        text += "fn main() {\n    f0();\n}\n";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let toks = lexer::lex(&text, FileId(0), 0, &interner).unwrap().tokens;
+        assert!(item_segments(&text, &toks).len() > 1, "the file splits");
+        let dir = std::env::temp_dir().join(format!("lust-worklist-test-{}-segments", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("main.rs");
+        std::fs::write(&root, &text).unwrap();
+        let input = CrateInput {
+            root_path: root,
+            root_text: text,
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:segments", "bin", "segments", false) },
+            crate_name: "segments".into(),
+            deps: Vec::new(),
+        };
+        let one = resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(true)).ok().expect("segmented resolves");
+        let whole = resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(false)).ok().expect("whole resolves");
+        assert_eq!(one.fn_lines, whole.fn_lines);
+        assert_eq!(one.body_hashes, whole.body_hashes);
+        assert_eq!(one.structure_hash, whole.structure_hash);
+        assert_eq!(one.scans.bodies, whole.scans.bodies);
+        let item_hashes = |r: &ResolvedCrate| r.scans.items.iter().map(|i| (i.hash, i.fn_name)).collect::<Vec<_>>();
+        assert_eq!(item_hashes(&one), item_hashes(&whole));
+        assert_eq!(one.tables.fn_module, whole.tables.fn_module);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn resolve(files: &[(&str, &str)], crate_name: &str) -> Result<ResolvedCrate, ResolveError> {
