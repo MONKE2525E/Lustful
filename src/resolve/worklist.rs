@@ -183,6 +183,44 @@ fn piece_cut_ok(lexed: &lexer::Lexed, b: usize, len: usize) -> bool {
             && lexed.tokens[n - 2].span.hi as usize == b - 1)
 }
 
+/// Lexes one file. A big file lexes in parallel pieces (`route_pieces`)
+/// that join into exactly the tokens and string table of one serial lex;
+/// when any piece fails its cut check or does not lex, the serial lex
+/// runs, so errors are the serial ones.
+fn lex_file(text: &str, file: FileId, interner: &Interner) -> Result<lexer::Lexed, Diag> {
+    if let Some(pieces) = route_pieces(text) {
+        let parts = par_map(&pieces, |&(a, b)| {
+            let l = lexer::lex(&text[a..b], file, a as u32, interner).ok()?;
+            piece_cut_ok(&l, b, text.len()).then_some(l)
+        });
+        if let Some(parts) = parts.into_iter().collect::<Option<Vec<_>>>() {
+            return Ok(join_lexed(parts));
+        }
+    }
+    lexer::lex(text, file, 0, interner)
+}
+
+/// Joins piece lexes in order: one final `Eof`, and string-table indexes
+/// (`Tok::string_index_mut`) moved past the strings of earlier pieces.
+fn join_lexed(parts: Vec<lexer::Lexed>) -> lexer::Lexed {
+    let mut out = lexer::Lexed { tokens: Vec::with_capacity(parts.iter().map(|p| p.tokens.len()).sum()), strings: Vec::new() };
+    let last = parts.len() - 1;
+    for (k, mut part) in parts.into_iter().enumerate() {
+        let base = out.strings.len() as u32;
+        if k < last {
+            part.tokens.pop();
+        }
+        out.tokens.extend(part.tokens.into_iter().map(|mut t| {
+            if let Some(i) = t.tok.string_index_mut() {
+                *i += base;
+            }
+            t
+        }));
+        out.strings.append(&mut part.strings);
+    }
+    out
+}
+
 /// The lexed form of `needs_resolve`, for callers that already lexed.
 pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     use crate::lexer::Tok;
@@ -1255,7 +1293,7 @@ fn process_disc_orig(
     let text_hash = hash_str(&text);
     let lexed = match cache.raw(&file_key, text_hash, file_id) {
         Some(l) => l,
-        None => match lexer::lex(&text, file_id, 0, interner) {
+        None => match lex_file(&text, file_id, interner) {
             Ok(l) => {
                 cache.put_raw(&file_key, text_hash, file_id, &l);
                 l
@@ -4549,6 +4587,40 @@ mod tests {
         }
         let answers: Vec<bool> = cases.iter().map(|t| serial(t)).collect();
         assert_eq!(answers, [false, true, true, false, false, true, true]);
+    }
+
+    /// A big file lexed in parallel pieces joins into exactly the serial
+    /// token list and string table, with every kind that indexes the string
+    /// table (`Tok::string_index`) in pieces after the first, so each is
+    /// moved past the earlier pieces' strings.
+    #[test]
+    fn parallel_lex_matches_serial() {
+        let text: String = (0..4000)
+            .map(|i| {
+                format!(
+                    "/// doc {i}\nfn f{i}() -> u8 {{ let _s = \"s{i}\"; let _b = b\"b{i}\"; let _f = {i}.5; b'{}' }}\n",
+                    (b'a' + (i % 26) as u8) as char
+                )
+            })
+            .collect();
+        let pieces = route_pieces(&text).expect("big text splits");
+        assert!(pieces.len() > 1);
+        let i = Interner::default();
+        let serial = lexer::lex(&text, FileId(3), 0, &i).unwrap();
+        let joined = lex_file(&text, FileId(3), &i).unwrap();
+        assert_eq!(joined.strings, serial.strings);
+        assert_eq!(joined.tokens.len(), serial.tokens.len());
+        for (a, b) in joined.tokens.iter().zip(&serial.tokens) {
+            assert!(a.tok == b.tok && a.span == b.span, "{:?} vs {:?}", a, b);
+        }
+        // The string-table kinds all occur past the first cut.
+        let first_cut = pieces[0].1 as u32;
+        let later = |k: fn(lexer::Tok) -> bool| serial.tokens.iter().any(|t| t.span.lo >= first_cut && k(t.tok));
+        assert!(later(|t| matches!(t, lexer::Tok::Str(_))));
+        assert!(later(|t| matches!(t, lexer::Tok::ByteStr(_))));
+        assert!(later(|t| matches!(t, lexer::Tok::ByteChar(_))));
+        assert!(later(|t| matches!(t, lexer::Tok::Float(_))));
+        assert!(later(|t| matches!(t, lexer::Tok::DocStr(_))));
     }
 
     fn resolve(files: &[(&str, &str)], crate_name: &str) -> Result<ResolvedCrate, ResolveError> {
