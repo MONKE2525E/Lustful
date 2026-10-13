@@ -85,9 +85,12 @@ pub fn check_const_fn(p: &Program, ck: &Checked, f: &FnInfo, prior_errs: bool) -
 /// True when a call to the std builtin `b` is a `const fn` call in
 /// rustc 1.99. This is the one table of std const operations for the
 /// checker: every other builtin is a non-const call in a const
-/// function. Entries were probed against rustc 1.99 (`const fn` bodies
-/// that call each method); keep the table conservative, because a
-/// wrong `true` is a false accept.
+/// function. The const evaluator keeps its own name-based list of
+/// the primitive methods it can run; the two lists agree on the
+/// families both sides support, and each side rejects the rest on
+/// its own. Entries were probed against rustc 1.99 (`const fn`
+/// bodies that call each method); keep the table conservative,
+/// because a wrong `true` is a false accept.
 fn builtin_is_const(b: Builtin) -> bool {
     use Builtin::*;
     matches!(
