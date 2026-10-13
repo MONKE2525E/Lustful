@@ -428,6 +428,26 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     crate::pool::par_map(items, f)
 }
 
+/// The file's inner `allow` attributes, for seeding later chunks so a
+/// chunk parse builds the same item attributes as a whole parse. Empty
+/// when there is only one chunk (it reads them itself).
+fn chunk_seed_allows(front: &Front) -> Vec<crate::ast::Attr> {
+    if front.chunks.len() < 2 {
+        return Vec::new();
+    }
+    parser::leading_allows(&front.chunks[0].lexed, &front.interner, &front.known)
+}
+
+/// Parses chunk `i`: the first chunk as a whole parse, later chunks
+/// seeded with the file's inner allows.
+fn parse_chunk(front: &Front, i: usize, seed: &[crate::ast::Attr]) -> Result<Ast, Diag> {
+    if i == 0 {
+        parser::parse(&front.chunks[i].lexed, &front.interner, &front.known)
+    } else {
+        parser::parse_seeded(&front.chunks[i].lexed, &front.interner, &front.known, seed)
+    }
+}
+
 /// Splits source into chunks of whole top-level items, about `2 * cores` of them. Boundaries are
 /// content-defined: the chunk is cut before an item when a hash of the item's header line hits a
 /// mask. So editing or inserting an item only changes the chunk it is in, and every other chunk
@@ -761,28 +781,47 @@ fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
     }
 }
 
-/// (offset of each top-level item's first line, hash of its header line), skipping attributes.
+/// True when a column-0 line starts an outer doc comment, which the lexer
+/// emits as `#[doc = ..]` tokens: `///` (not `////`) or `/**` (not `/***`
+/// or `/**/`). Same rule as the lexer.
+fn is_doc_line(line: &str) -> bool {
+    (line.starts_with("///") && !line[3..].starts_with('/'))
+        || (line.starts_with("/**") && !line[3..].starts_with('*') && !line.starts_with("/**/"))
+}
+
+/// (offset of each top-level item's first line, hash of its header line).
+/// An item preceded by attributes gets the first attribute line as its
+/// offset, so a chunk cut at a header never falls between an attribute
+/// and its item. Doc comments are attributes. A pending attribute run
+/// carries across blank and comment lines and resolves at the next item
+/// line; lines inside a block comment starting at column 0 are neither.
 fn item_headers(src: &str) -> Vec<(usize, u64)> {
-    let starts = ["fn ", "pub ", "struct ", "enum ", "impl ", "#[", "use "];
+    let starts = ["fn ", "pub ", "struct ", "enum ", "impl ", "use "];
     let mut items = Vec::new();
-    let mut prev_attr = false;
     let mut pending: Option<usize> = None;
+    let mut in_block = false;
     let mut pos = 0;
     for line in src.split_inclusive('\n') {
-        let is_attr = line.starts_with("#[");
-        if starts.iter().any(|s| line.starts_with(s)) && !prev_attr {
-            pending = Some(pos);
+        if in_block {
+            if line.contains("*/") {
+                in_block = false;
+            }
+            pos += line.len();
+            continue;
         }
-        if let Some(at) = pending
-            && !is_attr
-        {
+        let is_attr = line.starts_with("#[") || is_doc_line(line);
+        if is_attr && pending.is_none() {
+            pending = Some(pos);
+        } else if starts.iter().any(|s| line.starts_with(s)) {
+            let at = pending.take().unwrap_or(pos);
             let mut h = crate::intern::FxHasher::default();
             std::hash::Hash::hash(line, &mut h);
             items.push((at, std::hash::Hasher::finish(&h)));
-            pending = None;
         }
-        if !line.trim().is_empty() {
-            prev_attr = is_attr;
+        // A block comment that opens at column 0 and does not close on
+        // this line hides the lines it spans from the tests above.
+        if line.starts_with("/*") && !line[2..].contains("*/") {
+            in_block = true;
         }
         pos += line.len();
     }
@@ -2054,7 +2093,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // Only top-level functions changed: parse just the chunks with new text, and splice their
         // items between the unchanged chunks' items.
         let todo: Vec<usize> = (0..front.chunks.len()).filter(|&i| front.chunks[i].items.is_none()).collect();
-        let parsed = par_map(&todo, |&i| parser::parse(&front.chunks[i].lexed, &front.interner, &front.known));
+        // Later chunks start under the file's inner allows, as a whole
+        // parse scopes them (the first chunk reads them itself).
+        let seed = chunk_seed_allows(front);
+        let parsed = par_map(&todo, |&i| parse_chunk(front, i, &seed));
         if let Some(Err(d)) = parsed.iter().find(|p| p.is_err()) {
             let d = d.clone();
             return errors(&mut [d], &map, &src, req);
@@ -2080,7 +2122,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     } else {
         // Reused chunks carry shifted token spans (see chunk assembly), so every chunk is ready.
-        let parsed = par_map(&front.chunks, |c| parser::parse(&c.lexed, &front.interner, &front.known));
+        let seed = chunk_seed_allows(front);
+        let parsed = par_map(&front.chunks, |c| {
+            if c.start == 0 {
+                parser::parse(&c.lexed, &front.interner, &front.known)
+            } else {
+                parser::parse_seeded(&c.lexed, &front.interner, &front.known, &seed)
+            }
+        });
         let ast = if parsed.iter().all(|p| p.is_ok()) {
             let mut start = 0;
             for (c, p) in front.chunks.iter_mut().zip(&parsed) {
@@ -3191,6 +3240,58 @@ mod tests {
         scan.feed(&text.as_bytes()[20..], 20, Some(&mut split));
         assert_eq!(split, want);
         assert!(scan.clean());
+    }
+
+    /// A chunk cut never falls between an attribute (a doc comment counts,
+    /// the lexer emits it as `#[doc = ..]`) and its item: the header of an
+    /// item preceded by attributes names the first attribute line, and no
+    /// header names the item line itself. A chunk ending after attributes
+    /// is a parse error, which used to send the whole file down the serial
+    /// re-parse path.
+    #[test]
+    fn item_headers_keep_attrs_with_their_item() {
+        let src = "\
+fn a() {}
+/// Doc for B.
+struct B;
+/// Doc for C.
+#[derive(Debug)]
+struct C;
+#[derive(Debug)]
+// A plain comment between the attribute and its item.
+struct D;
+/** Doc for E,
+on two lines. */
+struct E;
+//// Not a doc comment.
+struct F;
+";
+        let at = |line: &str| src.find(line).unwrap();
+        let got: Vec<usize> = item_headers(src).into_iter().map(|(at, _)| at).collect();
+        assert_eq!(
+            got,
+            vec![at("fn a()"), at("/// Doc for B."), at("/// Doc for C."), at("#[derive(Debug)]\n//"), at("/** Doc for E,"), at("struct F;")]
+        );
+    }
+
+    /// A later chunk seeded with the file's inner allows builds the
+    /// same fn attributes as a whole parse, so chunking cannot move an
+    /// `allow` lint answer.
+    #[test]
+    fn seeded_chunk_keeps_crate_allows() {
+        let whole = "#![allow(arithmetic_overflow)]\nfn a() {}\nfn b() -> u8 { 1 }\n";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(whole, ROOT_FILE, 0, &interner).unwrap();
+        let seed = parser::leading_allows(&lexed, &interner, &known);
+        assert_eq!(seed.len(), 1);
+        let chunk2 = lexer::lex("fn b() -> u8 { 1 }\n", ROOT_FILE, 0, &interner).unwrap();
+        let seeded = parser::parse_seeded(&chunk2, &interner, &known, &seed).unwrap();
+        let ItemKind::Fn(def) = &seeded.items[0].kind else { panic!("fn item") };
+        assert!(def.attrs.iter().any(|a| crate::check::allow_attr(a, &interner, "arithmetic_overflow")));
+        let unseeded = parser::parse(&chunk2, &interner, &known).unwrap();
+        let ItemKind::Fn(def) = &unseeded.items[0].kind else { panic!("fn item") };
+        assert!(!def.attrs.iter().any(|a| crate::check::allow_attr(a, &interner, "arithmetic_overflow")));
     }
 
     /// The driver's slot keys and `collect`'s stored def ids are computed in two

@@ -72,7 +72,41 @@ const MAX_DEPTH: u32 = 2000;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known)
+    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, &[])
+}
+
+/// The file-level `allow` inner attributes a whole parse of `lexed`
+/// scopes over its items, read from the leading inner run only. A
+/// caller that parses one file in pieces (driver chunks, resolver
+/// segments) seeds each later piece with this list, so a piece parse
+/// builds the same item attributes as the parse in place. An error
+/// in the run reads as no allows; the real parse reports it.
+pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<Attr> {
+    let mut p = Parser {
+        toks: &lexed.tokens,
+        pos: 0,
+        ast: Ast::default(),
+        interner,
+        known,
+        str_base: 0,
+        depth: 0,
+        deferred: None,
+        let_ok: false,
+        scope_allows: Vec::new(),
+        block_inner_ok: false,
+    };
+    match p.inner_attributes() {
+        Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Like `parse`, for a piece of a file after its first piece: items
+/// start under `seed_allows` (from `leading_allows`), exactly as a
+/// whole parse scopes the file's inner allows over them. A leading
+/// inner run in the piece itself still wins, as in `parse`.
+pub fn parse_seeded(lexed: &Lexed, interner: &Interner, known: &Known, seed_allows: &[Attr]) -> PResult<Ast> {
+    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, seed_allows)
 }
 
 /// Parses the whole items in `lexed.tokens[range]` into their own `Ast`, as `parse` parses
@@ -80,6 +114,19 @@ pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> 
 /// (`resolve::worklist::item_segments`). The `Ast` holds only the strings its tokens name
 /// (`Tok::string_index`), re-indexed from zero, so it stands alone like any chunk `Ast`.
 pub fn parse_items(lexed: &Lexed, range: std::ops::Range<usize>, interner: &Interner, known: &Known) -> PResult<Ast> {
+    parse_items_seeded(lexed, range, interner, known, &[])
+}
+
+/// Like `parse_items`, for a segment after the file's first: items
+/// start under `seed_allows` (from `leading_allows` on the whole
+/// file), as `parse_seeded` does for chunks.
+pub fn parse_items_seeded(
+    lexed: &Lexed,
+    range: std::ops::Range<usize>,
+    interner: &Interner,
+    known: &Known,
+    seed_allows: &[Attr],
+) -> PResult<Ast> {
     let toks = &lexed.tokens[range];
     let lo = toks.iter().filter_map(|t| t.tok.string_index()).min().unwrap_or(0);
     let hi = toks.iter().filter_map(|t| t.tok.string_index()).max().map_or(lo, |i| i + 1);
@@ -97,18 +144,22 @@ pub fn parse_items(lexed: &Lexed, range: std::ops::Range<usize>, interner: &Inte
         let end = v.last().map_or(Span::default(), |t| t.span);
         v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     }
-    parse_tokens(&v, lexed.strings[lo as usize..hi as usize].to_vec(), interner, known)
+    parse_tokens(&v, lexed.strings[lo as usize..hi as usize].to_vec(), interner, known, seed_allows)
 }
 
 /// The item loop of `parse` over one token list (ending in `Eof`) and its string table.
-fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
+fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known, seed_allows: &[Attr]) -> PResult<Ast> {
+    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: seed_allows.to_vec(), block_inner_ok: false };
     p.ast.strings = strings;
     // Inner attributes are permitted only here, before the first item
     // (and before any outer attribute): they scope over the whole file.
+    // A seeded piece with no inner run of its own keeps the seed, so its
+    // items carry the same allows as in a whole parse.
     match p.inner_attributes() {
         Ok(inner) => {
-            p.scope_allows = inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect();
+            if !inner.attrs.is_empty() {
+                p.scope_allows = inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect();
+            }
             p.ast.inner_attrs = inner.attrs;
         }
         Err(hard) => return Err(hard),

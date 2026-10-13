@@ -2352,7 +2352,19 @@ fn resolve_one(
         let asts: Vec<Ast> = if segments.len() == 1 {
             vec![parser::parse(&lexed, interner, known)?]
         } else {
-            match par_map(&segments, |r| parser::parse_items(&lexed, r.clone(), interner, known)).into_iter().collect() {
+            // Later segments start under the file's inner allows, as
+            // the one-piece parse scopes them.
+            let seed = parser::leading_allows(&lexed, interner, known);
+            match par_map(&segments, |r| {
+                if r.start == 0 {
+                    parser::parse_items(&lexed, r.clone(), interner, known)
+                } else {
+                    parser::parse_items_seeded(&lexed, r.clone(), interner, known, &seed)
+                }
+            })
+            .into_iter()
+            .collect()
+            {
                 Ok(asts) => asts,
                 Err(_) => vec![parser::parse(&lexed, interner, known)?],
             }
