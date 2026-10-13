@@ -2217,13 +2217,16 @@ pub fn resolve_fn_sig(
         ));
     }
     // Elision, as in the plain path: a returned reference borrows
-    // from `self`, or from the only reference parameter.
+    // from `self`, or from the only reference parameter. A written
+    // `dyn` object lifetime (`+ '_`, `+ 'static`) is one more input
+    // lifetime, so that parameter is no single source (rustc E0106).
     let mut ret_borrows_from = None;
     if crate::check::collect::contains_ref(tys, ret) {
         let ref_params: Vec<usize> = (0..params.len()).filter(|&i| crate::check::collect::contains_ref(tys, params[i])).collect();
+        let dyn_lt = def.params.iter().any(|prm| has_written_dyn_lifetime(ast, prm.ty));
         if def.self_param.as_ref().is_some_and(|s| s.kind != ast::SelfKind::Value) {
             ret_borrows_from = Some(0);
-        } else if ref_params.len() == 1 {
+        } else if ref_params.len() == 1 && !dyn_lt {
             ret_borrows_from = Some(ref_params[0]);
         } else {
             let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
@@ -2236,6 +2239,25 @@ pub fn resolve_fn_sig(
         }
     }
     (params, ret, ret_borrows_from, generics, scope)
+}
+
+/// True when a written type holds a `dyn` type with a written object
+/// lifetime (`dyn Tr + '_`, `dyn Tr + 'static`).
+fn has_written_dyn_lifetime(ast: &Ast, id: ast::TyId) -> bool {
+    match ast.ty(id) {
+        TyExpr::Dyn { bounds, lifetime, .. } => lifetime.is_some() || bounds.iter().any(|b| matches!(b, TraitBound::Lifetime(_))),
+        TyExpr::Ref { inner, .. }
+        | TyExpr::Paren(inner)
+        | TyExpr::Array { inner, .. }
+        | TyExpr::Slice(inner)
+        | TyExpr::Ptr { inner, .. } => has_written_dyn_lifetime(ast, *inner),
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| has_written_dyn_lifetime(ast, e)),
+        TyExpr::Path(segs) => segs.iter().any(|seg| match &seg.args {
+            GenericArgs::Angle(args) => args.iter().any(|a| matches!(a, AstArg::Type(t) if has_written_dyn_lifetime(ast, *t))),
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 /// True when a written field type holds only `'static` (or
