@@ -933,10 +933,11 @@ pub(super) fn dyn_probe(
         return Probe::Miss;
     }
     let inherent = inherent.filter(|&f| form_of(p.fn_info(f).self_kind) == Some(form));
-    let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut cx.tys, principal, name)
+    let cands: Vec<(usize, object::ObjectCand)> = object::object_cands(p, &mut cx.tys, principal, name)
         .into_iter()
-        .filter(|c| only.is_none_or(|t| c.owner.def == t))
-        .filter(|c| match c.call {
+        .enumerate()
+        .filter(|(_, c)| only.is_none_or(|t| c.owner.def == t))
+        .filter(|(_, c)| match c.call {
             Ok((_, DynRecv::Ref)) => form == ReceiverForm::Ref,
             Ok((_, DynRecv::RefMut)) => form == ReceiverForm::RefMut,
             Err(_) => p.gx.trait_methods.get(&c.def).and_then(|t| form_of(t.self_kind)) == Some(form),
@@ -967,7 +968,7 @@ pub(super) fn dyn_probe(
         cx.check_args(&params[1.min(params.len())..], args, name_span);
         return Probe::Hit(ret);
     }
-    let Some(c) = cands.into_iter().next() else { return Probe::Miss };
+    let Some((ci, c)) = cands.into_iter().next() else { return Probe::Miss };
     let slot = match c.call {
         Ok((slot, _)) => slot,
         Err(why) => {
@@ -992,7 +993,8 @@ pub(super) fn dyn_probe(
     sargs[0] = GenericArg::Ty(step);
     let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut cx.tys, t, &sargs)).collect();
     let ret = subst(&mut cx.tys, tret, &sargs);
-    cx.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs, autoref: probe.autoref });
+    let cand = u8::try_from(ci).expect("at most 256 object candidates");
+    cx.set_res(e, Res::DynMethod { owner: c.owner.def, cand, slot, derefs, autoref: probe.autoref });
     if c.needs_static && !object::dyn_is_static(p, &cx.tys, step) {
         cx.obl.push(crate::check::obligations::Obligation::DynStatic { span: name_span });
     }

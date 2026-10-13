@@ -341,7 +341,10 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             continue;
         }
         match recv {
-            Some(recv) => info.methods.push(DynMethod { def: mdef, name: mname, recv, needs_static: where_self_static(p, &tm.def.where_clause) }),
+            Some(recv) => {
+                let needs_static = where_self_static(p, &tm.def.where_clause);
+                info.methods.push(DynMethod { def: mdef, name: mname, recv, needs_static })
+            }
             None if tm.self_kind.is_some() => {
                 info.uncallable.push((mname, mdef, "it takes `self` by value, and a `dyn` value has no size"))
             }

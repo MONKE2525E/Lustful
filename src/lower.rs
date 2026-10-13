@@ -467,16 +467,27 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// Points a dyn method call's receiver at the vtable of the trait
     /// that declares the method: unchanged for a principal method, an
     /// upcast along the super slots for a supertrait method.
-    fn dyn_receiver(&mut self, recv: Operand, recv_dyn: Ty, mutable: bool, owner: DefId, name: crate::intern::Sym, span: Span) -> Operand {
+    #[allow(clippy::too_many_arguments)]
+    fn dyn_receiver(
+        &mut self,
+        recv: Operand,
+        recv_dyn: Ty,
+        mutable: bool,
+        owner: DefId,
+        cand: u8,
+        name: crate::intern::Sym,
+        span: Span,
+    ) -> Operand {
         use crate::check::object;
         let Some(principal) = object::principal_of(&self.body.tys, recv_dyn) else { return recv };
         if principal.def == owner {
             return recv;
         }
         let cands = object::object_cands(self.p, &mut self.body.tys, principal, name);
-        // Check resolved the call to this owner, so the supertrait and
-        // its slot path exist; a miss here would call the wrong vtable.
-        let Some(c) = cands.into_iter().find(|c| c.owner.def == owner) else { unreachable!() };
+        // Check resolved the call to this candidate, so the supertrait
+        // and its slot path exist; a miss here would call the wrong
+        // vtable.
+        let Some(c) = cands.into_iter().nth(cand as usize).filter(|c| c.owner.def == owner) else { unreachable!() };
         let Some(path) = object::upcast_path(self.p, &mut self.body.tys, principal, c.owner) else { unreachable!() };
         let bounds = self.body.tys.intern_dyn_bounds(DynBounds {
             principal: Some(Binder::plain(c.owner)),
@@ -888,7 +899,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     // `<dyn P as Tr>::m(d, ..)`, `<dyn P>::m(d, ..)`, and
                     // `Tr::m(d, ..)`: the receiver is the first argument,
                     // already a dyn reference.
-                    Res::DynMethod { owner, slot, .. } => {
+                    Res::DynMethod { owner, cand, slot, .. } => {
                         let Expr::Call { callee, .. } = p.ast.expr(e) else { unreachable!() };
                         let name = match p.ast.expr(*callee) {
                             Expr::QPath { segs, .. } | Expr::Path(segs) => segs[segs.len() - 1].name,
@@ -901,7 +912,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                             _ => unreachable!(),
                         };
                         let r = ops.remove(0);
-                        let r = self.dyn_receiver(r, recv_dyn, m, owner, name, span);
+                        let r = self.dyn_receiver(r, recv_dyn, m, owner, cand, name, span);
                         ops.insert(0, r);
                         let t = self.temp(ty);
                         self.call_into(CallTarget::Dyn(slot), ops, Place::local(t), span);
@@ -1669,13 +1680,14 @@ impl<'p, 'a> Lower<'p, 'a> {
         enum Callee {
             Fn(LocalDefId),
             Builtin(Builtin),
-            /// Through the vtable: the declaring trait and the slot.
-            Dyn(DefId, u32),
+            /// Through the vtable: the declaring trait, its object
+            /// candidate index, and the slot.
+            Dyn(DefId, u8, u32),
         }
         let (callee, derefs, autoref) = match self.ck.res(e) {
             Res::Method { f, derefs, autoref } => (Callee::Fn(f), derefs, autoref),
             Res::BuiltinMethod { b, derefs, autoref } => (Callee::Builtin(b), derefs, autoref),
-            Res::DynMethod { owner, slot, derefs, autoref } => (Callee::Dyn(owner, slot), derefs, autoref),
+            Res::DynMethod { owner, cand, slot, derefs, autoref } => (Callee::Dyn(owner, cand, slot), derefs, autoref),
             _ => return,
         };
         let recv_ty = self.peel(self.ty(recv), derefs);
@@ -1759,10 +1771,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         let target = match callee {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
             Callee::Builtin(b) => CallTarget::Builtin(b),
-            Callee::Dyn(owner, slot) => {
+            Callee::Dyn(owner, cand, slot) => {
                 let Expr::MethodCall { name, .. } = self.p.ast.expr(e) else { unreachable!() };
                 let r = ops.remove(0);
-                let r = self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, *name, span);
+                let r = self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, cand, *name, span);
                 ops.insert(0, r);
                 // The call writes a temporary of the method's own return
                 // type: codegen reads the vtable entry's C signature from

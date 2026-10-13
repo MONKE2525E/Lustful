@@ -348,10 +348,13 @@ pub enum Res {
     },
     /// A method call through a dyn receiver's vtable (ARCH 2.8):
     /// `owner` is the trait that declares the method (the principal
-    /// or a supertrait, reached by its upcast path) and `slot` the
-    /// method's word index in that trait's vtable.
+    /// or a supertrait, reached by its upcast path), `cand` its index
+    /// in `object::object_cands` (one generic trait can be a
+    /// supertrait twice: `B<u8> + B<u16>`), and `slot` the method's
+    /// word index in that trait's vtable.
     DynMethod {
         owner: DefId,
+        cand: u8,
         slot: u32,
         derefs: u8,
         autoref: Autoref,
@@ -5372,6 +5375,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// A trait ref written in a body path (`<T as Tr<u8, _>>`,
+    /// `Tr::<u8>::m`) with `base` as Self; `_` args become body
+    /// variables.
+    fn written_trait_ref(&mut self, base: Ty, tref: &ast::TraitRefExpr, span: Span) -> Result<TraitRef, Diag> {
+        let p = self.p;
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let tr = generics::resolve_trait_ref(p.ast, p.interner, p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, tref, span)?;
+        let old: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+        let new: Vec<GenericArg> = old
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(self.instantiate_infers(t)),
+                g => g,
+            })
+            .collect();
+        Ok(TraitRef { args: self.tys.intern_args(&new), ..tr })
+    }
+
+    /// True when the trait args of `hint` past Self can name the
+    /// existential trait ref `owner`: each equal, or still inferred.
+    fn trait_args_fit(&mut self, hint: TraitRef, owner: TraitRef) -> bool {
+        let (hs, os) = (self.tys.args(hint.args).to_vec(), self.tys.args(owner.args).to_vec());
+        hs.len() == os.len()
+            && hs.iter().zip(&os).skip(1).all(|(a, b)| match (a.as_ty(), b.as_ty()) {
+                (Some(a), Some(b)) => {
+                    let a = self.deep(a);
+                    matches!(self.tys.kind(a), TyKind::Infer(_)) || a == self.deep(b)
+                }
+                _ => true,
+            })
+    }
+
     /// A path call on a dyn Self type: the `impl dyn P` method of that
     /// name, else the one object candidate (of the hinted trait, when
     /// written, or of the template's pick when this body replays one),
@@ -5409,14 +5444,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.check_args(&params, args, span);
             return Some(ret);
         }
-        let cands: Vec<object::ObjectCand> = object::object_cands(p, &mut self.tys, principal, name)
+        let mut cands: Vec<(usize, object::ObjectCand)> = object::object_cands(p, &mut self.tys, principal, name)
             .into_iter()
-            .filter(|c| only.is_none_or(|t| t == c.owner.def))
+            .enumerate()
+            .filter(|(_, c)| only.is_none_or(|t| t == c.owner.def))
             .collect();
+        // Written trait args pick the ref of that trait (`<dyn P as
+        // B<u16>>::m` with `P: B<u8> + B<u16>`), or none.
+        if let Some(h) = hint {
+            cands.retain(|(_, c)| self.trait_args_fit(h, c.owner));
+        }
         if cands.len() != 1 {
             return None;
         }
-        let c = cands.into_iter().next().unwrap();
+        let (ci, c) = cands.into_iter().next().unwrap();
+        if let Some(h) = hint {
+            let (hs, os) = (self.tys.args(h.args).to_vec(), self.tys.args(c.owner.args).to_vec());
+            for (a, b) in hs.iter().zip(&os).skip(1) {
+                if let (Some(a), Some(b)) = (a.as_ty(), b.as_ty()) {
+                    self.unify(a, b);
+                }
+            }
+        }
         let slot = match c.call {
             Ok((slot, _)) => slot,
             Err(why) => {
@@ -5436,7 +5485,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         sargs[0] = GenericArg::Ty(base);
         let params: Vec<Ty> = tparams.iter().map(|&t| subst(&mut self.tys, t, &sargs)).collect();
         let ret = subst(&mut self.tys, tret, &sargs);
-        self.set_res(e, Res::DynMethod { owner: c.owner.def, slot, derefs: 0, autoref: Autoref::None });
+        let cand = u8::try_from(ci).expect("at most 256 object candidates");
+        self.set_res(e, Res::DynMethod { owner: c.owner.def, cand, slot, derefs: 0, autoref: Autoref::None });
         if c.needs_static && !object::dyn_is_static(p, &self.tys, base) {
             self.obl.push(obligations::Obligation::DynStatic { span });
         }
@@ -5625,20 +5675,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let hint = if trait_path.is_empty() {
                         None
                     } else {
-                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                         let tref = ast::TraitRefExpr { path: trait_path.clone() };
-                        generics::resolve_trait_ref(
-                            p.ast,
-                            p.interner,
-                            p.known,
-                            &cx,
-                            &mut self.tys,
-                            &self.body_scope.clone(),
-                            base,
-                            &tref,
-                            span,
-                        )
-                        .ok()
+                        match self.written_trait_ref(base, &tref, span) {
+                            Ok(tr) => Some(tr),
+                            Err(d) => {
+                                self.errs.push(d);
+                                for &a in args {
+                                    self.expr(a, None);
+                                }
+                                return ERROR;
+                            }
+                        }
                     };
                     if let Some(t) = self.assoc_call(e, callee, base, hint, segs[0].name, args, span) {
                         return t;
@@ -5693,15 +5740,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             bases.insert(0, self.deep(inner));
                         }
                         for base in bases {
-                            let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
-                            for _ in 1..rec.generics.params.len() {
-                                tr_args.push(GenericArg::Ty(self.new_var(false)));
-                            }
-                            let args_id = self.tys.intern_args(&tr_args);
-                            let hint = TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS };
+                            // Written trait args (`Tr::<u8>::m(x)`) fix the
+                            // trait ref, as in `<_ as Tr<u8>>::m(x)`.
+                            let hint = if matches!(segs[0].args, ast::GenericArgs::Angle(_)) {
+                                let tref = ast::TraitRefExpr { path: vec![segs[0].clone()] };
+                                match self.written_trait_ref(base, &tref, span) {
+                                    Ok(tr) => tr,
+                                    Err(d) => {
+                                        self.errs.push(d);
+                                        for &a in args {
+                                            self.expr(a, None);
+                                        }
+                                        return ERROR;
+                                    }
+                                }
+                            } else {
+                                let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                                for _ in 1..rec.generics.params.len() {
+                                    tr_args.push(GenericArg::Ty(self.new_var(false)));
+                                }
+                                let args_id = self.tys.intern_args(&tr_args);
+                                TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS }
+                            };
                             if let Some(t) = self.assoc_call(e, callee, base, Some(hint), segs[1].name, args, span) {
                                 return t;
                             }
+                        }
+                        if matches!(segs[0].args, ast::GenericArgs::Angle(_)) {
+                            let shown = match self.tys.kind(at) {
+                                TyKind::Ref(_, _, inner) => self.deep(inner),
+                                _ => at,
+                            };
+                            let (tr_name, tn) = (self.trait_name(tdef), self.tn(shown));
+                            self.err(
+                                "L0612",
+                                span,
+                                format!("no impl of `{tr_name}` with these trait arguments for `{tn}`"),
+                                "Change the trait arguments, or add the impl.",
+                            );
+                            for &a in args {
+                                self.expr(a, None);
+                            }
+                            return ERROR;
                         }
                     }
                 }
