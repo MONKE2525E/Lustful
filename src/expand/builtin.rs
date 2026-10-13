@@ -854,9 +854,11 @@ fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<
         }
         // `const { e }` and nothing else is the const form; any other
         // initializer (`const { 1 } + 1` included) is a lazy expression.
+        // Its block is the init fn body's one expression, so the checker
+        // can hand a block with statements to the const evaluator whole.
         let const_block = match init.as_slice() {
             [c, b] if c.is_tok(Tok::Const) => match unwrap_frag(std::slice::from_ref(b)) {
-                [Tt::Delim(Delim::Brace, inner, s)] => Some(Tt::Delim(Delim::Brace, inner.clone(), *s)),
+                [Tt::Delim(Delim::Brace, inner, s)] => Some(Tt::Delim(Delim::Brace, vec![Tt::Delim(Delim::Brace, inner.clone(), *s)], *s)),
                 _ => None,
             },
             _ => None,

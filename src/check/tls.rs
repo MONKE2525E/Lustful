@@ -205,25 +205,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if !self.p.statics.iter().any(|s| s.tls.is_some_and(|k| k.eager && k.init == fid)) {
             return;
         }
+        // The init fn body is `{ { .. } }`: its tail is the const block.
         let def = self.p.fn_info(fid).def;
-        if let Some(b) = def.body {
-            self.tls_const_block(b, def.name_span);
+        if let Some(b) = def.body
+            && let Some(t) = self.p.ast.block(b).tail
+        {
+            self.tls_const_expr(t);
         }
     }
 
-    fn tls_const_block(&mut self, b: ast::BlockId, span: Span) {
-        let blk = self.p.ast.block(b);
-        match (blk.stmts.is_empty(), blk.tail) {
-            (true, Some(t)) => self.tls_const_expr(t),
-            _ => self.err(
-                "L0640",
-                span,
-                "statements in a `thread_local!` `const { .. }` initializer are not supported yet",
-                "Write the initializer as one expression.",
-            ),
-        }
-    }
-
+    /// Proves one part of a const initializer (see `tls_const_init_check`).
+    /// A block with statements goes to the evaluator whole.
     fn tls_const_expr(&mut self, e: ExprId) {
         use Builtin as B;
         let p = self.p;
@@ -239,10 +231,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             ast::Expr::StructLit { fields, update: None, .. } => fields.iter().map(|f| f.2).collect(),
             ast::Expr::Tuple(es) | ast::Expr::Array(es) => es.clone(),
-            ast::Expr::Block(b) => {
-                let span = self.span(e);
-                return self.tls_const_block(*b, span);
-            }
+            ast::Expr::Block(b) if p.ast.block(*b).stmts.is_empty() && p.ast.block(*b).tail.is_some() => vec![p.ast.block(*b).tail.unwrap()],
             _ => {
                 let t = self.out.expr_ty[self.ei(e)];
                 let mut ccx = CheckCx { cx: self };
