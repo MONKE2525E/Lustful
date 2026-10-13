@@ -66,6 +66,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterCollect
             | B::IterSum
             | B::IterProduct
+            | B::HashExtend
     )
 }
 
@@ -520,9 +521,53 @@ impl Ex<'_, '_, '_> {
                 self.drop_local(owned);
                 self.drop_local(fl);
             }
+            B::HashExtend => {
+                // `map.extend(src)` (W-STD-B): `src` through `IntoIterator`.
+                let (r, src) = (arg()?, arg()?);
+                let st = self.op_ty(&src)?;
+                let want = it::as_iter_ty(&mut self.body.tys, st).ok_or("iterator expansion: bad extend argument")?;
+                let iv = self.into_iter(src, want)?;
+                let (owned, ty) = self.own(iv)?;
+                let rt = self.op_ty(&r)?;
+                let rl = self.local(rt);
+                self.assign(Place::local(rl), Rvalue::Use(r));
+                self.hash_extend(Place::local(owned), ty, rl)?;
+                self.drop_local(owned);
+                self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
+            }
             _ => return Err(format!("iterator expansion: unexpected builtin {b:?}")),
         }
         Ok(())
+    }
+
+    /// hashbrown's `extend` into the map or set behind `table` (a `&mut`
+    /// local): reserve the size hint's lower bound when the table is
+    /// empty, else half of it rounded up, then insert every item in
+    /// order (a map's `(K, V)` items; an old value drops at once).
+    fn hash_extend(&mut self, itp: Place, ty: Ty, table: Local) -> R {
+        let tt = self.body.locals[table as usize].ty;
+        let TyKind::Ref(_, _, t) = self.body.tys.kind(tt) else { return Err("iterator expansion: extend of a non-reference".into()) };
+        let (kind, targs) = crate::ty::hash::hash_parts(&self.body.tys, t).ok_or("iterator expansion: extend of a non-table")?;
+        let (lo, _) = self.hint(itp.clone(), ty)?;
+        let u = self.local(UNIT);
+        self.call_builtin(Builtin::HashExtendReserve, vec![Operand::Copy(Place::local(table)), Operand::Copy(Place::local(lo))], Place::local(u));
+        let map = kind == crate::ty::hash::HashTy::HashMap;
+        let old_ty = if map { self.body.tys.mk_option(targs[1]) } else { BOOL };
+        self.each(&itp, ty, &mut |this, x, _| {
+            let res = this.local(old_ty);
+            let mut args = vec![Operand::Copy(Place::local(table))];
+            if map {
+                args.push(Operand::Move(Place::local(x).project(Proj::Field(0))));
+                args.push(Operand::Move(Place::local(x).project(Proj::Field(1))));
+            } else {
+                args.push(Operand::Move(Place::local(x)));
+            }
+            this.call_builtin(if map { Builtin::MapInsert } else { Builtin::SetInsert }, args, Place::local(res));
+            if map {
+                this.drop_local(res);
+            }
+            Ok(())
+        })
     }
 
     /// The iterator place and type behind a `&mut I` argument.
@@ -555,6 +600,8 @@ impl Ex<'_, '_, '_> {
         let l = self.local(want);
         match k {
             IterKind::VecIntoIter => self.call_builtin(Builtin::IterVecIntoIter, vec![o], Place::local(l)),
+            // A map or set (or a reference to one) makes its hash iterator.
+            k if k.is_hash() => self.call_builtin(Builtin::HashIterNew, vec![o], Place::local(l)),
             IterKind::SliceIter | IterKind::SliceIterMut => {
                 let fields = it::field_tys(&mut self.body.tys, want).ok_or("iterator expansion: bad slice iterator")?;
                 let pl = self.op_place(o, ot);
@@ -630,6 +677,22 @@ impl Ex<'_, '_, '_> {
                 let r = self.ref_to(true, itp, ty);
                 let b = if back { Builtin::VecIterNextBack } else { Builtin::VecIterNext };
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
+            // The hash iterators step in the core (cgen/hash.rs, W-STD-B);
+            // none is double-ended.
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => {
+                let r = self.ref_to(true, itp, ty);
+                self.call_builtin(Builtin::HashIterNext, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
             K::Range => {
@@ -2134,6 +2197,22 @@ impl Ex<'_, '_, '_> {
                 self.call_builtin(Builtin::VecIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
                 set_exact(self, Operand::Copy(Place::local(n)));
             }
+            // hashbrown's iterators know their remaining count exactly.
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => {
+                let r = self.ref_to(false, itp, ty);
+                let n = self.local(USIZE);
+                self.call_builtin(Builtin::HashIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
+                set_exact(self, Operand::Copy(Place::local(n)));
+            }
             K::RangeInclusive => {
                 // Exhausted or empty: (0, Some(0)); else steps + 1, with
                 // `checked_add` on the upper bound.
@@ -2386,6 +2465,18 @@ impl Ex<'_, '_, '_> {
             K::Skip | K::StepBy => self.tra(a[0]),
             K::Filter | K::FilterMap | K::TakeWhile | K::SkipWhile | K::Inspect => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
+            // Not `TrustedLen` in Rust 1.99 (`collect` of two keys
+            // allocates 4).
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => false,
         }
     }
 
@@ -3307,6 +3398,16 @@ impl Ex<'_, '_, '_> {
             }
             self.cur = join;
             self.assign(dest, Rvalue::Use(Operand::Move(Place::local(s))));
+            return Ok(());
+        }
+        // `HashMap::from_iter` and `HashSet::from_iter` (W-STD-B):
+        // `with_hasher(S::default())`, then `extend`.
+        if crate::ty::hash::hash_parts(&self.body.tys, dest_ty).is_some() {
+            let m = self.local(dest_ty);
+            self.call_builtin(Builtin::HashDefault, vec![], Place::local(m));
+            let rm = self.ref_to(true, Place::local(m), dest_ty);
+            self.hash_extend(itp, ty, rm)?;
+            self.assign(dest, Rvalue::Use(Operand::Move(Place::local(m))));
             return Ok(());
         }
         let Some(elem) = self.body.tys.vec_elem(dest_ty) else { return Err("iterator expansion: collect into an unsupported type".into()) };

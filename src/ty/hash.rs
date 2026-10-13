@@ -21,6 +21,21 @@ pub enum HashTy {
     /// `hash_map::Entry<'a, K, V>`: args `[K, V]`. Only its methods are
     /// supported (not matching on its variants).
     Entry,
+    // The C forms of the hash iterators (`IterKind::is_hash`), never
+    // types: no def, not in `ALL`. Args are `[K, V]` for a map's,
+    // `[T]` for a set's; the variant says which part an item is.
+    /// Borrowing, item `(&K, &V)` (`iter`, `iter_mut`).
+    IterPairs,
+    /// Borrowing, item `&K` (`keys`, a set's `iter`).
+    IterKeys,
+    /// Borrowing, item `&V` (`values`, `values_mut`).
+    IterValues,
+    /// Owning, item `(K, V)` (`into_iter`).
+    IntoPairs,
+    /// Owning, item `K` (`into_keys`, a set's `into_iter`).
+    IntoKeys,
+    /// Owning, item `V` (`into_values`).
+    IntoValues,
 }
 
 impl HashTy {
@@ -37,7 +52,31 @@ impl HashTy {
             HashTy::DefaultHasher => (&["std", "hash", "random"], "DefaultHasher"),
             HashTy::BuildHasherDefault => (&["core", "hash"], "BuildHasherDefault"),
             HashTy::Entry => (&["std", "collections", "hash_map"], "Entry"),
+            _ => (&["std", "collections", "hash_map"], "Iter"),
         }
+    }
+
+    /// The C form of a hash iterator kind.
+    pub fn of_iter(k: crate::ty::iter::IterKind) -> HashTy {
+        use crate::ty::iter::IterKind as K;
+        match k {
+            K::MapIter | K::MapIterMut => HashTy::IterPairs,
+            K::MapKeys | K::SetIter => HashTy::IterKeys,
+            K::MapValues | K::MapValuesMut => HashTy::IterValues,
+            K::MapIntoIter => HashTy::IntoPairs,
+            K::MapIntoKeys | K::SetIntoIter => HashTy::IntoKeys,
+            _ => HashTy::IntoValues,
+        }
+    }
+
+    /// True for the iterator C forms.
+    pub fn is_iter_form(self) -> bool {
+        self as usize >= HashTy::IterPairs as usize
+    }
+
+    /// True for the owning iterator C forms.
+    pub fn is_owning_iter(self) -> bool {
+        matches!(self, HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues)
     }
 
     /// The number of type args.
@@ -47,6 +86,7 @@ impl HashTy {
             HashTy::HashSet | HashTy::Entry => 2,
             HashTy::BuildHasherDefault => 1,
             HashTy::RandomState | HashTy::DefaultHasher => 0,
+            _ => 2,
         }
     }
 

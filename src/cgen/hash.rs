@@ -19,7 +19,7 @@ pub(super) fn is_table(k: HashTy) -> bool {
 /// True for the hash types cgen declares a struct for: the tables and
 /// `Entry`.
 pub(super) fn has_struct(k: HashTy) -> bool {
-    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry)
+    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry) || k.is_iter_form()
 }
 
 /// The member list of a declared hash struct: a table and its builder,
@@ -28,6 +28,10 @@ pub(super) fn has_struct(k: HashTy) -> bool {
 pub(super) fn struct_fields(t: &CTy) -> String {
     match t {
         CTy::Hash(HashTy::Entry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
+        // An owning iterator's `it.t` points at its own `t`: re-pointed
+        // before each use, since the struct moves.
+        CTy::Hash(k, _) if k.is_owning_iter() => "lust_hash_table t; lust_hash_iter it;".to_string(),
+        CTy::Hash(k, _) if k.is_iter_form() => "lust_hash_iter it;".to_string(),
         _ => format!("lust_hash_table t; {} s;", ctype(&builder_cty(t))),
     }
 }
@@ -40,6 +44,7 @@ pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
         HashTy::DefaultHasher => "lust_sip13".into(),
         HashTy::BuildHasherDefault => "lust_Unit".into(),
         HashTy::Entry => format!("HE_{mangled}"),
+        _ => format!("HI_{mangled}"),
     }
 }
 
@@ -49,6 +54,8 @@ pub(super) fn elem_cty(t: &CTy) -> CTy {
     match t {
         CTy::Hash(HashTy::HashMap | HashTy::Entry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
         CTy::Hash(HashTy::HashSet, a) => a[0].clone(),
+        CTy::Hash(k, a) if k.is_iter_form() && a.len() == 2 => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
+        CTy::Hash(k, a) if k.is_iter_form() => a[0].clone(),
         _ => CTy::Unit,
     }
 }
@@ -520,7 +527,26 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::SetContains
             | B::SetRemove
             | B::SetGet
+            | B::HashIterNew
+            | B::HashIterNext
+            | B::HashIterLen
+            | B::HashExtendReserve
+            | B::HashReserve
     )
+}
+
+/// The drop glue body of an owning hash iterator: the elements not yet
+/// yielded, in iteration order, then the allocation (hashbrown's
+/// `RawIntoIter` drop).
+pub(super) fn iter_drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let ec = elem_cty(t);
+    let mut body = String::from("  p->it.t = &p->t;\n");
+    if needs_drop_c(p, &ec) {
+        need(Glue::Drop, &ec);
+        let _ = writeln!(body, "  {{ void *e; while ((e = lust_hash_iter_next(&p->it, 0))) drop_{}(({}*)e); }}", mangle(&ec), ctype(&ec));
+    }
+    body.push_str("  lust_hash_drop_table(&p->t, 0, 0);\n");
+    body
 }
 
 impl FnGen<'_, '_, '_> {
@@ -750,6 +776,82 @@ impl FnGen<'_, '_, '_> {
             B::EntryKey => {
                 let e = ctype(&elem_cty(&recv));
                 Some(format!("({r}->slot ? &(({e}*){r}->slot)->f0 : &{r}->key)"))
+            }
+            B::HashIterNew => {
+                // A borrowing iterator walks the table in place; an owning
+                // one takes the table, and the map's builder drops now
+                // (the map is consumed by `into_iter`).
+                let CTy::Hash(k, _) = dest else { return None };
+                if !k.is_owning_iter() {
+                    let _ = writeln!(self.out, "    {dc} {t}; lust_hash_iter_init(&{t}.it, &{r}->t);");
+                    return Some(t);
+                }
+                let m = self.tmp();
+                let _ = writeln!(self.out, "    {} {m} = {};", ctype(&recv), vals[0]);
+                let s = builder_cty(&recv);
+                if needs_drop_c(self.p, &s) {
+                    self.want(Glue::Drop, &s);
+                    let _ = writeln!(self.out, "    drop_{}(&{m}.s);", mangle(&s));
+                }
+                let _ = writeln!(self.out, "    {dc} {t}; {t}.t = {m}.t; lust_hash_iter_init(&{t}.it, &{t}.t);");
+                Some(t)
+            }
+            B::HashIterLen => Some(format!("{r}->it.left")),
+            B::HashReserve | B::HashExtendReserve => {
+                // `extend` reserves the hint's lower bound into an empty
+                // table, else half of it rounded up (wrapping, as std).
+                let m = mangle(&recv);
+                self.want(Glue::HashOf, &recv);
+                let n = if b == B::HashReserve {
+                    vals[1].clone()
+                } else {
+                    format!("(lust_hash_len(&{r}->t) == 0 ? (uint64_t)({0}) : ((uint64_t)({0}) + 1) / 2)", vals[1])
+                };
+                let _ = writeln!(self.out, "    lust_hash_reserve(&{r}->t, {n}, hof_{m}, &{r}->s);");
+                Some("((lust_Unit){})".into())
+            }
+            B::HashIterNext => {
+                let CTy::Hash(k, a) = &recv else { return None };
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let f = self.tmp();
+                let repoint = if k.is_owning_iter() { format!("{r}->it.t = &{r}->t; ") } else { String::new() };
+                let _ = writeln!(self.out, "    {repoint}{e} *{f} = ({e}*)lust_hash_iter_next(&{r}->it, 0);");
+                let map = a.len() == 2;
+                // The part of an owned element an item leaves behind drops
+                // when the item is taken (`map(|(k, _)| k)` and kin).
+                let mut drop_part = |this: &mut Self, part: usize| {
+                    let pc = a[part].clone();
+                    if needs_drop_c(this.p, &pc) {
+                        this.want(Glue::Drop, &pc);
+                        let _ = writeln!(this.out, "    if ({f}) drop_{}(&{f}->f{part});", mangle(&pc));
+                    }
+                };
+                let item = match k {
+                    HashTy::IterPairs => {
+                        let it = CTy::Tuple(vec![CTy::Ref(Box::new(a[0].clone())), CTy::Ref(Box::new(a[1].clone()))]);
+                        collect_types(&it, &mut self.sig_types);
+                        format!("(({}){{ &{f}->f0, &{f}->f1 }})", ctype(&it))
+                    }
+                    HashTy::IterKeys if map => format!("(&{f}->f0)"),
+                    HashTy::IterKeys => f.clone(),
+                    HashTy::IterValues => format!("(&{f}->f1)"),
+                    HashTy::IntoPairs => format!("(*{f})"),
+                    HashTy::IntoKeys if map => {
+                        drop_part(self, 1);
+                        format!("({f}->f0)")
+                    }
+                    HashTy::IntoKeys => format!("(*{f})"),
+                    HashTy::IntoValues => {
+                        drop_part(self, 0);
+                        format!("({f}->f1)")
+                    }
+                    _ => return None,
+                };
+                let some = self.make_variant(dest, 1, &[item]);
+                let none = self.make_variant(dest, 0, &[]);
+                let _ = writeln!(self.out, "    {dc} {t} = {f} ? {some} : {none};");
+                Some(t)
             }
             _ => None,
         }

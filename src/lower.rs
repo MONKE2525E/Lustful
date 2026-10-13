@@ -3431,15 +3431,27 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = bodyb;
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             self.assign(Place::local(item), Rvalue::Use(Operand::Copy(c)), span);
-        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter))
-            || self.body.tys.boxed_slice_elem(self.ty(iter)).is_some()
-            || self.recv_iterable(self.ty(iter)).is_some()
-        {
+        } else if let Some(hash_it) = {
+            let ity = self.ty(iter);
+            let h = crate::ty::iter::hash_for_iter(&mut self.body.tys, ity).flatten();
+            h.or_else(|| {
+                (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.recv_iterable(ity).is_some())
+                    .then_some(ERROR)
+            })
+        } {
             // `for x in it` over a builtin iterator (ty/iter.rs): call
-            // `next` until it returns None, like the Chars arm. A boxed
-            // slice by value iterates its `vec::IntoIter` (Rust 2024).
+            // `next` until it returns None, like the Chars arm. A map or
+            // set (or a reference to one) first makes its hash iterator. A
+            // boxed slice by value iterates its `vec::IntoIter` (Rust 2024).
             let recv = self.recv_iterable(self.ty(iter));
             let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
+                _ if hash_it != ERROR => {
+                    let it = self.temp(hash_it);
+                    let src = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(src)));
+                    self.call_into(CallTarget::Builtin(Builtin::HashIterNew), vec![Operand::Move(Place::local(src))], Place::local(it), span);
+                    (hash_it, it)
+                }
                 // An mpsc receiver (W-THREADS): `for x in rx` iterates
                 // its `IntoIter`, `for x in &rx` its `Iter`.
                 _ if let Some((owned, el)) = recv => {

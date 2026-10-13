@@ -503,6 +503,18 @@ pub enum Builtin {
     SetContains,
     SetRemove,
     SetGet,
+    /// A hash iterator from its map or set (by reference or by value);
+    /// the kind is the result type's (`IterKind::is_hash`).
+    HashIterNew,
+    /// `next` and the remaining length of a hash iterator: emitted by
+    /// the iterator expansion (lower/iter.rs), never by check.
+    HashIterNext,
+    HashIterLen,
+    /// `map.extend(iter)` and `set.extend(iter)`: expanded with the
+    /// iterator (lower/iter.rs); `HashExtendReserve` is its reserve step.
+    HashExtend,
+    HashExtendReserve,
+    HashReserve,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -11040,7 +11052,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ret;
             }
             // HashMap, HashSet, and Entry methods (check/hashmap.rs).
-            if let Some(ret) = self.hash_coll_method(e, recv, base, derefs, name, name_span, args) {
+            if let Some(ret) = self.hash_coll_method(e, recv, rt, base, derefs, name, name_span, args) {
                 return ret;
             }
         }
@@ -12650,6 +12662,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return lt;
         }
         let t = self.expr(iter, None);
+        // A map or set, by value or by reference (W-STD-B): the loop
+        // runs its hash iterator (`hash_for_iter`).
+        let dt = self.deep(t);
+        if let Some(it) = crate::ty::iter::hash_for_iter(&mut self.tys, dt) {
+            return match it {
+                Some(it) => crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR),
+                None => {
+                    let s = self.span(iter);
+                    let tn = self.tn(t);
+                    self.err("L0113", s, format!("`{tn}` is not an iterator"), "Iterate over `&set` or `set` itself.");
+                    ERROR
+                }
+            };
+        }
         match self.kind(t) {
             _ if self.tys.is_chars_ty(self.resolve(t)) => CHAR,
             _ if crate::ty::iter::is_iter(&self.tys, self.resolve(t)) => {

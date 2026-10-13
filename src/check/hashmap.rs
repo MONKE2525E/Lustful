@@ -41,17 +41,9 @@ pub fn hasher_write_arg(name: &str) -> Option<Option<IntTy>> {
 /// HashMap and HashSet methods Rust declares that lust does not port
 /// yet: a call rejects with L0640 naming the method.
 const DECLARED_ONLY: &[&str] = &[
-    "iter",
-    "iter_mut",
-    "keys",
-    "values",
-    "values_mut",
-    "into_keys",
-    "into_values",
     "drain",
     "extract_if",
     "retain",
-    "reserve",
     "try_reserve",
     "shrink_to_fit",
     "shrink_to",
@@ -167,6 +159,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         &mut self,
         e: ExprId,
         recv: ExprId,
+        rt: Ty,
         base: Ty,
         derefs: u8,
         name: Sym,
@@ -179,6 +172,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let n = self.p.interner.get(name);
+        if kind != HashTy::Entry
+            && matches!(n, "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "into_iter" | "into_keys" | "into_values")
+            && let Some(t) = self.hash_iter_source(e, recv, rt, kind, &targs, derefs, n, name_span, args)
+        {
+            return Some(t);
+        }
         let (k, v) = (targs[0], if kind == HashTy::HashSet { UNIT } else { targs[1] });
         let s = *targs.last().unwrap_or(&UNIT);
         let lookup = |cx: &mut Self| {
@@ -192,6 +191,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (_, "is_empty") if table => Some((B::HashIsEmpty, Autoref::Ref, vec![], BOOL, None)),
             (_, "clear") if table => Some((B::HashClear, Autoref::RefMut, vec![], UNIT, None)),
             (_, "capacity") if table => Some((B::HashCapacity, Autoref::Ref, vec![], USIZE, None)),
+            (_, "reserve") if table => Some((B::HashReserve, Autoref::RefMut, vec![USIZE], UNIT, None)),
+            (_, "extend") if table => return Some(self.hash_extend(e, recv, kind, &targs, derefs, name_span, args)),
             (HashTy::HashMap, "insert") => {
                 self.require_hash_key(k, s, name_span);
                 let ov = self.tys.mk_option(v);
@@ -276,6 +277,149 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.require_lookup(k, q, s, name_span);
         }
         Some(ret)
+    }
+
+    /// The iterator sources of a map or set: `iter` and kin through an
+    /// autoref, `into_keys`/`into_values` by value, and `into_iter` by
+    /// Rust's probe (the first autoderef step with an `IntoIterator`
+    /// impl: `&X` and `&mut X` borrow, `X` itself is consumed). None
+    /// for a name the kind does not have.
+    #[allow(clippy::too_many_arguments)]
+    fn hash_iter_source(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        rt: Ty,
+        kind: HashTy,
+        targs: &[Ty],
+        derefs: u8,
+        n: &str,
+        span: Span,
+        args: &[ExprId],
+    ) -> Option<Ty> {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let set = kind == HashTy::HashSet;
+        let iargs: Vec<Ty> = if set { vec![targs[0]] } else { vec![targs[0], targs[1]] };
+        let (ik, autoref, derefs) = match n {
+            "iter" if set => (K::SetIter, Autoref::Ref, derefs),
+            "iter" => (K::MapIter, Autoref::Ref, derefs),
+            "iter_mut" if !set => (K::MapIterMut, Autoref::RefMut, derefs),
+            "keys" if !set => (K::MapKeys, Autoref::Ref, derefs),
+            "values" if !set => (K::MapValues, Autoref::Ref, derefs),
+            "values_mut" if !set => (K::MapValuesMut, Autoref::RefMut, derefs),
+            "into_keys" | "into_values" if !set && derefs == 0 => {
+                (if n == "into_keys" { K::MapIntoKeys } else { K::MapIntoValues }, Autoref::None, 0)
+            }
+            "into_iter" => {
+                let mut t = self.resolve(rt);
+                let mut found = None;
+                for j in 0..=derefs {
+                    match self.kind(t) {
+                        TyKind::Ref(_, m, inner) => {
+                            let inner = self.resolve(inner);
+                            if hash_parts(&self.tys, inner).is_some_and(|(k, _)| k == kind) {
+                                // There is no `IntoIterator for &mut HashSet`.
+                                if !(set && m.is_mut()) {
+                                    let ik = if set { K::SetIter } else if m.is_mut() { K::MapIterMut } else { K::MapIter };
+                                    found = Some((ik, Autoref::None, j));
+                                }
+                                break;
+                            }
+                            t = inner;
+                        }
+                        _ if j == 0 && hash_parts(&self.tys, t).is_some_and(|(k, _)| k == kind) => {
+                            found = Some((if set { K::SetIntoIter } else { K::MapIntoIter }, Autoref::None, 0));
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                found?
+            }
+            _ if matches!(n, "into_keys" | "into_values") && !set => {
+                self.err("L0640", span, format!("`{n}` through a reference is not implemented yet"), "Call it on the map value itself.");
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            _ => return None,
+        };
+        let ret = mk_iter(&mut self.tys, ik, &iargs);
+        if autoref != Autoref::None {
+            self.check_packed_borrow(recv, span);
+        }
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::HashIterNew, derefs, autoref });
+        self.check_args(&[], args, span);
+        Some(ret)
+    }
+
+    /// `map.extend(iter)` (`Extend<(K, V)>`) and `set.extend(iter)`
+    /// (`Extend<T>`) over anything `as_iter_ty` turns into a builtin
+    /// iterator. The `&`-item forms (`Extend<(&K, &V)>` for Copy types)
+    /// are not ported yet (L0640).
+    #[allow(clippy::too_many_arguments)]
+    fn hash_extend(&mut self, e: ExprId, recv: ExprId, kind: HashTy, targs: &[Ty], derefs: u8, span: Span, args: &[ExprId]) -> Ty {
+        let [a] = args else {
+            self.err("L0105", span, "`extend` takes 1 argument", "Pass the iterator.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return ERROR;
+        };
+        let at = self.expr(*a, None);
+        let at = self.deep(at);
+        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at) else {
+            let tn = self.tn(at);
+            self.err("L0640", self.span(*a), format!("`extend` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a map.");
+            return ERROR;
+        };
+        let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
+        let (k, s) = (targs[0], *targs.last().unwrap_or(&UNIT));
+        let want = if kind == HashTy::HashMap {
+            let ts = self.tys.intern_tys(&[targs[0], targs[1]]);
+            self.tys.intern(TyKind::Tuple(ts))
+        } else {
+            k
+        };
+        if !self.unify(want, item) {
+            let it_t = self.deep(item);
+            if matches!(self.kind(it_t), TyKind::Ref(..)) || matches!(self.kind(it_t), TyKind::Tuple(_)) {
+                let tn = self.tn(it_t);
+                self.err("L0640", self.span(*a), format!("`extend` from items of type `{tn}` is not implemented yet"), "Extend with owned items (`.copied()` or `.cloned()`).");
+            } else {
+                self.mismatch(self.span(*a), want, it_t);
+            }
+            return ERROR;
+        }
+        self.require_hash_key(k, s, span);
+        self.check_packed_borrow(recv, span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::HashExtend, derefs, autoref: Autoref::RefMut });
+        UNIT
+    }
+
+    /// `collect` into a HashMap (`FromIterator<(K, V)>`) or a HashSet
+    /// (`FromIterator<T>`): `S: BuildHasher + Default`. None when the
+    /// target is neither.
+    pub(super) fn hash_collect_target(&mut self, t: Ty, item: Ty, span: Span) -> Option<bool> {
+        let (kind, targs) = hash_parts(&self.tys, t)?;
+        let want = match kind {
+            HashTy::HashMap => {
+                let ts = self.tys.intern_tys(&[targs[0], targs[1]]);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            HashTy::HashSet => targs[0],
+            _ => return None,
+        };
+        if !self.unify(want, item) {
+            let it_t = self.deep(item);
+            self.mismatch(span, want, it_t);
+            return Some(false);
+        }
+        let s = *targs.last().unwrap_or(&UNIT);
+        self.require(self.p.gx.lang.default, s, span);
+        self.require_hash_key(targs[0], s, span);
+        Some(true)
     }
 
     /// The signature of a hash type constructor (`HashMap::new` and

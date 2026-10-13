@@ -5982,6 +5982,22 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::VecIntoIter | K::Range | K::RangeInclusive => ps[0],
                 K::Map | K::FilterMap => ps[2],
                 K::Copied | K::Cloned => ps[1],
+                // The hashed-collection iterators (W-STD-B).
+                K::MapIter | K::MapIterMut => {
+                    let kr = p.tys.mk_ref(false, ps[0]);
+                    let vr = p.tys.mk_ref(k == K::MapIterMut, ps[1]);
+                    let ts = p.tys.intern_tys(&[kr, vr]);
+                    p.tys.intern(TyKind::Tuple(ts))
+                }
+                K::MapKeys | K::SetIter => p.tys.mk_ref(false, ps[0]),
+                K::MapValues => p.tys.mk_ref(false, ps[1]),
+                K::MapValuesMut => p.tys.mk_ref(true, ps[1]),
+                K::MapIntoIter => {
+                    let ts = p.tys.intern_tys(&[ps[0], ps[1]]);
+                    p.tys.intern(TyKind::Tuple(ts))
+                }
+                K::MapIntoKeys | K::SetIntoIter => ps[0],
+                K::MapIntoValues => ps[1],
                 K::Enumerate => {
                     let inner = proj(p, ps[0]);
                     let ts = p.tys.intern_tys(&[USIZE, inner]);

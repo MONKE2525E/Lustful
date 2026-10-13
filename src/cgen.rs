@@ -261,6 +261,10 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
     if k == IterKind::VecIntoIter {
         return CTy::VecIter(Box::new(cty(tys, arg(0))));
     }
+    // The hash iterators' state is the core's (cgen/hash.rs).
+    if k.is_hash() {
+        return CTy::Hash(crate::ty::hash::HashTy::of_iter(k), args.iter().map(|&a| cty(tys, a)).collect());
+    }
     let fields = k
         .fields()
         .iter()
@@ -299,6 +303,12 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
         K::Zip => CTy::Tuple(vec![iter_item_cty(tys, a[0]), iter_item_cty(tys, a[1])]),
         K::Copied | K::Cloned => cty(tys, a[1]),
+        K::MapIter | K::MapIterMut => CTy::Tuple(vec![CTy::Ref(Box::new(cty(tys, a[0]))), CTy::Ref(Box::new(cty(tys, a[1])))]),
+        K::MapKeys | K::SetIter => CTy::Ref(Box::new(cty(tys, a[0]))),
+        K::MapValues | K::MapValuesMut => CTy::Ref(Box::new(cty(tys, a[1]))),
+        K::MapIntoIter => CTy::Tuple(vec![cty(tys, a[0]), cty(tys, a[1])]),
+        K::MapIntoKeys | K::SetIntoIter => cty(tys, a[0]),
+        K::MapIntoValues => cty(tys, a[1]),
         _ => iter_item_cty(tys, a[0]),
     }
 }
@@ -659,7 +669,9 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
-        CTy::Hash(k, a) => hash::is_table(*k) || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k))),
+        CTy::Hash(k, a) => {
+            hash::is_table(*k) || k.is_owning_iter() || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k)))
+        }
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -884,6 +896,9 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                         layout::struct_layout(&[layout::ptr_layout(), layout::int_layout(IntTy::U64), layout::ptr_layout(), key], c).ok()
                     }
                     HashTy::HashMap | HashTy::HashSet => layout::struct_layout(&[plain_layout(64, 8), go(p, args.last()?, seen)?], c).ok(),
+                    // `{ lust_hash_iter it; }`, owning: `{ table; it; }`.
+                    HashTy::IterPairs | HashTy::IterKeys | HashTy::IterValues => Some(plain_layout(40, 8)),
+                    HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => Some(plain_layout(104, 8)),
                 }
             }
             CTy::Args => Some(plain_layout(8, 8)),
@@ -1136,6 +1151,8 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 crate::ty::hash::HashTy::RandomState => (16, 8),
                 crate::ty::hash::HashTy::DefaultHasher => (72, 8),
                 crate::ty::hash::HashTy::BuildHasherDefault => (0, 1),
+                k if k.is_owning_iter() => (104, 8),
+                k if k.is_iter_form() => (40, 8),
                 crate::ty::hash::HashTy::Entry => {
                     // `{ table ptr, hash, slot ptr, K key }`
                     let (ks, ka) = args.first().map_or((0, 1), |k| go(p, k, seen));
@@ -3379,7 +3396,13 @@ impl FnGen<'_, '_, '_> {
             | B::SetInsert
             | B::SetContains
             | B::SetRemove
-            | B::SetGet => unreachable!("hash builtins emit in cgen/hash.rs"),
+            | B::SetGet
+            | B::HashIterNew
+            | B::HashIterNext
+            | B::HashIterLen
+            | B::HashExtendReserve
+            | B::HashReserve => unreachable!("hash builtins emit in cgen/hash.rs"),
+            B::HashExtend => unreachable!("expanded with its iterator (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.
@@ -6662,6 +6685,7 @@ fn glue_def(
             match t {
                 CTy::String => body.push_str("  lust_string_drop(p);\n"),
                 CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::drop_body(p, t, &mut need)),
+                CTy::Hash(k, _) if k.is_owning_iter() => body.push_str(&hash::iter_drop_body(p, t, &mut need)),
                 // An occupied Entry dropped its key at `entry()`.
                 CTy::Hash(crate::ty::hash::HashTy::Entry, a) => {
                     need(Glue::Drop, &a[0]);

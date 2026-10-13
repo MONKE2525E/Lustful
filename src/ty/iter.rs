@@ -69,6 +69,30 @@ pub enum IterKind {
     RecvTryIter,
     /// `std::sync::mpsc::IntoIter<T>` (`for x in rx`): args `[T]`.
     RecvIntoIter,
+    // The hashed-collection iterators (W-STD-B; cgen/hash.rs). Map
+    // kinds take args `[K, V]`, set kinds `[T]`. Their state is the
+    // hash core's raw iterator (`fields` is empty: `next` and the
+    // length are builtin calls).
+    /// `hash_map::Iter<K, V>`: item `(&K, &V)`.
+    MapIter,
+    /// `hash_map::IterMut<K, V>`: item `(&K, &mut V)`.
+    MapIterMut,
+    /// `hash_map::Keys<K, V>`: item `&K`.
+    MapKeys,
+    /// `hash_map::Values<K, V>`: item `&V`.
+    MapValues,
+    /// `hash_map::ValuesMut<K, V>`: item `&mut V`.
+    MapValuesMut,
+    /// `hash_map::IntoIter<K, V>`: item `(K, V)`.
+    MapIntoIter,
+    /// `hash_map::IntoKeys<K, V>`: item `K`.
+    MapIntoKeys,
+    /// `hash_map::IntoValues<K, V>`: item `V`.
+    MapIntoValues,
+    /// `hash_set::Iter<T>`: item `&T`.
+    SetIter,
+    /// `hash_set::IntoIter<T>`: item `T`.
+    SetIntoIter,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -94,7 +118,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 24] = [
+    pub const ALL: [IterKind; 34] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -119,13 +143,36 @@ impl IterKind {
         IterKind::RecvIter,
         IterKind::RecvTryIter,
         IterKind::RecvIntoIter,
+        IterKind::MapIter,
+        IterKind::MapIterMut,
+        IterKind::MapKeys,
+        IterKind::MapValues,
+        IterKind::MapValuesMut,
+        IterKind::MapIntoIter,
+        IterKind::MapIntoKeys,
+        IterKind::MapIntoValues,
+        IterKind::SetIter,
+        IterKind::SetIntoIter,
     ];
+
+    /// True for the hashed-collection iterators.
+    pub fn is_hash(self) -> bool {
+        self as usize >= IterKind::MapIter as usize
+    }
+
+    /// True for the hash iterators that own their table (by-value
+    /// `into_iter`, `into_keys`, `into_values`).
+    pub fn is_hash_owning(self) -> bool {
+        matches!(self, IterKind::MapIntoIter | IterKind::MapIntoKeys | IterKind::MapIntoValues | IterKind::SetIntoIter)
+    }
 
     /// The std module path and struct name: the def hash input and
     /// the printed name.
     pub fn path(self) -> (&'static [&'static str], &'static str) {
         use IterKind as K;
         const ADAPT: &[&str] = &["core", "iter", "adapters"];
+        const HMAP: &[&str] = &["std", "collections", "hash", "map"];
+        const HSET: &[&str] = &["std", "collections", "hash", "set"];
         match self {
             K::SliceIter => (&["core", "slice"], "Iter"),
             K::SliceIterMut => (&["core", "slice"], "IterMut"),
@@ -151,6 +198,16 @@ impl IterKind {
             K::RecvIter => (&["std", "sync", "mpsc"], "Iter"),
             K::RecvTryIter => (&["std", "sync", "mpsc"], "TryIter"),
             K::RecvIntoIter => (&["std", "sync", "mpsc"], "IntoIter"),
+            K::MapIter => (HMAP, "Iter"),
+            K::MapIterMut => (HMAP, "IterMut"),
+            K::MapKeys => (HMAP, "Keys"),
+            K::MapValues => (HMAP, "Values"),
+            K::MapValuesMut => (HMAP, "ValuesMut"),
+            K::MapIntoIter => (HMAP, "IntoIter"),
+            K::MapIntoKeys => (HMAP, "IntoKeys"),
+            K::MapIntoValues => (HMAP, "IntoValues"),
+            K::SetIter => (HSET, "Iter"),
+            K::SetIntoIter => (HSET, "IntoIter"),
         }
     }
 
@@ -160,6 +217,14 @@ impl IterKind {
         match self {
             K::Map | K::FilterMap => 3,
             K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned => 2,
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues => 2,
             _ => 1,
         }
     }
@@ -192,6 +257,16 @@ impl IterKind {
             K::RecvIter => "std::sync::mpsc::Iter",
             K::RecvTryIter => "std::sync::mpsc::TryIter",
             K::RecvIntoIter => "std::sync::mpsc::IntoIter",
+            K::MapIter => "std::collections::hash_map::Iter",
+            K::MapIterMut => "std::collections::hash_map::IterMut",
+            K::MapKeys => "std::collections::hash_map::Keys",
+            K::MapValues => "std::collections::hash_map::Values",
+            K::MapValuesMut => "std::collections::hash_map::ValuesMut",
+            K::MapIntoIter => "std::collections::hash_map::IntoIter",
+            K::MapIntoKeys => "std::collections::hash_map::IntoKeys",
+            K::MapIntoValues => "std::collections::hash_map::IntoValues",
+            K::SetIter => "std::collections::hash_set::Iter",
+            K::SetIntoIter => "std::collections::hash_set::IntoIter",
         }
     }
 
@@ -228,6 +303,17 @@ impl IterKind {
             K::Peekable => &[F::Arg(0), F::PeekSlot(0)],
             K::RecvIter | K::RecvTryIter => &[F::Recv(0, false)],
             K::RecvIntoIter => &[F::Recv(0, true)],
+            // The hash core's iterator state (cgen/hash.rs), never a place.
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => &[],
         }
     }
 }
@@ -285,7 +371,67 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
             tys.intern(TyKind::Tuple(ts))
         }
         K::Copied | K::Cloned => a[1],
+        K::MapIter | K::MapIterMut => {
+            let kr = tys.mk_ref(false, a[0]);
+            let vr = tys.mk_ref(k == K::MapIterMut, a[1]);
+            let ts = tys.intern_tys(&[kr, vr]);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        K::MapKeys | K::SetIter => tys.mk_ref(false, a[0]),
+        K::MapValues => tys.mk_ref(false, a[1]),
+        K::MapValuesMut => tys.mk_ref(true, a[1]),
+        K::MapIntoIter => {
+            let ts = tys.intern_tys(&[a[0], a[1]]);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        K::MapIntoKeys | K::SetIntoIter => a[0],
+        K::MapIntoValues => a[1],
     })
+}
+
+/// The hash iterator a `for` loop over `t` runs (W-STD-B): a map or set
+/// by value (`into_iter`), `&` of one (`iter`), or `&mut` of a map
+/// (`iter_mut`). `Some(None)` for `&mut` of a set (no `IntoIterator`
+/// impl), None when `t` is none of these.
+pub fn hash_for_iter(tys: &mut impl TyIntern, t: Ty) -> Option<Option<Ty>> {
+    use crate::ty::hash::{HashTy, hash_parts};
+    let (m, inner) = match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => (Some(m.is_mut()), inner),
+        _ => (None, t),
+    };
+    let (k, a) = hash_parts(tys, inner)?;
+    let (kind, args) = match (k, m) {
+        (HashTy::HashMap, None) => (IterKind::MapIntoIter, vec![a[0], a[1]]),
+        (HashTy::HashMap, Some(false)) => (IterKind::MapIter, vec![a[0], a[1]]),
+        (HashTy::HashMap, Some(true)) => (IterKind::MapIterMut, vec![a[0], a[1]]),
+        (HashTy::HashSet, None) => (IterKind::SetIntoIter, vec![a[0]]),
+        (HashTy::HashSet, Some(false)) => (IterKind::SetIter, vec![a[0]]),
+        (HashTy::HashSet, Some(true)) => return Some(None),
+        _ => return None,
+    };
+    Some(Some(mk_iter(tys, kind, &args)))
+}
+
+/// The iterator an `IntoIterator` argument (`extend`) turns into: a
+/// builtin iterator as itself, a Vec by value as `vec::IntoIter`, `&X`
+/// or `&mut X` over a Vec, slice, or array as a slice iterator, and a
+/// map or set as its `hash_for_iter` iterator. None for other types.
+pub fn as_iter_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+    if is_iter(tys, t) {
+        return Some(t);
+    }
+    if let Some(it) = hash_for_iter(tys, t) {
+        return it;
+    }
+    if let Some(el) = tys.vec_elem(t) {
+        return Some(mk_iter(tys, IterKind::VecIntoIter, &[el]));
+    }
+    let TyKind::Ref(_, m, inner) = tys.kind(t) else { return None };
+    let el = match tys.kind(inner) {
+        TyKind::Slice(el) | TyKind::Array(el, _) => el,
+        _ => tys.vec_elem(inner)?,
+    };
+    Some(mk_iter(tys, if m.is_mut() { IterKind::SliceIterMut } else { IterKind::SliceIter }, &[el]))
 }
 
 /// The semantic type of one stored field.
@@ -322,5 +468,15 @@ pub fn field_tys(tys: &mut impl TyIntern, t: Ty) -> Option<Vec<Ty>> {
 /// iterators always do; every other kind does when one of its args
 /// does (an arg covers every field and the item, see the kind docs).
 pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) -> bool {
-    matches!(k, IterKind::SliceIter | IterKind::SliceIterMut) || args.iter().any(|&a| arg_holds(a))
+    matches!(
+        k,
+        IterKind::SliceIter
+            | IterKind::SliceIterMut
+            | IterKind::MapIter
+            | IterKind::MapIterMut
+            | IterKind::MapKeys
+            | IterKind::MapValues
+            | IterKind::MapValuesMut
+            | IterKind::SetIter
+    ) || args.iter().any(|&a| arg_holds(a))
 }

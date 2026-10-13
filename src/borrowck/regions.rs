@@ -488,6 +488,11 @@ impl AdtTables {
             // `slice::IterMut<'a, T>` holds `&'a mut [T]`: invariant in `T`.
             Some(BuiltinTy::Iter(IterKind::SliceIterMut)) => return (Variance::Inv, DropMode::None),
             Some(BuiltinTy::Iter(IterKind::SliceIter)) => return (Variance::Co, DropMode::None),
+            // `hash_map::IterMut<'a, K, V>` and `ValuesMut` hold `&'a mut V`
+            // (W-STD-B): invariant in V, covariant in K, no drop.
+            Some(BuiltinTy::Iter(IterKind::MapIterMut | IterKind::MapValuesMut)) => {
+                return if j == 1 { (Variance::Inv, DropMode::None) } else { (Variance::Co, DropMode::None) };
+            }
             // The hashed collections (W-STD-B): HashMap and HashSet are
             // covariant and own their elements (hashbrown's RawTable);
             // `BuildHasherDefault<H>` holds `PhantomData<fn() -> H>`; an
@@ -500,6 +505,10 @@ impl AdtTables {
                     HashTy::BuildHasherDefault => (Variance::Co, DropMode::None),
                     HashTy::Entry => (Variance::Inv, if j == 0 { DropMode::Owned } else { DropMode::None }),
                     HashTy::RandomState | HashTy::DefaultHasher => (Variance::Inv, DropMode::Owned),
+                    // The C forms of the iterators are never types (no def).
+                    HashTy::IterPairs | HashTy::IterKeys | HashTy::IterValues | HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => {
+                        (Variance::Inv, DropMode::All)
+                    }
                 };
             }
             // Owning containers and the other iterators: covariant, their
@@ -574,6 +583,8 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
+        // The borrowing hash iterators hold `&'a` (or `&'a mut`) of their table (W-STD-B).
+        Some(BuiltinTy::Iter(k)) if k.is_hash() && !k.is_hash_owning() => return 1,
         // A Debug builder holds `&mut Formatter`, a map Entry `&mut` its
         // map (W-STD-B).
         Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
@@ -3112,6 +3123,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && inner == dt
                 && !av.is_empty()
                 && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashIterNew)) && self.call_hash_iter(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
@@ -3577,6 +3590,93 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         r
     }
 
+    /// `map.iter()` and kin (W-STD-B): the iterator's own region is
+    /// outlived by the map borrow, and its key and value regions follow
+    /// the map's (the values invariantly for `iter_mut` and
+    /// `values_mut`, which hand out `&mut V`). False (nothing added) for
+    /// the by-value forms, which take the opaque rule.
+    fn call_hash_iter(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::ty::iter::IterKind as K;
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, map) = self.body.tys.kind(*t0) else { return false };
+        let Some((ik, _)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
+        let Some((_, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
+        let (Some((&r, mv)), Some((&i, iv))) = (v0.split_first(), dv.split_first()) else { return false };
+        let parts: Vec<(Ty, usize)> = margs.iter().take(if ik == K::SetIter { 1 } else { 2 }).map(|&t| (t, self.sc.slots(t) as usize)).collect();
+        let n: usize = parts.iter().map(|p| p.1).sum();
+        if mv.len() < n || iv.len() < n {
+            return false;
+        }
+        self.edge(r, i);
+        let mut at = 0;
+        for (j, (t, n)) in parts.into_iter().enumerate() {
+            let var = if j == 1 && matches!(ik, K::MapIterMut | K::MapValuesMut) { Variance::Inv } else { Variance::Co };
+            let (a, b) = (mv[at..at + n].to_vec(), iv[at..at + n].to_vec());
+            self.relate(t, &a, t, &b, var);
+            at += n;
+        }
+        true
+    }
+
+    /// `table.extend(iter)` (W-STD-B): the items' regions outlive the
+    /// table's element regions; the iterator's own loans do not reach
+    /// the table unless an item holds them. False (nothing added) when
+    /// the item's regions cannot be read off the iterator type.
+    fn call_hash_extend(&mut self, avs: &[(Ty, Vec<u32>)]) -> bool {
+        let [(t0, v0), (it, iv)] = avs else { return false };
+        let TyKind::Ref(_, _, table) = self.body.tys.kind(*t0) else { return false };
+        let Some((kind, targs)) = crate::ty::hash::hash_parts(&self.body.tys, table) else { return false };
+        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
+        let parts = if kind == crate::ty::hash::HashTy::HashMap { 2 } else { 1 };
+        let n: usize = targs.iter().take(parts).map(|&t| self.sc.slots(t) as usize).sum();
+        let Some(ev) = v0.get(1..1 + n) else { return false };
+        let ev = ev.to_vec();
+        self.flow_all(&item_vars, &ev);
+        true
+    }
+
+    /// The region slots of an iterator type's item, read off the
+    /// iterator's own slots (`vars`, in slot order), for the builtin
+    /// kinds whose item is made of parts of the iterator type. None for
+    /// the rest (`Chain` mixes two sources).
+    fn item_slots(&mut self, t: Ty, vars: &[u32]) -> Option<Vec<u32>> {
+        use crate::ty::iter::IterKind as K;
+        if self.body.tys.is_chars_ty(t) {
+            return Some(Vec::new());
+        }
+        let (k, a) = crate::ty::iter::iter_parts(&self.body.tys, t)?;
+        let mut at = adt_regions(self.p, &self.body.tys, t) as usize;
+        let own: Vec<u32> = vars.get(..at)?.to_vec();
+        let mut args: Vec<Vec<u32>> = Vec::new();
+        for &x in &a {
+            let n = self.sc.slots(x) as usize;
+            args.push(vars.get(at..at + n)?.to_vec());
+            at += n;
+        }
+        let cat = |parts: &[&[u32]]| parts.concat();
+        Some(match k {
+            K::SliceIter | K::SliceIterMut => cat(&[&own, &args[0]]),
+            K::VecIntoIter | K::Range | K::RangeInclusive => args[0].clone(),
+            K::Map | K::FilterMap => args[2].clone(),
+            K::Copied | K::Cloned => args[1].clone(),
+            K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
+                self.item_slots(a[0], &args[0])?
+            }
+            K::Zip => {
+                let x = self.item_slots(a[0], &args[0])?;
+                let y = self.item_slots(a[1], &args[1])?;
+                cat(&[&x, &y])
+            }
+            K::Chain => return None,
+            K::MapIter | K::MapIterMut => cat(&[&own, &args[0], &own, &args[1]]),
+            K::MapKeys | K::SetIter => cat(&[&own, &args[0]]),
+            K::MapValues | K::MapValuesMut => cat(&[&own, &args[1]]),
+            K::MapIntoIter => cat(&[&args[0], &args[1]]),
+            K::MapIntoKeys | K::SetIntoIter => args[0].clone(),
+            K::MapIntoValues => args[1].clone(),
+        })
+    }
+
     /// Splits an iterator argument's slots (in `non_closure_slots`
     /// order) into the loan regions of the builtin iterator structs in
     /// it (their `adt_regions` slots) and the element regions (every
@@ -3957,6 +4057,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 out.push(item);
                 true
             }
+            // The W-STD-B kinds (hash iterators, array::IntoIter, repeat_n,
+            // Windows, CharIndices, ByNext, Flatten, option::IntoIter): the
+            // conservative item rule (`item_slots` for the hash forms).
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => false,
         }
     }
 

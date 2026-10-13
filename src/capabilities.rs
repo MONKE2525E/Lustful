@@ -411,6 +411,12 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::SetContains,
     Builtin::SetRemove,
     Builtin::SetGet,
+    Builtin::HashIterNew,
+    Builtin::HashIterNext,
+    Builtin::HashIterLen,
+    Builtin::HashExtend,
+    Builtin::HashExtendReserve,
+    Builtin::HashReserve,
 ];
 
 /// How a builtin is called.
@@ -753,6 +759,23 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         ),
         B::EntryOrInsert | B::EntryOrDefault | B::EntryKey => {
             (&["hash_map::Entry<K, V>"], vec![i.intern("or_insert"), i.intern("or_default"), i.intern("key")], Call::Method)
+        }
+        B::HashIterNew | B::HashIterNext | B::HashIterLen => (
+            &["HashMap<K, V, S>", "HashSet<T, S>"],
+            vec![
+                i.intern("iter"),
+                i.intern("iter_mut"),
+                i.intern("keys"),
+                i.intern("values"),
+                i.intern("values_mut"),
+                i.intern("into_iter"),
+                i.intern("into_keys"),
+                i.intern("into_values"),
+            ],
+            Call::Method,
+        ),
+        B::HashExtend | B::HashExtendReserve | B::HashReserve => {
+            (&["HashMap<K, V, S>", "HashSet<T, S>"], vec![i.intern("extend"), i.intern("reserve")], Call::Method)
         }
         B::SetInsert | B::SetContains | B::SetRemove | B::SetGet => {
             (&["HashSet<T, S>"], vec![i.intern("insert"), i.intern("contains"), i.intern("remove"), i.intern("get")], Call::Method)

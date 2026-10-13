@@ -671,6 +671,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             K::Enumerate | K::Take | K::Skip | K::Zip | K::StepBy => false,
             K::TakeWhile | K::SkipWhile => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
+            // hashbrown's iterators are forward-only.
+            K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => false,
         }
     }
 
@@ -715,6 +726,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let tn = self.tn(it_t);
                 self.err("L0612", span, format!("a `String` cannot be built from an iterator over `{tn}`"), "Collect into a `Vec` instead.");
             }
+            return ok;
+        }
+        if let Some(ok) = self.hash_collect_target(t, item, span) {
             return ok;
         }
         if matches!(self.kind(t), TyKind::Infer(_)) {
