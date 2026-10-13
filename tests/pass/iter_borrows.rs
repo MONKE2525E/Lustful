@@ -25,4 +25,21 @@ fn main() {
         *x += n as i32;
     }
     println!("{:?}", w);
+    counted();
+}
+
+// A counting closure's capture ends with the iterator: the items
+// only borrow the collection.
+fn counted() {
+    let v = vec![1, 2, 3];
+    let mut n = 0;
+    let first = v.iter().inspect(|_| n += 1).next();
+    n += 1;
+    let mut m = 0;
+    let all: Vec<&i32> = v.iter().filter(|_| {
+        m += 1;
+        true
+    }).collect();
+    m += 1;
+    println!("{:?} {} {:?} {}", first, n, all, m);
 }

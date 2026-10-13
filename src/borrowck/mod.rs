@@ -126,6 +126,10 @@ struct Loan {
     span: Span,
     /// The last use of the local that first holds this loan, if it is after the borrow.
     last_use: Option<Span>,
+    /// Made for a closure capture (its holder goes into a closure
+    /// value). Iterator items never carry these: a closure cannot
+    /// return a reference, so item references come from the sources.
+    capture: bool,
 }
 
 /// One field path below a local, as encoded projections (`Field`/`Downcast`). An empty path
@@ -533,6 +537,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     synthetic: true,
                     span: Span::default(),
                     last_use: None,
+                    capture: false,
                 });
             }
         }
@@ -559,7 +564,27 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.loan_stmt.push(si as u32);
                     self.loan_at[self.stmt_base[bi] + si] = self.loans.len() as u32;
                     holders.push(if dest.proj.is_empty() { Some(dest.local) } else { None });
-                    self.loans.push(Loan { place: place.clone(), mutable: m, synthetic: false, span: s.span, last_use: None });
+                    self.loans.push(Loan { place: place.clone(), mutable: m, synthetic: false, span: s.span, last_use: None, capture: false });
+                }
+            }
+        }
+        // Loans whose holder goes into a closure value are capture loans.
+        for b in &self.body.blocks {
+            for st in &b.stmts {
+                if let StmtKind::Assign(_, Rvalue::TupleAgg(ty, ops)) = &st.kind
+                    && matches!(self.body.tys.kind(*ty), TyKind::Closure(..))
+                {
+                    for o in ops {
+                        if let Operand::Copy(p) | Operand::Move(p) = o
+                            && p.proj.is_empty()
+                        {
+                            for (li, h) in holders.iter().enumerate() {
+                                if *h == Some(p.local) {
+                                    self.loans[li].capture = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1285,6 +1310,28 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
                 if target == CallTarget::Builtin(Builtin::VecPush) {
                     self.flow_into_mut_args(args, st, span);
+                }
+            }
+        }
+        // Iterator items and the containers built from them never
+        // carry a closure's capture loans (see `Loan::capture`).
+        if let CallTarget::Builtin(
+            Builtin::IterNext
+            | Builtin::IterNth
+            | Builtin::IterFind
+            | Builtin::IterFindMap
+            | Builtin::IterLast
+            | Builtin::IterMin
+            | Builtin::IterMax
+            | Builtin::IterMinByKey
+            | Builtin::IterMaxByKey
+            | Builtin::IterCollect,
+        ) = target
+        {
+            for li in 0..self.loans.len() {
+                if self.loans[li].capture {
+                    new_holds.remove(li);
+                    new_origins.remove(li);
                 }
             }
         }
