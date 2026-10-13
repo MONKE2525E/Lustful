@@ -2838,11 +2838,24 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let labeled = matches!(self.peek(), Tok::Lifetime(_)) && self.peek_at(1) == Tok::Colon;
-            let block_like = labeled || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
+            // An inline `const { .. }` block is block-like too: as a
+            // statement it needs no `;` and ends at its `}` (rustc).
+            let const_block = self.peek() == Tok::Const && self.peek_at(1) == Tok::LBrace;
+            let block_like =
+                labeled || const_block || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
             // A statement (or block tail) block may carry inner attributes.
             self.block_inner_ok = true;
             let expr = if block_like {
-                let e = if labeled { self.expr()? } else { self.block_like_expr(true)? };
+                let e = if labeled {
+                    self.expr()?
+                } else if const_block {
+                    let start = self.span();
+                    self.bump();
+                    let b = self.block()?;
+                    self.push_expr(Expr::ConstBlock(b), start.to(self.prev_span()))
+                } else {
+                    self.block_like_expr(true)?
+                };
                 // Allow method calls on a block-like expression, as rustc does.
                 if self.peek() == Tok::Dot || self.peek() == Tok::Question {
                     let e = self.postfix(e)?;

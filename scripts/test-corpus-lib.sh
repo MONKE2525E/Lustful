@@ -234,7 +234,14 @@ corpus_fail_one() {
   if [ $status -eq 124 ]; then
     corpus_lust_note unsupported "$name" "lust check timed out after ${case_timeout}s"
   elif [ $status -eq 0 ]; then
-    corpus_lust_note wrong "$name" "lust accepted a case rustc rejects ($want)"
+    # A post-monomorphization error (a generic inline const assert,
+    # ARCH 2.13) is a build error only, in rustc's check as in lust's:
+    # the build must reject it then.
+    if timeout "$case_timeout" "$LUST" build "$f" -o "$corpus_work/$name.lust" >"$corpus_work/$name.lust.out" 2>&1; then
+      corpus_lust_note wrong "$name" "lust accepted a case rustc rejects ($want)"
+    else
+      corpus_lust_note match "$name" ""
+    fi
   else
     corpus_lust_note match "$name" ""
   fi

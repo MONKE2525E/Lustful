@@ -4828,7 +4828,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            Expr::ConstBlock(_) => {
+            Expr::ConstBlock(b) => {
+                let b = *b;
                 let mut ccx = CheckCx { cx: self };
                 match crate::ty::consteval::eval(&mut ccx, e, expected) {
                     Ok((v, t)) => {
@@ -4836,6 +4837,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         ccx.cx.out.const_exprs[i] = Some(v);
                         t
                     }
+                    // A generic inline const (ARCH 2.13): a layout over the
+                    // template's params has no value here, so the template
+                    // check checks the block in generic form and each
+                    // instance evaluates it with its own types (a failing
+                    // assert is then a build error, as rustc's post-mono
+                    // error is).
+                    Err(d) if d.code == "L0652" && ccx.cx.is_template_check() => self.block(b, expected),
                     Err(d) => {
                         ccx.cx.errs.push(d);
                         ERROR
