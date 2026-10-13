@@ -1896,6 +1896,13 @@ pub struct GenTables<'a> {
     /// written `?Sized`: they answer `Sized` with false, so a
     /// template cannot unsize or pass on a param that may be `dyn`.
     pub unsized_opaques: Vec<AdtId>,
+    /// Every abstract stand-in Adt: a template param may hold a borrow.
+    pub opaque_adts: Vec<AdtId>,
+    /// Impls whose header names a dyn type with a `'static` object
+    /// lifetime (`impl dyn Tr`, `impl X for dyn Tr`), and their methods.
+    /// Using one needs the dyn value to be `'static` (`check::object`).
+    pub static_dyn_impls: Vec<DefId>,
+    pub static_dyn_fns: Vec<LocalDefId>,
     /// True once mono's materialize pass is done: every vtable a
     /// concrete body needs exists from then on.
     pub mono_done: bool,
@@ -1945,6 +1952,9 @@ impl Default for GenTables<'_> {
             dyn_inherent: FxMap::default(),
             dyn_impl_sites: Vec::new(),
             unsized_opaques: Vec::new(),
+            opaque_adts: Vec::new(),
+            static_dyn_impls: Vec::new(),
+            static_dyn_fns: Vec::new(),
             mono_done: false,
         }
     }

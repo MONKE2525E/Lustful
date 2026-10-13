@@ -20,6 +20,9 @@ use crate::ty::{AssocEqData, TraitRef};
 pub enum Obligation {
     Trait { trait_ref: TraitRef, span: Span, depth: u16 },
     AssocEq { eq: AssocEqData, span: Span },
+    /// A use that needs a dyn value's object lifetime to be `'static`
+    /// (`check::object`); decided once at body end.
+    DynStatic { span: Span },
 }
 
 /// The per-body work queue. Runs happen in `check/mod.rs`; see

@@ -625,6 +625,9 @@ struct Ctx<'p, 'a> {
     /// Unsizing coercion sites, (concrete pointee, dyn type, span)
     /// before zonking; `finish` turns them into vtable requests.
     vtable_sites: Vec<(Ty, Ty, Span)>,
+    /// True once an unsizing coercion made a dyn value from one that
+    /// may hold a borrow (see `dyn_static_clean`).
+    dyn_borrow_src: bool,
 }
 
 /// The module a body checks in: the module of the def that owns
@@ -751,6 +754,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closure_order: None,
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
+        dyn_borrow_src: false,
     };
     if let Some(sibs) = p.fn_siblings.get(&fid) {
         let layer: Vec<((Sym, CtxtId), u32)> = sibs
@@ -1015,6 +1019,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         t
     }
     fn set_res(&mut self, e: ExprId, r: Res) {
+        // A method of an impl for a `'static` dyn type (`impl dyn Tr`).
+        if let Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } = r
+            && self.p.gx.static_dyn_fns.contains(&f)
+        {
+            let span = self.span(e);
+            self.obl.push(obligations::Obligation::DynStatic { span });
+        }
         let i = self.ei(e);
         self.out.expr_res[i] = r;
     }
@@ -1521,6 +1532,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if sel == Selection::NoImpl && self.derive_query_holds(tr.def, self_ty) {
             return Selection::ParamEvidence(usize::MAX);
         }
+        // An impl for a `'static` dyn type (`impl X for dyn Tr`).
+        if let Selection::Impl { id, .. } = &sel
+            && p.gx.static_dyn_impls.contains(&p.gx.index.get(*id).def)
+        {
+            self.obl.push(obligations::Obligation::DynStatic { span });
+        }
         if let Selection::Impl { nested, .. } = &sel {
             if depth >= 64 {
                 return Selection::Overflow;
@@ -1758,6 +1775,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             pending.push(ob);
                         }
                     }
+                    obligations::Obligation::DynStatic { .. } => pending.push(ob),
                     obligations::Obligation::Trait { trait_ref, span, depth } => match self.select_obligation_at(trait_ref, span, depth) {
                         Selection::Impl { unbound, .. } => {
                             progress = true;
@@ -1796,8 +1814,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         if hard && !self.obl.is_empty() {
+            let mut dyn_static: Vec<Span> = Vec::new();
             for ob in self.obl.take() {
                 match ob {
+                    obligations::Obligation::DynStatic { span } => dyn_static.push(span),
                     obligations::Obligation::Trait { trait_ref, span, .. } => {
                         // One last try now that literal fallbacks and
                         // late bindings have run: an impl with a
@@ -1838,6 +1858,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
+            self.check_dyn_static(dyn_static);
         }
     }
 
@@ -1853,6 +1874,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     tys.push(eq.ty);
                     eq.trait_args
                 }
+                obligations::Obligation::DynStatic { .. } => continue,
             };
             tys.extend(self.tys.args(args).iter().filter_map(|g| g.as_ty()));
             for t in tys {
@@ -1891,6 +1913,73 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             _ => {}
         }
+    }
+
+    /// Reports the uses that need a `'static` dyn object lifetime when
+    /// this body cannot give them one (see `dyn_static_clean`). Concrete
+    /// instances skip it: their caller proved the bound that picked the
+    /// impl, and their params are the caller's types.
+    fn check_dyn_static(&mut self, mut spans: Vec<Span>) {
+        if spans.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
+            return;
+        }
+        if self.dyn_static_clean() {
+            return;
+        }
+        // A probe re-selection records no span; the call site does.
+        if spans.iter().any(|&s| s != Span::default()) {
+            spans.retain(|&s| s != Span::default());
+        } else {
+            spans = vec![self.f.def.name_span];
+        }
+        spans.dedup();
+        for span in spans {
+            self.err(
+                "L0705",
+                span,
+                "this use needs a `dyn` value that lives for `'static`, and lust cannot prove that here",
+                "Make the `dyn` value `'static` (`&'static dyn Tr` or `dyn Tr + 'static`), or write `impl dyn Tr + '_` for an impl that takes any lifetime.",
+            );
+        }
+    }
+
+    /// True when every dyn value in this body may have a `'static` object
+    /// lifetime, which rustc's inference could then pick: no parameter
+    /// (other than the `'static` `self` of an `impl dyn Tr` method) and
+    /// no callee's declared return type holds a dyn type with an erased
+    /// object lifetime, and no unsizing coercion starts from a value that
+    /// may hold a borrow.
+    fn dyn_static_clean(&mut self) -> bool {
+        let p = self.p;
+        if self.dyn_borrow_src {
+            return false;
+        }
+        let skip_self = usize::from(self.f.def.self_param.is_some() && p.gx.static_dyn_fns.contains(&self.fid));
+        if self.f.params.iter().skip(skip_self).any(|&t| object::has_erased_dyn(&p.tys, t)) {
+            return false;
+        }
+        for i in 0..self.out.expr_res.len() {
+            let erased = match self.out.expr_res[i] {
+                Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(&p.tys, p.fn_info(f).ret),
+                Res::DynMethod { owner, slot, .. } => {
+                    let info = p.gx.dyn_infos.get(&owner);
+                    let m = info.and_then(|info| (0..info.methods.len()).find(|&j| info.method_slot(j) == slot).map(|j| info.methods[j].def));
+                    m.and_then(|d| p.gx.trait_methods.get(&d)).is_none_or(|tm| object::has_erased_dyn(&p.tys, tm.ret))
+                }
+                Res::Indirect => {
+                    let e = ExprId(self.out.expr_base + i as u32);
+                    let Expr::Call { callee, .. } = p.ast.expr(e) else { continue };
+                    let ct = self.out.expr_ty[self.ei(*callee)];
+                    let ct = self.deep(ct);
+                    object::has_erased_dyn(&self.tys, ct)
+                }
+                _ => continue,
+            };
+            if erased {
+                return false;
+            }
+        }
+        true
     }
 
     /// True while any of `unbound` still names a free variable in
@@ -2646,6 +2735,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.mismatch(span, expected, found);
                 return None;
             }
+            if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && !matches!(self.tys.kind(x), TyKind::Dyn(_, Region::Static)) {
+                self.obl.push(obligations::Obligation::DynStatic { span });
+            }
             return Some(Coerce::Unsize(expected));
         }
         if !self.sized_ok(x) {
@@ -2658,7 +2750,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         }
-        if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && contains_ref(&self.tys, x) {
+        let to_static = matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static));
+        let borrows = object::may_borrow(p, &self.tys, x);
+        if !to_static && borrows {
+            self.dyn_borrow_src = true;
+        }
+        if to_static && borrows {
             let tn = self.tn(x);
             self.err(
                 "L0705",
@@ -10904,6 +11001,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 obligations::Obligation::AssocEq { eq, .. } => {
                     self.args_mention(eq.trait_args, &reported) || reported.iter().any(|&v| self.occurs(v, eq.ty))
                 }
+                obligations::Obligation::DynStatic { .. } => false,
             };
             if !mentions {
                 self.obl.push(ob);

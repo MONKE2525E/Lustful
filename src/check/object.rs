@@ -595,6 +595,73 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
     }
 }
 
+// Object lifetimes. Lust has no lifetime names, so a dyn type's object
+// lifetime is `'static` (written `+ 'static`, or under `&'static`) or
+// erased. An erased one written in a signature (`d: &dyn Tr`, `-> &dyn
+// Tr`) is a caller's lifetime; one in a body annotation is inferred,
+// and rustc may pick `'static` for it. Uses that need `'static` (an
+// `impl dyn Tr` method, an `impl X for dyn Tr`, a coercion to `dyn Tr +
+// 'static`) queue a `DynStatic` obligation. At body end, those pass only
+// when no dyn value in the body can come from a non-`'static` source
+// (`Ctx::dyn_static_clean`); otherwise they are L0705. That rejects
+// some programs rustc accepts, never the reverse.
+
+/// True when a dyn type an impl header names as its Self type has a
+/// `'static` object lifetime: `impl dyn Tr` and `impl X for dyn Tr` (the
+/// default outside a reference), or a written `+ 'static`. `+ '_` takes
+/// any lifetime, and so does a dyn behind an elided reference.
+pub fn header_dyn_is_static(ast: &crate::ast::Ast, interner: &crate::intern::Interner, t: crate::ast::TyId) -> bool {
+    use crate::ast::{TraitBound, TyExpr};
+    match ast.ty(t) {
+        TyExpr::Paren(inner) => header_dyn_is_static(ast, interner, *inner),
+        TyExpr::Dyn { bounds, lifetime, .. } => {
+            let written = lifetime.iter().chain(bounds.iter().filter_map(|b| match b {
+                TraitBound::Lifetime(lt) => Some(lt),
+                _ => None,
+            }));
+            written.map(|lt| interner.get(lt.name) == "static").next().unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
+/// True when a dyn type in `t` has an erased object lifetime: written in
+/// a signature, that is a caller's lifetime, not `'static`.
+pub fn has_erased_dyn(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Dyn(_, r) => r != Region::Static,
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_erased_dyn(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_erased_dyn(tys, e)),
+        TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Projection(_, a) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_erased_dyn(tys, e)))
+        }
+        TyKind::FnPtr(sig) => {
+            let s = tys.sig(sig).value;
+            has_erased_dyn(tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_erased_dyn(tys, e))
+        }
+        _ => false,
+    }
+}
+
+/// True when a value of type `t` may hold a borrow, so a dyn value made
+/// from it may not live for `'static` (rustc E0597, E0310): a reference,
+/// a type param or its template stand-in, a dyn type with an erased
+/// object lifetime, a borrowing std iterator, or anything holding one.
+pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) => true,
+        TyKind::Dyn(_, r) => r != Region::Static,
+        TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow(p, tys, e)),
+        TyKind::Adt(_, a) | TyKind::Closure(_, a) => {
+            tys.is_chars_ty(t)
+                || tys.local_adt(t).is_some_and(|id| p.gx.opaque_adts.contains(&id))
+                || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow(p, tys, e)))
+        }
+        _ => false,
+    }
+}
+
 /// True when a dyn type occurs anywhere in `t`.
 pub fn mentions_dyn(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {

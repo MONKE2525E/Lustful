@@ -2064,6 +2064,15 @@ pub fn collect_reuse<'a>(
                     p.gx.has_generics = true;
                     p.gx.dyn_impl_sites.push((self_pat, ast.ty_span(imp.self_ty)));
                 }
+                // A header dyn whose object lifetime is `'static` (a dyn
+                // Self outside a reference, or a dyn trait argument).
+                let static_dyn = crate::check::object::header_dyn_is_static(ast, interner, imp.self_ty)
+                    || trait_ref.is_some_and(|tr| {
+                        p.tys.args(tr.args).iter().skip(1).any(|g| g.as_ty().is_some_and(|t| matches!(p.tys.kind(t), TyKind::Dyn(..))))
+                    });
+                if static_dyn {
+                    p.gx.static_dyn_impls.push(impl_def);
+                }
                 if trait_ref.is_none() && owner.is_none() && !dyn_self {
                     errs.push(Diag::new(
                         "L0102",
@@ -2094,6 +2103,9 @@ pub fn collect_reuse<'a>(
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
                     let id = add_fn(&mut p, def, owner, Some(self_pat), Some(impl_def), &parent_gen, hash, &mut errs);
                     method_ids.push(id);
+                    if static_dyn {
+                        p.gx.static_dyn_fns.push(id);
+                    }
                     if dyn_self {
                         let key = (crate::check::object::erase_dyn_region(&mut p.tys, self_pat), def.name);
                         if p.gx.dyn_inherent.insert(key, id).is_some() {

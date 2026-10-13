@@ -745,7 +745,10 @@ fn method_set_fingerprint(p: &Program, key: &MethodSetKey, set: &MethodSet) -> F
 /// head) plus its impl defs, sorted so the bucket's discovery order
 /// does not matter (section 8.1).
 fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerprint {
-    let mut defs: Vec<(u64, u64)> = set.impls.iter().map(|d| (def_crate_hash(p, *d), d.hash.0)).collect();
+    // The `'static` dyn flag joins each impl (check::object): flipping
+    // `impl X for dyn Tr` to `+ '_` keeps the def.
+    let mut defs: Vec<(u64, u64, bool)> =
+        set.impls.iter().map(|d| (def_crate_hash(p, *d), d.hash.0, p.gx.static_dyn_impls.contains(d))).collect();
     defs.sort_unstable();
     let mut h = FxHasher::default();
     "impl-set-v2".hash(&mut h);
@@ -931,6 +934,9 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // locals, and the driver guards those with its per-slot head
         // hash, so a param rename reuses callers.
         (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic).hash(&mut h);
+        // `impl dyn Tr` vs `impl dyn Tr + '_`: the same types, but only
+        // the first needs a `'static` receiver (check::object).
+        p.gx.static_dyn_fns.contains(&local).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
         // A generic fn's parameters and bounds (its impl's too, merged
