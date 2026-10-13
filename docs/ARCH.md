@@ -2910,8 +2910,9 @@ fn: free in the body, tied to it by the creator, and a
 direct call's arguments flow into it; a return annotation
 may pin output slots to `'static` (the body then proves
 its result is `'static` itself). Named output lifetimes,
-and named parameters of a closure called from another
-closure, are L0203.
+a named lifetime in a parameter that a bound makes
+higher-ranked (`F: Fn(&T)`), and named parameters of a
+closure called from another closure, are L0203.
 
 Templates are checked with abstract type params. Instance
 bodies are borrow-checked too, without the universal

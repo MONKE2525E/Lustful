@@ -2446,11 +2446,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let arg_roles: Vec<Option<(bool, bool)>> = slots.iter().map(|&(r, _)| r).collect();
         let vars: Vec<u32> = arg_roles.iter().map(|_| self.fresh()).collect();
-        // A slot the annotation names is that region of the creator.
+        // A slot the annotation names is that region of the creator; only
+        // the creating body has those universals (another body that calls
+        // the closure, an instance of a generic callee, ties nothing).
+        let creator = c.parent == self.body.fn_id
+            || self.p.gx.instances.get(&self.body.fn_id).and_then(|i| i.template_local) == Some(c.parent);
         for (i, &(_, link)) in slots.iter().enumerate() {
             let u = match link {
                 Some(Region::Static) => Some(0),
-                Some(Region::Param(k)) if !self.own.closure && k < self.own.n_univ => Some(k + 1),
+                Some(Region::Param(k)) if creator && !self.own.closure && k < self.own.n_univ => Some(k + 1),
+                // A generic callee's instance: the bound took this input from
+                // a type param (check rejects a higher-ranked one), so the
+                // creator's call already tied what flows in.
+                Some(Region::Param(_)) if !creator && !self.own.closure => None,
                 Some(_) => {
                     self.errs.push(Diag::new(
                         "L0203",

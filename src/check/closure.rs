@@ -243,6 +243,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for (i, prm) in params.iter().enumerate() {
             let exp = expected_inputs.as_ref().and_then(|v| v.get(i).copied());
             let named = prm.ty.is_some_and(|w| generics::names_lifetime(self.p.ast, self.p.interner, w));
+            // W-BORROW: a named lifetime where the expected signature is
+            // higher-ranked (a bound that writes the reference, `F:
+            // Fn(&T)`) does not fit (rustc rejects the closure's signature);
+            // only an input the bound takes from a type param is free.
+            if named && exp.is_some() && free_args.as_ref().is_none_or(|f| f.get(i).copied().unwrap_or(true)) {
+                self.err(
+                    "L0203",
+                    prm.span,
+                    "a named lifetime in a closure parameter whose bound makes it higher-ranked is not supported",
+                    "Drop the lifetime from the annotation: the bound decides it.",
+                );
+            }
             input_regions.push(if named { prm.ty.and_then(|w| self.regioned_annotation(w)) } else { None });
             let t = match (prm.ty, exp) {
                 (Some(w), exp) => {
