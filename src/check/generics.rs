@@ -3156,7 +3156,45 @@ fn region_sig(
     let early: Vec<bool> = (0..n_named)
         .map(|i| scope.region_facts.iter().any(|&(a, b)| a == i || b == i) || !in_inputs.contains(&Region::Param(i)))
         .collect();
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early })
+    // `F: Fn*(A..)` bounds (parenthesized sugar names only those traits):
+    // their inputs with written lifetimes kept and elided ones bound by
+    // the sugar (`Region::Bound`), so borrowck knows which are
+    // higher-ranked. A bound it cannot resolve is left out.
+    let mut bs = scope.clone();
+    bs.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let type_param = |t: ast::TyId| match ast.ty(t) {
+        TyExpr::Path(segs) if segs.len() == 1 && matches!(segs[0].args, ast::GenericArgs::None) => {
+            scope.type_params.iter().find(|&&(n, _)| n == segs[0].name).map(|&(_, j)| j)
+        }
+        _ => None,
+    };
+    let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
+    for gp in &def.generics.params {
+        if let ast::GenericParam::Type { name, bounds, .. } = gp
+            && let Some(&(_, j)) = scope.type_params.iter().find(|&&(n, _)| n == *name)
+        {
+            bounded.push((j, bounds));
+        }
+    }
+    for pred in &def.where_clause.preds {
+        if let ast::WherePred::Type { ty, bounds, .. } = pred
+            && let Some(j) = type_param(*ty)
+        {
+            bounded.push((j, bounds));
+        }
+    }
+    let mut fn_bounds: Vec<(u32, Vec<Ty>)> = Vec::new();
+    for (j, bounds) in bounded {
+        for b in bounds {
+            let TraitBound::Trait { trait_ref, .. } = b else { continue };
+            let Some(ast::GenericArgs::Parenthesized { inputs, .. }) = trait_ref.path.last().map(|s| &s.args) else { continue };
+            let tys_in: Option<Vec<Ty>> = inputs.iter().map(|&t| resolve_scoped(ast, interner, known, cx, tys, t, &bs).ok()).collect();
+            if let Some(tys_in) = tys_in {
+                fn_bounds.push((j, tys_in));
+            }
+        }
+    }
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds })
 }
 
 /// True when a written type holds a `dyn` type with a written object

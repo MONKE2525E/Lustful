@@ -718,7 +718,7 @@ fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<De
 /// (deeply), outlives facts, and early-bound flags. A caller's borrow
 /// check reads all of them; the erased signature shows none.
 fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::RegionSig>) {
-    "region-sig-v1".hash(h);
+    "region-sig-v2".hash(h);
     let Some(rs) = rs else { return 0u8.hash(h) };
     1u8.hash(h);
     rs.n_univ.hash(h);
@@ -734,6 +734,14 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
         hash_region(h, b);
     }
     rs.early.hash(h);
+    (rs.fn_bounds.len() as u64).hash(h);
+    for (j, ins) in &rs.fn_bounds {
+        j.hash(h);
+        (ins.len() as u64).hash(h);
+        for &t in ins {
+            hash_regions_deep(h, p, t, &mut seen);
+        }
+    }
 }
 
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved

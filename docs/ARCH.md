@@ -2930,16 +2930,18 @@ closure) are free too, as rustc infers them: a direct call's
 arguments flow into them. A free or named argument slot
 where a bound or an iterator method is higher-ranked (`F:
 Fn(&T)`, `filter`'s `&Self::Item`) is L0735 (rustc: "not
-general enough"). A
+general enough"); a lifetime the bound writes (`F:
+Fn(&'static Message)`, the callee's `'a`; the region
+signature keeps bound inputs with regions) ties the slot to
+that region. A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
 fn: free in the body, tied to it by the creator, and a
 direct call's arguments flow into it; a return annotation
 may pin output slots to `'static` (the body then proves
-its result is `'static` itself). Named output lifetimes,
-a named lifetime in a parameter that a bound makes
-higher-ranked (`F: Fn(&T)`), and named parameters of a
-closure called from another closure, are L0203.
+its result is `'static` itself). Named output lifetimes
+and named parameters of a closure called from another
+closure are L0203.
 
 Templates are checked with abstract type params. Instance
 bodies are borrow-checked too, without the universal

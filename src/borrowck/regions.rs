@@ -106,6 +106,10 @@ pub struct RegionSig {
     pub names: Vec<String>,
     /// Per named lifetime (universals `0..early.len()`): early-bound.
     pub early: Vec<bool>,
+    /// The `Fn*(A..)` bounds on the fn's type params, with regions: the
+    /// param's index and the input types (a written lifetime as itself,
+    /// an elided one `Region::Bound`: higher-ranked).
+    pub fn_bounds: Vec<(u32, Vec<Ty>)>,
 }
 
 /// The borrow checker's side table of region signatures (W-BORROW, ARCH 5),
@@ -807,6 +811,18 @@ pub(super) enum End {
     Cap(u32),
     Arg(u32),
     Out(u32),
+}
+
+/// What a callee's `Fn*` bound makes of one closure argument slot
+/// (`bound_slots`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundSlot {
+    /// The call's instantiation of a type param: free in the closure.
+    Free,
+    /// An elided lifetime the bound writes: higher-ranked.
+    Hr,
+    /// A lifetime the bound names: this var (`'static` is 0).
+    Tie(u32),
 }
 
 /// The universal of a regioned signature region.
@@ -3194,7 +3210,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && b.count == 0
                 && self.p.gx.lang.is_fn_family(b.value.def)
             {
-                self.link_bound_closure(b.value.args, &binds);
+                self.link_bound_closure(b.value.args, &binds, sig, &univ);
             }
         }
         ok
@@ -3207,7 +3223,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// callee (`binds`; `&T`: past its higher-ranked outer reference).
     /// Records the closure in `bound_linked` when every free slot paired;
     /// `call` links any other closure conservatively.
-    fn link_bound_closure(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>) {
+    fn link_bound_closure(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>, sig: &RegionSig, univ: &[u32]) {
         let p = self.p;
         let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
         let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
@@ -3220,19 +3236,35 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let Some(c) = p.gx.closures.get(&def) else { return };
         let Ok(slots) = closure_arg_slots(&mut self.sc, c) else { return };
         let inputs = c.inputs.clone();
-        // A reference the bound writes is higher-ranked there: the callee
-        // may pass a borrow of its own data, so the closure must take any
-        // region in that slot (rustc: "not general enough").
-        let mut hr: Vec<bool> = Vec::with_capacity(slots.len());
+        // A reference the bound writes with an elided lifetime is
+        // higher-ranked there: the callee may pass a borrow of its own
+        // data, so the closure must take any region in that slot (rustc:
+        // "not general enough"). A written one (`&'static Message`, the
+        // callee's `'a`) ties the slot to that region. The regioned inputs
+        // come from the callee's signature; without them every written
+        // reference counts as higher-ranked.
+        let regioned: Option<Vec<Ty>> =
+            sig.fn_bounds.iter().find(|(j, ins)| *j == jf.0 && ins.len() == inputs_tmpl.len()).map(|(_, ins)| ins.clone());
+        let tmpl = regioned.unwrap_or_else(|| inputs_tmpl.clone());
+        let mut kinds: Vec<BoundSlot> = Vec::with_capacity(slots.len());
         for (i, &it) in inputs.iter().enumerate() {
-            match inputs_tmpl.get(i) {
-                Some(&t) => self.hr_slots(t, it, &mut hr),
-                None => hr.extend(std::iter::repeat_n(false, self.sc.slots(it) as usize)),
+            match tmpl.get(i) {
+                Some(&t) => self.bound_slots(t, it, univ, &mut kinds),
+                None => kinds.extend(std::iter::repeat_n(BoundSlot::Free, self.sc.slots(it) as usize)),
             }
         }
-        if hr.iter().zip(&slots).any(|(&h, (r, link))| h && (r.is_some() || link.is_some())) {
+        if kinds.iter().zip(&slots).any(|(k, (r, link))| *k == BoundSlot::Hr && (r.is_some() || link.is_some())) {
             self.not_general_enough();
             return;
+        }
+        for (idx, k) in kinds.iter().enumerate() {
+            if let BoundSlot::Tie(u) = *k
+                && slots.get(idx).is_some_and(|(r, _)| r.is_some())
+                && let Some(&v) = vars.get(idx)
+            {
+                self.edge(v, u);
+                self.edge(u, v);
+            }
         }
         let mut paired = vec![false; vars.len()];
         let mut at_slot = 0usize;
@@ -3269,38 +3301,51 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
-    /// Per slot of a closure input's erased type `t`: whether the bound's
-    /// input type `tmpl` (over the callee's params) makes it higher-ranked.
-    /// A type param or projection there is the call's instantiation (free);
-    /// any other region the bound writes is its own (elided in `Fn(&T)`
-    /// sugar, so higher-ranked; a named one is taken as higher-ranked too,
-    /// which only rejects more).
-    fn hr_slots(&mut self, tmpl: Ty, t: Ty, out: &mut Vec<bool>) {
+    /// Per slot of a closure input's erased type `t`, what the bound's
+    /// input type `tmpl` (over the callee's params; regioned when the
+    /// signature has it) makes of it: a type param or projection is the
+    /// call's instantiation (free); an elided lifetime (`Region::Bound`,
+    /// or any region in an erased bound) is higher-ranked; `'static` and
+    /// the callee's lifetime `k` tie the slot to `'static` and `univ[k]`.
+    fn bound_slots(&mut self, tmpl: Ty, t: Ty, univ: &[u32], out: &mut Vec<BoundSlot>) {
         let p = self.p;
         let n = self.sc.slots(t) as usize;
+        let kind = |r: Region| match r {
+            Region::Static => BoundSlot::Tie(0),
+            Region::Param(k) => univ.get(k as usize).map_or(BoundSlot::Hr, |&u| BoundSlot::Tie(u)),
+            _ => BoundSlot::Hr,
+        };
         match (p.tys.kind(tmpl), self.body.tys.kind(t)) {
-            (TyKind::Param(_) | TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(false, n)),
-            (TyKind::Ref(_, _, ti), TyKind::Ref(_, _, ei)) => {
-                out.push(true);
-                self.hr_slots(ti, ei, out);
+            (TyKind::Param(_) | TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(BoundSlot::Free, n)),
+            (TyKind::Ref(r, _, ti), TyKind::Ref(_, _, ei)) => {
+                out.push(kind(r));
+                self.bound_slots(ti, ei, univ, out);
             }
-            (TyKind::Adt(_, ta), TyKind::Adt(_, ea)) if p.tys.args(ta).len() == self.body.tys.args(ea).len() => {
-                out.extend(std::iter::repeat_n(true, adt_regions(p, &self.body.tys, t) as usize));
-                let pairs: Vec<(GenericArg, GenericArg)> = p.tys.args(ta).iter().copied().zip(self.body.tys.args(ea).iter().copied()).collect();
-                for (a, b) in pairs {
-                    if let (Some(a), Some(b)) = (a.as_ty(), b.as_ty()) {
-                        self.hr_slots(a, b, out);
+            (TyKind::Adt(_, ta), TyKind::Adt(_, ea)) => {
+                let lts: Vec<Region> = p.tys.args(ta).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let nr = adt_regions(p, &self.body.tys, t) as usize;
+                for i in 0..nr {
+                    out.push(lts.get(i).map_or(BoundSlot::Hr, |&r| kind(r)));
+                }
+                let ta_tys: Vec<Ty> = p.tys.args(ta).iter().filter_map(|g| g.as_ty()).collect();
+                let ea_tys: Vec<Ty> = self.body.tys.args(ea).iter().filter_map(|g| g.as_ty()).collect();
+                if ta_tys.len() == ea_tys.len() {
+                    for (a, b) in ta_tys.into_iter().zip(ea_tys) {
+                        self.bound_slots(a, b, univ, out);
                     }
+                } else {
+                    out.extend(std::iter::repeat_n(BoundSlot::Hr, n - nr));
                 }
             }
             (TyKind::Tuple(ta), TyKind::Tuple(ea)) if p.tys.tys_of(ta).len() == self.body.tys.tys_of(ea).len() => {
                 let pairs: Vec<(Ty, Ty)> = p.tys.tys_of(ta).iter().copied().zip(self.body.tys.tys_of(ea).iter().copied()).collect();
                 for (a, b) in pairs {
-                    self.hr_slots(a, b, out);
+                    self.bound_slots(a, b, univ, out);
                 }
             }
-            (TyKind::Array(a, _) | TyKind::Slice(a), TyKind::Array(b, _) | TyKind::Slice(b)) => self.hr_slots(a, b, out),
-            _ => out.extend(std::iter::repeat_n(true, n)),
+            (TyKind::Array(a, _) | TyKind::Slice(a), TyKind::Array(b, _) | TyKind::Slice(b)) => self.bound_slots(a, b, univ, out),
+            (TyKind::Dyn(_, r), TyKind::Dyn(..)) => out.push(kind(r)),
+            _ => out.extend(std::iter::repeat_n(BoundSlot::Hr, n)),
         }
     }
 
