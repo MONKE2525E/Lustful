@@ -3586,6 +3586,7 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
             (e, picks, calls, reads)
         };
         reuse.templates_checked += 1;
+        reuse.template_errors += body_errs.len();
         reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
         if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
             reuse.store_template(p, t, &reads, &picks, &calls);

@@ -552,6 +552,20 @@ def case_generic_reuse():
     strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("lust-stats:"))
     check("generic unmet bound rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
           f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
+    # A type error in a template body rejects warm as cold; fixing it is
+    # a body edit again (the error kept the item state).
+    edit("fn total<T: Score + Copy>(", "fn total<T: Score>(")
+    d.run(["check", src], expect=None)
+    edit("        s += x.twice() + 1;", "        s += x.twice() + true;")
+    r, _ = check_stats()
+    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
+    check("generic template body error rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
+          f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
+    edit("        s += x.twice() + true;", "        s += x.twice() + 1;")
+    r, cst = check_stats()
+    check("generic fix after a template error is a body edit", r.returncode == 0 and cst.get("rechecked", 99) <= 2, f"{r.returncode} {cst}")
+    st, prog = d.build(src, out)
+    same("fix after a template error", st, prog)
     d.kill()
 
 

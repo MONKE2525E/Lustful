@@ -91,6 +91,8 @@ pub struct GenReuse {
     pub templates_reused: usize,
     pub discovery_checked: usize,
     pub discovery_reused: usize,
+    /// Errors this collect's template checks reported (body errors).
+    pub template_errors: usize,
 }
 
 impl GenReuse {
@@ -109,6 +111,7 @@ impl GenReuse {
         self.templates_reused = 0;
         self.discovery_checked = 0;
         self.discovery_reused = 0;
+        self.template_errors = 0;
     }
 
     /// The source fingerprint of one fn of `p` (see the module docs),

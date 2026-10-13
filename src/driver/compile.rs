@@ -2246,7 +2246,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     ) {
         Ok(p) => p,
         Err(mut ds) => {
-            front.env_hash = None;
+            // A collect error drops the item state, so the next request
+            // rebuilds it in full mode. Errors that all come from
+            // template checks are body errors: the item state stands,
+            // and the next edit (usually the fix) stays a body edit.
+            if caches.gen_reuse.template_errors != ds.len() {
+                front.env_hash = None;
+            }
             return errors(&mut ds, &map, &src, req);
         }
     };
