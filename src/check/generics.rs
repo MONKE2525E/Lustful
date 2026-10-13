@@ -1230,7 +1230,7 @@ fn resolve_path_ty(
     if name == known.String {
         return no_generics(STRING);
     }
-    if name == known.Vec || name == known.Option {
+    if name == known.Vec || name == known.Option || name == known.Box {
         let args = match &seg.args {
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, 1, span, interner.get(name))?,
             _ => {
@@ -1243,7 +1243,16 @@ fn resolve_path_ty(
             }
         };
         let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
-        return Ok(if name == known.Vec { tys.mk_vec(elem) } else { tys.mk_option(elem) });
+        if name == known.Box && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+            return Err(not_yet("L0641", span, "a Box of an unsized type"));
+        }
+        return Ok(if name == known.Vec {
+            tys.mk_vec(elem)
+        } else if name == known.Box {
+            tys.mk_boxed(elem)
+        } else {
+            tys.mk_option(elem)
+        });
     }
     if name == known.Result {
         let args = match &seg.args {
@@ -3074,6 +3083,35 @@ pub fn add_synthetic_impls(p: &mut Program) {
             let mut g1 = one.clone();
             g1.predicates = preds;
             insert_synthetic(p, &mut ordinal, lang.copy, self_pat, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
+    // Box<T>: like Vec for the derive-shaped traits, plus Deref
+    // and DerefMut to T with no bounds of their own.
+    {
+        let box_p0 = p.tys.mk_boxed(p0);
+        for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default] {
+            let preds = pred_on_p0(p, tr);
+            let mut g1 = one.clone();
+            g1.predicates = preds;
+            insert_synthetic(p, &mut ordinal, tr, box_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+        }
+        let preds = pred_on_p0(p, lang.partial_eq);
+        let mut g1 = one.clone();
+        g1.predicates = preds;
+        insert_synthetic(p, &mut ordinal, lang.partial_eq, box_p0, &[box_p0], g1, Vec::new(), Synthetic::Lang, false, span);
+        for tr in [lang.deref, lang.deref_mut] {
+            insert_synthetic(
+                p,
+                &mut ordinal,
+                tr,
+                box_p0,
+                &[],
+                one.clone(),
+                vec![(lang.assoc_target, p0)],
+                Synthetic::Lang,
+                false,
+                span,
+            );
         }
     }
     // From<T> for T, and Into through From.

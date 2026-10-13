@@ -225,6 +225,8 @@ impl<'p, 'a> Lower<'p, 'a> {
         for _ in 0..n {
             if let TyKind::Ref(_, _, inner) = self.kind(t) {
                 t = inner;
+            } else if let Some(inner) = self.body.tys.boxed_elem(t) {
+                t = inner;
             }
         }
         t
@@ -353,7 +355,9 @@ impl<'p, 'a> Lower<'p, 'a> {
         match self.ck.coerce(e) {
             Coerce::None => op,
             Coerce::StrFromString => {
-                // `&String` (possibly `&&String`) to `&str`.
+                // `&String` (possibly `&&String`, or through a
+                // `Box<String>`, whose value is already the
+                // `&String` the builtin wants) to `&str`.
                 let mut place = self.op_place(op, ty, span);
                 let mut t = ty;
                 while let TyKind::Ref(_, _, inner) = self.kind(t) {
@@ -367,13 +371,28 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(place)], Place::local(tmp), span);
                 Operand::Copy(Place::local(tmp))
             }
+            Coerce::BoxToRef(n, m) => {
+                let place = self.op_place(op, ty, span);
+                let place = Self::derefs(place, n);
+                let elem = self.peel(ty, n);
+                let rt = self.ref_ty(m, elem);
+                let tmp = self.temp(rt);
+                self.assign(Place::local(tmp), Rvalue::Ref(m, place), span);
+                if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
+            }
             Coerce::Deref(n) => {
                 let place = self.op_place(op, ty, span);
                 Operand::Copy(Self::derefs(place, n))
             }
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => {
                 let place = self.op_place(op, ty, span);
-                let inner = self.peel(ty, 1);
+                let mut inner = self.peel(ty, 1);
+                let mut place = place.deref();
+                // `&Box<Vec<T>>` slices through the box as well.
+                if let Some(b) = self.body.tys.boxed_elem(inner) {
+                    place = place.deref();
+                    inner = b;
+                }
                 let elem = match self.kind(inner) {
                     TyKind::Array(e, _) => e,
                     _ => self.body.tys.vec_elem(inner).unwrap_or(ERROR),
@@ -381,7 +400,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let slice = self.body.tys.intern(TyKind::Slice(elem));
                 let rt = self.ref_ty(m, slice);
                 let tmp = self.temp(rt);
-                self.assign(Place::local(tmp), Rvalue::SliceOf(place.deref()), span);
+                self.assign(Place::local(tmp), Rvalue::SliceOf(place), span);
                 if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
             }
             Coerce::MutToShared | Coerce::Reborrow => {

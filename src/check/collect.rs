@@ -296,6 +296,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
                 let (a, b) = tys.result_args(t).unwrap_or((ERROR, ERROR));
                 format!("Result<{}, {}>", ty_name(p, tys, a), ty_name(p, tys, b))
             }
+            Some(BuiltinTy::Boxed) => format!("Box<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             None => match tys.local_adt(t) {
@@ -385,6 +386,17 @@ pub fn resolve_ty(
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 return Ok(tys.mk_option(e));
             }
+            if name == known.Box {
+                let args = seg.type_args();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, "Box takes one type argument", "Write `Box<T>`."));
+                }
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
+                if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                    return Err(not_yet("L0641", span, "a Box of an unsized type"));
+                }
+                return Ok(tys.mk_boxed(e));
+            }
             if name == known.Result {
                 let args = seg.type_args();
                 if args.len() != 2 {
@@ -407,7 +419,7 @@ pub fn resolve_ty(
             if name == known.f64 {
                 return no_generics(tys.float_ty(FloatTy::F64));
             }
-            if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
+            if ["HashMap", "HashSet", "BTreeMap", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
                 return Err(not_yet("L0641", span, &format!("the `{n}` type")));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
@@ -1167,6 +1179,7 @@ pub fn collect_reuse<'a>(
         };
         insert_builtin(&mut p, b.string, DefsKind::Struct, known.String, Generics::default());
         insert_builtin(&mut p, b.vec, DefsKind::Struct, known.Vec, one_ty_param());
+        insert_builtin(&mut p, b.boxed, DefsKind::Struct, known.Box, one_ty_param());
         insert_builtin(&mut p, b.option, DefsKind::Enum, known.Option, one_ty_param());
         let two_ty_params = Generics {
             parent: None,
@@ -1701,7 +1714,7 @@ pub fn collect_reuse<'a>(
                 "L0117",
                 p.adts[i].span,
                 format!("recursive type `{}` has infinite size", p.display_path(p.adts[i].name)),
-                "Put the recursive field in a Vec. Box is not supported yet.",
+                "Put the recursive field behind a `Box`, in a `Vec`, or behind a reference.",
             ));
         }
     }
@@ -2669,7 +2682,7 @@ pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().any(|&e| contains_ref(tys, e)),
         TyKind::Array(e, _) | TyKind::Slice(e) => contains_ref(tys, e),
         _ if tys.is_chars_ty(t) => true,
-        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
             Some(e) => contains_ref(tys, e),
             None => match tys.result_args(t) {
                 Some((a, b)) => contains_ref(tys, a) || contains_ref(tys, b),
@@ -2797,7 +2810,7 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     if tys.is_string_ty(t) {
         return true;
     }
-    if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+    if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
         return has_clone(p, tys, e);
     }
     if let Some((a, b)) = tys.result_args(t) {
@@ -2842,7 +2855,7 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if tys.is_string_ty(t) {
                 return true;
             }
-            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
                 return has_eq(p, tys, e);
             }
             if let Some((a, b)) = tys.result_args(t) {
@@ -2873,7 +2886,7 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::Args) {
                 return true;
             }
-            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
                 return has_debug(p, tys, e);
             }
             if let Some((a, b)) = tys.result_args(t) {
@@ -2898,7 +2911,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_display(p, tys, e),
-        _ => tys.is_string_ty(t),
+        _ => tys.is_string_ty(t) || tys.boxed_elem(t).is_some_and(|e| has_display(p, tys, e)),
     }
 }
 
@@ -2912,7 +2925,7 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Array(e, _) => return needs_drop(p, tys, e),
         _ => {}
     }
-    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() {
+    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.boxed_elem(t).is_some() {
         return true;
     }
     if let Some(e) = tys.option_elem(t) {

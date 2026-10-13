@@ -216,6 +216,7 @@ known_syms!(
     args,
     String,
     Vec,
+    Box,
     str,
     main,
     new,
@@ -420,6 +421,7 @@ known_syms!(
     trim_end,
     is_char_boundary,
     from_utf8,
+    leak,
 );
 
 impl Known {

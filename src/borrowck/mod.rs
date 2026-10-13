@@ -1270,6 +1270,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for pr in &dest.proj {
             t = match (self.body.tys.kind(t), pr) {
                 (TyKind::Ref(_, _, i), Proj::Deref) => i,
+                (_, Proj::Deref) if self.body.tys.boxed_elem(t).is_some() => self.body.tys.boxed_elem(t).unwrap(),
                 (_, Proj::Index(_)) => match self.body.tys.vec_elem(t) {
                     Some(e) => e,
                     None => return ERROR,
@@ -1448,10 +1449,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     }
 
     /// The leading exact part of a place as an encoded path, and whether
-    /// that is the whole place. Fields, downcasts, and constant indexes
-    /// into arrays are exact; a dereference or any other index is not,
-    /// and the prefix still identifies the field the place reaches into.
-    /// Encodings sit in the low two bits: 0 field, 1 downcast, 2 index.
+    /// that is the whole place. Fields, downcasts, constant indexes
+    /// into arrays, and a deref through a `Box` are exact; any other
+    /// dereference or index is not, and the prefix still identifies
+    /// the field the place reaches into.
+    /// Encodings sit in the low two bits: 0 field, 1 downcast, 2 index,
+    /// 3 box deref.
     fn prefix_of(&self, p: &Place) -> (Path, bool) {
         let mut path = Vec::new();
         let mut t = self.body.locals[p.local as usize].ty;
@@ -1477,7 +1480,16 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     },
                     _ => return (path, false),
                 },
-                Proj::Deref => return (path, false),
+                Proj::Deref => match self.body.tys.boxed_elem(t) {
+                    // Moving out of a `Box` is legal in Rust and
+                    // exact: the box owns its pointee outright.
+                    Some(e) => {
+                        path.push(3);
+                        t = e;
+                        variant = 0;
+                    }
+                    None => return (path, false),
+                },
             }
         }
         (path, true)
@@ -1603,6 +1615,20 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     match self.body.tys.kind(container) {
                         TyKind::Array(e, _) => cur = e,
                         _ => return,
+                    }
+                }
+                Proj::Deref => {
+                    // Through a `Box`: the box itself is the one
+                    // container a move may cross despite its Drop
+                    // impl; the pointee's own Drop still counts
+                    // for the field steps that follow.
+                    let container = self.head_resolve(cur, &env);
+                    match self.body.tys.boxed_elem(container) {
+                        Some(e) => {
+                            cur = e;
+                            variant = 0;
+                        }
+                        None => return,
                     }
                 }
                 _ => return,
@@ -1837,6 +1863,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     through_ref = true;
                     t = inner;
                 }
+                (_, Proj::Deref) if self.body.tys.boxed_elem(t).is_some() => t = self.body.tys.boxed_elem(t).unwrap(),
                 (_, Proj::Index(_)) if self.body.tys.vec_elem(t).is_some() => t = self.body.tys.vec_elem(t).unwrap(),
                 (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => t = e,
                 (TyKind::Tuple(ts), Proj::Field(i)) => {

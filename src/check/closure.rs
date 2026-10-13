@@ -716,6 +716,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Coerce::Reborrow => (1, CaptureMode::MutRef),
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => (1, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
+            Coerce::BoxToRef(n, m) => (n as usize, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
             Coerce::StrFromString => {
                 // Builtin derefs down to the `String`, then its
                 // overloaded deref borrows it.

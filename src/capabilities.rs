@@ -208,6 +208,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::StrReplace,
     Builtin::StrRepeat,
     Builtin::StrIsCharBoundary,
+    Builtin::BoxNew,
+    Builtin::BoxLeak,
 ];
 
 /// How a builtin is called.
@@ -412,6 +414,8 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
         B::StrReplace => (&["str"], vec![k.replace], Call::Method),
         B::StrRepeat => (&["str"], vec![k.repeat], Call::Method),
         B::StrIsCharBoundary => (&["str"], vec![k.is_char_boundary], Call::Method),
+        B::BoxNew => (&["Box<T>"], vec![k.new], Call::Associated),
+        B::BoxLeak => (&["Box<T>"], vec![k.leak], Call::Associated),
     }
 }
 
@@ -579,7 +583,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("the `HashMap` type", "L0641"),
     ("the `HashSet` type", "L0641"),
     ("the `BTreeMap` type", "L0641"),
-    ("the `Box` type", "L0641"),
+    ("a Box of an unsized type", "L0641"),
     ("the `Rc` type", "L0641"),
     ("the `Arc` type", "L0641"),
     ("the `RefCell` type", "L0641"),

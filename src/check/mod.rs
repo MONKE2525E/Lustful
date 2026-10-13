@@ -217,6 +217,8 @@ pub enum Builtin {
     StrReplace,
     StrRepeat,
     StrIsCharBoundary,
+    BoxNew,
+    BoxLeak,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -376,6 +378,10 @@ pub enum Coerce {
     SliceFromArray(bool),
     /// `&Vec<T>` to a slice reference; the bool is the target mutability.
     SliceFromVec(bool),
+    /// `&Box<T>` (possibly behind more references) to `&T` or
+    /// `&mut T`: this many derefs reach the pointee place, and
+    /// the bool is the target mutability.
+    BoxToRef(u8, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2222,11 +2228,40 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let (fd, fbase) = depth(self, found);
         let (ed, _) = depth(self, expected);
+        // The mutability of the reference directly on a `Box` base,
+        // which bounds what a deref coercion through it may hand out.
+        let box_ref_mut = |cx: &Self| -> Option<bool> {
+            let mut t = found;
+            loop {
+                match cx.kind(t) {
+                    TyKind::Ref(_, m, inner) => {
+                        if cx.tys.boxed_elem(cx.resolve(inner)).is_some() {
+                            return Some(m.is_mut());
+                        }
+                        t = inner;
+                    }
+                    _ => return None,
+                }
+            }
+        };
         let c = match (fk, ek) {
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
                 if self.kind(s) == TyKind::Str && self.tys.is_string_ty(self.resolve(fbase)) =>
             {
                 Coerce::StrFromString
+            }
+            (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
+                if self.kind(s) == TyKind::Str
+                    && self.tys.boxed_elem(self.resolve(fbase)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e))) =>
+            {
+                Coerce::StrFromString
+            }
+            (TyKind::Ref(..), TyKind::Ref(_, em, y))
+                if ed == 1
+                    && box_ref_mut(self).is_some_and(|bm| !em.is_mut() || bm)
+                    && self.tys.boxed_elem(self.resolve(fbase)).is_some_and(|e| self.unify(e, y)) =>
+            {
+                Coerce::BoxToRef(fd + 1, em.is_mut())
             }
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, _))
                 if fd > ed && {
@@ -2272,7 +2307,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if matches!(self.kind(y), TyKind::Slice(_))
                     && (!em.is_mut() || fm.is_mut())
-                    && match self.tys.vec_elem(self.resolve(x)) {
+                    && match self
+                        .tys
+                        .vec_elem(self.resolve(x))
+                        .or_else(|| self.tys.boxed_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
+                    {
                         Some(xe) => match self.kind(y) {
                             TyKind::Slice(ye) => self.unify(xe, ye),
                             _ => false,
@@ -2353,10 +2392,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match self.kind(y) {
             TyKind::Slice(ye) => match self.kind(x) {
                 TyKind::Array(xe, _) | TyKind::Slice(xe) => self.ty_matchish(xe, ye),
-                _ => self.tys.vec_elem(self.resolve(x)).is_some_and(|xe| self.ty_matchish(xe, ye)),
+                _ => self
+                    .tys
+                    .vec_elem(self.resolve(x))
+                    .or_else(|| self.tys.boxed_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
+                    .is_some_and(|xe| self.ty_matchish(xe, ye)),
             },
-            TyKind::Str => self.tys.is_string_ty(self.resolve(x)),
-            _ => self.ty_matchish(x, y),
+            TyKind::Str => {
+                self.tys.is_string_ty(self.resolve(x))
+                    || self.tys.boxed_elem(self.resolve(x)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e)))
+            }
+            _ => self.ty_matchish(x, y) || self.tys.boxed_elem(self.resolve(x)).is_some_and(|e| self.ty_matchish(e, y)),
         }
     }
 
@@ -2945,7 +2991,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // ARCH 2.12 run point: a field access must know the base type.
                 self.run_obligations(false);
                 let bt = self.deep(bt);
-                let (derefs, inner) = self.autoderef(bt);
+                let (derefs, inner) = self.autoderef_smart(bt);
                 if let Some(a) = self.tys.local_adt(inner) {
                     let adt = p.adt(a);
                     if !adt.is_enum
@@ -2977,7 +3023,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // ARCH 2.12 run point: an index must know the indexed type; the
                 // index type then follows from the selected `Index` impl.
                 self.run_obligations(false);
-                let (derefs, inner) = self.autoderef(bt);
+                let (derefs, inner) = self.autoderef_smart(bt);
                 if let Expr::Range { lo, hi, .. } = p.ast.expr(*index) {
                     // A range index makes a slice place. Bounds are usize.
                     // The range expression itself is not checked as a value;
@@ -3174,16 +3220,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let t = self.expr(*inner, None);
                 // ARCH 2.12 run point: a deref must know the pointee source type.
                 self.run_obligations(false);
+                let t = self.resolve(t);
                 match self.kind(t) {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
+                    _ if self.tys.boxed_elem(t).is_some() => self.tys.boxed_elem(t).unwrap_or(ERROR),
                     _ => {
                         let tn = self.tn(t);
                         self.err(
                             "L0113",
                             span,
                             format!("type `{tn}` cannot be dereferenced"),
-                            "Only references can be dereferenced with `*`.",
+                            "Only references and `Box` values can be dereferenced with `*`.",
                         );
                         ERROR
                     }
@@ -3458,7 +3506,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::TupleField { base, index } => {
                 let bt = self.expr(*base, None);
                 self.run_obligations(false);
-                let (derefs, inner) = self.autoderef(bt);
+                let (derefs, inner) = self.autoderef_smart(bt);
                 let field_ty = match self.kind(inner) {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
                     _ => match self.tys.local_adt(inner) {
@@ -3887,6 +3935,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         (n, t)
     }
+
+    /// Autoderef through references and `Box`: the chain field
+    /// access, indexing, and method calls follow in Rust. The
+    /// count is in the same units as `autoderef` (one `Deref`
+    /// projection per step), so recorded resolutions lower
+    /// uniformly.
+    fn autoderef_smart(&self, t: Ty) -> (u8, Ty) {
+        let (mut n, mut base) = self.autoderef(t);
+        while let Some(inner) = self.tys.boxed_elem(base) {
+            base = self.resolve(inner);
+            n += 1;
+            let (d, b) = self.autoderef(base);
+            n += d;
+            base = b;
+        }
+        (n, base)
+    }
     fn peel_one_ref(&self, t: Ty) -> (u8, Ty) {
         match self.kind(t) {
             TyKind::Ref(_, _, inner) => (1, inner),
@@ -4310,6 +4375,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return None;
             };
             return Some(Res::Builtin(b));
+        }
+        if ty_name == k.Box {
+            if item == k.new {
+                return Some(Res::Builtin(Builtin::BoxNew));
+            }
+            if item == k.leak {
+                return Some(Res::Builtin(Builtin::BoxLeak));
+            }
+            self.err(
+                "L0104",
+                span,
+                format!("no function `Box::{}`", self.name(item)),
+                "Lust supports Box::new and Box::leak.",
+            );
+            return None;
         }
         // Qualified builtin variant constructors: `Option::Some(..)`,
         // `Result::Ok(..)`, `Result::Err(..)`.
@@ -5120,6 +5200,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             }
                         }
                     }
+                    Builtin::BoxNew => {
+                        let generics = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs[0].type_args(),
+                            _ => Vec::new(),
+                        };
+                        let elem = match generics.first() {
+                            Some(&g) => self.resolve_written(g),
+                            None => self.new_var(false),
+                        };
+                        (vec![elem], self.tys.mk_boxed(elem))
+                    }
+                    Builtin::BoxLeak => {
+                        let elem = self.new_var(false);
+                        let bx = self.tys.mk_boxed(elem);
+                        let r = self.tys.mk_ref(true, elem);
+                        (vec![bx], r)
+                    }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {
                             Expr::Path(segs) => segs[0].type_args(),
@@ -5414,7 +5511,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // ARCH 2.12 run point: a method call must know the receiver type. The
         // obligation queue runs just before that head is required (ARCH 2.4).
         self.run_obligations(false);
-        let (derefs, base) = self.autoderef(rt);
+        // `Box` is a builtin deref step for method calls, as in
+        // Rust. Its own `clone` is found before the step (it is
+        // the one Box method this wave resolves at step zero),
+        // so that name keeps the unpeeled receiver.
+        let (derefs, base) = if name == k.clone { self.autoderef(rt) } else { self.autoderef_smart(rt) };
         self.check_method_vis(base, name, name_span);
         let bk = self.tys.kind(base);
         // ARCH 2.12: a method call needs a known receiver head (rustc

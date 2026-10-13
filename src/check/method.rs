@@ -898,15 +898,18 @@ pub(super) fn generic_method_search(
     explicit: &[Option<GenericArg>],
     expected: Option<Ty>,
 ) -> Probe {
-    // Autoderef steps through references (the builtin derefs of
-    // this wave), each with its deref count for lowering.
+    // Autoderef steps through references and `Box` (the builtin
+    // derefs of this wave), each with its deref count for lowering.
     let mut steps: Vec<(Ty, u8)> = Vec::new();
     let mut cur = cx.resolve(recv_ty);
     for derefs in 0..32u8 {
         steps.push((cur, derefs));
         match cx.tys.kind(cur) {
             TyKind::Ref(_, _, inner) => cur = cx.resolve(inner),
-            _ => break,
+            _ => match cx.tys.boxed_elem(cur) {
+                Some(inner) => cur = cx.resolve(inner),
+                None => break,
+            },
         }
     }
     for (step, derefs) in steps {

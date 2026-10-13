@@ -2841,6 +2841,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     inner(h, p, a);
                     inner(h, p, b);
                 }
+                cgen::CTy::Boxed(x) => {
+                    18u8.hash(h);
+                    inner(h, p, x);
+                }
             }
         }
         let mut h = crate::intern::FxHasher::default();
