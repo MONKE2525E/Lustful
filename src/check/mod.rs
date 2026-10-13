@@ -13,6 +13,7 @@ pub mod method;
 pub mod object;
 pub mod obligations;
 pub mod picks;
+pub mod stdtypes;
 pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
@@ -5786,8 +5787,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             match self.body_item_of(name, span.ctxt) {
                 Some(crate::check::collect::BodyItem::Fn(f)) => {
+                    // A nested fn used as a value is a fn item like a
+                    // top-level one (its type was the error type with no
+                    // diagnostic, so `k as fn(..)` built a null pointer).
                     self.set_res(e, Res::Fn(f));
-                    return ERROR;
+                    return self.fn_value_ty(f, span);
                 }
                 Some(crate::check::collect::BodyItem::Const(ci)) => {
                     let c = &p.body_consts[ci as usize];
@@ -7503,6 +7507,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         Expr::Path(segs) => self.value_path_args(a, segs, span),
                         _ => self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone()),
                     };
+                    // The expected type fixes the params first (rustc's
+                    // expected inputs), so a closure or a reference
+                    // argument sees its field's type (`S<u8>(|x| ..)`).
+                    if let Some(want) = expected.map(|t| self.resolve(t))
+                        && self.tys.adt_parts(want).is_some_and(|(d, _)| d == adef)
+                    {
+                        let snap = self.snapshot_vars();
+                        let mine = self.tys.mk_adt(adef, &gen_args);
+                        if !self.unify(mine, want) {
+                            self.rollback_vars(snap);
+                        }
+                    }
                     let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
                     self.check_args(&params, args, span);
                     // Forming the type owes its parameter bounds.

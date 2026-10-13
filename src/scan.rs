@@ -92,7 +92,11 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i].tok;
-        let fn_here = *t == Tok::Fn && (depth == 0 || (depth == 1 && in_impl));
+        // A name must follow: a `fn(...)` pointer type in a tuple struct
+        // field or an alias is not an item (it took the next item's
+        // braces as its body, W-CHECK-G).
+        let fn_here =
+            *t == Tok::Fn && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(_))) && (depth == 0 || (depth == 1 && in_impl));
         if fn_here {
             // The body is the first `{` at this depth after the signature.
             let mut j = i;

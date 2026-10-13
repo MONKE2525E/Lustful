@@ -277,6 +277,40 @@ impl Ex<'_, '_, '_> {
     /// `f_ty`), called through `FnMut`: the env goes by `&` for an
     /// `Fn` closure and by `&mut` for an `FnMut` one.
     fn call_fn(&mut self, f_ty: Ty, f_place: Place, args: Vec<Operand>, dest: Place) -> R {
+        // A fn pointer, fn item, or tuple constructor (W-CHECK-G): a plain
+        // call, as `Ctx::callable_res` resolves a call of the value.
+        match self.body.tys.kind(f_ty) {
+            TyKind::FnPtr(_) => {
+                let l = self.local(f_ty);
+                self.assign(Place::local(l), Rvalue::Use(Operand::Copy(f_place)));
+                self.call(CallTarget::Indirect(l), args, dest);
+                return Ok(());
+            }
+            TyKind::FnDef(def, fargs) => {
+                if let Some(a) = self.p.adt_by_def(def) {
+                    let v = match self.body.tys.args(fargs).first() {
+                        Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {
+                            ConstKind::Int(v) => v as u32,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    self.assign(dest, Rvalue::Aggregate(a, v, args));
+                    return Ok(());
+                }
+                let f = self.p.local_def(def.hash).ok_or("iterator expansion: fn item not found")?;
+                let gargs: Vec<GenericArg> = self.body.tys.args(fargs).to_vec();
+                let f = if gargs.is_empty() {
+                    f
+                } else {
+                    crate::check::generics::instance_for(self.p, &self.body.tys, f, &gargs)
+                        .ok_or("iterator expansion: no instance of the fn item")?
+                };
+                self.call(CallTarget::Fn(f), args, dest);
+                return Ok(());
+            }
+            _ => {}
+        }
         let TyKind::Closure(def, _) = self.body.tys.kind(f_ty) else {
             return Err("iterator expansion: the callable is not a closure".into());
         };

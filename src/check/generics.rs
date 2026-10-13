@@ -792,7 +792,7 @@ pub enum RegionMode {
 impl Scope {
     /// This scope with lifetimes erased: for the insides of fn pointer and
     /// `dyn` types, whose elided lifetimes are their own (late-bound).
-    fn erased(&self) -> Scope {
+    pub(crate) fn erased(&self) -> Scope {
         let mut s = self.clone();
         s.regions = RegionMode::Erase;
         s
@@ -906,7 +906,7 @@ fn check_lifetime(interner: &Interner, scope: &Scope, lt: ast::Lifetime) -> Resu
 /// scope's region mode (W-BORROW). In a body annotation an explicit
 /// `'static` is not supported yet: the annotation's region would be
 /// lost, and lust must not accept a borrow rustc rejects (L0203).
-fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
+pub(crate) fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
     if let Some(lt) = lt
         && let Some(&(_, r)) = scope.alias_lifetimes.iter().find(|(n, _)| *n == lt.name)
     {
@@ -1764,6 +1764,10 @@ fn resolve_path_ty(
             // path that really names a std type there
             // (`std::option::Vec` is not `Vec`).
             let path: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+            // A std iterator type by path (`std::slice::Iter<'a, T>`).
+            if let Some(kind) = crate::check::stdtypes::iter_by_path(&path) {
+                return crate::check::stdtypes::resolve_iter_path(ast, interner, known, cx, tys, scope, kind, segs.last().unwrap(), span);
+            }
             if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type)
                 && !crate::ty::lang::std_is_primitive_path(&path)
             {
@@ -3803,6 +3807,18 @@ pub fn finish_trait_impl(
         };
         validate_method_sig(p, &tmpl, local, tr, impl_parent_n, &assoc_tys, imp.span, errs);
     }
+    // A method signature that names this impl's own associated types
+    // (`fn next(&mut self) -> Option<Self::Item>`) means its bindings:
+    // the signature callers and codegen read holds the bound types (the
+    // projection stayed, and codegen typed it `()`).
+    for &local in method_ids {
+        let (params, ret) = (p.fn_info(local).params.clone(), p.fn_info(local).ret);
+        let params: Vec<Ty> = params.into_iter().map(|t| rewrite_own_projections(p, t, tr.args, &assoc_tys)).collect();
+        let ret = rewrite_own_projections(p, ret, tr.args, &assoc_tys);
+        let f = &mut p.fns[local.0 as usize];
+        f.params = params;
+        f.ret = ret;
+    }
     for &local in method_ids {
         let name = p.fn_info(local).name;
         if rec.method_by_name(name).is_none() {
@@ -4002,6 +4018,64 @@ fn rewrite_impl_projections(p: &mut Program, t: Ty, assoc_tys: &[(DefId, Ty)]) -
         TyKind::Array(e, n) => {
             let e = rewrite_impl_projections(p, e, assoc_tys);
             p.tys.intern(TyKind::Array(e, n))
+        }
+        _ => t,
+    }
+}
+
+/// `t` with every projection of this impl's own trait ref (`Self::A`,
+/// args equal to `trait_args`) replaced by the impl's binding.
+fn rewrite_own_projections(p: &mut Program, t: Ty, trait_args: ArgsId, assoc_tys: &[(DefId, Ty)]) -> Ty {
+    if !p.tys.flags(t).contains_projection() {
+        return t;
+    }
+    match p.tys.kind(t) {
+        TyKind::Projection(assoc, a) if a == trait_args => match assoc_tys.iter().find(|(d, _)| *d == assoc.0) {
+            Some(&(_, bound)) if bound != t => rewrite_own_projections(p, bound, trait_args, assoc_tys),
+            _ => t,
+        },
+        TyKind::Ref(r, m, e) => {
+            let e = rewrite_own_projections(p, e, trait_args, assoc_tys);
+            p.tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::RawPtr(m, e) => {
+            let e = rewrite_own_projections(p, e, trait_args, assoc_tys);
+            p.tys.intern(TyKind::RawPtr(m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = rewrite_own_projections(p, e, trait_args, assoc_tys);
+            p.tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = rewrite_own_projections(p, e, trait_args, assoc_tys);
+            p.tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
+            let out: Vec<Ty> = elems.into_iter().map(|e| rewrite_own_projections(p, e, trait_args, assoc_tys)).collect();
+            let ts = p.tys.intern_tys(&out);
+            p.tys.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Adt(d, a) => {
+            let raw: Vec<GenericArg> = p.tys.args(a).to_vec();
+            let out: Vec<GenericArg> = raw
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => GenericArg::Ty(rewrite_own_projections(p, e, trait_args, assoc_tys)),
+                    other => other,
+                })
+                .collect();
+            let a = p.tys.intern_args(&out);
+            p.tys.intern(TyKind::Adt(d, a))
+        }
+        TyKind::FnPtr(sig) => {
+            let b = p.tys.sig(sig);
+            let ins: Vec<Ty> = p.tys.tys_of(b.value.inputs).to_vec();
+            let ins: Vec<Ty> = ins.into_iter().map(|e| rewrite_own_projections(p, e, trait_args, assoc_tys)).collect();
+            let output = rewrite_own_projections(p, b.value.output, trait_args, assoc_tys);
+            let inputs = p.tys.intern_tys(&ins);
+            let sig = p.tys.intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..b.value } });
+            p.tys.intern(TyKind::FnPtr(sig))
         }
         _ => t,
     }

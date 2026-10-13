@@ -381,6 +381,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.check_packed_borrow(recv, span);
         }
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        // An expected adapter type fixes the adapter's own args first, so
+        // a closure argument sees a fn pointer the result names
+        // (`-> Map<Iter<'_, T>, fn(&T) -> U>`), as rustc's expected
+        // inputs do (W-CHECK-G).
+        if !params.is_empty()
+            && let Some(want) = expected.map(|t| self.resolve(t))
+            && it::is_iter(&self.tys, ret)
+            && self.tys.adt_parts(want).zip(self.tys.adt_parts(ret)).is_some_and(|((a, _), (b, _))| a == b)
+        {
+            let snap = self.snapshot_vars();
+            if !self.unify(ret, want) {
+                self.rollback_vars(snap);
+            }
+        }
         self.check_args(&params, args, span);
         ret
     }

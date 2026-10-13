@@ -202,12 +202,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
         expected: Option<Ty>,
     ) -> Ty {
         let span = self.span(e);
+        // A closure checked against a fn pointer type takes the pointer's
+        // signature and, capturing nothing, becomes a value of that type
+        // (lowering materializes its body fn's trampoline).
+        let mut to_fn_ptr: Option<(Ty, Ty, Ty)> = None;
         if let Some(t) = expected {
             let t = self.resolve(t);
             match self.kind(t) {
-                TyKind::FnPtr(_) => {
-                    self.err("L0820", span, "coercing a closure to a fn pointer is not supported yet", "Pass the closure to a generic parameter instead.");
-                    return ERROR;
+                TyKind::FnPtr(sig) => {
+                    let s = self.tys.sig(sig).value;
+                    if s.is_unsafe || s.extern_c {
+                        self.err(
+                            "L0820",
+                            span,
+                            "coercing a closure to an unsafe or extern fn pointer is not supported yet",
+                            "Use a safe `fn(..)` type.",
+                        );
+                        return ERROR;
+                    }
+                    let ins: Vec<Ty> = self.tys.tys_of(s.inputs).to_vec();
+                    let ts = self.tys.intern_tys(&ins);
+                    let tuple = self.tys.intern(TyKind::Tuple(ts));
+                    to_fn_ptr = Some((t, tuple, s.output));
                 }
                 TyKind::Dyn(..) => {
                     self.err("L0820", span, "closures as `dyn Fn` values are not supported yet", "Pass the closure to a generic parameter instead.");
@@ -221,7 +237,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Infer(v) => self.iter_closure_args.get(&v.0).cloned(),
             _ => None,
         });
-        let sig = self.expected_closure_sig(expected);
+        let sig = match to_fn_ptr {
+            Some((_, tuple, out)) => Some((tuple, Some(out))),
+            None => self.expected_closure_sig(expected),
+        };
         // W-BORROW: with no expected signature (a `let` closure), rustc
         // infers unannotated parameters' regions as free regions of the
         // enclosing fn, one per slot for every call, while an elided
@@ -334,7 +353,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
+        let captures_any = !captures.is_empty();
         self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, input_regions, output_region });
+        if let Some((fp, _, _)) = to_fn_ptr {
+            if captures_any {
+                self.err(
+                    "L0110",
+                    span,
+                    "mismatched types: a closure that captures variables cannot become a fn pointer",
+                    "Pass the captured values as arguments, or take a generic `F: Fn(..)` parameter instead.",
+                );
+                return ERROR;
+            }
+            return fp;
+        }
         ty
     }
 
@@ -1508,8 +1540,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let args: Vec<GenericArg> = self.tys.args(obl.args).to_vec();
         let self_ty = self.deep(args.first()?.as_ty()?);
-        let TyKind::Closure(def, _) = self.kind(self_ty) else { return None };
-        let (kind, inputs, _) = self.closure_facts(def)?;
+        let (kind, inputs) = match self.kind(self_ty) {
+            TyKind::Closure(def, _) => {
+                let (kind, inputs, _) = self.closure_facts(def)?;
+                (kind, inputs)
+            }
+            // A safe fn pointer, fn item, or tuple constructor implements
+            // all three Fn traits with its signature (ARCH 2.9).
+            TyKind::FnPtr(_) | TyKind::FnDef(..) => match self.fn_value_sig(self_ty) {
+                Some((params, _)) => (ClosureKind::Fn, params),
+                None => return Some(false),
+            },
+            _ => return None,
+        };
         let need = if obl.def == lang.fn_ {
             ClosureKind::Fn
         } else if obl.def == lang.fn_mut {
@@ -1546,8 +1589,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let deep = self.deep(self_ty);
-        let TyKind::Closure(def, _) = self.kind(deep) else { return None };
-        self.closure_facts(def).map(|f| f.2)
+        match self.kind(deep) {
+            TyKind::Closure(def, _) => self.closure_facts(def).map(|f| f.2),
+            TyKind::FnPtr(_) | TyKind::FnDef(..) => self.fn_value_sig(deep).map(|f| f.1),
+            _ => None,
+        }
+    }
+
+    /// The signature a fn pointer, fn item, or tuple constructor value
+    /// has as an `Fn` implementor: None for an unsafe or `extern "C"` fn
+    /// (those implement no Fn trait).
+    fn fn_value_sig(&mut self, t: Ty) -> Option<(Vec<Ty>, Ty)> {
+        if let TyKind::FnPtr(sig) = self.kind(t) {
+            let s = self.tys.sig(sig).value;
+            if s.is_unsafe || s.extern_c {
+                return None;
+            }
+        }
+        if let TyKind::FnDef(def, _) = self.kind(t)
+            && self.is_fn_item(t)
+            && self.p.local_def(def.hash).is_some_and(|f| self.p.fn_info(f).def.qual.is_unsafe)
+        {
+            return None;
+        }
+        self.callable_sig(t)
     }
 }
 

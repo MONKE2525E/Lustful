@@ -909,6 +909,37 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
     let info = p.fn_info(f);
     let ret = ctype(&cty(&p.tys, info.ret));
     let cast = fn_ptr_cast(p, f);
+    // The body fn of a closure that captures nothing (W-CHECK-G): a fn
+    // pointer to it takes only the call args, so the trampoline supplies
+    // the zero-sized env (by reference for `Fn` and `FnMut`).
+    if p.gx.closure_fns.contains_key(&f)
+        && let Some(&env_ty) = info.params.first()
+    {
+        let env_c = cty(&p.tys, env_ty);
+        let by_ref = matches!(env_c, CTy::Ref(ref inner) if **inner == CTy::Unit);
+        if by_ref || env_c == CTy::Unit {
+            let names: Vec<String> = (2..=info.params.len()).map(|i| format!("p{i}")).collect();
+            let decls: Vec<String> =
+                info.params.iter().enumerate().skip(1).map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
+            let env = if by_ref { "&env" } else { "env" };
+            let mut all = vec![env.to_string()];
+            all.extend(names);
+            if ret_is_large(p, f) {
+                let mut params = vec![format!("{ret} *out")];
+                params.extend(decls);
+                return format!(
+                    "static void tramp{slot}({}) {{ lust_Unit env; ({cast}lust_fns[{slot}])(out, {}); }}\n",
+                    params.join(", "),
+                    all.join(", ")
+                );
+            }
+            let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
+            return format!(
+                "static {ret} tramp{slot}({params}) {{ lust_Unit env; return ({cast}lust_fns[{slot}])({}); }}\n",
+                all.join(", ")
+            );
+        }
+    }
     let names: Vec<String> = (1..=info.params.len()).map(|i| format!("p{i}")).collect();
     let decls: Vec<String> = info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
     if ret_is_large(p, f) {
