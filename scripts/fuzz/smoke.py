@@ -683,6 +683,21 @@ fn grown() -> i64 { 1 }
               rc == 0 and out == "9\n" and panics() == before_panics,
               f"rc={rc} out={out!r} err={err!r}")
 
+        # 19b. The same value edit through a qualified path (`<S>::C`).
+        qp_p = os.path.join(sp_dir, "qp.rs")
+        steps, ok = [], True
+        for val in ("3", "4", "3", "4"):
+            open(qp_p, "w").write(f"struct S;\nimpl S {{\n    const C: i32 = {val};\n}}\n"
+                                  "fn show() -> i32 {\n    <S>::C\n}\nfn main() {\n    println!(\"{}\", show());\n}\n")
+            outs = []
+            for e in (env, cold_env):
+                r = subprocess.run([LUST, "run", qp_p, "-o", os.path.join(sp_dir, "q.bin")], cwd=work, env=e,
+                                   capture_output=True, text=True, timeout=30)
+                outs.append((r.returncode, r.stdout))
+            ok &= outs[0] == outs[1] == (0, f"{val}\n")
+            steps.append(f"warm {outs[0]} cold {outs[1]}")
+        check("qualified path assoc const value edit: warm run equals cold (fx-vis-fp)", ok, "; ".join(steps))
+
         # 20. Regression (fx-vis-fp, next 1c77df7): since generic reuse
         # keeps bodies across item edits outside the trait system, a
         # trait `use` edit must reach the warm answer. `trait_in_scope`

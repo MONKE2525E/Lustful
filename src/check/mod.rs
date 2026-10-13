@@ -9417,6 +9417,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             && let Some(adt) = self.tys.local_adt(self.resolve(base))
             && let Some(idx) = p.inherent_assoc_const(adt, name)
         {
+            // As on a plain `Type::C` path: the value is baked in (record
+            // its `Sig` read) and the item's visibility applies.
+            if let Some(&def) = p.const_defs.get(idx as usize) {
+                let _ = p.sig_of(&mut self.out.reads, def);
+            }
+            self.check_assoc_vis(adt, name, "associated constant", span);
             let c = &p.consts[idx as usize];
             let (v, t) = (c.value.clone(), c.ty);
             let i = self.ei(e);
