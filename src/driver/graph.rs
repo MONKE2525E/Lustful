@@ -935,6 +935,16 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // locals, and the driver guards those with its per-slot head
         // hash, so a param rename reuses callers.
         (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic).hash(&mut h);
+        // The written visibility and the defining module: a caller of an
+        // `impl dyn Tr` method checks access against them at the call
+        // (`Ctx::check_dyn_method_vis`). Methods have no `def_info`
+        // entry, so `hash_vis_facts` does not cover them.
+        if let Some(t) = &p.resolved {
+            hash_vis(&mut h, p, &crate::resolve::imports::vis_from_ast(&f.def.vis, p.interner));
+            if let Some(&m) = t.fn_module.get(local.0 as usize) {
+                hash_module_path(&mut h, p, t, m);
+            }
+        }
         // `impl dyn Tr` vs `impl dyn Tr + '_`: the same types, but only
         // the first needs a `'static` receiver (check::object).
         p.gx.static_dyn_fns.contains(&local).hash(&mut h);

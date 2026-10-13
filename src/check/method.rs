@@ -966,6 +966,7 @@ pub(super) fn dyn_probe(
             cx.errs.push(crate::check::generics::dyn_not_yet(name_span, "generic methods in `impl dyn Trait` blocks"));
             return Probe::Failed;
         }
+        cx.check_dyn_method_vis(f, name_span);
         let (params, ret) = {
             let info = p.fn_info(f);
             (info.params.clone(), info.ret)

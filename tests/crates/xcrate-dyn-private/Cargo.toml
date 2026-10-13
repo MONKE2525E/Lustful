@@ -1,0 +1,5 @@
+# Both reject (rustc E0624): the dependent crate calls a `pub(crate)`
+# method of a dependency crate's `impl dyn T` block.
+[workspace]
+members = ["base", "app"]
+resolver = "2"

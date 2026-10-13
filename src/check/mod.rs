@@ -1377,6 +1377,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Visibility of an `impl dyn Tr` method a call picked (rustc E0624):
+    /// its written visibility, from the module of its impl. The method's
+    /// `Sig` read covers both, so a warm caller rechecks when either moves.
+    fn check_dyn_method_vis(&mut self, f: LocalDefId, span: Span) {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return };
+        let _ = p.sig_of(&mut self.out.reads, p.def_id(f));
+        let info = p.fn_info(f);
+        let vis = crate::resolve::imports::vis_from_ast(&info.def.vis, p.interner);
+        if !tables.visible(&vis, defining_module(p, f), self.module, p.interner) {
+            self.err(
+                "L0510",
+                span,
+                format!("method `{}` is private", self.name(info.name)),
+                "Make the method `pub(crate)` (the smallest widening that works).",
+            );
+        }
+    }
+
     /// The tuple struct a value binding names as a constructor, if it names one.
     fn tuple_struct_ctor(&mut self, name: Sym) -> Option<AdtId> {
         match self.binding(Namespace::Value, name) {
@@ -6375,6 +6394,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 return Some(ERROR);
             }
+            self.check_dyn_method_vis(f, span);
             let (params, ret) = {
                 let info = p.fn_info(f);
                 (info.params.clone(), info.ret)
