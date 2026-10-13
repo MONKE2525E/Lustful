@@ -1748,6 +1748,7 @@ impl MacroEnv {
         // one name in one module are two (the later shadows).
         let mut seen_defs: FxMap<(usize, u32), ()> = FxMap::default();
         let mut own_exported: Vec<bool> = Vec::new();
+        let macro_rules = interner.intern("macro_rules");
         for (di, disc) in discs.iter().enumerate() {
             let base_path = tables.modules[disc.module.0 as usize].path.clone();
             let mut collect = |outline: &scan::Outline, lexed: &lexer::Lexed, owned: &mut Vec<OwnedMacroSource>| {
@@ -1781,7 +1782,12 @@ impl MacroEnv {
             if let Some(orig) = &disc.lexed {
                 collect(&disc.outline, orig, &mut owned);
             }
-            if let Some(Some(exp)) = expanded.get(di) {
+            if let Some(Some(exp)) = expanded.get(di)
+                && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Ident(macro_rules))
+            {
+                // Only `outline.macros` feeds this collect, and a
+                // macro definition needs a `macro_rules`
+                // identifier token; most expanded files have none.
                 let o = scan::outline(exp, interner);
                 collect(&o, exp, &mut owned);
             }
@@ -1806,18 +1812,30 @@ impl MacroEnv {
             dep_owned.insert(extern_name.clone(), idxs);
         }
         // The re-export fixpoint over this crate's use items.
+        // Use sites only feed that fixpoint and the glob seeds:
+        // with no macro source in this crate or its dependencies
+        // the bindings stay empty whatever the use items say, and
+        // a stream with no `use` token has no sites. Either way
+        // the token trees (the expensive part) are not built.
+        let no_sources = srcs.is_empty() && dep_exports.iter().all(|(_, s)| s.is_empty());
         let mut sites: Vec<UseSite> = Vec::new();
         let mut sites_by_disc: Vec<Vec<UseSite>> = Vec::with_capacity(discs.len());
         for (di, disc) in discs.iter().enumerate() {
-            let base = tables.modules[disc.module.0 as usize].path.clone();
             let mut mine: Vec<UseSite> = Vec::new();
-            if let Some(orig) = &disc.lexed {
-                let (trees, _) = crate::lexer::build_trees(&orig.tokens);
-                scan_use_sites(&trees, &base, interner, &mut mine);
-            }
-            if let Some(Some(exp)) = expanded.get(di) {
-                let (trees, _) = crate::lexer::build_trees(&exp.tokens);
-                scan_use_sites(&trees, &base, interner, &mut mine);
+            if !no_sources {
+                let base = tables.modules[disc.module.0 as usize].path.clone();
+                if let Some(orig) = &disc.lexed
+                    && orig.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
+                {
+                    let (trees, _) = crate::lexer::build_trees(&orig.tokens);
+                    scan_use_sites(&trees, &base, interner, &mut mine);
+                }
+                if let Some(Some(exp)) = expanded.get(di)
+                    && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
+                {
+                    let (trees, _) = crate::lexer::build_trees(&exp.tokens);
+                    scan_use_sites(&trees, &base, interner, &mut mine);
+                }
             }
             sites.extend(mine.iter().cloned());
             sites_by_disc.push(mine);
@@ -2184,11 +2202,19 @@ fn resolve_one(
             }
         }
         // Macro-generated module edges and macro definitions.
+        // Only the outline's mods and macros are read here; a
+        // stream with no `mod` token and no `macro_rules`
+        // identifier has neither, so the outline is the default.
         let before = discs.len();
         let mut new_queue: Vec<usize> = Vec::new();
+        let macro_rules = interner.intern("macro_rules");
         for di in 0..before {
             let Some(exp) = expanded[di].as_ref() else { continue };
-            let outline = scan::outline(exp, interner);
+            let outline = if exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Mod || t.tok == crate::lexer::Tok::Ident(macro_rules)) {
+                scan::outline(exp, interner)
+            } else {
+                scan::Outline::default()
+            };
             let disc_module = discs[di].module;
             let inline = outline_mods(di, &outline, &exp.strings, &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
             bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
@@ -2813,6 +2839,12 @@ fn textual_env(
     tables: &ResolvedTables,
     interner: &Interner,
 ) -> (Vec<Vec<usize>>, Vec<Vec<(u32, Vec<usize>, bool)>>) {
+    // With no textual macro source anywhere, every file inherits
+    // nothing and no `#[macro_use]` join has sources to add: the
+    // result is one empty list per disc.
+    if srcs.is_empty() && dep_owned.values().all(|v| v.is_empty()) {
+        return (vec![Vec::new(); discs.len()], vec![Vec::new(); discs.len()]);
+    }
     struct Cx<'a> {
         job: &'a CrateJob,
         discs: &'a [FileDisc],
@@ -2930,7 +2962,11 @@ fn textual_env(
     let mut extern_events: Vec<Vec<(u32, String)>> = Vec::with_capacity(discs.len());
     for (di, disc) in discs.iter().enumerate() {
         let mut ds = disc.outline.mods.clone();
-        if let Some(Some(exp)) = expanded.get(di) {
+        if let Some(Some(exp)) = expanded.get(di)
+            && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Mod)
+        {
+            // Only the outline's mods are read here (see the same
+            // gate in the expansion round loop).
             ds.extend(scan::outline(exp, interner).mods);
         }
         decls.push(ds);
