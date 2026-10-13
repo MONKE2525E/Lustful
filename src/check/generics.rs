@@ -711,19 +711,35 @@ fn resolve_generic_args(
     tys: &mut impl TyIntern,
     scope: &Scope,
     args: &[AstArg],
-    n_params: usize,
+    param_is_const: &[bool],
     span: Span,
     what: &str,
 ) -> Result<Vec<GenericArg>, Diag> {
+    let n_params = param_is_const.len();
     let mut out: Vec<GenericArg> = Vec::new();
+    // The index among type/const arguments (lifetimes do not count).
+    let mut vi = 0usize;
     for a in args {
         match a {
-            AstArg::Type(t) => out.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?)),
+            AstArg::Type(t) => {
+                // A bare path in a const parameter's position names
+                // a const, not a type (`Arr<N>`): the parser cannot
+                // tell, so the declared kind decides here.
+                if param_is_const.get(vi).copied().unwrap_or(false) {
+                    out.push(GenericArg::Const(resolve_const_path_arg(ast, interner, known, cx, tys, scope, *t, span)?));
+                } else {
+                    out.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?));
+                }
+                vi += 1;
+            }
             AstArg::Lifetime(lt) => {
                 check_lifetime(interner, *lt)?;
                 out.push(GenericArg::Lifetime(Region::Erased));
             }
-            AstArg::Const(e) => out.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?)),
+            AstArg::Const(e) => {
+                out.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?));
+                vi += 1;
+            }
             AstArg::Binding { span, .. } => {
                 return Err(Diag::new(
                     "L0110",
@@ -747,6 +763,53 @@ fn resolve_generic_args(
         ));
     }
     Ok(out)
+}
+
+/// A const generic argument the parser read as a type path
+/// (`Arr<N>`): a const parameter of the enclosing item, or a
+/// free const item. Rust reads a bare generic argument as a
+/// type first: only a single-segment path that names no type
+/// in scope may name a const (multi-segment const paths need
+/// braces, `Arr<{ S::N }>`).
+fn resolve_const_path_arg(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    t: ast::TyId,
+    span: Span,
+) -> Result<ConstId, Diag> {
+    let err = || {
+        Diag::new(
+            "L0110",
+            span,
+            "const argument must be a literal or a const parameter",
+            "Use a literal such as `3`, or braces around a const path such as `{ S::N }`.",
+        )
+    };
+    let TyExpr::Path(segs) = ast.ty(t) else { return Err(err()) };
+    let [seg] = segs.as_slice() else { return Err(err()) };
+    if seg.has_args() {
+        return Err(err());
+    }
+    // A name that resolves as a type here is a type argument,
+    // never a const (rustc E0747 in this position).
+    if cx.type_names.contains_key(&seg.name)
+        || cx.aliases.contains_key(&seg.name)
+        || scope.param_tys.iter().any(|(n, _)| *n == seg.name)
+        || seg.name == known.self_type
+    {
+        return Err(err());
+    }
+    if let Some(&(_, i)) = scope.const_params.iter().find(|(n, _)| *n == seg.name) {
+        return Ok(tys.intern_const(ConstKind::Param(i)));
+    }
+    match crate::check::collect::named_const_kind(ast, interner, known, seg.name) {
+        Some(k) => Ok(tys.intern_const(k)),
+        None => Err(err()),
+    }
 }
 
 /// A const generic argument or array length in signature form:
@@ -1232,7 +1295,7 @@ fn resolve_path_ty(
     }
     if name == known.Vec || name == known.Option || name == known.Box || name == known.Rc {
         let args = match &seg.args {
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, 1, span, interner.get(name))?,
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], span, interner.get(name))?,
             _ => {
                 return Err(Diag::new(
                     "L0110",
@@ -1261,7 +1324,7 @@ fn resolve_path_ty(
     }
     if name == known.Result {
         let args = match &seg.args {
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, 2, span, interner.get(name))?,
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false, false], span, interner.get(name))?,
             _ => {
                 return Err(Diag::new(
                     "L0110",
@@ -1299,7 +1362,32 @@ fn resolve_path_ty(
                     ));
                 }
             }
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, n_params, span, crate::intern::source_name(interner.get(name)))?,
+            GenericArgs::Angle(a) => {
+                // Declared parameter kinds from the Adt's own item:
+                // its built generics may not exist yet when an
+                // earlier item's fields name it.
+                let kinds: Vec<bool> = ast
+                    .items
+                    .iter()
+                    .filter_map(|it| match &it.kind {
+                        ast::ItemKind::Struct(s) if s.name == name => Some(&s.generics),
+                        ast::ItemKind::Enum(e) if e.name == name => Some(&e.generics),
+                        _ => None,
+                    })
+                    .next()
+                    .map(|g| {
+                        g.params
+                            .iter()
+                            .filter_map(|p| match p {
+                                ast::GenericParam::Type { .. } => Some(false),
+                                ast::GenericParam::Const { .. } => Some(true),
+                                ast::GenericParam::Lifetime { .. } => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![false; n_params]);
+                resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, crate::intern::source_name(interner.get(name)))?
+            }
             GenericArgs::Parenthesized { .. } => {
                 return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
             }
