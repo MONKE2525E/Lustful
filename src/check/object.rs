@@ -290,7 +290,10 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         // drops `'static` bounds today); lust does not check those
         // bounds at dyn calls, so they are unsupported, not violations.
         let rustc_allows = |pred: &&Predicate| match pred {
-            Predicate::Trait(b) => p.tys.args(b.value.args).len() == 1 && lang.is_auto(b.value.def),
+            Predicate::Trait(b) => {
+                let a = p.tys.args(b.value.args);
+                a.len() == 1 && is_self(&p.tys, a[0]) && lang.is_auto(b.value.def)
+            }
             Predicate::TypeOutlives(..) => true,
             _ => false,
         };
