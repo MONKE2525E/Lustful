@@ -167,12 +167,17 @@ pub(super) fn replay_method(
     explicit: &[Option<GenericArg>],
     expected: Option<Ty>,
 ) -> Option<Ty> {
+    // The same autoderef steps as the template's search: references,
+    // then `Box` and `Rc` (`method::generic_method_search`).
     let mut step = cx.resolve(recv_ty);
     let mut ok = true;
     for _ in 0..pick.derefs {
         match cx.tys.kind(step) {
             TyKind::Ref(_, _, inner) => step = cx.resolve(inner),
-            _ => ok = false,
+            _ => match cx.tys.smart_elem(step) {
+                Some(inner) => step = cx.resolve(inner),
+                None => ok = false,
+            },
         }
     }
     if ok {
