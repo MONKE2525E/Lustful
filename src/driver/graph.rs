@@ -370,6 +370,53 @@ fn hash_trait_ref(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, tr: &Trait
     }
 }
 
+/// Hashes one predicate: a bound, an associated type equality, or an
+/// outlives fact, with defs in stable form.
+fn hash_predicate(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, pred: &Predicate) {
+    match pred {
+        Predicate::Trait(b) => {
+            (0u8, b.count).hash(h);
+            hash_trait_ref(h, p, tys, &b.value);
+        }
+        Predicate::AssocEq(b) => {
+            (1u8, b.count).hash(h);
+            hash_def_pub(h, p, b.value.assoc);
+            hash_args(h, p, tys, b.value.trait_args);
+            hash_ty(h, p, tys, b.value.ty);
+        }
+        Predicate::Outlives(a, b) => {
+            2u8.hash(h);
+            hash_region(h, *a);
+            hash_region(h, *b);
+        }
+        Predicate::TypeOutlives(t, r) => {
+            3u8.hash(h);
+            hash_ty(h, p, tys, *t);
+            hash_region(h, *r);
+        }
+    }
+}
+
+/// Hashes one generics list: parameter kinds (names bind nothing a
+/// reader sees) and predicates in source order.
+fn hash_generics(h: &mut FxHasher, p: &Program, g: &Generics) {
+    (g.params.len() as u64).hash(h);
+    for param in &g.params {
+        match param.kind {
+            ParamKind::Lifetime => 0u8.hash(h),
+            ParamKind::Type => 1u8.hash(h),
+            ParamKind::Const(t) => {
+                2u8.hash(h);
+                hash_ty(h, p, &p.tys, t);
+            }
+        }
+    }
+    (g.predicates.len() as u64).hash(h);
+    for pred in &g.predicates {
+        hash_predicate(h, p, &p.tys, pred);
+    }
+}
+
 /// Hashes one type by structure, with defs in stable form. This is the
 /// in-memory fingerprint of section 8.1, not the 8.4 disk form: W-DRIVER owns
 /// the disk translation and may reshape it. Kind tags follow `TyKind`
@@ -576,6 +623,11 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     adt.repr.int.hash(h);
     adt.repr.align.hash(h);
     (adt.derives.debug, adt.derives.clone, adt.derives.copy, adt.derives.partial_eq).hash(h);
+    // A generic Adt's parameters and bounds: a bound edit changes what
+    // every use of the type must prove (generic reuse, W-PERF).
+    if let Some(g) = p.gx.adt_generics.get(a.0 as usize) {
+        hash_generics(h, p, g);
+    }
     (adt.variants.len() as u64).hash(h);
     for v in &adt.variants {
         p.name(v.name).hash(h);
@@ -881,6 +933,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
+        // A generic fn's parameters and bounds (its impl's too, merged
+        // in by collect): callers prove the bounds (generic reuse).
+        match p.gx.fn_templates.get(local.0 as usize) {
+            Some(Some(t)) => hash_generics(&mut h, p, &t.generics),
+            _ => u64::MAX.hash(&mut h),
+        }
     } else if p.adt_by_def(def).is_some() {
         1u8.hash(&mut h);
         layout_fingerprint(p, def).0.hash(&mut h);
@@ -1174,8 +1232,16 @@ impl<'a> Program<'a> {
     /// was checked, so the stored result can be reused if the body itself
     /// is unchanged. The count (not just a bool) feeds the scale gate's
     /// invalidated-query row.
+    #[cfg(test)]
     pub fn reads_dirty(&self, reads: &Reads) -> usize {
         reads.iter().filter(|(k, stored)| self.read_fingerprint(k) != **stored).count()
+    }
+
+    /// `reads_dirty` with a per-program memo of node answers: a walk
+    /// over many bodies computes each node's fingerprint once. The
+    /// driver's walks use this form; tests use the plain one.
+    pub fn reads_dirty_memo(&self, reads: &Reads, memo: &mut FxMap<ReadKey, Read>) -> usize {
+        reads.iter().filter(|(k, stored)| *memo.entry(**k).or_insert_with(|| self.read_fingerprint(k)) != **stored).count()
     }
 }
 

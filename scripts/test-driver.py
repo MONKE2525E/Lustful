@@ -44,6 +44,9 @@
 #      alternate, and every answer equals a cold one-shot build,
 #      including panic lines and columns after edits that only move
 #      text (comment lines above a closure, spaces inside a body).
+#      Item edits outside the trait system (a new fn, a bound added to
+#      a generic fn) keep the other templates' checks, and a bound the
+#      caller cannot meet rejects warm exactly as cold.
 #  13. moved instance Adt ids: an edit that makes a new generic Adt
 #      instance first in discovery moves the ids (and C names) of the
 #      others; a warm build must rebuild the glue unit and every unit
@@ -521,6 +524,31 @@ def case_generic_reuse():
     d.run(["check", src])
     st, prog = d.build(src, out)
     same("item edit, check, body edit, check, build", st, prog)
+
+    def check_stats():
+        r = d.run(["check", src], expect=None)
+        line = r.stderr.split("lust-stats:")[-1].split("\n")[0]
+        return r, {k: int(v) for k, _, v in (kv.partition("=") for kv in line.split()) if v.isdigit()}
+
+    # A new fn: an item edit outside the trait system. No template
+    # reads the new name, so every template check is reused.
+    edit("fn other() -> u8 {", "fn added() -> u8 {\n    9\n}\n\nfn other() -> u8 {")
+    _, cst = check_stats()
+    check("generic new fn reuses template checks", cst.get("templates") == 0, str(cst))
+    st, prog = d.build(src, out)
+    same("new fn", st, prog)
+    # A bound the caller meets, then one it cannot meet: the warm
+    # answer must reject exactly as a cold check does (rule zero).
+    edit("fn total<T: Score>(", "fn total<T: Score + Sized>(")
+    st, prog = d.build(src, out)
+    same("bound added, caller meets it", st, prog)
+    edit("fn total<T: Score + Sized>(", "fn total<T: Score + Copy>(")
+    r, _ = check_stats()
+    env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold-reject"))
+    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
+    strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("lust-stats:"))
+    check("generic unmet bound rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
+          f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
     d.kill()
 
 

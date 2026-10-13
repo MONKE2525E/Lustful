@@ -1,26 +1,34 @@
 // Generic-program reuse across daemon requests (docs/ARCH.md section 8;
 // W-PERF wave B). Collect checks every template once against its bounds
 // (`generics::template_check`) and runs instance discovery over every
-// plain fn and every instance it makes (`generics::materialize`). Both
-// results are functions of the checked body's source text and the
-// program's item-level environment. This cache keeps them per stable
-// def across the requests of one daemon session, so collect checks only
-// the bodies an edit touched and replays the rest in the cold order.
+// plain fn and every instance it makes (`generics::materialize`). This
+// cache keeps both results per stable def across the requests of one
+// daemon session, so collect checks only the bodies an edit touched and
+// replays the rest in the cold order.
 //
-// The driver owns the environment half of the key: it clears the cache
-// whenever anything item-level changed, a const fn body changed, or the
-// program has a nested static (see `compile.rs`, "generic reuse"). Under
-// an unchanged environment, an entry holds while its source fingerprint
-// holds: the body hash of the AST fn whose text the body checks. A
-// closure body fn's source is its parent's, an instance's source is its
-// template's, and a trait default method's text is part of the trait
-// item, which the environment covers.
+// A stored result depends on three things, and holds while all three do:
+// - the trait system: trait items, impl items, and derive lists. The
+//   driver clears the cache when their fingerprint changes (and on a
+//   const fn body edit, a nested static, or a slot renumber; see
+//   `compile.rs`, "generic reuse"). No read records trait selection,
+//   so this is the only key for it.
+// - the source: the body and head hash of the AST fn whose text the
+//   body checks. A closure body fn's source is its parent's, an
+//   instance's source is its template's, and a trait default method's
+//   text is part of its trait item, under the first key.
+// - everything else the check read (section 8.2 `Reads`: bindings,
+//   method sets, signatures with generics and bounds, layouts). An entry
+//   made under another item-level environment replays its reads against
+//   this program first. Instance entries do not: an instance check
+//   replays its template's picks without probing, so its reads miss the
+//   probes that chose them; after an item edit, instances recheck.
 use crate::ast::ExprId;
 use crate::check::closure::ClosureKind;
 use crate::check::collect::Program;
 use crate::check::generics::{FnClass, OwnedArg, OwnedClosure, OwnedTy};
 use crate::check::picks::TraitPick;
 use crate::def::{DefId, LocalDefId};
+use crate::driver::graph::{Read, ReadKey, Reads};
 use crate::intern::FxMap;
 
 /// One passing template check of a body with no closure expressions:
@@ -29,6 +37,9 @@ use crate::intern::FxMap;
 /// Ast is rebuilt; offsets inside one body do not).
 struct TemplateEntry {
     src: u64,
+    /// The item-level environment the entry last held under.
+    env: u64,
+    reads: Reads,
     n_exprs: u32,
     picks: Vec<(u32, TraitPick)>,
     calls: Vec<(u32, ClosureKind)>,
@@ -39,6 +50,8 @@ struct TemplateEntry {
 /// check order.
 struct DiscoveryEntry {
     src: u64,
+    env: u64,
+    reads: Reads,
     adt_tys: Vec<OwnedTy>,
     requests: Vec<(DefId, Vec<OwnedArg>)>,
     closures: Vec<OwnedClosure>,
@@ -55,11 +68,16 @@ pub struct GenReuse {
     /// False: every lookup misses and nothing is stored (one-shot
     /// sessions, and `collect` callers outside the driver).
     pub on: bool,
-    /// Source fingerprint of each AST fn, in `LocalDefId` order (the
-    /// driver's scan body hash), set by the driver before collect.
+    /// Source fingerprint of each AST fn, in `LocalDefId` order (body
+    /// and head hash), set by the driver before collect.
     pub ast_src: Vec<u64>,
+    /// This request's item-level environment (item-scan hash and AST fn
+    /// count), set by the driver before collect.
+    pub env: u64,
     templates: FxMap<DefId, TemplateEntry>,
     discovery: FxMap<DefId, DiscoveryEntry>,
+    /// Node answers of this collect's program, for read replays.
+    memo: FxMap<ReadKey, Read>,
     /// This collect's work, for the stats line: checks run and reused.
     pub templates_checked: usize,
     pub templates_reused: usize,
@@ -68,14 +86,15 @@ pub struct GenReuse {
 }
 
 impl GenReuse {
-    /// Drops every entry: the environment they were made under changed.
+    /// Drops every entry: the trait system they were made under changed.
     pub fn clear(&mut self) {
         self.templates.clear();
         self.discovery.clear();
     }
 
-    /// Resets the per-collect counters before a collect runs.
+    /// Resets the per-collect state before a collect runs.
     pub fn begin(&mut self) {
+        self.memo.clear();
         self.templates_checked = 0;
         self.templates_reused = 0;
         self.discovery_checked = 0;
@@ -87,7 +106,7 @@ impl GenReuse {
     pub fn src_of(&self, p: &Program, f: LocalDefId) -> Option<u64> {
         let s = self.source(p, f)?;
         // A trait default body: its text is in the trait item, which
-        // the environment half of the key covers.
+        // the trait-system key covers.
         Some(self.ast_src.get(s.0 as usize).copied().unwrap_or(0))
     }
 
@@ -112,6 +131,12 @@ impl GenReuse {
         None
     }
 
+    /// True when an entry made under `env` with `reads` still holds in
+    /// this program: same environment, or every read answers the same.
+    fn reads_hold(memo: &mut FxMap<ReadKey, Read>, this_env: u64, p: &Program, env: u64, reads: &Reads) -> bool {
+        env == this_env || p.reads_dirty_memo(reads, memo) == 0
+    }
+
     /// The stored picks and closure call kinds of template `t`, rebased
     /// onto its current body, if its stored check still holds.
     #[allow(clippy::type_complexity)]
@@ -121,10 +146,11 @@ impl GenReuse {
         }
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_info(t).def.exprs;
-        let e = self.templates.get(&p.def_id(t))?;
-        if e.src != src || e.n_exprs != hi - lo {
+        let e = self.templates.get_mut(&p.def_id(t))?;
+        if e.src != src || e.n_exprs != hi - lo || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
             return None;
         }
+        e.env = self.env;
         self.templates_reused += 1;
         let picks = e.picks.iter().map(|&(off, pick)| (ExprId(lo + off), pick)).collect();
         let calls = e.calls.iter().map(|&(off, k)| (ExprId(lo + off), k)).collect();
@@ -133,7 +159,7 @@ impl GenReuse {
 
     /// Stores one passing template check (the caller passes only bodies
     /// with no closure expressions).
-    pub fn store_template(&mut self, p: &Program, t: LocalDefId, picks: &[(ExprId, TraitPick)], calls: &[(ExprId, ClosureKind)]) {
+    pub fn store_template(&mut self, p: &Program, t: LocalDefId, reads: &Reads, picks: &[(ExprId, TraitPick)], calls: &[(ExprId, ClosureKind)]) {
         if !self.on {
             return;
         }
@@ -145,7 +171,8 @@ impl GenReuse {
         }
         let picks = picks.iter().map(|&(e, pick)| (e.0 - lo, pick)).collect();
         let calls = calls.iter().map(|&(e, k)| (e.0 - lo, k)).collect();
-        self.templates.insert(p.def_id(t), TemplateEntry { src, n_exprs: hi - lo, picks, calls });
+        let entry = TemplateEntry { src, env: self.env, reads: with_own_sig(p, t, reads), n_exprs: hi - lo, picks, calls };
+        self.templates.insert(p.def_id(t), entry);
     }
 
     /// The stored discovery output of fn `f`, if it still holds.
@@ -154,8 +181,9 @@ impl GenReuse {
             return None;
         }
         let src = self.src_of(p, f)?;
-        let e = self.discovery.get(&p.def_id(f))?;
-        if e.src != src {
+        let instance = p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Instance);
+        let e = self.discovery.get_mut(&p.def_id(f))?;
+        if e.src != src || (instance && e.env != self.env) || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
             return None;
         }
         let mut requests = Vec::with_capacity(e.requests.len());
@@ -163,15 +191,18 @@ impl GenReuse {
             let l = p.local_def(def.hash).filter(|&l| p.def_id(l) == *def)?;
             requests.push((l, args.clone()));
         }
+        e.env = self.env;
         self.discovery_reused += 1;
         Some((e.adt_tys.clone(), requests, e.closures.clone()))
     }
 
     /// Stores the output of one clean discovery check of fn `f`.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_discovered(
         &mut self,
         p: &Program,
         f: LocalDefId,
+        reads: &Reads,
         adt_tys: &[OwnedTy],
         requests: &[(LocalDefId, Vec<OwnedArg>)],
         closures: &[OwnedClosure],
@@ -181,6 +212,19 @@ impl GenReuse {
         }
         let Some(src) = self.src_of(p, f) else { return };
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
-        self.discovery.insert(p.def_id(f), DiscoveryEntry { src, adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec() });
+        let reads = with_own_sig(p, f, reads);
+        let entry = DiscoveryEntry { src, env: self.env, reads, adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec() };
+        self.discovery.insert(p.def_id(f), entry);
     }
+}
+
+/// A check's read set plus a `Sig` read of the checked fn itself: a body
+/// reads its own signature (parameter and return types, deep) through
+/// the compat `FnInfo` path, which records nothing, and its field
+/// accesses record nothing either. The driver adds the same read to
+/// each slot's stored set.
+fn with_own_sig(p: &Program, f: LocalDefId, reads: &Reads) -> Reads {
+    let mut reads = reads.clone();
+    let _ = p.sig_of(&mut reads, p.def_id(f));
+    reads
 }

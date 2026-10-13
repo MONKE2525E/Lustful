@@ -3566,10 +3566,11 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
                 closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
             }
         }
-        let (body_errs, picks, calls) = {
+        let (body_errs, picks, calls, reads) = {
             let (c, mut e) = crate::check::check_fn(p, t);
             let picks = c.trait_picks.clone();
             let calls = c.closure_calls.clone();
+            let reads = c.reads.clone();
             if e.is_empty() {
                 let body = crate::lower::lower(p, t, c);
                 e.extend(crate::borrowck::borrowck(p, &body));
@@ -3579,11 +3580,11 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
                     e.extend(crate::borrowck::borrowck(p, &cbody));
                 }
             }
-            (e, picks, calls)
+            (e, picks, calls, reads)
         };
         reuse.templates_checked += 1;
         if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
-            reuse.store_template(p, t, &picks, &calls);
+            reuse.store_template(p, t, &reads, &picks, &calls);
         }
         record_template_closures(p, t, Vec::new(), calls);
         errs.extend(body_errs);
@@ -4082,7 +4083,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                     }
                 }
                 if discarded.is_empty() {
-                    reuse.store_discovered(p, fid, &adt_tys, &reqs, &closures_owned);
+                    reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned);
                 }
                 (adt_tys, reqs, closures_owned)
             };

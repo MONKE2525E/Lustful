@@ -72,6 +72,15 @@ pub(crate) fn scan_ast_seq(ast: &Ast) -> AstScans {
     assemble(ast, ast.items.iter().map(|item| scan_item(ast, item)).collect())
 }
 
+/// The structural hash of one item without fn bodies (the item-scan
+/// hash of `scan_ast`). A trait item hashes its default bodies too.
+pub(crate) fn item_hash(ast: &Ast, item: &Item) -> u64 {
+    let mut w = Walker { ast, idents: None };
+    let mut h = FxHasher::default();
+    w.item(&mut h, item, false);
+    h.finish()
+}
+
 /// The hash of one fn's head: name, qualifiers, generics, self and
 /// parameter bindings (names, patterns, types), return type, and
 /// where clause. The driver stores it per slot: a body is checked

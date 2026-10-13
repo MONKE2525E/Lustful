@@ -47,10 +47,11 @@ pub(crate) struct Front {
     pub(crate) prev_adt_ids: FxMap<crate::def::DefPathHash, u32>,
     /// The static index of every top-level static at the last parse.
     pub(crate) prev_static_ids: FxMap<crate::def::DefPathHash, u32>,
-    /// True when the last parse had a shape whose derived Adt
-    /// indices (generic instances, nested statics) can shift when
-    /// a def is added even though the defs in `prev_adt_ids` and
-    /// `prev_static_ids` keep theirs. Growth is then not reusable.
+    /// True when the last parse had a shape whose derived indices (a
+    /// nested static's) can shift when a def is added even though the
+    /// defs in `prev_adt_ids` and `prev_static_ids` keep theirs.
+    /// Growth is then not reusable. Instance Adt ids of a generic
+    /// program shift too; builds check those (`Caches::inst_adt_fp`).
     pub(crate) prev_order_fragile: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
@@ -231,7 +232,10 @@ pub(crate) struct Caches {
     /// (the item-level environment and AST fn count they were made
     /// under) holds.
     pub(crate) gen_reuse: super::gen_reuse::GenReuse,
-    pub(crate) gen_key: Option<u64>,
+    /// The item-level environment (item-scan hash and AST fn count) and
+    /// the trait-system fingerprint of the last collect (see compile.rs).
+    pub(crate) gen_env: Option<u64>,
+    pub(crate) gen_trait: Option<u64>,
     /// Fingerprint of the instance Adt numbering (id, instance key) the
     /// current `out` entries of a generic program were generated under.
     /// C names Adts by id, so cached C is reusable only while it holds.
@@ -321,7 +325,8 @@ impl Session {
                 persistent,
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
-                gen_key: None,
+                gen_env: None,
+                gen_trait: None,
                 inst_adt_fp: 0,
             },
             std_cache: None,

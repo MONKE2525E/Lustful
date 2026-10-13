@@ -209,6 +209,43 @@ fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, 
     std::hash::Hasher::finish(&h)
 }
 
+/// The trait-system fingerprint generic reuse keys on (driver/
+/// gen_reuse.rs): every trait item (default bodies included), every
+/// impl item (headers, method heads, associated items), every type
+/// alias and const item (an impl header or bound can reach a type
+/// through them), and the derive list of every Adt that has one, in
+/// item order. Body
+/// checks read trait selection without recording it, so any edit here
+/// drops every stored generic result.
+fn trait_system_hash(ast: &Ast, interner: &Interner) -> u64 {
+    use std::hash::Hash;
+    let mut h = crate::intern::FxHasher::default();
+    "trait-system-v1".hash(&mut h);
+    for item in &ast.items {
+        let derives = match &item.kind {
+            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
+                (0u8, super::ast_hash::item_hash(ast, item)).hash(&mut h);
+                continue;
+            }
+            ItemKind::Struct(s) => (s.name, &s.derives),
+            ItemKind::Enum(e) => (e.name, &e.derives),
+            _ => continue,
+        };
+        // An Adt with no derives adds no impl: a new plain struct
+        // keeps the key.
+        if derives.1.is_empty() {
+            continue;
+        }
+        1u8.hash(&mut h);
+        interner.get(derives.0).hash(&mut h);
+        (derives.1.len() as u64).hash(&mut h);
+        for (d, _) in derives.1 {
+            interner.get(*d).hash(&mut h);
+        }
+    }
+    std::hash::Hasher::finish(&h)
+}
+
 /// Empties one slot like a dead fn: no C, no reads, no IR.
 fn wipe_slot(caches: &mut Caches, s: usize) {
     caches.out[s] = FnOut::default();
@@ -799,8 +836,10 @@ fn file_text_hash(map: &SourceMap, file: FileId) -> u64 {
 /// The Adt and top-level static indices `collect` will assign for
 /// one Ast under the session `DefOrder`, predicted with the same
 /// hash and rank rules collect uses, plus whether this Ast has a
-/// shape whose derived indices can shift on growth (generic
-/// parameters anywhere, or a nested static). The slot update
+/// shape whose derived indices can shift on growth (a nested
+/// static). Instance Adt ids of a generic program shift on growth
+/// too, but the build checks those itself (`inst_adt_fingerprint`)
+/// and regenerates C when they move. The slot update
 /// compares the prediction with the last parse's indices: cached
 /// output carries session-local indices (CTy in glue and type
 /// sets, static indices in IR), so it is reusable only when every
@@ -815,16 +854,13 @@ fn predicted_def_ids(
     let mut static_hashes: Vec<crate::def::DefPathHash> = Vec::new();
     let mut counts: FxMap<Sym, u32> = FxMap::default();
     let mut fragile = false;
-    let has_params = |g: &crate::ast::Generics| !g.params.is_empty();
     for item in &ast.items {
         match &item.kind {
             ItemKind::Struct(s) => {
-                fragile |= has_params(&s.generics);
                 let disamb = *counts.entry(s.name).and_modify(|c| *c += 1).or_insert(0);
                 adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(s.name), disamb));
             }
             ItemKind::Enum(e) => {
-                fragile |= has_params(&e.generics);
                 let disamb = *counts.entry(e.name).and_modify(|c| *c += 1).or_insert(0);
                 adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(e.name), disamb));
             }
@@ -832,28 +868,16 @@ fn predicted_def_ids(
                 // Collect numbers no Adt for a union today, but the
                 // old sequence hash counted it as an Adt-shaped def:
                 // keep it in the map so a union edit still guards.
-                fragile |= has_params(&u.generics);
                 let disamb = *counts.entry(u.name).and_modify(|c| *c += 1).or_insert(0);
                 adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(u.name), disamb));
             }
             ItemKind::Static(s) => {
                 static_hashes.push(def::item_hash(stable, &[], def::DefKind::Static, interner.get(s.name), 0));
             }
-            ItemKind::Fn(f) => fragile |= has_params(&f.generics),
-            ItemKind::Impl(imp) => {
-                fragile |= has_params(&imp.generics) || imp.fns.iter().any(|f| has_params(&f.generics));
-            }
-            ItemKind::Trait(t) => fragile |= has_params(&t.generics),
             _ => {}
         }
     }
-    for item in &ast.stmt_items {
-        match &item.kind {
-            ItemKind::Static(_) => fragile = true,
-            ItemKind::Fn(f) => fragile |= has_params(&f.generics),
-            _ => {}
-        }
-    }
+    fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Static(_)));
     // Collect also numbers the synthetic `core::cmp::Ordering` Adt
     // (check/collect.rs pass 1) unless a user type, alias, or trait
     // of that name shadows it: predict the same extra hash.
@@ -941,9 +965,10 @@ fn slot_update(
     // Cached output stays reusable in full mode when every Adt and
     // static of the last parse keeps its session-local index in
     // this parse (pure additions append at the end of the session
-    // order), except that growth in a fragile program (generics,
-    // nested statics) can shift derived indices the maps do not
-    // name, so growth there still clears.
+    // order), except that growth in a fragile program (a nested
+    // static) can shift derived indices the maps do not name, so
+    // growth there still clears. (Instance Adt ids of a generic
+    // program shift too; a build regenerates C when they move.)
     let (mut adt_ids, mut static_ids, mut fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
     // A def order loaded from disk is trusted only when it names at
     // least one def of this parse (`def_order_stale`).
@@ -2121,30 +2146,44 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // the single-file path keeps the session key's identity.
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
     // Generic reuse (driver/gen_reuse.rs, W-PERF): template checks and
-    // instance discovery of a generic program are stored per stable def
-    // and reused while the item-level environment (the item-scan hash
-    // and the AST fn count) holds. Anything else drops them: a const fn
-    // body edit (const values move), a nested static (its index can
-    // move), or a slot compaction (cached C carries slot numbers).
-    let gen_key = front.env_hash.map(|env| {
+    // instance discovery of a generic program are stored per stable def.
+    // They hold while the trait system holds (`trait_system_hash`); an
+    // entry made under another item-level environment (item-scan hash
+    // and AST fn count) replays its recorded reads first. Anything else
+    // drops them: a const fn body edit (const values move), a nested
+    // static (its index can move), or a slot compaction (cached C
+    // carries slot numbers). The source key of an AST fn is its body
+    // and head hash.
+    let gen_env = front.env_hash.map(|env| {
         let mut h = crate::intern::FxHasher::default();
         std::hash::Hash::hash(&(env, fn_count), &mut h);
         std::hash::Hasher::finish(&h)
     });
+    let gen_trait = trait_system_hash(&front.ast, &front.interner);
     let nested_static = front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
     let gen_ok = caches.persistent
-        && gen_key.is_some()
-        && caches.gen_key == gen_key
+        && gen_env.is_some()
+        && caches.gen_trait == Some(gen_trait)
         && !const_fn_changed
         && !nested_static
         && !front.slots_renumbered;
+    let env_same = gen_env.is_some() && caches.gen_env == gen_env;
     if !gen_ok {
         caches.gen_reuse.clear();
     }
     front.slots_renumbered = false;
-    caches.gen_key = gen_key;
-    caches.gen_reuse.on = caches.persistent && gen_key.is_some() && !nested_static;
-    caches.gen_reuse.ast_src.clone_from(&body_hashes_all);
+    caches.gen_env = gen_env;
+    caches.gen_trait = Some(gen_trait);
+    caches.gen_reuse.on = caches.persistent && gen_env.is_some() && !nested_static;
+    caches.gen_reuse.env = gen_env.unwrap_or(0);
+    caches.gen_reuse.ast_src = (0..fn_count)
+        .map(|i| {
+            let head = front.fn_slot.get(i).and_then(|&s| front.slot_head.get(s as usize)).copied().unwrap_or(0);
+            let mut h = crate::intern::FxHasher::default();
+            std::hash::Hash::hash(&(body_hashes_all[i], head), &mut h);
+            std::hash::Hasher::finish(&h)
+        })
+        .collect();
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).
@@ -2253,8 +2292,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if !front.inst_slot[s] {
                 continue;
             }
-            if !gen_ok {
-                // Checked under another environment.
+            if !gen_ok || !env_same {
+                // Checked under another environment: an instance check
+                // replays its template's picks without probing, so its
+                // reads cannot prove it still holds (see gen_reuse.rs).
                 caches.ok[s] = false;
             }
             // An instance slot with no instance in a build is dead: its
@@ -2320,11 +2361,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let candidates: Vec<(usize, Option<crate::driver::graph::Reads>)> =
             mention_only.iter().map(|&i| (i, caches.slot_reads.get(slot_at(i)).cloned().flatten())).collect();
         let mut reused: Vec<usize> = Vec::new();
+        let mut memo = FxMap::default();
         for (i, reads) in candidates {
             match reads {
                 Some(r)
                     if {
-                        let d = program.reads_dirty(&r);
+                        let d = program.reads_dirty_memo(&r, &mut memo);
                         reads_invalidated += d;
                         d == 0
                     } =>
@@ -2403,11 +2445,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The instance Adt numbering this build generates C under.
     let inst_adt_fp = if program.gx.has_generics && req.cmd == Cmd::Build { inst_adt_fingerprint(&program) } else { 0 };
     if program.gx.has_generics {
-        // Generic reuse: under an unchanged environment, a plain fn
-        // rechecks when its body changed, an instance when its source
-        // (its template's body) changed, and either when its last
-        // check failed or a build has no C for it. C names Adts by
-        // id and instance Adt ids are creation order, so a build whose
+        // Generic reuse: a plain fn rechecks when the front end or the
+        // read-set walk put it in `changed`; an instance or closure body
+        // fn when its source changed or the environment moved (its slot
+        // is then stale, see above); any of them when its last check
+        // failed or a build has no C for it. C names Adts by id and
+        // instance Adt ids are creation order, so a build whose
         // instance Adt numbering moved regenerates every body. Without
         // reuse, the whole concrete set rechecks, every compile.
         let build = req.cmd == Cmd::Build;
