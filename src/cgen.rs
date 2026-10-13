@@ -794,7 +794,7 @@ impl FnGen<'_, '_, '_> {
         let p = self.p;
         let fid = self.body.fn_id;
         let slot = self.slots[fid.0 as usize];
-        let _ = writeln!(self.out, "/* {} */\nstatic {} {{", p.name(p.fn_info(fid).name), fn_sig(p, fid, slot));
+        let _ = writeln!(self.out, "/* {} */\nstatic {} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
         // Locals grouped by C type. No initializers: the borrow checker proves every read is
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
@@ -3810,7 +3810,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Adt(a) => {
                 let adt = p.adt(*a);
                 let an = a.0;
-                let _ = writeln!(out, "/* {} */", p.name(adt.name));
+                let _ = writeln!(out, "/* {} */", p.display_path(adt.name));
                 let packed = adt.repr.kind == ReprKind::Packed;
                 if packed {
                     out.push_str("#pragma pack(push, 1)\n");
@@ -4245,7 +4245,10 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 CTy::Adt(a) => {
                     let adt = p.adt(*a);
                     let variant_body = |v: &Variant, access: &dyn Fn(usize) -> String, need: &mut dyn FnMut(Glue, &CTy)| -> String {
-                        let mut s = lit(p.name(v.name));
+                        // The struct's pseudo-variant carries the flat
+                        // name; rustc prints the source name. Enum
+                        // variant names are already source names.
+                        let mut s = lit(p.display_name(v.name));
                         match v.shape {
                             VariantShape::Unit => {}
                             VariantShape::Tuple => {
