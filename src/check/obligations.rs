@@ -56,6 +56,13 @@ impl Obligations {
         std::mem::take(&mut self.queue)
     }
 
+    /// The waiting obligations, in queue order. Closure signature
+    /// deduction (ARCH 2.9) reads the `Fn` bounds on an expected type
+    /// variable from here.
+    pub fn pending(&self) -> &[Obligation] {
+        &self.queue
+    }
+
     /// How many obligations wait, for probe rollback.
     pub fn len(&self) -> usize {
         self.queue.len()

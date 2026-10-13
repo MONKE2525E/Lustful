@@ -417,9 +417,16 @@ pub(super) fn trait_probe_for(
                 let obl_len = cx.obl_len();
                 let err_len = cx.errs.len();
                 let sites_len = cx.generic_sites.len();
-                let csites_len = cx.closure_sites.len();
                 let picks_len = cx.out.trait_picks.len();
                 let dmeth_len = cx.deferred_methods.len();
+                // Closures checked in the trial are checked again for
+                // real below: drop their records and parameter locals.
+                let closures_len = cx.closures.len();
+                let calls_len = cx.out.closure_calls.len();
+                let locals_len = cx.out.locals.len();
+                let binops_len = cx.deferred_binops.len();
+                let open_len = cx.open_binops.len();
+                let fmt_len = cx.deferred_fmt.len();
                 let mut input_vars: Vec<Ty> = Vec::new();
                 let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
                 for _ in 0..n_inputs {
@@ -466,9 +473,14 @@ pub(super) fn trait_probe_for(
                 cx.obl_truncate(obl_len);
                 cx.errs.truncate(err_len);
                 cx.generic_sites.truncate(sites_len);
-                cx.closure_sites.truncate(csites_len);
                 cx.out.trait_picks.truncate(picks_len);
                 cx.deferred_methods.truncate(dmeth_len);
+                cx.closures.truncate(closures_len);
+                cx.out.closure_calls.truncate(calls_len);
+                cx.out.locals.truncate(locals_len);
+                cx.deferred_binops.truncate(binops_len);
+                cx.open_binops.truncate(open_len);
+                cx.deferred_fmt.truncate(fmt_len);
                 if let Some(inputs) = zonked {
                     let snap = cx.snapshot_vars();
                     let obl_len = cx.obl_len();

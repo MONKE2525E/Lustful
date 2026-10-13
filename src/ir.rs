@@ -219,6 +219,10 @@ pub struct Body<'g> {
     /// (docs/ARCH.md section 8.2). Carried with the body result so the
     /// driver can store it with the checked body; record-only today.
     pub reads: Reads,
+    /// Errors lowering found (a closure body place that no capture
+    /// covers). Borrow checking reports them first; such a body is
+    /// never generated.
+    pub lower_errs: Vec<crate::diag::Diag>,
 }
 
 impl Body<'_> {

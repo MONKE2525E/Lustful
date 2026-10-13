@@ -376,6 +376,9 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         ref_local: body.locals.iter().map(|l| contains_ref(&body.tys, l.ty)).collect(),
         ops_buf: Vec::new(),
     };
+    if !body.lower_errs.is_empty() {
+        return body.lower_errs.clone();
+    }
     ck.collect_loans();
     ck.collect_move_paths();
     let n = body.locals.len();

@@ -2525,10 +2525,17 @@ impl CollectCx<'_, '_> {
     }
 }
 
+/// The capture types of a closure type (its args, ARCH 2.9): the
+/// closure value is a tuple of these.
+pub fn closure_fields(tys: &impl TyIntern, a: ArgsId) -> Vec<Ty> {
+    tys.args(a).iter().filter_map(|g| g.as_ty()).collect()
+}
+
 pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Ref(..) => true,
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| contains_ref(tys, e)),
+        TyKind::Closure(_, a) => closure_fields(tys, a).iter().any(|&e| contains_ref(tys, e)),
         TyKind::Array(e, _) | TyKind::Slice(e) => contains_ref(tys, e),
         _ if tys.is_chars_ty(t) => true,
         _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
@@ -2620,10 +2627,11 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.copy, None),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         // Fn items, fn pointers, and (non-capturing) closures are Copy.
-        TyKind::FnDef(..) | TyKind::FnPtr(_) | TyKind::Closure(..) => true,
+        TyKind::FnDef(..) | TyKind::FnPtr(_) => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),
+        TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
             if let Some(e) = tys.option_elem(t) {
@@ -2649,6 +2657,9 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => return env_proves(tys, t, p.gx.lang.clone, None),
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| has_clone(p, tys, e)),
+        // A closure is Clone when its captures are; only the Copy
+        // case is supported (a clone of a closure is a copy then).
+        TyKind::Closure(..) => return is_copy(p, tys, t),
         TyKind::Array(e, _) => return has_clone(p, tys, e),
         _ => {}
     }
@@ -2766,6 +2777,7 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => return true,
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop(p, tys, e)),
+        TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| needs_drop(p, tys, e)),
         TyKind::Array(e, _) => return needs_drop(p, tys, e),
         _ => {}
     }

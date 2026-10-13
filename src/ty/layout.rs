@@ -760,7 +760,7 @@ fn compute(
         },
         TyKind::RawPtr(_, _) => Ok(raw_ptr_layout()),
         TyKind::FnPtr(_) => Ok(ptr_layout()),
-        TyKind::FnDef(..) | TyKind::Closure(..) => Ok(zst_layout(1)),
+        TyKind::FnDef(..) => Ok(zst_layout(1)),
         TyKind::Array(e, c) => {
             let len = const_len(tys, c, env, frames).ok_or(())?;
             let el = go(tys, shapes, e, env, frames, memo, active)?;
@@ -771,6 +771,19 @@ fn compute(
             let mut fields = Vec::with_capacity(elems.len());
             for e in elems {
                 fields.push(go(tys, shapes, e, env, frames, memo, active)?);
+            }
+            tuple_layout(&fields)
+        }
+        // A closure is laid out like a tuple of its captures, in
+        // capture order (ARCH 4.5): no captures is size 0.
+        TyKind::Closure(_, a) => {
+            let elems: Vec<Ty> = tys.args(a).iter().filter_map(|g| g.as_ty()).collect();
+            if elems.is_empty() {
+                return Ok(zst_layout(1));
+            }
+            let mut fields = Vec::with_capacity(elems.len());
+            for e in elems {
+                fields.push(go(tys, shapes, e, memo, active)?);
             }
             tuple_layout(&fields)
         }

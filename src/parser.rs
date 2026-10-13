@@ -2427,6 +2427,10 @@ impl<'a> Parser<'a> {
             }
         }
         let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+        // With a written return type the body must be a block, as in Rust.
+        if ret.is_some() && self.peek() != Tok::LBrace {
+            return Err(syntax(self.span(), "expected `{` after the closure return type"));
+        }
         let body = self.expr()?;
         let span = start.to(self.prev_span());
         Ok(self.push_expr(Expr::Closure { is_move, is_async: false, params, ret, body }, span))

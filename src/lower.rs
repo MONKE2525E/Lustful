@@ -6,6 +6,8 @@ use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
 
+mod closure;
+
 struct LoopInfo {
     break_bb: Bb,
     continue_bb: Bb,
@@ -29,17 +31,22 @@ struct Lower<'p, 'a> {
     /// `needs_drop` answers per body type: every scope exit asks for each of
     /// its locals, and the answer walks Adt fields.
     drop_ty: crate::intern::FxMap<Ty, bool>,
+    /// Set while lowering a closure body fn (see `lower::closure`).
+    upvars: Option<closure::Upvars>,
 }
 
 /// Lowers one checked function body to IR.
 pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
+    if p.gx.closure_fns.contains_key(&fid) {
+        return closure::lower_closure(p, fid, ck);
+    }
     let f = p.fn_info(fid);
     // The owned type store lift (ARCH 2.1): the checked body's types move into the
     // lowered body through this boundary. Identity today; see `ty::lift_to_owned`.
     let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
     let reads = std::mem::take(&mut ck.reads);
     let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
-    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads };
+    let body = Body { fn_id: fid, tys, locals: Vec::new(), blocks: vec![entry], arg_count: f.params.len(), reads, lower_errs: Vec::new() };
     let mut lw = Lower {
         p,
         ck,
@@ -50,6 +57,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         local_map: Vec::new(),
         mut_index: 0,
         drop_ty: Default::default(),
+        upvars: None,
     };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
@@ -67,13 +75,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
     };
-    // A closure fn lowers its closure body expression instead of
-    // the enclosing fn's block (W-TRAITS-CORE through the owner).
-    if let Some(cf) = p.gx.closure_fns.get(&fid).copied() {
-        let ast::Expr::Closure { body: cbody, .. } = p.ast.expr(cf.expr) else { unreachable!() };
-        let body_e = *cbody;
-        lw.expr_into(body_e, Some(&Place::local(0)));
-    } else if let Some(b) = body {
+    if let Some(b) = body {
         lw.block_into(b, Some(&Place::local(0)));
     }
     let root = lw.scopes.pop().unwrap();
@@ -115,10 +117,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         let ei = (e.0 - self.ck.expr_base) as usize;
         let Some(args) = self.ck.generic_args.get(ei) else { return f };
-        // A closure template can have no parameters at all
-        // (plain parent, fully written signature); its one
-        // instance is still a separate fn mono made.
-        if args.is_empty() && !self.p.gx.closure_fns.contains_key(&f) {
+        if args.is_empty() {
             return f;
         }
         crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f)
@@ -656,6 +655,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.method_into(e, *callee, args, dest, span);
                     return;
                 }
+                if let Res::ClosureCall { kind, derefs } = res {
+                    self.closure_call(e, *callee, args, kind, derefs, dest, span);
+                    return;
+                }
                 // An indirect call reads the callee value before the
                 // arguments run, as Rust evaluates the callee first.
                 let indirect_local = if res == Res::Indirect {
@@ -1001,9 +1004,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span);
                 }
             }
-            // A closure value is zero-sized: calls name its
-            // instance directly, so the value is a unit constant.
-            Expr::Closure { .. } => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
+            Expr::Closure { .. } => self.closure_value(e, dest, span),
             Expr::Try(inner) => self.try_into(e, *inner, dest, ty, span),
             // AST v2 expression forms the parser still rejects.
             Expr::Float(_)

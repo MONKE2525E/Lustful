@@ -46,6 +46,20 @@ pub trait SolveCx {
     /// Records one `ImplSet` read (section 8.2): the bucket for this
     /// trait and Self type was read, and was empty when `failed`.
     fn record_impl_set(&mut self, trait_def: DefId, self_ty: Ty, failed: bool);
+    /// Builtin selection for a closure Self type (ARCH 2.9): a closure
+    /// implements the Fn traits its kind allows, with no impl in the
+    /// index. `Some(true)` confirms and unifies the input tuple with the
+    /// closure's parameters; `Some(false)` is a definite no; `None` (the
+    /// default, and for traits outside the Fn family) leaves the
+    /// obligation to the impl index.
+    fn closure_select(&mut self, _obl: TraitRef) -> Option<bool> {
+        None
+    }
+    /// The `FnOnce::Output` of a closure Self type, for normalization.
+    /// `None` when `assoc` is not that def or the closure is unknown.
+    fn closure_output(&mut self, _assoc: DefId, _self_ty: Ty) -> Option<Ty> {
+        None
+    }
 }
 
 /// The answer of one selection (section 2.4).
@@ -72,6 +86,9 @@ pub enum Selection {
     /// The depth cap or the cycle set stopped selection (step 7).
     /// The caller reports the selection-overflow error.
     Overflow,
+    /// A builtin answer with no impl and no nested obligations: a
+    /// closure implementing an Fn trait (`SolveCx::closure_select`).
+    Builtin,
 }
 
 /// One body's solver state: the selection memo and cycle stack
@@ -399,6 +416,17 @@ impl Solver {
             }
         }
 
+        // Closures implement the Fn traits builtin (ARCH 2.9).
+        {
+            let self_ty = self_ty_of(cx.tys(), &obl);
+            let deep = cx.deep_resolve(self_ty);
+            if matches!(cx.tys().kind(deep), TyKind::Closure(..))
+                && let Some(ok) = cx.closure_select(obl)
+            {
+                return if ok { Selection::Builtin } else { Selection::NoImpl };
+            }
+        }
+
         // Step 2: header candidates by probe unification.
         let self_ty = self_ty_of(cx.tys(), &obl);
         let cands: Vec<ImplId> = {
@@ -599,6 +627,16 @@ impl Solver {
         }
         match cx.tys().kind(t) {
             TyKind::Projection(assoc, args) => {
+                // `<Closure as FnOnce<A>>::Output` is the closure's
+                // return type (ARCH 2.9), with no impl to read it from.
+                if let Some(self_ty) = cx.tys().args(args).first().and_then(|g| g.as_ty()) {
+                    let deep = cx.deep_resolve(self_ty);
+                    if matches!(cx.tys().kind(deep), TyKind::Closure(..))
+                        && let Some(out) = cx.closure_output(assoc.0, deep)
+                    {
+                        return self.normalize_inner(cx, index, env, out, depth + 1);
+                    }
+                }
                 let Some(trait_def) = index.trait_of_assoc(assoc.0) else { return t };
                 // Normalize inside the trait args first, so nested
                 // projections reach selection in their simplest form.

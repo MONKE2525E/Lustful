@@ -2078,7 +2078,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         for i in 0..program.fns.len() {
             if !matches!(
                 program.gx.fn_class.get(i),
-                Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance) | None
+                Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance | crate::check::generics::FnClass::Closure) | None
             ) {
                 let s = front.fn_slot[i] as usize;
                 caches.out[s] = FnOut::default();
@@ -2205,7 +2205,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             .filter(|&i| {
                 matches!(
                     program.gx.fn_class.get(i),
-                    Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance) | None
+                    Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance | crate::check::generics::FnClass::Closure) | None
                 )
             })
             .collect();

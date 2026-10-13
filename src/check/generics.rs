@@ -232,23 +232,32 @@ impl LangTraits {
                 (bit_xor, assoc_out(bit_xor)),
                 (shl, assoc_out(shl)),
                 (shr, assoc_out(shr)),
-                (fn_, assoc_out(fn_)),
-                (fn_mut, assoc_out(fn_mut)),
+                // One `Output` def for the whole Fn family, declared on
+                // FnOnce as in std (see `output_of`).
+                (fn_once, assoc_out(fn_once)),
+                (fn_mut, assoc_out(fn_once)),
             ],
             assoc_target: lang_assoc(deref, "Target"),
             assoc_index_output: lang_assoc(index, "Output"),
         }
     }
 
-    /// The `Output` assoc def of an operator or `Fn` trait.
+    /// The `Output` assoc def of an operator or `Fn` trait. The Fn
+    /// family shares one def, `FnOnce::Output`, as in std: `Fn` and
+    /// `FnMut` declare no `Output` of their own and `F: Fn() -> R`
+    /// binds `<F as FnOnce<()>>::Output`. A projection of it selects
+    /// `FnOnce`, which every closure and every Fn-bounded parameter
+    /// implements (supertrait elaboration).
     pub fn output_of(&self, trait_def: DefId) -> Option<DefId> {
-        if trait_def == self.fn_once {
-            // FnOnce::Output is its own assoc in std; Fn and FnMut
-            // inherit it. One shared def is enough here because
-            // projections still differ by their trait args.
+        if self.is_fn_family(trait_def) {
             return Some(self.outputs[12].1);
         }
         self.outputs.iter().find(|(t, _)| *t == trait_def).map(|(_, a)| *a)
+    }
+
+    /// True for `Fn`, `FnMut`, and `FnOnce`.
+    pub fn is_fn_family(&self, trait_def: DefId) -> bool {
+        trait_def == self.fn_ || trait_def == self.fn_mut || trait_def == self.fn_once
     }
 
     /// A lang trait by its Rust name, for bound resolution.
@@ -426,15 +435,8 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
         rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
-        rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![(lang.output_of(lang.fn_).unwrap(), "Output")], &["call"]),
-        rec(
-            lang.fn_mut,
-            "FnMut",
-            1,
-            vec![self_pred(tys, lang.fn_once, &[1])],
-            vec![(lang.output_of(lang.fn_mut).unwrap(), "Output")],
-            &["call_mut"],
-        ),
+        rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![], &["call"]),
+        rec(lang.fn_mut, "FnMut", 1, vec![self_pred(tys, lang.fn_once, &[1])], vec![], &["call_mut"]),
         rec(lang.fn_once, "FnOnce", 1, vec![], vec![(lang.output_of(lang.fn_once).unwrap(), "Output")], &["call_once"]),
     ]
 }
@@ -661,7 +663,12 @@ fn resolve_trait_path_args(
     let (input_args, bindings): (Vec<GenericArg>, Vec<(DefId, GenericArg)>) = match &seg.args {
         GenericArgs::None => (Vec::new(), Vec::new()),
         GenericArgs::Parenthesized { inputs, output } => {
-            // Fn sugar: one tuple input argument, Output binding.
+            // Fn sugar: one tuple input argument, Output binding. A
+            // missing `-> R` means `-> ()`, as in Rust. Only the Fn
+            // traits take this sugar (rustc E0214 elsewhere).
+            if !cx.lang.is_fn_family(trait_def) {
+                return Err(Diag::new("L0110", span, "parenthesized trait sugar is only for Fn traits", "Use angle arguments."));
+            }
             let mut parts = Vec::new();
             for t in inputs {
                 parts.push(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?);
@@ -673,14 +680,12 @@ fn resolve_trait_path_args(
                 let ts = tys.intern_tys(&parts);
                 tys.intern(TyKind::Tuple(ts))
             };
-            let mut bindings = Vec::new();
-            if let Some(out) = output {
-                let assoc = cx
-                    .lang
-                    .output_of(trait_def)
-                    .ok_or_else(|| Diag::new("L0110", span, "parenthesized trait sugar is only for Fn traits", "Use angle arguments."))?;
-                bindings.push((assoc, GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *out, scope)?)));
-            }
+            let assoc = cx.lang.output_of(trait_def).expect("the Fn family has an Output def");
+            let out = match output {
+                Some(out) => resolve_scoped(ast, interner, known, cx, tys, *out, scope)?,
+                None => UNIT,
+            };
+            let bindings = vec![(assoc, GenericArg::Ty(out))];
             (vec![GenericArg::Ty(tuple)], bindings)
         }
         GenericArgs::Angle(args) => {
@@ -1398,6 +1403,8 @@ pub struct FnScope {
 #[derive(Clone, Debug)]
 pub struct FnTemplate {
     pub generics: Generics,
+    /// The same env as the template's `FnScope`; bodies read that one.
+    #[allow(dead_code)]
     pub env: Vec<Predicate>,
 }
 
@@ -1432,17 +1439,31 @@ pub enum FnClass {
     Template,
     Instance,
     Stub,
+    /// A closure body fn of a plain fn or a concrete instance (ARCH
+    /// 2.9): checked as its parent, lowered from the closure body,
+    /// and generated like any instance.
+    Closure,
+    /// A closure body fn of a template check: borrow-checked only,
+    /// never generated.
+    TemplateClosure,
 }
 
-/// One closure template or instance fn: the AST closure
-/// expression whose body it checks and lowers. The fn's generics
-/// are the enclosing fn's generics followed by one type
-/// parameter per closure parameter and one for the return type,
-/// so a closure instance key carries its whole signature.
-#[derive(Clone, Copy, Debug)]
-pub struct ClosureFn {
-    pub expr: crate::ast::ExprId,
+/// One closure registered by mono: its parent fn (the body it is
+/// checked in), its body fn, and its kind and signature in global
+/// types. Calls and Fn selection in other bodies read the facts from
+/// here (iface: lowering and cgen read `body_fn`).
+#[derive(Clone, Debug)]
+pub struct ClosureEntry {
+    pub parent: LocalDefId,
+    pub body_fn: LocalDefId,
+    pub kind: crate::check::closure::ClosureKind,
+    pub inputs: Vec<Ty>,
+    pub output: Ty,
 }
+
+/// A template's capture analysis without types: (root local,
+/// projections, mode) per capture, in capture order.
+pub type CaptureShape = (u32, Vec<crate::ir::Proj>, crate::check::closure::CaptureMode);
 
 /// One materialized fn instance: its template and concrete args
 /// (combined parent+own order). Lowering reads `template_local`
@@ -1492,13 +1513,17 @@ pub struct GenTables<'a> {
     pub fn_scopes: Vec<FnScope>,
     pub fn_class: Vec<FnClass>,
     pub instances: FxMap<LocalDefId, InstanceInfo>,
-    /// Closure fns (templates and their instances) by local id.
-    pub closure_fns: FxMap<LocalDefId, ClosureFn>,
-    /// The closure template fn for each closure expression.
-    pub closure_by_expr: FxMap<crate::ast::ExprId, LocalDefId>,
-    /// The closure template fn for each closure def (the def a
-    /// `TyKind::Closure` names).
-    pub closure_by_def: FxMap<DefId, LocalDefId>,
+    /// Every registered closure by its def (ARCH 2.9).
+    pub closures: FxMap<DefId, ClosureEntry>,
+    /// Closure body fns back to their closure def.
+    pub closure_fns: FxMap<LocalDefId, DefId>,
+    /// Each template's closures as its template check analyzed them:
+    /// (template, closure expr) to kind and capture shapes. Concrete
+    /// instances reuse these, so captures follow the generic body.
+    pub template_closures: FxMap<(LocalDefId, ast::ExprId), (crate::check::closure::ClosureKind, Vec<CaptureShape>)>,
+    /// The Fn trait each closure call in a template goes through
+    /// (from its template check), by (template, call expr).
+    pub template_calls: FxMap<(LocalDefId, ast::ExprId), crate::check::closure::ClosureKind>,
     pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
     /// Inherent method templates by (Adt template def, name), in
     /// registration order; disjoint Self patterns may share a name.
@@ -1555,9 +1580,10 @@ impl Default for GenTables<'_> {
             fn_scopes: Vec::new(),
             fn_class: Vec::new(),
             instances: FxMap::default(),
+            closures: FxMap::default(),
             closure_fns: FxMap::default(),
-            closure_by_expr: FxMap::default(),
-            closure_by_def: FxMap::default(),
+            template_closures: FxMap::default(),
+            template_calls: FxMap::default(),
             instance_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
             inherent_self_pats: FxMap::default(),
@@ -2645,51 +2671,6 @@ pub fn add_synthetic_impls(p: &mut Program) {
             );
         }
     }
-    // Closures: one Fn/FnMut/FnOnce (plus Copy/Clone) record per
-    // closure template. The Self pattern is the closure type over
-    // the template's parameters; the Fn input is the tuple of the
-    // signature parameters and Output is the return parameter.
-    // Only non-capturing closures exist in this slice, and those
-    // always implement all three Fn traits.
-    let closures: Vec<(DefId, LocalDefId)> = p.gx.closure_by_def.iter().map(|(&d, &l)| (d, l)).collect();
-    for (def, local) in closures {
-        let Some(Some(tmpl)) = p.gx.fn_templates.get(local.0 as usize).cloned() else { continue };
-        let mut lt = 0u32;
-        let pat_args: Vec<GenericArg> = tmpl
-            .generics
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, pd)| match pd.kind {
-                ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
-                ParamKind::Lifetime => {
-                    let a = GenericArg::Lifetime(Region::Param(lt));
-                    lt += 1;
-                    a
-                }
-                ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
-            })
-            .collect();
-        let args_id = p.tys.intern_args(&pat_args);
-        let self_pat = p.tys.intern(TyKind::Closure(def, args_id));
-        // The signature pattern is the template's own FnInfo:
-        // annotated types are fixed there, unwritten ones are
-        // the signature parameters.
-        let (inputs, output) = {
-            let info = p.fn_info(local);
-            (info.params.clone(), info.ret)
-        };
-        let ts = p.tys.intern_tys(&inputs);
-        let tuple = p.tys.intern(TyKind::Tuple(ts));
-        let generics = Generics { parent: None, params: tmpl.generics.params.clone(), predicates: Vec::new() };
-        for tr in [lang.fn_, lang.fn_mut, lang.fn_once] {
-            let assoc: Vec<(DefId, Ty)> = lang.output_of(tr).map(|o| vec![(o, output)]).unwrap_or_default();
-            insert_synthetic(p, &mut ordinal, tr, self_pat, &[tuple], generics.clone(), assoc, Synthetic::Lang, false, span);
-        }
-        for tr in [lang.copy, lang.clone] {
-            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], generics.clone(), Vec::new(), Synthetic::Lang, false, span);
-        }
-    }
     // Lang facts for builtin types.
     let g0 = Generics::default();
     let scalar_traits = [lang.copy, lang.clone, lang.debug, lang.eq, lang.hash, lang.default];
@@ -3246,24 +3227,44 @@ fn add_trait_method_stubs(p: &mut Program) {
 /// method's stub, and its pick is recorded for the instances.
 /// Closure templates are checked in place by their enclosing body.
 fn template_check(p: &mut Program) -> Vec<Diag> {
-    let templates: Vec<LocalDefId> = (0..p.fns.len() as u32)
-        .map(LocalDefId)
-        .filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Template) && !p.gx.closure_fns.contains_key(&f))
-        .collect();
+    let templates: Vec<LocalDefId> =
+        (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Template)).collect();
     for &t in &templates {
         p.gx.template_checks.insert(t, t);
     }
     let mut errs: Vec<Diag> = Vec::new();
     for t in templates {
-        let (body_errs, picks) = {
+        // Closures first: their body fns must exist before the body
+        // lowers (its closure calls name them), and the capture
+        // analysis is recorded for the instances. Only bodies with
+        // closure expressions pay this extra check.
+        let mut closure_fns: Vec<LocalDefId> = Vec::new();
+        if fn_has_closures(p, t) {
+            let (owned, shapes) = {
+                let (c, _) = crate::check::check_fn(p, t);
+                (snapshot_closures(&c), closure_shapes(&c))
+            };
+            record_template_closures(p, t, shapes, Vec::new());
+            if let Some(owned) = owned {
+                closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
+            }
+        }
+        let (body_errs, picks, calls) = {
             let (c, mut e) = crate::check::check_fn(p, t);
             let picks = c.trait_picks.clone();
+            let calls = c.closure_calls.clone();
             if e.is_empty() {
                 let body = crate::lower::lower(p, t, c);
                 e.extend(crate::borrowck::borrowck(p, &body));
+                for &cf in &closure_fns {
+                    let (cc, _) = crate::check::check_fn(p, cf);
+                    let cbody = crate::lower::lower(p, cf, cc);
+                    e.extend(crate::borrowck::borrowck(p, &cbody));
+                }
             }
-            (e, picks)
+            (e, picks, calls)
         };
+        record_template_closures(p, t, Vec::new(), calls);
         errs.extend(body_errs);
         for (call, pick) in picks {
             p.gx.trait_picks.insert(call, pick);
@@ -3368,6 +3369,113 @@ fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKin
     None
 }
 
+/// One closure of a checked body, snapshotted out of its store so
+/// the program can grow while it registers (see `register_closures`).
+struct OwnedClosure {
+    def: DefId,
+    kind: crate::check::closure::ClosureKind,
+    env: OwnedTy,
+    inputs: Vec<OwnedTy>,
+    output: OwnedTy,
+}
+
+/// Snapshots the closures of one checked body. None when a closure
+/// type still holds an inference variable (the body failed to check).
+fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
+    let mut out = Vec::with_capacity(c.closures.len());
+    for cl in &c.closures {
+        out.push(OwnedClosure {
+            def: cl.def,
+            kind: cl.kind,
+            env: snapshot_ty(&c.tys, cl.ty)?,
+            inputs: cl.inputs.iter().map(|&t| snapshot_ty(&c.tys, t)).collect::<Option<Vec<_>>>()?,
+            output: snapshot_ty(&c.tys, cl.output)?,
+        });
+    }
+    Some(out)
+}
+
+/// The closure analysis of one checked body without types.
+type ClosureShapes = Vec<(ast::ExprId, crate::check::closure::ClosureKind, Vec<CaptureShape>)>;
+
+fn closure_shapes(c: &crate::check::Checked) -> ClosureShapes {
+    c.closures.iter().map(|cl| (cl.expr, cl.kind, cl.captures.iter().map(|cap| (cap.root, cap.projs.clone(), cap.mode)).collect())).collect()
+}
+
+/// True when a fn body holds a closure expression.
+fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
+    let (lo, hi) = p.fn_info(fid).def.exprs;
+    (lo..hi).any(|x| matches!(p.ast.expr(ast::ExprId(x)), ast::Expr::Closure { .. }))
+}
+
+/// Records one template check's closure analysis and closure call
+/// modes, for the template's concrete instances.
+fn record_template_closures(p: &mut Program, template: LocalDefId, shapes: ClosureShapes, calls: Vec<(ast::ExprId, crate::check::closure::ClosureKind)>) {
+    for (e, k, sh) in shapes {
+        p.gx.template_closures.insert((template, e), (k, sh));
+    }
+    for (e, k) in calls {
+        p.gx.template_calls.insert((template, e), k);
+    }
+}
+
+/// Registers the closures of one checked body (ARCH 2.9): each gets
+/// a body fn appended to `p.fns` under the closure's own def (so its
+/// slot keys on the parent's identity plus the closure ordinal),
+/// taking the env first (`&C`, `&mut C`, or `C` by kind) and then the
+/// closure's parameters. `class` is `Closure` for concrete parents
+/// and `TemplateClosure` for template checks (borrowck only).
+/// Returns the new body fns.
+fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosure>, class: FnClass) -> Vec<LocalDefId> {
+    use crate::check::closure::ClosureKind;
+    let mut out = Vec::new();
+    for oc in owned {
+        if let Some(e) = p.gx.closures.get(&oc.def) {
+            out.push(e.body_fn);
+            continue;
+        }
+        let env = build_owned_ty(p, &oc.env);
+        let inputs: Vec<Ty> = oc.inputs.iter().map(|t| build_owned_ty(p, t)).collect();
+        let output = build_owned_ty(p, &oc.output);
+        let env_param = match oc.kind {
+            ClosureKind::Fn => p.tys.mk_ref(false, env),
+            ClosureKind::FnMut => p.tys.mk_ref(true, env),
+            ClosureKind::FnOnce => env,
+        };
+        let mut params = vec![env_param];
+        params.extend(inputs.iter().copied());
+        let (def, owner) = {
+            let f = p.fn_info(parent);
+            (f.def, f.owner)
+        };
+        let name = p.interner.intern("{closure}");
+        let id = LocalDefId(p.fns.len() as u32);
+        p.fn_defs.push(oc.def);
+        p.def_by_hash.entry(oc.def.hash).or_insert(id);
+        let mut data = crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Closure, None, name, crate::ty::defs::Vis::Priv, def.name_span);
+        data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret: output };
+        p.defs.insert(oc.def, data);
+        p.fns.push(crate::check::collect::FnInfo {
+            name,
+            def,
+            owner,
+            self_kind: None,
+            params,
+            ret: output,
+            ret_borrows_from: None,
+            is_const: false,
+        });
+        p.gx.fn_templates.push(None);
+        let scope = p.gx.fn_scopes.get(parent.0 as usize).cloned().unwrap_or_default();
+        p.gx.fn_scopes.push(scope);
+        p.gx.fn_class.push(class);
+        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output });
+        p.gx.closure_fns.insert(id, oc.def);
+        out.push(id);
+    }
+    out
+}
+
 /// Creates (or finds) the concrete instance of one template.
 fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
     let template_def = p.def_id(template);
@@ -3440,9 +3548,6 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
     };
     p.gx.fn_scopes.push(FnScope { env: Vec::new(), scope });
     p.gx.fn_class.push(FnClass::Instance);
-    if let Some(cf) = p.gx.closure_fns.get(&template).copied() {
-        p.gx.closure_fns.insert(id, cf);
-    }
     p.gx.instances.insert(id, InstanceInfo { template_def, template_local: Some(template), args: args_id });
     p.gx.instance_by_key.insert((template_def, args_id), id);
     p.gx.mono_counts.1 += 1;
@@ -3566,6 +3671,11 @@ fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
 /// them against the finished tables. Returns mono's own errors
 /// (instantiation depth and count caps, section 4.2).
 pub fn materialize(p: &mut Program) -> Vec<Diag> {
+    // Closures need the instance machinery too: each closure body is
+    // its own fn with a slot, made here (ARCH 2.9, 4.1).
+    if !p.gx.has_generics && p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. })) {
+        p.gx.has_generics = true;
+    }
     if !p.gx.has_generics {
         return Vec::new();
     }
@@ -3605,8 +3715,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             // Snapshot everything the instance requests name,
             // then drop the checked body: it borrows the program
             // this loop is about to extend.
-            let (adt_tys_owned, requests_owned) = {
+            let (adt_tys_owned, requests_owned, closures_owned) = {
                 let (checked, _discarded) = crate::check::check_fn(p, fid);
+                let closures_owned = snapshot_closures(&checked).unwrap_or_default();
                 let mut adt_tys: Vec<OwnedTy> = Vec::new();
                 for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
                     if let Some(o) = snapshot_ty(&checked.tys, t) {
@@ -3640,8 +3751,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                         reqs.push((*template, owned));
                     }
                 }
-                (adt_tys, reqs)
+                (adt_tys, reqs, closures_owned)
             };
+            register_closures(p, fid, closures_owned, FnClass::Closure);
             for owned in &adt_tys_owned {
                 let gt = build_owned_ty(p, owned);
                 ensure_global_adt_instances(p, gt, 0);
@@ -3784,134 +3896,6 @@ pub fn append_trait_default_templates(p: &mut Program) {
         p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: env.clone() }));
         p.gx.fn_scopes.push(FnScope { env, scope: tmpl.scope.clone() });
         p.gx.fn_class.push(FnClass::Template);
-    }
-}
-
-/// Appends one template fn per closure expression in every
-/// collected fn body. A closure template's generics are its
-/// enclosing fn's generics (the immediately enclosing closure
-/// for a nested one) plus one type parameter per UNWRITTEN
-/// signature type (closure parameters first, then the return
-/// type); written types resolve in the enclosing scope and
-/// are fixed parts of the template signature. Body checking
-/// instantiates the signature parameters from the body and
-/// Fn obligations, so mono materializes closure instances
-/// exactly like fn instances. Only non-capturing closures
-/// are supported; capture use is rejected during body checking.
-pub fn collect_closures(p: &mut Program, errs: &mut Vec<Diag>) {
-    let sig_name = p.interner.intern("<closure>");
-    let hosts: Vec<LocalDefId> = (0..p.fns.len() as u32)
-        .map(LocalDefId)
-        .filter(|&f| matches!(p.gx.fn_class.get(f.0 as usize), Some(FnClass::Plain | FnClass::Template) | None))
-        .collect();
-    for host in hosts {
-        let (lo, hi) = p.fn_info(host).def.exprs;
-        let mut found: Vec<ast::ExprId> = Vec::new();
-        for raw in lo..hi {
-            let e = ast::ExprId(raw);
-            if matches!(p.ast.expr(e), ast::Expr::Closure { .. }) {
-                found.push(e);
-            }
-        }
-        if found.is_empty() {
-            continue;
-        }
-        p.gx.has_generics = true;
-        // Token order, outer before inner at equal starts.
-        found.sort_by(|&a, &b| {
-            let (sa, sb) = (p.ast.expr_span(a), p.ast.expr_span(b));
-            (sa.lo, std::cmp::Reverse(sa.hi), std::cmp::Reverse(a.0)).cmp(&(sb.lo, std::cmp::Reverse(sb.hi), std::cmp::Reverse(b.0)))
-        });
-        let contains = |outer: Span, inner: Span| outer.lo <= inner.lo && inner.hi <= outer.hi;
-        // (span, local id) of enclosing closures, innermost last.
-        let mut stack: Vec<(Span, LocalDefId)> = Vec::new();
-        // Ordinal among the closures of one enclosing body.
-        let mut ordinals: FxMap<LocalDefId, u32> = FxMap::default();
-        for e in found {
-            let span = p.ast.expr_span(e);
-            while stack.last().is_some_and(|(s, _)| !contains(*s, span)) {
-                stack.pop();
-            }
-            let parent = stack.last().map_or(host, |&(_, l)| l);
-            let ordinal = {
-                let o = ordinals.entry(parent).or_insert(0);
-                let v = *o;
-                *o += 1;
-                v
-            };
-            let (mut generics, env, scope) = match p.gx.fn_templates.get(parent.0 as usize).cloned().flatten() {
-                Some(t) => (t.generics, t.env, p.gx.fn_scopes[parent.0 as usize].scope.clone()),
-                None => (Generics::default(), p.gx.fn_scopes[parent.0 as usize].env.clone(), p.gx.fn_scopes[parent.0 as usize].scope.clone()),
-            };
-            generics.parent = None;
-            let n_parent = generics.params.len();
-            let (ctys, cret) = match p.ast.expr(e) {
-                ast::Expr::Closure { params: cparams, ret: cret, .. } => (cparams.iter().map(|c| c.ty).collect::<Vec<_>>(), *cret),
-                _ => unreachable!(),
-            };
-            // Written signature types are fixed template types
-            // resolved in the enclosing scope; unwritten ones
-            // become signature parameters, in written order.
-            let written = |p: &mut Program, t: ast::TyId, scope: &Scope, errs: &mut Vec<Diag>| {
-                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, t, scope).unwrap_or_else(|d| {
-                    errs.push(d);
-                    ERROR
-                })
-            };
-            let mut next_param = n_parent as u32;
-            let mut mk = |p: &mut Program, generics: &mut Generics, t: Option<ast::TyId>, scope: &Scope, errs: &mut Vec<Diag>| match t {
-                Some(t) => written(p, t, scope, errs),
-                None => {
-                    let ty = p.tys.intern(TyKind::Param(ParamId(next_param)));
-                    next_param += 1;
-                    generics.params.push(ParamDef { name: sig_name, kind: ParamKind::Type, span });
-                    ty
-                }
-            };
-            let mut params: Vec<Ty> = Vec::new();
-            for ct in ctys {
-                params.push(mk(p, &mut generics, ct, &scope.clone(), errs));
-            }
-            let ret = mk(p, &mut generics, cret, &scope.clone(), errs);
-            let parent_def = p.def_id(parent);
-            let name = p.fn_info(parent).name;
-            let def = p.fn_info(host).def;
-            let def_id = DefId {
-                krate: p.krate,
-                hash: crate::def::item_hash(
-                    p.stable_crate,
-                    &["<closure>"],
-                    crate::def::DefKind::Fn,
-                    &format!("{}#{ordinal}", parent_def.hash.0),
-                    0,
-                ),
-            };
-            let local = LocalDefId(p.fns.len() as u32);
-            p.fn_defs.push(def_id);
-            p.def_by_hash.entry(def_id.hash).or_insert(local);
-            let mut data = crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Fn, None, name, crate::ty::defs::Vis::Priv, span);
-            data.generics = generics.clone();
-            data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
-            p.defs.insert(def_id, data);
-            p.fns.push(crate::check::collect::FnInfo {
-                name,
-                def,
-                owner: None,
-                self_kind: None,
-                params,
-                ret,
-                ret_borrows_from: None,
-                is_const: false,
-            });
-            p.gx.fn_templates.push(Some(FnTemplate { generics, env: env.clone() }));
-            p.gx.fn_scopes.push(FnScope { env, scope });
-            p.gx.fn_class.push(FnClass::Template);
-            p.gx.closure_fns.insert(local, ClosureFn { expr: e });
-            p.gx.closure_by_expr.insert(e, local);
-            p.gx.closure_by_def.insert(def_id, local);
-            stack.push((span, local));
-        }
     }
 }
 
@@ -4341,7 +4325,6 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
 /// coherence over the whole index (section 2.6).
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
-    collect_closures(p, errs);
     add_synthetic_impls(p);
     check_supertrait_cycles(p, errs);
     check_impl_obligations(p, errs);

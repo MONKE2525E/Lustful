@@ -161,6 +161,9 @@ pub enum DefKind {
     // associated-item defs. Existing hashes do not move.
     Trait = 10,
     Assoc = 11,
+    // Added at the end for closures (ARCH 1.7: parent fn hash plus
+    // the closure's ordinal in that body, in token order).
+    Closure = 12,
 }
 
 impl DefKind {
@@ -178,6 +181,7 @@ impl DefKind {
             DefKind::Module => "mod",
             DefKind::Trait => "trait",
             DefKind::Assoc => "assoc",
+            DefKind::Closure => "closure",
         }
     }
 }

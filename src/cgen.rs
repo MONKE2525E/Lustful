@@ -78,9 +78,15 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
                 Box::new(cty(tys, b.value.output)),
             )
         }
-        TyKind::FnDef(..) | TyKind::Closure(..) => CTy::Unit,
+        TyKind::FnDef(..) => CTy::Unit,
         TyKind::Str => CTy::Str,
         TyKind::Tuple(ts) => CTy::Tuple(tys.tys_of(ts).iter().map(|&e| cty(tys, e)).collect()),
+        // A closure value is exactly a tuple of its captures (ARCH 4.5);
+        // a closure with no captures is zero-sized like `()`.
+        TyKind::Closure(_, a) => {
+            let fields: Vec<CTy> = tys.args(a).iter().filter_map(|g| g.as_ty()).map(|e| cty(tys, e)).collect();
+            if fields.is_empty() { CTy::Unit } else { CTy::Tuple(fields) }
+        }
         TyKind::Array(e, c) => {
             let n = match tys.const_kind(c) {
                 ConstKind::Int(n) => n as u64,
@@ -249,6 +255,9 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) => {
             out.push(t.clone())
         }
+        // A pointer to a fn pointer still names its typedef, which has
+        // no forward form (a closure capturing a fn pointer by ref).
+        CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
         _ => {}
     }
 }
@@ -3773,6 +3782,12 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
     for t in &list {
         if let CTy::Adt(a) = t {
             let _ = writeln!(out, "typedef struct A{0} A{0};", a.0);
+        }
+        // Every struct-typed C type too: a closure env holds references
+        // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
+        // before the referenced type's own definition.
+        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) = t {
+            let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
         }
     }
     // Each definition comes after the types it holds by value.
