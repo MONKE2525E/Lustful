@@ -15,7 +15,7 @@
 # also requires the full stderr text to match.
 #
 # Usage:
-#   fuzz.py run --edits 2000 --seed 7 --crate small|realish|multi [--modules 40] [--strict]
+#   fuzz.py run --edits 2000 --seed 7 --crate small|small2|realish|multi|multi2 [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
 #   fuzz.py shrink --prev A.rs --cur B.rs --out DIR
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
@@ -100,6 +100,128 @@ fn main() {
     let nums = vec![10, 20, 30];
     println!("{} {} {} {} {} {} {:?} {}", label(t), c, pick(&nums, 1), pts.len(),
              TABLE[1], hit(3), pts[0].clone(), std::mem::size_of::<Point>());
+}
+'''
+
+# small2: the small crate plus the newer features (a trait and its impl,
+# Result, a closure, byte literals), so the same edit ops hit their
+# invalidation edges. A separate crate kind on purpose: SMALL_CRATE,
+# SNIPPETS, and the edit ops stay byte-identical, so old seeds on
+# small/multi/realish keep the exact edit sequences they have always
+# covered. Feature edits (make_feature_edit) run only for small2.
+SMALL2_CRATE = '''#[derive(Debug, Clone, PartialEq)]
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+#[derive(Debug)]
+enum Shape {
+    Dot,
+    Pair(i64, i64),
+}
+
+const fn seed_val() -> i64 {
+    3
+}
+
+const SEED: i64 = seed_val();
+
+static TABLE: [i64; 2] = [SEED, SEED + 1];
+
+static BYTES: &[u8; 3] = b"abc";
+
+impl Point {
+    fn sum(&self) -> i64 {
+        self.x + self.y
+    }
+
+    fn bump(&mut self, d: i64) {
+        self.x += d;
+        self.y += d * 2;
+    }
+}
+
+trait Score {
+    fn score(&self) -> i64;
+}
+
+impl Score for Point {
+    fn score(&self) -> i64 {
+        self.x * 10 + self.y
+    }
+}
+
+fn classify(s: Shape) -> i64 {
+    match s {
+        Shape::Dot => 0,
+        Shape::Pair(a, b) => a * 10 + b,
+    }
+}
+
+fn total(pts: &Vec<Point>) -> i64 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < pts.len() {
+        acc += pts[i].sum();
+        i += 1;
+    }
+    acc
+}
+
+fn label(n: i64) -> String {
+    let mut s = String::from("n=");
+    s.push_str(&n.to_string());
+    s
+}
+
+fn pick(v: &Vec<i64>, i: usize) -> i64 {
+    v[i]
+}
+
+fn hit(n: i64) -> i64 {
+    match n {
+        SEED => 1,
+        _ => 0,
+    }
+}
+
+fn try_pick(v: &Vec<i64>, i: usize) -> Result<i64, String> {
+    if i < v.len() {
+        Ok(v[i])
+    } else {
+        Err(String::from("oob"))
+    }
+}
+
+fn pick_or(v: &Vec<i64>, i: usize) -> Result<i64, String> {
+    match try_pick(v, i) {
+        Ok(x) => Ok(x + 1),
+        Err(e) => Err(e),
+    }
+}
+
+fn use_closure(n: i64) -> i64 {
+    let add_seed = |x: i64| x + SEED;
+    add_seed(n)
+}
+
+fn byte_sum() -> i64 {
+    let c = b'z';
+    BYTES[0] as i64 + c as i64
+}
+
+fn main() {
+    let mut pts: Vec<Point> = Vec::new();
+    pts.push(Point { x: 1, y: 2 });
+    pts.push(Point { x: 3, y: 4 });
+    pts[0].bump(5);
+    let t = total(&pts);
+    let c = classify(Shape::Pair(2, 3));
+    let nums = vec![10, 20, 30];
+    println!("{} {} {} {} {} {} {:?} {}", label(t), c, pick(&nums, 1), pts.len(),
+             TABLE[1], hit(3), pts[0].clone(), std::mem::size_of::<Point>());
+    println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());
 }
 '''
 
@@ -437,9 +559,95 @@ def make_edit(rng, text, snapshots):
     return text, op
 
 
+def drop_block(text, head):
+    """Deletes the brace block that starts at `head` (naive brace count;
+    the generated items have no braces in strings). None if absent."""
+    i = text.find(head)
+    if i < 0:
+        return None
+    j = text.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(text)):
+        depth += (text[k] == "{") - (text[k] == "}")
+        if depth == 0:
+            return text[:i] + text[k + 1:]
+    return None
+
+
+def make_feature_edit(rng, text):
+    """Edits that aim at the newer features (small2 only, on its own RNG
+    and a fixed cadence, so the main edit stream is untouched): trait
+    impls added, duplicated (coherence must reject), and removed;
+    closures; Result and `?` (`?` is rejected today, so both sides must
+    agree on the reject, and the case turns into an accept test the day
+    `?` lands); byte literals; derive list cycles; Result signature
+    flips (the own-signature reuse class)."""
+    op = rng.choice(["feat_trait_impl", "feat_dup_impl", "feat_impl_toggle",
+                     "feat_closure", "feat_result_q", "feat_bytes",
+                     "feat_derive", "feat_result_sig"])
+    lines = text.splitlines(keepends=True)
+    b = item_bounds(lines)
+    at = rng.choice(b) if b else 0
+    n = rng.randint(0, 10**6)
+    if op == "feat_trait_impl":
+        lines.insert(at, f"trait Tr{n} {{\n    fn tr_val(&self) -> i64;\n}}\n"
+                         f"impl Tr{n} for Point {{\n    fn tr_val(&self) -> i64 {{\n"
+                         f"        self.x + {n % 7}\n    }}\n}}\n"
+                         f"fn use_tr{n}(p: &Point) -> i64 {{\n    p.tr_val()\n}}\n")
+        return "".join(lines), op
+    if op == "feat_dup_impl":
+        lines.insert(at, "impl Score for Point {\n    fn score(&self) -> i64 {\n        0\n    }\n}\n")
+        return "".join(lines), op
+    if op == "feat_impl_toggle":
+        cut = drop_block(text, "impl Score for Point")
+        if cut is not None:
+            return cut, op
+        lines.insert(at, "impl Score for Point {\n    fn score(&self) -> i64 {\n"
+                         "        self.x * 10 + self.y\n    }\n}\n")
+        return "".join(lines), op
+    if op == "feat_closure":
+        item = rng.choice([
+            f"fn clo{n}(v: i64) -> i64 {{\n    let f = |x: i64| x * 2 + {n % 5};\n    f(v)\n}}\n",
+            f"fn clo{n}(v: i64) -> i64 {{\n    let k = {n % 9};\n    let f = |x: i64| x + k;\n    f(v)\n}}\n",
+        ])
+        lines.insert(at, item)
+        return "".join(lines), op
+    if op == "feat_result_q":
+        lines.insert(at, f"fn try{n}(v: i64) -> Result<i64, i64> {{\n"
+                         f"    if v < 0 {{ Err(v) }} else {{ Ok(v + {n % 3}) }}\n}}\n"
+                         f"fn try{n}_up(v: i64) -> Result<i64, i64> {{\n"
+                         f"    let x = try{n}(v)?;\n    Ok(x * 2)\n}}\n")
+        return "".join(lines), op
+    if op == "feat_bytes":
+        lines.insert(at, f'const BS{n}: &[u8; 2] = b"hi";\n'
+                         f"fn bc{n}() -> i64 {{\n    BS{n}[1] as i64 + b'a' as i64\n}}\n")
+        return "".join(lines), op
+    if op == "feat_derive":
+        cycle = ["Debug, Clone, PartialEq", "Debug, Clone", "Debug",
+                 "Debug, Copy, Clone, PartialEq"]
+        m = re.search(r"#\[derive\(([^)]*)\)\]\nstruct Point", text)
+        if m and m.group(1) in cycle:
+            nxt = cycle[(cycle.index(m.group(1)) + 1) % len(cycle)]
+            return text[:m.start(1)] + nxt + text[m.end(1):], op
+        return text, op
+    if op == "feat_result_sig":
+        hits = [(m.start(), m.group(0)) for m in
+                re.finditer(r"Result<i64, (?:String|i64)>", text)]
+        if hits:
+            k, cur = rng.choice(hits)
+            nxt = "Result<i64, i64>" if cur.endswith("String>") else "Result<i64, String>"
+            return text[:k] + nxt + text[k + len(cur):], op
+        return text, op
+    return text, op
+
+
 def crate_text(kind, modules):
     if kind == "small":
         return SMALL_CRATE
+    if kind == "small2":
+        return SMALL2_CRATE
     if kind == "realish":
         make = os.path.join(ROOT, "bench/realish/make.py")
         return subprocess.run([sys.executable, make, str(modules)], capture_output=True,
@@ -456,9 +664,12 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
-    if a.crate == "multi":
-        return cmd_run_multi(a)
+    if a.crate in ("multi", "multi2"):
+        return cmd_run_multi(a, rename=a.crate == "multi2")
     rng = random.Random(a.seed)
+    # Feature edits draw from their own RNG so the main stream keeps
+    # the sequence old seeds have always covered (see SMALL2_CRATE).
+    frng = random.Random(a.seed ^ 0xFEA7)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -480,7 +691,10 @@ def cmd_run(a):
         seen_guard = 0
         for it in range(a.edits):
             prev = text
-            text, op = make_edit(rng, text, snapshots)
+            if a.crate == "small2" and it % 13 == 7:
+                text, op = make_feature_edit(frng, text)
+            else:
+                text, op = make_edit(rng, text, snapshots)
             ops[op.split(":")[0]] += 1
             if a.record:
                 with open(os.path.join(a.record, f"{it + 1:04d}.rs"), "w") as f:
@@ -533,7 +747,9 @@ def cmd_run(a):
                 snapshots.append(text)
             # A const_edit can move a baked-in value while `check` still
             # passes; run-compare right after it, not only every 25 edits.
-            if (it % 25 == 24 or op == "const_edit") and da[0] == 0:
+            # Feature edits get the same treatment: a derive or impl edit
+            # can change which glue a body runs while `check` still passes.
+            if (it % 25 == 24 or op == "const_edit" or op.startswith("feat_")) and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
                 if ok and why == "program hang":
                     # The edited program does not terminate on either side:
@@ -640,15 +856,18 @@ pub fn value() -> i64 {
 }
 
 
-def cmd_run_multi(a):
+def cmd_run_multi(a, rename=False):
     """Multi-file mode (W-RESOLVE): the seed crate is a small module tree.
     Each edit applies the single-file edit ops to one random file, or a
     structural op (add/remove a module file, toggle its `mod` line).
     The equivalence rule is the same: daemon answer == cold answer, and
     the fresh-session guard must never fire. Failure pairs are saved as
     one bundle of files per side (replay/shrink stay single-file tools).
+    With rename=True (crate multi2), a module rename also fires on a
+    fixed cadence from its own RNG; plain multi keeps its old stream.
     """
     rng = random.Random(a.seed)
+    frng = random.Random(a.seed ^ 0xFEA7)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
     base = os.path.join(h.work, "multi")
@@ -699,6 +918,36 @@ def cmd_run_multi(a):
             return fs, op
         return dict(rng.choice(snapshots)), "restore_files"
 
+    def rename_mod(rng, fs):
+        """Renames one module and its uses, or renames it back: b <-> bb
+        (file move plus `mod` line and `b::` paths) or a::inner <->
+        a::deeper. A rename moves every def in the module to a new
+        stable path, so stale per-file caches show up at once."""
+        fs = dict(fs)
+        main = fs.get("main.rs", "")
+        if rng.choice(["b", "inner"]) == "b":
+            if "b/mod.rs" in fs and "mod b;" in main:
+                fs["bb/mod.rs"] = fs.pop("b/mod.rs")
+                fs["main.rs"] = main.replace("mod b;", "mod bb;").replace("b::", "bb::")
+                return fs, "rename_mod:b2bb"
+            if "bb/mod.rs" in fs and "mod bb;" in main:
+                fs["b/mod.rs"] = fs.pop("bb/mod.rs")
+                fs["main.rs"] = main.replace("mod bb;", "mod b;").replace("bb::", "b::")
+                return fs, "rename_mod:bb2b"
+        else:
+            atext = fs.get("a.rs", "")
+            if "a/inner.rs" in fs and "pub mod inner;" in atext:
+                fs["a/deeper.rs"] = fs.pop("a/inner.rs")
+                fs["a.rs"] = atext.replace("pub mod inner;", "pub mod deeper;")
+                fs["main.rs"] = main.replace("a::inner::", "a::deeper::")
+                return fs, "rename_mod:inner2deeper"
+            if "a/deeper.rs" in fs and "pub mod deeper;" in atext:
+                fs["a/inner.rs"] = fs.pop("a/deeper.rs")
+                fs["a.rs"] = atext.replace("pub mod deeper;", "pub mod inner;")
+                fs["main.rs"] = main.replace("a::deeper::", "a::inner::")
+                return fs, "rename_mod:deeper2inner"
+        return fs, "rename_mod:noop"
+
     try:
         write_all(files)
         ok, why, da, co = compare(h, "check", a.strict)
@@ -708,7 +957,9 @@ def cmd_run_multi(a):
         seen_guard = 0
         for it in range(a.edits):
             prev = files
-            if rng.random() < 0.2:
+            if rename and it % 47 == 23:
+                files, op = rename_mod(frng, files)
+            elif rng.random() < 0.2:
                 files, op = structural(rng, files)
             else:
                 rel = rng.choice(sorted(files))
@@ -778,7 +1029,7 @@ def cmd_run_multi(a):
                 print(f"... {it + 1}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
         h.wait_guard_idle()
         guard = h.guard_count()
-        print(f"RESULT seed={a.seed} crate=multi edits={a.edits} failures={failures} "
+        print(f"RESULT seed={a.seed} crate={a.crate} edits={a.edits} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
         print("bad:", dict(bad_ops))
