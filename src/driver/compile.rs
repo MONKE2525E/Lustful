@@ -3051,4 +3051,59 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
         assert!(warm.stderr.contains("L0802"), "{}", warm.stderr);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Warm and cold checks of a resolver-routed file over the item segment
+    /// size agree byte for byte at every step: a body edit, a late type
+    /// error, a late borrow error, their fixes, and a route flip (the `use`
+    /// line goes, so the file leaves the resolver, then comes back). The
+    /// warm daemon session parses the file whole; each cold one-shot
+    /// session parses it in item segments.
+    #[test]
+    fn warm_and_cold_agree_on_a_segmented_file() {
+        let dir = std::env::temp_dir().join(format!("lust-warmbig-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.rs");
+        let key = crate::protocol::SessionKey::synthetic(&file, false);
+        let req = Request { json: true, ..req_for(key.clone()) };
+        let mut orig = String::from("use std::collections::HashMap;\n");
+        for i in 0..320 {
+            let prev = if i == 0 { "t".to_string() } else { format!("run{}(t % 7)", i - 1) };
+            orig += &format!(
+                "#[derive(Debug, Clone, PartialEq)]\nenum Kind{i} {{ A(i64), B {{ x: i64, y: i64 }}, C }}\n\
+                 struct S{i} {{ id: i64, name: String, kind: Kind{i}, items: Vec<i64> }}\n\
+                 fn make{i}(n: i64) -> S{i} {{\n    let kind = if n % 3 == 0 {{ Kind{i}::A(n) }} else if n % 3 == 1 {{ Kind{i}::B {{ x: n, y: n * 2 }} }} else {{ Kind{i}::C }};\n    \
+                 S{i} {{ id: n, name: format!(\"s{{}}\", n), kind, items: vec![n, n + 1, n + 2] }}\n}}\n\
+                 fn score{i}(s: &S{i}) -> i64 {{\n    let mut total = s.id + s.name.len() as i64;\n    for v in &s.items {{ total += *v; }}\n    \
+                 match &s.kind {{ Kind{i}::A(v) => total + v, Kind{i}::B {{ x, y }} => total + x * y, Kind{i}::C => total - 1 }}\n}}\n\
+                 fn run{i}(n: i64) -> i64 {{ let s = make{i}(n); let t = score{i}(&s); if t > 100 {{ t - {prev} }} else {{ t }} }}\n"
+            );
+        }
+        orig += "fn main() { let n = std::env::args().count() as i64; println!(\"{}\", run319(n)); }\n";
+        let interner = crate::intern::Interner::default();
+        let toks = lexer::lex(&orig, crate::diag::FileId(0), 0, &interner).unwrap().tokens;
+        assert!(toks.len() > 16 * 4096, "over the item segment size: {} tokens", toks.len());
+        let steps = [
+            ("orig", orig.clone()),
+            ("body edit", orig.replace("t - run318(t % 7)", "t - run318(t % 7) + 1")),
+            ("late type error", orig.clone() + "fn zzz() -> i64 { \"bad\" }\n"),
+            ("fixed", orig.clone()),
+            ("late borrow error", orig.clone() + "fn zzz() -> usize { let s = String::from(\"a\"); let t = s; s.len() + t.len() }\n"),
+            ("fixed again", orig.clone()),
+            ("route flip", orig.replacen("use std::collections::HashMap;\n", "", 1)),
+            ("route back", orig.clone()),
+        ];
+        let mut warm = Session::new(dir.join("warm"), true, key.clone());
+        let mut codes = Vec::new();
+        for (k, (name, text)) in steps.iter().enumerate() {
+            std::fs::write(&file, text).unwrap();
+            let w = compile(&req, &mut warm);
+            assert_eq!(warm.front.resolved_crate, *name != "route flip", "step {name}: routing");
+            let c = compile(&req, &mut Session::new(dir.join(format!("cold{k}")), false, key.clone()));
+            assert_eq!((w.code, &w.stdout, &w.stderr), (c.code, &c.stdout, &c.stderr), "step {name}: warm vs cold");
+            codes.push(w.code);
+        }
+        assert_eq!(codes, [0, 0, 1, 0, 1, 0, 0, 0], "each step's expected answer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
