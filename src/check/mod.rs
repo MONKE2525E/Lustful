@@ -4722,18 +4722,52 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // pointers: retag the first element too when any
                         // element is a different fn item.
                         let elt = self.resolve(el);
-                        let el = if elems.len() > 1 && self.is_fn_item(elt) {
-                            match self.callable_sig(elt) {
-                                Some((params, ret)) => {
-                                    let fp = self.fn_ptr_ty(&params, ret);
-                                    self.set(first, fp);
-                                    fp
-                                }
-                                None => el,
+                        // Closures that capture nothing join as a fn
+                        // pointer when they differ (rustc's LUB coercion).
+                        if elems.len() > 1 && matches!(self.kind(elt), TyKind::Closure(_, caps) if self.tys.args(caps).is_empty()) {
+                            let mut joined = elt;
+                            for &el_e in &elems[1..] {
+                                let t = self.expr(el_e, None);
+                                joined = match self.closure_lub(joined, t) {
+                                    Some(fp) => fp,
+                                    None => {
+                                        if !self.unify(joined, t) {
+                                            let sp = self.span(el_e);
+                                            self.mismatch(sp, joined, t);
+                                        }
+                                        joined
+                                    }
+                                };
                             }
-                        } else {
-                            el
-                        };
+                            if matches!(self.kind(joined), TyKind::FnPtr(_)) {
+                                for &el_e in elems.iter() {
+                                    self.set(el_e, joined);
+                                }
+                            }
+                            let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                            return self.tys.intern(TyKind::Array(joined, c));
+                        }
+                        // Fn items join as a fn pointer only when they
+                        // differ (`[a, b]`); `[a, a]` keeps the item type,
+                        // which is zero-sized (rustc's LUB coercion).
+                        if elems.len() > 1 && self.is_fn_item(elt) {
+                            let rest: Vec<Ty> = elems[1..].iter().map(|&el_e| self.expr(el_e, None)).collect();
+                            if rest.iter().all(|&t| self.resolve(t) == elt) {
+                                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                                return self.tys.intern(TyKind::Array(elt, c));
+                            }
+                            let Some((params, ret)) = self.callable_sig(elt) else {
+                                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                                return self.tys.intern(TyKind::Array(ERROR, c));
+                            };
+                            let fp = self.fn_ptr_ty(&params, ret);
+                            self.set(first, fp);
+                            for (&el_e, &t) in elems[1..].iter().zip(&rest) {
+                                self.coerce_expr(el_e, t, fp);
+                            }
+                            let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                            return self.tys.intern(TyKind::Array(fp, c));
+                        }
                         for &el_e in &elems[1..] {
                             self.expect_expr(el_e, el);
                         }
@@ -5105,6 +5139,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if self.kind(b) == TyKind::Never {
             return a;
+        }
+        // Two closures that capture nothing (or one and a fn pointer)
+        // with one signature join as a function pointer, as rustc's LUB
+        // coercion does; lowering makes each a trampoline value.
+        if let Some(fp) = self.closure_lub(a, b) {
+            return fp;
         }
         // Two plain fn items (or an item and a pointer) with one
         // signature join as a function pointer.

@@ -151,12 +151,20 @@ impl<'p, 'a> Lower<'p, 'a> {
     pub(super) fn closure_value(&mut self, e: ExprId, dest: Option<&Place>, span: Span) {
         let ty = self.ty(e);
         let Some(info) = self.ck.closures.iter().find(|c| c.expr == e).cloned() else { return };
-        // A closure checked as a fn pointer (it captures nothing): the
-        // value is its body fn's trampoline, which supplies the empty env.
-        if matches!(self.kind(ty), TyKind::FnPtr(_))
+        // A closure checked as a fn pointer, or joined with another
+        // branch into one (it captures nothing): the value is its body
+        // fn's trampoline, which supplies the empty env.
+        let want = match dest {
+            Some(d) if d.proj.is_empty() && matches!(self.kind(self.body.locals[d.local as usize].ty), TyKind::FnPtr(_)) => {
+                self.body.locals[d.local as usize].ty
+            }
+            _ => ty,
+        };
+        if matches!(self.kind(want), TyKind::FnPtr(_))
+            && info.captures.is_empty()
             && let Some(entry) = self.p.gx.closures.get(&info.def)
         {
-            self.set_or_temp(dest, Rvalue::FnValue(entry.body_fn, ty), ty, span);
+            self.set_or_temp(dest, Rvalue::FnValue(entry.body_fn, want), want, span);
             return;
         }
         if info.captures.is_empty() {

@@ -2672,7 +2672,6 @@ pub struct ClosureEntry {
 pub struct OpaqueInfo {
     pub owner: DefId,
     pub bounds: Vec<Predicate>,
-    pub span: Span,
 }
 
 /// The def of the return-position `impl Trait` of one fn.
@@ -3227,7 +3226,7 @@ pub fn resolve_fn_sig(
                             "Write the trait the returned value implements, such as `impl Iterator<Item = u8>`.",
                         ));
                     }
-                    opaque = Some((od, OpaqueInfo { owner, bounds: preds, span }));
+                    opaque = Some((od, OpaqueInfo { owner, bounds: preds }));
                     oty
                 }
             }

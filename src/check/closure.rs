@@ -1456,6 +1456,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let mut t = self.resolve(ct);
         let mut derefs: u8 = 0;
+        // Smart pointers peeled on the way (`Box<F>`, `Rc<F>`): calls
+        // go through the pointee, as `impl Fn for Box<F>` and the
+        // callee autoderef do in rustc.
+        let (mut via_box, mut via_rc) = (false, false);
         loop {
             match self.kind(t) {
                 TyKind::Closure(def, _) => {
@@ -1463,6 +1467,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.err("L0820", span, "this closure call is not supported yet", "Call the closure where it is defined.");
                         return ERROR;
                     };
+                    // Through a smart pointer only an `Fn` closure is called:
+                    // rustc picks `Fn for Box<F>` first, so a boxed FnMut or
+                    // FnOnce closure is E0525 (`(*b)()` works), and an `Rc`
+                    // gives only shared access (E0596).
+                    if (via_box || via_rc) && kind != ClosureKind::Fn {
+                        for &a in args {
+                            self.expr(a, None);
+                        }
+                        self.err(
+                            "L0110",
+                            span,
+                            "expected a closure that implements `Fn`: a boxed or shared `FnMut` or `FnOnce` closure is not called this way",
+                            "Call it through the pointee instead: `(*b)()`, or keep the closure unboxed.",
+                        );
+                        return ERROR;
+                    }
                     // In an instance, a call keeps the Fn trait the
                     // template resolved it through (FnOnce consumes the
                     // closure even when it is Fn), as rustc's generic body.
@@ -1475,6 +1495,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 TyKind::Ref(_, _, inner) if derefs < 8 => {
                     derefs += 1;
                     t = self.resolve(inner);
+                }
+                TyKind::Adt(..) if derefs < 8 && self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(e), TyKind::Closure(..))) => {
+                    if self.tys.rc_elem(t).is_some() {
+                        via_rc = true;
+                    } else {
+                        via_box = true;
+                    }
+                    derefs += 1;
+                    t = self.tys.smart_elem(t).map_or(ERROR, |e| self.resolve(e));
                 }
                 TyKind::Infer(v) if !v.is_int() && !v.is_float() => {
                     self.err("L0610", span, "type annotations needed: the type of this callee must be known here", "Annotate the callee's type.");
@@ -1580,6 +1609,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let ts = self.tys.intern_tys(&inputs);
         let tuple = self.tys.intern(TyKind::Tuple(ts));
         Some(self.unify(want, tuple))
+    }
+
+    /// The fn pointer two branch types join as when each is a closure
+    /// that captures nothing (or one of them is already a fn pointer)
+    /// and the signatures agree. None otherwise, or for one closure type.
+    pub(super) fn closure_lub(&mut self, a: Ty, b: Ty) -> Option<Ty> {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        if a == b {
+            return None;
+        }
+        let sig = |cx: &mut Self, t: Ty| -> Option<(Vec<Ty>, Ty)> {
+            match cx.kind(t) {
+                TyKind::Closure(def, caps) if cx.tys.args(caps).is_empty() => cx.closure_facts(def).map(|(_, i, o)| (i, o)),
+                TyKind::FnPtr(_) => cx.callable_sig(t),
+                _ => None,
+            }
+        };
+        if !matches!(self.kind(a), TyKind::Closure(..)) && !matches!(self.kind(b), TyKind::Closure(..)) {
+            return None;
+        }
+        let ((ia, oa), (ib, ob)) = (sig(self, a)?, sig(self, b)?);
+        if ia.len() != ib.len() {
+            return None;
+        }
+        let snap = self.snapshot_vars();
+        let ok = ia.iter().zip(&ib).all(|(&x, &y)| self.unify(x, y)) && self.unify(oa, ob);
+        if !ok {
+            self.rollback_vars(snap);
+            return None;
+        }
+        Some(self.fn_ptr_ty(&ia, oa))
     }
 
     /// The output of a closure for `<C as FnOnce<A>>::Output`.

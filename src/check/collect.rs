@@ -535,6 +535,19 @@ fn check_generic_aliases(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// A const, static, or associated const item's written type: the plain
+/// resolver, else the scoped one (a generic alias with its args and
+/// defaults, a generic Adt applied to args).
+fn resolve_item_ty(p: &mut Program, id: ast::TyId, self_ty: Option<Ty>) -> Result<Ty, Diag> {
+    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, id, self_ty).or_else(|d| {
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let scope = generics::Scope { self_ty, ..generics::Scope::default() };
+        let generic_alias = d.message.contains("needs the scoped resolver");
+        generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, id, &scope).map_err(|e| if generic_alias { e } else { d })
+    })
+}
+
 /// The span of a path to a user Adt with lifetime params that writes none
 /// (a hidden lifetime), anywhere in a written type.
 fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
@@ -755,6 +768,11 @@ pub fn resolve_ty(
                 return no_generics(tys.adt_ty(adt));
             }
             if let Some(&t) = aliases.get(&name) {
+                // A generic alias needs the scoped resolver (its args and
+                // defaults): callers fall back to it on this error.
+                if tys.flags(t).contains_param() {
+                    return Err(Diag::new("L0110", span, "this generic alias needs the scoped resolver", "Write the alias's arguments."));
+                }
                 return no_generics(t);
             }
             let n = interner.get(name);
@@ -2924,7 +2942,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             _ => continue,
         };
         let Some(value) = value else { continue };
-        let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, ty_id, None) {
+        let ty = match resolve_item_ty(p, ty_id, None) {
             Ok(t) => t,
             Err(d) => {
                 errs.push(d);
@@ -3151,7 +3169,7 @@ fn register_assoc_consts<'a>(
                     continue;
                 }
                 let self_ty = owner.map(|o| p.tys.adt_ty(o));
-                let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, c.ty, self_ty) {
+                let ty = match resolve_item_ty(p, c.ty, self_ty) {
                     Ok(t) => t,
                     Err(d) => match p.gx.trait_assoc_consts.get(&assoc).copied().filter(|&(t, _)| !p.tys.flags(t).contains_param()) {
                         // The scoped check in `finish_trait_impl`
@@ -3203,7 +3221,7 @@ fn register_assoc_consts<'a>(
                 ));
                 continue;
             }
-            let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, c.ty, Some(self_ty)) {
+            let ty = match resolve_item_ty(p, c.ty, Some(self_ty)) {
                 Ok(t) => t,
                 Err(d) => {
                     errs.push(d);
