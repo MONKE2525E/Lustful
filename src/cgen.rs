@@ -762,6 +762,18 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     g.collect_move_paths();
     g.function();
     g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
+    // A `main` returning `Result` gets a Termination entry in its
+    // unit (see `fn_unit`): it needs the error type's Debug glue
+    // and the Result's own drop glue.
+    if Some(body.fn_id) == p.main
+        && let Some((_, err_t)) = p.tys.result_args(p.fn_info(body.fn_id).ret)
+    {
+        let rc = cty(&p.tys, p.fn_info(body.fn_id).ret);
+        g.want(Glue::Debug, &cty(&p.tys, err_t));
+        if needs_drop_c(p, &rc) {
+            g.want(Glue::Drop, &rc);
+        }
+    }
     let mut types = std::mem::take(&mut g.sig_types);
     for t in &g.local_cty {
         collect_types(t, &mut types);
@@ -3135,7 +3147,10 @@ pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usi
     for u in overlays {
         let _ = writeln!(c, "  lust_overlay_u{u}();");
     }
-    let _ = writeln!(c, "  ((void (*)(void))lust_fns[{main_slot}])();\n  lust_flush();\n  return 0;\n}}");
+    let _ = writeln!(
+        c,
+        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  lust_flush();\n  return 0;\n}}"
+    );
     c
 }
 
@@ -3145,6 +3160,7 @@ pub fn table_unit(capacity: usize, fn_units: &[usize]) -> String {
     let mut c = unit_header();
     let _ = writeln!(c, "lust_fnptr lust_fns[{}];", capacity.max(1));
     let _ = writeln!(c, "lust_fnptr lust_tramps[{}];", capacity.max(1));
+    let _ = writeln!(c, "int (*lust_main_entry_p)(void);");
     for u in fn_units {
         let _ = writeln!(c, "void lust_register_u{u}(void);");
     }
@@ -3515,10 +3531,49 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     for f in &fns[range.clone()] {
         c.push_str(&f.code);
     }
+    // Termination entry for a `main` returning `Result<(), E>`:
+    // call main through the table, print `Error: {err:?}` to
+    // stderr and exit 1 on Err, as Rust does. Registered below in
+    // `lust_main_entry_p`, which the main unit prefers over the
+    // plain void call. The Debug and Drop glue it calls is wanted
+    // by main's own FnOut (see `gen_fn`).
+    let main_entry = p.main.filter(|m| range.contains(&(m.0 as usize)) && !fns[m.0 as usize].code.is_empty());
+    if let Some(m) = main_entry
+        && let Some((_, err_t)) = p.tys.result_args(p.fn_info(m).ret)
+    {
+        let rc = cty(&p.tys, p.fn_info(m).ret);
+        let rt = ctype(&rc);
+        let cast = fn_ptr_cast(p, m);
+        let idx = m.0;
+        let disc = disc_call(p, &rc, "(&r)");
+        let field = variant_field(p, &rc, "r", 1, 0);
+        let ec = cty(&p.tys, err_t);
+        let _ = writeln!(c, "static int lust_main_entry_impl(void) {{");
+        if ret_is_large(p, m) {
+            let _ = writeln!(c, "  {rt} r; ({cast}lust_fns[{idx}])(&r);");
+        } else {
+            let _ = writeln!(c, "  {rt} r = ({cast}lust_fns[{idx}])();");
+        }
+        let _ = writeln!(c, "  int rc = 0;");
+        let _ = writeln!(
+            c,
+            "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_string_push_cstr(&s, \"Error: \"); dbg_{}(&s, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}",
+            mangle(&ec)
+        );
+        if needs_drop_c(p, &rc) {
+            let _ = writeln!(c, "  drop_{}(&r);", mangle(&rc));
+        }
+        let _ = writeln!(c, "  return rc;\n}}");
+    }
     let _ = writeln!(c, "void {register}(void) {{");
     for i in range.filter(|&i| !fns[i].code.is_empty()) {
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
         let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
+    }
+    if let Some(m) = main_entry
+        && p.tys.result_args(p.fn_info(m).ret).is_some()
+    {
+        let _ = writeln!(c, "  lust_main_entry_p = lust_main_entry_impl;");
     }
     c.push_str("}\n");
     c

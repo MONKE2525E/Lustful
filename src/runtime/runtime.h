@@ -44,6 +44,9 @@ extern lust_fnptr lust_fns[];
 /* One slot trampoline per slot (ARCH 4.5): stable addresses that
    forward through lust_fns, stored in fn pointer values. */
 extern lust_fnptr lust_tramps[];
+/* Entry for a `main` that returns `Result<(), E>`: set by the unit
+   that holds main when it registers; NULL for a `()` main. */
+extern int (*lust_main_entry_p)(void);
 void lust_base_init(void);
 
 /* A source location: (function id << 32) | (line within the function << 12) | column. Lines are

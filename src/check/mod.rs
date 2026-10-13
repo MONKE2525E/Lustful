@@ -248,6 +248,21 @@ pub enum Res {
     },
     /// A call through a function pointer value in the callee expression.
     Indirect,
+    /// A `?` with no error conversion: on `Option`, or on `Result`
+    /// whose error type already matches the enclosing return type.
+    TryPlain,
+    /// A `?` on `Result` whose error converts through this
+    /// `From::from` method (a template until mono rewrites it
+    /// through `Checked::generic_args`; `LocalDefId(u32::MAX)` when
+    /// only param evidence proves it in a template body).
+    TryFrom(LocalDefId),
+    /// A `?` on `Result` whose error converts by a numeric
+    /// widening cast (the `From` impls with no user fn).
+    TryCast,
+    /// A `?` on `Result` whose error converts through the builtin
+    /// `From<&str> for String` or `From<&String> for String`: a
+    /// copy into a fresh String with no user fn behind it.
+    TryStringFrom,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -441,6 +456,10 @@ struct Ctx<'p, 'a> {
     /// checked in place, outermost first: a nested closure's
     /// parent args while its enclosing fn is still this body.
     closure_arg_stack: Vec<Vec<GenericArg>>,
+    /// Return types of closure bodies being inferred in place,
+    /// innermost last: a `?` inside one targets the closure's own
+    /// return type, not the enclosing fn's.
+    ret_stack: Vec<Ty>,
     /// Closures whose bodies get a second inference pass at
     /// finish when signature variables are still unbound.
     deferred_closures: Vec<DeferredClosure>,
@@ -520,6 +539,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         generic_sites: Vec::new(),
         closure_sites: Vec::new(),
         closure_arg_stack: Vec::new(),
+        ret_stack: Vec::new(),
         deferred_closures: Vec::new(),
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
@@ -2851,12 +2871,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         self.closure_arg_stack.push(args.to_vec());
+        self.ret_stack.push(ret_ty);
         let saved_flag = self.head_unknown_flag;
         self.head_unknown_flag = false;
         let bt = self.expr(body, Some(ret_ty));
         self.coerce_expr(body, bt, ret_ty);
         let head_failed = self.head_unknown_flag;
         self.head_unknown_flag = saved_flag;
+        self.ret_stack.pop();
         self.closure_arg_stack.pop();
         // The body's own obligations run once here so operators
         // and method calls in the body can bind signature
@@ -3842,15 +3864,134 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Expr::Closure { params, ret, body, .. } => self.closure_expr(e, params, *ret, *body, span),
+            Expr::Try(inner) => self.try_expr(e, *inner, span),
             // AST v2 expression forms the parser still rejects.
-            Expr::Try(_)
-            | Expr::Await(_)
+            Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
             | Expr::QPath { .. }
             | Expr::Underscore
             | Expr::MacroCall(_) => ERROR,
         }
+    }
+
+    /// The `?` operator. On `Option` the enclosing return type must
+    /// be an `Option`; on `Result` it must be a `Result` whose error
+    /// type matches, widens numerically, or converts through a
+    /// `From` impl, selected here like `From::from` itself is in
+    /// `assoc_call`. The conversion plan rides in `Res` for lowering.
+    fn try_expr(&mut self, e: ExprId, inner: ExprId, span: Span) -> Ty {
+        let p = self.p;
+        let it0 = self.expr(inner, None);
+        self.run_obligations(false);
+        let it = self.resolve(it0);
+        let ret = self.ret_stack.last().copied().unwrap_or(self.f.ret);
+        let ret = self.resolve(ret);
+        let general_var = |cx: &Self, t: Ty| matches!(cx.tys.kind(t), TyKind::Infer(v) if !v.is_int() && !v.is_float());
+        if let Some(elem) = self.tys.option_elem(it) {
+            let ok = self.tys.option_elem(ret).is_some()
+                || (general_var(self, ret) && {
+                    let v = self.new_var(false);
+                    let o = self.tys.mk_option(v);
+                    self.unify(ret, o)
+                });
+            if !ok && self.kind(it) != TyKind::Error && self.kind(ret) != TyKind::Error {
+                self.err(
+                    "L0112",
+                    span,
+                    "the `?` operator on an `Option` can only be used in a function that returns `Option`",
+                    "Change the return type to `Option<_>`, or handle the `None` case with `match`.",
+                );
+            }
+            self.set_res(e, Res::TryPlain);
+            return elem;
+        }
+        if let Some((ok_t, err_t)) = self.tys.result_args(it) {
+            let ret_err = match self.tys.result_args(ret) {
+                Some((_, e2)) => Some(e2),
+                None if general_var(self, ret) => {
+                    let o = self.new_var(false);
+                    let r = self.tys.mk_result(o, err_t);
+                    if self.unify(ret, r) { Some(err_t) } else { None }
+                }
+                None => None,
+            };
+            let Some(ret_err) = ret_err else {
+                if self.kind(it) != TyKind::Error && self.kind(ret) != TyKind::Error {
+                    self.err(
+                        "L0112",
+                        span,
+                        "the `?` operator on a `Result` can only be used in a function that returns `Result`",
+                        "Change the return type to `Result<_, _>`, or handle the `Err` case with `match`.",
+                    );
+                }
+                self.set_res(e, Res::TryPlain);
+                return ok_t;
+            };
+            // The common case: the error types already agree.
+            let snap = self.snapshot_vars();
+            if self.unify(err_t, ret_err) {
+                self.set_res(e, Res::TryPlain);
+                return ok_t;
+            }
+            self.rollback_vars(snap);
+            let (e1, e2) = (self.resolve(err_t), self.resolve(ret_err));
+            if Self::numeric_from_ok(self.kind(e1), self.kind(e2)) {
+                self.set_res(e, Res::TryCast);
+                return ok_t;
+            }
+            // The builtin `From<&str>` and `From<&String>` for
+            // String: a copy, with no impl record behind it.
+            if e2 == STRING && matches!(self.kind(e1), TyKind::Ref(_, _, i) if i == STR || i == STRING) {
+                self.set_res(e, Res::TryStringFrom);
+                return ok_t;
+            }
+            let args_id = self.tys.intern_args(&[GenericArg::Ty(e2), GenericArg::Ty(e1)]);
+            let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
+            // The obligation is what makes a generic body without the
+            // `From` bound fail at finish; selection here only picks
+            // the call target for lowering.
+            self.obl.push_trait_at(tr, span, 0);
+            let sel = self.select_obligation_at(tr, span, 0);
+            let from_fn = match &sel {
+                Selection::Impl { id, args: impl_args, .. } => {
+                    self.method_instance_for_impl(e, *id, tr, *impl_args, "from", span).map(|(local, _, _)| local)
+                }
+                _ => None,
+            };
+            match (sel, from_fn) {
+                (_, Some(local)) => self.set_res(e, Res::TryFrom(local)),
+                // The MAX marker is a template-only plan: an instance
+                // check re-selects and fills in the real target. In a
+                // concrete body it would lower as a plain move of the
+                // wrong type, so it must not escape a template check.
+                (Selection::Impl { .. } | Selection::ParamEvidence(_), None) if self.is_template_check() => {
+                    self.set_res(e, Res::TryFrom(LocalDefId(u32::MAX)))
+                }
+                _ => {
+                    let (a, b) = (self.tn(e1), self.tn(e2));
+                    self.err(
+                        "L0112",
+                        span,
+                        format!("the `?` operator cannot convert the error type `{a}` to `{b}`"),
+                        format!("Implement `From<{a}>` for `{b}`, or map the error before the `?`."),
+                    );
+                    self.set_res(e, Res::TryPlain);
+                }
+            }
+            return ok_t;
+        }
+        if self.kind(it) != TyKind::Error {
+            let tn = self.tn(it);
+            self.err(
+                "L0112",
+                span,
+                format!("the `?` operator can only be used on `Option` or `Result` values, not `{tn}`"),
+                "Remove the `?`, or produce an `Option` or `Result` first.",
+            );
+        }
+        self.set_res(e, Res::TryPlain);
+        ERROR
     }
 
     fn unit_body(&mut self, t: Ty, b: ast::BlockId) {

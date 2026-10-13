@@ -1824,8 +1824,15 @@ pub fn collect_mode<'a>(
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
-        if !f.params.is_empty() || f.ret != UNIT {
-            errs.push(Diag::new("L0110", f.def.name_span, "`main` must take no parameters and return ()", "Write `fn main() { ... }`."));
+        // Rust's Termination for main: (), or Result<(), E> with E: Debug.
+        let ret_ok = f.ret == UNIT || matches!(p.tys.result_args(f.ret), Some((ok, e)) if ok == UNIT && has_debug(&p, &p.tys, e));
+        if !f.params.is_empty() || !ret_ok {
+            errs.push(Diag::new(
+                "L0110",
+                f.def.name_span,
+                "`main` must take no parameters and return () or Result<(), E> with E: Debug",
+                "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
+            ));
         }
     }
     // Const and static items: register names first, then evaluate with the

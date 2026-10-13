@@ -2689,7 +2689,10 @@ impl<'a> Parser<'a> {
                     self.expect(Tok::RBracket, "`]`")?;
                     e = self.push_expr(Expr::Index { base: e, index }, start.to(self.prev_span()));
                 }
-                Tok::Question => return Err(self.reject(C_CORE, "the `?` operator")),
+                Tok::Question => {
+                    self.bump();
+                    e = self.push_expr(Expr::Try(e), start.to(self.prev_span()));
+                }
                 _ => return Ok(e),
             }
         }

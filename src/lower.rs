@@ -944,9 +944,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             // A closure value is zero-sized: calls name its
             // instance directly, so the value is a unit constant.
             Expr::Closure { .. } => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
+            Expr::Try(inner) => self.try_into(e, *inner, dest, ty, span),
             // AST v2 expression forms the parser still rejects.
             Expr::Float(_)
-            | Expr::Try(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
@@ -956,6 +956,73 @@ impl<'p, 'a> Lower<'p, 'a> {
             | Expr::Underscore
             | Expr::MacroCall(_) => {}
         }
+    }
+
+    /// `expr?`: evaluate the scrutinee into a temporary, branch on
+    /// its discriminant, move the success payload to `dest` on the
+    /// good side, and on the empty side build the enclosing return
+    /// value (converting the error as the checker recorded) and
+    /// return it through the normal return path, drops included.
+    fn try_into(&mut self, e: ExprId, inner: ExprId, dest: Option<&Place>, ty: Ty, span: Span) {
+        let ity = self.ty(inner);
+        let t = self.temp(ity);
+        self.expr_into(inner, Some(&Place::local(t)));
+        let tp = Place::local(t);
+        let dsc = self.temp(int(IntTy::U32));
+        self.assign(Place::local(dsc), Rvalue::Discriminant(tp.clone()), span);
+        let is_result = self.body.tys.result_args(ity).is_some();
+        // Variant index of the valued side: Ok is 0, Some is 1.
+        let good: u32 = if is_result { 0 } else { 1 };
+        let ok_bb = self.new_block();
+        let err_bb = self.new_block();
+        {
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(dsc)), vec![(good, ok_bb)], err_bb);
+            b.term_span = span;
+        }
+        self.cur = err_bb;
+        let ret_ty = self.body.locals[0].ty;
+        if let Some((_, err_ty)) = self.body.tys.result_args(ity) {
+            let payload = tp.clone().project(Proj::Downcast(1)).project(Proj::Field(0));
+            let ret_err = self.body.tys.result_args(ret_ty).map(|(_, e2)| e2).unwrap_or(err_ty);
+            let err_op = match self.ck.res(e) {
+                Res::TryCast => {
+                    let ct = self.temp(ret_err);
+                    let op = self.operand_from(payload, err_ty);
+                    self.assign(Place::local(ct), Rvalue::Cast(op, ret_err), span);
+                    Operand::Move(Place::local(ct))
+                }
+                Res::TryFrom(f) if f.0 != u32::MAX => {
+                    let f = self.resolve_generic_fn(e, f);
+                    let ct = self.temp(ret_err);
+                    let op = self.operand_from(payload, err_ty);
+                    self.call_into(CallTarget::Fn(f), vec![op], Place::local(ct), span);
+                    Operand::Move(Place::local(ct))
+                }
+                Res::TryStringFrom => {
+                    let mut op = self.operand_from(payload, err_ty);
+                    // `From<&String>` first views the String as `&str`.
+                    if matches!(self.body.tys.kind(err_ty), TyKind::Ref(_, _, i) if i == STRING) {
+                        let st = self.temp(REF_STR);
+                        self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![op], Place::local(st), span);
+                        op = Operand::Move(Place::local(st));
+                    }
+                    let ct = self.temp(ret_err);
+                    self.call_into(CallTarget::Builtin(Builtin::StringFrom), vec![op], Place::local(ct), span);
+                    Operand::Move(Place::local(ct))
+                }
+                _ => self.operand_from(payload, err_ty),
+            };
+            self.assign(Place::local(0), Rvalue::Res(ret_ty, false, err_op), span);
+        } else {
+            self.assign(Place::local(0), Rvalue::Opt(ret_ty, None), span);
+        }
+        self.exit_to(0, span);
+        self.terminate(Terminator::Return, span);
+        self.cur = ok_bb;
+        let payload = tp.project(Proj::Downcast(good)).project(Proj::Field(0));
+        let op = self.operand_from(payload, ty);
+        self.set_or_temp(dest, Rvalue::Use(op), ty, span);
     }
 
     /// The `&&` elements of a condition, left to right.

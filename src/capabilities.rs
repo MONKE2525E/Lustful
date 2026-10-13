@@ -516,7 +516,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("capturing closures", "L0820"),
     ("patterns in closure parameters", "L0820"),
     ("closures returning references", "L0820"),
-    ("the `?` operator", "L0820"),
     ("named format arguments", "L0641"),
     ("format spec forms other than {} and {:?} (named in the message)", "L0641"),
     ("#[test] functions inside impl blocks", "L9001"),
@@ -610,6 +609,7 @@ const EXPRESSIONS: &[&str] = &[
     "format strings with {}, {:?}, positions, and captured names",
     "vec! literals with [value; count]",
     "assignment and compound assignment",
+    "the ? operator on Option and Result, with From error conversion",
 ];
 
 const DERIVES: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq (accepted, no effect yet)", "Hash (accepted, no effect yet)"];
