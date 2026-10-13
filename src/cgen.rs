@@ -1988,7 +1988,36 @@ impl FnGen<'_, '_, '_> {
             CTy::Int(i) => *i,
             _ => IntTy::I64,
         };
+        // The (element type, data pointer, length) C expressions of
+        // a Vec, slice, or array operand, in whichever shape the
+        // method receiver arrived: `&Vec` (pointer to lust_Vec),
+        // `&[T]` (the fat slice value), `&&[T]` (pointer to it),
+        // `&[T; N]` (pointer to the array), or a by-value array.
+        let slice_like = |t: &CTy, val: &str| -> (CTy, String, String) {
+            match t {
+                CTy::Ref(inner) => match &**inner {
+                    CTy::Vec(e) => ((**e).clone(), format!("(({}*){val}->ptr)", ctype(e)), format!("{val}->len")),
+                    CTy::Slice(e) => ((**e).clone(), format!("{val}->ptr"), format!("{val}->len")),
+                    CTy::Array(e, n) => ((**e).clone(), format!("{val}->v"), format!("((uint64_t){n})")),
+                    _ => unreachable!(),
+                },
+                CTy::Slice(e) => ((**e).clone(), format!("{val}.ptr"), format!("{val}.len")),
+                CTy::Array(e, n) => ((**e).clone(), format!("{val}.v"), format!("((uint64_t){n})")),
+                _ => unreachable!(),
+            }
+        };
         match b {
+            B::MemDrop => {
+                // The operand was moved into the call, so its own
+                // drop flag is already clear; this is its one drop.
+                if needs_drop_c(self.p, &tys[0]) {
+                    self.want(Glue::Drop, &tys[0]);
+                    let t = self.tmp();
+                    let _ = writeln!(self.out, "    {} {t} = {};", ctype(&tys[0]), vals[0]);
+                    let _ = writeln!(self.out, "    drop_{}(&{t});", mangle(&tys[0]));
+                }
+                "((lust_Unit){})".into()
+            }
             B::StringNew => "lust_string_new()".into(),
             B::StringFrom => format!("lust_string_from({})", vals[0]),
             B::StringWithCapacity => format!("lust_string_with_capacity({})", vals[0]),
@@ -2210,39 +2239,37 @@ impl FnGen<'_, '_, '_> {
                 }
                 format!("({disc} ? {} : {d})", variant_field(self.p, &tys[0], &t, 1, 0))
             }
-            B::VecPop | B::VecGet | B::VecFirst | B::VecLast => {
-                let CTy::Ref(v) = &tys[0] else { unreachable!() };
-                let CTy::Vec(e) = &**v else { unreachable!() };
-                let et = ctype(e);
-                let (opt, r) =
-                    if b == B::VecPop { (CTy::Option(e.clone()), "") } else { (CTy::Option(Box::new(CTy::Ref(e.clone()))), "&") };
+            B::VecPop | B::VecGet | B::VecFirst | B::VecLast | B::VecGetMut | B::VecFirstMut | B::VecLastMut => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (opt, r) = if b == B::VecPop {
+                    (CTy::Option(Box::new(e.clone())), "")
+                } else {
+                    (CTy::Option(Box::new(CTy::Ref(Box::new(e.clone())))), "&")
+                };
                 let ot = ctype(&opt);
                 let t = self.tmp();
                 let v = &vals[0];
                 let (cond, idx) = match b {
-                    B::VecPop => (format!("{v}->len > 0"), format!("--{v}->len")),
-                    B::VecGet => (format!("{} < {v}->len", vals[1]), vals[1].clone()),
-                    B::VecFirst => (format!("{v}->len > 0"), "0".into()),
-                    _ => (format!("{v}->len > 0"), format!("{v}->len - 1")),
+                    B::VecPop => (format!("{len} > 0"), format!("--{v}->len")),
+                    B::VecGet | B::VecGetMut => (format!("{} < {len}", vals[1]), vals[1].clone()),
+                    B::VecFirst | B::VecFirstMut => (format!("{len} > 0"), "0".into()),
+                    _ => (format!("{len} > 0"), format!("{len} - 1")),
                 };
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let some = disc_set(self.p, &opt, &t, 1);
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
-                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}(({et}*){v}->ptr)[{idx}];{some} }}");
+                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}{ptr}[{idx}];{some} }}");
                 t
             }
             B::VecContains => {
-                let CTy::Ref(v) = &tys[0] else { unreachable!() };
-                let CTy::Vec(e) = &**v else { unreachable!() };
-                let et = ctype(e);
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let (t, i) = (self.tmp(), self.tmp());
-                let elem = format!("(&(({et}*){}->ptr)[{i}])", vals[0]);
-                let eq = self.eq_expr(e, &elem, &vals[1]);
+                let elem = format!("(&{ptr}[{i}])");
+                let eq = self.eq_expr(&e, &elem, &vals[1]);
                 let _ = writeln!(
                     self.out,
-                    "    uint8_t {t} = 0;\n    for (uint64_t {i} = 0; {i} < {}->len; {i}++) if ({eq}) {{ {t} = 1; break; }}",
-                    vals[0]
+                    "    uint8_t {t} = 0;\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) if ({eq}) {{ {t} = 1; break; }}"
                 );
                 t
             }
@@ -2294,6 +2321,179 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(
                     self.out,
                     "    lust_vec_check_remove({vv}, {i}, {loc});\n    {et} {t} = (({et}*){vv}->ptr)[{i}];\n    lust_vec_remove_at({vv}, {i}, sizeof({et}));"
+                );
+                t
+            }
+            B::VecCapacity => format!("({})->cap", vals[0]),
+            B::VecReserve | B::VecReserveExact | B::VecShrinkToFit | B::VecShrinkTo => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let vv = &vals[0];
+                let call = match b {
+                    B::VecReserve => format!("lust_vec_reserve({vv}, {}, sizeof({et}), _Alignof({et}))", vals[1]),
+                    B::VecReserveExact => format!("lust_vec_reserve_exact({vv}, {}, sizeof({et}), _Alignof({et}))", vals[1]),
+                    B::VecShrinkToFit => format!("lust_vec_shrink_to({vv}, 0, sizeof({et}), _Alignof({et}))"),
+                    _ => format!("lust_vec_shrink_to({vv}, {}, sizeof({et}), _Alignof({et}))", vals[1]),
+                };
+                let _ = writeln!(self.out, "    {call};");
+                "((lust_Unit){})".into()
+            }
+            B::VecSwapRemove => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let (et, t) = (ctype(e), self.tmp());
+                let (vv, i) = (&vals[0], &vals[1]);
+                let _ = writeln!(
+                    self.out,
+                    "    lust_bounds({i}, {vv}->len, {loc});\n    {et} {t} = (({et}*){vv}->ptr)[{i}];\n    (({et}*){vv}->ptr)[{i}] = (({et}*){vv}->ptr)[{vv}->len - 1];\n    {vv}->len--;"
+                );
+                t
+            }
+            B::VecAppend => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let (vv, o) = (&vals[0], &vals[1]);
+                let (n, i) = (self.tmp(), self.tmp());
+                // Elements move bitwise; the source keeps its
+                // buffer and capacity with length 0, as in Rust.
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {n} = {o}->len;\n    lust_vec_reserve({vv}, {n}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {n}; {i}++) (({et}*){vv}->ptr)[{vv}->len + {i}] = (({et}*){o}->ptr)[{i}];\n    {vv}->len += {n};\n    {o}->len = 0;"
+                );
+                "((lust_Unit){})".into()
+            }
+            B::VecExtendFromSlice => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let (_, sptr, slen) = slice_like(&tys[1], &vals[1]);
+                let (sp, sn, i) = (self.tmp(), self.tmp(), self.tmp());
+                let vv = &vals[0];
+                let cloned = if is_copy_c(self.p, e) {
+                    format!("{sp}[{i}]")
+                } else {
+                    self.want(Glue::Clone, e);
+                    format!("clone_{}(&{sp}[{i}])", mangle(e))
+                };
+                // The source pointer and length are read into
+                // temporaries before the reserve can reallocate
+                // (the receiver cannot alias the source in Rust,
+                // but the operand text may name the same locals).
+                let _ = writeln!(
+                    self.out,
+                    "    {et} *{sp} = {sptr};\n    uint64_t {sn} = {slen};\n    lust_vec_reserve({vv}, {sn}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {sn}; {i}++) (({et}*){vv}->ptr)[{vv}->len++] = {cloned};"
+                );
+                "((lust_Unit){})".into()
+            }
+            B::VecSplitOff => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let (et, t, i) = (ctype(e), self.tmp(), self.tmp());
+                let (vv, at) = (&vals[0], &vals[1]);
+                let _ = writeln!(
+                    self.out,
+                    "    if ({at} > {vv}->len) lust_panic_cstr(\"`at` split index should be <= len\", {loc});\n    lust_Vec {t} = lust_vec_with_capacity({vv}->len - {at}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = {at}; {i} < {vv}->len; {i}++) (({et}*){t}.ptr)[{i} - {at}] = (({et}*){vv}->ptr)[{i}];\n    {t}.len = {vv}->len - {at};\n    {vv}->len = {at};"
+                );
+                t
+            }
+            B::VecResize => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let (vv, n) = (&vals[0], &vals[1]);
+                let (tv, i) = (self.tmp(), self.tmp());
+                // The value is read first: it may come from the
+                // Vec the resize then reallocates or truncates.
+                let _ = writeln!(self.out, "    {et} {tv} = {};", vals[2]);
+                if needs_drop_c(self.p, e) {
+                    self.want(Glue::Drop, e);
+                    let i2 = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({n} < {vv}->len) {{ for (uint64_t {i2} = {n}; {i2} < {vv}->len; {i2}++) drop_{}(&(({et}*){vv}->ptr)[{i2}]); }}\n    if ({n} <= {vv}->len) {{ drop_{}(&{tv}); }}",
+                        mangle(e),
+                        mangle(e)
+                    );
+                }
+                let _ = writeln!(self.out, "    if ({n} <= {vv}->len) {{ {vv}->len = {n}; }} else {{");
+                let _ = writeln!(self.out, "      lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
+                if is_copy_c(self.p, e) {
+                    let _ =
+                        writeln!(self.out, "      while ({vv}->len < {n}) (({et}*){vv}->ptr)[{vv}->len++] = {tv};");
+                } else {
+                    self.want(Glue::Clone, e);
+                    // Clones first, the value itself last, as Rust's
+                    // `repeat_n` yields them: (count - 1) clones.
+                    let _ = writeln!(
+                        self.out,
+                        "      for (uint64_t {i} = {vv}->len; {i} + 1 < {n}; {i}++) (({et}*){vv}->ptr)[{i}] = clone_{}(&{tv});\n      (({et}*){vv}->ptr)[{n} - 1] = {tv};\n      {vv}->len = {n};",
+                        mangle(e)
+                    );
+                }
+                let _ = writeln!(self.out, "    }}");
+                "((lust_Unit){})".into()
+            }
+            B::VecDedup => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let vv = &vals[0];
+                let (w, r) = (self.tmp(), self.tmp());
+                let elem_r = format!("(&(({et}*){vv}->ptr)[{r}])");
+                let elem_w = format!("(&(({et}*){vv}->ptr)[{w} - 1])");
+                let eq = self.eq_expr(e, &elem_r, &elem_w);
+                let drop_dup = if needs_drop_c(self.p, e) {
+                    self.want(Glue::Drop, e);
+                    format!("drop_{}(&(({et}*){vv}->ptr)[{r}]); ", mangle(e))
+                } else {
+                    String::new()
+                };
+                // A duplicate drops as soon as it is found, before
+                // the next comparison, as in Rust.
+                let _ = writeln!(
+                    self.out,
+                    "    if ({vv}->len > 1) {{\n      uint64_t {w} = 1;\n      for (uint64_t {r} = 1; {r} < {vv}->len; {r}++) {{\n        if ({eq}) {{ {drop_dup}}} else {{ if ({w} != {r}) (({et}*){vv}->ptr)[{w}] = (({et}*){vv}->ptr)[{r}]; {w}++; }}\n      }}\n      {vv}->len = {w};\n    }}"
+                );
+                "((lust_Unit){})".into()
+            }
+            B::VecReverse => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let et = ctype(&e);
+                let (i, t) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    for (uint64_t {i} = 0; {i} < {len} / 2; {i}++) {{ {et} {t} = {ptr}[{i}]; {ptr}[{i}] = {ptr}[{len} - 1 - {i}]; {ptr}[{len} - 1 - {i}] = {t}; }}"
+                );
+                "((lust_Unit){})".into()
+            }
+            B::VecAsSlice | B::VecAsMutSlice => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let sl = CTy::Slice(e.clone());
+                let (st, t) = (ctype(&sl), self.tmp());
+                let vv = &vals[0];
+                let _ = writeln!(self.out, "    {st} {t} = {{ ({et}*){vv}->ptr, {vv}->len }};");
+                t
+            }
+            B::SliceToVec | B::VecFrom => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let et = ctype(&e);
+                // `Vec::from([T; N])` moves its elements; the
+                // slice forms clone them. Both allocate exactly.
+                let moves = b == B::VecFrom && matches!(tys[0], CTy::Array(..));
+                let (t, i) = (self.tmp(), self.tmp());
+                let elem = if moves || is_copy_c(self.p, &e) {
+                    format!("{ptr}[{i}]")
+                } else {
+                    self.want(Glue::Clone, &e);
+                    format!("clone_{}(&{ptr}[{i}])", mangle(&e))
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_Vec {t} = lust_vec_with_capacity({len}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) (({et}*){t}.ptr)[{i}] = {elem};\n    {t}.len = {len};"
                 );
                 t
             }

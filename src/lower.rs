@@ -710,8 +710,29 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Intrinsic(id), ops, d, span);
                     }
-                    Res::Builtin(Builtin::VecNew) | Res::Builtin(Builtin::VecWithCapacity) => {
+                    Res::Builtin(Builtin::VecNew) => {
                         self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span)
+                    }
+                    Res::Builtin(Builtin::VecWithCapacity) => {
+                        // An empty Vec in a temporary, an exact
+                        // reserve on it, then a move to the dest:
+                        // the requested capacity is observable
+                        // through `capacity()`, so it cannot be
+                        // dropped, and the dest place itself need
+                        // not be mutable.
+                        let tv = self.temp(ty);
+                        self.assign(Place::local(tv), Rvalue::VecLit(self.peel_vec(ty), Vec::new()), span);
+                        let rt = self.ref_ty(true, ty);
+                        let r = self.temp(rt);
+                        self.assign(Place::local(r), Rvalue::Ref(true, Place::local(tv)), span);
+                        let u = self.temp(UNIT);
+                        self.call_into(
+                            CallTarget::Builtin(Builtin::VecReserveExact),
+                            vec![Operand::Move(Place::local(r)), ops.into_iter().next().unwrap()],
+                            Place::local(u),
+                            span,
+                        );
+                        self.set_or_temp(dest, Rvalue::Use(Operand::Move(Place::local(tv))), ty, span);
                     }
                     Res::Builtin(b) => {
                         let d = self.call_dest(dest, ty);
@@ -1875,6 +1896,41 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = bodyb;
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             self.assign(Place::local(item), Rvalue::Use(Operand::Copy(c)), span);
+        } else if self.body.tys.vec_elem(self.ty(iter)).is_some() {
+            // `for x in v` by value: move the Vec into a temporary
+            // and remove each front element in turn. Removing (not
+            // indexing) keeps the temporary's own drop exact on
+            // `break`, `return`, and `?` exits from the body: what
+            // is left in it is exactly what still must drop.
+            let vt = self.ty(iter);
+            let it = self.temp(vt);
+            self.expr_into(iter, Some(&Place::local(it)));
+            self.goto(head, span);
+            let sref_t = self.ref_ty(false, vt);
+            let sref = self.temp(sref_t);
+            self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(it)), span);
+            let ln = self.temp(USIZE);
+            self.call_into(CallTarget::Builtin(Builtin::VecLen), vec![Operand::Copy(Place::local(sref))], Place::local(ln), span);
+            let c = self.temp(BOOL);
+            self.assign(
+                Place::local(c),
+                Rvalue::Bin(BinOp::Lt, Operand::Const(Const::Int(0, IntTy::Usize)), Operand::Copy(Place::local(ln))),
+                span,
+            );
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), bodyb, exit);
+            b.term_span = span;
+            self.cur = bodyb;
+            let mref_t = self.ref_ty(true, vt);
+            let mref = self.temp(mref_t);
+            self.assign(Place::local(mref), Rvalue::Ref(true, Place::local(it)), span);
+            let zero = self.const_usize(0, span);
+            self.call_into(
+                CallTarget::Builtin(Builtin::VecRemove),
+                vec![Operand::Move(Place::local(mref)), Operand::Copy(Place::local(zero))],
+                Place::local(item),
+                span,
+            );
         } else {
             // `for x in &v` / `&mut v`: index loop over a reference held for the whole loop.
             let it_ty = self.ty(iter);

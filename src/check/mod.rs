@@ -176,6 +176,26 @@ pub enum Builtin {
     CharToDigit,
     SliceLen,
     SliceIsEmpty,
+    VecCapacity,
+    VecReserve,
+    VecReserveExact,
+    VecShrinkToFit,
+    VecShrinkTo,
+    VecSwapRemove,
+    VecAppend,
+    VecExtendFromSlice,
+    VecSplitOff,
+    VecResize,
+    VecDedup,
+    VecReverse,
+    VecFirstMut,
+    VecLastMut,
+    VecGetMut,
+    VecAsSlice,
+    VecAsMutSlice,
+    SliceToVec,
+    VecFrom,
+    MemDrop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -493,6 +513,14 @@ struct Ctx<'p, 'a> {
     /// the format check ran: (type, spec, span). The format test
     /// re-runs at finish (W-TRAITS-CORE).
     deferred_fmt: Vec<(Ty, FmtSpec, Span)>,
+    /// Element types a builtin Vec or slice method needs to be
+    /// Clone (`extend_from_slice`, `resize`, `to_vec`), re-tested
+    /// at finish like the format traits: the element type can
+    /// still be a variable at the call.
+    deferred_clone: Vec<(Ty, Span)>,
+    /// Element types a builtin Vec method needs to be PartialEq
+    /// (`contains`, `dedup`), re-tested at finish as above.
+    deferred_eq: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -626,6 +654,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
+        deferred_clone: Vec::new(),
+        deferred_eq: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -4212,12 +4242,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Builtin::VecNew
             } else if item == k.with_capacity {
                 Builtin::VecWithCapacity
+            } else if item == k.from {
+                Builtin::VecFrom
             } else {
                 self.err(
                     "L0104",
                     span,
                     format!("no function `Vec::{}`", self.name(item)),
-                    "Lust supports Vec::new and Vec::with_capacity.",
+                    "Lust supports Vec::new, Vec::with_capacity, and Vec::from.",
                 );
                 return None;
             };
@@ -4631,6 +4663,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if is_value {
             return self.value_call(e, callee, args, span);
         }
+        // `std::mem::drop(value)`: move the value and drop it now.
+        // A user fn or body item named `drop` shadows the prelude
+        // name, so the one-segment form checks those first.
+        if let Expr::Path(segs) = p.ast.expr(callee) {
+            let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
+            let qualified = matches!(names.as_slice(), ["std" | "core", "mem", "drop"] | ["mem", "drop"]);
+            let bare = names.as_slice() == ["drop"]
+                && self.binding_fn(segs[0].name).is_none()
+                && self.body_item_of(segs[0].name, self.span(callee).ctxt).is_none();
+            if qualified || bare {
+                if args.len() != 1 {
+                    self.err(
+                        "L0105",
+                        span,
+                        "this function takes 1 argument but a different number was given",
+                        "Pass exactly one value.",
+                    );
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
+                self.expr(args[0], None);
+                self.set_res(e, Res::Builtin(Builtin::MemDrop));
+                return UNIT;
+            }
+        }
         // `std::mem::size_of_val(&value)`: the size of the value's type.
         if let Expr::Path(segs) = p.ast.expr(callee) {
             let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
@@ -4957,6 +5016,42 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::EnvArgs => (vec![], ARGS),
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
                     Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
+                    Builtin::VecFrom => {
+                        // The three forms lust takes: `&[T]` and
+                        // `&[T; N]` (clone each element, exact
+                        // capacity) and `[T; N]` (move each element).
+                        // The argument is checked once here to pick
+                        // the form; `check_args` below then checks it
+                        // against its own type.
+                        let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
+                        let at = self.resolve(at);
+                        let elem = match self.kind(at) {
+                            TyKind::Ref(_, _, inner) => match self.kind(self.resolve(inner)) {
+                                TyKind::Slice(e) | TyKind::Array(e, _) => {
+                                    self.deferred_clone.push((e, span));
+                                    Some(e)
+                                }
+                                _ => None,
+                            },
+                            TyKind::Array(e, _) => Some(e),
+                            TyKind::Error => Some(ERROR),
+                            TyKind::Infer(_) => Some(ERROR),
+                            _ => None,
+                        };
+                        match elem {
+                            Some(e) => (vec![at], self.tys.mk_vec(e)),
+                            None => {
+                                let tn = self.tn(at);
+                                self.err(
+                                    "L0110",
+                                    span,
+                                    format!("`Vec::from` needs a slice or an array, found `{tn}`"),
+                                    "Pass `&[T]`, `&[T; N]`, or `[T; N]`.",
+                                );
+                                (vec![at], ERROR)
+                            }
+                        }
+                    }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
                         let generics = match p.ast.expr(callee) {
                             Expr::Path(segs) => segs[0].type_args(),
@@ -5349,6 +5444,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let opt_ref = self.tys.mk_option(r);
                     Some((B::VecLast, Autoref::Ref, vec![], opt_ref))
                 } else if name == k.contains {
+                    self.deferred_eq.push((elem, name_span));
                     let r = self.tys.mk_ref(false, elem);
                     Some((B::VecContains, Autoref::Ref, vec![r], BOOL))
                 } else if name == k.swap {
@@ -5361,15 +5457,103 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::VecRemove, Autoref::RefMut, vec![USIZE], elem))
                 } else if name == k.truncate {
                     Some((B::VecTruncate, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.capacity {
+                    Some((B::VecCapacity, Autoref::Ref, vec![], USIZE))
+                } else if name == k.reserve {
+                    Some((B::VecReserve, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.reserve_exact {
+                    Some((B::VecReserveExact, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.shrink_to_fit {
+                    Some((B::VecShrinkToFit, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.shrink_to {
+                    Some((B::VecShrinkTo, Autoref::RefMut, vec![USIZE], UNIT))
+                } else if name == k.swap_remove {
+                    Some((B::VecSwapRemove, Autoref::RefMut, vec![USIZE], elem))
+                } else if name == k.append {
+                    let r = self.tys.mk_ref(true, base);
+                    Some((B::VecAppend, Autoref::RefMut, vec![r], UNIT))
+                } else if name == k.extend_from_slice {
+                    self.deferred_clone.push((elem, name_span));
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    let r = self.tys.mk_ref(false, sl);
+                    Some((B::VecExtendFromSlice, Autoref::RefMut, vec![r], UNIT))
+                } else if name == k.split_off {
+                    Some((B::VecSplitOff, Autoref::RefMut, vec![USIZE], base))
+                } else if name == k.resize {
+                    self.deferred_clone.push((elem, name_span));
+                    Some((B::VecResize, Autoref::RefMut, vec![USIZE, elem], UNIT))
+                } else if name == k.dedup {
+                    self.deferred_eq.push((elem, name_span));
+                    Some((B::VecDedup, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.reverse {
+                    Some((B::VecReverse, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.first_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecFirstMut, Autoref::RefMut, vec![], opt_ref))
+                } else if name == k.last_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecLastMut, Autoref::RefMut, vec![], opt_ref))
+                } else if name == k.get_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecGetMut, Autoref::RefMut, vec![USIZE], opt_ref))
+                } else if name == k.as_slice {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    let r = self.tys.mk_ref(false, sl);
+                    Some((B::VecAsSlice, Autoref::Ref, vec![], r))
+                } else if name == k.as_mut_slice {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    let r = self.tys.mk_ref(true, sl);
+                    Some((B::VecAsMutSlice, Autoref::RefMut, vec![], r))
                 } else {
                     None
                 }
             }
             (None, TyKind::Slice(_)) | (None, TyKind::Array(..)) => {
+                let elem = match bk {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => e,
+                    _ => ERROR,
+                };
                 if name == k.len {
                     Some((B::SliceLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
                     Some((B::SliceIsEmpty, Autoref::Ref, vec![], BOOL))
+                } else if name == k.to_vec {
+                    self.deferred_clone.push((elem, name_span));
+                    let v = self.tys.mk_vec(elem);
+                    Some((B::SliceToVec, Autoref::Ref, vec![], v))
+                } else if name == k.reverse {
+                    Some((B::VecReverse, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.first {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecFirst, Autoref::Ref, vec![], opt_ref))
+                } else if name == k.last {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecLast, Autoref::Ref, vec![], opt_ref))
+                } else if name == k.get {
+                    let r = self.tys.mk_ref(false, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecGet, Autoref::Ref, vec![USIZE], opt_ref))
+                } else if name == k.first_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecFirstMut, Autoref::RefMut, vec![], opt_ref))
+                } else if name == k.last_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecLastMut, Autoref::RefMut, vec![], opt_ref))
+                } else if name == k.get_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let opt_ref = self.tys.mk_option(r);
+                    Some((B::VecGetMut, Autoref::RefMut, vec![USIZE], opt_ref))
+                } else if name == k.contains {
+                    self.deferred_eq.push((elem, name_span));
+                    let r = self.tys.mk_ref(false, elem);
+                    Some((B::VecContains, Autoref::Ref, vec![r], BOOL))
                 } else {
                     None
                 }
@@ -6248,11 +6432,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             TyKind::Array(elem, _) => elem,
-            _ if self.tys.vec_elem(self.resolve(t)).is_some() => {
-                let s = self.span(iter);
-                self.errs.push(unsupported(s, "iterating a Vec by value"));
-                ERROR
-            }
+            _ if self.tys.vec_elem(self.resolve(t)).is_some() => self.tys.vec_elem(self.resolve(t)).unwrap_or(ERROR),
             TyKind::Error => ERROR,
             _ => match self.for_trait_iter(for_e, iter, t) {
                 Some(item) => item,
@@ -9336,6 +9516,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
             let t = self.deep(t);
             self.check_fmt_arg(t, spec, span);
+        }
+        // Deferred Clone and PartialEq needs of builtin Vec and
+        // slice methods, with types as bound by now.
+        for (t, span) in std::mem::take(&mut self.deferred_clone) {
+            let t = self.deep(t);
+            let t = self.normalize_here(t);
+            if !has_clone(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                let tn = self.tn(t);
+                self.err("L0112", span, format!("`{tn}` does not implement Clone"), "Add #[derive(Clone)] to the type.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_eq) {
+            let t = self.deep(t);
+            let t = self.normalize_here(t);
+            if !has_eq(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                let tn = self.tn(t);
+                self.err("L0112", span, format!("type `{tn}` cannot be compared with `==`"), "Add #[derive(PartialEq)] to the type.");
+            }
         }
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
