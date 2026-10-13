@@ -490,10 +490,17 @@ impl AdtTables {
                 | BuiltinTy::Rc
                 | BuiltinTy::Chars
                 | BuiltinTy::Args
-                | BuiltinTy::Iter(_),
+                | BuiltinTy::Iter(_)
+                | BuiltinTy::Weak,
             ) => return (Variance::Co, DropMode::Owned),
             // `fmt` types (W-STD-B) take no type args.
             Some(BuiltinTy::Fmt(_)) => return (Variance::Inv, DropMode::Owned),
+            // `RefMut<'b, T>` acts as `&'b mut T`, `Ref<'b, T>` as `&'b T`;
+            // neither drops the `T` (W-STD-A).
+            Some(BuiltinTy::RefMutGuard) => return (Variance::Inv, DropMode::None),
+            Some(BuiltinTy::RefGuard) => return (Variance::Co, DropMode::None),
+            // Interior mutability: `Cell<T>` and `RefCell<T>` are invariant.
+            Some(BuiltinTy::Cell | BuiltinTy::RefCell) => return (Variance::Inv, DropMode::Owned),
             None => {}
         }
         let v = self.variance.get(&def).and_then(|v| v.get(j)).copied().unwrap_or(Variance::Inv);
@@ -504,12 +511,14 @@ impl AdtTables {
 
 /// The number of region params an Adt type carries ahead of its type args:
 /// a user Adt's declared lifetimes, or one for the builtin borrowing
-/// iterators (`Chars`, `slice::Iter`, `slice::IterMut`, whose erased types
-/// drop the lifetime).
+/// iterators (`Chars`, `slice::Iter`, `slice::IterMut`) and the `RefCell`
+/// guards (`Ref`, `RefMut`), whose erased types drop the lifetime.
 fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     use crate::ty::iter::IterKind;
     match tys.builtin_of(t) {
-        Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)) => return 1,
+        Some(
+            BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut) | BuiltinTy::RefGuard | BuiltinTy::RefMutGuard,
+        ) => return 1,
         // A Debug builder holds `&mut Formatter` (W-STD-B).
         Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
         Some(_) => return 0,
@@ -518,6 +527,22 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     match tys.kind(t) {
         TyKind::Adt(def, _) => p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len() as u32),
         _ => 0,
+    }
+}
+
+/// True when a drop of a value of type `t` drops a `RefCell` guard,
+/// whose own drop uses its borrow (Rust's `BorrowRef` is `Drop`).
+fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Adt(_, args) => {
+            tys.guard_elem(t).is_some()
+                || (tys.builtin_of(t) != Some(BuiltinTy::Weak)
+                    && tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| drops_guard(tys, e))))
+        }
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| drops_guard(tys, e)),
+        TyKind::Array(e, _) => drops_guard(tys, e),
+        TyKind::Closure(_, args) => closure_fields(tys, args).into_iter().any(|e| drops_guard(tys, e)),
+        _ => false,
     }
 }
 
@@ -660,7 +685,14 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
             TyKind::Adt(def, args) => {
                 let mut at = at;
                 for k in 0..adt_regions(self.p, self.tys, t) {
-                    let rm = if self.tys.builtin_of(t).is_some() { DropMode::None } else { self.p.regions.adts(self.p).region_modes(def, k as usize).1 };
+                    // A guard's drop gives its borrow back, so it uses it.
+                    let rm = if self.tys.guard_elem(t).is_some() {
+                        DropMode::All
+                    } else if self.tys.builtin_of(t).is_some() {
+                        DropMode::None
+                    } else {
+                        self.p.regions.adts(self.p).region_modes(def, k as usize).1
+                    };
                     out[at as usize] = all || (m != DropMode::None && rm == DropMode::All);
                     at += 1;
                 }
@@ -1668,7 +1700,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             b.owner.push(0);
             b.drop_slot.push(false);
         }
-        let drops = !super::drop_heads(p).is_empty();
+        let drops = !super::drop_heads(p).is_empty() || body.locals.iter().any(|d| drops_guard(&body.tys, d.ty));
         for (l, decl) in body.locals.iter().enumerate() {
             let n = b.local_slots(l as Local);
             let base = b.owner.len() as u32;
@@ -1785,6 +1817,16 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     TyKind::Ref(_, m, inner) => {
                         derefs.push((out[0], m.is_mut()));
                         out.remove(0);
+                        ty = inner;
+                    }
+                    TyKind::Adt(..) if tys.guard_elem(ty).is_some() => {
+                        // A `RefCell` guard derefs like the reference it
+                        // stands for: its own region leads, then the value's.
+                        let (inner, is_mut) = tys.guard_elem(ty).unwrap();
+                        derefs.push((out[0], is_mut));
+                        out.remove(0);
+                        let n = self.sc.slots(inner) as usize;
+                        out.truncate(n);
                         ty = inner;
                     }
                     TyKind::Adt(..) if tys.adt_first_ty_arg(ty).is_some() && !tys.is_chars_ty(ty) => {
@@ -2577,13 +2619,26 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     self.non_closure_slots(inner, vars, &mut 0, &mut from);
                 }
                 self.flow_all(&from, &dv);
+                // An item that can write through shared memory (`&RefCell`)
+                // is its source's own regions, both ways.
+                if has_interior(&self.body.tys, dt) {
+                    self.flow_all(&dv, &from);
+                }
             }
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone)) && self.call_clone(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone))
+                && let [(at, av)] = avs.as_slice()
+                && let TyKind::Ref(_, _, inner) = self.body.tys.kind(*at)
+                && inner == dt
+                && !av.is_empty()
+                && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
+            _ if let CallTarget::Builtin(b) = target
+                && self.call_cell(b, &avs, dt, &dv) => {}
             _ => {
                 self.call_opaque(&avs, dt, &dv);
                 if matches!(target, CallTarget::Fn(_)) {
@@ -2699,6 +2754,62 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
+    /// The `Cell` and `RefCell` builtins on a `&Cell<T>` or `&RefCell<T>`
+    /// receiver (W-STD-A). Interior mutability stores through a shared
+    /// reference, so a stored value flows into the cell's `T` slots as
+    /// through `&mut`; a read flows out of them; a guard's `T` is the
+    /// cell's (`RefMut` invariantly) behind the guard's own region, which
+    /// the borrow of the cell outlives. False for any other call (the
+    /// caller goes on).
+    fn call_cell(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::check::Builtin as B;
+        if !matches!(
+            b,
+            B::RefCellBorrow | B::RefCellBorrowMut | B::CellGet | B::CellSet | B::CellReplace | B::RefCellReplace | B::CellSwap | B::RefCellSwap
+        ) {
+            return false;
+        }
+        let tys = &self.body.tys;
+        let Some((rt, rv)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, cell) = tys.kind(*rt) else { return false };
+        let Some(elem) = tys.cell_elem(cell).or_else(|| tys.refcell_elem(cell)) else { return false };
+        if rv.is_empty() {
+            return false;
+        }
+        let tv = rv[1..].to_vec();
+        match b {
+            B::RefCellBorrow | B::RefCellBorrowMut => {
+                let Some(&g) = dv.first() else { return true };
+                self.edge(rv[0], g);
+                let v = if b == B::RefCellBorrowMut { Variance::Inv } else { Variance::Co };
+                if !self.relate(elem, &tv, elem, &dv[1..], v) {
+                    self.equate_all(&tv, &dv[1..]);
+                }
+            }
+            B::CellSwap | B::RefCellSwap => {
+                if let Some((_, ov)) = avs.get(1)
+                    && ov.len() == rv.len()
+                    && !self.relate(elem, &tv, elem, &ov[1..], Variance::Inv)
+                {
+                    self.equate_all(&tv, &ov[1..]);
+                }
+            }
+            _ => {
+                // `set` and `replace` store their argument; `get` and
+                // `replace` hand back a value out of the cell.
+                if let Some((xt, xv)) = avs.get(1)
+                    && !self.relate(*xt, xv, elem, &tv, Variance::Co)
+                {
+                    self.flow_all(xv, &tv);
+                }
+                if !self.relate(elem, &tv, dt, dv, Variance::Co) {
+                    self.flow_all(&tv, dv);
+                }
+            }
+        }
+        true
+    }
+
     /// A builtin that builds an iterator adapter (`map`, `filter`,
     /// `inspect`, ...): the adapter stores its arguments as its type args,
     /// so an argument whose type is one of those args flows into that part
@@ -2718,6 +2829,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             return self.call_opaque(avs, dt, dv);
         }
         let mut used = vec![false; comps.len()];
+        // A fallback flow into an adapter that can write through shared
+        // memory goes both ways (see `has_interior`).
+        let interior = has_interior(&self.body.tys, dt);
         for (t, v) in avs {
             if v.is_empty() {
                 continue;
@@ -2729,9 +2843,17 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     let part = dv[s0..s0 + n].to_vec();
                     if !self.relate(*t, v, comps[j], &part, Variance::Co) {
                         self.flow_all(v, dv);
+                        if interior {
+                            self.flow_all(dv, v);
+                        }
                     }
                 }
-                None => self.flow_all(v, dv),
+                None => {
+                    self.flow_all(v, dv);
+                    if interior {
+                        self.flow_all(dv, v);
+                    }
+                }
             }
         }
     }
@@ -3318,7 +3440,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// argument's target may receive every other argument's regions.
     fn call_opaque(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) {
         let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-        if has_mut_ref(&self.body.tys, dt) {
+        if has_mut_ref(&self.body.tys, dt) || has_interior(&self.body.tys, dt) {
             self.equate_all(&all, dv);
         } else {
             self.flow_all(&all, dv);
@@ -4485,6 +4607,23 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
 }
 
 /// True when a type holds a `&mut` reference somewhere.
+/// True when a value of type `t` can reach a `Cell`, `RefCell`, or
+/// `RefCell` guard: memory shared values can write through. A builtin
+/// result of such a type may alias its source (an `Rc` clone shares the
+/// cell), so its regions are the source's, not just outlived by them.
+fn has_interior(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(_, _, inner) | TyKind::Array(inner, _) | TyKind::Slice(inner) => has_interior(tys, inner),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_interior(tys, e)),
+        TyKind::Adt(_, a) => {
+            matches!(tys.builtin_of(t), Some(BuiltinTy::Cell | BuiltinTy::RefCell | BuiltinTy::RefGuard | BuiltinTy::RefMutGuard))
+                || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_interior(tys, e)))
+        }
+        TyKind::Closure(_, a) => closure_fields(tys, a).into_iter().any(|e| has_interior(tys, e)),
+        _ => false,
+    }
+}
+
 fn has_mut_ref(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Ref(_, m, inner) => m.is_mut() || has_mut_ref(tys, inner),
