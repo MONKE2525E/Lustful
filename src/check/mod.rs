@@ -349,6 +349,15 @@ pub enum Builtin {
     /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
     /// an `i8`: `partial_cmp` and `cmp` read it once.
     CmpCode,
+    SliceSort,
+    SliceSortUnstable,
+    SliceSortBy,
+    SliceSortUnstableBy,
+    SliceSortByKey,
+    SliceSortUnstableByKey,
+    SliceBinarySearch,
+    SliceBinarySearchBy,
+    SliceBinarySearchByKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

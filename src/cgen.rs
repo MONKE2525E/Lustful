@@ -506,6 +506,8 @@ struct FnGen<'b, 'p, 'a> {
     vtables: HashMap<u32, String>,
     /// Vtable statics and their method shims, emitted ahead of the function.
     prelude: String,
+    /// Comparator adapters emitted so far (`sort_adapter`), for names.
+    adapters: u32,
 }
 
 /// A layout with no field or niche detail, for runtime struct types whose
@@ -1008,6 +1010,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         ret_large: ret_is_large(p, body.fn_id),
         vtables: HashMap::new(),
         prelude: String::new(),
+        adapters: 0,
     };
     g.collect_move_paths();
     if g.bad_move {
@@ -2490,6 +2493,154 @@ impl FnGen<'_, '_, '_> {
         }
     }
 
+    /// The closure body fn of a closure operand (a sort comparator or
+    /// key): check gives these builtins closure args only.
+    fn closure_arg(&self, o: &Operand) -> LocalDefId {
+        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a sort comparator is a closure value") };
+        let mut t = self.body.locals[pl.local as usize].ty;
+        for pr in &pl.proj {
+            t = match (self.body.tys.kind(t), pr) {
+                (TyKind::Ref(_, _, i), Proj::Deref) => i,
+                _ => panic!("internal: a sort comparator place with projections"),
+            };
+        }
+        match self.body.tys.kind(t) {
+            TyKind::Closure(def, _) => self.p.gx.closures[&def].body_fn,
+            _ => panic!("internal: a sort comparator is a closure value"),
+        }
+    }
+
+    /// A call of closure body `f` on the env pointer `env` and the
+    /// argument expressions, into a fresh variable of its return type
+    /// (written to `out`): the large-return form takes `&var` first.
+    fn closure_call_c(&mut self, out: &mut String, f: LocalDefId, env: &str, args: &[String]) -> (String, CTy) {
+        let rt = cty(&self.p.tys, self.p.fn_info(f).ret);
+        collect_types(&rt, &mut self.sig_types);
+        for &t in &self.p.fn_info(f).params {
+            collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
+        }
+        let v = self.tmp();
+        let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
+        let rest: String = args.iter().map(|a| format!(", {a}")).collect();
+        if ret_is_large(self.p, f) {
+            let _ = writeln!(out, "  {} {v}; {call}(&{v}, {env}{rest});", ctype(&rt));
+        } else {
+            let _ = writeln!(out, "  {} {v} = {call}({env}{rest});", ctype(&rt));
+        }
+        (v, rt)
+    }
+
+    /// C statements (into `out`) comparing the values at pointer
+    /// expressions `a` and `b` of an Ord type lust compares
+    /// (check/iter.rs `has_total_ord`); returns the name of an int32_t
+    /// that is negative, zero, or positive like `Ord::cmp`.
+    fn cmp3_c(&mut self, out: &mut String, t: &CTy, a: &str, b: &str) -> String {
+        if let CTy::Ref(inner) = t
+            && **inner != CTy::Str
+        {
+            return self.cmp3_c(out, inner, &format!("(*{a})"), &format!("(*{b})"));
+        }
+        let v = self.tmp();
+        match t {
+            CTy::Unit => {
+                let _ = writeln!(out, "  int32_t {v} = 0;");
+            }
+            CTy::Int(i) if is128(*i) => {
+                let f = if i.signed() { "lust_i128_cmp" } else { "lust_u128_cmp" };
+                let _ = writeln!(out, "  int32_t {v} = {f}(*{a}, *{b});");
+            }
+            CTy::Int(_) | CTy::Bool | CTy::Char => {
+                let _ = writeln!(out, "  int32_t {v} = (*{a} > *{b}) - (*{a} < *{b});");
+            }
+            CTy::String => {
+                let _ = writeln!(out, "  int32_t {v} = lust_str_cmp(lust_string_as_str({a}), lust_string_as_str({b}));");
+            }
+            CTy::Ref(_) => {
+                let _ = writeln!(out, "  int32_t {v} = lust_str_cmp(*{a}, *{b});");
+            }
+            CTy::Tuple(es) => {
+                let _ = writeln!(out, "  int32_t {v} = 0;");
+                for (i, e) in es.iter().enumerate() {
+                    let _ = writeln!(out, "  if (!{v}) {{");
+                    let c = self.cmp3_c(out, e, &format!("(&({a})->f{i})"), &format!("(&({b})->f{i})"));
+                    let _ = writeln!(out, "  {v} = {c}; }}");
+                }
+            }
+            _ => panic!("internal: sort comparison of a type check does not allow"),
+        }
+        v
+    }
+
+    /// The `is_less` adapter of one sort call (runtime/sort.h): `a.lt(b)`
+    /// for `sort`, `compare(a, b) == Less` for `sort_by`, and
+    /// `f(a).lt(&f(b))` for `sort_by_key` (the keys drop after, in
+    /// reverse order of creation, as Rust's temporaries do).
+    fn sort_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<LocalDefId>) -> String {
+        use Builtin as B;
+        let name = format!("lust_less_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        self.adapters += 1;
+        let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
+        let (a, bb) = (format!("(({pt})a)"), format!("(({pt})b)"));
+        let mut body = String::new();
+        match (b, clo) {
+            (B::SliceSortBy | B::SliceSortUnstableBy, Some(f)) => {
+                let (r, rt) = self.closure_call_c(&mut body, f, "ctx", &[a, bb]);
+                let _ = writeln!(body, "  return {} == 0;", disc_call(self.p, &rt, &format!("(&{r})")));
+            }
+            (B::SliceSortByKey | B::SliceSortUnstableByKey, Some(f)) => {
+                let (ka, kt) = self.closure_call_c(&mut body, f, "ctx", &[a]);
+                let (kb, _) = self.closure_call_c(&mut body, f, "ctx", &[bb]);
+                let c = self.cmp3_c(&mut body, &kt, &format!("(&{ka})"), &format!("(&{kb})"));
+                if needs_drop_c(self.p, &kt) {
+                    self.want(Glue::Drop, &kt);
+                    let _ = writeln!(body, "  drop_{0}(&{kb}); drop_{0}(&{ka});", mangle(&kt));
+                }
+                let _ = writeln!(body, "  return {c} < 0;");
+            }
+            _ => {
+                let c = self.cmp3_c(&mut body, elem, &a, &bb);
+                let _ = writeln!(body, "  return {c} < 0;");
+            }
+        }
+        let _ = writeln!(self.prelude, "static uint8_t {name}(void *ctx, const void *a, const void *b) {{
+{body}}}");
+        name
+    }
+
+    /// The `cmp(ctx, p)` adapter of one binary search call: `p.cmp(x)`,
+    /// `f(p)` as an Ordering, or `f(p).cmp(b)` with ctx `{&f, b}`.
+    fn search_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<LocalDefId>) -> String {
+        use Builtin as B;
+        let name = format!("lust_bcmp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        self.adapters += 1;
+        let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
+        let p = format!("(({pt})p)");
+        let mut body = String::new();
+        match (b, clo) {
+            (B::SliceBinarySearchBy, Some(f)) => {
+                let (r, rt) = self.closure_call_c(&mut body, f, "ctx", &[p]);
+                let _ = writeln!(body, "  return (int32_t){} - 1;", disc_call(self.p, &rt, &format!("(&{r})")));
+            }
+            (B::SliceBinarySearchByKey, Some(f)) => {
+                let (k, kt) = self.closure_call_c(&mut body, f, "((void**)ctx)[0]", &[p]);
+                let kp = ctype(&CTy::Ref(Box::new(kt.clone())));
+                let c = self.cmp3_c(&mut body, &kt, &format!("(&{k})"), &format!("(({kp})((void**)ctx)[1])"));
+                if needs_drop_c(self.p, &kt) {
+                    self.want(Glue::Drop, &kt);
+                    let _ = writeln!(body, "  drop_{}(&{k});", mangle(&kt));
+                }
+                let _ = writeln!(body, "  return {c};");
+            }
+            _ => {
+                let c = self.cmp3_c(&mut body, elem, &p, &format!("(({pt})ctx)"));
+                let _ = writeln!(body, "  return {c};");
+            }
+        }
+        let _ = writeln!(self.prelude, "static int32_t {name}(void *ctx, const void *p) {{
+{body}}}");
+        name
+    }
+
     fn eq_expr(&mut self, t: &CTy, a: &str, b: &str) -> String {
         match t {
             CTy::Unit => "1".into(),
@@ -3056,6 +3207,77 @@ impl FnGen<'_, '_, '_> {
                 let some = disc_set(self.p, &opt, &t, 1);
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
                 let _ = writeln!(self.out, "    if ({v}->front < {v}->len) {{ {field} = (({}*){v}->ptr)[{idx}];{some} }}", ctype(&e));
+                t
+            }
+            // The sort family (W-STD-A, runtime/sort.h): a comparator
+            // adapter per call site, then Rust 1.99's driftsort or
+            // ipnsort over the element bytes.
+            B::SliceSort | B::SliceSortUnstable | B::SliceSortBy | B::SliceSortUnstableBy | B::SliceSortByKey | B::SliceSortUnstableByKey => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let size = c_size_align(self.p, &e).0;
+                let clo = ops.get(1).map(|o| self.closure_arg(o));
+                let adapter = self.sort_adapter(b, &e, clo);
+                let ctx = match (vals.get(1), tys.get(1)) {
+                    (Some(v), Some(t)) => {
+                        let c = self.tmp();
+                        let _ = writeln!(self.out, "    {} {c} = {v};", ctype(t));
+                        Some((c, t.clone()))
+                    }
+                    _ => None,
+                };
+                let cx = ctx.as_ref().map_or("0".to_string(), |(c, _)| format!("(void*)&{c}"));
+                // Rust picks the small sort by Copy-ness and freeze-ness
+                // (no Cell or RefCell inside); lust has no such types yet.
+                let freeze = 1;
+                if matches!(b, B::SliceSort | B::SliceSortBy | B::SliceSortByKey) {
+                    let _ = writeln!(self.out, "    lust_sort_stable({ptr}, {len}, {size}, {freeze}, {cx}, {adapter});");
+                } else {
+                    let copy = u8::from(is_copy_c(self.p, &e));
+                    let _ = writeln!(self.out, "    lust_sort_unstable({ptr}, {len}, {size}, {freeze}, {copy}, {cx}, {adapter});");
+                }
+                if let Some((c, t)) = ctx
+                    && needs_drop_c(self.p, &t)
+                {
+                    self.want(Glue::Drop, &t);
+                    let _ = writeln!(self.out, "    drop_{}(&{c});", mangle(&t));
+                }
+                "((lust_Unit){})".into()
+            }
+            B::SliceBinarySearch | B::SliceBinarySearchBy | B::SliceBinarySearchByKey => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let size = c_size_align(self.p, &e).0;
+                let clo = match b {
+                    B::SliceBinarySearchBy => Some(self.closure_arg(&ops[1])),
+                    B::SliceBinarySearchByKey => Some(self.closure_arg(&ops[2])),
+                    _ => None,
+                };
+                let adapter = self.search_adapter(b, &e, clo);
+                let cx = match b {
+                    B::SliceBinarySearch => format!("(void*){}", vals[1]),
+                    B::SliceBinarySearchBy => {
+                        let c = self.tmp();
+                        let _ = writeln!(self.out, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
+                        format!("(void*)&{c}")
+                    }
+                    _ => {
+                        let (c, k) = (self.tmp(), self.tmp());
+                        let _ = writeln!(self.out, "    {} {c} = {};", ctype(&tys[2]), vals[2]);
+                        let _ = writeln!(self.out, "    void *{k}[2] = {{ (void*)&{c}, (void*){} }};", vals[1]);
+                        format!("(void*){k}")
+                    }
+                };
+                let r = self.tmp();
+                let _ = writeln!(self.out, "    int64_t {r} = lust_binary_search({ptr}, {len}, {size}, {cx}, {adapter});");
+                let res = CTy::Result(Box::new(CTy::Int(IntTy::Usize)), Box::new(CTy::Int(IntTy::Usize)));
+                collect_types(&res, &mut self.sig_types);
+                let t = self.tmp();
+                let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
+                let (set_ok, set_err) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+                let _ = writeln!(self.out, "    {} {t};", ctype(&res));
+                let _ = writeln!(
+                    self.out,
+                    "    if ({r} >= 0) {{ {set_ok} {ok_f} = (uint64_t){r}; }} else {{ {set_err} {err_f} = (uint64_t)(-{r} - 1); }}"
+                );
                 t
             }
             B::IterIter
@@ -4138,6 +4360,7 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
     let src = src.replacen("#include \"float.h\"", &header, 1);
     let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
+    let src = src.replacen("#include \"sort.h\"", include_str!("runtime/sort.h"), 1);
     let src = src.replacen("#include \"hash.h\"", &hash, 1);
     src.replacen("#include \"deps.h\"", &deps, 1)
 }

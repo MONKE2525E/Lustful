@@ -1425,6 +1425,9 @@ uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY
    (src/runtime/fmt.h, W-STD-B). */
 #include "fmt.h"
 
+/* Slice sorting: Rust 1.99 driftsort and ipnsort (src/runtime/sort.h). */
+#include "sort.h"
+
 /* Erased hash table core (src/runtime/hash.h): declarations in every
    unit, bodies only in the runtime unit (LUST_IMPL). */
 #include "hash.h"

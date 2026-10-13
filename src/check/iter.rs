@@ -95,8 +95,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "iter" => "iter",
                 "iter_mut" => "iter_mut",
                 "into_iter" => "into_iter",
+                "sort" => "sort",
+                "sort_unstable" => "sort_unstable",
+                "sort_by" => "sort_by",
+                "sort_unstable_by" => "sort_unstable_by",
+                "sort_by_key" => "sort_by_key",
+                "sort_unstable_by_key" => "sort_unstable_by_key",
+                "binary_search" => "binary_search",
+                "binary_search_by" => "binary_search_by",
+                "binary_search_by_key" => "binary_search_by_key",
                 _ => return None,
             };
+            if n.starts_with("sort") || n.starts_with("binary_search") {
+                return Some(self.seq_sort(e, recv, el, derefs, n, name_span, args));
+            }
             return self.iter_source(e, rt, base, el, derefs, n, name_span, args);
         }
         if !it::is_iter(&self.tys, base) {
@@ -108,6 +120,55 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         Some(self.iter_call(e, recv, base, derefs, &n, name_span, args, turbofish, expected))
+    }
+
+    /// The sort and binary-search family on a Vec, slice, or array
+    /// (runtime/sort.h ports Rust 1.99's algorithms). Comparators are
+    /// closures; `sort`, `binary_search`, and the `_by_key` keys need
+    /// an `Ord` type lust compares (`has_total_ord`).
+    #[allow(clippy::too_many_arguments)]
+    fn seq_sort(&mut self, e: ExprId, recv: ExprId, el: Ty, derefs: u8, n: &str, span: Span, args: &[ExprId]) -> Ty {
+        use Builtin as B;
+        let ord = generics::ordering_ty(&mut self.tys);
+        let r_el = self.tys.mk_ref(false, el);
+        let res = self.tys.mk_result(USIZE, USIZE);
+        let (b, autoref, params, ret) = match n {
+            "sort" | "sort_unstable" => {
+                self.deferred_ord.push((el, span));
+                (if n == "sort" { B::SliceSort } else { B::SliceSortUnstable }, Autoref::RefMut, vec![], UNIT)
+            }
+            "sort_by" | "sort_unstable_by" => {
+                let f = self.fn_mut_param(&[r_el, r_el], ord, span);
+                (if n == "sort_by" { B::SliceSortBy } else { B::SliceSortUnstableBy }, Autoref::RefMut, vec![f], UNIT)
+            }
+            "sort_by_key" | "sort_unstable_by_key" => {
+                let key = self.new_var(false);
+                let f = self.fn_mut_param(&[r_el], key, span);
+                self.deferred_ord.push((key, span));
+                (if n == "sort_by_key" { B::SliceSortByKey } else { B::SliceSortUnstableByKey }, Autoref::RefMut, vec![f], UNIT)
+            }
+            "binary_search" => {
+                self.deferred_ord.push((el, span));
+                (B::SliceBinarySearch, Autoref::Ref, vec![r_el], res)
+            }
+            "binary_search_by" => {
+                let f = self.fn_mut_param(&[r_el], ord, span);
+                (B::SliceBinarySearchBy, Autoref::Ref, vec![f], res)
+            }
+            _ => {
+                let key = self.new_var(false);
+                let rk = self.tys.mk_ref(false, key);
+                let f = self.fn_mut_param(&[r_el], key, span);
+                self.deferred_ord.push((key, span));
+                (B::SliceBinarySearchByKey, Autoref::Ref, vec![rk, f], res)
+            }
+        };
+        if autoref != Autoref::None {
+            self.check_packed_borrow(recv, span);
+        }
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        self.check_args(&params, args, span);
+        ret
     }
 
     /// A source method on a Vec, slice, or array receiver.

@@ -308,6 +308,15 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::ConvDeref,
     Builtin::ConvRcInner,
     Builtin::CmpCode,
+    Builtin::SliceSort,
+    Builtin::SliceSortUnstable,
+    Builtin::SliceSortBy,
+    Builtin::SliceSortUnstableBy,
+    Builtin::SliceSortByKey,
+    Builtin::SliceSortUnstableByKey,
+    Builtin::SliceBinarySearch,
+    Builtin::SliceBinarySearchBy,
+    Builtin::SliceBinarySearchByKey,
 ];
 
 /// How a builtin is called.
@@ -615,6 +624,15 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             Call::Method,
         ),
         B::CmpCode => (&["any Ord type"], vec![i.intern("cmp")], Call::Method),
+        B::SliceSort => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort")], Call::Method),
+        B::SliceSortUnstable => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_unstable")], Call::Method),
+        B::SliceSortBy => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_by")], Call::Method),
+        B::SliceSortUnstableBy => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_unstable_by")], Call::Method),
+        B::SliceSortByKey => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_by_key")], Call::Method),
+        B::SliceSortUnstableByKey => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_unstable_by_key")], Call::Method),
+        B::SliceBinarySearch => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("binary_search")], Call::Method),
+        B::SliceBinarySearchBy => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("binary_search_by")], Call::Method),
+        B::SliceBinarySearchByKey => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("binary_search_by_key")], Call::Method),
     }
 }
 
