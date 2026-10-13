@@ -144,7 +144,7 @@ use ShippedCrate as C;
 /// row index is the item's discriminant (a test pins this).
 pub const LANG_ITEMS: &[LangItemDef] = &[
     LangItemDef { item: L::Option, name: "option", krate: C::Core, required: true },
-    LangItemDef { item: L::Result, name: "result", krate: C::Core, required: false },
+    LangItemDef { item: L::Result, name: "result", krate: C::Core, required: true },
     LangItemDef { item: L::String, name: "string", krate: C::Alloc, required: true },
     LangItemDef { item: L::Vec, name: "vec", krate: C::Alloc, required: true },
     LangItemDef { item: L::Box, name: "box", krate: C::Alloc, required: false },
@@ -196,6 +196,7 @@ impl LangItems {
     pub fn from_builtins(b: BuiltinDefs) -> LangItems {
         let mut items = LangItems { defs: [None; LANG_ITEMS.len()] };
         items.set(LangItem::Option, b.option);
+        items.set(LangItem::Result, b.result);
         items.set(LangItem::String, b.string);
         items.set(LangItem::Vec, b.vec);
         items
@@ -809,6 +810,7 @@ mod tests {
         let b = g.builtins();
         let items = LangItems::from_builtins(b);
         assert_eq!(items.get(LangItem::Option), Some(b.option));
+        assert_eq!(items.get(LangItem::Result), Some(b.result));
         assert_eq!(items.get(LangItem::String), Some(b.string));
         assert_eq!(items.get(LangItem::Vec), Some(b.vec));
         assert_eq!(items.get(LangItem::Box), None);

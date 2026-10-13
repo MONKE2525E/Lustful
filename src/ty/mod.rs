@@ -569,6 +569,7 @@ pub struct BuiltinDefs {
     pub string: DefId,
     pub vec: DefId,
     pub option: DefId,
+    pub result: DefId,
     /// `str::Chars`, the iterator from `s.chars()`.
     pub chars: DefId,
     /// `std::env::Args`.
@@ -584,6 +585,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::Vec)
         } else if def == self.option {
             Some(BuiltinTy::Option)
+        } else if def == self.result {
+            Some(BuiltinTy::Result)
         } else if def == self.chars {
             Some(BuiltinTy::Chars)
         } else if def == self.args {
@@ -601,6 +604,7 @@ pub enum BuiltinTy {
     String,
     Vec,
     Option,
+    Result,
     Chars,
     Args,
 }
@@ -715,6 +719,12 @@ pub trait TyIntern {
     fn mk_vec(&mut self, elem: Ty) -> Ty;
     /// `Option<elem>` as an Adt application of the builtin def. See `mk_vec`.
     fn mk_option(&mut self, elem: Ty) -> Ty;
+    /// `Result<t, e>` as an Adt application of the builtin def. No
+    /// one-arg cache: the plain intern path dedups it.
+    fn mk_result(&mut self, t: Ty, e: Ty) -> Ty {
+        let def = self.builtins().result;
+        self.mk_adt(def, &[GenericArg::Ty(t), GenericArg::Ty(e)])
+    }
     /// The `(def, args)` of an Adt type, builtin or user.
     fn adt_parts(&self, t: Ty) -> Option<(DefId, ArgsId)> {
         match self.kind(t) {
@@ -746,6 +756,15 @@ pub trait TyIntern {
     /// The element type of an `Option<T>`.
     fn option_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Option)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// The `(T, E)` type arguments of a `Result<T, E>`.
+    fn result_args(&self, t: Ty) -> Option<(Ty, Ty)> {
+        if self.builtin_of(t) != Some(BuiltinTy::Result) {
+            return None;
+        }
+        let (_, a) = self.adt_parts(t)?;
+        let args = self.args(a);
+        Some((args.first().and_then(|g| g.as_ty())?, args.get(1).and_then(|g| g.as_ty())?))
     }
     /// The session-local index of a monomorphized Adt instance
     /// (`Bag<u8>` next to `Bag<u16>`), registered by mono when it
@@ -900,6 +919,7 @@ impl GlobalTys {
             string: builtin_def(&["alloc", "string"], "String"),
             vec: builtin_def(&["alloc", "vec"], "Vec"),
             option: builtin_def(&["core", "option"], "Option"),
+            result: builtin_def(&["core", "result"], "Result"),
             chars: builtin_def(&["core", "str"], "Chars"),
             args: builtin_def(&["std", "env"], "Args"),
         };

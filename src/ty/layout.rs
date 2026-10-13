@@ -739,6 +739,12 @@ fn compute(
                 let el = go(tys, shapes, e, memo, active)?;
                 enum_layout(&[vec![], vec![el]], &[0, 1], Repr::default())
             }
+            Some(BuiltinTy::Result) => {
+                let (ok_t, err_t) = tys.result_args(t).ok_or(())?;
+                let ok_l = go(tys, shapes, ok_t, memo, active)?;
+                let err_l = go(tys, shapes, err_t, memo, active)?;
+                enum_layout(&[vec![ok_l], vec![err_l]], &[0, 1], Repr::default())
+            }
             Some(_) => Err(()),
             None => {
                 let id = tys.local_adt(t).ok_or(())?;

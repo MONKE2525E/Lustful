@@ -693,6 +693,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                             self.call_into(CallTarget::Indirect(l), ops, d, span);
                         }
                     }
+                    Res::ResOk => {
+                        let op = ops.into_iter().next().unwrap_or(Operand::Const(crate::ir::Const::Unit));
+                        self.set_or_temp(dest, Rvalue::Res(ty, true, op), ty, span)
+                    }
+                    Res::ResErr => {
+                        let op = ops.into_iter().next().unwrap_or(Operand::Const(crate::ir::Const::Unit));
+                        self.set_or_temp(dest, Rvalue::Res(ty, false, op), ty, span)
+                    }
                     _ => return,
                 }
             }
@@ -1767,6 +1775,18 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             return;
         }
+        if let PatRes::Res(is_ok) = self.ck.pat_res(pat) {
+            let d = self.temp(int(IntTy::U32));
+            self.assign(Place::local(d), Rvalue::Discriminant(place.clone()), span);
+            let ok = self.new_block();
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![((!is_ok) as u32, ok)], fail);
+            self.cur = ok;
+            if let Pat::TupleStruct { elems, .. } = p.ast.pat(pat) {
+                self.test_pat(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), fail);
+            }
+            return;
+        }
         let const_pat = match self.ck.pat_res(pat) {
             PatRes::ConstItem(idx) => Some(p.consts[idx as usize].value.clone()),
             PatRes::PrimConst(v) => Some(crate::ty::consteval::ConstValue::Int(v)),
@@ -1952,6 +1972,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Opt(true)) => {
                 self.bind_pat(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)));
+            }
+            (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
+                self.bind_pat(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)));
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, PatRes::Variant(a, v)) => {
                 let base = if p.adt(a).is_enum { place.project(Proj::Downcast(v)) } else { place };
@@ -2272,6 +2295,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 if let Some(elem) = self.body.tys.option_elem(ty) {
                     let op = if *variant == 1 && !vals.is_empty() { Some(self.const_operand(&vals[0], elem, span)) } else { None };
                     self.assign(dest.clone(), Rvalue::Opt(ty, op), span);
+                } else if let Some((ok_t, err_t)) = self.body.tys.result_args(ty) {
+                    if !vals.is_empty() {
+                        let is_ok = *variant == 0;
+                        let op = self.const_operand(&vals[0], if is_ok { ok_t } else { err_t }, span);
+                        self.assign(dest.clone(), Rvalue::Res(ty, is_ok, op), span);
+                    }
                 } else if let Some(a) = self.body.tys.local_adt(ty) {
                     let ops: Vec<Operand> = vals
                         .iter()

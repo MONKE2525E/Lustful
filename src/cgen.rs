@@ -22,6 +22,8 @@ pub enum CTy {
     String,
     Vec(Box<CTy>),
     Option(Box<CTy>),
+    /// `Result<T, E>`: variant 0 is `Ok(T)`, variant 1 is `Err(E)`.
+    Result(Box<CTy>, Box<CTy>),
     Ref(Box<CTy>),
     Adt(AdtId),
     Args,
@@ -95,6 +97,10 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Option) => CTy::Option(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Result) => {
+                let (a, b) = tys.result_args(t).unwrap_or((ERROR, ERROR));
+                CTy::Result(Box::new(cty(tys, a)), Box::new(cty(tys, b)))
+            }
             Some(BuiltinTy::Chars) => CTy::Chars,
             Some(BuiltinTy::Args) => CTy::Args,
             None => match tys.local_adt(t) {
@@ -155,6 +161,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
+        CTy::Result(..) => format!("R_{}", mangle(t)),
         CTy::Args => "lust_Args".into(),
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
@@ -177,6 +184,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
+        CTy::Result(a, b) => format!("R_{}{}_", mangle(a), mangle(b)),
         CTy::Args => "Args".into(),
         CTy::Chars => "Chars".into(),
         CTy::Tuple(es) => es.iter().map(|e| format!("{}_", mangle(e))).collect(),
@@ -208,6 +216,11 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(t.clone());
             collect_types(e, out);
         }
+        CTy::Result(a, b) => {
+            out.insert(t.clone());
+            collect_types(a, out);
+            collect_types(b, out);
+        }
         CTy::Tuple(es) => {
             out.insert(t.clone());
             es.iter().for_each(|e| collect_types(e, out));
@@ -233,7 +246,9 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) => out.push(t.clone()),
+        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) => {
+            out.push(t.clone())
+        }
         _ => {}
     }
 }
@@ -242,6 +257,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
         CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::Ref(_) | CTy::Args | CTy::Chars | CTy::Slice(_) => true,
         CTy::Option(e) => is_copy_c(p, e),
+        CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
         CTy::Adt(a) => p.adt(*a).derives.copy,
@@ -253,6 +269,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
         CTy::String | CTy::Vec(_) => true,
         CTy::Option(e) => needs_drop_c(p, e),
+        CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
         CTy::Array(e, _) => needs_drop_c(p, e),
         CTy::Adt(a) => {
@@ -416,6 +433,10 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 let l = layout::enum_layout(&[vec![], vec![go(p, e, seen)?]], &[0, 1], layout::Repr::default()).ok()?;
                 enum_is_exact(&l, 2).then_some(l)
             }
+            CTy::Result(a, b) => {
+                let l = layout::enum_layout(&[vec![go(p, a, seen)?], vec![go(p, b, seen)?]], &[0, 1], layout::Repr::default()).ok()?;
+                enum_is_exact(&l, 2).then_some(l)
+            }
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     return None;
@@ -478,7 +499,7 @@ fn zero_lit(p: &Program, t: &CTy) -> String {
 /// The discriminant values of an enum or Option CTy, in variant order.
 fn adt_discs(p: &Program, t: &CTy) -> Vec<i128> {
     match t {
-        CTy::Option(_) => vec![0, 1],
+        CTy::Option(_) | CTy::Result(..) => vec![0, 1],
         CTy::Adt(a) => p.adt(*a).variants.iter().map(|v| v.disc).collect(),
         _ => Vec::new(),
     }
@@ -584,6 +605,15 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Ref(_) => (8, 8),
             CTy::Option(e) => {
                 let (es, ea) = go(p, e, seen);
+                let align = ea.max(4);
+                (align_up(align_up(4, ea) + es, align), align)
+            }
+            CTy::Result(a, b) => {
+                // Legacy shape: a uint32 tag, then a union of the two
+                // payloads, like a legacy two-variant Adt enum.
+                let (as_, aa) = go(p, a, seen);
+                let (bs, ba) = go(p, b, seen);
+                let (es, ea) = (as_.max(bs), aa.max(ba));
                 let align = ea.max(4);
                 (align_up(align_up(4, ea) + es, align), align)
             }
@@ -1091,6 +1121,12 @@ impl FnGen<'_, '_, '_> {
                     e = variant_field(self.p, &t, &e, 1, 0);
                     t = *inner;
                 }
+                (Proj::Downcast(v), CTy::Result(..)) => variant = Some(*v),
+                (Proj::Field(_), CTy::Result(ok_t, err_t)) => {
+                    let v = variant.take().unwrap_or(0);
+                    e = variant_field(self.p, &t, &e, v as usize, 0);
+                    t = if v == 0 { *ok_t } else { *err_t };
+                }
                 (Proj::Downcast(v), _) => variant = Some(*v),
                 (Proj::Index(l), CTy::Vec(el)) => {
                     e = format!("(({}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]", ctype(&el));
@@ -1558,6 +1594,11 @@ impl FnGen<'_, '_, '_> {
                     }
                     _ => format!("(({}){a})", ctype(&to)),
                 }
+            }
+            Rvalue::Res(ty, is_ok, op) => {
+                let t = cty(&self.body.tys, *ty);
+                let (v, _) = self.operand(op, loc, post);
+                self.make_variant(&t, (!*is_ok) as usize, &[v])
             }
             Rvalue::Opt(ty, op) => {
                 let t = cty(&self.body.tys, *ty);
@@ -3302,6 +3343,11 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
+        (CV::Variant(variant, vals), CTy::Result(a, b)) => {
+            let e = if *variant == 0 { a } else { b };
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+            variant_lit(p, t, *variant as usize, &inits)
+        }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), vals.len() as u64);
             let init = const_init(p, v, &at, pre, counter);
@@ -3632,6 +3678,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         match &t {
             CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| collect_types(&cty(&p.tys, f.ty), &mut inner)),
             CTy::Option(e) => collect_types(e, &mut inner),
+            CTy::Result(a, b) => {
+                collect_types(a, &mut inner);
+                collect_types(b, &mut inner);
+            }
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
@@ -3659,6 +3709,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         match t {
             CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| by_value_deps(&cty(&p.tys, f.ty), &mut deps)),
             CTy::Option(e) => by_value_deps(e, &mut deps),
+            CTy::Result(a, b) => {
+                by_value_deps(a, &mut deps);
+                by_value_deps(b, &mut deps);
+            }
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
@@ -3676,6 +3730,20 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 Some(l) => emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![], vec![(**e).clone()]], &l),
                 None => {
                     let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
+                }
+            },
+            CTy::Result(a, b) => match c_layout(p, t) {
+                Some(l) => {
+                    emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![(**a).clone()], vec![(**b).clone()]], &l)
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "typedef struct {0} {{ uint32_t tag; union {{ struct {{ {1} f0; }} v0; struct {{ {2} f0; }} v1; }} u; }} {0};",
+                        ctype(t),
+                        ctype(a),
+                        ctype(b)
+                    );
                 }
             },
             CTy::Tuple(es) => match c_layout(p, t) {
@@ -3845,6 +3913,18 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     need(Glue::Drop, e);
                     let _ = writeln!(body, "  if ({disc_p}) drop_{}(&{pf});", mangle(e));
                 }
+                CTy::Result(a, b) => {
+                    if needs_drop_c(p, a) {
+                        need(Glue::Drop, a);
+                        let f0 = variant_field(p, t, "(*p)", 0, 0);
+                        let _ = writeln!(body, "  if (!{disc_p}) drop_{}(&{f0});", mangle(a));
+                    }
+                    if needs_drop_c(p, b) {
+                        need(Glue::Drop, b);
+                        let f1 = variant_field(p, t, "(*p)", 1, 0);
+                        let _ = writeln!(body, "  if ({disc_p}) drop_{}(&{f1});", mangle(b));
+                    }
+                }
                 CTy::Tuple(es) => {
                     for (fi, ft) in es.iter().enumerate() {
                         if needs_drop_c(p, ft) {
@@ -3911,6 +3991,20 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let c = clone_of(e, &pf, &mut need);
                     let rf = variant_field(p, t, "r", 1, 0);
                     let _ = writeln!(body, "  {ct} r = *p;\n  if ({disc_p}) {rf} = {c};\n  return r;");
+                }
+                CTy::Result(a, b) => {
+                    let _ = writeln!(body, "  {ct} r = *p;");
+                    if !is_copy_c(p, a) {
+                        let c = clone_of(a, &variant_field(p, t, "(*p)", 0, 0), &mut need);
+                        let rf = variant_field(p, t, "r", 0, 0);
+                        let _ = writeln!(body, "  if (!{disc_p}) {rf} = {c};");
+                    }
+                    if !is_copy_c(p, b) {
+                        let c = clone_of(b, &variant_field(p, t, "(*p)", 1, 0), &mut need);
+                        let rf = variant_field(p, t, "r", 1, 0);
+                        let _ = writeln!(body, "  if ({disc_p}) {rf} = {c};");
+                    }
+                    body.push_str("  return r;\n");
                 }
                 CTy::Tuple(es) => {
                     let _ = writeln!(body, "  {ct} r = *p;");
@@ -3990,6 +4084,12 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let c = eq_of(e, &af, &bf, &mut need);
                     let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
                     let _ = writeln!(body, "  return {da} == {db} && (!{da} || {c});");
+                }
+                CTy::Result(x, y) => {
+                    let ca = eq_of(x, &variant_field(p, t, "(*a)", 0, 0), &variant_field(p, t, "(*b)", 0, 0), &mut need);
+                    let cb = eq_of(y, &variant_field(p, t, "(*a)", 1, 0), &variant_field(p, t, "(*b)", 1, 0), &mut need);
+                    let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                    let _ = writeln!(body, "  return {da} == {db} && ({da} ? {cb} : {ca});");
                 }
                 CTy::Tuple(es) => {
                     for (fi, ft) in es.iter().enumerate() {
@@ -4074,6 +4174,18 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 CTy::Option(inner) => {
                     let e = dbg_of(inner, &pf, &mut need);
                     let _ = writeln!(body, "  if ({disc_p}) {{ {} {e} {} }} else {}", lit("Some("), lit(")"), lit("None"));
+                }
+                CTy::Result(x, y) => {
+                    let ea = dbg_of(x, &variant_field(p, t, "(*p)", 0, 0), &mut need);
+                    let eb = dbg_of(y, &variant_field(p, t, "(*p)", 1, 0), &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  if ({disc_p}) {{ {} {eb} {} }} else {{ {} {ea} {} }}",
+                        lit("Err("),
+                        lit(")"),
+                        lit("Ok("),
+                        lit(")")
+                    );
                 }
                 CTy::Tuple(es) => {
                     let mut s = lit("(");
@@ -4247,6 +4359,7 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
         }
         Rvalue::ArrayRepeat(_, o, _) => op_has(o),
         Rvalue::Opt(_, o) => o.as_ref().is_some_and(op_has),
+        Rvalue::Res(_, _, o) => op_has(o),
         Rvalue::Format(parts) => parts_has(parts),
         Rvalue::FnValue(..) => false,
     }

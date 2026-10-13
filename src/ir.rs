@@ -79,6 +79,8 @@ pub enum Rvalue {
     Aggregate(AdtId, u32, Vec<Operand>),
     /// `Some(x)` or `None`, of the given Option type.
     Opt(Ty, Option<Operand>),
+    /// `Ok(x)` (true) or `Err(x)` (false), of the given Result type.
+    Res(Ty, bool, Operand),
     VecLit(Ty, Vec<Operand>),
     VecRepeat(Ty, Operand, Operand),
     /// `a == b` for any PartialEq type. Both operands are references to `ty`.

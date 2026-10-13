@@ -155,6 +155,11 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
                 None => 0u8.hash(h),
             }
         }
+        Rvalue::Res(t, is_ok, o) => {
+            (23u8, is_ok).hash(h);
+            ty(h, *t, seen);
+            hash_operand(h, p, tys, o, seen);
+        }
         Rvalue::VecLit(t, os) => {
             7u8.hash(h);
             ty(h, *t, seen);
@@ -476,6 +481,7 @@ enum CachedRvalue {
     Cast(CachedOperand, u32),
     Aggregate(DefId, u32, Vec<CachedOperand>),
     Opt(u32, Option<CachedOperand>),
+    Res(u32, bool, CachedOperand),
     VecLit(u32, Vec<CachedOperand>),
     VecRepeat(u32, CachedOperand, CachedOperand),
     Eq { a: CachedOperand, b: CachedOperand, ty: u32, ne: bool },
@@ -766,6 +772,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::Cast(o, t) => CachedRvalue::Cast(cache_operand(b, p, o), b.ty(*t)),
         Rvalue::Aggregate(adt, v, operands) => CachedRvalue::Aggregate(p.def_of_adt(*adt), *v, os(b, operands)),
         Rvalue::Opt(t, o) => CachedRvalue::Opt(b.ty(*t), o.as_ref().map(|o| cache_operand(b, p, o))),
+        Rvalue::Res(t, is_ok, o) => CachedRvalue::Res(b.ty(*t), *is_ok, cache_operand(b, p, o)),
         Rvalue::VecLit(t, operands) => CachedRvalue::VecLit(b.ty(*t), os(b, operands)),
         Rvalue::VecRepeat(t, a, c) => CachedRvalue::VecRepeat(b.ty(*t), cache_operand(b, p, a), cache_operand(b, p, c)),
         Rvalue::Eq { a, b: c, ty, ne } => {
@@ -923,6 +930,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             CachedRvalue::Opt(t, o) => {
                 Rvalue::Opt(intern.ty(tys, *t)?, match o { Some(o) => Some(operand(intern, tys, strings, o)?), None => None })
             }
+            CachedRvalue::Res(t, is_ok, o) => Rvalue::Res(intern.ty(tys, *t)?, *is_ok, operand(intern, tys, strings, o)?),
             CachedRvalue::VecLit(t, operands) => Rvalue::VecLit(intern.ty(tys, *t)?, os(intern, tys, operands)?),
             CachedRvalue::VecRepeat(t, a, c) => {
                 Rvalue::VecRepeat(intern.ty(tys, *t)?, operand(intern, tys, strings, a)?, operand(intern, tys, strings, c)?)

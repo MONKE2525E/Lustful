@@ -1183,8 +1183,9 @@ impl Evaluator {
             }
             CallTarget::VariantCtor { adt, variant, ty } => {
                 // A user variant knows its field types; check each argument
-                // against them. The `Some` shim (adt u32::MAX) has none here.
-                let fields: Vec<Ty> = if adt.0 == u32::MAX { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
+                // against them. The `Some` and `Ok`/`Err` shims (adt
+                // u32::MAX and u32::MAX - 1) have none here.
+                let fields: Vec<Ty> = if adt.0 >= u32::MAX - 1 { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
                 let mut vals = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
                     let want = fields.get(i).copied();
@@ -1532,6 +1533,25 @@ impl Evaluator {
                         if !want_some {
                             return Ok(true);
                         }
+                    }
+                }
+                // Result patterns by name: Ok is variant 0, Err is 1.
+                if let ConstValue::Variant(variant, fields) = &v
+                    && let Some((ok_ty, err_ty)) = cx.tys_ref().result_args(t)
+                {
+                    let want_ok = cx.sym_text(segs[segs.len() - 1].name) == "Ok";
+                    let want_err = cx.sym_text(segs[segs.len() - 1].name) == "Err";
+                    if (want_ok && *variant == 0) || (want_err && *variant == 1) {
+                        if let Pat::TupleStruct { elems, .. } = cx.ast().pat(pat)
+                            && elems.len() == 1
+                        {
+                            let elem_ty = if want_ok { ok_ty } else { err_ty };
+                            return self.match_pat(cx, env, elems[0], &fields[0].clone(), elem_ty, _in_match, binds);
+                        }
+                        return Ok(true);
+                    }
+                    if want_ok || want_err {
+                        return Ok(false);
                     }
                 }
                 let Some((adt, variant)) = cx.pattern_variant(segs) else {

@@ -2426,6 +2426,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     inner(h, p, out);
                 }
+                cgen::CTy::Result(a, b) => {
+                    17u8.hash(h);
+                    inner(h, p, a);
+                    inner(h, p, b);
+                }
             }
         }
         let mut h = crate::intern::FxHasher::default();

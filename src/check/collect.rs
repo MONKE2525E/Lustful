@@ -265,6 +265,10 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Option) => {
                 format!("Option<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e)))
             }
+            Some(BuiltinTy::Result) => {
+                let (a, b) = tys.result_args(t).unwrap_or((ERROR, ERROR));
+                format!("Result<{}, {}>", ty_name(p, tys, a), ty_name(p, tys, b))
+            }
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             None => match tys.local_adt(t) {
@@ -354,6 +358,15 @@ pub fn resolve_ty(
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 return Ok(tys.mk_option(e));
             }
+            if name == known.Result {
+                let args = seg.type_args();
+                if args.len() != 2 {
+                    return Err(Diag::new("L0110", span, "Result takes two type arguments", "Write `Result<T, E>`."));
+                }
+                let t = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[1], self_ty)?;
+                return Ok(tys.mk_result(t, e));
+            }
             if let Some(&adt) = type_names.get(&name) {
                 return no_generics(tys.adt_ty(adt));
             }
@@ -367,7 +380,7 @@ pub fn resolve_ty(
             if name == known.f64 {
                 return no_generics(tys.float_ty(FloatTy::F64));
             }
-            if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
+            if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
                 return Err(not_yet("L0641", span, &format!("the `{n}` type")));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
@@ -1007,6 +1020,15 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         insert_builtin(&mut p, b.string, DefsKind::Struct, known.String, Generics::default());
         insert_builtin(&mut p, b.vec, DefsKind::Struct, known.Vec, one_ty_param());
         insert_builtin(&mut p, b.option, DefsKind::Enum, known.Option, one_ty_param());
+        let two_ty_params = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: interner.intern("T"), kind: ParamKind::Type, span: dummy },
+                ParamDef { name: interner.intern("E"), kind: ParamKind::Type, span: dummy },
+            ],
+            predicates: Vec::new(),
+        };
+        insert_builtin(&mut p, b.result, DefsKind::Enum, known.Result, two_ty_params);
         insert_builtin(&mut p, b.chars, DefsKind::Struct, interner.intern("Chars"), Generics::default());
         insert_builtin(&mut p, b.args, DefsKind::Struct, interner.intern("Args"), Generics::default());
     }
@@ -2089,6 +2111,10 @@ fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> boo
         CV::Variant(variant, vals) => {
             let elem_tys: Vec<Ty> = match p.tys.kind(ty) {
                 _ if p.tys.option_elem(ty).is_some() => vec![p.tys.option_elem(ty).unwrap()],
+                _ if p.tys.result_args(ty).is_some() => {
+                    let (a, b) = p.tys.result_args(ty).unwrap();
+                    vec![if *variant == 0 { a } else { b }]
+                }
                 _ => match p.tys.local_adt(ty) {
                     Some(a) => p.adt(a).variants[*variant as usize].fields.iter().map(|f| f.ty).collect(),
                     None => vec![ERROR; vals.len()],
@@ -2213,6 +2239,14 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         if segs.len() == 1 && last == self.p.known.Some {
             return CallTarget::VariantCtor { adt: AdtId(u32::MAX), variant: 1, ty: ERROR };
         }
+        // The Result shim sits one below the Option shim (u32::MAX):
+        // Ok is variant 0, Err is variant 1.
+        if segs.len() == 1 && last == self.p.known.Ok {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX - 1), variant: 0, ty: ERROR };
+        }
+        if segs.len() == 1 && last == self.p.known.Err {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX - 1), variant: 1, ty: ERROR };
+        }
         let fid = if segs.len() == 1 {
             self.p.fn_names.get(&last).copied()
         } else if segs.len() == 2 {
@@ -2266,7 +2300,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         self.variant_of(segs)
     }
     fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)> {
-        if adt.0 == u32::MAX {
+        if adt.0 >= u32::MAX - 1 {
             return Vec::new();
         }
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
@@ -2286,7 +2320,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         self.p.adt(adt).variants[variant as usize].disc
     }
     fn is_enum(&self, adt: AdtId) -> bool {
-        adt.0 != u32::MAX && self.p.adt(adt).is_enum
+        adt.0 < u32::MAX - 1 && self.p.adt(adt).is_enum
     }
 }
 
@@ -2326,7 +2360,10 @@ pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
         _ if tys.is_chars_ty(t) => true,
         _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
             Some(e) => contains_ref(tys, e),
-            None => false,
+            None => match tys.result_args(t) {
+                Some((a, b)) => contains_ref(tys, a) || contains_ref(tys, b),
+                None => false,
+            },
         },
     }
 }
@@ -2356,7 +2393,10 @@ pub fn is_sized_ty(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Array(e, _) => is_sized_ty(tys, e),
         TyKind::Adt(..) => match tys.adt_first_ty_arg(t) {
             Some(e) if tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() => is_sized_ty(tys, e),
-            _ => true,
+            _ => match tys.result_args(t) {
+                Some((a, b)) => is_sized_ty(tys, a) && is_sized_ty(tys, b),
+                None => true,
+            },
         },
         _ => true,
     }
@@ -2371,6 +2411,9 @@ fn type_holds_adt_by_value(p: &Program, root: AdtId, t: Ty, seen: &mut Vec<bool>
         _ => {
             if let Some(inner) = p.tys.option_elem(t) {
                 return type_holds_adt_by_value(p, root, inner, seen);
+            }
+            if let Some((a, b)) = p.tys.result_args(t) {
+                return type_holds_adt_by_value(p, root, a, seen) || type_holds_adt_by_value(p, root, b, seen);
             }
             match p.tys.local_adt(t) {
                 Some(a) => a == root || contains_adt_by_value(p, root, a, seen),
@@ -2398,6 +2441,9 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if let Some(e) = tys.option_elem(t) {
                 return is_copy(p, tys, e);
             }
+            if let Some((a, b)) = tys.result_args(t) {
+                return is_copy(p, tys, a) && is_copy(p, tys, b);
+            }
             match tys.local_adt(t) {
                 Some(a) => {
                     p.adt(a).derives.copy
@@ -2422,6 +2468,9 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
     if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
         return has_clone(p, tys, e);
+    }
+    if let Some((a, b)) = tys.result_args(t) {
+        return has_clone(p, tys, a) && has_clone(p, tys, b);
     }
     match tys.local_adt(t) {
         Some(a) => {
@@ -2463,6 +2512,9 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
                 return has_eq(p, tys, e);
             }
+            if let Some((a, b)) = tys.result_args(t) {
+                return has_eq(p, tys, a) && has_eq(p, tys, b);
+            }
             match tys.local_adt(t) {
                 Some(a) => {
                     p.adt(a).derives.partial_eq
@@ -2489,6 +2541,9 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)) {
                 return has_debug(p, tys, e);
+            }
+            if let Some((a, b)) = tys.result_args(t) {
+                return has_debug(p, tys, a) && has_debug(p, tys, b);
             }
             match tys.local_adt(t) {
                 Some(a) => {
@@ -2524,6 +2579,9 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
     if let Some(e) = tys.option_elem(t) {
         return needs_drop(p, tys, e);
+    }
+    if let Some((a, b)) = tys.result_args(t) {
+        return needs_drop(p, tys, a) || needs_drop(p, tys, b);
     }
     match tys.local_adt(t) {
         Some(a) => {

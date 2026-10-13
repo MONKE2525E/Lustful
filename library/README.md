@@ -66,10 +66,10 @@ use when W-STD writes it.
 
 ## Lang items (`LANG_ITEMS` in src/ty/lang.rs)
 
-Resolved at load today: `option`, `string`, `vec` (builtin defs;
-required, a load fails without them).
+Resolved at load today: `option`, `result`, `string`, `vec` (builtin
+defs; required, a load fails without them).
 
-Declared in the table, no def yet: `result`, `box`, `rc`, `arc`,
+Declared in the table, no def yet: `box`, `rc`, `arc`,
 `unsafe_cell`, `phantom_data`, the Range family, `iterator`,
 `into_iterator`, `drop`, `deref`, `deref_mut`, the Fn family,
 `sized`, `send`, `sync`, `panic`, `panic_bounds`, `formatter`,

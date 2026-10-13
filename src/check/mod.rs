@@ -187,6 +187,9 @@ pub enum Res {
     /// `None`, and `Some` used as a constructor.
     OptNone,
     OptSome,
+    /// `Ok` and `Err` used as constructors.
+    ResOk,
+    ResErr,
     Method {
         f: LocalDefId,
         derefs: u8,
@@ -295,6 +298,8 @@ pub enum PatRes {
     Variant(AdtId, u32),
     /// `Some(..)` (true) or `None` (false).
     Opt(bool),
+    /// `Ok(..)` (true) or `Err(..)` (false).
+    Res(bool),
 }
 
 pub struct LocalInfo {
@@ -993,6 +998,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => match self.tys.builtin_of(t) {
                 Some(BuiltinTy::Vec) => format!("Vec<{}>", self.tn(self.tys.adt_first_ty_arg(t).unwrap_or(ERROR))),
                 Some(BuiltinTy::Option) => format!("Option<{}>", self.tn(self.tys.adt_first_ty_arg(t).unwrap_or(ERROR))),
+                Some(BuiltinTy::Result) => {
+                    let (a, b) = self.tys.result_args(t).unwrap_or((ERROR, ERROR));
+                    format!("Result<{}, {}>", self.tn(a), self.tn(b))
+                }
                 _ => ty_name(self.p, &self.tys, t),
             },
         }
@@ -1616,6 +1625,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(e) = self.tys.vec_elem(t).or_else(|| self.tys.option_elem(t)) {
                     seen.push(t);
                     return self.auto_inner(trait_def, e, seen);
+                }
+                if let Some((a, b)) = self.tys.result_args(t) {
+                    seen.push(t);
+                    let mut unknown = false;
+                    for e in [a, b] {
+                        match self.auto_inner(trait_def, e, seen) {
+                            Some(false) => return Some(false),
+                            None => unknown = true,
+                            _ => {}
+                        }
+                    }
+                    return if unknown { None } else { Some(true) };
                 }
                 if let Some(a) = self.tys.local_adt(t) {
                     seen.push(t);
@@ -4049,6 +4070,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
+            if r == Res::OptNone {
+                let v = self.new_var(false);
+                return self.tys.mk_option(v);
+            }
             if let Res::Variant(a, v) = r {
                 let variant = &p.adt(a).variants[v as usize];
                 if variant.shape == VariantShape::Unit {
@@ -4196,6 +4221,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return None;
             };
             return Some(Res::Builtin(b));
+        }
+        // Qualified builtin variant constructors: `Option::Some(..)`,
+        // `Result::Ok(..)`, `Result::Err(..)`.
+        if ty_name == k.Option && item == k.Some {
+            return Some(Res::OptSome);
+        }
+        if ty_name == k.Option && item == k.None {
+            return Some(Res::OptNone);
+        }
+        if ty_name == k.Result && item == k.Ok {
+            return Some(Res::ResOk);
+        }
+        if ty_name == k.Result && item == k.Err {
+            return Some(Res::ResErr);
         }
         let adt = if ty_name == p.known.self_type {
             self.f.owner
@@ -4615,6 +4654,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => match self.binding_fn(name) {
                         Some(f) => Res::Fn(f),
                         None if name == p.known.Some => Res::OptSome,
+                    None if name == p.known.Ok => Res::ResOk,
+                    None if name == p.known.Err => Res::ResErr,
                         None if matches!(self.name(name), "size_of" | "align_of") && !segs[0].type_args().is_empty() => {
                             let align = self.name(name) == "align_of";
                             self.layout_query(&segs[0], align, span)
@@ -4751,6 +4792,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             let t = self.expr(args[0], None);
             return self.tys.mk_option(t);
+        }
+        if res == Res::ResOk || res == Res::ResErr {
+            let who = if res == Res::ResOk { "Ok" } else { "Err" };
+            if args.len() != 1 {
+                self.err("L0105", span, format!("`{who}` takes one argument"), format!("Write `{who}(value)`."));
+                return ERROR;
+            }
+            // Turbofish on the constructor or on `Result` itself pins
+            // both sides; otherwise the other side is a fresh var.
+            let turbo: Vec<Ty> = match p.ast.expr(callee) {
+                Expr::Path(segs) => segs
+                    .iter()
+                    .flat_map(|s| s.type_args())
+                    .filter(|&g| !matches!(p.ast.ty(g), ast::TyExpr::Infer))
+                    .map(|g| self.resolve_written(g))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let (want, other) = if turbo.len() == 2 {
+                if res == Res::ResOk { (Some(turbo[0]), turbo[1]) } else { (Some(turbo[1]), turbo[0]) }
+            } else {
+                (None, self.new_var(false))
+            };
+            let t = self.expr(args[0], want);
+            return if res == Res::ResOk { self.tys.mk_result(t, other) } else { self.tys.mk_result(other, t) };
         }
         match res {
             Res::ConstUsize(_) => {
@@ -6306,6 +6372,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return;
         }
+        if opt.is_none()
+            && let Some(is_ok) = self.result_pattern(pat)
+        {
+            let (a, b) = (self.new_var(false), self.new_var(false));
+            let rt = self.tys.mk_result(a, b);
+            if !self.unify(rt, t) {
+                self.mismatch(span, t, rt);
+                return;
+            }
+            self.out.pat_res[pi] = PatRes::Res(is_ok);
+            if let Pat::TupleStruct { elems, .. } = p.ast.pat(pat) {
+                self.pattern_mode(elems[0], if is_ok { a } else { b }, mode, in_match);
+            }
+            return;
+        }
         // A plain name that resolves to a const item, a unit struct, or
         // a unit variant is a path pattern, not a binding (unless a
         // local binding shadows the name). Imports count: resolution
@@ -6815,7 +6896,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let k = self.p.known;
         match self.p.ast.pat(pat) {
             Pat::Binding { name, mutable: false, by_ref: false } if *name == k.None => Some(false),
-            Pat::TupleStruct { path, elems } if path.len() == 1 && path[0].name == k.Some && elems.len() == 1 => Some(true),
+            Pat::Path(segs) if segs.len() == 2 && segs[0].name == k.Option && segs[1].name == k.None => Some(false),
+            Pat::TupleStruct { path, elems }
+                if elems.len() == 1
+                    && ((path.len() == 1 && path[0].name == k.Some)
+                        || (path.len() == 2 && path[0].name == k.Option && path[1].name == k.Some)) =>
+            {
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// `Ok(..)` as `Some(true)`, `Err(..)` as `Some(false)`, in the
+    /// prelude spelling and the qualified `Result::Ok(..)` spelling.
+    fn result_pattern(&self, pat: PatId) -> Option<bool> {
+        let k = self.p.known;
+        match self.p.ast.pat(pat) {
+            Pat::TupleStruct { path, elems } if elems.len() == 1 => {
+                let last = path.last().map(|s| s.name)?;
+                if (path.len() == 1 || (path.len() == 2 && path[0].name == k.Result)) && last == k.Ok {
+                    Some(true)
+                } else if (path.len() == 1 || (path.len() == 2 && path[0].name == k.Result)) && last == k.Err {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -6867,7 +6974,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let own = self.out.pat_res[(pat.0 - self.out.pat_base) as usize];
         match self.p.ast.pat(pat) {
             Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => match self.pres(*inner) {
-                r @ (PatRes::Variant(..) | PatRes::Opt(_)) => r,
+                r @ (PatRes::Variant(..) | PatRes::Opt(_) | PatRes::Res(_)) => r,
                 _ => own,
             },
             _ => own,
@@ -7024,6 +7131,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         })
                         .collect();
                     return none && !somes.is_empty() && self.covers(&somes);
+                }
+                (PatRes::Res(_), _) => {
+                    let side = |want: bool| -> Vec<PatId> {
+                        flat.iter()
+                            .filter_map(|&y| match (self.pres(y), p.ast.pat(self.pat_unwrap(y))) {
+                                (PatRes::Res(w), Pat::TupleStruct { elems, .. }) if w == want => Some(elems[0]),
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    let (oks, errs) = (side(true), side(false));
+                    return !oks.is_empty() && !errs.is_empty() && self.covers(&oks) && self.covers(&errs);
                 }
                 (PatRes::Variant(a, _), _) if p.adt(a).is_enum => {
                     return (0..p.adt(a).variants.len()).all(|v| self.covers_variant(&flat, a, v as u32));
@@ -7227,7 +7346,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn irrefutable(&self, pat: PatId) -> bool {
         let p = self.p;
-        if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_)) {
+        if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_) | PatRes::Res(_)) {
             return false;
         }
         match p.ast.pat(pat) {
@@ -8559,6 +8678,14 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         if segs.len() == 1 && last == p.known.Some {
             return CallTarget::VariantCtor { adt: AdtId(u32::MAX), variant: 1, ty: ERROR };
         }
+        // The Result shim sits one below the Option shim (u32::MAX):
+        // Ok is variant 0, Err is variant 1.
+        if segs.len() == 1 && last == p.known.Ok {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX - 1), variant: 0, ty: ERROR };
+        }
+        if segs.len() == 1 && last == p.known.Err {
+            return CallTarget::VariantCtor { adt: AdtId(u32::MAX - 1), variant: 1, ty: ERROR };
+        }
         let span = self.cx.span(callee);
         let fid = if segs.len() == 1 {
             if self.cx.lookup(last, span.ctxt).is_some() {
@@ -8626,7 +8753,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         variant_of(self.cx.p, segs)
     }
     fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)> {
-        if adt.0 == u32::MAX {
+        if adt.0 >= u32::MAX - 1 {
             return Vec::new();
         }
         self.cx.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
@@ -8650,7 +8777,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         self.cx.p.adt(adt).variants[variant as usize].disc
     }
     fn is_enum(&self, adt: AdtId) -> bool {
-        adt.0 != u32::MAX && self.cx.p.adt(adt).is_enum
+        adt.0 < u32::MAX - 1 && self.cx.p.adt(adt).is_enum
     }
 }
 

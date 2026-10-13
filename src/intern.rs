@@ -289,6 +289,11 @@ known_syms!(
     to_ascii_uppercase,
     to_ascii_lowercase,
     to_digit,
+    Result,
+    Ok,
+    Err,
+    is_ok,
+    is_err,
 );
 
 impl Known {

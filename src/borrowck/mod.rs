@@ -280,7 +280,7 @@ fn successors(t: &Terminator) -> Vec<Bb> {
 /// Calls `f` for every operand read by an rvalue, in evaluation order.
 fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
     match rv {
-        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::Opt(_, Some(o)) => f(o),
+        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::Opt(_, Some(o)) | Rvalue::Res(_, _, o) => f(o),
         Rvalue::Opt(_, None) => {}
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::Eq { a, b, .. } => {
             f(a);
@@ -1286,6 +1286,10 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         TyKind::Adt(..) if self.body.tys.option_elem(container).is_some() => {
                             self.body.tys.option_elem(container).unwrap_or(ERROR)
                         }
+                        TyKind::Adt(..) if self.body.tys.result_args(container).is_some() => {
+                            let (a, b) = self.body.tys.result_args(container).unwrap();
+                            if variant == 0 { a } else { b }
+                        }
                         TyKind::Adt(..) => match self.body.tys.local_adt(container) {
                             Some(a) => {
                                 let f = self.p.adt(a).variants.get(variant as usize).and_then(|v| v.fields.get(*i as usize));
@@ -1492,6 +1496,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
                 (TyKind::Adt(..), Proj::Downcast(v)) => variant = *v,
                 (_, Proj::Field(_)) if self.body.tys.option_elem(t).is_some() => t = self.body.tys.option_elem(t).unwrap(),
+                (_, Proj::Field(_)) if self.body.tys.result_args(t).is_some() => {
+                    let (a, b) = self.body.tys.result_args(t).unwrap();
+                    t = if variant == 0 { a } else { b };
+                    variant = 0;
+                }
                 _ => {}
             }
         }

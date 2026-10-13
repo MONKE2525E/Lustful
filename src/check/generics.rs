@@ -1079,6 +1079,22 @@ fn resolve_path_ty(
         let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
         return Ok(if name == known.Vec { tys.mk_vec(elem) } else { tys.mk_option(elem) });
     }
+    if name == known.Result {
+        let args = match &seg.args {
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, 2, span, interner.get(name))?,
+            _ => {
+                return Err(Diag::new(
+                    "L0110",
+                    span,
+                    "`Result` takes two type arguments".to_string(),
+                    "Write `Result<T, E>`.",
+                ));
+            }
+        };
+        let mut it = args.iter().filter_map(|g| g.as_ty());
+        let (t, e) = (it.next().unwrap_or(ERROR), it.next().unwrap_or(ERROR));
+        return Ok(tys.mk_result(t, e));
+    }
     if segs.len() == 1
         && let Some(&alias_ty) = cx.aliases.get(&name)
     {
@@ -1114,7 +1130,7 @@ fn resolve_path_ty(
         return Ok(tys.mk_adt(def, &gargs));
     }
     let n = interner.get(name);
-    if ["HashMap", "HashSet", "BTreeMap", "Result", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
+    if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
         return Err(not_yet("L0641", span, &format!("the `{n}` type")));
     }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
