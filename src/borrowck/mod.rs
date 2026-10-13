@@ -1328,22 +1328,16 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         if is_copy(self.p, &self.body.tys, moved) {
             return;
         }
+        // A generic field is a move unless the bounds make it Copy:
+        // the template check's body store carries its param env, so
+        // `is_copy` above answers a param from its bounds.
         if let Some(container) = drop_container {
-            if matches!(self.body.tys.kind(moved), TyKind::Param(_)) {
-                // The moved type is a generic of this fn: whether the
-                // move is a legal copy out depends on bounds this pass
-                // does not read, so it stays an unsupported form.
-                if self.seen.insert(("L9001", span)) {
-                    self.errs.push(unsupported(span, "moving a generic field out of a type that implements `Drop`"));
-                }
-            } else {
-                self.err(
-                    "L0305",
-                    span,
-                    format!("cannot move out of {}, because it implements `Drop`", ty_name(self.p, &self.body.tys, container)),
-                    "Borrow the field with `&`, clone it, or use `std::mem::replace` (not yet supported) style code.",
-                );
-            }
+            self.err(
+                "L0305",
+                span,
+                format!("cannot move out of {}, because it implements `Drop`", ty_name(self.p, &self.body.tys, container)),
+                "Borrow the field with `&`, clone it, or use `std::mem::replace` (not yet supported) style code.",
+            );
         }
     }
 

@@ -483,7 +483,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("`unsafe` blocks and functions", "L0404"),
     ("`async` functions and blocks", "L0405"),
     ("moving a field out of a struct or enum", "L9001"),
-    ("moving a generic field out of a type that implements `Drop`", "L9001"),
     ("destructuring in `let` without an initializer", "L9001"),
     ("non-scalar const patterns", "L9001"),
     ("ranges outside `for` loops", "L9001"),
