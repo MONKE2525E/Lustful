@@ -228,6 +228,21 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
             format!("  return lust_f_pad(f, {});\n", lit("an error occurred when formatting an argument"))
         }
+        // std's UTF-8 errors (W-STD-A): their Display writes with
+        // `write!`, a fresh default Formatter over the same sink, so the
+        // caller's width and fill do not apply.
+        CTy::Adt(_) if let Some(u) = utf8_error_part(p, t, "(*p)") => {
+            let opt = CTy::Option(Box::new(CTy::Int(IntTy::U8)));
+            let o = format!("{u}.f1");
+            format!(
+                "  lust_Formatter g; lust_f_init(&g, f->buf);\n  if ({}) return lust_f_write_str(&g, {}) || lust_f_u64(&g, {}) || lust_f_write_str(&g, {}) || lust_f_u64(&g, {u}.f0);\n  return lust_f_write_str(&g, {}) || lust_f_u64(&g, {u}.f0);\n",
+                disc_call(p, &opt, &format!("&{o}")),
+                lit("invalid utf-8 sequence of "),
+                variant_field(p, &opt, &o, 1, 0),
+                lit(" bytes from index "),
+                lit("incomplete utf-8 byte sequence from index ")
+            )
+        }
         CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots) {
             Some(call) => format!("  {call}\n"),
             None => "  abort();\n".to_string(),

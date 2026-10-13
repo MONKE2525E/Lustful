@@ -911,12 +911,12 @@ fn predicted_def_ids(
         }
     }
     fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Static(_)));
-    // Collect also numbers the synthetic `core::cmp::Ordering` Adt
-    // (check/collect.rs pass 1), always (a user type of that name only
-    // shadows its flat name): predict the same extra hash.
-    adt_hashes.push(crate::check::generics::ordering_def().hash);
-    // And `core::fmt::Error`, always (W-STD-B).
-    adt_hashes.push(crate::check::generics::fmt_error_def().hash);
+    // Collect also numbers the synthetic std Adts (check/collect.rs
+    // pass 1), always (a user type of the same name only shadows its
+    // flat name): predict the same extra hashes.
+    for (_, _, def, _) in crate::check::generics::std_adts() {
+        adt_hashes.push(def.hash);
+    }
     let to_map = |hashes: &[crate::def::DefPathHash], ranks: Vec<u32>| -> FxMap<crate::def::DefPathHash, u32> {
         hashes.iter().copied().zip(ranks).collect()
     };
@@ -3626,12 +3626,10 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
             let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
             let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
             for (hash, &id) in &adts {
-                // The synthetic `Ordering` and `fmt::Error` Adts carry
-                // their builtin defs, not local-crate ones (check/collect.rs).
-                let def = if *hash == crate::check::generics::ordering_def().hash {
-                    crate::check::generics::ordering_def()
-                } else if *hash == crate::check::generics::fmt_error_def().hash {
-                    crate::check::generics::fmt_error_def()
+                // A synthetic std Adt carries its builtin def, not a
+                // local-crate one (check/collect.rs).
+                let def = if let Some((_, _, d, _)) = crate::check::generics::std_adts().into_iter().find(|s| s.2.hash == *hash) {
+                    d
                 } else {
                     crate::def::DefId { krate: ids.local, hash: *hash }
                 };

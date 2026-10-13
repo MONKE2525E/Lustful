@@ -540,6 +540,47 @@ pub fn fmt_result_ty(tys: &mut impl TyIntern) -> Ty {
     tys.mk_result(UNIT, e)
 }
 
+/// The def of `core::str::Utf8Error`, a synthetic struct Adt like
+/// `Ordering` (W-STD-A): `valid_up_to: usize, error_len: Option<u8>`.
+pub fn utf8_error_def() -> DefId {
+    lang_def(&["core", "str"], crate::def::DefKind::Adt, "Utf8Error")
+}
+
+/// The def of `alloc::string::FromUtf8Error`, a synthetic struct Adt:
+/// `bytes: Vec<u8>, error: Utf8Error`.
+pub fn from_utf8_error_def() -> DefId {
+    lang_def(&["alloc", "string"], crate::def::DefKind::Adt, "FromUtf8Error")
+}
+
+/// The synthetic std Adts collect always registers, as (index, name,
+/// def, is_enum). A user type, alias, or trait of the same name shadows
+/// only the flat name (check/collect.rs); `fmt::Error` never has one.
+/// The driver predicts the same list.
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 4] {
+    [
+        (0, "Ordering", ordering_def(), true),
+        (1, "Error", fmt_error_def(), false),
+        (2, "Utf8Error", utf8_error_def(), false),
+        (3, "FromUtf8Error", from_utf8_error_def(), false),
+    ]
+}
+
+/// The synthetic std Adt a canonical std type path (`std::cmp::Ordering`,
+/// `std::fmt::Error`) names, by its module and name.
+pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
+    let [.., module, name] = path else { return None };
+    [("cmp", "Ordering", ordering_def()), ("fmt", "Error", fmt_error_def()), ("str", "Utf8Error", utf8_error_def()), ("string", "FromUtf8Error", from_utf8_error_def())]
+        .into_iter()
+        .find(|(m, n, _)| m == module && n == name)
+        .map(|(_, _, d)| d)
+}
+
+/// True when the Adt is one of the synthetic std Adts: a std path may
+/// name it, and code outside std sees none of its fields.
+pub fn is_std_adt(tys: &impl TyIntern, a: AdtId) -> bool {
+    std_adts().iter().any(|s| tys.local_adt_of(s.2) == Some(a))
+}
+
 /// The signature of one lang trait method over the trait's generics
 /// (Self at 0, then the inputs): receiver form, parameter types
 /// with the receiver first, return type, and which parameter a
@@ -1905,10 +1946,13 @@ fn resolve_path_ty(
                 let n = interner.get(segs.last().unwrap().name);
                 return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
             }
-            // `std::cmp::Ordering` is the core enum even where a user
-            // type named `Ordering` owns the flat name.
-            if path[1..] == ["cmp", "Ordering"] && !segs[2].has_args() {
-                return Ok(ordering_ty(tys));
+            // `std::cmp::Ordering` is the core enum (and the UTF-8 error
+            // paths the std structs) even where a user type of that name
+            // owns the flat name.
+            if let Some(def) = std_adt_of_path(&path)
+                && !segs.last().unwrap().has_args()
+            {
+                return Ok(tys.intern(TyKind::Adt(def, EMPTY_ARGS)));
             }
             // `core::fmt` types are known by their full path only:
             // `Error` and `Result` must never match a bare name.
@@ -2056,7 +2100,7 @@ fn resolve_path_ty(
         let (t, e) = (it.next().unwrap_or(ERROR), it.next().unwrap_or(ERROR));
         return Ok(tys.mk_result(t, e));
     }
-    if std_path && cx.type_names.get(&name).is_none_or(|&a| tys.local_adt_of(ordering_def()) != Some(a)) {
+    if std_path && cx.type_names.get(&name).is_none_or(|&a| !is_std_adt(tys, a)) {
         return Err(crate::check::collect::std_path_shadowed(interner, name, span));
     }
     if segs.len() == 1
@@ -6951,6 +6995,10 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
             let a = p.adt(adt_id);
             (a.derives, a.span, a.is_enum, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
         };
+        // A synthetic std Adt's derives are std's own, valid as written.
+        if is_std_adt(&p.tys, adt_id) {
+            continue;
+        }
         // Derived `Copy` needs a `Clone` impl on the type, derived or
         // written; derived `Clone` needs every field to clone by
         // structure or through a written non-generic impl the glue

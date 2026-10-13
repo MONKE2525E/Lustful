@@ -796,10 +796,14 @@ pub fn resolve_ty(
                     let n = interner.get(segs.last().unwrap().name);
                     return Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."));
                 }
-                // `std::cmp::Ordering` is the core enum even where a
-                // user type named `Ordering` owns the flat name.
-                if path[1..] == ["cmp", "Ordering"] && !segs[2].has_args() {
-                    return Ok(generics::ordering_ty(tys));
+                // `std::cmp::Ordering` is the core enum (and the UTF-8
+                // error paths the std structs) even where a user type of
+                // that name owns the flat name.
+                let last = segs.last().unwrap();
+                if let Some(def) = generics::std_adt_of_path(&path)
+                    && !last.has_args()
+                {
+                    return Ok(tys.intern(TyKind::Adt(def, EMPTY_ARGS)));
                 }
                 segs.last().unwrap()
             } else if segs.len() == 1 {
@@ -908,7 +912,7 @@ pub fn resolve_ty(
             // A std path names std's type, never a user type or alias
             // of the same name (std's `Ordering` is the one std Adt).
             if let Some(&adt) = type_names.get(&name)
-                && (!std_prefixed || tys.local_adt_of(generics::ordering_def()) == Some(adt))
+                && (!std_prefixed || generics::is_std_adt(tys, adt))
             {
                 return no_generics(tys.adt_ty(adt));
             }
@@ -1857,24 +1861,31 @@ pub fn collect_reuse<'a>(
             adt_srcs.push((idx, name, span, is_enum, hash));
         }
     }
-    // `core::cmp::Ordering` is an ordinary fieldless enum Adt with a
-    // builtin def (lang signatures name it; its variants and derives
-    // are the plain enum machinery). It takes part in the same stable
-    // ranking as user Adts (the driver predicts the same set: see
-    // `predicted_def_ids`). A user type, alias, or trait of the same
-    // name shadows it in the flat name table, as with any name here;
-    // the Adt itself always exists, so `cmp`, `partial_cmp`, and the
-    // full `std::cmp::Ordering` paths still name the core type.
-    let ordering_name = interner.intern("Ordering");
-    let ordering_taken = adt_srcs.iter().any(|s| s.1 == ordering_name)
-        || p.gx.trait_names.contains_key(&ordering_name)
-        || ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Type(a) if a.name == ordering_name));
-    adt_srcs.push((usize::MAX, ordering_name, Span::default(), true, generics::ordering_def().hash));
-    // `core::fmt::Error`, the unit struct of `fmt::Result` (W-STD-B):
-    // always present, never in the flat name table (only `fmt::Error`
-    // paths reach it; see `generics::resolve_fmt_path`).
-    let fmt_error_name = interner.intern("Error");
-    adt_srcs.push((usize::MAX - 1, fmt_error_name, Span::default(), false, generics::fmt_error_def().hash));
+    // The synthetic std Adts (`generics::std_adts`): `core::cmp::Ordering`
+    // is an ordinary fieldless enum with a builtin def (lang signatures
+    // name it; its variants and derives are the plain enum machinery),
+    // `fmt::Error` the unit struct of `fmt::Result` (W-STD-B), and
+    // `str::Utf8Error` and `string::FromUtf8Error` plain structs
+    // (W-STD-A). They take part in the same stable ranking as user Adts
+    // (the driver predicts the same set: see `predicted_def_ids`). A
+    // user type, alias, or trait of the same name shadows one in the
+    // flat name table, as with any name here; the Adt itself always
+    // exists, so `cmp`, `from_utf8`, and the full std paths still name
+    // the std type. `fmt::Error` never enters the flat name table (only
+    // `fmt::Error` paths reach it; see `generics::resolve_fmt_path`).
+    // Index k marks its source as `usize::MAX - k`.
+    let std_taken: Vec<Sym> = generics::std_adts()
+        .iter()
+        .map(|s| interner.intern(s.1))
+        .filter(|&n| {
+            adt_srcs.iter().any(|s| s.1 == n)
+                || p.gx.trait_names.contains_key(&n)
+                || ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Type(a) if a.name == n))
+        })
+        .collect();
+    for (k, name, def, is_enum) in generics::std_adts() {
+        adt_srcs.push((usize::MAX - k, interner.intern(name), Span::default(), is_enum, def.hash));
+    }
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -1900,68 +1911,63 @@ pub fn collect_reuse<'a>(
     }
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
-        if item_idx == usize::MAX - 1 {
-            // The synthetic `fmt::Error` unit struct (see above), with
-            // core's derives; its Display is the runtime's.
+        if item_idx > usize::MAX - 4 {
+            // A synthetic std Adt (see above): variants, fields, and
+            // derives are std's, written here directly (no AST item).
             let id = AdtId(adt_base as u32 + rank);
-            let def = generics::fmt_error_def();
-            p.adts[id.0 as usize] = AdtDef {
-                name,
-                is_enum: false,
-                variants: vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+            let unit = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc };
+            let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty };
+            let named = |fields: Vec<Field>| vec![Variant { name, shape: VariantShape::Named, fields, disc: 0 }];
+            let (def, variants, derives) = match usize::MAX - item_idx {
+                0 => (
+                    generics::ordering_def(),
+                    vec![unit("Less", -1), unit("Equal", 0), unit("Greater", 1)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, partial_ord: true, ord: true, ..Derives::default() },
+                ),
                 // core: `#[derive(Copy, Clone, Debug, Default, Eq, Hash,
-                // Ord, PartialEq, PartialOrd)]`.
-                derives: Derives {
-                    debug: true,
-                    clone: true,
-                    copy: true,
-                    partial_eq: true,
-                    eq: true,
-                    hash: true,
-                    partial_ord: true,
-                    ord: true,
-                    default: true,
-                    default_variant: None,
-                },
-                span,
-                repr: crate::ty::layout::Repr::default(),
+                // Ord, PartialEq, PartialOrd)]`; its Display is the runtime's.
+                1 => (
+                    generics::fmt_error_def(),
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+                    Derives {
+                        debug: true,
+                        clone: true,
+                        copy: true,
+                        partial_eq: true,
+                        eq: true,
+                        hash: true,
+                        partial_ord: true,
+                        ord: true,
+                        default: true,
+                        default_variant: None,
+                    },
+                ),
+                2 => {
+                    let error_len = p.tys.mk_option(int(IntTy::U8));
+                    (
+                        generics::utf8_error_def(),
+                        named(vec![field("valid_up_to", int(IntTy::Usize)), field("error_len", error_len)]),
+                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                _ => {
+                    let bytes = p.tys.mk_vec(int(IntTy::U8));
+                    let error = p.tys.intern(TyKind::Adt(generics::utf8_error_def(), EMPTY_ARGS));
+                    (
+                        generics::from_utf8_error_def(),
+                        named(vec![field("bytes", bytes), field("error", error)]),
+                        Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
             };
+            p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            p.tys.register_adt(def, id);
-            p.defs.insert_adt(def, id, DefData::skeleton(DefsKind::Struct, None, name, Vis::Pub, span));
-            p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
-            continue;
-        }
-        if item_idx == usize::MAX {
-            // The synthetic `Ordering` Adt (see above): variants and
-            // derives are core's, written here directly (no AST item).
-            let id = AdtId(adt_base as u32 + rank);
-            let def = generics::ordering_def();
-            let variant = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc };
-            p.adts[id.0 as usize] = AdtDef {
-                name,
-                is_enum: true,
-                variants: vec![variant("Less", -1), variant("Equal", 0), variant("Greater", 1)],
-                derives: Derives {
-                    debug: true,
-                    clone: true,
-                    copy: true,
-                    partial_eq: true,
-                    eq: true,
-                    hash: true,
-                    partial_ord: true,
-                    ord: true,
-                    ..Derives::default()
-                },
-                span,
-                repr: crate::ty::layout::Repr::default(),
-            };
-            p.gx.adt_info[id.0 as usize] = (def, 0);
-            if !ordering_taken {
+            if usize::MAX - item_idx != 1 && !std_taken.contains(&name) {
                 p.type_names.insert(name, id);
             }
             p.tys.register_adt(def, id);
-            p.defs.insert_adt(def, id, DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span));
+            let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
+            p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Pub, span));
             p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             continue;
         }
@@ -4622,7 +4628,9 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         _ => {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
-                || tys.adt_parts(t).is_some_and(|(d, _)| d == crate::check::generics::fmt_error_def())
+                || tys.adt_parts(t).is_some_and(|(d, _)| {
+                    d == crate::check::generics::fmt_error_def() || d == generics::utf8_error_def() || d == generics::from_utf8_error_def()
+                })
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))
         }
     }

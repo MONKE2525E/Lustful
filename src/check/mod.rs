@@ -4,6 +4,7 @@
 pub mod closure;
 pub mod cells;
 pub mod process;
+pub mod utf8;
 pub mod collect;
 pub mod constfn;
 pub mod convert;
@@ -383,6 +384,15 @@ pub enum Builtin {
     CellSwap,
     /// `ExitCode::from(u8)` (check/process.rs).
     ExitCodeFrom,
+    /// UTF-8 decoding (check/utf8.rs): `String::from_utf8`,
+    /// `str::from_utf8`, and the methods of their errors.
+    StringFromUtf8,
+    StrFromUtf8,
+    FromUtf8ErrorUtf8Error,
+    FromUtf8ErrorAsBytes,
+    FromUtf8ErrorIntoBytes,
+    Utf8ErrorValidUpTo,
+    Utf8ErrorErrorLen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1624,6 +1634,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// rechecks this body when a visibility it asked about changes.
     fn check_field_vis(&mut self, a: AdtId, field: Sym, span: Span) {
         let p = self.p;
+        // The fields of std's structs are private to std.
+        if generics::is_std_adt(&p.tys, a) {
+            let name = self.name(field).to_string();
+            self.err("L0510", span, format!("field `{name}` is private"), "Use the type's methods instead.");
+            return;
+        }
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
@@ -7378,6 +7394,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("mem", "take") => Some(Builtin::MemTake),
                 ("cmp", "max") => Some(Builtin::CmpMax),
                 ("cmp", "min") => Some(Builtin::CmpMin),
+                ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
                 _ => None,
             };
             if let Some(b) = b {
@@ -7402,6 +7419,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The first segment is a type-namespace binding read (`Self` is a
         // scope name, not a binding, and records nothing).
         let ty_bound = if ty_name == k.self_type { BindingRes::Absent } else { self.binding(Namespace::Type, ty_name) };
+        if ty_name == k.String || ty_name == k.str {
+            if let Some(r) = self.utf8_assoc(ty_name == k.String, item, span) {
+                return r;
+            }
+        }
         if ty_name == k.String {
             let b = if item == k.new {
                 Builtin::StringNew
@@ -7531,7 +7553,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         // A std path names std's type, never a user type of the same
         // name (std's `Ordering` is the one std Adt here).
-        if std_ty && p.tys.local_adt_of(generics::ordering_def()) != Some(a) {
+        if std_ty && !generics::is_std_adt(&p.tys, a) {
             self.errs.push(collect::std_path_shadowed(p.interner, ty_name, span));
             return None;
         }
@@ -9029,6 +9051,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.cell_call_sig(b, callee)
                     }
                     Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
+                    Builtin::StringFromUtf8 | Builtin::StrFromUtf8 => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
                         let rc = self.tys.mk_rc(elem);
@@ -9855,6 +9878,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `Weak`, `RefCell`, and `Cell` methods (check/cells.rs).
         if let Some(ret) = self.cell_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        if let Some(ret) = self.utf8_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         use Builtin as B;

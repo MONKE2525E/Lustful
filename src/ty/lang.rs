@@ -785,6 +785,8 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std", "core"], "cell", "Cell"),
     (&["std", "core"], "cmp", "Ordering"),
     (&["std"], "process", "ExitCode"),
+    (&["std", "core"], "str", "Utf8Error"),
+    (&["std", "alloc"], "string", "FromUtf8Error"),
 ];
 
 /// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
@@ -850,6 +852,10 @@ const STD_TYPE_PATHS: &[&str] = &[
     "core/cmp/Ordering",
     "std/cmp/Ordering",
     "std/process/ExitCode",
+    "core/str/Utf8Error",
+    "std/str/Utf8Error",
+    "alloc/string/FromUtf8Error",
+    "std/string/FromUtf8Error",
     "std/collections/HashMap",
     "std/collections/HashSet",
     "alloc/collections/BTreeMap",
@@ -1010,6 +1016,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/cmp/max",
     "core/cmp/min",
     "std/cmp/min",
+    "core/str/from_utf8",
+    "std/str/from_utf8",
     "std/env/args",
     "std/process/exit",
     "std/process/abort",
@@ -1178,6 +1186,14 @@ pub fn std_is_primitive_path(path: &[&str]) -> bool {
                 | "reference"
                 | "fn"
         )
+}
+
+/// True for the names of the primitive types a type path can name.
+pub fn is_primitive_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool" | "char" | "str" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "f16" | "f32" | "f64" | "f128"
+    )
 }
 
 #[cfg(test)]

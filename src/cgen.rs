@@ -800,6 +800,20 @@ fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
     }
 }
 
+/// The `Utf8Error` value inside a std `FromUtf8Error` or `Utf8Error`
+/// value `e` (synthetic std Adts, check/collect.rs); None for any other
+/// type.
+fn utf8_error_part(p: &Program, t: &CTy, e: &str) -> Option<String> {
+    let CTy::Adt(a) = t else { return None };
+    if p.tys.local_adt_of(crate::check::generics::from_utf8_error_def()) == Some(*a) {
+        Some(format!("({e}).f1"))
+    } else if p.tys.local_adt_of(crate::check::generics::utf8_error_def()) == Some(*a) {
+        Some(format!("({e})"))
+    } else {
+        None
+    }
+}
+
 /// The C field access for field `fi` of variant `vi` in the enum or
 /// Option value expression `e`. Only Options differ between the layout
 /// and legacy shapes; Adt enums keep `.u.v{vi}.f{fi}` in both.
@@ -2901,6 +2915,71 @@ impl FnGen<'_, '_, '_> {
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
+            B::StringFromUtf8 | B::StrFromUtf8 => {
+                // Validate, then build `Ok(text)` or `Err(error)` with
+                // Rust's `valid_up_to` and `error_len` (runtime core.c).
+                let p = self.p;
+                let string = b == B::StringFromUtf8;
+                let (Some(fe), Some(ue)) = (p.tys.local_adt_of(crate::check::generics::from_utf8_error_def()), p.tys.local_adt_of(crate::check::generics::utf8_error_def()))
+                else {
+                    unreachable!("from_utf8 type-checks only with std's error Adts")
+                };
+                let (ok, err) = if string { (CTy::String, CTy::Adt(fe)) } else { (CTy::Ref(Box::new(CTy::Str)), CTy::Adt(ue)) };
+                let res = CTy::Result(Box::new(ok), Box::new(err));
+                let opt = CTy::Option(Box::new(CTy::Int(IntTy::U8)));
+                let (t, vu, el) = (self.tmp(), self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+                let (ptr, len, ok_val, bytes) = if string {
+                    let v = self.tmp();
+                    let _ = writeln!(self.out, "    lust_Vec {v} = {};", vals[0]);
+                    (
+                        format!("((const uint8_t*){v}.ptr)"),
+                        format!("{v}.len"),
+                        format!("(lust_String){{ (uint8_t*){v}.ptr, {v}.len, {v}.cap }}"),
+                        Some(v),
+                    )
+                } else {
+                    let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                    let ok_val = format!("(lust_str){{ (uint8_t*){ptr}, {len} }}");
+                    (format!("((const uint8_t*){ptr})"), len, ok_val, None)
+                };
+                // The `Utf8Error` part of the error value.
+                let u = if string { format!("{err_f}.f1") } else { err_f.clone() };
+                let o = format!("{u}.f1");
+                let (some_f, some_d, none_d) = (variant_field(p, &opt, &o, 1, 0), disc_set(p, &opt, &o, 1), disc_set(p, &opt, &o, 0));
+                let rt = ctype(&res);
+                let _ = writeln!(self.out, "    uint64_t {vu} = 0; uint8_t {el} = 0; {rt} {t};");
+                let _ = writeln!(self.out, "    if (lust_utf8_check({ptr}, {len}, &{vu}, &{el})) {{ {ok_f} = {ok_val}; {ok_d} }}");
+                let keep = bytes.map_or(String::new(), |v| format!("{err_f}.f0 = {v}; "));
+                let _ = writeln!(
+                    self.out,
+                    "    else {{ {keep}{u}.f0 = {vu}; if ({el}) {{ {some_f} = {el}; {some_d} }} else {{ {none_d} }} {err_d} }}"
+                );
+                t
+            }
+            B::FromUtf8ErrorUtf8Error => format!("(*{}).f1", vals[0]),
+            B::FromUtf8ErrorAsBytes => {
+                let sl = ctype(&CTy::Slice(Box::new(CTy::Int(IntTy::U8))));
+                format!("(({sl}){{ (uint8_t*)(*{0}).f0.ptr, (*{0}).f0.len }})", vals[0])
+            }
+            B::FromUtf8ErrorIntoBytes => format!("({}).f0", vals[0]),
+            B::Utf8ErrorValidUpTo => format!("(*{}).f0", vals[0]),
+            B::Utf8ErrorErrorLen => {
+                let p = self.p;
+                let (o8, o64) = (CTy::Option(Box::new(CTy::Int(IntTy::U8))), CTy::Option(Box::new(CTy::Int(IntTy::Usize))));
+                let src = format!("(*{}).f1", vals[0]);
+                let t = self.tmp();
+                let disc = disc_call(p, &o8, &format!("&{src}"));
+                let (some_f, some_d, none_d) = (variant_field(p, &o64, &t, 1, 0), disc_set(p, &o64, &t, 1), disc_set(p, &o64, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; if ({disc}) {{ {some_f} = (uint64_t){}; {some_d} }} else {{ {none_d} }}",
+                    ctype(&o64),
+                    variant_field(p, &o8, &src, 1, 0)
+                );
+                t
+            }
             B::RcWeakCount => format!("((*{})->weak - 1)", vals[0]),
             B::RcGetMut => {
                 let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };

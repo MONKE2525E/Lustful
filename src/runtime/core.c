@@ -1403,6 +1403,65 @@ uint32_t lust_utf8_prev(const uint8_t *p, uint64_t *end) LUST_BODY({
     return c;
 })
 
+/* UTF-8 validation with Rust's error report (core::str::validations::
+   run_utf8_validation): 1 when `v` is valid; else 0 with the length of
+   the valid prefix and the invalid sequence's length (1 to 3), or 0 when
+   the input ends inside a sequence (Rust's `error_len() == None`). */
+int lust_utf8_check(const uint8_t *v, uint64_t len, uint64_t *valid_up_to, uint8_t *error_len) LUST_BODY({
+    uint64_t i = 0;
+    while (i < len) {
+        uint64_t start = i;
+        uint8_t first = v[i];
+        if (first < 0x80) {
+            i++;
+            continue;
+        }
+        uint8_t el = 1;
+        int w = (first >= 0xC2 && first <= 0xDF) ? 2 : (first >= 0xE0 && first <= 0xEF) ? 3 : (first >= 0xF0 && first <= 0xF4) ? 4 : 0;
+        if (w == 0) goto bad;
+        if (++i >= len) { el = 0; goto bad; }
+        uint8_t b = v[i];
+        if (w == 2) {
+            if ((b & 0xC0) != 0x80) goto bad;
+        } else {
+            int ok = w == 3
+                ? ((first == 0xE0 && b >= 0xA0 && b <= 0xBF) || (first >= 0xE1 && first <= 0xEC && b >= 0x80 && b <= 0xBF)
+                   || (first == 0xED && b >= 0x80 && b <= 0x9F) || (first >= 0xEE && b >= 0x80 && b <= 0xBF))
+                : ((first == 0xF0 && b >= 0x90 && b <= 0xBF) || (first >= 0xF1 && first <= 0xF3 && b >= 0x80 && b <= 0xBF)
+                   || (first == 0xF4 && b >= 0x80 && b <= 0x8F));
+            if (!ok) goto bad;
+            el = 2;
+            if (++i >= len) { el = 0; goto bad; }
+            if ((v[i] & 0xC0) != 0x80) goto bad;
+            if (w == 4) {
+                el = 3;
+                if (++i >= len) { el = 0; goto bad; }
+                if ((v[i] & 0xC0) != 0x80) goto bad;
+            }
+        }
+        i++;
+        continue;
+    bad:
+        *valid_up_to = start;
+        *error_len = el;
+        return 0;
+    }
+    return 1;
+})
+
+/* `Display` of `str::Utf8Error` (and `FromUtf8Error`, which shows its
+   `Utf8Error`): Rust writes it with `write!`, so no padding applies. */
+void lust_fmt_utf8_error(lust_String *out, uint64_t valid_up_to, uint32_t has_len, uint64_t len) LUST_BODY({
+    if (has_len) {
+        lust_string_push_cstr(out, "invalid utf-8 sequence of ");
+        lust_fmt_u64(out, len);
+        lust_string_push_cstr(out, " bytes from index ");
+    } else {
+        lust_string_push_cstr(out, "incomplete utf-8 byte sequence from index ");
+    }
+    lust_fmt_u64(out, valid_up_to);
+})
+
 /* char::to_digit. Returns 0xFFFFFFFF for "not a digit". */
 uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
     if (radix < 2 || radix > 36) lust_panic_cstr("to_digit: invalid radix -- radix must be in the range 2 to 36 inclusive", loc);

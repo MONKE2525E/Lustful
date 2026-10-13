@@ -339,6 +339,13 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CellGetMut,
     Builtin::CellSwap,
     Builtin::ExitCodeFrom,
+    Builtin::StringFromUtf8,
+    Builtin::StrFromUtf8,
+    Builtin::FromUtf8ErrorUtf8Error,
+    Builtin::FromUtf8ErrorAsBytes,
+    Builtin::FromUtf8ErrorIntoBytes,
+    Builtin::Utf8ErrorValidUpTo,
+    Builtin::Utf8ErrorErrorLen,
 ];
 
 /// How a builtin is called.
@@ -677,6 +684,13 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::CellGetMut => (&["Cell<T>"], vec![i.intern("get_mut")], Call::Method),
         B::CellSwap => (&["Cell<T>"], vec![i.intern("swap")], Call::Method),
         B::ExitCodeFrom => (&["std::process::ExitCode"], vec![k.from], Call::Associated),
+        B::StringFromUtf8 => (&["String"], vec![i.intern("from_utf8")], Call::Associated),
+        B::StrFromUtf8 => (&["str", "std::str"], vec![i.intern("from_utf8")], Call::Associated),
+        B::FromUtf8ErrorUtf8Error => (&["std::string::FromUtf8Error"], vec![i.intern("utf8_error")], Call::Method),
+        B::FromUtf8ErrorAsBytes => (&["std::string::FromUtf8Error"], vec![i.intern("as_bytes")], Call::Method),
+        B::FromUtf8ErrorIntoBytes => (&["std::string::FromUtf8Error"], vec![i.intern("into_bytes")], Call::Method),
+        B::Utf8ErrorValidUpTo => (&["std::str::Utf8Error"], vec![i.intern("valid_up_to")], Call::Method),
+        B::Utf8ErrorErrorLen => (&["std::str::Utf8Error"], vec![i.intern("error_len")], Call::Method),
     }
 }
 

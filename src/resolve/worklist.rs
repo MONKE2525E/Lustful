@@ -4229,6 +4229,15 @@ impl Rewrite<'_> {
                     .next()
             });
         let Some(alias) = alias else { return false };
+        // A module import does not shadow a primitive type in a type
+        // position: `use std::str;` keeps `&str` the primitive.
+        if names.len() == 1
+            && ns == Namespace::Type
+            && crate::ty::lang::is_primitive_type_name(self.interner.get(first))
+            && crate::ty::lang::std_is_module_path(&alias.iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>())
+        {
+            return false;
+        }
         let mut out: Vec<PathSeg> = alias.iter().map(|s| PathSeg::plain(*s)).collect();
         // Turbofish on the imported name belongs on the aliased item.
         if let Some(last) = out.last_mut() {
