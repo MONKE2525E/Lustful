@@ -1228,6 +1228,11 @@ fn slot_update(
         caches.slot_used[slot].clear();
         caches.slot_fp[slot] = 0;
         caches.slot_ir[slot] = None;
+        // A fn of the same identity and text can come back (an edit
+        // undone, a nested fn's `#nested{k}` index moving back). It
+        // must not look unchanged and passing with this empty C.
+        front.slot_hash[slot] = 0;
+        front.slot_head[slot] = 0;
     }
     // Re-check a function if its body changed, or it is new, or its body mentions a changed
     // function's name (only possible in the "signatures" case). A function in the last
@@ -1276,6 +1281,15 @@ fn slot_update(
         // own head creates. The stored hash advances with the body
         // hash below, before the check runs, under the same rule.
         let head_same = front.slot_head[slot] == heads[i];
+        // A body whose C names a slot that is dead now rechecks, so its
+        // C is made again. Slots are append-only, so that callee lives
+        // at a new slot: its stable identity moved while this caller's
+        // text stayed (a nested fn's `#nested{k}` index moves when an
+        // earlier body gains or loses an item). No read covers it.
+        let calls_dead = caches.slot_used[slot].iter().any(|&u| live.get(u as usize) == Some(&false) && !front.inst_slot[u as usize]);
+        if calls_dead {
+            caches.ok[slot] = false;
+        }
         if (full_walk || const_fn_changed) && body_same && head_same && caches.ok[slot] {
             // Full-mode (or const-fn-edit) candidate: the body is unchanged and passed
             // before, so only its recorded reads can dirty it. It

@@ -658,6 +658,47 @@ def case_nested_items():
     check("nested items: no warm panic", "panicked" not in err, err[-300:])
 
 
+def case_moved_and_revived_slots():
+    # 16. A nested fn's identity holds its `#nested{k}` stmt index.
+    # (a) A removed fn's slot kept its body hash while marked passing
+    # with no C, so the same fn put back was reused unchecked: a check
+    # that cold rejects passed warm. (b) An item added to an earlier
+    # body moves every later nested fn to a new slot while its parent's
+    # text stays: the parent's reused C called the dead old slots, and
+    # the warm binary crashed.
+    work = tempfile.mkdtemp(prefix="lust-driver-moved-slots-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    d.start()
+    bad = "fn f() -> i64 {\n    fn g() -> bool { 5 }\n    1\n}\n\nfn main() {\n    println!(\"{}\", f());\n}\n"
+    codes = []
+    for text in (bad, bad.replace("    fn g() -> bool { 5 }\n", ""), bad):
+        open(src, "w").write(text)
+        codes.append(d.run(["check", src], expect=None).returncode)
+    check("revived nested fn rechecks", codes == [1, 0, 1], str(codes))
+
+    def tree(first):
+        # The const routes the file through the resolver path.
+        parts = []
+        for name, k, nested in (("f0", 9, first), ("f1", 5, [2, 1]), ("f2", 5, [4, 4]), ("f3", 9, [8, 7])):
+            lines = [f"fn {name}() -> i64 {{"] + [f"    fn {name}_g{j}() -> i64 {{ {v} }}" for j, v in enumerate(nested)]
+            terms = [str(k)] + [f"{name}_g{j}()" for j in range(len(nested))]
+            if name == "f1":
+                lines.append("    const K: i64 = 6;")
+                terms.append("K")
+            parts.append("\n".join(lines + ["    " + " + ".join(terms), "}"]))
+        return "\n\n".join(parts + ['fn main() {\n    println!("{}", f0() + f1() + f2() + f3());\n}']) + "\n"
+
+    for name, text, want in (("moved nested slots: base", tree([]), "60"), ("moved nested slots", tree([7]), "67")):
+        open(src, "w").write(text)
+        r = d.run(["build", src, "-o", out], expect=None)
+        prog = subprocess.run([out], capture_output=True, text=True) if r.returncode == 0 else None
+        got = (prog.returncode, prog.stdout.strip()) if prog else r.stderr[-200:]
+        check(name, got == (0, want), str(got))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -673,6 +714,7 @@ def main():
     case_moved_instance_ids()
     case_new_empty_unit()
     case_nested_items()
+    case_moved_and_revived_slots()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
