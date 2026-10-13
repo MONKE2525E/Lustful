@@ -1934,6 +1934,11 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_ne!(layout_of_src(base), layout_of_src(&field_edit), "field edit moves the layout");
         let derive_edit = base.replace("struct Foo", "#[derive(Clone)]\nstruct Foo");
         assert_ne!(layout_of_src(base), layout_of_src(&derive_edit), "derive edit moves the layout fingerprint");
+        let eq_base = base.replace("struct Foo", "#[derive(PartialEq, Eq, Hash)]\nstruct Foo");
+        for (from, to) in [("Eq, Hash", "Hash"), ("Eq, Hash", "Eq")] {
+            let edited = eq_base.replace(from, to);
+            assert_ne!(layout_of_src(&eq_base), layout_of_src(&edited), "an `Eq` or `Hash` derive edit moves the layout");
+        }
         with_program(base, |interner, p| {
             let a = p.type_names[&interner.intern("Foo")];
             let def = p.def_of_adt(a);
