@@ -3955,7 +3955,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let sel = self.select_obligation_at(tr, span, 0);
             let from_fn = match &sel {
                 Selection::Impl { id, args: impl_args, .. } => {
-                    self.method_instance_for_impl(e, *id, tr, *impl_args, "from", span).map(|(local, _, _)| local)
+                    self.method_instance_for_impl(e, *id, tr, impl_args.clone(), "from", span).map(|(local, _, _)| local)
                 }
                 _ => None,
             };
