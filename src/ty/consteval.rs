@@ -89,6 +89,11 @@ pub trait ConstCx<'a> {
     fn ast(&self) -> &'a Ast;
     /// A const item or immutable static by name, evaluating it if needed.
     fn const_item(&mut self, name: Sym) -> Option<TypedValue>;
+    /// An inherent associated const by its path (`Type::CONST`,
+    /// module segments may lead), evaluating it if needed.
+    fn assoc_const_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
+        None
+    }
     /// A call target for a callee expression already known to be a path.
     fn call_target(&mut self, callee: ExprId) -> CallTarget;
     /// A path used as a value: a unit variant, if it names one.
@@ -825,6 +830,12 @@ impl Evaluator {
             if let Some(v) = self.int_assoc_const(cx, segs) {
                 return Ok(v);
             }
+        }
+        // Inherent associated consts of user types: `Type::CONST`.
+        if segs.len() >= 2
+            && let Some(v) = cx.assoc_const_item(segs)
+        {
+            return Ok(v);
         }
         if let Some(v) = self.float_assoc_const(cx, segs) {
             return Ok(v);

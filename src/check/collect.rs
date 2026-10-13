@@ -120,6 +120,13 @@ pub struct Program<'a> {
     /// into `consts`. They are const items like free consts, but not
     /// in `const_names`: a plain name must never find them.
     pub assoc_const_names: HashMap<(AdtId, Sym), u32>,
+    /// Associated const values of trait impls: (impl def, assoc
+    /// def) to an index into `consts`. Filled with the other const
+    /// tables in `eval_const_items`, before template checks run.
+    pub impl_assoc_consts: HashMap<(DefId, DefId), u32>,
+    /// Trait associated const default values: assoc def to an
+    /// index into `consts`.
+    pub trait_assoc_const_values: HashMap<DefId, u32>,
     /// Evaluated static items, and name to index. Codegen emits these as
     /// static data in the glue unit.
     pub statics: Vec<StaticItem>,
@@ -239,6 +246,19 @@ impl<'a> Program<'a> {
     /// The index of the const item with this def, if this crate defines it.
     pub fn const_by_def(&self, def: DefId) -> Option<u32> {
         self.const_defs.iter().position(|&d| d == def).map(|i| i as u32)
+    }
+    /// The index into `consts` of an inherent associated const.
+    /// Materialized Adt instances answer through their template:
+    /// the value is evaluated once per impl (an initializer that
+    /// names the impl's own parameters fails evaluation and never
+    /// reaches the table, so one value serves every instance).
+    pub fn inherent_assoc_const(&self, adt: AdtId, name: Sym) -> Option<u32> {
+        if let Some(&i) = self.assoc_const_names.get(&(adt, name)) {
+            return Some(i);
+        }
+        let def = self.defs.def_of_adt(adt)?;
+        let template = self.defs.local_adt(def)?;
+        self.assoc_const_names.get(&(template, name)).copied()
     }
     /// The index of the static item with this def, if this crate defines it.
     pub fn static_by_def(&self, def: DefId) -> Option<u32> {
@@ -489,6 +509,76 @@ pub fn resolve_ty(
 /// const evaluator (ARCH 2.13) in `ty::consteval`.
 pub fn eval_array_len(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<u128> {
     u128::try_from(eval_const_int(ast, interner, known, e)?).ok()
+}
+
+/// The value expression of a named const found by scanning the
+/// crate's items: a free const item for one name, an inherent
+/// associated const for two (`Type::CONST`, by flat type name).
+/// Signature-form const resolution uses this before the const
+/// tables exist; the scan is by written (flat) name, as the
+/// scalar interpreter's own lookups are.
+fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
+    match names {
+        [name] => {
+            for item in &ast.items {
+                if let ItemKind::Const(c) = &item.kind
+                    && c.name == Some(*name)
+                    && let Some(v) = c.value
+                {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        [ty_name, name] => {
+            for item in &ast.items {
+                let ItemKind::Impl(imp) = &item.kind else { continue };
+                if imp.trait_ref.is_some() {
+                    continue;
+                }
+                let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
+                if segs.first().map(|s| s.name) != Some(*ty_name) {
+                    continue;
+                }
+                for c in &imp.consts {
+                    if c.name == *name
+                        && let Some(v) = c.default
+                    {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The integer value of a named const (see `named_const_expr`),
+/// for const generic arguments written as bare paths.
+pub fn named_const_int(ast: &Ast, interner: &Interner, known: &Known, names: &[Sym]) -> Option<u128> {
+    let e = named_const_expr(ast, names)?;
+    u128::try_from(eval_const_int(ast, interner, known, e)?).ok()
+}
+
+/// The const-generic value of a free const item by name, in the
+/// kind of its declared type: an integer const for the integer
+/// types, `Bool` for `bool`, `Char` for `char`.
+pub fn named_const_kind(ast: &Ast, interner: &Interner, known: &Known, name: Sym) -> Option<ConstKind> {
+    for item in &ast.items {
+        let ItemKind::Const(c) = &item.kind else { continue };
+        if c.name != Some(name) {
+            continue;
+        }
+        let v = c.value?;
+        let scalar = eval_const_int(ast, interner, known, v)?;
+        return match ast.ty(c.ty) {
+            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.bool => Some(ConstKind::Bool(scalar != 0)),
+            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char => char::from_u32(scalar as u32).map(ConstKind::Char),
+            _ => u128::try_from(scalar).ok().map(ConstKind::Int),
+        };
+    }
+    None
 }
 
 /// A `size_of::<T>()` or `align_of::<T>()` array length, for types whose
@@ -876,20 +966,20 @@ fn eval_scalar(
             }
             // A reference to another const item, found by scanning the
             // crate's items (collect evaluates all of them later anyway).
-            let mut out = None;
-            for item in &ast.items {
-                if let ItemKind::Const(c) = &item.kind
-                    && c.name == Some(name)
-                    && let Some(v) = c.value
-                {
-                    let mut empty = Vec::new();
-                    out = val(ast, interner, known, v, depth + 1, &mut empty, steps);
-                    break;
-                }
-            }
+            let out = named_const_expr(ast, &[name]).and_then(|v| {
+                let mut empty = Vec::new();
+                val(ast, interner, known, v, depth + 1, &mut empty, steps)
+            });
             SFlow::V(out)
         }
         Expr::Path(segs) if segs.len() == 2 => {
+            // An inherent associated const (`Type::CONST`), found by
+            // scanning the crate's impls like a free const above.
+            if let Some(v) = named_const_expr(ast, &[segs[0].name, segs[1].name]) {
+                let mut empty = Vec::new();
+                let out = val(ast, interner, known, v, depth + 1, &mut empty, steps);
+                return SFlow::V(out);
+            }
             // `i64::MAX` and friends by written name.
             let out = known.int_ty(segs[0].name).and_then(|it| {
                 let item = interner.get(segs[1].name);
@@ -1147,6 +1237,8 @@ pub fn collect_reuse<'a>(
         fns: Vec::new(),
         consts: Vec::new(),
         assoc_const_names: HashMap::default(),
+        impl_assoc_consts: HashMap::default(),
+        trait_assoc_const_values: HashMap::default(),
         const_names: HashMap::default(),
         const_defs: Vec::new(),
         static_defs: Vec::new(),
@@ -1998,8 +2090,8 @@ pub fn collect_reuse<'a>(
                         &mut errs,
                     );
                 }
-                // Inherent associated consts are evaluated by
-                // eval_assoc_consts below (W-RESOLVE phase 2).
+                // Associated consts are evaluated with the const
+                // items below (W-RESOLVE phase 2).
             }
             _ => {}
         }
@@ -2061,6 +2153,13 @@ pub fn collect_reuse<'a>(
             }
         }
     }
+    // Const and static items: register names first, then evaluate with the
+    // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
+    // so one bad item reports once; collection fails anyway on the error.
+    // This runs before `finish_collect`: its template checks (and, in a
+    // build, the instance checks in mono) read consts, statics, and assoc
+    // consts from these tables, in generic and plain bodies alike.
+    eval_const_items(&mut p, &mut errs, &mut def_order.statics);
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
@@ -2075,14 +2174,19 @@ pub fn collect_reuse<'a>(
             ));
         }
     }
-    // Const and static items: register names first, then evaluate with the
-    // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
-    // so one bad item reports once; collection fails anyway on the error.
-    eval_const_items(&mut p, &mut errs, &mut def_order.statics);
-    eval_assoc_consts(&mut p, &mut errs);
 
     *reuse = std::mem::take(&mut p.gx.reuse);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
+}
+
+/// Where an associated const's evaluated value lands.
+enum PendingAssoc {
+    /// An inherent impl const: `assoc_const_names` under its Adt.
+    Inherent { owner: AdtId, impl_def: DefId },
+    /// A trait impl const: `impl_assoc_consts` under its impl.
+    TraitImpl { impl_def: DefId, assoc: DefId },
+    /// A trait default: `trait_assoc_const_values`.
+    TraitDefault { trait_def: DefId, assoc: DefId },
 }
 
 /// One const or static item waiting for evaluation.
@@ -2097,6 +2201,8 @@ struct PendingConst {
     is_static: Option<bool>,
     /// The index in `Program::statics` for a static item.
     static_idx: u32,
+    /// Set for an associated const (never a plain-name lookup).
+    assoc: Option<PendingAssoc>,
 }
 
 enum PendingState {
@@ -2167,8 +2273,13 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                 ));
             }
         }
-        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx }, PendingState::Todo));
+        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None }, PendingState::Todo));
     }
+    // Associated consts evaluate in the same pending list, so a
+    // free const can read an inherent associated const (and back)
+    // with the same cycle detection as free items.
+    let mut assoc_by_key: HashMap<(Sym, Sym), usize> = HashMap::default();
+    register_assoc_consts(p, errs, &mut pending, &mut assoc_by_key);
     if pending.is_empty() {
         return;
     }
@@ -2200,7 +2311,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         static_count = nested;
     }
     let n = pending.len();
-    let mut cx = CollectCx { p, pending, by_name, errs };
+    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, errs };
     for i in 0..n {
         cx.eval_pending(i);
     }
@@ -2209,6 +2320,33 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
     let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
     for (item, state) in pending {
         let PendingState::Done(value) = state else { continue };
+        if let Some(assoc) = item.assoc {
+            // An associated const is a const item with a child def,
+            // found only through its assoc table.
+            let name = item.name.unwrap();
+            let idx = p.consts.len() as u32;
+            let (parent, parent_hash) = match &assoc {
+                PendingAssoc::Inherent { impl_def, .. } | PendingAssoc::TraitImpl { impl_def, .. } => (*impl_def, impl_def.hash),
+                PendingAssoc::TraitDefault { trait_def, .. } => (*trait_def, trait_def.hash),
+            };
+            let hash = crate::def::child_hash(parent_hash, crate::def::DefKind::Const, p.interner.get(name), 0);
+            let def = DefId { krate: p.krate, hash };
+            p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(parent), name, Vis::Priv, item.span));
+            p.const_defs.push(def);
+            p.consts.push(ConstItem { name, ty: item.ty, value });
+            match assoc {
+                PendingAssoc::Inherent { owner, .. } => {
+                    p.assoc_const_names.insert((owner, name), idx);
+                }
+                PendingAssoc::TraitImpl { impl_def, assoc } => {
+                    p.impl_assoc_consts.insert((impl_def, assoc), idx);
+                }
+                PendingAssoc::TraitDefault { assoc, .. } => {
+                    p.trait_assoc_const_values.insert(assoc, idx);
+                }
+            }
+            continue;
+        }
         match item.is_static {
             None if item.stmt_idx.is_some() => {
                 if let Some(name) = item.name {
@@ -2258,52 +2396,104 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         .collect();
 }
 
-/// Registers and evaluates the associated consts of inherent impls
-/// (W-RESOLVE phase 2, on the merged evaluator). They become const
-/// items with child defs under their impl, found through
-/// `assoc_const_names` only: initializers read free consts through
-/// the same context fallback as other const items, never other
-/// associated consts by plain name (Rust requires `Self::` there).
-fn eval_assoc_consts<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
+/// Registers the associated consts of inherent impls, trait
+/// impls, and trait defaults as pending items of
+/// `eval_const_items` (W-RESOLVE phase 2, on the merged
+/// evaluator). They become const items with child defs under
+/// their impl or trait, found through their assoc tables only:
+/// initializers read free consts by plain name and inherent
+/// associated consts by `Type::CONST` (the `assoc_by_key`
+/// entries, keyed by flat type name), never other associated
+/// consts by plain name (Rust requires a qualified path there).
+/// Impl ordinals must match the fn pass exactly (same
+/// iteration, same owner test), so child hashes name the same
+/// impl.
+fn register_assoc_consts<'a>(
+    p: &mut Program<'a>,
+    errs: &mut Vec<Diag>,
+    pending: &mut Vec<(PendingConst, PendingState)>,
+    assoc_by_key: &mut HashMap<(Sym, Sym), usize>,
+) {
     let ast = p.ast;
-    let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
-    let mut owners: Vec<(AdtId, DefId, Sym)> = Vec::new();
-    // Impl ordinals must match the fn pass exactly (same iteration,
-    // same owner test), so child hashes name the same impl.
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    let mut inherent_seen: Vec<(AdtId, Sym)> = Vec::new();
     for item in &ast.items {
         let ItemKind::Impl(imp) = &item.kind else { continue };
-        if imp.is_negative || imp.trait_ref.is_some() {
-            // The fn pass still consumes an ordinal for these (its
-            // header is the self type's first segment, counted before
-            // any continue), then handles or rejects them itself.
-            let header = match ast.ty(imp.self_ty) {
-                TyExpr::Path(segs) if !segs.is_empty() => p.interner.get(segs[0].name).to_string(),
-                _ => "<error>".to_string(),
-            };
-            let o = impl_ordinals.get(&header).copied().unwrap_or(0);
-            impl_ordinals.insert(header, o + 1);
-            continue;
-        }
+        // The fn pass consumes one ordinal per impl header before
+        // any continue, negative and trait impls included.
         let header = match ast.ty(imp.self_ty) {
             TyExpr::Path(segs) if !segs.is_empty() => p.interner.get(segs[0].name).to_string(),
             _ => "<error>".to_string(),
         };
         let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
         impl_ordinals.insert(header.clone(), ordinal + 1);
-        let owner = match ast.ty(imp.self_ty) {
-            TyExpr::Path(segs) if segs.len() == 1 => p.type_names.get(&segs[0].name).copied(),
-            _ => None,
-        };
-        let Some(owner) = owner else { continue };
-        if imp.consts.is_empty() {
+        if imp.is_negative || imp.consts.is_empty() {
             continue;
         }
         let parent_hash = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
         let impl_def = DefId { krate: p.krate, hash: parent_hash };
+        let owner = match ast.ty(imp.self_ty) {
+            TyExpr::Path(segs) if segs.len() == 1 => p.type_names.get(&segs[0].name).copied(),
+            _ => None,
+        };
+        if imp.trait_ref.is_some() {
+            // A trait impl const: its trait and assoc def come
+            // from the index record the fn pass inserted.
+            let Some((_, rec)) = p.gx.index.by_def(impl_def) else { continue };
+            let trait_def = rec.trait_def;
+            let Some(trec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
+            for c in &imp.consts {
+                // Unknown and duplicate names are reported by
+                // `finish_trait_impl`; only value items register.
+                let Some(assoc) = trec.assoc_by_name(c.name).filter(|a| p.gx.trait_assoc_consts.contains_key(a)) else {
+                    continue;
+                };
+                if pending
+                    .iter()
+                    .any(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitImpl { impl_def: d, assoc: a }) if d == impl_def && a == assoc))
+                {
+                    continue;
+                }
+                let self_ty = owner.map(|o| p.tys.adt_ty(o));
+                let ty = match resolve_ty(ast, p.interner, p.known, &p.type_names, &p.aliases, &mut p.tys, c.ty, self_ty) {
+                    Ok(t) => t,
+                    Err(d) => match p.gx.trait_assoc_consts.get(&assoc).copied().filter(|&(t, _)| !p.tys.flags(t).contains_param()) {
+                        // The scoped check in `finish_trait_impl`
+                        // already validated the written type; a
+                        // plain resolve failure here only means it
+                        // names the impl's parameters, so the
+                        // trait's concrete type stands in.
+                        Some((t, _)) => t,
+                        None => {
+                            errs.push(d);
+                            continue;
+                        }
+                    },
+                };
+                let Some(value) = c.default else {
+                    errs.push(not_yet("L0632", c.name_span, "associated consts without a value"));
+                    continue;
+                };
+                pending.push((
+                    PendingConst {
+                        name: Some(c.name),
+                        ty,
+                        expr: value,
+                        span: c.span,
+                        is_static: None,
+                        static_idx: 0,
+                        stmt_idx: None,
+                        assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
+                    },
+                    PendingState::Todo,
+                ));
+            }
+            continue;
+        }
+        let Some(owner) = owner else { continue };
         let self_ty = p.tys.adt_ty(owner);
         for c in &imp.consts {
-            if owners.iter().any(|&(o, _, n)| o == owner && n == c.name) || p.methods.contains_key(&(owner, c.name)) {
+            if inherent_seen.contains(&(owner, c.name)) || p.methods.contains_key(&(owner, c.name)) {
                 errs.push(Diag::new(
                     "L0106",
                     c.name_span,
@@ -2323,31 +2513,54 @@ fn eval_assoc_consts<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
                 errs.push(not_yet("L0632", c.name_span, "associated consts without a value"));
                 continue;
             };
-            owners.push((owner, impl_def, c.name));
+            inherent_seen.push((owner, c.name));
+            assoc_by_key.insert((p.adts[owner.0 as usize].name, c.name), pending.len());
             pending.push((
-                PendingConst { name: Some(c.name), ty, expr: value, span: c.span, is_static: None, static_idx: 0, stmt_idx: None },
+                PendingConst {
+                    name: Some(c.name),
+                    ty,
+                    expr: value,
+                    span: c.span,
+                    is_static: None,
+                    static_idx: 0,
+                    stmt_idx: None,
+                    assoc: Some(PendingAssoc::Inherent { owner, impl_def }),
+                },
                 PendingState::Todo,
             ));
         }
     }
-    if pending.is_empty() {
-        return;
-    }
-    let n = pending.len();
-    let mut cx = CollectCx { p, pending, by_name: HashMap::default(), errs };
-    for i in 0..n {
-        cx.eval_pending(i);
-    }
-    let CollectCx { p, pending, .. } = cx;
-    for ((item, state), (owner, impl_def, name)) in pending.into_iter().zip(owners) {
-        let PendingState::Done(value) = state else { continue };
-        let idx = p.consts.len() as u32;
-        let hash = crate::def::child_hash(impl_def.hash, crate::def::DefKind::Const, p.interner.get(name), 0);
-        let def = DefId { krate: p.krate, hash };
-        p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(impl_def), name, Vis::Priv, item.span));
-        p.const_defs.push(def);
-        p.consts.push(ConstItem { name, ty: item.ty, value });
-        p.assoc_const_names.insert((owner, name), idx);
+    // Trait defaults. A default whose type names the trait's
+    // parameters has no single value to evaluate here; it stays
+    // unregistered and use sites reject, as before.
+    for item in &ast.items {
+        let ItemKind::Trait(tdef) = &item.kind else { continue };
+        let Some(&trait_def) = p.gx.trait_names.get(&tdef.name) else { continue };
+        let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
+        for c in &tdef.consts {
+            let Some(value) = c.default else { continue };
+            let Some(assoc) = rec.assoc_by_name(c.name) else { continue };
+            let Some(&(ty, _)) = p.gx.trait_assoc_consts.get(&assoc) else { continue };
+            if p.tys.flags(ty).contains_param() {
+                continue;
+            }
+            if pending.iter().any(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitDefault { assoc: a, .. }) if a == assoc)) {
+                continue;
+            }
+            pending.push((
+                PendingConst {
+                    name: Some(c.name),
+                    ty,
+                    expr: value,
+                    span: c.span,
+                    is_static: None,
+                    static_idx: 0,
+                    stmt_idx: None,
+                    assoc: Some(PendingAssoc::TraitDefault { trait_def, assoc }),
+                },
+                PendingState::Todo,
+            ));
+        }
     }
 }
 
@@ -2356,6 +2569,12 @@ struct CollectCx<'x, 'a> {
     p: &'x mut Program<'a>,
     pending: Vec<(PendingConst, PendingState)>,
     by_name: HashMap<Sym, usize>,
+    /// Pending inherent associated consts by (flat type name,
+    /// const name), for `Type::CONST` reads in initializers.
+    assoc_by_key: HashMap<(Sym, Sym), usize>,
+    /// The flat type name `Self` means while an inherent
+    /// associated const evaluates (its owning Adt).
+    self_name: Option<Sym>,
     errs: &'x mut Vec<Diag>,
 }
 
@@ -2383,7 +2602,17 @@ impl CollectCx<'_, '_> {
             let it = &self.pending[idx].0;
             (it.expr, it.ty, it.span)
         };
-        match crate::ty::consteval::eval(self, expr, Some(ty)) {
+        // `Self::CONST` in an inherent associated const's
+        // initializer names its owning Adt; every other item
+        // evaluates with no `Self`.
+        let prev_self = self.self_name;
+        self.self_name = match self.pending[idx].0.assoc {
+            Some(PendingAssoc::Inherent { owner, .. }) => Some(self.p.adts[owner.0 as usize].name),
+            _ => None,
+        };
+        let evaluated = crate::ty::consteval::eval(self, expr, Some(ty));
+        self.self_name = prev_self;
+        match evaluated {
             Ok((v, vt)) => {
                 if self.pending[idx].0.is_static.is_some() && !static_form(self.p, &v, ty) {
                     self.errs.push(Diag::new(
@@ -2512,6 +2741,21 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             let c = &self.p.consts[i as usize];
             (c.value.clone(), c.ty)
         })
+    }
+    fn assoc_const_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
+        // The last two segments name the type and the const;
+        // earlier segments are module anchors the resolver has
+        // already folded into the flat type name where it can.
+        let [.., ty_seg, item_seg] = segs else { return None };
+        let ty_name = if ty_seg.name == self.p.known.self_type { self.self_name? } else { ty_seg.name };
+        if let Some(&i) = self.assoc_by_key.get(&(ty_name, item_seg.name)) {
+            let ty = self.pending[i].0.ty;
+            return self.eval_pending(i).map(|v| (v, ty));
+        }
+        let adt = self.p.type_names.get(&ty_name).copied()?;
+        let idx = self.p.inherent_assoc_const(adt, item_seg.name)?;
+        let c = &self.p.consts[idx as usize];
+        Some((c.value.clone(), c.ty))
     }
     fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
         if let Some(&i) = self.by_name.get(&name)
