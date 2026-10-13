@@ -2045,6 +2045,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let mut pending: Vec<obligations::Obligation> = Vec::new();
             let mut progress = false;
             for ob in work {
+                // What a selection queues and binds, to tell a repeat (below).
+                let (queued, trail, vars) = (self.obl.len(), self.trail.len(), self.vars.len());
                 match ob {
                     obligations::Obligation::AssocEq { eq, span } => {
                         if self.prove_assoc_eq(eq, span) {
@@ -2055,10 +2057,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     obligations::Obligation::DynStatic { .. } | obligations::Obligation::TypeStatic { .. } => pending.push(ob),
                     obligations::Obligation::Trait { trait_ref, span, depth } => match self.select_obligation_at(trait_ref, span, depth) {
-                        Selection::Impl { unbound, .. } => {
-                            progress = true;
+                        Selection::Impl { id, args, unbound, .. } => {
                             if !unbound.is_empty() && self.still_unbound(&unbound, trait_ref) {
+                                // A re-queued obligation that selects the same impl with the
+                                // same args again binds only the probe's fresh variables and
+                                // queues copies of the nested predicates its last selection
+                                // queued: no progress. Counting it ran every run point to the
+                                // round cap and grew the queue each round.
+                                let bound_old = self.trail.get(trail..).unwrap_or(&[]).iter().any(|&v| (v as usize) < vars);
+                                if self.obl.note_requeued(trait_ref, span, depth, id, &args) || bound_old {
+                                    progress = true;
+                                } else {
+                                    self.obl.truncate(queued);
+                                }
                                 pending.push(ob);
+                            } else {
+                                progress = true;
                             }
                         }
                         Selection::ParamEvidence(_) | Selection::Builtin => {

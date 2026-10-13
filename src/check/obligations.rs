@@ -13,7 +13,9 @@
 // and from bindings written at a use (`T: Iterator<Item = u8>`):
 // it is proved by normalizing the projection, never by search.
 use crate::diag::Span;
-use crate::ty::{AssocEqData, TraitRef, Ty};
+use crate::intern::FxMap;
+use crate::traits::ImplId;
+use crate::ty::{AssocEqData, GenericArg, TraitRef, Ty};
 
 /// One pending obligation plus the span that needs it.
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +35,9 @@ pub enum Obligation {
 #[derive(Default)]
 pub struct Obligations {
     queue: Vec<Obligation>,
+    /// The impl and args each re-queued trait obligation (trait
+    /// ref, span, depth) was last selected with; see `note_requeued`.
+    requeued: FxMap<(TraitRef, Span, u16), (ImplId, Vec<GenericArg>)>,
 }
 
 impl Obligations {
@@ -78,5 +83,25 @@ impl Obligations {
     /// method probe).
     pub fn truncate(&mut self, len: usize) {
         self.queue.truncate(len);
+    }
+
+    /// Records the impl selection of a trait obligation that goes
+    /// back on the queue because an impl parameter is still an
+    /// inference variable. False when its last selection had the
+    /// same impl and args: the nested predicates of that selection
+    /// are queued, so this one repeats them and settles nothing.
+    /// A selection with other args (a variable got bound) is new.
+    pub fn note_requeued(&mut self, trait_ref: TraitRef, span: Span, depth: u16, id: ImplId, args: &[GenericArg]) -> bool {
+        match self.requeued.get_mut(&(trait_ref, span, depth)) {
+            Some(last) if last.0 == id && last.1 == args => false,
+            Some(last) => {
+                *last = (id, args.to_vec());
+                true
+            }
+            None => {
+                self.requeued.insert((trait_ref, span, depth), (id, args.to_vec()));
+                true
+            }
+        }
     }
 }
