@@ -3539,6 +3539,7 @@ fn register_items(
                 e.name = flat;
             }
             ItemKind::Const(c) => {
+                tables.const_init_module.insert(c.span, module);
                 if let Some(name) = c.name {
                     check_dup(seen, Namespace::Value, name, c.name_span, &mut reported, diags);
                     let flat = flat_name(tables, flat_prefix, module, name, interner);
@@ -3554,6 +3555,7 @@ fn register_items(
                 }
             }
             ItemKind::Static(s) => {
+                tables.const_init_module.insert(s.span, module);
                 check_dup(seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, s.name, interner);
@@ -3580,6 +3582,9 @@ fn register_items(
                 a.name = flat;
             }
             ItemKind::Trait(t) => {
+                for c in &t.consts {
+                    tables.const_init_module.insert(c.span, module);
+                }
                 check_dup(seen, Namespace::Type, t.name, t.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, t.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, t.name, interner);
@@ -3599,8 +3604,11 @@ fn register_items(
                 // Associated fn visibility, once the self type resolves
                 // in this module. The rewrite pass resolves the path
                 // properly; here a one-segment or resolvable path is
-                // enough to key the table.
-                let _ = imp;
+                // enough to key the table. Associated consts record
+                // their defining module for the const evaluator.
+                for c in &imp.consts {
+                    tables.const_init_module.insert(c.span, module);
+                }
             }
             ItemKind::Use(u) => {
                 flatten_use(&u.tree, module, vis(), imports, interner);

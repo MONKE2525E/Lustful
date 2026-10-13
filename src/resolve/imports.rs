@@ -178,6 +178,13 @@ pub struct ResolvedTables {
     /// Adt def -> variant names, for variant imports and `use E::*`.
     pub variants: FxMap<DefId, Vec<Sym>>,
     pub def_info: FxMap<DefId, DefInfo>,
+    /// The defining module of each const, static, and associated
+    /// const item, keyed by the item's span. The const evaluator in
+    /// collect reads it to check field privacy in initializers:
+    /// a span survives flattening and Ast concatenation, and items
+    /// with no def of their own (anonymous consts, associated
+    /// consts) still have one. Filled in `register_items`.
+    pub const_init_module: FxMap<Span, ModuleId>,
     /// Flat name -> the source path text for diagnostics (`m0::Stats`,
     /// or `base::inner::Deep` for a source dependency, whose flat name
     /// carries only a hash of the crate). Filled where defs are renamed
@@ -229,6 +236,7 @@ impl ResolvedTables {
             tuple_field_vis: FxMap::default(),
             variants: FxMap::default(),
             def_info: FxMap::default(),
+            const_init_module: FxMap::default(),
             display_names: FxMap::default(),
             module_defs: vec![DefId::PLACEHOLDER],
             flat: Default::default(),

@@ -2887,7 +2887,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         static_count = nested;
     }
     let n = pending.len();
-    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, errs };
+    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, module: None, errs };
     for i in 0..n {
         cx.eval_pending(i);
     }
@@ -3205,6 +3205,29 @@ fn self_pat_matches(tys: &crate::ty::GlobalTys, pat: Ty, target: Ty, map: &mut V
     }
 }
 
+/// True when a named field of `adt` is not visible from module
+/// `from`, by the resolver's field table. The const evaluator's
+/// privacy hooks in collect and in body checking share this test;
+/// it mirrors `check_field_vis` without its read recording.
+pub(crate) fn named_field_is_private(p: &Program, adt: AdtId, field: Sym, from: crate::ty::defs::ModuleId) -> bool {
+    let Some(tables) = &p.resolved else { return false };
+    let Some(def) = p.defs.def_of_adt(adt) else { return false };
+    match tables.field_vis.get(&def) {
+        Some((def_mod, fields)) => fields.get(&field).is_some_and(|vis| !tables.visible(vis, *def_mod, from, p.interner)),
+        None => false,
+    }
+}
+
+/// True when tuple field `index` of `adt` is not visible from `from`.
+pub(crate) fn tuple_field_is_private(p: &Program, adt: AdtId, index: u32, from: crate::ty::defs::ModuleId) -> bool {
+    let Some(tables) = &p.resolved else { return false };
+    let Some(def) = p.defs.def_of_adt(adt) else { return false };
+    match tables.tuple_field_vis.get(&def) {
+        Some((def_mod, fields)) => fields.get(index as usize).is_some_and(|vis| !tables.visible(vis, *def_mod, from, p.interner)),
+        None => false,
+    }
+}
+
 /// The const evaluator's context over the collected tables.
 struct CollectCx<'x, 'a> {
     p: &'x mut Program<'a>,
@@ -3220,6 +3243,12 @@ struct CollectCx<'x, 'a> {
     /// `Self::CONST` read picks this impl's const among
     /// same-name consts of disjoint impls.
     self_pat: Option<Ty>,
+    /// The defining module of the item now evaluating, for field
+    /// privacy in its initializer. Nested item evaluation (an item
+    /// that reads another const) restores the outer module, like
+    /// `self_name`. None when the module is unknown (no resolver
+    /// tables, or an item the tables do not name): no check then.
+    module: Option<crate::ty::defs::ModuleId>,
     errs: &'x mut Vec<Diag>,
 }
 
@@ -3266,6 +3295,35 @@ impl CollectCx<'_, '_> {
         Some(self.p.tys.mk_adt(self.p.def_of_adt(adt), &args))
     }
 
+    /// The defining module of one pending item: the resolver's
+    /// span table for module items (anonymous and associated
+    /// consts included), else the enclosing function's module for
+    /// an item in a body (the smallest fn expression range that
+    /// holds the initializer; nested fn items share their outer
+    /// function's module, so any holding range gives it).
+    fn pending_module(&self, it: &PendingConst) -> Option<crate::ty::defs::ModuleId> {
+        let tables = self.p.resolved.as_deref()?;
+        if let Some(m) = tables.const_init_module.get(&it.span) {
+            return Some(*m);
+        }
+        if it.stmt_idx.is_none() {
+            return None;
+        }
+        let mut best: Option<(u32, crate::ty::defs::ModuleId)> = None;
+        for (i, f) in self.p.fns.iter().enumerate() {
+            let (lo, hi) = f.def.exprs;
+            if it.expr.0 >= lo && it.expr.0 < hi {
+                let size = hi - lo;
+                if best.is_none_or(|(b, _)| size < b)
+                    && let Some(m) = tables.fn_module.get(i)
+                {
+                    best = Some((size, *m));
+                }
+            }
+        }
+        best.map(|(_, m)| m)
+    }
+
     /// Evaluates one pending item, on demand from other items.
     fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
         match &self.pending[idx].1 {
@@ -3298,7 +3356,10 @@ impl CollectCx<'_, '_> {
             Some(PendingAssoc::Inherent { owner, self_pat, .. }) => (Some(self.p.adts[owner.0 as usize].name), Some(self_pat)),
             _ => (None, None),
         };
+        let prev_module = self.module;
+        self.module = self.pending_module(&self.pending[idx].0);
         let evaluated = crate::ty::consteval::eval(self, expr, Some(ty));
+        self.module = prev_module;
         self.self_name = prev_self;
         self.self_pat = prev_pat;
         match evaluated {
@@ -3595,6 +3656,18 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     }
     fn is_enum(&self, adt: AdtId) -> bool {
         adt.0 < u32::MAX - 1 && self.p.adt(adt).is_enum
+    }
+    fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
+        match self.module {
+            Some(m) => named_field_is_private(self.p, adt, field, m),
+            None => false,
+        }
+    }
+    fn tuple_field_private(&mut self, adt: AdtId, index: u32) -> bool {
+        match self.module {
+            Some(m) => tuple_field_is_private(self.p, adt, index, m),
+            None => false,
+        }
     }
 }
 

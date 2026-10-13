@@ -119,6 +119,18 @@ pub trait ConstCx<'a> {
     fn discriminant(&self, adt: AdtId, variant: u32) -> i128;
     /// True when the Adt is an enum (a struct literal for it builds a variant).
     fn is_enum(&self, adt: AdtId) -> bool;
+    /// True when a named field is private to the module whose const
+    /// expression the evaluator runs. The evaluator asks only outside
+    /// a called const fn's body: that body is checked in its own
+    /// module by the body checker. The default answers false, for
+    /// contexts with no module table.
+    fn named_field_private(&mut self, _adt: AdtId, _field: Sym) -> bool {
+        false
+    }
+    /// True when a tuple field is private, like `named_field_private`.
+    fn tuple_field_private(&mut self, _adt: AdtId, _index: u32) -> bool {
+        false
+    }
 }
 
 /// Why evaluation left a block early.
@@ -146,6 +158,28 @@ fn nonconst(span: Span, what: &str) -> Diag {
         span,
         format!("cannot call non-const function `{what}` in a const context"),
         "Mark the function `const fn`, or move the call out of the const item.",
+    )
+}
+
+/// The L0510 for a private field named in a const expression, with
+/// the same text as the body checker's field privacy errors.
+fn private_field(span: Span, label: &str) -> Diag {
+    Diag::new(
+        "L0510",
+        span,
+        format!("field `{label}` is private"),
+        "Make the field `pub(crate)` (the smallest widening that works).",
+    )
+}
+
+/// The L0510 for a tuple struct constructor with a private field,
+/// in call or pattern position.
+fn private_ctor(span: Span) -> Diag {
+    Diag::new(
+        "L0510",
+        span,
+        "tuple struct constructor is private".to_string(),
+        "Make every field `pub(crate)`, or add a public constructor function.",
     )
 }
 
@@ -262,7 +296,7 @@ pub fn is_unsuffixed_lit(ast: &Ast, e: ExprId) -> bool {
 /// Evaluates one const expression. `expected` is the type the context wants,
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
-    let mut ev = Evaluator { steps: 0 };
+    let mut ev = Evaluator { steps: 0, call_depth: 0 };
     let mut env: Env = Vec::new();
     match ev.expr(cx, &mut env, e, expected)? {
         Flow::Val(v) => Ok(v),
@@ -272,6 +306,10 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
 
 struct Evaluator {
     steps: u64,
+    /// How deep the evaluator is in called const fn bodies. Field
+    /// privacy asks run only at depth 0: a called const fn's body is
+    /// written in its own module and checked there.
+    call_depth: u32,
 }
 
 impl Evaluator {
@@ -279,6 +317,33 @@ impl Evaluator {
         self.steps += 1;
         if self.steps > STEP_CAP {
             return Err(outside(span, "this const item (step limit reached)"));
+        }
+        Ok(())
+    }
+
+    /// Rejects a named field the context calls private to this const
+    /// expression's module. A no-op inside a called const fn.
+    fn check_named_field<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, adt: AdtId, field: Sym, span: Span) -> Result<(), Diag> {
+        if self.call_depth == 0 && cx.named_field_private(adt, field) {
+            let label = crate::intern::source_name(cx.sym_text(field)).to_string();
+            return Err(private_field(span, &label));
+        }
+        Ok(())
+    }
+
+    /// Rejects a tuple field the context calls private.
+    fn check_tuple_field<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, adt: AdtId, index: u32, span: Span) -> Result<(), Diag> {
+        if self.call_depth == 0 && cx.tuple_field_private(adt, index) {
+            return Err(private_field(span, &index.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Rejects a tuple struct constructor (call or pattern) when any
+    /// of its `n` fields is private, as rustc does (E0603).
+    fn check_tuple_ctor<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, adt: AdtId, n: usize, span: Span) -> Result<(), Diag> {
+        if self.call_depth == 0 && (0..n).any(|i| cx.tuple_field_private(adt, i as u32)) {
+            return Err(private_ctor(span));
         }
         Ok(())
     }
@@ -519,6 +584,7 @@ impl Evaluator {
                 let (v, t) = self.value(cx, env, *base, None)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let Some(adt) = cx.tys_ref().local_adt(t) else { return Err(outside(span, "this field access")) };
+                self.check_named_field(cx, adt, *name, span)?;
                 let fields = cx.variant_fields(adt, 0);
                 let Some(i) = fields.iter().position(|(n, _)| n == name) else {
                     return Err(outside(span, "this field access"));
@@ -531,6 +597,11 @@ impl Evaluator {
             Expr::TupleField { base, index } => {
                 let (v, t) = self.value(cx, env, *base, None)?;
                 let (v, t) = self.deref_value(cx, v, t);
+                if !matches!(cx.tys_ref().kind(t), TyKind::Tuple(_))
+                    && let Some(adt) = cx.tys_ref().local_adt(t)
+                {
+                    self.check_tuple_field(cx, adt, *index, span)?;
+                }
                 let elem_ty = match cx.tys_ref().kind(t) {
                     TyKind::Tuple(ts) => cx.tys_ref().tys_of(ts).get(*index as usize).copied(),
                     _ => cx.tys_ref().local_adt(t).and_then(|a| cx.variant_fields(a, 0).get(*index as usize).map(|f| f.1)),
@@ -574,6 +645,16 @@ impl Evaluator {
                     return Err(outside(span, "this struct literal"));
                 };
                 let field_defs = cx.variant_fields(adt, variant);
+                // Privacy first: written fields, and every field when
+                // `..base` fills the rest (rustc E0451 for both).
+                for &(fname, fspan, _) in fields {
+                    self.check_named_field(cx, adt, fname, fspan)?;
+                }
+                if update.is_some() {
+                    for &(fname, _) in &field_defs {
+                        self.check_named_field(cx, adt, fname, span)?;
+                    }
+                }
                 let mut vals: Vec<Option<ConstValue>> = vec![None; field_defs.len()];
                 for &(fname, _, fe) in fields {
                     let Some(i) = field_defs.iter().position(|(n, _)| *n == fname) else {
@@ -643,6 +724,10 @@ impl Evaluator {
                     let Some(i) = found else {
                         return Err(outside(span, "this `offset_of!` field"));
                     };
+                    match ffield {
+                        crate::ast::OffsetField::Name(fname) => self.check_named_field(cx, adt, fname, span)?,
+                        crate::ast::OffsetField::Index(idx) => self.check_tuple_field(cx, adt, idx, span)?,
+                    }
                     let Some(l) = cx.layout(cur) else {
                         return Err(Diag::new(
                             "L0652",
@@ -657,6 +742,11 @@ impl Evaluator {
                 (ConstValue::Int(off as i128), USIZE)
             }
             Expr::Call { callee, args } => return Ok(Flow::Val(self.call(cx, env, *callee, args, span)?)),
+            // Only primitive methods evaluate today (`method_call`
+            // below). If user const methods land: run the method
+            // body with `call_depth` raised, as the ConstFn call
+            // arm does, so its field accesses are not privacy
+            // checked against the caller's module.
             Expr::MethodCall { recv, name, args, .. } => {
                 return Ok(Flow::Val(self.method_call(cx, env, *recv, *name, args, expected, span)?));
             }
@@ -1267,6 +1357,11 @@ impl Evaluator {
                 // against them. The `Some` and `Ok`/`Err` shims (adt
                 // u32::MAX and u32::MAX - 1) have none here.
                 let fields: Vec<Ty> = if adt.0 >= u32::MAX - 1 { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
+                // A tuple struct constructor is private when any field
+                // is; enum variant fields take the enum's visibility.
+                if adt.0 < u32::MAX - 1 && !cx.is_enum(adt) {
+                    self.check_tuple_ctor(cx, adt, fields.len(), span)?;
+                }
                 let mut vals = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
                     let want = fields.get(i).copied();
@@ -1278,13 +1373,22 @@ impl Evaluator {
                     }
                     vals.push(v);
                 }
-                Ok((ConstValue::Variant(variant, vals), ty))
+                // A tuple struct builds an aggregate, like its struct
+                // literal form; only enum variants (and the shims,
+                // whose layout is enum-shaped) build a variant value.
+                if adt.0 >= u32::MAX - 1 || cx.is_enum(adt) {
+                    Ok((ConstValue::Variant(variant, vals), ty))
+                } else {
+                    Ok((ConstValue::Aggregate(vals), ty))
+                }
             }
             CallTarget::ConstFn(body) => {
                 if args.len() != body.params.len() {
                     return Err(outside(span, "this call (wrong number of arguments)"));
                 }
-                let mut fenv: Env = Vec::new();
+                // Arguments evaluate in the caller's module, so they
+                // evaluate before the call depth moves.
+                let mut arg_vals: Vec<TypedValue> = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
                     let (v0, vt) = self.value(cx, env, a, body.param_tys.get(i).copied())?;
                     if let Some(&want) = body.param_tys.get(i)
@@ -1294,20 +1398,40 @@ impl Evaluator {
                     }
                     // The parameter has its declared type inside the body,
                     // whatever width the argument literal was written at.
-                    let v = (v0, body.param_tys.get(i).copied().unwrap_or(vt));
+                    arg_vals.push((v0, body.param_tys.get(i).copied().unwrap_or(vt)));
+                }
+                // Parameter patterns and the body are the callee's
+                // code, checked in its own module: run both below
+                // depth 0 so the privacy hooks stay out.
+                self.call_depth += 1;
+                let mut fenv: Env = Vec::new();
+                let mut bind_err: Option<Diag> = None;
+                for (i, v) in arg_vals.into_iter().enumerate() {
                     let (name, mutable, pat) = body.params[i];
                     match pat {
                         Some(pat) => {
                             let mut binds = Vec::new();
-                            if !self.match_pat(cx, &mut fenv, pat, &v.0.clone(), v.1, true, &mut binds)? {
-                                return Err(outside(span, "this call (argument pattern)"));
+                            match self.match_pat(cx, &mut fenv, pat, &v.0.clone(), v.1, true, &mut binds) {
+                                Ok(true) => fenv.extend(binds),
+                                Ok(false) => {
+                                    bind_err = Some(outside(span, "this call (argument pattern)"));
+                                    break;
+                                }
+                                Err(d) => {
+                                    bind_err = Some(d);
+                                    break;
+                                }
                             }
-                            fenv.extend(binds);
                         }
                         None => fenv.push((name, v, mutable)),
                     }
                 }
-                match self.block(cx, &mut fenv, body.body, Some(body.ret))? {
+                let flow = match bind_err {
+                    Some(d) => Err(d),
+                    None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
+                };
+                self.call_depth -= 1;
+                match flow? {
                     // The fn body is type-checked as a fn; its value has the
                     // declared return type here. A wide (unsuffixed-literal)
                     // integer result is range-checked against it first:
@@ -2368,6 +2492,21 @@ impl Evaluator {
                     return Err(outside(span, "this pattern"));
                 };
                 let field_defs = cx.variant_fields(adt, variant);
+                // Privacy of the fields this pattern names. A tuple
+                // struct pattern names its constructor, so any
+                // private field rejects, rest or not; a struct
+                // pattern names only its written fields.
+                match cx.ast().pat(pat) {
+                    Pat::TupleStruct { .. } if !cx.is_enum(adt) => {
+                        self.check_tuple_ctor(cx, adt, field_defs.len(), span)?;
+                    }
+                    Pat::Struct { fields, .. } => {
+                        for &(fname, _) in fields {
+                            self.check_named_field(cx, adt, fname, span)?;
+                        }
+                    }
+                    _ => {}
+                }
                 let vals: &Vec<ConstValue> = match &v {
                     ConstValue::Variant(got, vals) => {
                         if *got != variant {
@@ -2449,8 +2588,45 @@ impl Evaluator {
         }
     }
 
+    /// Checks every field step of an assignment place for privacy,
+    /// innermost first (a read of each step is what the write does).
+    fn check_place_fields<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, e: ExprId, span: Span) -> Result<(), Diag> {
+        match cx.ast().expr(e) {
+            Expr::Field { base, name } => {
+                self.check_place_fields(cx, env, *base, span)?;
+                let Some(bt) = self.place_ty(cx, env, *base) else { return Ok(()) };
+                let bt = match cx.tys_ref().kind(bt) {
+                    TyKind::Ref(_, _, inner) => inner,
+                    _ => bt,
+                };
+                if let Some(adt) = cx.tys_ref().local_adt(bt) {
+                    self.check_named_field(cx, adt, *name, span)?;
+                }
+                Ok(())
+            }
+            Expr::TupleField { base, index } => {
+                self.check_place_fields(cx, env, *base, span)?;
+                let Some(bt) = self.place_ty(cx, env, *base) else { return Ok(()) };
+                let bt = match cx.tys_ref().kind(bt) {
+                    TyKind::Ref(_, _, inner) => inner,
+                    _ => bt,
+                };
+                if !matches!(cx.tys_ref().kind(bt), TyKind::Tuple(_))
+                    && let Some(adt) = cx.tys_ref().local_adt(bt)
+                {
+                    self.check_tuple_field(cx, adt, *index, span)?;
+                }
+                Ok(())
+            }
+            Expr::Deref(inner) => self.check_place_fields(cx, env, *inner, span),
+            Expr::Index { base, .. } => self.check_place_fields(cx, env, *base, span),
+            _ => Ok(()),
+        }
+    }
+
     /// Assigns `v` into the place `e` denotes in the environment.
     fn assign_place<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, v: ConstValue, span: Span) -> Result<(), Diag> {
+        self.check_place_fields(cx, env, e, span)?;
         match cx.ast().expr(e) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;

@@ -13778,6 +13778,28 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     fn is_enum(&self, adt: AdtId) -> bool {
         adt.0 < u32::MAX - 1 && self.cx.p.adt(adt).is_enum
     }
+    fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
+        // A privacy answer inside body const evaluation (a `const`
+        // block the checker does not walk) depends on the Adt's
+        // member visibility: record the same `Sig(adt)` read as
+        // `check_field_vis`, so a visibility edit rechecks it.
+        let p = self.cx.p;
+        if p.resolved.is_some()
+            && let Some(def) = p.defs.def_of_adt(adt)
+        {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        crate::check::collect::named_field_is_private(p, adt, field, self.cx.module)
+    }
+    fn tuple_field_private(&mut self, adt: AdtId, index: u32) -> bool {
+        let p = self.cx.p;
+        if p.resolved.is_some()
+            && let Some(def) = p.defs.def_of_adt(adt)
+        {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        crate::check::collect::tuple_field_is_private(p, adt, index, self.cx.module)
+    }
 }
 
 /// The (Adt, variant) a path denotes in the compat tables.
