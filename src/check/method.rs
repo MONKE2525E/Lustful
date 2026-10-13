@@ -354,6 +354,21 @@ pub(super) fn trait_probe_for(
                 Some(SelfKind::Value) if form != ReceiverForm::Value => continue,
                 Some(SelfKind::Ref) if form != ReceiverForm::Ref => continue,
                 Some(SelfKind::RefMut) if form != ReceiverForm::RefMut => continue,
+                // A typed receiver (`self: &Rc<Self>`) matches the one
+                // variant whose receiver type it names, with this
+                // variant's Self (every variant of a smart pointer step
+                // shares the pointee as Self, so a trait impl for the
+                // pointee would hit once per variant otherwise).
+                Some(SelfKind::Typed) => {
+                    let Some(want) = tmpl.as_ref().and_then(|t| t.params.first().copied()) else { continue };
+                    let want = subst(&mut cx.tys, want, &[GenericArg::Ty(step)]);
+                    let snap = cx.snapshot_vars();
+                    let ok = cx.unify(want, probe.recv_ty);
+                    cx.rollback_vars(snap);
+                    if !ok {
+                        continue;
+                    }
+                }
                 _ => {}
             }
             let n_inputs = rec.generics.params.len().saturating_sub(1);
