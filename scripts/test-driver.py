@@ -615,6 +615,49 @@ def case_new_empty_unit():
     d.kill()
 
 
+def case_nested_items():
+    # 15. A single file whose fns hold nested fns, edited in each parse
+    # mode. Bodies and signatures mode parsed into the old Ast and kept
+    # the replaced nested fn, so the program had one fn more than slots:
+    # builds panicked (the daemon answered from a fresh session), and a
+    # check never checked the new copy's body (warm false accept).
+    work = tempfile.mkdtemp(prefix="lust-driver-nested-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    base = ("fn a(x: i64) -> i64 {\n    fn na() -> i64 { 1 }\n    na() + x\n}\n\n"
+            "fn b() -> i64 {\n    fn nb() -> i64 { 20 }\n    nb()\n}\n\n"
+            "fn main() {\n    println!(\"{} {}\", a(0), b());\n}\n")
+    d.start()
+    # Checks only, first in the session: the nested body no longer fits
+    # its signature (`b` prints it, which fits both), and cold rejects.
+    printed = base.replace("    nb()\n}", "    println!(\"{}\", nb());\n    20\n}")
+    open(src, "w").write(printed)
+    d.run(["check", src])
+    open(src, "w").write(printed.replace("fn nb() -> i64", "fn nb() -> bool"))
+    c = d.run(["check", src], expect=None)
+    check("nested items, nested signature only: rejects", c.returncode == 1, c.stderr[-200:])
+    edits = [
+        ("outer body", [("na() + x", "na() + x + 2")], "3 20"),
+        ("nested body", [("{ 20 }", "{ 30 }")], "1 30"),
+        ("outer signature", [("fn a(x: i64)", "fn a(x: i64, _y: i64)"), ("a(0)", "a(0, 0)")], "1 20"),
+        ("later outer signature", [("fn b()", "fn b(_y: i64)"), (", b()", ", b(0)")], "1 20"),
+    ]
+    for name, subs, want in edits:
+        text = base
+        for old, new in subs:
+            text = text.replace(old, new)
+        for step, body, expect in ((f"{name}: base", base, "1 20"), (name, text, want)):
+            open(src, "w").write(body)
+            c = d.run(["check", src], expect=None)
+            b = d.run(["build", src, "-o", out], expect=None)
+            prog = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+            got = prog.stdout.strip() if prog else b.stderr[-200:]
+            check(f"nested items, {step}", c.returncode == 0 and got == expect, f"check {c.returncode}: {got!r}")
+    err = d.kill()
+    check("nested items: no warm panic", "panicked" not in err, err[-300:])
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -629,6 +672,7 @@ def main():
     case_generic_reuse()
     case_moved_instance_ids()
     case_new_empty_unit()
+    case_nested_items()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

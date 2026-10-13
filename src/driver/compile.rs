@@ -15,7 +15,8 @@
 //      program (`Program::reads_dirty`, the section 8.3 step 5 dirty walk) is reused without a
 //      recheck: per-name binding reads, method-set probes, and failed lookups are precise where
 //      name mentions are not. Candidates with no stored reads always recheck.
-//   3. Anything else (a type, an impl, a use changed): full mode. Every unchanged passing body
+//   3. Anything else (a type, an impl, a use changed), and any edit to a single file whose last
+//      parse had items inside fn bodies: full mode. Every unchanged passing body
 //      is a dirty-walk candidate; only bodies whose recorded reads changed recheck. The caches
 //      clear instead when reuse is not provable (first compile, Adt sequence change, or slot
 //      compaction; see `slot_update`).
@@ -2023,9 +2024,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     front.src.clone_from(&src);
     front.map = map.clone();
 
-    // Which rule applies (see the top of this file).
-    let bodies_only = front.env_hash == Some(env) && front.ast_fn_count == fn_count;
-    let changed_names = if bodies_only || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
+    // Which rule applies (see the top of this file). Bodies and
+    // signatures mode parse into the old Ast: new nodes go at the end
+    // and the replaced ones stay. `stmt_items` is also the list of body
+    // items that collect numbers in order, so once the Ast has one, a
+    // re-parsed body adds a second copy (a fn that no slot maps to and
+    // that is never checked: a warm false accept) or puts it out of
+    // file order. Such a file takes the full parse.
+    let splice = front.ast.stmt_items.is_empty();
+    let bodies_only = splice && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
+    let changed_names =
+        if bodies_only || !splice || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
     let mode = if bodies_only {
         "bodies"
     } else if changed_names.is_some() {
