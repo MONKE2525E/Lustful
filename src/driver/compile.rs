@@ -391,6 +391,19 @@ enum ScanState {
     BlockComment(u32),
 }
 
+/// The bytes that can change `BoundaryScan`'s state in normal code: a newline (a line
+/// start to record), comment and literal openers, and brackets.
+const NORMAL_STOPS: [bool; 256] = {
+    let mut t = [false; 256];
+    let stops = b"\n/\"'{}()[]";
+    let mut k = 0;
+    while k < stops.len() {
+        t[stops[k] as usize] = true;
+        k += 1;
+    }
+    t
+};
+
 struct BoundaryScan {
     state: ScanState,
     brace: i64,
@@ -410,9 +423,16 @@ impl BoundaryScan {
     fn feed(&mut self, b: &[u8], base: usize, mut out: Option<&mut Vec<usize>>) {
         let mut i = 0;
         while i < b.len() {
-            let c = b[i];
             match self.state {
                 ScanState::Normal => {
+                    // Most bytes cannot change the state: skip them in a tight loop.
+                    while i < b.len() && !NORMAL_STOPS[b[i] as usize] {
+                        i += 1;
+                    }
+                    if i == b.len() {
+                        break;
+                    }
+                    let c = b[i];
                     match c {
                         b'\n' => {
                             i += 1;
@@ -466,7 +486,7 @@ impl BoundaryScan {
                     }
                     i += 1;
                 }
-                ScanState::Str => match c {
+                ScanState::Str => match b[i] {
                     b'\\' => i += 2,
                     b'"' => {
                         self.state = ScanState::Normal;
@@ -474,7 +494,7 @@ impl BoundaryScan {
                     }
                     _ => i += 1,
                 },
-                ScanState::Char => match c {
+                ScanState::Char => match b[i] {
                     b'\\' => i += 2,
                     b'\'' => {
                         self.state = ScanState::Normal;
@@ -483,7 +503,7 @@ impl BoundaryScan {
                     _ => i += 1,
                 },
                 ScanState::LineComment => {
-                    if c == b'\n' {
+                    if b[i] == b'\n' {
                         self.state = ScanState::Normal;
                         i += 1;
                         if self.clean() {
@@ -496,6 +516,7 @@ impl BoundaryScan {
                     }
                 }
                 ScanState::BlockComment(d) => {
+                    let c = b[i];
                     if c == b'/' && b.get(i + 1) == Some(&b'*') {
                         self.state = ScanState::BlockComment(d + 1);
                         i += 2;
@@ -2820,6 +2841,25 @@ mod tests {
         sweep_bases(&dir, std::process::id());
         assert!(!dir.join(&mine).exists(), "exiting owner's unreferenced base swept");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boundary scan records exactly the clean line starts: not inside a
+    /// string (escapes included), a block comment, or brackets, and after a
+    /// line comment ends. Fed whole or in two parts, the answer is the same.
+    #[test]
+    fn boundary_scan_clean_line_starts() {
+        let text = "fn a() {\n  let s = \"}\\n{\";\n}\n// x {\nfn b() {}\n/* {\n */\nstruct C;\nlet c = '{';\n";
+        let after = |line: &str| text.find(line).unwrap() + line.len();
+        let want = vec![after("}\n"), after("// x {\n"), after("fn b() {}\n"), after(" */\n"), after("struct C;\n"), text.len()];
+        let mut got = Vec::new();
+        BoundaryScan::new().feed(text.as_bytes(), 0, Some(&mut got));
+        assert_eq!(got, want);
+        let mut split = Vec::new();
+        let mut scan = BoundaryScan::new();
+        scan.feed(&text.as_bytes()[..20], 0, Some(&mut split));
+        scan.feed(&text.as_bytes()[20..], 20, Some(&mut split));
+        assert_eq!(split, want);
+        assert!(scan.clean());
     }
 
     /// The driver's slot keys and `collect`'s stored def ids are computed in two
