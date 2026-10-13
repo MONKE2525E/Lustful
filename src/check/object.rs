@@ -712,7 +712,10 @@ pub fn dyn_is_static(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// a signature, that is a caller's lifetime, not `'static`.
 pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
+        TyKind::Dyn(..) => {
+            !dyn_is_static(p, tys, t)
+                || principal_of(tys, t).is_some_and(|pr| tys.args(pr.args).iter().any(|g| g.as_ty().is_some_and(|e| has_erased_dyn(p, tys, e))))
+        }
         TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_erased_dyn(p, tys, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_erased_dyn(p, tys, e)),
         TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Projection(_, a) => {
@@ -723,6 +726,41 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             has_erased_dyn(p, tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_erased_dyn(p, tys, e))
         }
         _ => false,
+    }
+}
+
+/// True when a dyn type with an erased object lifetime sits in an
+/// invariant position of the return type `t`: under `&mut` or `*mut`
+/// (other than a dyn pointee of the outer reference, which a return
+/// coerces), a user Adt (lust computes no variance), a fn pointer, or
+/// trait args. A body value that flows there gets the caller's object
+/// lifetime, so it cannot also be `'static` (`Ctx::dyn_static_clean`).
+pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    fn go(p: &Program, tys: &impl TyIntern, t: Ty, inv: bool, depth: u32) -> bool {
+        let args_go = |a: crate::ty::ArgsId, inv: bool| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(p, tys, e, inv, depth + 1)));
+        if depth > 32 {
+            return false;
+        }
+        match tys.kind(t) {
+            TyKind::Dyn(..) => (inv && !dyn_is_static(p, tys, t)) || principal_of(tys, t).is_some_and(|pr| args_go(pr.args, true)),
+            TyKind::Ref(_, m, e) | TyKind::RawPtr(m, e) => go(p, tys, e, inv || m.is_mut(), depth + 1),
+            TyKind::Slice(e) | TyKind::Array(e, _) => go(p, tys, e, inv, depth + 1),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(p, tys, e, inv, depth + 1)),
+            TyKind::Adt(_, a) => {
+                let covariant = matches!(tys.builtin_of(t), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec));
+                args_go(a, inv || !covariant)
+            }
+            TyKind::FnPtr(sig) => {
+                let s = tys.sig(sig).value;
+                go(p, tys, s.output, true, depth + 1) || tys.tys_of(s.inputs).iter().any(|&e| go(p, tys, e, true, depth + 1))
+            }
+            TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => args_go(a, true),
+            _ => false,
+        }
+    }
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) if matches!(tys.kind(e), TyKind::Dyn(..)) => go(p, tys, e, false, 1),
+        _ => go(p, tys, t, false, 0),
     }
 }
 

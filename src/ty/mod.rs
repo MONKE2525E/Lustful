@@ -637,6 +637,7 @@ impl TyFlags {
     const PARAM: u8 = 1;
     const PROJECTION: u8 = 2;
     const INFER: u8 = 4;
+    const STATIC_REGION: u8 = 8;
     /// True if some subterm is a generic `Param`.
     pub fn contains_param(self) -> bool {
         self.0 & Self::PARAM != 0
@@ -649,6 +650,12 @@ impl TyFlags {
     /// True if some subterm is an inference variable.
     pub fn contains_infer(self) -> bool {
         self.0 & Self::INFER != 0
+    }
+    /// True if some subterm is a dyn type or a reference with a
+    /// `'static` region (the only regions lust keeps; see
+    /// `check::object`): coercions skip the region checks without one.
+    pub fn contains_static_region(self) -> bool {
+        self.0 & Self::STATIC_REGION != 0
     }
     fn union(self, other: TyFlags) -> TyFlags {
         TyFlags(self.0 | other.0)
@@ -869,6 +876,7 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
         TyKind::Param(_) => TyFlags(TyFlags::PARAM),
         TyKind::Infer(_) => TyFlags(TyFlags::INFER),
         TyKind::Projection(_, a) => TyFlags(TyFlags::PROJECTION).union(of_args(a)),
+        TyKind::Ref(Region::Static, _, t) => of_ty(t).union(TyFlags(TyFlags::STATIC_REGION)),
         TyKind::Ref(_, _, t) | TyKind::RawPtr(_, t) | TyKind::Slice(t) => of_ty(t),
         TyKind::Array(t, c) => of_ty(t).union(of_const(c)),
         TyKind::Tuple(ts) => s.tys_of(ts).iter().fold(TyFlags::default(), |f, &t| f.union(of_ty(t))),
@@ -877,11 +885,14 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
             let sig = s.sig(sig).value;
             s.tys_of(sig.inputs).iter().fold(of_ty(sig.output), |f, &t| f.union(of_ty(t)))
         }
-        TyKind::Dyn(b, _) => {
+        TyKind::Dyn(b, r) => {
             let b = s.dyn_bounds(b);
             let mut f = b.principal.as_ref().map_or_else(TyFlags::default, |p| of_trait_ref(&p.value));
             for sup in &b.supertraits {
                 f = f.union(of_trait_ref(&sup.value));
+            }
+            if r == Region::Static {
+                f = f.union(TyFlags(TyFlags::STATIC_REGION));
             }
             f
         }

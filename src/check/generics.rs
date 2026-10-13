@@ -1010,10 +1010,16 @@ pub fn resolve_scoped(
             let mut inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
             // `&'static dyn Tr` defaults its object lifetime to the
             // reference's: `&'static (dyn Tr + 'static)` (ARCH 2.8).
+            // A reference to a dyn type keeps a written `'static`, so
+            // a coercion into it can be checked (`check::object`);
+            // every other reference is erased.
             if lifetime.is_some_and(|lt| interner.get(lt.name) == "static")
-                && let TyKind::Dyn(b, Region::Erased) = tys.kind(inner)
+                && let TyKind::Dyn(b, r) = tys.kind(inner)
             {
-                inner = tys.intern(TyKind::Dyn(b, Region::Static));
+                if r == Region::Erased {
+                    inner = tys.intern(TyKind::Dyn(b, Region::Static));
+                }
+                return Ok(tys.intern(TyKind::Ref(Region::Static, Mut::from_bool(*mutable), inner)));
             }
             Ok(tys.mk_ref(*mutable, inner))
         }

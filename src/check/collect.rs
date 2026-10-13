@@ -298,11 +298,12 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
         TyKind::Never => "!".into(),
         TyKind::Int(i) => i.name().into(),
         TyKind::Float(f) => f.name().into(),
-        TyKind::Ref(_, m, e) => {
+        TyKind::Ref(r, m, e) => {
             let inner = ty_name(p, tys, e);
             // `&(dyn A + Send)`: the parens are part of the Rust syntax.
             let inner = if matches!(tys.kind(e), TyKind::Dyn(..)) && inner.contains(" + ") { format!("({inner})") } else { inner };
-            format!("&{}{inner}", if m.is_mut() { "mut " } else { "" })
+            let lt = if r == Region::Static { "'static " } else { "" };
+            format!("&{lt}{}{inner}", if m.is_mut() { "mut " } else { "" })
         }
         TyKind::RawPtr(m, e) => format!("*{}{}", if m.is_mut() { "mut " } else { "const " }, ty_name(p, tys, e)),
         TyKind::Slice(e) => format!("[{}]", ty_name(p, tys, e)),

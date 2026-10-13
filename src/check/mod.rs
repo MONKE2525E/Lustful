@@ -1957,6 +1957,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if self.f.params.iter().skip(skip_self).any(|&t| object::has_erased_dyn(p, &p.tys, t)) {
             return false;
         }
+        // A dyn value that flows into the return type invariantly gets
+        // the caller's object lifetime (`Option<&mut dyn Tr>`).
+        if object::has_erased_dyn_invariant(p, &p.tys, self.f.ret) {
+            return false;
+        }
+        // A closure's parameter and return lifetimes are its caller's.
+        for i in 0..self.closures.len() {
+            let sig: Vec<Ty> = self.closures[i].inputs.iter().copied().chain([self.closures[i].output]).collect();
+            for t in sig {
+                let t = self.deep(t);
+                if object::has_erased_dyn(p, &self.tys, t) {
+                    return false;
+                }
+            }
+        }
         for i in 0..self.out.expr_res.len() {
             let erased = match self.out.expr_res[i] {
                 Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(p, &p.tys, p.fn_info(f).ret),
@@ -2495,10 +2510,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 } =>
             {
+                let mut t = found;
+                for _ in 0..fd - ed {
+                    if let TyKind::Ref(_, _, inner) = self.kind(t) {
+                        t = inner;
+                    }
+                }
+                self.dyn_regions(t, expected, false, span);
                 Coerce::Deref(fd - ed)
             }
-            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Shared, y)) if self.unify(x, y) => Coerce::MutToShared,
-            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Mut, y)) if self.unify(x, y) => Coerce::Reborrow,
+            // A dyn target takes the unsizing arm below even when the
+            // types already unify: it checks the object lifetimes.
+            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Shared, y)) if !dyn_target && self.unify(x, y) => {
+                self.dyn_regions(x, y, false, span);
+                Coerce::MutToShared
+            }
+            (TyKind::Ref(_, Mut::Mut, x), TyKind::Ref(_, Mut::Mut, y)) if !dyn_target && self.unify(x, y) => {
+                self.dyn_regions(x, y, true, span);
+                Coerce::Reborrow
+            }
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if matches!(self.kind(y), TyKind::Slice(_))
                     && (!em.is_mut() || fm.is_mut())
@@ -2510,6 +2540,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         _ => false,
                     } =>
             {
+                if let (TyKind::Array(xe, _), TyKind::Slice(ye)) = (self.kind(x), self.kind(y)) {
+                    self.dyn_regions(xe, ye, em.is_mut(), span);
+                }
                 Coerce::SliceFromArray(em.is_mut())
             }
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
@@ -2527,6 +2560,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         None => false,
                     } =>
             {
+                if let (Some(xe), TyKind::Slice(ye)) = (self.tys.vec_elem(self.resolve(x)), self.kind(y)) {
+                    self.dyn_regions(xe, ye, em.is_mut(), span);
+                }
                 Coerce::SliceFromVec(em.is_mut())
             }
             // A plain fn item coerces to a function pointer with the
@@ -2545,7 +2581,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
             {
-                match self.unsize_coercion(x, y, found, expected, span) {
+                match self.unsize_coercion(x, y, found, expected, span, e) {
                     Some(c) => c,
                     None => return false,
                 }
@@ -2563,6 +2599,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.mismatch(span, expected, found);
                     return false;
                 }
+                self.dyn_regions(found, expected, false, span);
                 Coerce::None
             }
         };
@@ -2571,6 +2608,106 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.coerce[i] = c;
         }
         true
+    }
+
+    /// The object lifetime checks of a coercion whose types unified
+    /// (`unify` ignores regions; see `check::object`). A `'static`
+    /// object lifetime the found type lacks needs proof: a `DynStatic`
+    /// obligation. Under `&mut`, `*mut`, a user Adt (lust computes no
+    /// variance), a fn pointer, or trait args (`invariant`), the object
+    /// lifetimes must match; and a written `&'static` reference to a
+    /// dyn value cannot come from a shorter one. lust cannot prove
+    /// either, so both are L0705.
+    fn dyn_regions(&mut self, found: Ty, expected: Ty, invariant: bool, span: Span) {
+        let (f, e) = (self.deep(found), self.deep(expected));
+        if !self.tys.flags(f).contains_static_region() && !self.tys.flags(e).contains_static_region() {
+            return;
+        }
+        let mut need_static = false;
+        match self.region_walk(f, e, invariant, &mut need_static, 0) {
+            Some(why) => self.err(
+                "L0705",
+                span,
+                why,
+                "Use the same object lifetime on both sides, or drop the `'static` bound from the `dyn` type.",
+            ),
+            None if need_static => self.obl.push(obligations::Obligation::DynStatic { span }),
+            None => {}
+        }
+    }
+
+    /// `dyn_regions` over two unified types, in parallel. Sets
+    /// `need_static` for a `'static` object lifetime that needs proof;
+    /// returns the reason when the regions cannot match.
+    fn region_walk(&mut self, f: Ty, e: Ty, invariant: bool, need_static: &mut bool, depth: u32) -> Option<String> {
+        let p = self.p;
+        if depth > 32 || f == e {
+            return None;
+        }
+        match (self.tys.kind(f), self.tys.kind(e)) {
+            (TyKind::Dyn(bf, _), TyKind::Dyn(be, _)) => {
+                let (fs, es) = (object::dyn_is_static(p, &self.tys, f), object::dyn_is_static(p, &self.tys, e));
+                if es && !fs {
+                    *need_static = true;
+                } else if fs && !es && invariant {
+                    return Some(format!(
+                        "`{}` and `{}` must have the same object lifetime here, and lust cannot prove that",
+                        self.tn(f),
+                        self.tn(e)
+                    ));
+                }
+                match (self.tys.dyn_bounds(bf).principal, self.tys.dyn_bounds(be).principal) {
+                    (Some(pf), Some(pe)) if pf.value.def == pe.value.def => self.args_walk(pf.value.args, pe.value.args, true, need_static, depth),
+                    _ => None,
+                }
+            }
+            (TyKind::Ref(rf, _, xf), TyKind::Ref(re, me, xe)) => {
+                if re == Region::Static && rf != Region::Static {
+                    return Some(format!("lust cannot prove that this reference lives for `'static`, which `{}` requires", self.tn(e)));
+                }
+                if rf == Region::Static && re != Region::Static && invariant {
+                    return Some(format!("`{}` and `{}` must have the same lifetime here, and lust cannot prove that", self.tn(f), self.tn(e)));
+                }
+                self.region_walk(xf, xe, invariant || me.is_mut(), need_static, depth + 1)
+            }
+            (TyKind::RawPtr(_, xf), TyKind::RawPtr(me, xe)) => self.region_walk(xf, xe, invariant || me.is_mut(), need_static, depth + 1),
+            (TyKind::Slice(xf), TyKind::Slice(xe)) | (TyKind::Array(xf, _), TyKind::Array(xe, _)) => {
+                self.region_walk(xf, xe, invariant, need_static, depth + 1)
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (a, b) = (self.tys.tys_of(a).to_vec(), self.tys.tys_of(b).to_vec());
+                a.into_iter().zip(b).find_map(|(x, y)| self.region_walk(x, y, invariant, need_static, depth + 1))
+            }
+            // `Option`, `Result`, and `Vec` are covariant.
+            (TyKind::Adt(df, af), TyKind::Adt(de, ae)) if df == de => {
+                let covariant = matches!(self.tys.builtin_of(f), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec));
+                self.args_walk(af, ae, invariant || !covariant, need_static, depth)
+            }
+            (TyKind::FnPtr(sf), TyKind::FnPtr(se)) => {
+                let (sf, se) = (self.tys.sig(sf).value, self.tys.sig(se).value);
+                let (inf, ine) = (self.tys.tys_of(sf.inputs).to_vec(), self.tys.tys_of(se.inputs).to_vec());
+                inf.into_iter()
+                    .chain([sf.output])
+                    .zip(ine.into_iter().chain([se.output]))
+                    .find_map(|(x, y)| self.region_walk(x, y, true, need_static, depth + 1))
+            }
+            (TyKind::FnDef(df, af), TyKind::FnDef(de, ae))
+            | (TyKind::Closure(df, af), TyKind::Closure(de, ae))
+            | (TyKind::Opaque(df, af), TyKind::Opaque(de, ae))
+                if df == de =>
+            {
+                self.args_walk(af, ae, true, need_static, depth)
+            }
+            _ => None,
+        }
+    }
+
+    fn args_walk(&mut self, a: ArgsId, b: ArgsId, invariant: bool, need_static: &mut bool, depth: u32) -> Option<String> {
+        let (a, b) = (self.tys.args(a).to_vec(), self.tys.args(b).to_vec());
+        a.into_iter().zip(b).find_map(|(x, y)| match (x.as_ty(), y.as_ty()) {
+            (Some(x), Some(y)) => self.region_walk(x, y, invariant, need_static, depth + 1),
+            _ => None,
+        })
     }
     /// Structural equality with inference variables as wildcards.
     fn ty_matchish(&self, a: Ty, b: Ty) -> bool {
@@ -2706,10 +2843,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// written auto trait, which are queued as obligations, and becomes
     /// a vtable request. Reports the error and returns None when the
     /// coercion cannot apply.
-    fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span) -> Option<Coerce> {
+    fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> Option<Coerce> {
         let p = self.p;
         let (mut x, y) = (self.deep(x), self.deep(y));
         let to = object::principal_of(&self.tys, y)?;
+        // A written `&'static dyn Tr` target: lust tracks no reference
+        // lifetimes, so only a borrow of a static item (or a reference
+        // already typed `&'static`) proves it.
+        if matches!(self.kind(expected), TyKind::Ref(Region::Static, ..))
+            && !matches!(self.kind(found), TyKind::Ref(Region::Static, ..))
+            && !e.is_some_and(|e| self.static_borrow(e))
+        {
+            let tn = self.tn(expected);
+            self.err(
+                "L0705",
+                span,
+                format!("lust cannot prove that this reference lives for `'static`, which `{tn}` requires"),
+                "Borrow a `static` item here, or use `&(dyn Tr + 'static)` (a shorter reference to a `'static` object).",
+            );
+            return None;
+        }
         // A numeric literal behind the coercion (`&3 as &dyn Tr`): as in
         // rustc, the one impl of the trait for a type of that kind
         // decides it, and otherwise the literal falls back to i32 (f64).
@@ -2780,6 +2933,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// True when `e` borrows a static item (`&S0`): the one reference
+    /// lust knows lives for `'static`.
+    fn static_borrow(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Ref { raw: false, expr, .. } => matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)),
+            _ => false,
+        }
+    }
+
     fn expect_expr(&mut self, e: ExprId, expected: Ty) -> Ty {
         let t = self.expr(e, Some(expected));
         self.coerce_expr(e, t, expected);
