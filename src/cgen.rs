@@ -313,6 +313,9 @@ pub struct FnOut {
     pub glue: HashSet<(Glue, CTy)>,
     /// Named C types (structs, enums, Options) this function's code needs declared.
     pub types: HashSet<CTy>,
+    /// A code generation failure the driver must report instead of
+    /// using `code` (see `FnGen::bad_move`).
+    pub error: Option<String>,
 }
 
 struct FnGen<'b, 'p, 'a> {
@@ -329,6 +332,14 @@ struct FnGen<'b, 'p, 'a> {
     /// elaboration). A zeroed field cannot stand for "moved": a type
     /// with a user `Drop` impl would run it on the zero value.
     move_paths: Vec<Vec<Vec<Step>>>,
+    /// The body moves part of a drop-needing local in a way drop
+    /// elaboration cannot track (through a reference or a
+    /// non-constant index, or along a path that does not fit the
+    /// local's type). The borrow checker rejects every such move
+    /// today, so this is a backstop: it turns a silent double drop
+    /// into a compile error if a future move form (for example a
+    /// `Box` deref move) reaches code generation first.
+    bad_move: bool,
     /// Locals that hold one constant array index (see
     /// `borrowck::const_index_locals`): a move out of `a[c]` is a
     /// partial move like a field move.
@@ -760,6 +771,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         local_cty,
         local_drop,
         move_paths: vec![Vec::new(); n_locals],
+        bad_move: false,
         const_index: crate::borrowck::const_index_locals(body),
         map,
         sig_types: HashSet::new(),
@@ -769,7 +781,13 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         ret_large: ret_is_large(p, body.fn_id),
     };
     g.collect_move_paths();
+    if g.bad_move {
+        return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
+    }
     g.function();
+    if g.bad_move {
+        return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
+    }
     g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
     // A `main` returning `Result` gets a Termination entry in its
     // unit (see `fn_unit`): it needs the error type's Debug glue
@@ -790,7 +808,15 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     for (_, t) in &g.glue {
         collect_types(t, &mut types);
     }
-    FnOut { code: g.out, glue: g.glue, types }
+    FnOut { code: g.out, glue: g.glue, types, error: None }
+}
+
+/// The driver-facing message for `FnGen::bad_move`.
+fn bad_move_error(p: &Program, body: &Body) -> String {
+    format!(
+        "internal: code generation for `{}`: a move out of part of a value reached code generation in a form drop elaboration cannot track (through a reference or a non-constant index)",
+        p.name(p.fn_info(body.fn_id).name)
+    )
 }
 
 impl FnGen<'_, '_, '_> {
@@ -910,6 +936,10 @@ impl FnGen<'_, '_, '_> {
     }
 
     /// Fills `move_paths` from every `Move` of a part of a local.
+    /// The statement and terminator matches are exhaustive, like
+    /// the rvalue scan, so a new IR variant cannot hide a move from
+    /// drop elaboration. A part move with no trackable path sets
+    /// `bad_move` instead of being skipped.
     fn collect_move_paths(&mut self) {
         let body = self.body;
         let mut moved: Vec<&Place> = Vec::new();
@@ -918,31 +948,48 @@ impl FnGen<'_, '_, '_> {
                 match &s.kind {
                     StmtKind::Assign(_, rv) => rvalue_moves(rv, &mut moved),
                     StmtKind::Print { parts, .. } => parts_moves(parts, &mut moved),
-                    _ => {}
+                    StmtKind::Drop(_) | StmtKind::StorageDead(_) | StmtKind::FakeRead(_) => {}
                 }
             }
             match &b.term {
                 Terminator::If(o, ..) | Terminator::Switch(o, ..) => operand_moves(o, &mut moved),
+                // `dest` is a write and an `Indirect` target reads a
+                // Copy fn pointer local: neither moves a place.
                 Terminator::Call { args, .. } => args.iter().for_each(|o| operand_moves(o, &mut moved)),
                 Terminator::Panic(parts) => parts_moves(parts, &mut moved),
-                _ => {}
+                Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable => {}
             }
         }
         for pl in moved {
-            let l = pl.local as usize;
-            let Some(path) = self.steps_of(pl) else { continue };
-            if path.is_empty() || !self.local_drop[l] || self.move_paths[l].contains(&path) {
+            if pl.proj.is_empty() {
                 continue;
             }
-            if needs_drop_c(self.p, &self.path_place(pl.local, &path).1) {
-                self.move_paths[l].push(path);
+            let l = pl.local as usize;
+            if !self.local_drop[l] {
+                continue;
+            }
+            let Some(path) = self.steps_of(pl) else {
+                self.bad_move = true;
+                continue;
+            };
+            match self.path_place(pl.local, &path) {
+                Some((_, t)) if needs_drop_c(self.p, &t) => {
+                    if !self.move_paths[l].contains(&path) {
+                        self.move_paths[l].push(path);
+                    }
+                }
+                Some(_) => {}
+                None => self.bad_move = true,
             }
         }
     }
 
     /// The C expression and type of one move path of local `l`
-    /// (`place` for the projections a path can hold).
-    fn path_place(&self, l: Local, path: &[Step]) -> (String, CTy) {
+    /// (`place` for the projections a path can hold), or None when
+    /// a step does not fit the type it steps into. Callers turn
+    /// None into `bad_move`: a move path that does not fit its
+    /// local's type must not reach drop elaboration.
+    fn path_place(&self, l: Local, path: &[Step]) -> Option<(String, CTy)> {
         let mut e = format!("l{l}");
         let mut t = self.local_cty[l as usize].clone();
         let mut variant: Option<u32> = None;
@@ -955,11 +1002,12 @@ impl FnGen<'_, '_, '_> {
                         Some(v) => format!("{e}.u.v{v}.f{i}"),
                         None => format!("{e}.f{i}"),
                     };
-                    t = cty(&self.p.tys, self.p.adt(a).variants[v.unwrap_or(0) as usize].fields[i as usize].ty);
+                    let f = self.p.adt(a).variants.get(v.unwrap_or(0) as usize)?.fields.get(i as usize)?;
+                    t = cty(&self.p.tys, f.ty);
                 }
                 (Step::Field(i), CTy::Tuple(es)) => {
                     e = format!("{e}.f{i}");
-                    t = es[i as usize].clone();
+                    t = es.get(i as usize)?.clone();
                 }
                 (Step::Field(_), CTy::Option(inner)) => {
                     variant = None;
@@ -971,14 +1019,17 @@ impl FnGen<'_, '_, '_> {
                     e = variant_field(self.p, &t, &e, v as usize, 0);
                     t = if v == 0 { *a } else { *b };
                 }
-                (Step::Elem(c), CTy::Array(el, _)) => {
+                (Step::Elem(c), CTy::Array(el, n)) => {
+                    if c >= n {
+                        return None;
+                    }
                     e = format!("{e}.v[{c}]");
                     t = *el;
                 }
-                _ => panic!("bad move path in codegen"),
+                _ => return None,
             }
         }
-        (e, t)
+        Some((e, t))
     }
 
     /// The flag index of one moved path of local `l`.
@@ -1009,7 +1060,15 @@ impl FnGen<'_, '_, '_> {
         let paths = &self.move_paths[l as usize];
         let own = paths.iter().position(|p| p == prefix);
         let deeper = paths.iter().any(|p| p.len() > prefix.len() && p.starts_with(prefix));
-        let (e, t) = self.path_place(l, prefix);
+        // Every prefix here is a prefix of a path `collect_move_paths`
+        // verified, or one step below such a prefix taken from the
+        // type at that prefix (`elab_parts`), so None cannot happen
+        // for a body the scan accepted. Flag it anyway: the driver
+        // reports `bad_move` and discards this function's code.
+        let Some((e, t)) = self.path_place(l, prefix) else {
+            self.bad_move = true;
+            return String::new();
+        };
         let inner = if deeper {
             self.elab_parts(l, prefix, &e, &t)
         } else if needs_drop_c(self.p, &t) {
@@ -4506,38 +4565,46 @@ fn parts_moves<'r>(parts: &'r [FmtPart], out: &mut Vec<&'r Place>) {
     }
 }
 
-/// Collects the moved places among the operands of one rvalue.
-fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
+/// Calls `op` for every operand one rvalue reads and `pl` for
+/// every place it reads without an operand (a borrow, a
+/// discriminant, a slice or length base). The one exhaustive
+/// rvalue scan in this file: the move scan and the mentions scan
+/// both go through it, so a new `Rvalue` variant updates both.
+fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: &mut impl FnMut(&'r Place)) {
     match rv {
-        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::ArrayRepeat(_, o, _) => operand_moves(o, out),
-        Rvalue::Subslice { lo, hi, .. } => {
-            operand_moves(lo, out);
-            if let Some(h) = hi {
-                operand_moves(h, out);
-            }
-        }
+        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::ArrayRepeat(_, o, _) | Rvalue::Res(_, _, o) => op(o),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
-            operand_moves(a, out);
-            operand_moves(b, out);
+            op(a);
+            op(b);
         }
         Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
-            ops.iter().for_each(|o| operand_moves(o, out))
+            ops.iter().for_each(|o| op(o))
         }
         Rvalue::Opt(_, o) => {
             if let Some(o) = o {
-                operand_moves(o, out);
+                op(o);
             }
         }
-        Rvalue::Res(_, _, o) => operand_moves(o, out),
-        Rvalue::Format(parts) => parts_moves(parts, out),
-        Rvalue::Ref(..)
-        | Rvalue::Discriminant(_)
-        | Rvalue::SliceOf(_)
-        | Rvalue::LenOf(_)
-        | Rvalue::StaticLoad(_)
-        | Rvalue::StaticRef(_)
-        | Rvalue::FnValue(..) => {}
+        Rvalue::Format(parts) => parts.iter().for_each(|p| {
+            if let FmtPart::Arg { value, .. } = p {
+                op(value);
+            }
+        }),
+        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => pl(p),
+        Rvalue::Subslice { base, lo, hi, .. } => {
+            pl(base);
+            op(lo);
+            if let Some(h) = hi {
+                op(h);
+            }
+        }
+        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) => {}
     }
+}
+
+/// Collects the moved places among the operands of one rvalue.
+fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
+    visit_rvalue_reads(rv, &mut |o| operand_moves(o, out), &mut |_| {});
 }
 
 fn operand_mentions(o: &Operand, l: Local) -> bool {
@@ -4545,25 +4612,9 @@ fn operand_mentions(o: &Operand, l: Local) -> bool {
 }
 
 fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
-    let op_has = |o: &Operand| operand_mentions(o, l);
-    let parts_has = |ps: &[FmtPart]| ps.iter().any(|p| matches!(p, FmtPart::Arg { value, .. } if op_has(value)));
-    match rv {
-        Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) => op_has(o),
-        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => place_mentions(p, l),
-        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) => false,
-        Rvalue::Subslice { base, lo, hi, .. } => place_mentions(base, l) || op_has(lo) || hi.as_ref().is_some_and(op_has),
-        Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
-            op_has(a) || op_has(b)
-        }
-        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
-            ops.iter().any(op_has)
-        }
-        Rvalue::ArrayRepeat(_, o, _) => op_has(o),
-        Rvalue::Opt(_, o) => o.as_ref().is_some_and(op_has),
-        Rvalue::Res(_, _, o) => op_has(o),
-        Rvalue::Format(parts) => parts_has(parts),
-        Rvalue::FnValue(..) => false,
-    }
+    let (mut op_hit, mut pl_hit) = (false, false);
+    visit_rvalue_reads(rv, &mut |o| op_hit |= operand_mentions(o, l), &mut |p| pl_hit |= place_mentions(p, l));
+    op_hit || pl_hit
 }
 
 fn succ(t: &Terminator) -> Vec<Bb> {
@@ -4572,7 +4623,7 @@ fn succ(t: &Terminator) -> Vec<Bb> {
         Terminator::If(_, a, b) => vec![*a, *b],
         Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
         Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
-        _ => Vec::new(),
+        Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => Vec::new(),
     }
 }
 
@@ -4642,6 +4693,51 @@ mod tests {
         let run = std::process::Command::new(&exe).output().unwrap();
         assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
         assert_eq!(String::from_utf8(run.stdout).unwrap(), "42\n3\n1.75\n1267650600228229401496703205381\n");
+    }
+
+    /// A move out of part of a drop-needing local through a deref
+    /// has no move path drop elaboration can track. The borrow
+    /// checker rejects such a move before code generation, so no
+    /// lowered body from source reaches this: hand-build one and
+    /// check `gen_fn` reports it in `FnOut::error` instead of
+    /// panicking or silently dropping the rest twice.
+    #[test]
+    fn bad_move_path_is_an_error_not_a_panic() {
+        let src = "fn main() { println!(\"hi\"); }\n";
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let main = program.main.unwrap();
+        let slots: Vec<u32> = (0..program.fns.len() as u32).collect();
+        let (ck, errs) = check_fn(&program, main);
+        assert!(errs.is_empty(), "{errs:?}");
+        let mut body = crate::lower::lower(&program, main, ck);
+        assert!(gen_fn(&program, &body, &map, 1, &slots).error.is_none(), "the lowered body is fine");
+        let span = Span::new(FileId(0), 0, 0);
+        let elems = body.tys.intern_tys(&[STRING, int(IntTy::U8)]);
+        let tuple_ty = body.tys.intern(TyKind::Tuple(elems));
+        let local = |ty: Ty| LocalDecl { ty, mutable: false, name: None };
+        body.locals = vec![local(UNIT), local(tuple_ty), local(STRING)];
+        body.blocks = vec![BlockData {
+            stmts: vec![Stmt {
+                kind: StmtKind::Assign(
+                    Place::local(2),
+                    Rvalue::Use(Operand::Move(Place { local: 1, proj: vec![Proj::Deref, Proj::Field(0)] })),
+                ),
+                span,
+            }],
+            term: Terminator::Return,
+            term_span: span,
+        }];
+        let out = gen_fn(&program, &body, &map, 1, &slots);
+        let err = out.error.expect("a deref part move is a code generation error");
+        assert!(err.contains("drop elaboration cannot track"), "{err}");
+        assert!(out.code.is_empty(), "no code is emitted for a bad move body");
     }
 
     /// Derived glue regenerates when a field type changes under the

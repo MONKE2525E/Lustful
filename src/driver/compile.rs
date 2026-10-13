@@ -2321,6 +2321,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if scan_i < fn_count { scan_of(front, scan_i).1 } else { 0 }
     };
     let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot));
+    if let Some(e) = outs.iter().find_map(|o| o.error.clone()) {
+        return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
