@@ -4361,6 +4361,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every renamed def records its source path in
+    /// `display_names`, so flat names stay out of program output and
+    /// diagnostics. Root defs keep plain names and need no entry.
+    #[test]
+    fn flat_names_record_display_paths() {
+        // The fallback string forms: a dependency hash segment drops,
+        // module segments join with `::`, plain names pass through.
+        assert_eq!(crate::intern::source_name("k0123456789abcdef$inner$Deep"), "Deep");
+        assert_eq!(crate::intern::source_name("a$b$Deep"), "Deep");
+        assert_eq!(crate::intern::source_path("k0123456789abcdef$inner$Deep"), "inner::Deep");
+        assert_eq!(crate::intern::source_path("Plain"), "Plain");
+
+        let dir = std::env::temp_dir().join(format!("lust-worklist-display-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("main.rs"), "mod a;\nstruct Root;\nfn main() { let _ = a::b::Deep; let _ = Root; }").unwrap();
+        std::fs::write(dir.join("a.rs"), "pub mod b;\npub struct Shallow;\npub fn f() {}\npub const C: i64 = 1;").unwrap();
+        std::fs::write(dir.join("a/b.rs"), "pub struct Deep;").unwrap();
+        let interner: &'static Interner = Box::leak(Box::new(Interner::default()));
+        let known: &'static Known = Box::leak(Box::new(Known::new(interner)));
+        let input = CrateInput {
+            root_path: dir.join("main.rs"),
+            root_text: std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:displaytest", "bin", "displaytest", false) },
+            crate_name: "displaytest".into(),
+            deps: Vec::new(),
+        };
+        let r = resolve_crate(&input, interner, known).ok().expect("display test crate resolves");
+        let shown = |flat_text: &str| r.tables.display_names.get(&interner.intern(flat_text)).map(|&d| interner.get(d).to_string());
+        assert_eq!(shown("a$b$Deep").as_deref(), Some("a::b::Deep"));
+        assert_eq!(shown("a$Shallow").as_deref(), Some("a::Shallow"));
+        assert_eq!(shown("a$f").as_deref(), Some("a::f"));
+        assert_eq!(shown("a$C").as_deref(), Some("a::C"));
+        assert_eq!(shown("Root"), None, "root defs keep plain names");
+        // A warm resolve through the cache rebuilds the same table.
+        let mut cache = ResolveCache::new();
+        let warm = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("warm resolve");
+        assert_eq!(warm.tables.display_names, r.tables.display_names);
+        let warm2 = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("cached resolve");
+        assert_eq!(warm2.tables.display_names, r.tables.display_names);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Nested (body-local) fns keep collect's order through the
     /// per-file chunk scans: every top-level body first, then every
     /// nested body, on a cold and on a fully cached resolve.

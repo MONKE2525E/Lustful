@@ -1,0 +1,8 @@
+# Diagnostics case: a type error naming a module type. Lust must
+# reject with L0110 (its message names m0::Stats, never m0$Stats).
+[package]
+name = "debug-names-diag"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

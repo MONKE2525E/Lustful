@@ -1,0 +1,5 @@
+# Derived Debug for types from a source dependency crate must print
+# source names, not the k<hash>$ flat prefix.
+[workspace]
+members = ["app", "base"]
+resolver = "2"

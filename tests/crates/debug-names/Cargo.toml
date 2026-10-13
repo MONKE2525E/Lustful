@@ -1,0 +1,8 @@
+# Derived Debug must print source names, not resolver flat names,
+# for types in modules (the m0$Stats leak).
+[package]
+name = "debug-names"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
