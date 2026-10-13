@@ -25,7 +25,15 @@
 # time, the lust check time, and lust's first diagnostic instead of
 # edit counters.
 #
-# Usage: python3 scripts/scale-gate.py [--modules 40] [--json out.json] [--multi]
+# --generic measures the generic multi-file crate (bench/realish/
+# make_generic.py: each module is a warehouse copy plus a generic half
+# with traits, generic structs and impls, generic fns, and closures)
+# with the edits generic code makes: a body edit in a generic fn, a
+# body edit in a plain fn that calls generics, a new instance use, an
+# added impl (unused, then used), a generic fn signature edit, and new
+# fn and struct defs. Every row also builds the same tree in a cold
+# one-shot session and asserts the same program output (exactness).
+# Usage: python3 scripts/scale-gate.py [--modules 40] [--json out.json] [--multi | --generic]
 # --multi measures the same crate split into one module file per
 # warehouse copy (bench/realish/make_multi.py, the resolver path)
 # with per-edit scenarios: body edit, new fn, signature edit, type
@@ -39,6 +47,7 @@ LUST = os.path.join(ROOT, "target/release/lust")
 MODULES = 40
 JSON_OUT = None
 MULTI = False
+GENERIC = False
 args = sys.argv[1:]
 while args:
     a = args.pop(0)
@@ -48,6 +57,8 @@ while args:
         JSON_OUT = args.pop(0)
     elif a == "--multi":
         MULTI = True
+    elif a == "--generic":
+        GENERIC = True
     else:
         sys.exit(f"unknown argument: {a}")
 
@@ -90,6 +101,8 @@ def print_rows(rows, rss, lines, work, label):
 def main():
     if MULTI:
         return main_multi()
+    if GENERIC:
+        return main_generic()
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
     work = tempfile.mkdtemp(prefix="lust-scale-")
@@ -373,6 +386,166 @@ def main_multi():
     if JSON_OUT:
         with open(JSON_OUT, "w") as f:
             json.dump({"crate_lines": lines, "modules": MODULES, "daemon_rss_kb": rss, "multi": True, "rows": rows}, f, indent=1)
+        print(f"json: {JSON_OUT}")
+    kill_daemon()
+
+
+def main_generic():
+    if not os.path.exists(LUST):
+        sys.exit(f"{LUST} not built; run cargo build --release first")
+    work = tempfile.mkdtemp(prefix="lust-scale-generic-")
+    crate_dir = os.path.join(work, "crate")
+    subprocess.run([sys.executable, os.path.join(ROOT, "bench/realish/make_generic.py"), str(MODULES), crate_dir], check=True)
+    crate = os.path.join(crate_dir, "main.rs")
+    lines = sum(1 for f in os.listdir(crate_dir) if f.endswith(".rs") for _ in open(os.path.join(crate_dir, f)))
+    env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "s.sock"),
+               LUST_CACHE_DIR=os.path.join(work, "cache"), LUST_STATS="1",
+               LUST_DAEMON_IDLE="300s")
+    prog = os.path.join(work, "prog")
+    rows = []
+    cold_n = [0]
+
+    def run(cmd, use_env=None):
+        start = time.perf_counter()
+        r = subprocess.run(cmd, cwd=work, env=use_env or env, capture_output=True, text=True)
+        return (time.perf_counter() - start) * 1000, r
+
+    def cold_output():
+        # A fresh one-shot session with an empty cache: the reference
+        # answer every warm row must reproduce.
+        cold_n[0] += 1
+        cenv = dict(env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold-{cold_n[0]}"))
+        cprog = os.path.join(work, "cold-prog")
+        _, cr = run([LUST, "check", crate], cenv)
+        _, br = run([LUST, "build", crate, "-o", cprog], cenv)
+        assert cr.returncode == 0 and br.returncode == 0, f"cold run failed\n{cr.stderr[-400:]}{br.stderr[-400:]}"
+        return subprocess.run([cprog], capture_output=True, text=True).stdout
+
+    def build_row(name, row_env=None, compare=True):
+        ct, cr = run([LUST, "check", "--timings", crate], row_env)
+        bt, br = run([LUST, "build", "--timings", crate, "-o", prog], row_env)
+        assert cr.returncode == 0, f"{name}: check failed\n{cr.stderr[-800:]}"
+        assert br.returncode == 0, f"{name}: build failed\n{br.stderr[-800:]}"
+        run_r = subprocess.run([prog], capture_output=True, text=True)
+        assert run_r.returncode == 0, f"{name}: program failed"
+        if compare:
+            assert run_r.stdout == cold_output(), f"{name}: warm output differs from a cold run"
+        front, back = parse_stats(cr.stderr), parse_stats(br.stderr)
+        row = {
+            "scenario": name,
+            "check_ms": round(ct, 1), "build_ms": round(bt, 1),
+            "link_ms": round(link_ms(br.stderr), 1),
+            "changed_bodies": front.get("rechecked"), "reused_bodies": front.get("reused"),
+            "invalidated_queries": front.get("invalidated"), "instances": back.get("instances"),
+            "templates_check": front.get("templates"), "discovered_check": front.get("discovered"),
+            "rechecked_build": back.get("rechecked"), "templates_build": back.get("templates"),
+            "discovered_build": back.get("discovered"),
+            "c_bytes": back.get("c_bytes"), "dirty_units": back.get("dirty_units"),
+            "units_compiled": back.get("units_compiled"), "units_from_disk": back.get("unit_cache_hits"),
+            "table_rebuilt": back.get("table_rebuilt"), "mode": front.get("mode"),
+            "checksum": run_r.stdout.strip().splitlines()[-1] if run_r.stdout.strip() else "",
+            "cold_checked": compare,
+        }
+        rows.append(row)
+        return row
+
+    def edit(rel, old, new, count=1):
+        path = os.path.join(crate_dir, rel)
+        text = open(path).read()
+        assert text.count(old) >= count, f"edit not found in {rel}: {old!r}"
+        open(path, "w").write(text.replace(old, new, count))
+
+    daemon = None
+
+    def start_daemon():
+        nonlocal daemon
+        daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):
+            if os.path.exists(os.path.join(work, "s.sock")):
+                return
+            time.sleep(0.05)
+        sys.exit("daemon did not start")
+
+    def daemon_rss_kb():
+        try:
+            for line in open(f"/proc/{daemon.pid}/status"):
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        except OSError:
+            return None
+
+    def kill_daemon():
+        nonlocal daemon
+        if daemon:
+            daemon.kill()
+            daemon.wait()
+            daemon = None
+        for f in ("s.sock", "s.sock.lock"):
+            try:
+                os.remove(os.path.join(work, f))
+            except FileNotFoundError:
+                pass
+
+    m = "m21.rs"
+    cold_env = dict(env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold-cache"))
+    build_row("fresh cold (one-shot, empty caches)", row_env=cold_env, compare=False)
+    start_daemon()
+    build_row("fresh cold (new daemon session)")
+    build_row("warm no-op (daemon)", compare=False)
+    rss = daemon_rss_kb()
+
+    edit(m, "if qty >= 10 { subtotal / 20 } else { 0 }", "if qty >= 8 { subtotal / 25 } else { 0 }")
+    build_row("body edit, plain fn (no generic calls)")
+    edit(m, "        s += xs[i].score();\n", "        s += xs[i].score() + 1;\n")
+    build_row("body edit in a generic fn")
+    edit(m, "    while k < 20 {\n", "    while k < 21 {\n")
+    build_row("body edit, plain fn that calls generics")
+    edit(m, "    let mix = closure_mix_m21(best);\n",
+         "    let mix = closure_mix_m21(best);\n"
+         "    let swapped = Pair_m21 { a: Gadget_m21 { id: 5, power: 6, cost: 2 }, b: Widget_m21 { id: 7, weight: 8 } };\n"
+         "    let mix = mix + pair_score_m21(&swapped);\n")
+    build_row("new instance use (pair_score<Gadget, Widget>)")
+    edit(m, "fn sum_scores_m21<",
+         "impl Merge_m21 for Gadget_m21 {\n"
+         "    fn merge(&self, other: &Gadget_m21) -> Gadget_m21 {\n"
+         "        Gadget_m21 { id: self.id, power: self.power + other.power, cost: self.cost.min(other.cost) }\n"
+         "    }\n}\n\nfn sum_scores_m21<")
+    build_row("add an impl (unused)")
+    edit(m, "    let mix = closure_mix_m21(best);\n",
+         "    let mix = closure_mix_m21(best) + match merge_all_m21(&g.items) { Some(x) => x.power, None => 0 };\n")
+    build_row("use the new impl (merge_all<Gadget>)")
+    edit(m, "fn pair_score_m21<A: Scored_m21, B: Scored_m21>(p: &Pair_m21<A, B>) -> i64 {\n    p.a.score() * 10 + p.b.score()",
+         "fn pair_score_m21<A: Scored_m21, B: Scored_m21>(p: &Pair_m21<A, B>, k: i64) -> i64 {\n    p.a.score() * k + p.b.score()")
+    edit(m, "pair_score_m21(&p)", "pair_score_m21(&p, 10)")
+    edit(m, "pair_score_m21(&swapped)", "pair_score_m21(&swapped, 9)")
+    build_row("signature edit of a generic fn (new param)")
+    edit(m, "fn sum_scores_m21<",
+         "fn qty_ok_m21(q: i64) -> bool {\n    q > 0 && q <= 50\n}\n\nfn sum_scores_m21<")
+    build_row("new fn def (unused)")
+    edit(m, "fn sum_scores_m21<", "struct Extra_m21 {\n    v: i64,\n}\n\nfn sum_scores_m21<")
+    build_row("new struct def (unused)")
+
+    kill_daemon()
+    start_daemon()
+    build_row("cached cold after restart (manifest + disk objects)")
+    build_row("restart warm no-op", compare=False)
+
+    print(f"scale gate (generic multi-file): {MODULES} modules, {lines} physical lines, work dir {work}")
+    print(f"daemon memory after cold build: RSS {rss} kB")
+    print()
+    hdr = ("scenario", "check", "build", "chk", "tmpl", "disc", "bld", "inst", "C KB", "tccU", "diskU")
+    print(" ".join(f"{h:>6}" if i else f"{h:<48}" for i, h in enumerate(hdr)))
+    for r in rows:
+        print(f"{r['scenario']:<48} {r['check_ms']:>6.0f} {r['build_ms']:>6.0f} {r['changed_bodies']:>6} "
+              f"{r['templates_check']:>6} {r['discovered_check']:>6} {r['rechecked_build']:>6} {r['instances']:>6} "
+              f"{(r['c_bytes'] or 0) // 1024:>6} {r['units_compiled']:>6} {r['units_from_disk']:>6}"
+              f"  [{r['mode']}] {r['checksum']}{'' if r['cold_checked'] else ' (no cold compare)'}")
+    print("chk/bld: bodies rechecked by the driver in check/build; tmpl/disc: template checks and")
+    print("discovery checks inside collect (check request); inst: live slots; tccU/diskU: units compiled/from disk.")
+    if JSON_OUT:
+        with open(JSON_OUT, "w") as f:
+            json.dump({"crate_lines": lines, "modules": MODULES, "daemon_rss_kb": rss, "generic": True, "rows": rows}, f, indent=1)
         print(f"json: {JSON_OUT}")
     kill_daemon()
 
