@@ -7,6 +7,7 @@ use crate::ir::*;
 use crate::ty::*;
 
 mod closure;
+pub mod iter;
 
 struct LoopInfo {
     break_bb: Bb,
@@ -1200,6 +1201,16 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let ops = ops.into_iter().map(|o| o.unwrap()).collect();
                 self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span);
             }
+            // A range value (check/iter.rs): the std struct's fields,
+            // `start`, `end`, and `exhausted` for the inclusive form.
+            Expr::Range { lo: Some(lo), hi: Some(hi), inclusive } => {
+                let ty = self.ty(e);
+                let mut ops = vec![self.operand(*lo), self.operand(*hi)];
+                if *inclusive {
+                    ops.push(Operand::Const(Const::Bool(false)));
+                }
+                self.set_or_temp(dest, Rvalue::TupleAgg(ty, ops), ty, span);
+            }
             Expr::Range { .. } => {}
             Expr::Break { label, value: val } => {
                 let ti = match label {
@@ -2315,6 +2326,27 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = bodyb;
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             self.assign(Place::local(item), Rvalue::Use(Operand::Copy(c)), span);
+        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter)) {
+            // `for x in it` over a builtin iterator (ty/iter.rs): call
+            // `next` until it returns None, like the Chars arm.
+            let it_ty = self.ty(iter);
+            let it = self.temp(it_ty);
+            self.expr_into(iter, Some(&Place::local(it)));
+            self.goto(head, span);
+            let mt = self.ref_ty(true, it_ty);
+            let r = self.temp(mt);
+            self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
+            let ot = self.body.tys.mk_option(item_ty);
+            let nx = self.temp(ot);
+            self.call_into(CallTarget::Builtin(Builtin::IterNext), vec![Operand::Move(Place::local(r))], Place::local(nx), span);
+            let d = self.temp(int(IntTy::U32));
+            self.assign(Place::local(d), Rvalue::Discriminant(Place::local(nx)), span);
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, bodyb)], exit);
+            self.cur = bodyb;
+            let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
+            let op = self.operand_from(c, item_ty);
+            self.assign(Place::local(item), Rvalue::Use(op), span);
         } else if self.body.tys.vec_elem(self.ty(iter)).is_some() {
             // `for x in v` by value: move the Vec into a temporary
             // and remove each front element in turn. Removing (not

@@ -4,6 +4,7 @@
 pub mod closure;
 pub mod collect;
 pub mod generics;
+pub mod iter;
 pub mod method;
 pub mod object;
 pub mod obligations;
@@ -235,6 +236,49 @@ pub enum Builtin {
     MemTake,
     CmpMax,
     CmpMin,
+    IterIter,
+    IterIterMut,
+    IterVecIntoIter,
+    IterNext,
+    IterMap,
+    IterFilter,
+    IterFilterMap,
+    IterEnumerate,
+    IterRev,
+    IterTake,
+    IterSkip,
+    IterStepBy,
+    IterChain,
+    IterZip,
+    IterCopied,
+    IterCloned,
+    IterTakeWhile,
+    IterSkipWhile,
+    IterPeekable,
+    IterPeek,
+    IterInspect,
+    IterCount,
+    IterLast,
+    IterNth,
+    IterAny,
+    IterAll,
+    IterFind,
+    IterFindMap,
+    IterPosition,
+    IterFold,
+    IterForEach,
+    IterMin,
+    IterMax,
+    IterMinByKey,
+    IterMaxByKey,
+    IterCollect,
+    IterSum,
+    IterProduct,
+    VecIterNext,
+    VecIterNextBack,
+    VecIterLen,
+    CharsBytesLeft,
+    CharsNextBack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -615,6 +659,12 @@ struct Ctx<'p, 'a> {
     /// Element types a builtin Vec method needs to be PartialEq
     /// (`contains`, `dedup`), re-tested at finish as above.
     deferred_eq: Vec<(Ty, Span)>,
+    /// Item types an iterator method needs to be Copy (`copied`),
+    /// re-tested at finish as above (W-STD-A).
+    deferred_copy: Vec<(Ty, Span)>,
+    /// Item or key types an iterator method needs to be Ord (`min`,
+    /// `max`, `min_by_key`, `max_by_key`), re-tested at finish.
+    deferred_ord: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -758,6 +808,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_fmt: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_eq: Vec::new(),
+        deferred_copy: Vec::new(),
+        deferred_ord: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -3967,6 +4019,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 UNIT
             }
             Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span, expected),
+            Expr::Range { lo: Some(lo), hi: Some(hi), inclusive } => self.range_value(e, *lo, *hi, *inclusive, span),
             Expr::Range { .. } => {
                 self.errs.push(unsupported(span, "ranges outside `for` loops"));
                 ERROR
@@ -7377,6 +7430,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(ret) = self.prim_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
+        // Iterator sources on sequences and every method on a builtin
+        // iterator (check/iter.rs, W-STD-A).
+        if let Some(ret) = self.iter_method(e, recv, rt, base, derefs, name, name_span, args, turbofish, expected) {
+            return ret;
+        }
         use Builtin as B;
         // Builtin methods dispatch on the v2 builtin def in the first slot and on
         // the general kind in the second; user Adts were handled above.
@@ -8560,6 +8618,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let t = self.expr(iter, None);
         match self.kind(t) {
             _ if self.tys.is_chars_ty(self.resolve(t)) => CHAR,
+            _ if crate::ty::iter::is_iter(&self.tys, self.resolve(t)) => {
+                let r = self.deep(t);
+                crate::ty::iter::item_ty(&mut self.tys, r).unwrap_or(ERROR)
+            }
             TyKind::Ref(r, m, inner) => {
                 let elem = match self.kind(self.resolve(inner)) {
                     TyKind::Slice(elem) | TyKind::Array(elem, _) => Some(elem),
@@ -10681,7 +10743,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// True when a closure type sits inside an Adt's type arguments.
     fn closure_in_adt(&self, t: Ty, in_adt: bool) -> bool {
         match self.tys.kind(t) {
-            TyKind::Closure(_, a) => in_adt || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, in_adt))),
+            TyKind::Closure(_, a) => {
+                in_adt || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, in_adt)))
+            }
+            // A builtin iterator stores its closures as fields lust
+            // models (ty/iter.rs); its loans flow through `contains_ref`.
+            TyKind::Adt(..) if crate::ty::iter::iter_parts(&self.tys, t).is_some() => {
+                crate::ty::iter::iter_parts(&self.tys, t).is_some_and(|(_, a)| a.iter().any(|&e| self.closure_in_adt(e, in_adt)))
+            }
             TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, true))),
             TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.closure_in_adt(e, in_adt),
             TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.closure_in_adt(e, in_adt)),
@@ -12066,6 +12135,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !has_eq(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0112", span, format!("type `{tn}` cannot be compared with `==`"), "Add #[derive(PartialEq)] to the type.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_copy) {
+            let t = self.deep(t);
+            if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_ord) {
+            let t = self.deep(t);
+            if !iter::has_total_ord(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Compare integers, chars, strings, or tuples of them.");
             }
         }
         for i in 0..self.out.expr_ty.len() {

@@ -7,6 +7,7 @@ use crate::diag::{SourceMap, Span};
 use crate::ir::*;
 use crate::ty::lang::{self, SigTy};
 use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind};
+use crate::ty::iter::IterKind;
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -51,6 +52,9 @@ pub enum CTy {
     /// fat value stands for it, as for slices): the runtime's
     /// `lust_dyn` (data pointer and vtable, ARCH 2.8).
     Dyn,
+    /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
+    /// the moved-in buffer plus the front index of what it still owns.
+    VecIter(Box<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -122,12 +126,61 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             }
             Some(BuiltinTy::Chars) => CTy::Chars,
             Some(BuiltinTy::Args) => CTy::Args,
+            Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
             },
         },
         _ => CTy::Unit,
+    }
+}
+
+/// The C form of a builtin iterator (ty/iter.rs): a tuple of its
+/// stored fields, built structurally (no type interning here), or the
+/// runtime's `lust_VecIter` for `vec::IntoIter`.
+fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
+    use crate::ty::iter::Field;
+    let args: Vec<Ty> = tys.adt_parts(t).map(|(_, a)| tys.args(a).iter().map(|g| g.as_ty().unwrap_or(ERROR)).collect()).unwrap_or_default();
+    let arg = |i: u8| args.get(i as usize).copied().unwrap_or(ERROR);
+    if k == IterKind::VecIntoIter {
+        return CTy::VecIter(Box::new(cty(tys, arg(0))));
+    }
+    let fields = k
+        .fields()
+        .iter()
+        .map(|&f| match f {
+            Field::Arg(i) => cty(tys, arg(i)),
+            Field::Usize => CTy::Int(IntTy::Usize),
+            Field::Bool => CTy::Bool,
+            Field::OptArg(i) => CTy::Option(Box::new(cty(tys, arg(i)))),
+            Field::SliceRef(i, _) => CTy::Slice(Box::new(cty(tys, arg(i)))),
+            Field::VecArg(i) => CTy::Vec(Box::new(cty(tys, arg(i)))),
+            Field::PeekSlot(i) => CTy::Option(Box::new(CTy::Option(Box::new(iter_item_cty(tys, arg(i)))))),
+        })
+        .collect();
+    CTy::Tuple(fields)
+}
+
+/// The C form of an iterator type's item, built without interning.
+fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
+    use IterKind as K;
+    if tys.is_chars_ty(t) {
+        return CTy::Char;
+    }
+    let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) else { return CTy::Unit };
+    let ref_to = |e: Ty| match tys.kind(e) {
+        TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
+        _ => CTy::Ref(Box::new(cty(tys, e))),
+    };
+    match k {
+        K::SliceIter | K::SliceIterMut => ref_to(a[0]),
+        K::VecIntoIter | K::Range | K::RangeInclusive => cty(tys, a[0]),
+        K::Map | K::FilterMap => cty(tys, a[2]),
+        K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
+        K::Zip => CTy::Tuple(vec![iter_item_cty(tys, a[0]), iter_item_cty(tys, a[1])]),
+        K::Copied | K::Cloned => cty(tys, a[1]),
+        _ => iter_item_cty(tys, a[0]),
     }
 }
 
@@ -179,6 +232,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Ref(inner) if **inner == CTy::Str => "lust_str".into(),
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
+        CTy::VecIter(_) => "lust_VecIter".into(),
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
@@ -205,6 +259,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Vec(e) => format!("V_{}_", mangle(e)),
         CTy::Boxed(e) => format!("Bx_{}_", mangle(e)),
         CTy::Rc(e) => format!("Rc_{}_", mangle(e)),
+        CTy::VecIter(e) => format!("VI_{}_", mangle(e)),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -263,7 +318,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) => collect_types(e, out),
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) => collect_types(e, out),
         CTy::Rc(e) => {
             out.insert(t.clone());
             collect_types(e, out);
@@ -309,7 +364,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::VecIter(_) => true,
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -475,6 +530,11 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             }
             CTy::Chars => Some(plain_layout(24, 8)),
             CTy::Args => Some(plain_layout(8, 8)),
+            CTy::VecIter(_) => layout::struct_layout(
+                &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)],
+                layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
+            )
+            .ok(),
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
@@ -656,6 +716,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::FnPtr(..) => (8, 8),
             CTy::Str => (16, 8),
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
+            CTy::VecIter(_) => (32, 8),
             CTy::Args => (8, 8),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
@@ -796,6 +857,16 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
 /// Generates C for one function body. `base_line` is the line of its `fn` keyword, in the
 /// file that defines it; `slots` maps every LocalDefId to its slot in `lust_fns`.
 pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: &[u32]) -> FnOut {
+    // Iterator builtins become plain IR first (W-STD-A, lower/iter.rs).
+    let expanded;
+    let body = match crate::lower::iter::expand(p, body) {
+        Ok(Some(b)) => {
+            expanded = b;
+            &expanded
+        }
+        Ok(None) => body,
+        Err(e) => return FnOut { error: Some(e), ..Default::default() },
+    };
     let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
     let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
     let n_locals = local_cty.len();
@@ -2643,6 +2714,68 @@ impl FnGen<'_, '_, '_> {
                 }
                 format!("({disc} ? {} : {d})", variant_field(self.p, &tys[0], &t, 1, 0))
             }
+            // `vec::IntoIter` (W-STD-A): the moved-in buffer, then
+            // `next` and `next_back` take from `front..len`.
+            B::IterVecIntoIter => format!("((lust_VecIter){{ {0}.ptr, {0}.len, {0}.cap, 0 }})", vals[0]),
+            B::VecIterLen => format!("({0}->len - {0}->front)", vals[0]),
+            B::CharsBytesLeft => format!("({0}->s.len - {0}->pos)", vals[0]),
+            B::VecIterNext | B::VecIterNextBack => {
+                let e = match &tys[0] {
+                    CTy::Ref(inner) => match &**inner {
+                        CTy::VecIter(e) => (**e).clone(),
+                        _ => unreachable!("vec::IntoIter next takes &mut lust_VecIter"),
+                    },
+                    _ => unreachable!("vec::IntoIter next takes &mut lust_VecIter"),
+                };
+                let opt = CTy::Option(Box::new(e.clone()));
+                let ot = ctype(&opt);
+                let t = self.tmp();
+                let v = &vals[0];
+                let idx = if b == B::VecIterNext { format!("{v}->front++") } else { format!("--{v}->len") };
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    if ({v}->front < {v}->len) {{ {field} = (({}*){v}->ptr)[{idx}];{some} }}", ctype(&e));
+                t
+            }
+            B::IterIter
+            | B::IterIterMut
+            | B::IterNext
+            | B::IterMap
+            | B::IterFilter
+            | B::IterFilterMap
+            | B::IterEnumerate
+            | B::IterRev
+            | B::IterTake
+            | B::IterSkip
+            | B::IterStepBy
+            | B::IterChain
+            | B::IterZip
+            | B::IterCopied
+            | B::IterCloned
+            | B::IterTakeWhile
+            | B::IterSkipWhile
+            | B::IterPeekable
+            | B::IterPeek
+            | B::IterInspect
+            | B::IterCount
+            | B::IterLast
+            | B::IterNth
+            | B::IterAny
+            | B::IterAll
+            | B::IterFind
+            | B::IterFindMap
+            | B::IterPosition
+            | B::IterFold
+            | B::IterForEach
+            | B::IterMin
+            | B::IterMax
+            | B::IterMinByKey
+            | B::IterMaxByKey
+            | B::IterCollect
+            | B::IterSum
+            | B::IterProduct => unreachable!("iterator builtins are expanded before codegen (lower/iter.rs)"),
             B::VecPop | B::VecGet | B::VecFirst | B::VecLast | B::VecGetMut | B::VecFirstMut | B::VecLastMut => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let (opt, r) = if b == B::VecPop {
@@ -2924,6 +3057,18 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let _ =
                     writeln!(self.out, "    if ({it}->pos < {it}->s.len) {{ {field} = lust_utf8_next({it}->s.ptr, &{it}->pos);{some} }}");
+                t
+            }
+            B::CharsNextBack => {
+                let t = self.tmp();
+                let it = &vals[0];
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    if ({it}->pos < {it}->s.len) {{ {field} = lust_utf8_prev({it}->s.ptr, &{it}->s.len);{some} }}");
                 t
             }
             B::CharsCount => format!("lust_chars_count({})", vals[0]),
@@ -4812,6 +4957,17 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     }
                     let et = ctype(e);
                     let _ = writeln!(body, "  lust_dealloc((void*)*p, sizeof({et}), _Alignof({et}));");
+                }
+                CTy::VecIter(e) => {
+                    // What `next` has not moved out yet: `front..len`,
+                    // in order, then the buffer (as `vec::IntoIter`).
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  for (uint64_t i = p->front; i < p->len; i++) drop_{}(&(({}*)p->ptr)[i]);", mangle(e), ctype(e));
+                    }
+                    if c_layout(p, e).is_none_or(|l| l.size > 0) {
+                        body.push_str("  if (p->cap) free(p->ptr);\n");
+                    }
                 }
                 CTy::Rc(e) => {
                     let it = format!("RcI_{}", mangle(e));

@@ -221,6 +221,49 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::MemTake,
     Builtin::CmpMax,
     Builtin::CmpMin,
+    Builtin::IterIter,
+    Builtin::IterIterMut,
+    Builtin::IterVecIntoIter,
+    Builtin::IterNext,
+    Builtin::IterMap,
+    Builtin::IterFilter,
+    Builtin::IterFilterMap,
+    Builtin::IterEnumerate,
+    Builtin::IterRev,
+    Builtin::IterTake,
+    Builtin::IterSkip,
+    Builtin::IterStepBy,
+    Builtin::IterChain,
+    Builtin::IterZip,
+    Builtin::IterCopied,
+    Builtin::IterCloned,
+    Builtin::IterTakeWhile,
+    Builtin::IterSkipWhile,
+    Builtin::IterPeekable,
+    Builtin::IterPeek,
+    Builtin::IterInspect,
+    Builtin::IterCount,
+    Builtin::IterLast,
+    Builtin::IterNth,
+    Builtin::IterAny,
+    Builtin::IterAll,
+    Builtin::IterFind,
+    Builtin::IterFindMap,
+    Builtin::IterPosition,
+    Builtin::IterFold,
+    Builtin::IterForEach,
+    Builtin::IterMin,
+    Builtin::IterMax,
+    Builtin::IterMinByKey,
+    Builtin::IterMaxByKey,
+    Builtin::IterCollect,
+    Builtin::IterSum,
+    Builtin::IterProduct,
+    Builtin::VecIterNext,
+    Builtin::VecIterNextBack,
+    Builtin::VecIterLen,
+    Builtin::CharsBytesLeft,
+    Builtin::CharsNextBack,
 ];
 
 /// How a builtin is called.
@@ -233,7 +276,7 @@ enum Call {
 
 /// The receiver or owner types of a builtin, the names it answers to, and how it is called.
 /// Exhaustive on purpose: adding a `Builtin` variant fails to compile until it is listed here.
-fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Call) {
+fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str], Vec<Sym>, Call) {
     use Builtin as B;
     match b {
         B::StringNew => (&["String"], vec![k.new], Call::Associated),
@@ -438,6 +481,49 @@ fn builtin_info(b: Builtin, k: &Known) -> (&'static [&'static str], Vec<Sym>, Ca
         B::MemTake => (&["core::mem"], vec![k.take], Call::Function),
         B::CmpMax => (&["core::cmp"], vec![k.max], Call::Function),
         B::CmpMin => (&["core::cmp"], vec![k.min], Call::Function),
+        B::IterIter => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("iter")], Call::Method),
+        B::IterIterMut => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("iter_mut")], Call::Method),
+        B::IterVecIntoIter => (&["Vec<T>"], vec![i.intern("into_iter")], Call::Method),
+        B::IterNext => (&["Iterator"], vec![i.intern("next")], Call::Method),
+        B::IterMap => (&["Iterator"], vec![i.intern("map")], Call::Method),
+        B::IterFilter => (&["Iterator"], vec![i.intern("filter")], Call::Method),
+        B::IterFilterMap => (&["Iterator"], vec![i.intern("filter_map")], Call::Method),
+        B::IterEnumerate => (&["Iterator"], vec![i.intern("enumerate")], Call::Method),
+        B::IterRev => (&["Iterator"], vec![i.intern("rev")], Call::Method),
+        B::IterTake => (&["Iterator"], vec![i.intern("take")], Call::Method),
+        B::IterSkip => (&["Iterator"], vec![i.intern("skip")], Call::Method),
+        B::IterStepBy => (&["Iterator"], vec![i.intern("step_by")], Call::Method),
+        B::IterChain => (&["Iterator"], vec![i.intern("chain")], Call::Method),
+        B::IterZip => (&["Iterator"], vec![i.intern("zip")], Call::Method),
+        B::IterCopied => (&["Iterator"], vec![i.intern("copied")], Call::Method),
+        B::IterCloned => (&["Iterator"], vec![i.intern("cloned")], Call::Method),
+        B::IterTakeWhile => (&["Iterator"], vec![i.intern("take_while")], Call::Method),
+        B::IterSkipWhile => (&["Iterator"], vec![i.intern("skip_while")], Call::Method),
+        B::IterPeekable => (&["Iterator"], vec![i.intern("peekable")], Call::Method),
+        B::IterPeek => (&["std::iter::Peekable<I>"], vec![i.intern("peek")], Call::Method),
+        B::IterInspect => (&["Iterator"], vec![i.intern("inspect")], Call::Method),
+        B::IterCount => (&["Iterator"], vec![i.intern("count")], Call::Method),
+        B::IterLast => (&["Iterator"], vec![i.intern("last")], Call::Method),
+        B::IterNth => (&["Iterator"], vec![i.intern("nth")], Call::Method),
+        B::IterAny => (&["Iterator"], vec![i.intern("any")], Call::Method),
+        B::IterAll => (&["Iterator"], vec![i.intern("all")], Call::Method),
+        B::IterFind => (&["Iterator"], vec![i.intern("find")], Call::Method),
+        B::IterFindMap => (&["Iterator"], vec![i.intern("find_map")], Call::Method),
+        B::IterPosition => (&["Iterator"], vec![i.intern("position")], Call::Method),
+        B::IterFold => (&["Iterator"], vec![i.intern("fold")], Call::Method),
+        B::IterForEach => (&["Iterator"], vec![i.intern("for_each")], Call::Method),
+        B::IterMin => (&["Iterator"], vec![i.intern("min")], Call::Method),
+        B::IterMax => (&["Iterator"], vec![i.intern("max")], Call::Method),
+        B::IterMinByKey => (&["Iterator"], vec![i.intern("min_by_key")], Call::Method),
+        B::IterMaxByKey => (&["Iterator"], vec![i.intern("max_by_key")], Call::Method),
+        B::IterCollect => (&["Iterator"], vec![i.intern("collect")], Call::Method),
+        B::IterSum => (&["Iterator"], vec![i.intern("sum")], Call::Method),
+        B::IterProduct => (&["Iterator"], vec![i.intern("product")], Call::Method),
+        B::VecIterNext => (&["std::vec::IntoIter<T>"], vec![i.intern("next")], Call::Method),
+        B::VecIterNextBack => (&["std::vec::IntoIter<T>"], vec![i.intern("next_back")], Call::Method),
+        B::VecIterLen => (&["std::vec::IntoIter<T>"], vec![i.intern("len")], Call::Method),
+        B::CharsBytesLeft => (&["str::Chars"], vec![i.intern("size_hint")], Call::Method),
+        B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
     }
 }
 
@@ -735,7 +821,7 @@ fn grouped(want: Call) -> Vec<(String, Vec<String>)> {
     let known = Known::new(&interner);
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for &b in ALL_BUILTINS {
-        let (types, names, call) = builtin_info(b, &known);
+        let (types, names, call) = builtin_info(b, &known, &interner);
         if call != want {
             continue;
         }

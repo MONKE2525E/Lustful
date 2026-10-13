@@ -32,6 +32,8 @@ _Static_assert(sizeof(lust_Unit) == 0 && _Alignof(lust_Unit) == 1, "unit layout"
 typedef struct { uint8_t *ptr; uint64_t len; } lust_str;
 typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
 typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;
+/* `vec::IntoIter<T>`: the moved-in Vec buffer; elements `front..len` are still owned. */
+typedef struct { void *ptr; uint64_t len; uint64_t cap; uint64_t front; } lust_VecIter;
 typedef struct { uint64_t n; } lust_Args;
 /* `&dyn Trait` and `&mut dyn Trait` (ARCH 2.8): the data pointer and the
    vtable, an array of words: drop glue, size, align, one super vtable per

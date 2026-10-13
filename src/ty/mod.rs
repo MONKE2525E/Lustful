@@ -13,6 +13,7 @@
 // and kin), never by matching on a builtin `TyKind` case.
 pub mod consteval;
 pub mod defs;
+pub mod iter;
 pub mod lang;
 pub mod layout;
 pub use defs::{DefData, Defs, SigData};
@@ -586,6 +587,8 @@ pub struct BuiltinDefs {
     pub chars: DefId,
     /// `std::env::Args`.
     pub args: DefId,
+    /// The builtin iterator structs, by `IterKind` index (ty/iter.rs).
+    pub iters: [DefId; iter::IterKind::ALL.len()],
 }
 
 impl BuiltinDefs {
@@ -607,8 +610,10 @@ impl BuiltinDefs {
             Some(BuiltinTy::Chars)
         } else if def == self.args {
             Some(BuiltinTy::Args)
-        } else {
+        } else if def.krate != BUILTIN_CRATE {
             None
+        } else {
+            self.iters.iter().position(|&d| d == def).map(|i| BuiltinTy::Iter(iter::IterKind::ALL[i]))
         }
     }
 }
@@ -625,6 +630,8 @@ pub enum BuiltinTy {
     Rc,
     Chars,
     Args,
+    /// A std iterator struct (ty/iter.rs).
+    Iter(iter::IterKind),
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -902,6 +909,7 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
 
 /// One interned arena. The same value always gets the same id; ids start at `base`
 /// so a body overlay can continue the global arena's numbering (as `Ty` does today).
+#[derive(Clone)]
 struct Arena<T, I> {
     items: Vec<T>,
     map: FxMap<T, I>,
@@ -984,6 +992,7 @@ impl GlobalTys {
             rc: builtin_def(&["alloc", "rc"], "Rc"),
             chars: builtin_def(&["core", "str"], "Chars"),
             args: builtin_def(&["std", "env"], "Args"),
+            iters: iter::IterKind::ALL.map(iter::iter_def),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),
@@ -1168,7 +1177,9 @@ impl TyIntern for GlobalTys {
 
 /// A function's view of the type table: the frozen global table plus local additions.
 /// Every arena numbers its local entries after the global entries, so a global id
-/// means the same value in every body and bodies need no locks.
+/// means the same value in every body and bodies need no locks. Clone copies the
+/// local additions (codegen's iterator expansion grows a copy, lower/iter.rs).
+#[derive(Clone)]
 pub struct Tys<'g> {
     pub global: &'g GlobalTys,
     /// The param env of the template body this store belongs to

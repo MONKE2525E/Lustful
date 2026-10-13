@@ -1370,6 +1370,16 @@ uint64_t lust_chars_count(lust_Chars c) LUST_BODY({
     while (c.pos < c.s.len) { lust_utf8_next(c.s.ptr, &c.pos); n++; }
     return n;
 })
+/* The char that ends at `*end` (`Chars::next_back`): back over the
+   continuation bytes, decode forward, and leave `*end` at its start. */
+uint32_t lust_utf8_prev(const uint8_t *p, uint64_t *end) LUST_BODY({
+    uint64_t i = *end - 1;
+    while (i > 0 && (p[i] & 0xC0) == 0x80) i--;
+    uint64_t j = i;
+    uint32_t c = lust_utf8_next(p, &j);
+    *end = i;
+    return c;
+})
 
 /* char::to_digit. Returns 0xFFFFFFFF for "not a digit". */
 uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({

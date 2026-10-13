@@ -1254,6 +1254,26 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 }
                 self.flow_into_mut_args(args, st, span);
             }
+            CallTarget::Builtin(Builtin::IterNext | Builtin::IterNth | Builtin::IterFind | Builtin::IterFindMap) => {
+                // An iterator item borrows what the iterator borrows,
+                // never the iterator itself (W-STD-A, ty/iter.rs): the
+                // result holds the loans of the place the `&mut self`
+                // argument borrows, not that temporary borrow.
+                if self.dest_holds_refs(dest) {
+                    if let Some(Operand::Copy(p) | Operand::Move(p)) = args.first() {
+                        let targets: Vec<Local> = bit_iter(st.holds(p.local as usize)).map(|l| self.loans[l].place.local).collect();
+                        for t in targets {
+                            new_holds.union_words(st.holds(t as usize));
+                            new_origins.union_words(st.origins(t as usize));
+                        }
+                        new_origins.union_words(st.origins(p.local as usize));
+                    }
+                    for o in args.iter().skip(1) {
+                        self.holds_of(o, st, &mut new_holds);
+                        self.origins_of(o, st, &mut new_origins);
+                    }
+                }
+            }
             CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => {
                 // Builtins were plain rvalues before S7: a reference-typed
                 // result may hold any argument's loans.

@@ -326,6 +326,11 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Rc) => format!("Rc<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
+            Some(BuiltinTy::Iter(k)) => {
+                let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
+                format!("{}<{}>", k.display(), shown.join(", "))
+            }
             None => match tys.local_adt(t) {
                 Some(a) => p.display_path(p.adt(a).name),
                 None => "{unknown}".into(),
@@ -1312,6 +1317,13 @@ pub fn collect_reuse<'a>(
         insert_builtin(&mut p, b.result, DefsKind::Enum, known.Result, two_ty_params);
         insert_builtin(&mut p, b.chars, DefsKind::Struct, interner.intern("Chars"), Generics::default());
         insert_builtin(&mut p, b.args, DefsKind::Struct, interner.intern("Args"), Generics::default());
+        for k in crate::ty::iter::IterKind::ALL {
+            let params = (0..k.n_args())
+                .map(|i| ParamDef { name: interner.intern(["I", "F", "B"][i]), kind: ParamKind::Type, span: dummy })
+                .collect();
+            let g = Generics { parent: None, params, predicates: Vec::new() };
+            insert_builtin(&mut p, b.iters[k as usize], DefsKind::Struct, interner.intern(k.path().1), g);
+        }
     }
     let mut errs = Vec::new();
     let dup = |span: Span, n: &str| Diag::new("L0106", span, format!("`{n}` is defined more than once"), "Rename one of the definitions.");
@@ -3003,7 +3015,10 @@ pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
             Some(e) => contains_ref(tys, e),
             None => match tys.result_args(t) {
                 Some((a, b)) => contains_ref(tys, a) || contains_ref(tys, b),
-                None => false,
+                None => match crate::ty::iter::iter_parts(tys, t) {
+                    Some((k, a)) => crate::ty::iter::iter_holds_ref(k, &a, &|e| contains_ref(tys, e)),
+                    None => false,
+                },
             },
         },
     }
@@ -3253,6 +3268,12 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
     if let Some((a, b)) = tys.result_args(t) {
         return needs_drop(p, tys, a) || needs_drop(p, tys, b);
+    }
+    if let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) {
+        // `vec::IntoIter` owns its buffer. Other kinds drop what their
+        // args hold (an over-count for the `Map` item arg is harmless:
+        // the drop glue only drops stored fields).
+        return k == crate::ty::iter::IterKind::VecIntoIter || a.iter().any(|&e| needs_drop(p, tys, e));
     }
     match tys.local_adt(t) {
         Some(a) => {

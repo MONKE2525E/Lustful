@@ -1140,9 +1140,15 @@ fn assoc_projection(
         return Err(not_yet("L0505", span, "module paths in types"));
     }
     let name = segs[0].name;
+    // The same bound can reach a scope twice (a method's own bounds
+    // are in both its own scope and the combined env); one trait ref
+    // counts once, as in rustc, where only distinct traits clash.
     let mut hits: Vec<&AssocSrc> = Vec::new();
     for src in &scope.assoc_srcs {
-        if src.self_ty == base && src.assocs.iter().any(|(n, _)| *n == name) {
+        if src.self_ty == base
+            && src.assocs.iter().any(|(n, _)| *n == name)
+            && !hits.iter().any(|h| h.trait_def == src.trait_def && h.args == src.args)
+        {
             hits.push(src);
         }
     }
@@ -3388,6 +3394,45 @@ pub fn add_synthetic_impls(p: &mut Program) {
             predicates: vec![Predicate::Trait(Binder::plain(TraitRef { def: lang.from, args, bindings: EMPTY_BINDINGS }))],
         };
         insert_synthetic(p, &mut ordinal, lang.into, p0, &[p1], g2, Vec::new(), Synthetic::Lang, false, span);
+    }
+    // Iterator for the builtin iterator structs (ty/iter.rs, W-STD-A):
+    // selection and `Item` normalization only; `next` and the
+    // adapters stay builtin calls.
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let names = ["I", "F", "B"];
+        for k in K::ALL {
+            let params: Vec<ParamDef> =
+                (0..k.n_args()).map(|i| ParamDef { name: p.interner.intern(names[i]), kind: ParamKind::Type, span }).collect();
+            let ps: Vec<Ty> = (0..k.n_args() as u32).map(|i| p.tys.intern(TyKind::Param(ParamId(i)))).collect();
+            let self_pat = mk_iter(&mut p.tys, k, &ps);
+            let proj = |p: &mut Program, t: Ty| {
+                let a = p.tys.intern_args(&[GenericArg::Ty(t)]);
+                p.tys.intern(TyKind::Projection(AssocId(lang.assoc_item), a))
+            };
+            let item = match k {
+                K::SliceIter => p.tys.mk_ref(false, ps[0]),
+                K::SliceIterMut => p.tys.mk_ref(true, ps[0]),
+                K::VecIntoIter | K::Range | K::RangeInclusive => ps[0],
+                K::Map | K::FilterMap => ps[2],
+                K::Copied | K::Cloned => ps[1],
+                K::Enumerate => {
+                    let inner = proj(p, ps[0]);
+                    let ts = p.tys.intern_tys(&[USIZE, inner]);
+                    p.tys.intern(TyKind::Tuple(ts))
+                }
+                K::Zip => {
+                    let (x, y) = (proj(p, ps[0]), proj(p, ps[1]));
+                    let ts = p.tys.intern_tys(&[x, y]);
+                    p.tys.intern(TyKind::Tuple(ts))
+                }
+                _ => proj(p, ps[0]),
+            };
+            let g = Generics { parent: None, params, predicates: Vec::new() };
+            insert_synthetic(p, &mut ordinal, lang.iterator, self_pat, &[], g, vec![(lang.assoc_item, item)], Synthetic::Lang, false, span);
+        }
+        let chars = CHARS;
+        insert_synthetic(p, &mut ordinal, lang.iterator, chars, &[], g0.clone(), vec![(lang.assoc_item, CHAR)], Synthetic::Lang, false, span);
     }
     // The IntoIterator blanket: impl<I: Iterator> IntoIterator
     // for I, Item = I::Item, IntoIter = I.
