@@ -599,6 +599,8 @@ pub struct BuiltinDefs {
     pub cell: DefId,
     pub ref_guard: DefId,
     pub ref_mut_guard: DefId,
+    /// `std::process::ExitCode`, a `main` result (W-STD-A phase 3).
+    pub exit_code: DefId,
 }
 
 impl BuiltinDefs {
@@ -634,6 +636,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::RefGuard)
         } else if def == self.ref_mut_guard {
             Some(BuiltinTy::RefMutGuard)
+        } else if def == self.exit_code {
+            Some(BuiltinTy::ExitCode)
         } else if def.krate != BUILTIN_CRATE {
             None
         } else {
@@ -665,6 +669,8 @@ pub enum BuiltinTy {
     RefGuard,
     /// `cell::RefMut<T>`, a mutable `RefCell` borrow guard.
     RefMutGuard,
+    /// `process::ExitCode`.
+    ExitCode,
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -869,6 +875,14 @@ pub trait TyIntern {
     fn cell_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Cell)).then(|| self.adt_first_ty_arg(t)).flatten()
     }
+    /// `std::process::ExitCode`.
+    fn exit_code_ty(&mut self) -> Ty {
+        let def = self.builtins().exit_code;
+        self.mk_adt(def, &[])
+    }
+    fn is_exit_code(&self, t: Ty) -> bool {
+        self.builtin_of(t) == Some(BuiltinTy::ExitCode)
+    }
     /// One of the one-arg builtin Adts by its def field.
     fn mk_builtin1(&mut self, which: fn(&BuiltinDefs) -> DefId, elem: Ty) -> Ty {
         let def = which(&self.builtins());
@@ -1056,6 +1070,7 @@ impl GlobalTys {
             cell: builtin_def(&["core", "cell"], "Cell"),
             ref_guard: builtin_def(&["core", "cell"], "Ref"),
             ref_mut_guard: builtin_def(&["core", "cell"], "RefMut"),
+            exit_code: builtin_def(&["std", "process"], "ExitCode"),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

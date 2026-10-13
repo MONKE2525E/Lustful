@@ -3182,6 +3182,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     (25u8, *m).hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::ExitCode => 26u8.hash(h),
             }
         }
         let mut h = crate::intern::FxHasher::default();

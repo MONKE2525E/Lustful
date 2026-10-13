@@ -162,6 +162,17 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
         CTy::Weak(_) => {
             let _ = writeln!(body, "  return lust_f_write_str(f, {});", lit("(Weak)"));
         }
+        // `ExitCode(unix_exit_status(N))`: std's tuple of the unix
+        // status tuple, through the builders (W-STD-A).
+        CTy::ExitCode => {
+            let n = int_expr(IntTy::U8, FmtKind::Debug, "w2", "(*p)");
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugTuple b; lust_fmt_slot s; lust_Formatter *w; lust_dtuple_new(&b, f, {}); if ((w = lust_dtuple_field(&b, &s))) {{ lust_DebugTuple b2; lust_fmt_slot s2; lust_Formatter *w2; lust_dtuple_new(&b2, w, {}); if ((w2 = lust_dtuple_field(&b2, &s2))) lust_dtuple_field_end(&b2, &s2, {n}); lust_dtuple_field_end(&b, &s, lust_dtuple_finish(&b2)); }} return lust_dtuple_finish(&b); }}",
+                lit("ExitCode"),
+                lit("unix_exit_status")
+            );
+        }
         CTy::Cell(e) => {
             let _ = writeln!(body, "  {}", builder_fields("Cell", true, &[("value".to_string(), "p".to_string(), (**e).clone())], need));
         }

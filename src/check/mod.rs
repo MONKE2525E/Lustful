@@ -3,6 +3,7 @@
 // Signature collection runs before body checking, in `collect`.
 pub mod closure;
 pub mod cells;
+pub mod process;
 pub mod collect;
 pub mod constfn;
 pub mod convert;
@@ -380,6 +381,8 @@ pub enum Builtin {
     CellIntoInner,
     CellGetMut,
     CellSwap,
+    /// `ExitCode::from(u8)` (check/process.rs).
+    ExitCodeFrom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7084,6 +7087,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
         }
+        // `ExitCode::SUCCESS` and `ExitCode::FAILURE` (check/process.rs).
+        if let Some(t) = self.exit_code_const(e, segs) {
+            return t;
+        }
         // Char associated consts.
         if segs.len() == 2 && segs[0].name == p.known.char {
             let c = match self.name(segs[1].name) {
@@ -7455,6 +7462,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
         if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
+            return r;
+        }
+        if let Some(r) = self.exit_code_assoc(ty_name, item, std_ty, span) {
             return r;
         }
         // A user type named `Rc` shadows std's (which needs a `use`),
@@ -9018,6 +9028,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
+                    Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
                         let rc = self.tys.mk_rc(elem);

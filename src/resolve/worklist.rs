@@ -4573,6 +4573,19 @@ impl Rewrite<'_> {
                             continue;
                         }
                         let bind_name = if name == self_sym { *mod_path.last().unwrap() } else { name };
+                        // A std module (`use std::rc::{self, Rc}`) binds as a
+                        // std alias, as `use std::rc;` does.
+                        if mod_path.len() > 1
+                            && let PathRes::Done(Target::Extern(i)) | PathRes::Partial(Target::Extern(i), _) =
+                                self.tables.resolve_module_path(module, mod_path, imp.leading_colon, self.interner)
+                            && self.tables.externs[i as usize].is_std_lib
+                            && self.tables.externs[i as usize].unsupported.is_none()
+                        {
+                            if self.interner.get(bind_name) != "_" && insert_local_std(scopes, bind_name, Namespace::Type, mod_path.to_vec()) {
+                                self.push_local_dup(span, bind_name);
+                            }
+                            continue;
+                        }
                         let target = match self.tables.resolve_module_path(module, mod_path, imp.leading_colon, self.interner) {
                             PathRes::Done(t) => Some(t),
                             _ => match self

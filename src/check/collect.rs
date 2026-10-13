@@ -370,6 +370,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
+            Some(BuiltinTy::ExitCode) => "ExitCode".into(),
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -882,6 +883,9 @@ pub fn resolve_ty(
                     _ => |d| d.cell,
                 };
                 return Ok(tys.mk_builtin1(which, e));
+            }
+            if interner.get(name) == "ExitCode" && (std_prefixed || !type_names.contains_key(&name)) {
+                return no_generics(tys.exit_code_ty());
             }
             if name == known.Result {
                 let args = seg.type_args();
@@ -1798,6 +1802,7 @@ pub fn collect_reuse<'a>(
         for k in crate::ty::fmt::FmtTy::ALL {
             insert_builtin(&mut p, b.fmt_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), Generics::default());
         }
+        insert_builtin(&mut p, b.exit_code, DefsKind::Struct, interner.intern("ExitCode"), Generics::default());
         for (def, n) in [(b.weak, "Weak"), (b.refcell, "RefCell"), (b.cell, "Cell"), (b.ref_guard, "Ref"), (b.ref_mut_guard, "RefMut")] {
             insert_builtin(&mut p, def, DefsKind::Struct, interner.intern(n), one_ty_param());
         }
@@ -3043,13 +3048,15 @@ pub fn collect_reuse<'a>(
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
-        // Rust's Termination for main: (), or Result<(), E> with E: Debug.
-        let ret_ok = f.ret == UNIT || matches!(p.tys.result_args(f.ret), Some((ok, e)) if ok == UNIT && has_debug(&p, &p.tys, e));
+        // Rust's Termination for main: (), ExitCode, or Result<T, E>
+        // with T one of those and E: Debug.
+        let term = |t: Ty| t == UNIT || p.tys.is_exit_code(t);
+        let ret_ok = term(f.ret) || matches!(p.tys.result_args(f.ret), Some((ok, e)) if term(ok) && has_debug(&p, &p.tys, e));
         if !f.params.is_empty() || !ret_ok {
             errs.push(Diag::new(
                 "L0110",
                 f.def.name_span,
-                "`main` must take no parameters and return () or Result<(), E> with E: Debug",
+                "`main` must take no parameters and return (), ExitCode, or Result<T, E> with T one of those and E: Debug",
                 "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
             ));
         }
@@ -4160,6 +4167,9 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
+            if tys.is_exit_code(t) {
+                return true;
+            }
             if let Some(e) = tys.option_elem(t) {
                 return is_copy(p, tys, e);
             }
@@ -4194,7 +4204,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Array(e, _) => return glue_clone(p, tys, e, seen),
         _ => {}
     }
-    if tys.is_string_ty(t) {
+    if tys.is_string_ty(t) || tys.is_exit_code(t) {
         return true;
     }
     if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() {
@@ -4531,7 +4541,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_eq(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_eq(p, tys, e, seen),
         _ => {
-            if tys.is_string_ty(t) {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) {
                 return true;
             }
             if tys.guard_elem(t).is_some() {
@@ -4570,7 +4580,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
             // no such rendering, so it is not Debug here (a reject).
-            if tys.is_string_ty(t) || tys.weak_elem(t).is_some() {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() {
                 return true;
             }
             if let Some(e) = tys.cell_elem(t) {

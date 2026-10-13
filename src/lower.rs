@@ -4582,7 +4582,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn const_operand(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, span: Span) -> Operand {
         use crate::ty::consteval::ConstValue as CV;
         match v {
-            CV::Int(i) => {
+            CV::Int(i) if !self.body.tys.is_exit_code(ty) => {
                 let it = match self.kind(ty) {
                     TyKind::Int(it) => it,
                     _ => IntTy::I32,
@@ -4610,6 +4610,14 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// Stores a const value into a place, building it from its parts.
     fn const_into(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, dest: &Place, span: Span) {
         use crate::ty::consteval::ConstValue as CV;
+        // `ExitCode::SUCCESS` and `FAILURE` build through `ExitCode::from`.
+        if let CV::Int(i) = v
+            && self.body.tys.is_exit_code(ty)
+        {
+            let status = Operand::Const(Const::Int(*i as u128, IntTy::U8));
+            self.call_into(CallTarget::Builtin(Builtin::ExitCodeFrom), vec![status], dest.clone(), span);
+            return;
+        }
         // An array const value at a slice reference type goes through a
         // temporary array and a SliceOf, like the coercion path.
         if let TyKind::Ref(_, _, inner) = self.kind(ty)

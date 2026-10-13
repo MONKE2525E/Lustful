@@ -2040,6 +2040,9 @@ fn resolve_path_ty(
         };
         return Ok(tys.mk_builtin1(which, elem));
     }
+    if interner.get(name) == "ExitCode" && (std_path || !cx.type_names.contains_key(&name)) {
+        return no_generics(tys.exit_code_ty());
+    }
     if name == known.Result {
         let args = match &seg.args {
             GenericArgs::Angle(a) => {

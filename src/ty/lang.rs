@@ -783,6 +783,7 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std", "alloc"], "rc", "Weak"),
     (&["std", "core"], "cell", "RefCell"),
     (&["std", "core"], "cell", "Cell"),
+    (&["std"], "process", "ExitCode"),
 ];
 
 /// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
@@ -847,6 +848,7 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/cell/RefCell",
     "core/cmp/Ordering",
     "std/cmp/Ordering",
+    "std/process/ExitCode",
     "std/collections/HashMap",
     "std/collections/HashSet",
     "alloc/collections/BTreeMap",

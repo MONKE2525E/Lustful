@@ -338,6 +338,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CellIntoInner,
     Builtin::CellGetMut,
     Builtin::CellSwap,
+    Builtin::ExitCodeFrom,
 ];
 
 /// How a builtin is called.
@@ -675,6 +676,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::CellIntoInner => (&["Cell<T>"], vec![i.intern("into_inner")], Call::Method),
         B::CellGetMut => (&["Cell<T>"], vec![i.intern("get_mut")], Call::Method),
         B::CellSwap => (&["Cell<T>"], vec![i.intern("swap")], Call::Method),
+        B::ExitCodeFrom => (&["std::process::ExitCode"], vec![k.from], Call::Associated),
     }
 }
 

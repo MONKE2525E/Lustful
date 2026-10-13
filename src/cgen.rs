@@ -77,6 +77,8 @@ pub enum CTy {
     /// A `core::fmt` struct (W-STD-B): the runtime's `lust_Formatter`
     /// or Debug builder (src/runtime/fmt.h).
     Fmt(crate::ty::fmt::FmtTy),
+    /// A `process::ExitCode`: its status byte as a `uint8_t`.
+    ExitCode,
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -159,6 +161,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             }
             Some(BuiltinTy::Chars) => CTy::Chars,
             Some(BuiltinTy::Args) => CTy::Args,
+            Some(BuiltinTy::ExitCode) => CTy::ExitCode,
             Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
             Some(BuiltinTy::Fmt(k)) => CTy::Fmt(k),
             Some(BuiltinTy::Weak) => CTy::Weak(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
@@ -292,6 +295,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
         CTy::Args => "lust_Args".into(),
+        CTy::ExitCode => "uint8_t".into(),
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
@@ -341,6 +345,7 @@ fn mangle(t: &CTy) -> String {
         CTy::RefCell(e) => format!("RCL_{}_", mangle(e)),
         CTy::Cell(e) => format!("Cl_{}_", mangle(e)),
         CTy::Guard(e, m) => format!("Gd{}_{}_", if *m { "M" } else { "" }, mangle(e)),
+        CTy::ExitCode => "XC".into(),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -449,6 +454,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::FnPtr(..)
         | CTy::Ref(_)
         | CTy::Args
+        | CTy::ExitCode
         | CTy::Chars
         | CTy::Slice(_)
         | CTy::Dyn => true,
@@ -659,6 +665,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 Some(plain_layout(size, align))
             }
             CTy::Args => Some(plain_layout(8, 8)),
+            CTy::ExitCode => Some(plain_layout(1, 1)),
             CTy::Weak(_) | CTy::Guard(..) => Some(layout::ptr_layout()),
             // `UnsafeCell` hides the value's niche, as in Rust.
             CTy::Cell(e) => go(p, e, seen).map(|mut l| {
@@ -867,6 +874,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             }
             CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
+            CTy::ExitCode => (1, 1),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
@@ -2892,6 +2900,7 @@ impl FnGen<'_, '_, '_> {
                 format!("((uint64_t *)(*{}).data)[{}]", vals[0], if b == B::RcStrongCount { -2 } else { -1 })
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
+            B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
             B::RcWeakCount => format!("((*{})->weak - 1)", vals[0]),
             B::RcGetMut => {
                 let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
@@ -5102,35 +5111,47 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     for f in &fns[range.clone()] {
         c.push_str(&f.code);
     }
-    // Termination entry for a `main` returning `Result<(), E>`:
-    // call main through the table, print `Error: {err:?}` to
-    // stderr and exit 1 on Err, as Rust does. Registered below in
-    // `lust_main_entry_p`, which the main unit prefers over the
+    // Termination entry for a `main` returning `ExitCode` or
+    // `Result<T, E>` (T `()` or `ExitCode`): call main through the
+    // table; on Err print `Error: {err:?}` to stderr and exit 1, as
+    // Rust does; an `ExitCode` is the exit status. Registered below
+    // in `lust_main_entry_p`, which the main unit prefers over the
     // plain void call. The Debug and Drop glue it calls is wanted
     // by main's own FnOut (see `gen_fn`).
     let main_entry = p.main.filter(|m| range.contains(&(m.0 as usize)) && !fns[m.0 as usize].code.is_empty());
-    if let Some(m) = main_entry
-        && let Some((_, err_t)) = p.tys.result_args(p.fn_info(m).ret)
-    {
-        let rc = cty(&p.tys, p.fn_info(m).ret);
+    let term_entry = main_entry.filter(|&m| {
+        let ret = p.fn_info(m).ret;
+        p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
+    });
+    if let Some(m) = term_entry {
+        let ret = p.fn_info(m).ret;
+        let rc = cty(&p.tys, ret);
         let rt = ctype(&rc);
         let cast = fn_ptr_cast(p, m);
         let idx = m.0;
-        let disc = disc_call(p, &rc, "(&r)");
-        let field = variant_field(p, &rc, "r", 1, 0);
-        let ec = cty(&p.tys, err_t);
         let _ = writeln!(c, "static int lust_main_entry_impl(void) {{");
         if ret_is_large(p, m) {
             let _ = writeln!(c, "  {rt} r; ({cast}lust_fns[{idx}])(&r);");
         } else {
             let _ = writeln!(c, "  {rt} r = ({cast}lust_fns[{idx}])();");
         }
-        let _ = writeln!(c, "  int rc = 0;");
-        let _ = writeln!(
-            c,
-            "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}",
-            mangle(&ec)
-        );
+        match p.tys.result_args(ret) {
+            Some((ok_t, err_t)) => {
+                let disc = disc_call(p, &rc, "(&r)");
+                let field = variant_field(p, &rc, "r", 1, 0);
+                let ec = cty(&p.tys, err_t);
+                let ok = if p.tys.is_exit_code(ok_t) { format!(" else {{ rc = {}; }}", variant_field(p, &rc, "r", 0, 0)) } else { String::new() };
+                let _ = writeln!(c, "  int rc = 0;");
+                let _ = writeln!(
+                    c,
+                    "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}{ok}",
+                    mangle(&ec)
+                );
+            }
+            None => {
+                let _ = writeln!(c, "  int rc = r;");
+            }
+        }
         if needs_drop_c(p, &rc) {
             let _ = writeln!(c, "  drop_{}(&r);", mangle(&rc));
         }
@@ -5141,9 +5162,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
         let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
     }
-    if let Some(m) = main_entry
-        && p.tys.result_args(p.fn_info(m).ret).is_some()
-    {
+    if term_entry.is_some() {
         let _ = writeln!(c, "  lust_main_entry_p = lust_main_entry_impl;");
     }
     c.push_str("}\n");
@@ -5868,7 +5887,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 match t {
                     CTy::Unit => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
-                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("({x} == {y})"),
+                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::ExitCode => format!("({x} == {y})"),
                     _ => {
                         need(Glue::Eq, t);
                         format!("eq_{}(&{x}, &{y})", mangle(t))
@@ -5876,6 +5895,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 }
             };
             match t {
+                CTy::ExitCode => body.push_str("  return *a == *b;\n"),
                 CTy::String => body.push_str("  return lust_str_eq(lust_string_as_str(a), lust_string_as_str(b));\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return lust_str_eq(*a, *b);\n"),
                 CTy::Option(e) => {

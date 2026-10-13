@@ -493,8 +493,8 @@ impl AdtTables {
                 | BuiltinTy::Iter(_)
                 | BuiltinTy::Weak,
             ) => return (Variance::Co, DropMode::Owned),
-            // `fmt` types (W-STD-B) take no type args.
-            Some(BuiltinTy::Fmt(_)) => return (Variance::Inv, DropMode::Owned),
+            // `fmt` types (W-STD-B) and `ExitCode` take no type args.
+            Some(BuiltinTy::Fmt(_) | BuiltinTy::ExitCode) => return (Variance::Inv, DropMode::Owned),
             // `RefMut<'b, T>` acts as `&'b mut T`, `Ref<'b, T>` as `&'b T`;
             // neither drops the `T` (W-STD-A).
             Some(BuiltinTy::RefMutGuard) => return (Variance::Inv, DropMode::None),

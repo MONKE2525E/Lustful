@@ -1493,6 +1493,21 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     ));
                     return TryOut::Done(false);
                 }
+                // A std module (`use std::rc::{self, Rc}`) binds as the
+                // std alias `use std::rc;` records, not as the crate root.
+                if mod_path.len() > 1
+                    && let PathRes::Done(Target::Extern(i)) | PathRes::Partial(Target::Extern(i), _) =
+                        tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner)
+                {
+                    if let Some(why) = &tables.externs[i as usize].unsupported {
+                        diags.push(unsupported_diag(why, imp.span));
+                        return TryOut::Done(false);
+                    }
+                    if tables.externs[i as usize].is_std_lib {
+                        let bind_name = if *name == self_sym { *mod_path.last().unwrap() } else { *name };
+                        return TryOut::Done(record_std_alias(tables, imp, mod_path, bind_name, interner, diags));
+                    }
+                }
                 // The prefix names a module, or an enum whose own name
                 // `self` binds (`use a::E::{self, V}`).
                 let target = match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
