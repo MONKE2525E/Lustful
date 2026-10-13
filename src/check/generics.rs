@@ -759,6 +759,10 @@ pub struct Scope {
     /// A `let` annotation in a body whose regions the checker records for
     /// the borrow checker: explicit lifetimes are allowed there (W-BORROW).
     pub annotation: bool,
+    /// W-BORROW, `RegionMode::Keep` only: the default object lifetime of
+    /// a `dyn` type right under a reference (`&'a dyn Tr` is
+    /// `&'a (dyn Tr + 'a)`); none means `'static` (`Box<dyn Tr>`).
+    pub obj_default: Option<Region>,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -903,6 +907,43 @@ fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, s
             },
         },
     }
+}
+
+/// True when a written type is a `dyn` type (through parens).
+fn points_to_dyn(ast: &Ast, id: ast::TyId) -> bool {
+    match ast.ty(id) {
+        TyExpr::Dyn { .. } => true,
+        TyExpr::Paren(i) => points_to_dyn(ast, *i),
+        _ => false,
+    }
+}
+
+/// W-BORROW: a `dyn` type's object lifetime in region signatures
+/// (`RegionMode::Keep`): the written one, else the enclosing reference's
+/// (`Scope::obj_default`), else `'static`. Erased types keep only a
+/// written `'static` (`resolve_dyn`), so this changes nothing check reads.
+fn keep_object_lifetime(
+    interner: &Interner,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    ty: Ty,
+    bounds: &[TraitBound],
+    lifetime: Option<ast::Lifetime>,
+    span: Span,
+) -> Result<Ty, Diag> {
+    if !matches!(scope.regions, RegionMode::Keep { .. }) {
+        return Ok(ty);
+    }
+    let TyKind::Dyn(b, r) = tys.kind(ty) else { return Ok(ty) };
+    if r == Region::Static {
+        return Ok(ty);
+    }
+    let written = lifetime.or_else(|| bounds.iter().find_map(|tb| if let TraitBound::Lifetime(lt) = tb { Some(*lt) } else { None }));
+    let region = match written {
+        Some(lt) => scope_region(interner, scope, Some(lt), span)?,
+        None => scope.obj_default.unwrap_or(Region::Static),
+    };
+    Ok(tys.intern(TyKind::Dyn(b, region)))
 }
 
 /// True when a dyn trait path's args carry a free region: a reference or
@@ -1344,7 +1385,19 @@ pub fn resolve_scoped(
             // a coercion into it can be checked (`check::object`); the
             // borrow checker honors that kept region too. Every other
             // reference resolves under the scope's region mode.
-            let mut inner = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
+            let pointee = *inner;
+            let dyn_pointee = matches!(scope.regions, RegionMode::Keep { .. }) && points_to_dyn(ast, pointee);
+            let early = if dyn_pointee { Some(scope_region(interner, scope, *lifetime, span)?) } else { None };
+            let mut inner = match early {
+                // W-BORROW: the pointee's default object lifetime is this
+                // reference's, in region signatures (`resolve_dyn`).
+                Some(r) => {
+                    let mut s = scope.clone();
+                    s.obj_default = Some(r);
+                    resolve_scoped(ast, interner, known, cx, tys, pointee, &s)?
+                }
+                None => resolve_scoped(ast, interner, known, cx, tys, pointee, scope)?,
+            };
             if lifetime.is_some_and(|lt| interner.get(lt.name) == "static")
                 && let TyKind::Dyn(b, r) = tys.kind(inner)
             {
@@ -1353,7 +1406,10 @@ pub fn resolve_scoped(
                 }
                 return Ok(tys.intern(TyKind::Ref(Region::Static, Mut::from_bool(*mutable), inner)));
             }
-            let region = scope_region(interner, scope, *lifetime, span)?;
+            let region = match early {
+                Some(r) => r,
+                None => scope_region(interner, scope, *lifetime, span)?,
+            };
             Ok(if region == Region::Erased { tys.mk_ref(*mutable, inner) } else { tys.intern(TyKind::Ref(region, Mut::from_bool(*mutable), inner)) })
         }
         TyExpr::Tuple(elems) => {
@@ -1386,7 +1442,10 @@ pub fn resolve_scoped(
             None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
         },
         TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
-        TyExpr::Dyn { binder, bounds, lifetime } => resolve_dyn(ast, interner, known, cx, tys, &scope.erased(), binder, bounds, *lifetime, span),
+        TyExpr::Dyn { binder, bounds, lifetime } => {
+            let ty = resolve_dyn(ast, interner, known, cx, tys, &scope.erased(), binder, bounds, *lifetime, span)?;
+            keep_object_lifetime(interner, tys, scope, ty, bounds, *lifetime, span)
+        }
         TyExpr::FnPtr { qual, inputs, variadic, ret, .. } => {
             if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
                 return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));

@@ -290,8 +290,11 @@ impl AdtTables {
                     }
                 }
             }
+            // A dyn's object lifetime: covariant (`dyn Tr + 'long` is a
+            // `dyn Tr + 'short`), drop-visible (an unknown destructor).
+            TyKind::Dyn(_, r) => note(r, v.then(Variance::Co), if m == DropMode::None { DropMode::None } else { DropMode::All }, var, drop),
             _ => {
-                // A region inside anything else (fn pointers, dyn, closures)
+                // A region inside anything else (fn pointers, closures)
                 // is held invariant and drop-visible: the safe answer.
                 let mut rs = Vec::new();
                 regions_of(&p.tys, ty, &mut rs);
@@ -450,6 +453,8 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
             TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec().into_iter().map(|e| self.slots(e)).sum(),
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.slots(e),
             TyKind::Closure(_, args) => closure_fields(self.tys, args).into_iter().map(|e| self.slots(e)).sum(),
+            // The object lifetime (`dyn Tr + 'o`).
+            TyKind::Dyn(..) => 1,
             _ => 0,
         };
         self.memo.insert(t, n);
@@ -485,6 +490,9 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
                     self.slot_regions(e, out);
                 }
             }
+            // A trait bounded by `'static` makes its object lifetime
+            // `'static` whatever the default would be (rustc, ARCH 2.8).
+            TyKind::Dyn(_, r) => out.push(if crate::check::object::dyn_is_static(self.p, self.tys, t) { Region::Static } else { r }),
             _ => {}
         }
     }
@@ -529,6 +537,10 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
                     at = self.each_slot(e, Variance::Inv, at, f);
                 }
                 at
+            }
+            TyKind::Dyn(..) => {
+                f(at, v.then(Variance::Co));
+                at + 1
             }
             _ => at,
         }
@@ -575,6 +587,11 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
                     at = self.drop_slots(e, m, at, out);
                 }
                 at
+            }
+            // An owned dyn's unknown destructor may use what it borrows.
+            TyKind::Dyn(..) => {
+                out[at as usize] = m != DropMode::None;
+                at + 1
             }
             _ => at,
         }
@@ -874,6 +891,21 @@ impl OwnSig {
             (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
                 self.pair(sc, a, b, binds, out)
             }
+            // The object lifetime the signature names (or its default;
+            // `'static` for a trait bounded by `'static`).
+            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
+                let rr = if crate::check::object::dyn_is_static(sc.p, tys, e) { Region::Static } else { rr };
+                let mut fresh = || {
+                    self.n_univ += 1;
+                    self.n_univ
+                };
+                let u = univ_of(rr, &mut fresh);
+                while self.names.len() < self.n_univ as usize + 1 {
+                    self.names.push("an anonymous lifetime".into());
+                }
+                out.push(u);
+                true
+            }
             _ => r == e && sc.slots(e) == 0,
         }
     }
@@ -1150,6 +1182,12 @@ fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ],
                     }
                 }
             }
+        }
+        // `&'r (dyn Tr + 'o)` gives `'o: 'r`.
+        TyKind::Dyn(..) => {
+            let Some(&u) = us.get(*at) else { return };
+            each(u, facts, outer);
+            *at += 1;
         }
         _ => {}
     }
@@ -1507,6 +1545,21 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if av.is_empty() && bv.is_empty() {
             return true;
         }
+        // A value flowing into a place is a coercion site: rustc may
+        // shorten the object lifetime of the outermost `&`/`&mut dyn`
+        // (`&'r mut (dyn Tr + 'a)` to `&'r mut (dyn Tr + 'b)`, `'a: 'b`),
+        // which plain `&mut` invariance would equate.
+        if v == Variance::Co
+            && let (TyKind::Ref(_, _, ai), TyKind::Ref(_, _, bi)) = (self.body.tys.kind(a), self.body.tys.kind(b))
+            && matches!(self.body.tys.kind(ai), TyKind::Dyn(..))
+            && matches!(self.body.tys.kind(bi), TyKind::Dyn(..))
+            && av.len() == 2
+            && bv.len() == 2
+        {
+            self.edge(av[0], bv[0]);
+            self.edge(av[1], bv[1]);
+            return true;
+        }
         if a == b && a != ERROR && av.len() == bv.len() {
             let mut pairs: Vec<(u32, Variance)> = Vec::with_capacity(av.len());
             self.sc.each_slot(a, v, 0, &mut |i, var| pairs.push((i, var)));
@@ -1577,6 +1630,13 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 let (xs, ys) = (closure_fields(tys, xa), closure_fields(tys, ya));
                 xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.walk(x, av, ia, y, bv, ib, Variance::Inv))
             }
+            (TyKind::Dyn(..), TyKind::Dyn(..)) => {
+                let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
+                self.edge_v(x, y, v.then(Variance::Co));
+                *ia += 1;
+                *ib += 1;
+                true
+            }
             _ => self.sc.slots(a) == 0 && self.sc.slots(b) == 0,
         }
     }
@@ -1618,6 +1678,10 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
             (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
                 self.annotation_regions(a, b, out)
+            }
+            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
+                out.push(if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr });
+                true
             }
             _ => r == e || self.sc.slots(e) == 0,
         }
@@ -1819,19 +1883,33 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
             Rvalue::ArrayRepeat(_, o, _) | Rvalue::VecRepeat(_, o, _) => self.into_place(o, dest, &[Proj::Index(0)]),
             Rvalue::MakeDyn { ptr: o, .. } | Rvalue::DynUpcast { ptr: o, .. } => {
-                // A dyn pointer from a thin one (or a narrower dyn): the
-                // pointer's region carries over. The object lifetime is
-                // `check::object`'s; the data's own regions stay alive
-                // through the pointer by its well-formedness (`T: 'p`).
+                // A dyn pointer from a thin one (or a narrower dyn). The
+                // pointer's own region carries over (`&'p S` to `&'q dyn
+                // Tr`: `'p: 'q`), and every region of the data outlives the
+                // object lifetime (`S: 'o`, rustc's unsizing; an upcast
+                // gives `'o1: 'o2`). An owning pointer (`Box<dyn Tr + 'o>`)
+                // has only the object slot.
                 let mut ov = Vec::new();
-                self.operand(o, &mut ov);
+                let ot = self.operand(o, &mut ov);
                 let dt = self.place(dest, &mut dv, &mut d);
-                let _ = dt;
-                if let (Some(&x), Some(&y)) = (ov.first(), dv.first()) {
-                    self.edge(x, y);
-                }
-                if ov.len() > 1 && dv.len() > 1 {
-                    self.equate_all(&ov[1..], &dv[1..]);
+                let refs = (matches!(self.body.tys.kind(ot), TyKind::Ref(..)), matches!(self.body.tys.kind(dt), TyKind::Ref(..)));
+                let (data, obj): (Vec<u32>, Option<u32>) = match refs {
+                    (true, true) => {
+                        if let (Some(&x), Some(&y)) = (ov.first(), dv.first()) {
+                            self.edge(x, y);
+                        }
+                        (ov.iter().skip(1).copied().collect(), dv.get(1).copied())
+                    }
+                    (false, false) => (ov.clone(), dv.first().copied()),
+                    _ => (Vec::new(), None),
+                };
+                match obj {
+                    Some(o) if dv.len() == if refs.1 { 2 } else { 1 } => {
+                        for x in data {
+                            self.edge(x, o);
+                        }
+                    }
+                    _ => self.equate_all(&ov, &dv),
                 }
             }
             _ => {}
@@ -2566,6 +2644,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
                 self.inst_walk(a, b, univ, binds, out)
             }
+            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
+                let rr = if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr };
+                let v = self.inst_region(rr, univ);
+                out.push(v);
+                true
+            }
             _ => self.sc.slots(e) == 0,
         }
     }
@@ -2659,6 +2743,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 for e in closure_fields(tys, args) {
                     self.implied_edges(e, vars, at, refs);
                 }
+            }
+            TyKind::Dyn(..) => {
+                if let Some(&v) = vars.get(*at) {
+                    for &o in refs.iter() {
+                        self.edge(v, o);
+                    }
+                }
+                *at += 1;
             }
             _ => {}
         }
@@ -3106,6 +3198,7 @@ impl Contract<'_, '_> {
                 }
             }
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => self.walk(x, y, v, a_trait),
+            (TyKind::Dyn(_, ra), TyKind::Dyn(_, rb)) => self.slot(ra, rb, v.then(Variance::Co), a_trait),
             _ => {}
         }
     }
@@ -3156,6 +3249,7 @@ fn implied_regioned(tys: &impl TyIntern, t: Ty, outer: &mut Vec<Region>, out: &m
             }
         }
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => implied_regioned(tys, e, outer, out),
+        TyKind::Dyn(_, r) => note(r, outer, out),
         _ => {}
     }
 }

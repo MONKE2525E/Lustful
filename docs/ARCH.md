@@ -2790,7 +2790,9 @@ read stay region-erased: lifetime params do not enter
 `Generics.params` (type param indexes and instance keys
 do not change), and an Adt type drops its lifetime args.
 Only `&'static dyn Tr` keeps its `'static` in the erased
-type (`check::object`, ARCH 2.8). Collect fills a
+type (`check::object`, ARCH 2.8); region signatures keep
+every dyn object lifetime (the written one, else the
+enclosing reference's, else `'static`). Collect fills a
 borrow-checker side table, `Program.regions`
 (`borrowck::RegionTables`), by resolving each signature a
 second time with `Scope.regions = RegionMode::Keep`:
@@ -2913,8 +2915,12 @@ regioned ones (`AdtTables`). `&'a T`: covariant in `'a`
 and `T`; `&'a mut T`: covariant in `'a`, invariant in
 `T`; raw pointers: `*const` covariant, `*mut` invariant;
 fn pointers: inputs contravariant, output covariant;
-builtin containers covariant; closures, dyn, opaque, and
-projections invariant (conservative). Cycles converge
+builtin containers covariant; a dyn object lifetime
+covariant (one slot per dyn type; a coercion may also
+shorten it behind the outermost `&mut`, as rustc's
+unsizing does; a trait bounded by `'static` makes it
+`'static`); closures, opaque types, and projections
+invariant (conservative). Cycles converge
 because the lattice is finite (bivariant, co, contra,
 invariant).
 
@@ -2971,11 +2977,11 @@ the gate shapes (`lifetime_gate_parser`,
 Each case runs against rustc 1.99 in difftest.
 
 Known gaps: regions of body types other than `let`
-annotations (casts, turbofish, closure params); fn pointer and
-dyn regions; closure arguments are higher-ranked outside
-iterator methods (rustc also frees an unannotated closure's
-arguments, and those of a bound written over a type
-param); the closure contract's coarser source-to-sink
+annotations (casts, turbofish, closure params); fn pointer
+regions and regions in a dyn type's trait args; closure
+arguments are higher-ranked outside iterator methods and
+bounds over type params (rustc also frees an unannotated
+closure's arguments); the closure contract's coarser source-to-sink
 edges; `T: 'a`; Adt inferred outlives
 facts (missing facts reject, never accept); precise
 builtin region signatures.
