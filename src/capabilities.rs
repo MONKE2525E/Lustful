@@ -681,6 +681,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("moving a field out of a struct or enum", "L9001"),
     ("destructuring in `let` without an initializer", "L9001"),
     ("non-scalar const patterns", "L9001"),
+    ("match guards over a by-value slice-pattern middle", "L9001"),
     ("ranges outside `for` loops", "L9001"),
     ("module paths", "L0505"),
     ("module paths in types", "L0505"),
