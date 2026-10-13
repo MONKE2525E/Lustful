@@ -2376,6 +2376,7 @@ fn resolve_one(
             &list_module,
             &mut imports,
             &mut adt_counts,
+            &mut inner_diags,
         );
     }
     match run_imports(tables, &imports, interner) {
@@ -3288,7 +3289,25 @@ fn register_items(
     // in registration order: the disambiguator source, without
     // rescanning every recorded def per Adt (quadratic at scale).
     adt_counts: &mut FxMap<Sym, u32>,
+    diags: &mut Vec<Diag>,
 ) {
+    // Names this item list defines, per namespace. Two local definitions
+    // of one name in one namespace are a duplicate (rustc E0428), even
+    // when both hash to the same target (two fns) or to a module the
+    // module tree already holds (two `mod` items): the binding insert
+    // alone cannot see those. One report per duplicate item.
+    let mut seen: FxMap<(u8, Sym), ()> = FxMap::default();
+    let check_dup = |seen: &mut FxMap<(u8, Sym), ()>, ns: Namespace, name: Sym, span: Span, reported: &mut bool, diags: &mut Vec<Diag>| {
+        if seen.insert((ns_index(ns) as u8, name), ()).is_some() && !*reported {
+            *reported = true;
+            diags.push(Diag::new(
+                "L0106",
+                span,
+                format!("`{}` is defined more than once", interner.get(name)),
+                "Rename one of the definitions.",
+            ));
+        }
+    };
     // Adt disambiguators count same-flat-name Adts in one pass order,
     // matching collect (which counts by name over the whole crate).
     for item in items.iter_mut() {
@@ -3296,8 +3315,10 @@ fn register_items(
         let bind = |tables: &mut ResolvedTables, ns: Namespace, name: Sym, target: Target, vis: VisKind| {
             tables.insert(module, ns, name, Bind { target, vis, rank: 2, def_module: module });
         };
+        let mut reported = false;
         match &mut item.kind {
             ItemKind::Mod(m) => {
+                check_dup(&mut seen, Namespace::Type, m.name, m.name_span, &mut reported, diags);
                 let mut key = prefix.to_vec();
                 key.push(m.name);
                 if let Some(&child) = list_module.get(&(fi, key.clone())) {
@@ -3313,11 +3334,25 @@ fn register_items(
                     };
                     bind(tables, Namespace::Type, m.name, Target::Module(child), vis());
                     if let Some(body) = &mut m.body {
-                        register_items(body, child, fi, &key, input, flat_prefix, interner, tables, list_module, imports, adt_counts);
+                        register_items(
+                            body,
+                            child,
+                            fi,
+                            &key,
+                            input,
+                            flat_prefix,
+                            interner,
+                            tables,
+                            list_module,
+                            imports,
+                            adt_counts,
+                            diags,
+                        );
                     }
                 }
             }
             ItemKind::Fn(f) => {
+                check_dup(&mut seen, Namespace::Value, f.name, f.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, f.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, f.name, interner);
                 let def = DefId { krate: input.crate_ids.local, hash: def::free_fn_hash(input.crate_ids.stable, &[], interner.get(flat)) };
@@ -3327,6 +3362,14 @@ fn register_items(
                 f.name = flat;
             }
             ItemKind::Struct(s) => {
+                // A braced struct has no constructor value: its name lives
+                // only in the type namespace. Unit and tuple structs also
+                // name their constructor in the value namespace.
+                let has_ctor = !matches!(s.fields, VariantFields::Struct(_));
+                check_dup(&mut seen, Namespace::Type, s.name, s.name_span, &mut reported, diags);
+                if has_ctor {
+                    check_dup(&mut seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
+                }
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, s.name, interner);
                 let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
@@ -3335,11 +3378,14 @@ fn register_items(
                     hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Adt, interner.get(flat), disamb),
                 };
                 bind(tables, Namespace::Type, s.name, Target::Def(def), vis());
-                bind(tables, Namespace::Value, s.name, Target::Def(def), vis());
+                if has_ctor {
+                    bind(tables, Namespace::Value, s.name, Target::Def(def), vis());
+                }
                 record_adt(tables, def, flat, module, vis(), &s.fields, interner);
                 s.name = flat;
             }
             ItemKind::Enum(e) => {
+                check_dup(&mut seen, Namespace::Type, e.name, e.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, e.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, e.name, interner);
                 let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
@@ -3363,6 +3409,7 @@ fn register_items(
             }
             ItemKind::Const(c) => {
                 if let Some(name) = c.name {
+                    check_dup(&mut seen, Namespace::Value, name, c.name_span, &mut reported, diags);
                     let flat = flat_name(tables, flat_prefix, module, name, interner);
                     record_display(tables, input, flat_prefix, module, flat, name, interner);
                     let def = DefId {
@@ -3376,6 +3423,7 @@ fn register_items(
                 }
             }
             ItemKind::Static(s) => {
+                check_dup(&mut seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, s.name, interner);
                 let def = DefId {
@@ -3388,6 +3436,7 @@ fn register_items(
                 s.name = flat;
             }
             ItemKind::Type(a) => {
+                check_dup(&mut seen, Namespace::Type, a.name, a.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, a.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, a.name, interner);
                 let def = DefId {
@@ -3400,6 +3449,7 @@ fn register_items(
                 a.name = flat;
             }
             ItemKind::Trait(t) => {
+                check_dup(&mut seen, Namespace::Type, t.name, t.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, t.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, t.name, interner);
                 // The ordinal counts same-flat-name traits in
@@ -3427,6 +3477,7 @@ fn register_items(
             ItemKind::ExternCrate(e) => {
                 let bind_name = e.rename.unwrap_or(e.name);
                 if bind_name != interner.intern("_") {
+                    check_dup(&mut seen, Namespace::Type, bind_name, e.span, &mut reported, diags);
                     let target = if e.name == interner.intern("self") {
                         Some(Target::Module(tables.root_of(module)))
                     } else {
@@ -3436,6 +3487,9 @@ fn register_items(
                         bind(tables, Namespace::Type, bind_name, target, vis());
                     }
                 }
+            }
+            ItemKind::Union(u) => {
+                check_dup(&mut seen, Namespace::Type, u.name, u.name_span, &mut reported, diags);
             }
             _ => {}
         }
@@ -3454,7 +3508,10 @@ fn record_adt(
 ) {
     tables.def_info.insert(def, DefInfo { kind: ResKind::Adt, flat, module, vis });
     tables.flat[ns_index(Namespace::Type)].insert(flat, def);
-    tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+    // Only a unit or tuple struct names a constructor value.
+    if !matches!(fields, VariantFields::Struct(_)) {
+        tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+    }
     if let VariantFields::Struct(fs) = fields {
         let mut map = FxMap::default();
         for f in fs {
@@ -3522,8 +3579,9 @@ struct Frame {
     locals: Vec<Sym>,
     /// Function-local imports: (name, namespace index) to target.
     imports: FxMap<(Sym, usize), LocalBind>,
-    /// Names bound by an explicit (non-glob) local import in this
-    /// frame, for the duplicate-import check (rustc E0252).
+    /// Names bound at explicit rank in this frame, by an explicit `use`
+    /// or a nested item: a second explicit binding of one name in one
+    /// namespace is a duplicate, where a glob binding is not.
     explicit: Vec<(Sym, usize)>,
 }
 
@@ -4037,6 +4095,33 @@ impl Rewrite<'_> {
     /// of the block.
     fn stmt_item(&mut self, ast: &mut Ast, idx: u32, module: ModuleId, scopes: &mut Vec<Frame>) {
         let Some(item) = ast.stmt_items.get(idx as usize) else { return };
+        // A nested item binds its name in this block at explicit rank, so
+        // an explicit `use` of the same name in the block (either order)
+        // is a duplicate. Item-to-item duplicates also fire here; collect
+        // checks them again for entry points that skip this pass.
+        {
+            let item_name = match &item.kind {
+                ItemKind::Fn(def) => Some((def.name, def.name_span)),
+                ItemKind::Const(c) => c.name.map(|n| (n, c.name_span)),
+                ItemKind::Static(s) => Some((s.name, s.name_span)),
+                _ => None,
+            };
+            if let Some((name, span)) = item_name
+                && let Some(frame) = scopes.last_mut()
+            {
+                let key = (name, ns_index(Namespace::Value));
+                if frame.explicit.contains(&key) {
+                    self.diags.push(Diag::new(
+                        "L0106",
+                        span,
+                        format!("`{}` is defined more than once", self.interner.get(name)),
+                        "Rename one of the definitions.",
+                    ));
+                } else {
+                    frame.explicit.push(key);
+                }
+            }
+        }
         let ItemKind::Use(u) = &item.kind else { return };
         let tree = u.tree.clone();
         let span = item.span;
@@ -4090,7 +4175,10 @@ impl Rewrite<'_> {
                     if *path.last().unwrap() != self_sym && name != *path.last().unwrap() && path.iter().all(|&s| kw(s)) {
                         match self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner) {
                             PathRes::Done(Target::Module(src)) => {
-                                if insert_local(scopes, name, Namespace::Type, LocalBind::Target(Target::Module(src)), 2) {
+                                let bn = crate::resolve::imports::import_bind_name(name, Target::Module(src), self.interner);
+                                if insert_local(scopes, bn, Namespace::Type, LocalBind::Target(Target::Module(src)), 2)
+                                    && self.interner.get(name) != "_"
+                                {
                                     self.push_local_dup(span, name);
                                 }
                             }
@@ -4127,7 +4215,10 @@ impl Rewrite<'_> {
                         };
                         match target {
                             Some(t) => {
-                                if insert_local(scopes, bind_name, Namespace::Type, LocalBind::Target(t), 2) {
+                                let bn = crate::resolve::imports::import_bind_name(bind_name, t, self.interner);
+                                if insert_local(scopes, bn, Namespace::Type, LocalBind::Target(t), 2)
+                                    && self.interner.get(bind_name) != "_"
+                                {
                                     self.push_local_dup(span, bind_name);
                                 }
                             }
@@ -4139,22 +4230,28 @@ impl Rewrite<'_> {
                         PathRes::Done(Target::Module(src)) => {
                             let last = *path.last().unwrap();
                             let mut any = false;
-                            let mut dup_reported = false;
+                            let mut dup = false;
                             for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
                                 match self.tables.lookup(src, ns, last) {
                                     Some(BindState::One(b)) if self.tables.visible(&b.vis, b.def_module, module, self.interner) => {
                                         any = true;
-                                        if insert_local(scopes, name, ns, LocalBind::Target(b.target), 2) && !dup_reported {
-                                            self.push_local_dup(span, name);
-                                            dup_reported = true;
-                                        }
+                                        let bn = crate::resolve::imports::import_bind_name(name, b.target, self.interner);
+                                        dup |= insert_local(scopes, bn, ns, LocalBind::Target(b.target), 2);
                                     }
                                     Some(BindState::Ambiguous) => {
                                         any = true;
-                                        insert_local(scopes, name, ns, LocalBind::Ambiguous, 2);
+                                        dup |= insert_local(scopes, name, ns, LocalBind::Ambiguous, 2);
                                     }
                                     _ => {}
                                 }
+                            }
+                            if dup && self.interner.get(name) != "_" {
+                                self.diags.push(Diag::new(
+                                    "L0106",
+                                    span,
+                                    format!("`{}` is defined more than once", self.interner.get(name)),
+                                    "Rename one of the imports with `as`, or remove one.",
+                                ));
                             }
                             if !any {
                                 self.diags.push(Diag::new(

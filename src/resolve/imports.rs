@@ -427,7 +427,12 @@ impl ResolvedTables {
             }
             Some(BindState::One(old)) => {
                 if old.target == bind.target {
-                    InsertOut::Same
+                    // The same target bound twice at explicit rank is still
+                    // two definitions of one name (rustc E0252/E0255): a
+                    // repeated `use`, or a `use` of an item this module
+                    // defines. A glob (rank 1) re-binding the same target
+                    // is legal and stays `Same`.
+                    if old.rank == 2 && bind.rank == 2 { InsertOut::Dup } else { InsertOut::Same }
                 } else if bind.rank > old.rank {
                     map.insert(name, BindState::One(bind));
                     InsertOut::Changed
@@ -1271,7 +1276,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 let out = tables.insert(
                     imp.module,
                     Namespace::Value,
-                    *name,
+                    import_bind_name(*name, Target::Variant(adt, path[rest]), interner),
                     Bind { target: Target::Variant(adt, path[rest]), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                 );
                 if dup {
@@ -1297,14 +1302,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         if !tables.check_reexport(imp, target, interner.get(*name), interner, diags) {
                             return TryOut::Done(false);
                         }
-                        let dup = explicit_exists(tables, imp, Namespace::Type, *name);
+                        let bind_name = import_bind_name(*name, target, interner);
+                        let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
                         let out = tables.insert(
                             imp.module,
                             Namespace::Type,
-                            *name,
+                            bind_name,
                             Bind { target, vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                         );
-                        if dup {
+                        if dup && interner.get(*name) != "_" {
                             diags.push(dup_diag(imp, *name, interner));
                         } else {
                             report_dup(out, imp, *name, interner, diags);
@@ -1356,14 +1362,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     return TryOut::Done(false);
                 }
                 let bind_name = if *name == self_sym { mod_path.last().copied().unwrap_or(*name) } else { *name };
-                let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
+                let store_name = import_bind_name(bind_name, target, interner);
+                let dup = explicit_exists(tables, imp, Namespace::Type, store_name);
                 let out = tables.insert(
                     imp.module,
                     Namespace::Type,
-                    bind_name,
+                    store_name,
                     Bind { target, vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                 );
-                if dup {
+                if dup && interner.get(bind_name) != "_" {
                     diags.push(dup_diag(imp, bind_name, interner));
                 } else {
                     report_dup(out, imp, bind_name, interner, diags);
@@ -1381,14 +1388,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         TryOut::Done(false)
                     }
                     PathRes::Done(Target::Module(src)) => {
-                        let dup = explicit_exists(tables, imp, Namespace::Type, *name);
+                        let bind_name = import_bind_name(*name, Target::Module(src), interner);
+                        let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
                         let out = tables.insert(
                             imp.module,
                             Namespace::Type,
-                            *name,
+                            bind_name,
                             Bind { target: Target::Module(src), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
                         );
-                        if dup {
+                        if dup && interner.get(*name) != "_" {
                             diags.push(dup_diag(imp, *name, interner));
                         } else {
                             report_dup(out, imp, *name, interner, diags);
@@ -1451,9 +1459,10 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     }
                     let mut dup_reported = false;
                     for (ns, bind) in found {
-                        let dup = explicit_exists(tables, imp, ns, *name);
-                        let out = tables.insert(imp.module, ns, *name, bind);
-                        if dup {
+                        let bind_name = import_bind_name(*name, bind.target, interner);
+                        let dup = explicit_exists(tables, imp, ns, bind_name);
+                        let out = tables.insert(imp.module, ns, bind_name, bind);
+                        if dup && interner.get(*name) != "_" {
                             if !dup_reported {
                                 diags.push(dup_diag(imp, *name, interner));
                                 dup_reported = true;
@@ -1522,9 +1531,29 @@ fn dup_diag(imp: &Import, name: Sym, interner: &Interner) -> Diag {
     )
 }
 
+/// The binding name for one explicit import. `as _` binds no usable
+/// name, so it is stored under a synthetic name keyed by its target:
+/// several `as _` imports of different items (the usual trait imports)
+/// then coexist, and a repeat of one item lands on the same key. The
+/// synthetic name is not a legal Rust identifier, so source text can
+/// never name it.
+pub fn import_bind_name(name: Sym, target: Target, interner: &Interner) -> Sym {
+    if interner.get(name) != "_" {
+        return name;
+    }
+    let key = match target {
+        Target::Def(d) => d.hash.0 ^ ((d.krate.0 as u64) << 1),
+        Target::Module(m) => (m.0 as u64) ^ 0x9e37_79b9,
+        Target::Extern(i) => (i as u64) ^ 0x51f_15e,
+        Target::Variant(d, s) => d.hash.0 ^ (s.0 as u64).rotate_left(17),
+    };
+    interner.intern(&format!("$lust$anon${key:x}"))
+}
+
 /// Reports a duplicate explicit import (two sources, one binding name).
+/// An `as _` import binds no name and is never a duplicate.
 fn report_dup(out: InsertOut, imp: &Import, name: Sym, interner: &Interner, diags: &mut Vec<Diag>) {
-    if out == InsertOut::Dup {
+    if out == InsertOut::Dup && interner.get(name) != "_" {
         diags.push(dup_diag(imp, name, interner));
     }
 }
