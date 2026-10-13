@@ -12338,10 +12338,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// Zonks the closure records into `Checked` and rejects the closure
-    /// forms outside this slice (ARCH 2.9): closure types stored inside
-    /// an Adt. A closure that returns a reference is borrowck's (W-BORROW
-    /// closure contract).
+    /// Zonks the closure records into `Checked`. A closure stored inside
+    /// an Adt (a struct field, `Option`, `Vec`) holds its captures' loans
+    /// through the Adt's type args, which the borrow checker tracks
+    /// (W-BORROW closure contract), as it does a closure that returns a
+    /// reference.
     fn finish_closures(&mut self) {
         for mut c in std::mem::take(&mut self.closures) {
             // A signature nothing fixed is an annotation error (rustc
@@ -12364,40 +12365,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             c.ty = self.zonk(c.ty);
             self.out.closures.push(c);
-        }
-        if self.out.closures.is_empty() {
-            return;
-        }
-        for i in 0..self.out.expr_ty.len() {
-            let t = self.out.expr_ty[i];
-            if self.closure_in_adt(t, false) {
-                let span = self.span(ExprId(self.out.expr_base + i as u32));
-                self.err(
-                    "L0820",
-                    span,
-                    "closures stored inside a struct, enum, `Option`, or `Vec` are not supported yet",
-                    "Call the closure directly, or pass it to a generic parameter.",
-                );
-                break;
-            }
-        }
-    }
-
-    /// True when a closure type sits inside an Adt's type arguments.
-    fn closure_in_adt(&self, t: Ty, in_adt: bool) -> bool {
-        match self.tys.kind(t) {
-            TyKind::Closure(_, a) => {
-                in_adt || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, in_adt)))
-            }
-            // A builtin iterator stores its closures as fields lust
-            // models (ty/iter.rs); its loans flow through `contains_ref`.
-            TyKind::Adt(..) if crate::ty::iter::iter_parts(&self.tys, t).is_some() => {
-                crate::ty::iter::iter_parts(&self.tys, t).is_some_and(|(_, a)| a.iter().any(|&e| self.closure_in_adt(e, in_adt)))
-            }
-            TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.closure_in_adt(e, true))),
-            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.closure_in_adt(e, in_adt),
-            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.closure_in_adt(e, in_adt)),
-            _ => false,
         }
     }
 

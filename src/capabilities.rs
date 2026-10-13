@@ -805,7 +805,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("`dyn` types in const and static items", "L0702"),
     ("`Box<dyn Trait>`, `Rc<dyn Trait>`, `Arc<dyn Trait>`", "L0641"),
     ("items other than `use` inside function bodies", "L0820"),
-    ("closures stored inside a struct, enum, `Option`, or `Vec`", "L0820"),
     ("closures as `dyn Fn` values", "L0820"),
     ("captured-variable uses outside the closure capture analysis (named in the message)", "L0820"),
     ("named format arguments", "L0641"),
