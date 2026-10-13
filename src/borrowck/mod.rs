@@ -312,6 +312,18 @@ fn drop_heads(p: &Program) -> HashSet<crate::def::DefId> {
     out
 }
 
+/// True when a type mentions an `impl Trait` (opaque) type anywhere.
+fn mentions_opaque(tys: &impl TyIntern, t: Ty) -> bool {
+    let args = |a: ArgsId| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| mentions_opaque(tys, e)));
+    match tys.kind(t) {
+        TyKind::Opaque(..) => true,
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => mentions_opaque(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| mentions_opaque(tys, e)),
+        TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Projection(_, a) => args(a),
+        _ => false,
+    }
+}
+
 /// The universal regions of a body's own signature: its fn's region
 /// signature (a closure body's from the closure rule, an instance's from
 /// its template), or one unrelated universal per slot when lust has none.
@@ -364,6 +376,18 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     };
     if !body.lower_errs.is_empty() {
         return body.lower_errs.clone();
+    }
+    // An `impl Trait` value has no region slots in the region engine: it
+    // could hold borrows lust would not see. Reject until it does (iface
+    // for whoever lands `impl Trait` returns; W-BORROW).
+    if let Some(l) = body.locals.iter().find(|l| mentions_opaque(&body.tys, l.ty)) {
+        let _ = l;
+        return vec![Diag::new(
+            "L0602",
+            p.fn_info(body.fn_id).def.name_span,
+            "the borrow checker does not track `impl Trait` values yet",
+            "Return a named type instead of `impl Trait`.",
+        )];
     }
     ck.collect_loans();
     ck.collect_move_paths();
