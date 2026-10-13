@@ -2871,7 +2871,14 @@ fn pointers, a signature it cannot pair) use the
 conservative rule: the result may hold every argument's
 regions (equal to them when it holds a `&mut`), and each
 `&mut` argument's target may receive every other
-argument's regions. A dyn call instantiates the trait
+argument's regions. An iterator item call (`next`,
+`find`, `last`, `min`, `collect` into a `Vec`) takes
+exactly the item's regions when the receiver names them
+(`iter_items`: `slice::Iter<'a, T>` yields `&'a T`, an
+adapter its inner iterator's items, `copied` drops the
+outer reference); items a `map` closure makes take the
+conservative rule. `to_vec` is a receiver rule (the
+elements are the slice's). A dyn call instantiates the trait
 method's signature; a call of a trait impl method also
 instantiates the trait's (rustc checks calls against the
 trait item, and an impl may refine it). A callee's `T:
@@ -2889,21 +2896,34 @@ captured `&mut` cannot escape); a by-value capture's
 regions are sources and sinks. In the closure body every
 capture slot, output slot, and argument slot is its own
 universal, and the facts are: each source outlives each
-other sink and each output slot. The creator adds the same
-source-to-sink edges, and every call's result (a direct
-call, or any call taking a closure that returns borrows,
-and iterator items through it) may hold the sources.
+other sink and each output slot. Relations between the
+captured slots, the free argument slots (below), and
+`'static` are not errors in the body: as rustc's closure
+requirements, the creator solves the body on demand
+(`closure_reqs`) and adds each relation the body needs, at
+the creating statement (or the first use of a closure with
+no captures). A body that does not check or lower gets the
+whole contract (its own errors reject it). Every call's
+result (a direct call, or any call taking a closure that
+returns borrows, and iterator items through it) may hold
+the sources.
 Argument slots are higher-ranked (L0733 when stored or
 returned), except for a closure an iterator method takes
 (check records `free_args` from `fn_mut_param`): its
 arguments are items, free regions, sources (and sinks
 behind a `&mut`), except the outer reference of an `&item`
-argument (`filter`, `find`); the creator links them to the
-call's other arguments (the iterator's sources, `fold`'s
-initial value), write-backs only to element regions. A
-closure passed straight to a generic fn whose `Fn` bound
-takes a type param or projection there (`F: FnOnce(T) ->
-U`) gets the same free arguments, linked at that call. A
+argument (`filter`, `find`); an argument that is the item
+takes exactly the item's regions when the receiver names
+them (`iter_items`), and any other (`fold`'s accumulator)
+links to the call's other arguments, write-backs only to
+element regions. A closure passed straight to a generic fn
+whose `Fn` bound takes a type param or projection there
+(`F: FnOnce(T) -> U`) gets the same free arguments: each
+input that is a type param (`&T`: past its outer
+reference) is equated with that param's instantiation at
+the call (found through the type `F` binds, so a mono
+instance pairs like its template); a closure no bound
+pairs links like an iterator method's. A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
 fn: free in the body, tied to it by the creator, and a

@@ -628,6 +628,7 @@ pub enum PatRes {
     Res(bool),
 }
 
+#[derive(Clone)]
 pub struct LocalInfo {
     pub name: Sym,
     pub ty: Ty,
@@ -635,7 +636,9 @@ pub struct LocalInfo {
     pub span: Span,
 }
 
-/// The checker's output for one function.
+/// The checker's output for one function. Clone: borrowck lowers each
+/// closure of a fn from one check of it (`closure_reqs`).
+#[derive(Clone)]
 pub struct Checked<'g> {
     pub tys: Tys<'g>,
     pub expr_base: u32,

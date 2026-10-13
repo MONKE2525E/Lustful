@@ -345,35 +345,69 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
     regions::OwnSig::build(p, body, sig, closure, check)
 }
 
+/// What a closure body needs between its captured and free argument
+/// regions and `'static`, and what its output slots may hold (rustc's
+/// closure requirements; `regions::End`), for its creator. None when the
+/// body has lowering errors or an `impl Trait` value.
+pub(super) fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, regions::End)>> {
+    if !body.lower_errs.is_empty() || body.locals.iter().any(|l| mentions_opaque(&body.tys, l.ty)) {
+        return None;
+    }
+    let mut ck = Ck::new(p, body);
+    ck.collect_loans();
+    let own = own_sig(p, body);
+    if !own.closure {
+        return None;
+    }
+    let ends = own.ends.clone();
+    let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);
+    b.build();
+    let sol = b.solve();
+    let end = |u: u32| ends.get(u as usize).copied().flatten();
+    Some(
+        sol.reqs
+            .iter()
+            .filter_map(|&(a, b)| Some((end(a)?, end(b)?)))
+            .filter(|(a, _)| !matches!(a, regions::End::Out(_)))
+            .collect(),
+    )
+}
+
+impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
+    fn new(p: &'p Program<'a>, body: &'b Body<'p>) -> Self {
+        let drop_heads = drop_heads(p);
+        Ck {
+            p,
+            body,
+            loans: Vec::new(),
+            stmt_base: Vec::new(),
+            loan_at: Vec::new(),
+            preds: vec![Vec::new(); body.blocks.len()],
+            succs: Vec::new(),
+            point_base: Vec::new(),
+            live_entry: Vec::new(),
+            drop_entry: Vec::new(),
+            scope: Vec::new(),
+            wl: 0,
+            sol: None,
+            errs: Vec::new(),
+            seen: HashSet::new(),
+            report: false,
+            loan_block: Vec::new(),
+            loan_stmt: Vec::new(),
+            drop_heads,
+            const_index: const_index_locals(body),
+            sh: Shape { n: 0, wn: 0, wm: 0 },
+            mpaths: Vec::new(),
+            mpath_at: Vec::new(),
+            ops_buf: Vec::new(),
+        }
+    }
+}
+
 /// Borrow-checks one function body.
 pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
-    let drop_heads = drop_heads(p);
-    let mut ck = Ck {
-        p,
-        body,
-        loans: Vec::new(),
-        stmt_base: Vec::new(),
-        loan_at: Vec::new(),
-        preds: vec![Vec::new(); body.blocks.len()],
-        succs: Vec::new(),
-        point_base: Vec::new(),
-        live_entry: Vec::new(),
-        drop_entry: Vec::new(),
-        scope: Vec::new(),
-        wl: 0,
-        sol: None,
-        errs: Vec::new(),
-        seen: HashSet::new(),
-        report: false,
-        loan_block: Vec::new(),
-        loan_stmt: Vec::new(),
-        drop_heads,
-        const_index: const_index_locals(body),
-        sh: Shape { n: 0, wn: 0, wm: 0 },
-        mpaths: Vec::new(),
-        mpath_at: Vec::new(),
-        ops_buf: Vec::new(),
-    };
+    let mut ck = Ck::new(p, body);
     if !body.lower_errs.is_empty() {
         return body.lower_errs.clone();
     }
