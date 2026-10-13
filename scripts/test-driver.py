@@ -30,6 +30,10 @@
 #      restart, so old units still hit the disk cache and output
 #      stays exact. A corrupted def-order file is a cache miss:
 #      the new daemon numbers fresh and output stays exact.
+#  10. empty-slot units after a restart: two fn units that hold only
+#      generic template slots have the same instance content, but each
+#      registers under its own unit number; a restarted daemon must
+#      not serve one unit the other's disk object.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -385,6 +389,28 @@ def case_restart_add_file():
     d.kill()
 
 
+def case_empty_units_restart():
+    # 10. 40 generic fns first in the file: at 16 slots per unit, the
+    # first two fn units hold only template slots (no C content).
+    work = tempfile.mkdtemp(prefix="lust-driver-empty-units-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    fns = [f"fn g{i}<T: Copy>(t: T) -> T {{ t }}" for i in range(40)]
+    main = 'fn main() { println!("{}", ' + " + ".join(f"g{i}({i}i64)" for i in range(40)) + "); }"
+    open(src, "w").write("\n".join(fns + [main]) + "\n")
+    out = os.path.join(work, "x")
+    d.start()
+    _, prog = d.build(src, out)
+    check("empty units cold output", prog.stdout.strip() == "780", prog.stdout)
+    d.kill()
+    d.start()
+    r = d.run(["build", src, "-o", out], expect=None)
+    check("empty units restart build", r.returncode == 0, r.stderr[-300:])
+    prog = subprocess.run([out], capture_output=True, text=True)
+    check("empty units restart output", prog.stdout.strip() == "780", prog.stdout)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -394,6 +420,7 @@ def main():
     case_multi_incremental()
     case_compaction_reemit()
     case_restart_add_file()
+    case_empty_units_restart()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

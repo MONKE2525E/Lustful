@@ -100,7 +100,10 @@ fn stats_on() -> bool {
 /// whose objects were (re)compiled or served as overlays, and
 /// `unit_cache_hits` the units whose object came from the disk unit
 /// cache instead of tcc. Instance count is the live slot count: today
-/// one instance per fn (mono instances join with generics).
+/// one instance per fn (mono instances join with generics). For a
+/// generic program, `templates` counts the template checks collect
+/// ran and `discovered` the bodies its instance discovery checked;
+/// both are front-end work `rechecked` does not count.
 #[derive(Default)]
 struct Stats {
     mode: &'static str,
@@ -115,13 +118,15 @@ struct Stats {
     table_rebuilt: bool,
     instances: usize,
     reemitted: usize,
+    templates: usize,
+    discovered: usize,
 }
 
 impl Stats {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-stats: mode={} fns={} rechecked={} reused={} invalidated={} c_bytes={} dirty_units={} units_compiled={} unit_cache_hits={} table_rebuilt={} instances={} reemitted={}",
+            "lust-stats: mode={} fns={} rechecked={} reused={} invalidated={} c_bytes={} dirty_units={} units_compiled={} unit_cache_hits={} table_rebuilt={} instances={} reemitted={} templates={} discovered={}",
             self.mode,
             self.fns,
             self.rechecked,
@@ -134,8 +139,22 @@ impl Stats {
             self.table_rebuilt as u8,
             self.instances,
             self.reemitted,
+            self.templates,
+            self.discovered,
         );
     }
+}
+
+/// The generic front-end work collect did for one program, for the
+/// stats line: (template checks, bodies checked by instance
+/// discovery). Discovery checks every plain fn and every instance it
+/// made; a program with no generics does neither.
+fn generic_work(p: &collect::Program) -> (usize, usize) {
+    use crate::check::generics::FnClass;
+    if !p.gx.has_generics {
+        return (0, 0);
+    }
+    (p.gx.mono_counts.0, p.gx.fn_class.iter().filter(|c| matches!(c, FnClass::Plain | FnClass::Instance)).count())
 }
 
 /// Unique temp file sequence for base-dir writes in this process. Several
@@ -2300,6 +2319,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 reused: reads_reused,
                 invalidated: reads_invalidated,
                 instances: front.fn_slot.len(),
+                templates: generic_work(&program).0,
+                discovered: generic_work(&program).1,
                 ..Default::default()
             }
             .render(&mut resp.stderr);
@@ -2534,9 +2555,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     // Per-unit object identity (section 4.2): each fn unit keys on its
     // instances' IR fingerprints (one instance per fn today) plus its
-    // used-slots hash; the table unit keys on the full slot manifest.
-    // The disk object cache keys on that alone for keyed units (see
-    // cache.rs): C text is a function of the IR and the used slots,
+    // used-slots hash and its unit number; the table unit keys on the
+    // full slot manifest. The disk object cache keys on that alone for
+    // keyed units (see cache.rs): C text is a function of the IR, the
+    // used slots, and the unit number (its register fn name),
     // so a hit is exactly as sound as recompiling, and a slot change
     // misses and re-emits. Adding one reachable fn changes no
     // unrelated unit's key: its object is copied from disk and tcc
@@ -2647,8 +2669,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 extra.sort_unstable();
                 extra.dedup();
+                // The unit number is a C input too: the unit's register
+                // fn is `lust_register_u<g>`. Two units of only empty
+                // slots (generic templates, stubs, dead fns) otherwise
+                // share a key, and a disk hit serves one the other's
+                // object (a duplicate register symbol at link).
                 let mut h = crate::intern::FxHasher::default();
-                std::hash::Hash::hash(&"cunit-glue-v1", &mut h);
+                std::hash::Hash::hash(&"cunit-glue-v2", &mut h);
+                std::hash::Hash::hash(&g, &mut h);
                 std::hash::Hash::hash(&base.0, &mut h);
                 for e in extra {
                     std::hash::Hash::hash(&e, &mut h);
@@ -2804,6 +2832,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
             instances: front.fn_slot.len(),
             reemitted,
+            templates: generic_work(&program).0,
+            discovered: generic_work(&program).1,
         }
         .render(&mut resp.stderr);
     }
