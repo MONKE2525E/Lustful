@@ -637,7 +637,7 @@ pub(crate) fn trait_def_of_path(
         return Err(not_yet("L0505", span, "module paths in trait references"));
     }
     cx.trait_by_name(interner, last.name).ok_or_else(|| {
-        Diag::new("L0102", span, format!("unknown trait `{}`", interner.get(last.name)), "Check the spelling, or define the trait.")
+        Diag::new("L0102", span, format!("unknown trait `{}`", crate::intern::source_path(interner.get(last.name))), "Check the spelling, or define the trait.")
     })
 }
 
@@ -1114,12 +1114,12 @@ fn resolve_path_ty(
                     return Err(Diag::new(
                         "L0110",
                         span,
-                        format!("`{}` takes {n_params} generic argument(s)", interner.get(name)),
+                        format!("`{}` takes {n_params} generic argument(s)", crate::intern::source_name(interner.get(name))),
                         "Write the arguments, for example with `_` where inference should fill them in a body.",
                     ));
                 }
             }
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, n_params, span, interner.get(name))?,
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, n_params, span, crate::intern::source_name(interner.get(name)))?,
             GenericArgs::Parenthesized { .. } => {
                 return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
             }
@@ -1644,7 +1644,7 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
             errs.push(Diag::new(
                 "L0106",
                 tdef.name_span,
-                format!("`{}` is defined more than once", p.name(tdef.name)),
+                format!("`{}` is defined more than once", p.display_name(tdef.name)),
                 "Rename one of the definitions.",
             ));
         }
@@ -3998,8 +3998,8 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
         let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
         for goal in goals {
             if !prove_goal(p, &env, goal) {
-                let gname = p.gx.index.trait_record(goal.def).map_or("?", |r| p.name(r.name));
-                let tname = p.name(trec.name);
+                let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+                let tname = p.display_path(trec.name);
                 errs.push(Diag::new(
                     "L0612",
                     rec.span,
@@ -4059,7 +4059,7 @@ fn check_supertrait_cycles(p: &Program, errs: &mut Vec<Diag>) {
             errs.push(Diag::new(
                 "L0110",
                 rec.map_or(Span::default(), |r| r.span),
-                format!("the supertraits of `{}` form a cycle", rec.map_or("?", |r| p.name(r.name))),
+                format!("the supertraits of `{}` form a cycle", rec.map_or_else(|| "?".to_string(), |r| p.display_path(r.name))),
                 "Remove one of the bounds so the trait graph has no cycle.",
             ));
         }
@@ -4300,7 +4300,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
                 .filter_map(|g| g.as_ty())
                 .any(|t| (0..n_params).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)));
             if !mentions_param && !prove_goal(p, &[], b.value) {
-                let gname = p.gx.index.trait_record(b.value.def).map_or("?", |r| p.name(r.name));
+                let gname = p.gx.index.trait_record(b.value.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0612",
                     span,
@@ -4311,7 +4311,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         }
         for goal in goals {
             if !prove_goal(p, &env, goal) {
-                let gname = p.gx.index.trait_record(goal.def).map_or("?", |r| p.name(r.name));
+                let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0612",
                     span,
@@ -4343,7 +4343,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &[], &by_construction, &is_local);
     for (_, later) in pairs {
         let rec = p.gx.index.get(later);
-        let trait_name = p.gx.index.trait_record(rec.trait_def).map_or("?", |r| p.name(r.name));
+        let trait_name = p.gx.index.trait_record(rec.trait_def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
         errs.push(Diag::new(
             "L0615",
             rec.span,
@@ -4375,7 +4375,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
         errs.push(Diag::new(
             "L0106",
             info.def.name_span,
-            format!("`{}` is defined more than once", p.name(info.name)),
+            format!("`{}` is defined more than once", p.display_name(info.name)),
             "Rename one of the definitions, or narrow one impl's Self type so they cannot both apply.",
         ));
     }

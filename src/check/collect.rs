@@ -176,6 +176,26 @@ impl<'a> Program<'a> {
     pub fn name(&self, s: Sym) -> &str {
         self.interner.get(s)
     }
+    /// The source (short) name of a def name, for program output such
+    /// as derived `Debug`: strips the resolver's flat-name module
+    /// prefix (`m0$Stats` reads `Stats`, as rustc prints). Display
+    /// only; lookups keep using `name`.
+    pub fn display_name(&self, s: Sym) -> &str {
+        crate::intern::source_name(self.interner.get(s))
+    }
+    /// The source path of a def name, for diagnostics (`m0::Stats`,
+    /// `base::inner::Deep` for a source dependency). Reads the
+    /// resolver's display table when it is attached; before that (in
+    /// collect itself) it falls back to the path carried in the flat
+    /// name, which lacks only a dependency's crate name.
+    pub fn display_path(&self, s: Sym) -> String {
+        if let Some(tables) = &self.resolved
+            && let Some(&d) = tables.display_names.get(&s)
+        {
+            return self.interner.get(d).to_string();
+        }
+        crate::intern::source_path(self.interner.get(s))
+    }
     pub fn adt(&self, id: AdtId) -> &AdtDef {
         &self.adts[id.0 as usize]
     }
@@ -272,7 +292,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             None => match tys.local_adt(t) {
-                Some(a) => p.name(p.adt(a).name).into(),
+                Some(a) => p.display_path(p.adt(a).name),
                 None => "{unknown}".into(),
             },
         },
@@ -1479,7 +1499,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
             errs.push(Diag::new(
                 "L0117",
                 p.adts[i].span,
-                format!("recursive type `{}` has infinite size", p.name(p.adts[i].name)),
+                format!("recursive type `{}` has infinite size", p.display_path(p.adts[i].name)),
                 "Put the recursive field in a Vec. Box is not supported yet.",
             ));
         }
@@ -1874,7 +1894,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
                 errs.push(Diag::new(
                     "L0106",
                     span,
-                    format!("`{}` is defined more than once", p.interner.get(n)),
+                    format!("`{}` is defined more than once", p.display_name(n)),
                     "Rename one of the definitions.",
                 ));
             }

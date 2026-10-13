@@ -1239,7 +1239,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, p.interner))
         {
-            let name = self.name(p.adt(a).name).to_string();
+            let name = p.display_path(p.adt(a).name);
             self.err(
                 "L0510",
                 span,
@@ -1939,7 +1939,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// The display name of a trait def, for obligation errors.
     fn trait_name(&self, def: DefId) -> String {
-        self.p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| self.p.name(r.name).to_string())
+        self.p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| self.p.display_path(r.name))
     }
 
     /// Replaces `_` markers in one resolved written type with
@@ -4365,7 +4365,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         };
         let Some(a) = adt else {
-            self.err("L0101", span, format!("cannot find type `{}`", self.name(ty_name)), "Check the spelling.");
+            self.err("L0101", span, format!("cannot find type `{}`", crate::intern::source_name(self.name(ty_name))), "Check the spelling.");
             return None;
         };
         // The variant and associated-item tables of the Adt are part of its
@@ -6827,7 +6827,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         && self.lookup(*name, span.ctxt).is_none()
                         && !matches!(self.pat_ident(*name), PatIdent::Variant(b, _) if b == a)
                     {
-                        let (vn, en) = (self.name(*name).to_string(), self.name(p.adt(a).name).to_string());
+                        let (vn, en) = (self.name(*name).to_string(), p.display_path(p.adt(a).name));
                         self.err(
                             "L0110",
                             span,
@@ -7296,7 +7296,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 pats.iter().for_each(|&x| self.flatten_or(x, &mut flat));
                 let missing: Vec<String> = (0..p.adt(a).variants.len())
                     .filter(|&v| !flat.iter().any(|&x| matches!(self.pres(x), PatRes::Variant(_, w) if w as usize == v)))
-                    .map(|v| format!("{}::{}", self.name(p.adt(a).name), self.name(p.adt(a).variants[v].name)))
+                    .map(|v| format!("{}::{}", p.display_path(p.adt(a).name), self.name(p.adt(a).variants[v].name)))
                     .collect();
                 if missing.is_empty() {
                     "non-exhaustive match: some nested cases are missing".to_string()
@@ -8739,7 +8739,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.unbound_vars(t, &mut reported);
             let param = p.gx.fn_templates.get(template.0 as usize).and_then(|t| t.as_ref()).and_then(|t| t.generics.params.get(gi));
             let pname = param.map_or("_".to_string(), |d| self.name(d.name).to_string());
-            let fname = self.name(p.fn_info(template).name).to_string();
+            let fname = p.display_path(p.fn_info(template).name);
             let span = self.span(ExprId(self.out.expr_base + ei as u32));
             self.err(
                 "L0610",
