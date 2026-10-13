@@ -3496,7 +3496,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Expr::Assign { lhs, rhs } => {
-                let lt = self.expr(*lhs, None);
+                let lt = self.assign_lhs_ty(*lhs);
                 self.place_check(*lhs);
                 self.expect_expr(*rhs, lt);
                 UNIT
@@ -3886,12 +3886,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Closure { params, ret, body, .. } => self.closure_expr(e, params, *ret, *body, span),
             Expr::Try(inner) => self.try_expr(e, *inner, span),
+            Expr::Underscore => {
+                self.err(
+                    "L0110",
+                    span,
+                    "in expressions, `_` can only be used on the left-hand side of an assignment",
+                    "Remove the `_`, or use it as a discard target in an assignment.",
+                );
+                ERROR
+            }
             // AST v2 expression forms the parser still rejects.
             Expr::Await(_)
             | Expr::AsyncBlock { .. }
             | Expr::UnsafeBlock(_)
             | Expr::QPath { .. }
-            | Expr::Underscore
             | Expr::MacroCall(_) => ERROR,
         }
     }
@@ -4093,6 +4101,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The type of an assignment target. Tuple and array targets are
+    /// destructuring assignment: their elements are targets in turn,
+    /// and `_` discards its element with a fresh type variable. Every
+    /// other target checks as the place expression it is.
+    fn assign_lhs_ty(&mut self, e: ExprId) -> Ty {
+        match self.p.ast.expr(e) {
+            Expr::Underscore => {
+                let t = self.new_var(false);
+                self.set(e, t)
+            }
+            Expr::Tuple(elems) => {
+                let ts: Vec<Ty> = elems.iter().map(|&el| self.assign_lhs_ty(el)).collect();
+                let id = self.tys.intern_tys(&ts);
+                let t = self.tys.intern(TyKind::Tuple(id));
+                self.set(e, t)
+            }
+            Expr::Array(elems) => {
+                let mut elem_ty = None;
+                for &el in elems {
+                    let et = self.assign_lhs_ty(el);
+                    match elem_ty {
+                        None => elem_ty = Some(et),
+                        Some(prev) => {
+                            if !self.unify(prev, et) {
+                                let s = self.span(el);
+                                self.mismatch(s, prev, et);
+                            }
+                        }
+                    }
+                }
+                let elem = elem_ty.unwrap_or_else(|| self.new_var(false));
+                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
+                let t = self.tys.intern(TyKind::Array(elem, c));
+                self.set(e, t)
+            }
+            _ => self.expr(e, None),
+        }
+    }
+
     fn place_check(&mut self, e: ExprId) {
         if let Some(idx) = self.static_root(e) {
             let s = self.span(e);
@@ -4111,6 +4158,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let ok = match self.p.ast.expr(e) {
             Expr::Path(segs) => segs.len() == 1 && matches!(self.out.expr_res[self.ei(e)], Res::Local(_)),
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) | Expr::SelfValue => true,
+            Expr::Underscore => true,
+            Expr::Tuple(elems) | Expr::Array(elems) => {
+                for &el in elems {
+                    self.place_check(el);
+                }
+                return;
+            }
             _ => false,
         };
         if !ok {

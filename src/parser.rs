@@ -2972,7 +2972,10 @@ impl<'a> Parser<'a> {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Expr::QPath { self_ty, trait_path, segs }
             }
-            Tok::Underscore => return Err(not_yet(C_CORE, start, "inferred expressions (`_`)")),
+            Tok::Underscore => {
+                self.bump();
+                Expr::Underscore
+            }
             Tok::Ident(_) | Tok::SelfUpper => {
                 if self.peek_at(1) == Tok::Bang {
                     return self.macro_call();

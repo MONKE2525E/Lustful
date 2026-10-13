@@ -774,6 +774,27 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Assign { lhs, rhs } => {
+                if matches!(p.ast.expr(*lhs), Expr::Tuple(_) | Expr::Array(_) | Expr::Underscore) {
+                    // Destructuring assignment: the right-hand side
+                    // evaluates once into a temporary, then each target
+                    // element is written from it (so a swap reads both
+                    // old values), and the temporary drops what remains.
+                    let rt = self.ty(*rhs);
+                    let tmp = Place::local(self.temp(rt));
+                    self.expr_into(*rhs, Some(&tmp));
+                    let mut writes = Vec::new();
+                    self.collect_assign_pattern(*lhs, tmp.clone(), rt, span, &mut writes);
+                    if needs_drop(self.p, &self.body.tys, rt) {
+                        self.push(StmtKind::Drop(tmp.local), span);
+                    }
+                    for (target, src, ety) in writes {
+                        let pl = self.place_for_mut(target);
+                        let op = self.operand_from(src, ety);
+                        self.assign(pl, Rvalue::Use(op), span);
+                    }
+                    self.unit(dest, span);
+                    return;
+                }
                 let o = self.operand(*rhs);
                 let pl = self.place_for_mut(*lhs);
                 self.assign(pl, Rvalue::Use(o), span);
@@ -1440,6 +1461,44 @@ impl<'p, 'a> Lower<'p, 'a> {
             Rvalue::Bin(op, a, b)
         };
         self.assign(out, rv, span);
+    }
+
+    /// Phase one of a destructuring assignment: move each written
+    /// element of the source place into its own temporary, in target
+    /// order, and collect the writes. `_` writes nothing and stays in
+    /// the source temporary, which the caller drops next: in Rust a
+    /// discarded element drops before the overwritten old values do.
+    fn collect_assign_pattern(&mut self, e: ExprId, src: Place, ty: Ty, span: Span, out: &mut Vec<(ExprId, Place, Ty)>) {
+        match self.p.ast.expr(e) {
+            Expr::Underscore => {}
+            Expr::Tuple(elems) => {
+                let elem_tys: Vec<Ty> = match self.kind(ty) {
+                    TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec(),
+                    _ => Vec::new(),
+                };
+                for (i, &el) in elems.iter().enumerate() {
+                    if let Some(&ety) = elem_tys.get(i) {
+                        self.collect_assign_pattern(el, src.project(Proj::Field(i as u32)), ety, span, out);
+                    }
+                }
+            }
+            Expr::Array(elems) => {
+                let elem_ty = match self.kind(ty) {
+                    TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                    _ => ERROR,
+                };
+                for (i, &el) in elems.iter().enumerate() {
+                    let idx = self.const_usize(i as u64, span);
+                    self.collect_assign_pattern(el, src.project(Proj::Index(idx)), elem_ty, span, out);
+                }
+            }
+            _ => {
+                let t = Place::local(self.temp(ty));
+                let op = self.operand_from(src, ty);
+                self.assign(t.clone(), Rvalue::Use(op), span);
+                out.push((e, t, ty));
+            }
+        }
     }
 
     /// A `&str` operand for a String or str place (a tuple field in an
