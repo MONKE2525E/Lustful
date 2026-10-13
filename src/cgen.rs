@@ -2944,7 +2944,14 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    lust_Vec {v} = {}; lust_vec_shrink_to(&{v}, 0, sizeof({et}), _Alignof({et}));", vals[0]);
                 format!("(({st}){{ ({et}*){v}.ptr, {v}.len }})")
             }
-            B::BoxSliceIntoVec => format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, ({0}).len }})", vals[0]),
+            B::BoxSliceIntoVec => {
+                // A zero-sized element's Vec reports capacity usize::MAX.
+                let CTy::BoxSlice(e) = &tys[0] else { unreachable!("into_vec on a Box<[T]>") };
+                let zst = c_layout(self.p, e).is_some_and(|l| l.size == 0);
+                let cap = if zst { "0xffffffffffffffffULL".to_string() } else { format!("({}).len", vals[0]) };
+                format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, {cap} }})", vals[0])
+            }
+            B::BoxSliceIntoIter => format!("((lust_VecIter){{ (void*)({0}).ptr, ({0}).len, ({0}).len, 0 }})", vals[0]),
             B::StringFromUtf8 | B::StrFromUtf8 => {
                 // Validate, then build `Ok(text)` or `Err(error)` with
                 // Rust's `valid_up_to` and `error_len` (runtime core.c).

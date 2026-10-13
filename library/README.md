@@ -104,7 +104,7 @@ source when the generic std pipeline can carry it.
 | `Rc`, `rc::Weak`, `RefCell` (with `Ref`/`RefMut`), `Cell` | check/cells.rs, cgen.rs | Implicit weak count; borrow panics as Rust; region rules in borrowck/regions.rs. |
 | `process::ExitCode` | check/process.rs | `main` may return it, or `Result<ExitCode, E>`. |
 | `String::from_utf8`, `str::from_utf8`, `FromUtf8Error`, `Utf8Error` | check/utf8.rs, runtime core.c | The error types are synthetic std Adts (check/collect.rs), so derived Debug/Clone/Eq are the struct machinery. |
-| `Box<[T]>` | cgen.rs `CTy::BoxSlice` | `into_boxed_slice`, `into_vec`, deref to `[T]`. No `Box<[T; N]>` coercion and no by-value `into_iter` yet. |
+| `Box<[T]>` | cgen.rs `CTy::BoxSlice` | `into_boxed_slice`, `into_vec`, by-value iteration (`vec::IntoIter`), deref to `[T]`. No `Box<[T; N]>` coercion yet. |
 | `Result` methods without closures | check/mod.rs `Res*` | Stopgap: is_ok, is_err, ok, err, unwrap, expect, unwrap_err, expect_err, unwrap_or. The closure methods wait for the source move (phase-1 WIP on a2/w-std-a-srcopt-wip). |
 
 Non-prelude std types (`Rc`, `Weak`, `RefCell`, `Cell`, `Ordering`,

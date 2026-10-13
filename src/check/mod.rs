@@ -395,9 +395,11 @@ pub enum Builtin {
     CellSwap,
     /// `ExitCode::from(u8)` (check/process.rs).
     ExitCodeFrom,
-    /// `Vec::into_boxed_slice` and `Box<[T]>::into_vec`.
+    /// `Vec::into_boxed_slice`, `Box<[T]>::into_vec`, and by-value
+    /// `Box<[T]>::into_iter` (a `vec::IntoIter<T>`, as in Rust 2024).
     VecIntoBoxedSlice,
     BoxSliceIntoVec,
+    BoxSliceIntoIter,
     /// UTF-8 decoding (check/utf8.rs): `String::from_utf8`,
     /// `str::from_utf8`, and the methods of their errors.
     StringFromUtf8,
@@ -9661,8 +9663,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 // Rust 2024 iterates a boxed slice by value here.
                 "into_iter" => {
-                    self.err("L0640", name_span, "`into_iter` on a `Box<[T]>` is not implemented yet", "Use `.iter()`, or `.into_vec().into_iter()`.");
-                    return ERROR;
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::BoxSliceIntoIter, derefs: 0, autoref: Autoref::None });
+                    self.check_args(&[], args, name_span);
+                    return crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::VecIntoIter, &[el]);
                 }
                 _ => {}
             }
@@ -11489,6 +11492,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             TyKind::Array(elem, _) => elem,
             _ if self.tys.vec_elem(self.resolve(t)).is_some() => self.tys.vec_elem(self.resolve(t)).unwrap_or(ERROR),
+            // A boxed slice by value (Rust 2024): its `vec::IntoIter`.
+            _ if self.tys.boxed_slice_elem(self.resolve(t)).is_some() => self.tys.boxed_slice_elem(self.resolve(t)).unwrap_or(ERROR),
             TyKind::Error => ERROR,
             _ => match self.for_trait_iter(for_e, iter, t) {
                 Some(item) => item,

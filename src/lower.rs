@@ -3221,12 +3221,26 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = bodyb;
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             self.assign(Place::local(item), Rvalue::Use(Operand::Copy(c)), span);
-        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter)) {
+        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter)) || self.body.tys.boxed_slice_elem(self.ty(iter)).is_some() {
             // `for x in it` over a builtin iterator (ty/iter.rs): call
-            // `next` until it returns None, like the Chars arm.
-            let it_ty = self.ty(iter);
-            let it = self.temp(it_ty);
-            self.expr_into(iter, Some(&Place::local(it)));
+            // `next` until it returns None, like the Chars arm. A boxed
+            // slice by value iterates its `vec::IntoIter` (Rust 2024).
+            let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
+                Some(el) => {
+                    let bx = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(bx)));
+                    let it_ty = crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::VecIntoIter, &[el]);
+                    let it = self.temp(it_ty);
+                    self.call_into(CallTarget::Builtin(Builtin::BoxSliceIntoIter), vec![Operand::Move(Place::local(bx))], Place::local(it), span);
+                    (it_ty, it)
+                }
+                None => {
+                    let it_ty = self.ty(iter);
+                    let it = self.temp(it_ty);
+                    self.expr_into(iter, Some(&Place::local(it)));
+                    (it_ty, it)
+                }
+            };
             self.goto(head, span);
             let mt = self.ref_ty(true, it_ty);
             let r = self.temp(mt);
