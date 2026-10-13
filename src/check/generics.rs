@@ -801,13 +801,16 @@ impl Scope {
 }
 
 /// What scoped resolution needs from the program being built.
-/// A type alias whose generics are lifetimes only (`type R<'a> = &'a str`,
-/// W-BORROW). Its body resolves at each use with the alias's lifetimes
-/// mapped to the use site's regions (`resolve_lifetime_alias`), so a
-/// generic Adt target works too.
+/// A generic type alias (`type R<'a> = &'a str`, `type M<K, V = u32> =
+/// Vec<(K, V)>`; W-BORROW). Its body resolves at each use with the alias's
+/// lifetimes mapped to the use site's regions and its type params to the
+/// use site's types (`resolve_generic_alias`), so a generic Adt target
+/// works too.
 #[derive(Clone, Debug)]
-pub struct LifetimeAlias {
+pub struct GenericAlias {
     pub lifetimes: Vec<Sym>,
+    /// Type params in order, with their defaults.
+    pub type_params: Vec<(Sym, Option<ast::TyId>)>,
     pub ty: ast::TyId,
     /// The erased body, once collect validated it (`ERROR` before).
     pub erased: Ty,
@@ -827,8 +830,8 @@ pub struct ResolveCx<'x> {
     pub trait_names: &'x FxMap<Sym, DefId>,
     /// Non-generic type aliases by name (collect pass 1.5).
     pub aliases: &'x FxMap<Sym, Ty>,
-    /// Type aliases whose generics are lifetimes only (W-BORROW).
-    pub lifetime_aliases: &'x FxMap<Sym, LifetimeAlias>,
+    /// Generic type aliases (W-BORROW).
+    pub generic_aliases: &'x FxMap<Sym, GenericAlias>,
     pub index: &'x ImplIndex,
     pub lang: &'x LangTraits,
 }
@@ -1183,6 +1186,7 @@ fn resolve_const_path_arg(
     // never a const (rustc E0747 in this position).
     if cx.type_names.contains_key(&seg.name)
         || cx.aliases.contains_key(&seg.name)
+        || cx.generic_aliases.contains_key(&seg.name)
         || scope.param_tys.iter().any(|(n, _)| *n == seg.name)
         || seg.name == known.self_type
     {
@@ -1846,9 +1850,9 @@ fn resolve_path_ty(
         return Ok(tys.mk_result(t, e));
     }
     if segs.len() == 1
-        && let Some(la) = cx.lifetime_aliases.get(&name)
+        && let Some(la) = cx.generic_aliases.get(&name)
     {
-        return resolve_lifetime_alias(ast, interner, known, cx, tys, scope, la, seg, span);
+        return resolve_generic_alias(ast, interner, known, cx, tys, scope, la, seg, span);
     }
     if segs.len() == 1
         && let Some(&alias_ty) = cx.aliases.get(&name)
@@ -1980,33 +1984,35 @@ fn resolve_fmt_path(tys: &mut impl TyIntern, name: &str, seg: &ast::PathSeg, spa
     }
 }
 
-/// A use of a lifetime alias (W-BORROW): lifetime args only, none (each
-/// elided under the use site's rules) or one per param (rustc E0107);
-/// the body resolves in a scope of its own where the alias's lifetimes
-/// are the use site's regions.
+/// A use of a generic alias (W-BORROW): lifetime args none (each elided
+/// under the use site's rules) or one per param, then type args, missing
+/// ones from their defaults (rustc E0107 otherwise); the body resolves in
+/// a scope of its own where the alias's lifetimes are the use site's
+/// regions and its type params the use site's types.
 #[allow(clippy::too_many_arguments)]
-fn resolve_lifetime_alias(
+fn resolve_generic_alias(
     ast: &Ast,
     interner: &Interner,
     known: &Known,
     cx: &ResolveCx,
     tys: &mut impl TyIntern,
     scope: &Scope,
-    la: &LifetimeAlias,
+    la: &GenericAlias,
     seg: &ast::PathSeg,
     span: Span,
 ) -> Result<Ty, Diag> {
-    let (written, other): (Vec<ast::Lifetime>, bool) = match &seg.args {
+    let (written, types, other): (Vec<ast::Lifetime>, Vec<ast::TyId>, bool) = match &seg.args {
         GenericArgs::Angle(a) => (
             a.iter().filter_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect(),
-            a.iter().any(|g| !matches!(g, AstArg::Lifetime(_))),
+            a.iter().filter_map(|g| if let AstArg::Type(t) = g { Some(*t) } else { None }).collect(),
+            a.iter().any(|g| !matches!(g, AstArg::Lifetime(_) | AstArg::Type(_))),
         ),
-        GenericArgs::None => (Vec::new(), false),
-        _ => (Vec::new(), true),
+        GenericArgs::None => (Vec::new(), Vec::new(), false),
+        _ => (Vec::new(), Vec::new(), true),
     };
     let alias = crate::intern::source_name(interner.get(seg.name)).to_string();
     if other {
-        return Err(Diag::new("L0110", span, format!("`{alias}` takes no type arguments"), "Pass lifetime arguments only."));
+        return Err(Diag::new("L0110", span, format!("`{alias}` takes lifetime and type arguments only"), "Pass lifetime and type arguments."));
     }
     if !written.is_empty() && written.len() != la.lifetimes.len() {
         return Err(Diag::new(
@@ -2014,6 +2020,15 @@ fn resolve_lifetime_alias(
             span,
             format!("`{alias}` takes {} lifetime argument(s), but {} were given", la.lifetimes.len(), written.len()),
             "Match the number of lifetime parameters in the alias.",
+        ));
+    }
+    let required = la.type_params.iter().take_while(|(_, d)| d.is_none()).count();
+    if types.len() > la.type_params.len() || types.len() < required {
+        return Err(Diag::new(
+            "L0110",
+            span,
+            format!("`{alias}` takes {} type argument(s), but {} were given", la.type_params.len(), types.len()),
+            "Match the number of type parameters in the alias.",
         ));
     }
     if scope.infer_cell.is_some()
@@ -2034,12 +2049,21 @@ fn resolve_lifetime_alias(
     for i in 0..la.lifetimes.len() {
         regions.push(scope_region(interner, scope, written.get(i).copied(), span)?);
     }
-    let body = Scope {
+    let mut body = Scope {
         regions: scope.regions.clone(),
         alias_lifetimes: la.lifetimes.iter().copied().zip(regions).collect(),
         alias_depth: scope.alias_depth + 1,
         ..Scope::default()
     };
+    // Type args resolve where they are written; a default resolves in the
+    // alias's scope, where the earlier params are bound.
+    for (i, &(name, default)) in la.type_params.iter().enumerate() {
+        let t = match types.get(i) {
+            Some(&w) => resolve_scoped(ast, interner, known, cx, tys, w, scope)?,
+            None => resolve_scoped(ast, interner, known, cx, tys, default.expect("checked arity"), &body)?,
+        };
+        body.param_tys.push((name, t));
+    }
     resolve_scoped(ast, interner, known, cx, tys, la.ty, &body)
 }
 
@@ -2565,8 +2589,8 @@ pub struct GenTables<'a> {
     /// (W-BORROW). They are not in `adt_generics`: lifetimes leave type
     /// param indexes and instance keys as before.
     pub adt_lifetimes: FxMap<DefId, Vec<Sym>>,
-    /// Type aliases whose generics are lifetimes only, by name (W-BORROW).
-    pub lifetime_aliases: FxMap<Sym, LifetimeAlias>,
+    /// Generic type aliases, by name (W-BORROW).
+    pub generic_aliases: FxMap<Sym, GenericAlias>,
     pub adt_generics: Vec<Generics>,
     pub adt_envs: Vec<Vec<Predicate>>,
     pub adt_scopes: Vec<Scope>,
@@ -2695,7 +2719,7 @@ impl Default for GenTables<'_> {
             wf_headers: Vec::new(),
             adt_info: Vec::new(),
             adt_lifetimes: FxMap::default(),
-            lifetime_aliases: FxMap::default(),
+            generic_aliases: FxMap::default(),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
             adt_scopes: Vec::new(),
@@ -2749,7 +2773,7 @@ impl GenTables<'_> {
             adt_lifetimes: &self.adt_lifetimes,
             trait_names: &self.trait_names,
             aliases,
-            lifetime_aliases: &self.lifetime_aliases,
+            generic_aliases: &self.generic_aliases,
             index: &self.index,
             lang: &self.lang,
         }

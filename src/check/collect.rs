@@ -469,7 +469,7 @@ fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
                 .get(&last.name)
                 .and_then(|&a| p.gx.adt_lifetimes.get(&p.gx.adt_info[a.0 as usize].0))
                 .map(|v| v.len())
-                .or_else(|| p.gx.lifetime_aliases.get(&last.name).map(|a| a.lifetimes.len()))
+                .or_else(|| p.gx.generic_aliases.get(&last.name).map(|a| a.lifetimes.len()))
                 .unwrap_or(0);
             let written = match &last.args {
                 ast::GenericArgs::Angle(a) => a.iter().any(|g| matches!(g, ast::GenericArg::Lifetime(_))),
@@ -491,7 +491,7 @@ fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
 /// `'static` or one of the alias's lifetime params `lts` (an elided one is
 /// rustc E0106, L0202; any other name is undeclared, E0261, L0203).
 /// Elided lifetimes inside fn pointer types are the pointer's own; the
-/// lifetime args of paths resolve with the body (`LifetimeAlias`).
+/// lifetime args of paths resolve with the body (`GenericAlias`).
 fn alias_lifetimes(ast: &Ast, interner: &Interner, id: ast::TyId, lts: &[Sym], errs: &mut Vec<Diag>) {
     match ast.ty(id) {
         TyExpr::Ref { lifetime, inner, .. } => {
@@ -523,6 +523,35 @@ fn alias_lifetimes(ast: &Ast, interner: &Interner, id: ast::TyId, lts: &[Sym], e
             }
         }
         _ => {}
+    }
+}
+
+/// True when a written type names `name` as a path's first segment
+/// anywhere (an alias's type param is used, rustc E0091).
+fn ty_mentions(ast: &Ast, id: ast::TyId, name: Sym) -> bool {
+    let seg_args = |seg: &ast::PathSeg| -> bool {
+        match &seg.args {
+            ast::GenericArgs::Angle(args) => args.iter().any(|g| match g {
+                ast::GenericArg::Type(t) => ty_mentions(ast, *t, name),
+                ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => ty_mentions(ast, *t, name),
+                _ => false,
+            }),
+            ast::GenericArgs::Parenthesized { inputs, output } => {
+                inputs.iter().any(|&t| ty_mentions(ast, t, name)) || output.is_some_and(|t| ty_mentions(ast, t, name))
+            }
+            ast::GenericArgs::None => false,
+        }
+    };
+    let bounds = |bs: &[ast::TraitBound]| bs.iter().any(|b| matches!(b, ast::TraitBound::Trait { trait_ref, .. } if trait_ref.path.iter().any(seg_args)));
+    match ast.ty(id) {
+        TyExpr::Path(segs) => segs.first().is_some_and(|s| s.name == name) || segs.iter().any(seg_args),
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => ty_mentions(ast, *inner, name),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => ty_mentions(ast, *inner, name),
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| ty_mentions(ast, e, name)),
+        TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|i| ty_mentions(ast, i.ty, name)) || ret.is_some_and(|r| ty_mentions(ast, r, name)),
+        TyExpr::Dyn { bounds: bs, .. } | TyExpr::ImplTrait { bounds: bs } => bounds(bs),
+        TyExpr::QPath { self_ty, trait_path, segs } => ty_mentions(ast, *self_ty, name) || trait_path.iter().any(seg_args) || segs.iter().any(seg_args),
+        _ => false,
     }
 }
 
@@ -1728,7 +1757,7 @@ pub fn collect_reuse<'a>(
                 }
                 seen_aliases.push(a.name);
                 // W-BORROW: an alias whose generics are lifetimes only
-                // resolves at each use (`generics::resolve_lifetime_alias`);
+                // resolves at each use (`generics::resolve_generic_alias`);
                 // its body is checked once below, after Adts and traits.
                 let lts: Vec<Sym> = a
                     .generics
@@ -1736,21 +1765,41 @@ pub fn collect_reuse<'a>(
                     .iter()
                     .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.name) } else { None })
                     .collect();
-                let only_lts = !lts.is_empty() && lts.len() == a.generics.params.len();
+                // Lifetime and type params resolve at each use; const
+                // params stay with the eager path (unsupported there).
+                let type_params: Vec<(Sym, Option<ast::TyId>)> = a
+                    .generics
+                    .params
+                    .iter()
+                    .filter_map(|g| if let ast::GenericParam::Type { name, default, .. } = g { Some((*name, *default)) } else { None })
+                    .collect();
+                let generic = !a.generics.params.is_empty() && lts.len() + type_params.len() == a.generics.params.len();
                 alias_lifetimes(ast, interner, a.ty, &lts, &mut errs);
-                if only_lts {
-                    for (i, n) in lts.iter().enumerate() {
-                        if lts[..i].contains(n) {
+                if generic {
+                    // rustc E0091: every type param of an alias is used.
+                    for (n, _) in &type_params {
+                        if !ty_mentions(ast, a.ty, *n) {
                             errs.push(Diag::new(
                                 "L0110",
                                 a.name_span,
-                                format!("the lifetime `'{}` is declared twice on this alias", interner.get(*n)),
-                                "Give each lifetime parameter its own name.",
+                                format!("type parameter `{}` is never used in this alias", interner.get(*n)),
+                                "Use the parameter in the aliased type, or remove it.",
+                            ));
+                        }
+                    }
+                    let names: Vec<Sym> = lts.iter().copied().chain(type_params.iter().map(|&(n, _)| n)).collect();
+                    for (i, n) in names.iter().enumerate() {
+                        if names[..i].contains(n) {
+                            errs.push(Diag::new(
+                                "L0110",
+                                a.name_span,
+                                format!("the parameter `{}` is declared twice on this alias", interner.get(*n)),
+                                "Give each parameter its own name.",
                             ));
                         }
                     }
                     let body_hash = crate::driver::ast_hash::item_hash(ast, item);
-                    p.gx.lifetime_aliases.insert(a.name, generics::LifetimeAlias { lifetimes: lts, ty: a.ty, erased: ERROR, body_hash });
+                    p.gx.generic_aliases.insert(a.name, generics::GenericAlias { lifetimes: lts, type_params, ty: a.ty, erased: ERROR, body_hash });
                 } else {
                     pending.push(a);
                 }
@@ -1793,8 +1842,26 @@ pub fn collect_reuse<'a>(
                         format!("cycle detected in type aliases: {}", names.join(", ")),
                         "Break the cycle: an alias must not name itself, directly or through other aliases.",
                     ));
-                } else if let Some(d) = first_err {
-                    errs.push(d);
+                } else {
+                    // W-BORROW: an alias this early pass cannot resolve (a
+                    // generic Adt target, an alias of a lazy alias) resolves
+                    // at each use like a generic alias, and its body is
+                    // checked with theirs below. Const params stay errors.
+                    let mut reported = false;
+                    for a in &pending {
+                        if a.generics.params.is_empty()
+                            && let Some(item) = ast.items.iter().find(|it| matches!(&it.kind, ItemKind::Type(x) if x.name == a.name))
+                        {
+                            let body_hash = crate::driver::ast_hash::item_hash(ast, item);
+                            p.gx.generic_aliases.insert(
+                                a.name,
+                                generics::GenericAlias { lifetimes: Vec::new(), type_params: Vec::new(), ty: a.ty, erased: ERROR, body_hash },
+                            );
+                        } else if !reported && let Some(d) = first_err.take() {
+                            errs.push(d);
+                            reported = true;
+                        }
+                    }
                 }
                 break;
             }
@@ -2331,17 +2398,32 @@ pub fn collect_reuse<'a>(
     // W-BORROW: each lifetime alias's body, checked once like rustc does
     // (an unused alias with an unknown type is still an error), and its
     // erased form kept for the driver's fingerprints.
-    let mut aliases: Vec<(Sym, generics::LifetimeAlias)> = p.gx.lifetime_aliases.iter().map(|(&n, a)| (n, a.clone())).collect();
+    let mut aliases: Vec<(Sym, generics::GenericAlias)> = p.gx.generic_aliases.iter().map(|(&n, a)| (n, a.clone())).collect();
     aliases.sort_by_key(|(_, a)| a.ty.0);
     for (name, la) in aliases {
-        let scope = generics::Scope { alias_lifetimes: la.lifetimes.iter().map(|&n| (n, Region::Erased)).collect(), alias_depth: 1, ..generics::Scope::default() };
+        let mut scope = generics::Scope { alias_lifetimes: la.lifetimes.iter().map(|&n| (n, Region::Erased)).collect(), alias_depth: 1, ..generics::Scope::default() };
+        for (i, &(n, _)) in la.type_params.iter().enumerate() {
+            let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
+            scope.param_tys.push((n, t));
+        }
         let res = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, la.ty, &scope)
+            let body = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, la.ty, &scope);
+            // Defaults are types of their own: check them too.
+            let mut defaults = Ok(());
+            for &(_, d) in &la.type_params {
+                if let Some(d) = d
+                    && let Err(e) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, d, &scope)
+                {
+                    defaults = Err(e);
+                    break;
+                }
+            }
+            defaults.and(body)
         };
         match res {
             Ok(t) => {
-                if let Some(e) = p.gx.lifetime_aliases.get_mut(&name) {
+                if let Some(e) = p.gx.generic_aliases.get_mut(&name) {
                     e.erased = t;
                 }
             }
