@@ -140,7 +140,10 @@ assert len(re.findall(r"^\s+[A-Z]\w+,", macro_body, re.M)) + token_count == len(
 # Rejected codes are all documented codes.
 codes = {c["code"] for c in cap["diagnostics"]["codes"]}
 assert all(r["code"] in codes for r in cap["rejected"])
-assert len(codes) == 96
+# Every code lust reports has an explain page, and every page is a code lust reports.
+# (A pinned count collided when two landings each added a code.)
+doc_codes = {p.stem for p in (root / "docs/errors").glob("L*.md")}
+assert codes == doc_codes, (sorted(codes - doc_codes), sorted(doc_codes - codes))
 PYEOF
 check cap-content $? "see the python assert above"
 "$lust" capabilities > "$work/cap.txt" 2>/dev/null; grep -q "methods on Vec<T>" "$work/cap.txt"; check cap-human $? "human output must list methods"
