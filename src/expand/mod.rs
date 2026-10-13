@@ -807,9 +807,10 @@ pub fn cache_stats() -> (u64, u64) {
 /// or a cfg attribute. A macro-free file pays one token scan and runs
 /// the unchanged pipeline.
 pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
+    let macro_rules = interner.intern("macro_rules");
     for (i, t) in tokens.iter().enumerate() {
         match t.tok {
-            Tok::Ident(s) if interner.get(s) == "macro_rules" => return true,
+            Tok::Ident(s) if s == macro_rules => return true,
             Tok::Bang => {
                 // `name!`: the token before the bang names the macro.
                 // A path-qualified parser macro (`std::println!`) also

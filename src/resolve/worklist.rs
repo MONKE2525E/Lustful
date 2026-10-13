@@ -394,10 +394,12 @@ fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
 fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Interner) -> Result<(), Diag> {
     use crate::lexer::Tok;
     let toks = &lexed.tokens;
+    // Symbols, not texts, per token: this scans every token of the crate.
+    let (macro_rules, cfg) = (interner.intern("macro_rules"), interner.intern("cfg"));
     let mut i = 0;
     while i < toks.len() {
         // Skip a macro_rules body (one delimited group after the name).
-        if matches!(toks[i].tok, Tok::Ident(s) if interner.get(s) == "macro_rules") && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) {
+        if toks[i].tok == Tok::Ident(macro_rules) && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) {
             i += 2;
             // Optional macro name, then the delimited body.
             if matches!(toks.get(i).map(|t| t.tok), Some(Tok::Ident(_))) {
@@ -470,7 +472,7 @@ fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Interner) -> R
             }
         }
         // `cfg!(...)` in expression position.
-        if matches!(toks[i].tok, Tok::Ident(s) if interner.get(s) == "cfg")
+        if toks[i].tok == Tok::Ident(cfg)
             && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang)
             && toks.get(i + 2).map(|t| t.tok) == Some(Tok::LParen)
         {

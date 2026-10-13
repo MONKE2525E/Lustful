@@ -342,6 +342,8 @@ pub fn outline_trees(toks: &[crate::lexer::Token]) -> Vec<crate::lexer::TokenTre
 /// its start (brace depth begins at 0), unlike chunk scans.
 pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
     let toks = &lexed.tokens;
+    // A symbol compare per identifier token, not a text read.
+    let macro_rules = interner.intern("macro_rules");
     let mut out = Outline::default();
     // Brace stack: Some(name) for an inline module body, None for any other
     // brace. Items are outline-visible exactly when every open brace is an
@@ -484,7 +486,7 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                 pending_vis = OutlineVis::Private;
                 i += 1;
             }
-            Tok::Ident(s) if interner.get(s) == "macro_rules" && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) => {
+            Tok::Ident(s) if s == macro_rules && toks.get(i + 1).map(|t| t.tok) == Some(Tok::Bang) => {
                 if let Some(Tok::Ident(name)) = toks.get(i + 2).map(|t| t.tok) {
                     let container = container_of(&braces);
                     out.macros.push(MacroDecl {
