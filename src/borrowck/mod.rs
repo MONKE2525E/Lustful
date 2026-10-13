@@ -1490,7 +1490,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                         }
                         bit_set(st.paths_mut(), id);
                     }
-                    None => self.bad_move(p, span),
+                    None => self.bad_move(p, span, st),
                 }
             }
             Operand::Const(_) => {}
@@ -1601,8 +1601,83 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         }
     }
 
-    fn bad_move(&mut self, p: &Place, span: Span) {
-        if p.proj.contains(&Proj::Deref) {
+    /// The container type at the first `Index` step of `place`, when
+    /// it indexes an array, a slice, or a `Vec`. Field and deref
+    /// steps before the index step through their types.
+    fn index_container_ty(&self, place: &Place) -> Option<Ty> {
+        let mut t = self.body.locals[place.local as usize].ty;
+        let mut variant = 0;
+        for pr in &place.proj {
+            match pr {
+                Proj::Field(i) => {
+                    t = self.step_field_ty(t, variant, *i);
+                    variant = 0;
+                }
+                Proj::Downcast(v) => variant = *v,
+                Proj::Deref => {
+                    if let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+                        t = inner;
+                    }
+                }
+                Proj::Index(_) => {
+                    return match self.body.tys.kind(t) {
+                        TyKind::Array(..) | TyKind::Slice(_) => Some(t),
+                        _ if self.body.tys.vec_elem(t).is_some() => Some(t),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    /// The diagnostic for a move out of an index read, in rustc's
+    /// text classes (E0508 for an array or slice, E0507 for a
+    /// `Vec`): a direct `Index` place, or the synthetic borrow
+    /// temporary lowering routes a non-Copy index read through
+    /// (`lower::operand_raw`), whose loan still names the indexed
+    /// place. A named reference local keeps the plain reference
+    /// text instead, as in rustc (`let x = *r;` is E0507 behind a
+    /// reference, not E0508).
+    fn index_move_diag(&self, p: &Place, st: &State) -> Option<(String, &'static str)> {
+        let container = self.index_container_ty(p).or_else(|| {
+            if self.body.locals[p.local as usize].name.is_some() {
+                return None;
+            }
+            bit_iter(st.holds(p.local as usize)).find_map(|li| self.index_container_ty(&self.loans[li].place))
+        })?;
+        let name = self.container_name(container);
+        Some(match self.body.tys.kind(container) {
+            TyKind::Array(..) => (
+                format!("cannot move out of type `{name}`, a non-copy array"),
+                "Borrow the element with `&a[i]`, clone it, or move it out with an array pattern such as `let [x, ..] = a;`.",
+            ),
+            TyKind::Slice(_) => (
+                format!("cannot move out of type `{name}`, a non-copy slice"),
+                "Borrow the element with `&s[i]`, or clone it with `s[i].clone()`.",
+            ),
+            _ => (format!("cannot move out of index of `{name}`"), "Borrow the element with `&v[i]`, or clone it with `v[i].clone()`."),
+        })
+    }
+
+    /// A container type name for `index_move_diag`: like
+    /// `ty_name`, but an array length prints its value when the
+    /// body knows it (the shared printer shows `_` today).
+    fn container_name(&self, t: Ty) -> String {
+        match self.body.tys.kind(t) {
+            TyKind::Array(e, c) => match self.body.tys.const_kind(c) {
+                ConstKind::Int(n) => format!("[{}; {}]", self.container_name(e), n),
+                _ => ty_name(self.p, &self.body.tys, t),
+            },
+            TyKind::Slice(e) => format!("[{}]", self.container_name(e)),
+            _ => ty_name(self.p, &self.body.tys, t),
+        }
+    }
+
+    fn bad_move(&mut self, p: &Place, span: Span, st: &State) {
+        if let Some((msg, fix)) = self.index_move_diag(p, st) {
+            self.err("L0305", span, msg, fix);
+        } else if p.proj.contains(&Proj::Deref) {
             self.err(
                 "L0305",
                 span,
