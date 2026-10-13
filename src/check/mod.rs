@@ -9194,9 +9194,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             UnOp::Neg => {
                 let Some(KVal::Int(x)) = v else { return None };
                 let t = self.out.expr_ty[self.ei(e)];
+                // A literal under the minus is a magnitude, not a
+                // negation of a value: `-128i8` and the `i128::MIN`
+                // literal (magnitude 2^127, stored as the MIN bit
+                // pattern) wrap to their own value and never fire.
+                if matches!(self.p.ast.expr(inner), Expr::Int(..)) {
+                    return self.k_wrap(x.wrapping_neg(), t).map(KVal::Int);
+                }
                 let Some((_, lo, hi)) = self.k_range(t) else { return None };
-                // A literal under the minus keeps its raw value, so
-                // `-128i8` is the value -128, not a negation overflow.
                 let r = x.checked_neg();
                 match r {
                     Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
