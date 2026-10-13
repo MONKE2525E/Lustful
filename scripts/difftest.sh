@@ -183,7 +183,15 @@ for f in "$root"/tests/fail/*.rs "$root"/tests/reject/*.rs; do
   [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
   seen=$((seen + 1))
   expect=$(head -1 "$f" | sed -n 's|^// expect: *\(L[0-9]*\).*|\1|p')
-  run_cc rustc "${rustc_flags[@]}" -o "$work/$name.rustc" "$f" 2>/dev/null
+  # Fail cases must be rejected by rustc with its default deny lints, so
+  # the fail oracle drops the `-A unconditional_panic` the pass corpus
+  # needs for its runtime-panic cases. Reject cases keep the pass flags:
+  # they only have to be programs rustc can build at all.
+  if [[ "$f" == */fail/* ]]; then
+    run_cc rustc --edition 2024 -C panic=abort -C overflow-checks=on -A warnings -o "$work/$name.rustc" "$f" 2>/dev/null
+  else
+    run_cc rustc "${rustc_flags[@]}" -o "$work/$name.rustc" "$f" 2>/dev/null
+  fi
   rustc_ok=$?
   if [[ "$f" == */fail/* && $rustc_ok -eq 0 ]]; then
     report bad "$name" "rustc accepted it, so it is not a valid negative test"; continue

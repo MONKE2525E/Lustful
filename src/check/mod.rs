@@ -706,15 +706,29 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 /// The model: peel the common reference layers (the blanket `&A == &B` impl), then require
 /// one of the base impls: String==String, String==str, String==&str, str==String,
 /// str==str, or &str==String.
-/// A value the overflow lint knows at compile time.
+/// A value the overflow lint knows at compile time. Integers hold the
+/// value's bits in an i128: for every integer type except `u128` that
+/// is also the mathematical value, and `u128` operations read the bits
+/// back as a u128, so values at or above 2^127 stay exact.
 #[derive(Clone, PartialEq)]
 enum KVal {
     Int(i128),
     Bool(bool),
+    /// A known enum discriminant: the adt and the variant index. The
+    /// payload stays unknown.
+    Enum(AdtId, u32),
     Agg(Vec<Option<KVal>>),
 }
 
 type KEnv = Vec<Option<KVal>>;
+
+/// Whether a match pattern matches a known scrutinee value, when the
+/// overflow lint can tell.
+enum KCov {
+    Yes,
+    No,
+    Unknown,
+}
 
 /// State of the overflow-lint walk: addressed locals, the stack of loop
 /// and labeled-block frames collecting break values, and one operation to
@@ -726,6 +740,13 @@ struct KLint {
     /// The current path is known to be unreachable (a known branch that
     /// is taken diverges): the rest of the block is not linted.
     dead: bool,
+    /// `#[allow(arithmetic_overflow)]` on the function.
+    allow_arith: bool,
+    /// `#[allow(unconditional_panic)]` on the function.
+    allow_panic: bool,
+    /// Statement-level allows in force (`#[allow(..)] let ..;`).
+    stmt_allow_arith: u32,
+    stmt_allow_panic: u32,
 }
 
 /// True when an attribute is `#[allow(<name>)]` (possibly one of several).
@@ -7952,25 +7973,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     // ---------- Known-value overflow lint (rustc `arithmetic_overflow`) ----------
 
-    /// The deny-level lint rustc runs over known values, mirrored from its
-    /// MIR const-prop behavior (probed against rustc): an arithmetic
-    /// operation on operands known at compile time that would overflow is
-    /// an error. The pass walks the checked body once, tracking scalar
-    /// locals whose value is known. The tracked set follows the probed
-    /// rules: a local whose address is taken anywhere is never tracked,
-    /// knowledge does not survive a control-flow join for locals assigned
-    /// on either side, a write through a field or index place drops the
-    /// whole aggregate, reads through references and enum payloads are
-    /// unknown, and an operation that stores back into the local it reads
-    /// (`a = a + 1`, `a += 1`) does not fire. `u128` values at or above
-    /// 2^127 are not tracked (they do not fit the i128 values here).
+    /// The deny-level lints rustc runs over known values, mirrored from
+    /// its MIR const-prop behavior (probed against rustc): an arithmetic
+    /// operation on operands known at compile time that would overflow
+    /// is an error (`arithmetic_overflow`, L0540), and so is an
+    /// operation that always panics: division or remainder by a known
+    /// zero, `MIN / -1`, and an index known to be out of bounds for an
+    /// array type (`unconditional_panic`, L0541). The pass walks the
+    /// checked body once, tracking scalar locals whose value is known.
+    /// The tracked set follows the probed rules: a local whose address
+    /// is taken anywhere is never tracked, knowledge does not survive a
+    /// control-flow join for locals assigned on either side, a write
+    /// through a field or index place drops the whole aggregate, reads
+    /// through references and enum payloads are unknown, and an
+    /// operation that stores back into the local it reads
+    /// (`a = a + 1`, `a += 1`) does not fire.
     fn overflow_lint(&mut self) {
         let p = self.p;
-        if self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
+        let allow_arith = self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow"));
+        let allow_panic = self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic"));
+        if allow_arith && allow_panic {
             return;
         }
         let Some(body) = self.f.def.body else { return };
-        let mut lint = KLint { addressed: vec![false; self.out.locals.len()], frames: Vec::new(), suppress: None, dead: false };
+        let mut lint = KLint {
+            addressed: vec![false; self.out.locals.len()],
+            frames: Vec::new(),
+            suppress: None,
+            dead: false,
+            allow_arith,
+            allow_panic,
+            stmt_allow_arith: 0,
+            stmt_allow_panic: 0,
+        };
         // A local whose address is taken anywhere in the body is not tracked.
         for i in 0..self.out.expr_ty.len() {
             let e = ExprId(self.out.expr_base + i as u32);
@@ -8026,8 +8061,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// The mathematical value of an i128 seen at integer type `t`, or None
-    /// for a u128 value that does not fit an i128.
+    /// True when `t` is the `u128` type, whose known values are bit
+    /// patterns rather than mathematical i128 values.
+    fn k_is_u128(&self, t: Ty) -> bool {
+        matches!(self.tys.kind(t), TyKind::Int(it) if !it.signed() && it.bits() >= 128)
+    }
+
+    /// The bit width of an integer type, when `t` is one.
+    fn k_bits(&self, t: Ty) -> Option<u32> {
+        match self.tys.kind(t) {
+            TyKind::Int(it) => Some(it.bits()),
+            _ => None,
+        }
+    }
+
+    /// Orders two known values at integer type `t` (in the u128 domain
+    /// for `u128`, where the stored i128 is only the bit pattern).
+    fn k_cmp(&self, a: i128, b: i128, t: Ty) -> std::cmp::Ordering {
+        if self.k_is_u128(t) {
+            (a as u128).cmp(&(b as u128))
+        } else {
+            a.cmp(&b)
+        }
+    }
+
+    /// The mathematical value of an i128 seen at integer type `t`. For
+    /// `u128` the bits pass through unchanged (see `KVal`).
     fn k_math(&self, v: i128, t: Ty) -> Option<i128> {
         match self.tys.kind(t) {
             TyKind::Int(it) => {
@@ -8035,7 +8094,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if it.signed() {
                     Some(crate::ty::consteval::truncate_to_int(v, it))
                 } else if bits >= 128 {
-                    if v >= 0 { Some(v) } else { None }
+                    Some(v)
                 } else {
                     Some(v & ((1i128 << bits) - 1))
                 }
@@ -8067,13 +8126,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    fn k_fire(&mut self, span: Span) {
+    fn k_fire(&mut self, span: Span, lint: &KLint) {
+        if lint.allow_arith || lint.stmt_allow_arith > 0 {
+            return;
+        }
         self.err(
             "L0540",
             span,
             "this arithmetic operation will overflow",
             "Change the values or the type. If the wrap is intended, use a `wrapping_*` operation.",
         );
+    }
+
+    /// The `unconditional_panic` fire: an operation on known values
+    /// that always panics when it runs.
+    fn k_fire_panic(&mut self, span: Span, lint: &KLint, what: &str, fix: &'static str) {
+        if lint.allow_panic || lint.stmt_allow_panic > 0 {
+            return;
+        }
+        self.err("L0541", span, format!("{what}: this operation will panic at runtime"), fix);
+    }
+
+    /// Reports an out-of-bounds index when the base expression has an
+    /// array type (through any number of references) and the index
+    /// value is known. Slice and `Vec` bases keep a runtime length
+    /// rustc does not const-propagate, so they never fire here.
+    fn k_check_index(&mut self, base: ExprId, iv: &Option<KVal>, span: Span, lint: &KLint) {
+        let Some(KVal::Int(i)) = iv else { return };
+        let mut t = self.out.expr_ty[self.ei(base)];
+        loop {
+            match self.tys.kind(t) {
+                TyKind::Ref(_, _, e) => t = e,
+                _ => break,
+            }
+        }
+        let TyKind::Array(_, c) = self.tys.kind(t) else { return };
+        let crate::ty::ConstKind::Int(len) = self.tys.const_kind(c) else { return };
+        if *i < 0 || *i as u128 >= len {
+            self.k_fire_panic(span, lint, "index out of bounds", "Change the index or the array length.");
+        }
     }
 
     /// Places whose writes change a tracked local, found by span within
@@ -8236,12 +8327,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return None;
             }
             let diverges = match stmt {
-                Stmt::Let { pat, init, els, .. } => {
+                Stmt::Let { pat, init, els, attrs, .. } => {
+                    // A statement-level `#[allow(..)]` covers this let.
+                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
+                        lint.stmt_allow_arith += 1;
+                    }
+                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic")) {
+                        lint.stmt_allow_panic += 1;
+                    }
                     let v = init.map(|i| self.k_expr(i, env, lint)).unwrap_or(None);
                     self.k_bind_pat(*pat, &v, env, lint);
                     if let Some(els) = els {
                         let mut eenv = env.clone();
                         self.k_block(*els, &mut eenv, lint);
+                    }
+                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
+                        lint.stmt_allow_arith -= 1;
+                    }
+                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic")) {
+                        lint.stmt_allow_panic -= 1;
                     }
                     init.is_some_and(|i| self.tys.kind(self.out.expr_ty[self.ei(i)]) == TyKind::Never)
                 }
@@ -8272,6 +8376,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             CV::Int(v) => self.k_math(*v, t).map(KVal::Int),
             CV::Bool(b) => Some(KVal::Bool(*b)),
             CV::Char(c) => Some(KVal::Int(*c as i128)),
+            CV::Variant(v, _) => match self.tys.kind(t) {
+                TyKind::Adt(def, _) => match self.p.adt_by_def(def) {
+                    Some(a) if self.p.adt(a).is_enum => Some(KVal::Enum(a, *v)),
+                    _ => None,
+                },
+                _ => None,
+            },
             CV::Aggregate(vals) => Some(KVal::Agg(vals.iter().map(|v| self.k_const(v, ERROR)).collect())),
             _ => None,
         }
@@ -8288,17 +8399,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return self.k_const(cv, ety);
         }
         match p.ast.expr(e) {
-            Expr::Int(v, _) => {
-                if *v <= i128::MAX as u128 {
-                    Some(KVal::Int(*v as i128))
-                } else {
-                    None
-                }
-            }
+            Expr::Int(v, _) => Some(KVal::Int(*v as u128 as i128)),
             Expr::Bool(b) => Some(KVal::Bool(*b)),
             Expr::Char(c) => Some(KVal::Int(*c as i128)),
             Expr::Path(_) | Expr::SelfValue => match self.out.expr_res[self.ei(e)] {
                 Res::Local(l) => env.get(l as usize).cloned().unwrap_or(None),
+                Res::Variant(a, v) if p.adt(a).is_enum => Some(KVal::Enum(a, v)),
                 _ => None,
             },
             Expr::Block(b) | Expr::UnsafeBlock(b) => self.k_block(*b, env, lint),
@@ -8425,8 +8531,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Match { scrut, arms } => {
                 let sv = self.k_expr(*scrut, env, lint);
+                let sty = self.out.expr_ty[self.ei(*scrut)];
                 let saved = lint.dead;
-                if let Some(arm) = sv.as_ref().and_then(|v| self.k_select_arm(arms, v)) {
+                if let Some(arm) = sv.as_ref().and_then(|v| self.k_select_arm(arms, v, sty)) {
                     // Only this arm runs. With several arms its assignments
                     // and its value are still lost at the join; a single
                     // arm is straight-line code.
@@ -8502,6 +8609,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     },
                     _ => match self.out.expr_res[self.ei(*callee)] {
                         Res::ConstUsize(u) => Some(KVal::Int(u as i128)),
+                        Res::Variant(a, v) if p.adt(a).is_enum => Some(KVal::Enum(a, v)),
                         Res::Variant(a, _) if !p.adt(a).is_enum => Some(KVal::Agg(vals)),
                         Res::OptSome => Some(KVal::Agg(vals)),
                         _ => None,
@@ -8525,6 +8633,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Index { base, index } => {
                 let bv = self.k_expr(*base, env, lint);
                 let iv = self.k_expr(*index, env, lint);
+                self.k_check_index(*base, &iv, span, lint);
                 match (bv, iv) {
                     (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => items.get(i as usize).cloned().unwrap_or(None),
                     _ => None,
@@ -8546,6 +8655,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             }
                         }
                         Some(KVal::Agg(items))
+                    }
+                    Res::Variant(a, v) if p.adt(a).is_enum => {
+                        for &(_, _, fe) in fields {
+                            self.k_expr(fe, env, lint);
+                        }
+                        Some(KVal::Enum(a, v))
                     }
                     _ => {
                         for &(_, _, fe) in fields {
@@ -8633,14 +8748,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 let rv = self.k_expr(*rhs, env, lint);
                 // A compound assignment does not fire for its own overflow
-                // (probed), but a bad shift amount still does.
+                // (probed), but a bad shift amount still does, and a
+                // division or remainder that always panics does too.
                 if matches!(op, BinOp::Shl | BinOp::Shr)
                     && let Some(KVal::Int(s)) = rv
                 {
                     let lt = self.out.expr_ty[self.ei(*lhs)];
-                    if let Some((it, _, _)) = self.k_range(lt) {
-                        if s < 0 || s >= it.bits() as i128 {
-                            self.k_fire(span);
+                    if let Some(bits) = self.k_bits(lt) {
+                        if s < 0 || s >= bits as i128 {
+                            self.k_fire(span, lint);
+                        }
+                    }
+                }
+                if matches!(op, BinOp::Div | BinOp::Rem)
+                    && let Some(KVal::Int(b)) = rv
+                {
+                    let lt = self.out.expr_ty[self.ei(*lhs)];
+                    if let Some(b) = self.k_math(b, lt) {
+                        if b == 0 {
+                            self.k_fire_panic(span, lint, "attempt to divide by zero", "Change the divisor so it cannot be zero.");
+                        } else if b == -1
+                            && let Some((_, lo, _)) = self.k_range(lt)
+                            && matches!(&old, Some(KVal::Int(a)) if self.k_math(*a, lt) == Some(lo))
+                        {
+                            self.k_fire_panic(span, lint, "attempt to divide with overflow", "Change the values or the type.");
                         }
                     }
                 }
@@ -8659,6 +8790,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 None
             }
             Expr::Try(inner) | Expr::Await(inner) => self.k_expr(*inner, env, lint),
+            Expr::Closure { params, body, .. } => {
+                // A closure body is its own body for the lints: its
+                // parameters are unknown, captures keep the knowledge
+                // they have here, and nothing it assigns leaks out.
+                let mut cenv = env.clone();
+                let none = None;
+                for param in params {
+                    self.k_bind_pat(param.pat, &none, &mut cenv, lint);
+                }
+                let saved = lint.dead;
+                lint.dead = false;
+                self.k_expr(*body, &mut cenv, lint);
+                lint.dead = saved;
+                None
+            }
             _ => None,
         }
     }
@@ -8669,7 +8815,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match self.p.ast.expr(e) {
             Expr::Index { base, index } => {
                 self.k_place_parts(*base, env, lint);
-                self.k_expr(*index, env, lint);
+                let iv = self.k_expr(*index, env, lint);
+                let span = self.span(e);
+                self.k_check_index(*base, &iv, span, lint);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.k_place_parts(*base, env, lint),
             Expr::Deref(inner) => {
@@ -8679,37 +8827,206 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// The arm a known scrutinee value selects, when a guard-free arm's
-    /// pattern is a literal, a range, or a catch-all.
-    fn k_select_arm<'x>(&self, arms: &'x [ast::Arm], v: &KVal) -> Option<&'x ast::Arm> {
-        let val = match v {
-            KVal::Int(i) => *i,
-            KVal::Bool(b) => *b as i128,
-            _ => return None,
-        };
-        arms.iter().find(|arm| arm.guard.is_none() && self.k_pat_covers(arm.pat, val))
+    /// The arm a known scrutinee value selects. Arms are read in
+    /// order: an arm is selected only when its pattern certainly
+    /// matches, it has no guard, and no earlier arm could have
+    /// matched. A pattern this pass cannot decide (a guarded arm that
+    /// covers, a payload subpattern, a const it cannot read) stops
+    /// the selection, so the caller walks every arm instead.
+    fn k_select_arm<'x>(&self, arms: &'x [ast::Arm], v: &KVal, sty: Ty) -> Option<&'x ast::Arm> {
+        for arm in arms {
+            match self.k_covers(arm.pat, v, sty) {
+                KCov::Yes if arm.guard.is_none() => return Some(arm),
+                KCov::Yes | KCov::Unknown => return None,
+                KCov::No => {}
+            }
+        }
+        None
     }
 
-    fn k_pat_covers(&self, pat: PatId, val: i128) -> bool {
-        match self.p.ast.pat(pat) {
-            Pat::Wild | Pat::Binding { .. } => !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_)),
-            Pat::Lit(l) => match self.p.ast.expr(*l) {
-                Expr::Bool(b) => val == *b as i128,
-                _ => self.const_scalar(*l) == Some(val),
+    /// Whether a pattern certainly matches, certainly misses, or may
+    /// match the known scrutinee value.
+    fn k_covers(&self, pat: PatId, v: &KVal, sty: Ty) -> KCov {
+        match v {
+            KVal::Int(i) => self.k_scalar_covers(pat, *i, sty),
+            KVal::Bool(b) => self.k_scalar_covers(pat, *b as i128, sty),
+            KVal::Enum(a, var) => self.k_enum_covers(pat, *a, *var),
+            KVal::Agg(_) => KCov::Unknown,
+        }
+    }
+
+    fn k_scalar_covers(&self, pat: PatId, val: i128, sty: Ty) -> KCov {
+        let p = self.p;
+        match p.ast.pat(pat) {
+            Pat::Wild => KCov::Yes,
+            Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+                // A const item used as a pattern matches only its value.
+                PatRes::ConstItem(_) => match self.pat_scalar(pat) {
+                    Some(x) if self.k_cmp(val, x, sty) == std::cmp::Ordering::Equal => KCov::Yes,
+                    Some(_) => KCov::No,
+                    None => KCov::Unknown,
+                },
+                PatRes::Binding { .. } => KCov::Yes,
+                _ => KCov::Unknown,
+            },
+            Pat::Path(_) => match self.pat_scalar(pat) {
+                Some(x) if self.k_cmp(val, x, sty) == std::cmp::Ordering::Equal => KCov::Yes,
+                Some(_) => KCov::No,
+                None => KCov::Unknown,
+            },
+            Pat::Lit(l) => match p.ast.expr(*l) {
+                Expr::Bool(b) => {
+                    if val == *b as i128 {
+                        KCov::Yes
+                    } else {
+                        KCov::No
+                    }
+                }
+                _ => match self.const_scalar(*l) {
+                    Some(x) if self.k_cmp(val, x, sty) == std::cmp::Ordering::Equal => KCov::Yes,
+                    Some(_) => KCov::No,
+                    None => KCov::Unknown,
+                },
             },
             Pat::Range { lo, hi, inclusive } => {
-                let lo_ok = lo.is_none_or(|e| self.const_scalar(e).is_some_and(|x| val >= x));
-                let hi_ok = hi.is_none_or(|e| self.const_scalar(e).is_some_and(|x| if *inclusive { val <= x } else { val < x }));
-                lo_ok && hi_ok
+                use std::cmp::Ordering::{Greater, Less};
+                let lo_v = match lo {
+                    Some(e) => match self.const_scalar(*e) {
+                        Some(x) => Some(x),
+                        None => return KCov::Unknown,
+                    },
+                    None => None,
+                };
+                let hi_v = match hi {
+                    Some(e) => match self.const_scalar(*e) {
+                        Some(x) => Some(x),
+                        None => return KCov::Unknown,
+                    },
+                    None => None,
+                };
+                let lo_ok = lo_v.is_none_or(|x| self.k_cmp(val, x, sty) != Less);
+                let hi_ok = hi_v.is_none_or(|x| {
+                    let c = self.k_cmp(val, x, sty);
+                    if *inclusive { c != Greater } else { c == Less }
+                });
+                if lo_ok && hi_ok {
+                    KCov::Yes
+                } else {
+                    KCov::No
+                }
             }
-            Pat::Or(alts) => alts.iter().any(|&a| self.k_pat_covers(a, val)),
-            Pat::At { inner, .. } | Pat::Paren(inner) => self.k_pat_covers(*inner, val),
+            Pat::Or(alts) => {
+                let mut any_unknown = false;
+                for &a in alts {
+                    match self.k_scalar_covers(a, val, sty) {
+                        KCov::Yes => return KCov::Yes,
+                        KCov::Unknown => any_unknown = true,
+                        KCov::No => {}
+                    }
+                }
+                if any_unknown {
+                    KCov::Unknown
+                } else {
+                    KCov::No
+                }
+            }
+            Pat::At { inner, .. } | Pat::Paren(inner) => self.k_scalar_covers(*inner, val, sty),
+            _ => KCov::Unknown,
+        }
+    }
+
+    fn k_enum_covers(&self, pat: PatId, adt: AdtId, var: u32) -> KCov {
+        let p = self.p;
+        match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+            PatRes::Variant(a, v) if a == adt => {
+                if v != var {
+                    return KCov::No;
+                }
+                // The variant matches; payload subpatterns that are
+                // plain bindings cannot refuse it.
+                let subs_catch = match p.ast.pat(pat) {
+                    Pat::TupleStruct { elems, .. } => elems.iter().all(|&s| self.k_pat_catches(s)),
+                    Pat::Struct { fields, .. } => fields.iter().all(|&(_, s)| self.k_pat_catches(s)),
+                    _ => true,
+                };
+                if subs_catch {
+                    KCov::Yes
+                } else {
+                    KCov::Unknown
+                }
+            }
+            PatRes::Variant(..) => KCov::Unknown,
+            _ => match p.ast.pat(pat) {
+                Pat::Wild => KCov::Yes,
+                Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+                    PatRes::Binding { .. } => KCov::Yes,
+                    _ => KCov::Unknown,
+                },
+                Pat::Or(alts) => {
+                    let mut any_unknown = false;
+                    for &a in alts {
+                        match self.k_enum_covers(a, adt, var) {
+                            KCov::Yes => return KCov::Yes,
+                            KCov::Unknown => any_unknown = true,
+                            KCov::No => {}
+                        }
+                    }
+                    if any_unknown {
+                        KCov::Unknown
+                    } else {
+                        KCov::No
+                    }
+                }
+                Pat::At { inner, .. } | Pat::Paren(inner) => self.k_enum_covers(*inner, adt, var),
+                _ => KCov::Unknown,
+            },
+        }
+    }
+
+    /// True when a subpattern accepts any payload (a binding, a
+    /// wildcard, or the same nested under `@`, parens, or borrows).
+    fn k_pat_catches(&self, pat: PatId) -> bool {
+        match self.p.ast.pat(pat) {
+            Pat::Wild | Pat::Rest => true,
+            Pat::Binding { .. } => matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Binding { .. }),
+            Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => self.k_pat_catches(*inner),
+            Pat::Or(alts) => alts.iter().any(|&a| self.k_pat_catches(a)),
             _ => false,
         }
     }
 
     /// Wrapped arithmetic for continuing a known value (no lint here).
     fn k_arith(&self, op: BinOp, a: i128, b: i128, t: Ty) -> Option<i128> {
+        if self.k_is_u128(t) {
+            // The stored values are u128 bit patterns; `b` of a shift is
+            // the amount in its own type, already range-checked by the
+            // caller, so a negative or huge amount just stops tracking.
+            let (au, bu) = (a as u128, b as u128);
+            let r = match op {
+                BinOp::Add => au.wrapping_add(bu),
+                BinOp::Sub => au.wrapping_sub(bu),
+                BinOp::Mul => au.wrapping_mul(bu),
+                BinOp::Div => {
+                    if bu == 0 {
+                        return None;
+                    }
+                    au / bu
+                }
+                BinOp::Rem => {
+                    if bu == 0 {
+                        return None;
+                    }
+                    au % bu
+                }
+                BinOp::BitAnd => au & bu,
+                BinOp::BitOr => au | bu,
+                BinOp::BitXor => au ^ bu,
+                BinOp::Shl => au.checked_shl(u32::try_from(b).ok()?)?,
+                BinOp::Shr => au.checked_shr(u32::try_from(b).ok()?)?,
+                _ => return None,
+            };
+            return Some(r as i128);
+        }
         let (a, b) = (self.k_math(a, t)?, self.k_math(b, t)?);
         let r = match op {
             BinOp::Add => a.checked_add(b)?,
@@ -8763,7 +9080,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (Some(KVal::Int(a)), Some(KVal::Int(b))) => {
                         let lt = self.out.expr_ty[self.ei(lhs)];
                         match (self.k_math(*a, lt), self.k_math(*b, lt)) {
-                            (Some(a), Some(b)) => Some(a.cmp(&b)),
+                            (Some(a), Some(b)) => Some(self.k_cmp(a, b, lt)),
                             _ => None,
                         }
                     }
@@ -8783,10 +9100,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             BinOp::Shl | BinOp::Shr => {
                 let lt = self.out.expr_ty[self.ei(lhs)];
-                if let (Some((it, _, _)), Some(KVal::Int(s))) = (self.k_range(lt), &rv)
-                    && (*s < 0 || *s >= it.bits() as i128)
+                if let (Some(bits), Some(KVal::Int(s))) = (self.k_bits(lt), &rv)
+                    && (*s < 0 || *s >= bits as i128)
                 {
-                    self.k_fire(span);
+                    self.k_fire(span, lint);
                     return None;
                 }
                 match (lv, rv) {
@@ -8797,6 +9114,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
                 let lt = self.out.expr_ty[self.ei(lhs)];
                 let (Some(KVal::Int(a)), Some(KVal::Int(b))) = (lv, rv) else { return None };
+                if self.k_is_u128(lt) {
+                    let (au, bu) = (a as u128, b as u128);
+                    let r = match op {
+                        BinOp::Add => au.checked_add(bu),
+                        BinOp::Sub => au.checked_sub(bu),
+                        _ => au.checked_mul(bu),
+                    };
+                    let suppressed = lint.suppress == Some((e, u32::MAX))
+                        || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
+                    return match r {
+                        Some(r) => Some(KVal::Int(r as i128)),
+                        None => {
+                            if !suppressed {
+                                self.k_fire(span, lint);
+                            }
+                            None
+                        }
+                    };
+                }
                 let Some((_, lo, hi)) = self.k_range(lt) else { return None };
                 let (Some(a), Some(b)) = (self.k_math(a, lt), self.k_math(b, lt)) else { return None };
                 let r = match op {
@@ -8810,13 +9146,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
                     _ => {
                         if !suppressed {
-                            self.k_fire(span);
+                            self.k_fire(span, lint);
                         }
                         None
                     }
                 }
             }
-            BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            BinOp::Div | BinOp::Rem => {
+                let lt = self.out.expr_ty[self.ei(lhs)];
+                // A known zero divisor panics whatever the dividend is;
+                // `MIN / -1` needs both sides known.
+                if let Some(KVal::Int(b)) = &rv
+                    && self.k_bits(lt).is_some()
+                    && let Some(b) = self.k_math(*b, lt)
+                {
+                    if b == 0 {
+                        self.k_fire_panic(span, lint, "attempt to divide by zero", "Change the divisor so it cannot be zero.");
+                        return None;
+                    }
+                    if b == -1
+                        && let Some(KVal::Int(a)) = &lv
+                        && let Some((_, lo, _)) = self.k_range(lt)
+                        && self.k_math(*a, lt) == Some(lo)
+                    {
+                        self.k_fire_panic(span, lint, "attempt to divide with overflow", "Change the values or the type.");
+                        return None;
+                    }
+                }
+                match (lv, rv) {
+                    (Some(KVal::Int(a)), Some(KVal::Int(b))) => self.k_arith(op, a, b, lt).map(KVal::Int),
+                    _ => None,
+                }
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                 let lt = self.out.expr_ty[self.ei(lhs)];
                 match (lv, rv) {
                     (Some(KVal::Int(a)), Some(KVal::Int(b))) => self.k_arith(op, a, b, lt).map(KVal::Int),
@@ -8841,7 +9203,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => {
                         let suppressed = matches!(lint.suppress, Some((se, root)) if se == e && self.k_place_root(inner) == Some(root));
                         if !suppressed {
-                            self.k_fire(span);
+                            self.k_fire(span, lint);
                         }
                         None
                     }
