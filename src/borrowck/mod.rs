@@ -137,19 +137,22 @@ type Path = Vec<u64>;
 /// A constant index into an array names one element like a field does,
 /// so moves out of it are partial moves; any other index is not exact.
 pub(crate) fn const_index_locals(body: &Body) -> std::collections::HashMap<Local, u64> {
-    let mut writes: std::collections::HashMap<Local, u32> = Default::default();
-    let mut value: std::collections::HashMap<Local, u64> = Default::default();
+    // Locals are dense indices into `body.locals`, so the scan is
+    // two flat vectors (one hash map entry and insert per assign
+    // was about 99M instructions on the 48k crate). Only the few
+    // surviving locals enter the returned map, whose contents are
+    // the same as a hashed scan would build.
+    let mut writes: Vec<u32> = vec![0; body.locals.len()];
+    let mut value: Vec<Option<u64>> = vec![None; body.locals.len()];
     let mut note_write = |dest: &Place, v: Option<u64>| {
         if dest.proj.is_empty() {
-            *writes.entry(dest.local).or_default() += 1;
-            match v {
-                Some(v) => {
-                    value.insert(dest.local, v);
-                }
-                None => {
-                    value.remove(&dest.local);
-                }
+            let l = dest.local as usize;
+            if l >= writes.len() {
+                writes.resize(l + 1, 0);
+                value.resize(l + 1, None);
             }
+            writes[l] += 1;
+            value[l] = v;
         }
     };
     for b in &body.blocks {
@@ -166,7 +169,11 @@ pub(crate) fn const_index_locals(body: &Body) -> std::collections::HashMap<Local
             note_write(dest, None);
         }
     }
-    value.into_iter().filter(|(l, _)| writes.get(l) == Some(&1)).collect()
+    value
+        .into_iter()
+        .enumerate()
+        .filter_map(|(l, v)| if writes[l] == 1 { v.map(|v| (l as Local, v)) } else { None })
+        .collect()
 }
 
 fn is_prefix(a: &[u64], b: &[u64]) -> bool {
@@ -382,11 +389,19 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     ck.collect_loans();
     ck.collect_move_paths();
     let n = body.locals.len();
-    ck.sh = Shape { n, wn: n.div_ceil(64).max(1), wl: ck.loans.len().div_ceil(64).max(1), wm: ck.mpaths.len().div_ceil(64) };
+    // A body with no loans keeps no loan rows in its states
+    // (`wl` 0: every holds/origins row is empty), and the two
+    // passes that only exist to answer which loans are live
+    // (reachability for escaped loans, local liveness) skip:
+    // `live_loans` is empty at every point of such a body, and
+    // the two call sites that ask for it short-circuit below.
+    ck.sh = Shape { n, wn: n.div_ceil(64).max(1), wl: ck.loans.len().div_ceil(64), wm: ck.mpaths.len().div_ceil(64) };
     ck.escaped = BitSet::new(ck.loans.len());
     ck.compute_preds();
-    ck.compute_reach();
-    ck.liveness();
+    if !ck.loans.is_empty() {
+        ck.compute_reach();
+        ck.liveness();
+    }
     ck.dataflow();
     ck.errs
 }
@@ -1017,7 +1032,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             StmtKind::Assign(dest, _) if dest.proj.is_empty() => Some(dest.local),
             _ => None,
         };
-        let live = if self.report { self.live_loans(st, self.live_after(b, si), skip, b, si) } else { BitSet::new(0) };
+        let live = if self.report && !self.loans.is_empty() {
+            self.live_loans(st, self.live_after(b, si), skip, b, si)
+        } else {
+            BitSet::new(0)
+        };
         match s {
             StmtKind::Assign(dest, rv) => {
                 // Reads and moves in the right-hand side.
@@ -1135,7 +1154,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             bit_unset(st.uninit_mut(), l);
             bit_unset(st.moved_mut(), l);
             self.clear_paths(st, l);
-            st.holds_mut(l).copy_from_slice(new_holds.words());
+            // Zip, not copy_from_slice: with no loans the row is
+            // empty while `new_holds` keeps its one inline (zero)
+            // word. With loans the lengths are both `wl`.
+            for (a, b) in st.holds_mut(l).iter_mut().zip(new_holds.words()) {
+                *a = *b;
+            }
             bits_or(st.origins_mut(l), new_origins.words());
         } else {
             self.check_init_write(dest, span, st);
@@ -1167,7 +1191,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     fn call_term(&mut self, b: u32, target: CallTarget, args: &[Operand], dest: &Place, span: Span, st: &mut State) {
         let si = self.body.blocks[b as usize].stmts.len() as u32;
         let skip = if dest.proj.is_empty() { Some(dest.local) } else { None };
-        let live = if self.report {
+        let live = if self.report && !self.loans.is_empty() {
             let mut locals = BitSet::new(self.n_locals());
             for s in &self.succs[b as usize] {
                 locals.union(&self.live_in_block[s.0 as usize]);
@@ -1981,6 +2005,21 @@ mod tests {
         assert!(b.join(&a), "new bits are a change");
         assert!(!b.join(&a), "the same bits are not");
         assert!(b == a);
+    }
+
+    /// A no-loan body has `wl` 0: loan rows are empty, and the move
+    /// paths start right after the local sets (no row words between).
+    #[test]
+    fn zero_loan_state_has_no_rows() {
+        let sh = Shape { n: 3, wn: 1, wl: 0, wm: 1 };
+        let mut a = State::new(sh);
+        assert!(a.holds(0).is_empty() && a.holds(2).is_empty() && a.origins(1).is_empty());
+        bit_set(a.paths_mut(), 4);
+        bit_set(a.moved_mut(), 2);
+        assert_eq!(bit_iter(a.paths()).collect::<Vec<_>>(), vec![4]);
+        assert!(bit_has(a.moved(), 2) && !bit_has(a.init(), 2));
+        let mut b = State::new(sh);
+        assert!(b.join(&a) && b == a);
     }
 
     /// One-word sets stay inline; wider sets spill to the heap form; both
