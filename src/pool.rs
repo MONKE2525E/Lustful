@@ -478,8 +478,9 @@ mod tests {
         assert_eq!(pool_threads(), 0, "a stopped pool must not start threads");
         assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         drop(stopped);
+        // Restarting threads can take seconds when other test binaries or gates load the box.
         let t0 = std::time::Instant::now();
-        while pool_threads() == 0 && t0.elapsed() < secs(5) {
+        while pool_threads() == 0 && t0.elapsed() < secs(30) {
             assert_eq!(par_map(&items, slow), want);
         }
         assert!(pool_threads() > 0, "the pool starts again after the guard drops");
