@@ -711,25 +711,75 @@ fn file_text_hash(map: &SourceMap, file: FileId) -> u64 {
     std::hash::Hasher::finish(&h)
 }
 
-/// The Adt and static name sequence hash of one Ast (see
-/// `Front::adt_seq_fp`): collect numbers Adts and statics in item
-/// order, and cached output carries those indices (CTy in glue and
-/// type sets, `lust_static_<n>` names in emitted C).
-fn adt_seq_fp(ast: &Ast) -> u64 {
-    let mut h = crate::intern::FxHasher::default();
+/// The Adt and top-level static indices `collect` will assign for
+/// one Ast under the session `DefOrder`, predicted with the same
+/// hash and rank rules collect uses, plus whether this Ast has a
+/// shape whose derived indices can shift on growth (generic
+/// parameters anywhere, or a nested static). The slot update
+/// compares the prediction with the last parse's indices: cached
+/// output carries session-local indices (CTy in glue and type
+/// sets, static indices in IR), so it is reusable only when every
+/// old def keeps its index.
+fn predicted_def_ids(
+    ast: &Ast,
+    interner: &Interner,
+    stable: StableCrateHash,
+    order: &collect::DefOrder,
+) -> (FxMap<crate::def::DefPathHash, u32>, FxMap<crate::def::DefPathHash, u32>, bool) {
+    let mut adt_hashes: Vec<crate::def::DefPathHash> = Vec::new();
+    let mut static_hashes: Vec<crate::def::DefPathHash> = Vec::new();
+    let mut counts: FxMap<Sym, u32> = FxMap::default();
+    let mut fragile = false;
+    let has_params = |g: &crate::ast::Generics| !g.params.is_empty();
     for item in &ast.items {
-        let name = match &item.kind {
-            ItemKind::Struct(s) => Some((0u8, s.name)),
-            ItemKind::Enum(e) => Some((1u8, e.name)),
-            ItemKind::Union(u) => Some((2u8, u.name)),
-            ItemKind::Static(s) => Some((3u8, s.name)),
-            _ => None,
-        };
-        if let Some(n) = name {
-            std::hash::Hash::hash(&n, &mut h);
+        match &item.kind {
+            ItemKind::Struct(s) => {
+                fragile |= has_params(&s.generics);
+                let disamb = *counts.entry(s.name).and_modify(|c| *c += 1).or_insert(0);
+                adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(s.name), disamb));
+            }
+            ItemKind::Enum(e) => {
+                fragile |= has_params(&e.generics);
+                let disamb = *counts.entry(e.name).and_modify(|c| *c += 1).or_insert(0);
+                adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(e.name), disamb));
+            }
+            ItemKind::Union(u) => {
+                // Collect numbers no Adt for a union today, but the
+                // old sequence hash counted it as an Adt-shaped def:
+                // keep it in the map so a union edit still guards.
+                fragile |= has_params(&u.generics);
+                let disamb = *counts.entry(u.name).and_modify(|c| *c += 1).or_insert(0);
+                adt_hashes.push(def::item_hash(stable, &[], def::DefKind::Adt, interner.get(u.name), disamb));
+            }
+            ItemKind::Static(s) => {
+                static_hashes.push(def::item_hash(stable, &[], def::DefKind::Static, interner.get(s.name), 0));
+            }
+            ItemKind::Fn(f) => fragile |= has_params(&f.generics),
+            ItemKind::Impl(imp) => {
+                fragile |= has_params(&imp.generics) || imp.fns.iter().any(|f| has_params(&f.generics));
+            }
+            ItemKind::Trait(t) => fragile |= has_params(&t.generics),
+            _ => {}
         }
     }
-    std::hash::Hasher::finish(&h)
+    for item in &ast.stmt_items {
+        match &item.kind {
+            ItemKind::Static(_) => fragile = true,
+            ItemKind::Fn(f) => fragile |= has_params(&f.generics),
+            _ => {}
+        }
+    }
+    let to_map = |hashes: &[crate::def::DefPathHash], ranks: Vec<u32>| -> FxMap<crate::def::DefPathHash, u32> {
+        hashes.iter().copied().zip(ranks).collect()
+    };
+    let adts = to_map(&adt_hashes, collect::stable_ranks_preview(&order.adts, &adt_hashes));
+    let statics = to_map(&static_hashes, collect::stable_ranks_preview(&order.statics, &static_hashes));
+    (adts, statics, fragile)
+}
+
+/// True when every def in `prev` is present in `new` at the same index.
+fn ids_kept(prev: &FxMap<crate::def::DefPathHash, u32>, new: &FxMap<crate::def::DefPathHash, u32>) -> bool {
+    prev.iter().all(|(h, id)| new.get(h) == Some(id))
 }
 
 /// True when the non-fn item hash sequence differs between two item
@@ -753,8 +803,8 @@ fn nonfn_items_changed(old: &[scan::ItemScan], new: &[scan::ItemScan]) -> bool {
 /// (Binding, MethodSet, ImplSet, Sig, Layout; Sig fingerprints hash named
 /// Adt layouts deeply, so type and impl edits dirty through them). Full
 /// mode falls back to clearing every cache when reuse is not provable: the
-/// first compile, an Adt name-sequence change (cached C and glue carry
-/// session-local Adt ids), or slot compaction (cached C carries slot
+/// first compile, an Adt or static index change (cached C and glue carry
+/// session-local indices), or slot compaction (cached C carries slot
 /// numbers). The one failure is a def hash collision (src/def.rs): an
 /// internal error the caller turns into a code 3 response.
 #[allow(clippy::too_many_arguments)]
@@ -773,9 +823,21 @@ fn slot_update(
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
     let had_env = front.env_hash.is_some();
-    let adt_seq = adt_seq_fp(&front.ast);
-    let adt_seq_same = had_env && front.adt_seq_fp == adt_seq;
-    front.adt_seq_fp = adt_seq;
+    // Cached output stays reusable in full mode when every Adt and
+    // static of the last parse keeps its session-local index in
+    // this parse (pure additions append at the end of the session
+    // order), except that growth in a fragile program (generics,
+    // nested statics) can shift derived indices the maps do not
+    // name, so growth there still clears.
+    let (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+    let grew = adt_ids.len() > front.prev_adt_ids.len() || static_ids.len() > front.prev_static_ids.len();
+    let ids_stable = had_env
+        && ids_kept(&front.prev_adt_ids, &adt_ids)
+        && ids_kept(&front.prev_static_ids, &static_ids)
+        && !(grew && (fragile || front.prev_order_fragile));
+    front.prev_adt_ids = adt_ids;
+    front.prev_static_ids = static_ids;
+    front.prev_order_fragile = fragile;
     let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
     front.env_hash = Some(env);
     front.items = item_scans;
@@ -785,7 +847,7 @@ fn slot_update(
     // compaction renumbers, but per-slot state remaps by stable
     // identity below and C re-emits from cached IR in the tail, so
     // it preserves too.
-    let full_walk = changed_names.is_none() && had_env && adt_seq_same;
+    let full_walk = changed_names.is_none() && ids_stable;
     // Per-slot state taken out for a compaction remap, keyed back in
     // by stable identity after assignment.
     struct SlotVecs {
@@ -1429,7 +1491,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;
-        front.adt_seq_fp = 0;
+        front.prev_adt_ids.clear();
+        front.prev_static_ids.clear();
+        front.prev_order_fragile = false;
         front.items.clear();
         front.fn_loc.clear();
         front.fn_slot.clear();
@@ -1867,7 +1931,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver path computes crate identity from the Cargo graph;
     // the single-file path keeps the session key's identity.
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
-    let mut program = match collect::collect_mode(&front.ast, &front.interner, &front.known, crate_ids, req.cmd == Cmd::Build) {
+    let mut program = match collect::collect_with_order(&front.ast, &front.interner, &front.known, crate_ids, req.cmd == Cmd::Build, &mut front.def_order) {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
@@ -2719,6 +2783,60 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
             assert_eq!(program.local_def(k.disk.hash), Some(local), "fn {i}");
         }
         assert_eq!(program.main.map(|m| program.def_id(m)), keys.get(2).map(|k| crate::def::DefId { krate: ids.local, hash: k.disk.hash }));
+    }
+
+    /// Adt and static indices are stable under reordering and
+    /// addition: a fresh order numbers by def hash (not item
+    /// order), and a session order keeps every old index when a
+    /// new def arrives whose hash sorts before the old ones. The
+    /// driver's predicted indices match collect's assignment.
+    #[test]
+    fn adt_and_static_indices_are_stable() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
+        // Collects one source and returns its Adt and static indices
+        // by name (Program borrows the Ast, so it stays inside).
+        let collect_src = |src: &str, order: &mut collect::DefOrder| {
+            let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
+            let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
+            for (hash, &id) in &adts {
+                let def = crate::def::DefId { krate: ids.local, hash: *hash };
+                assert_eq!(program.adt_by_def(def).map(|a| a.0), Some(id), "predicted Adt index");
+            }
+            for (hash, &idx) in &statics {
+                let def = crate::def::DefId { krate: ids.local, hash: *hash };
+                assert_eq!(program.static_by_def(def), Some(idx), "predicted static index");
+            }
+            let by_name = |names: &[&str]| -> Vec<u32> { names.iter().map(|n| program.type_names.get(&interner.intern(n)).map_or(u32::MAX, |a| a.0)).collect() };
+            let statics_by_name =
+                |names: &[&str]| -> Vec<u32> { names.iter().map(|n| program.static_names.get(&interner.intern(n)).copied().unwrap_or(u32::MAX)).collect() };
+            (by_name(&["Alpha", "Mid", "Zed"]), statics_by_name(&["SA", "SM", "SZ"]))
+        };
+
+        // Item order does not decide indices in a fresh session.
+        let (a, _) = collect_src("struct Zed { x: i64 }\nstruct Alpha { x: i64 }\nfn main() {}\n", &mut collect::DefOrder::default());
+        let (b, _) = collect_src("struct Alpha { x: i64 }\nstruct Zed { x: i64 }\nfn main() {}\n", &mut collect::DefOrder::default());
+        assert_eq!(a[0], b[0], "Alpha index is order-independent");
+        assert_eq!(a[2], b[2], "Zed index is order-independent");
+
+        // One session: adding defs (in any item position) and
+        // reordering files keeps every old index.
+        let mut order = collect::DefOrder::default();
+        let (a1, s1) = collect_src(
+            "struct Zed { x: i64 }\nstruct Mid { x: i64 }\nstatic SZ: i64 = 1;\nstatic SM: i64 = 2;\nfn main() {}\n",
+            &mut order,
+        );
+        let (a2, s2) = collect_src(
+            "struct Alpha { x: i64 }\nstruct Mid { x: i64 }\nstruct Zed { x: i64 }\nstatic SA: i64 = 3;\nstatic SM: i64 = 2;\nstatic SZ: i64 = 1;\nfn main() {}\n",
+            &mut order,
+        );
+        assert_eq!(a1[1], a2[1], "Mid keeps its index");
+        assert_eq!(a1[2], a2[2], "Zed keeps its index");
+        assert_eq!(s1[1], s2[1], "SM keeps its index");
+        assert_eq!(s1[2], s2[2], "SZ keeps its index");
     }
 
     fn req_for(key: crate::protocol::SessionKey) -> Request {

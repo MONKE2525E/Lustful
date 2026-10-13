@@ -986,6 +986,59 @@ fn variant_fields_src(interner: &Interner, vf: &VariantFields) -> (VariantShape,
     }
 }
 
+/// Session-stable numbering state for Adts and statics: every def
+/// hash ever numbered in this session, in first-seen order (hashes
+/// first seen in the same compile append in hash order, so a fresh
+/// session numbers by `DefPathHash` alone, independent of file and
+/// item order). A def's session-local index is its rank among the
+/// defs present in this compile: adding a def appends it after
+/// every def seen before, so present defs keep their indices.
+/// Cached output carries those indices (`CTy::Adt(AdtId)` in glue
+/// and type sets, static indices in IR), so index stability is
+/// what lets an edit that adds a file reuse the rest. The driver
+/// session owns one `DefOrder` across requests.
+#[derive(Default)]
+pub struct DefOrder {
+    pub adts: Vec<crate::def::DefPathHash>,
+    pub statics: Vec<crate::def::DefPathHash>,
+}
+
+/// The rank of each hash among `hashes`, by position in `order`
+/// after appending unseen hashes in hash order. The ranks are
+/// dense over `hashes`. `hashes` must hold each def once.
+pub(crate) fn stable_ranks(order: &mut Vec<crate::def::DefPathHash>, hashes: &[crate::def::DefPathHash]) -> Vec<u32> {
+    let pos: std::collections::HashMap<crate::def::DefPathHash, usize> = order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+    let mut unseen: Vec<crate::def::DefPathHash> = hashes.iter().copied().filter(|h| !pos.contains_key(h)).collect();
+    unseen.sort_by_key(|h| h.0);
+    unseen.dedup();
+    order.extend(unseen);
+    stable_ranks_preview(order, hashes)
+}
+
+/// The ranks `stable_ranks` would assign, without mutating `order`
+/// (the driver predicts this compile's indices before collect runs
+/// to decide whether cached output still applies).
+pub(crate) fn stable_ranks_preview(order: &[crate::def::DefPathHash], hashes: &[crate::def::DefPathHash]) -> Vec<u32> {
+    let mut extended: Vec<crate::def::DefPathHash> = order.to_vec();
+    let mut pos: std::collections::HashMap<crate::def::DefPathHash, usize> =
+        extended.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+    let mut unseen: Vec<crate::def::DefPathHash> = hashes.iter().copied().filter(|h| !pos.contains_key(h)).collect();
+    unseen.sort_by_key(|h| h.0);
+    unseen.dedup();
+    for h in unseen {
+        pos.insert(h, extended.len());
+        extended.push(h);
+    }
+    let mut by_pos: Vec<(usize, crate::def::DefPathHash)> = hashes.iter().map(|h| (pos[h], *h)).collect();
+    by_pos.sort_by_key(|(p, _)| *p);
+    by_pos.dedup_by_key(|(_, h)| *h);
+    let mut rank: std::collections::HashMap<crate::def::DefPathHash, u32> = std::collections::HashMap::default();
+    for (r, (_, h)) in by_pos.into_iter().enumerate() {
+        rank.insert(h, r as u32);
+    }
+    hashes.iter().map(|h| rank[h]).collect()
+}
+
 /// Builds the program tables. `crate_ids` names the crate for stable def
 /// identity (docs/ARCH.md section 1.7). Returns all collection errors.
 pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate_ids: CrateIds) -> Result<Program<'a>, Vec<Diag>> {
@@ -1001,6 +1054,20 @@ pub fn collect_mode<'a>(
     known: &'a Known,
     crate_ids: CrateIds,
     walk_instances: bool,
+) -> Result<Program<'a>, Vec<Diag>> {
+    collect_with_order(ast, interner, known, crate_ids, walk_instances, &mut DefOrder::default())
+}
+
+/// `collect_mode` with a caller-kept `DefOrder` (the driver session
+/// holds one across requests, so Adt and static indices survive
+/// edits that add or reorder defs).
+pub fn collect_with_order<'a>(
+    ast: &'a Ast,
+    interner: &'a Interner,
+    known: &'a Known,
+    crate_ids: CrateIds,
+    walk_instances: bool,
+    def_order: &mut DefOrder,
 ) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
@@ -1075,14 +1142,52 @@ pub fn collect_mode<'a>(
     generics::collect_trait_defs(&mut p, &mut errs);
 
     // Pass 1: type names, so fields can refer to types defined later.
-    let mut adt_name_counts: HashMap<Sym, u32> = HashMap::default();
-    for item in &ast.items {
-        let (name, span, is_enum) = match &item.kind {
-            ItemKind::Struct(s) => (s.name, s.name_span, false),
-            ItemKind::Enum(e) => (e.name, e.name_span, true),
-            _ => continue,
-        };
-        let id = AdtId(p.adts.len() as u32);
+    // AdtIds come from the session DefOrder (rank by DefPathHash
+    // history), not from item order: compute every Adt's hash and
+    // rank up front, then fill the tables at those indices.
+    let adt_base = p.adts.len();
+    let mut adt_srcs: Vec<(usize, Sym, Span, bool, crate::def::DefPathHash)> = Vec::new();
+    {
+        let mut counts: HashMap<Sym, u32> = HashMap::default();
+        for (idx, item) in ast.items.iter().enumerate() {
+            let (name, span, is_enum) = match &item.kind {
+                ItemKind::Struct(s) => (s.name, s.name_span, false),
+                ItemKind::Enum(e) => (e.name, e.name_span, true),
+                _ => continue,
+            };
+            let disamb = *counts.entry(name).and_modify(|c| *c += 1).or_insert(0);
+            let hash = crate::def::item_hash(crate_ids.stable, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
+            adt_srcs.push((idx, name, span, is_enum, hash));
+        }
+    }
+    let adt_ranks = {
+        let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
+        stable_ranks(&mut def_order.adts, &hashes)
+    };
+    let mut adt_id_of_item: Vec<Option<AdtId>> = vec![None; ast.items.len()];
+    {
+        let blank_name = interner.intern("");
+        for _ in 0..adt_srcs.len() {
+            p.adts.push(AdtDef {
+                name: blank_name,
+                is_enum: false,
+                variants: Vec::new(),
+                derives: Derives::default(),
+                span: Span::default(),
+                repr: crate::ty::layout::Repr::default(),
+            });
+            p.gx.adt_info.push((DefId::PLACEHOLDER, 0));
+            p.gx.adt_generics.push(Generics::default());
+            p.gx.adt_envs.push(Vec::new());
+            p.gx.adt_scopes.push(generics::Scope::default());
+            p.gx.adt_instance_of.push(None);
+        }
+    }
+    for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
+        let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
+        let item = &ast.items[item_idx];
+        let id = AdtId(adt_base as u32 + rank);
+        adt_id_of_item[item_idx] = Some(id);
         if p.type_names.insert(name, id).is_some() || p.gx.trait_names.contains_key(&name) {
             errs.push(dup(span, interner.get(name)));
         }
@@ -1097,22 +1202,16 @@ pub fn collect_mode<'a>(
         // The Adt's stable identity (ARCH 1.7): same name earlier in the file is a
         // duplicate definition (the error above), and the disambiguator keeps the
         // two records apart in the def table, as the old dense ids did.
-        let disamb = *adt_name_counts.entry(name).and_modify(|c| *c += 1).or_insert(0);
-        let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
         let def = DefId { krate: p.krate, hash };
-        p.adts.push(AdtDef {
+        p.adts[id.0 as usize] = AdtDef {
             name,
             is_enum,
             variants: Vec::new(),
             derives: Derives::default(),
             span,
             repr: crate::ty::layout::Repr::default(),
-        });
-        p.gx.adt_info.push((def, n_params));
-        p.gx.adt_generics.push(Generics::default());
-        p.gx.adt_envs.push(Vec::new());
-        p.gx.adt_scopes.push(generics::Scope::default());
-        p.gx.adt_instance_of.push(None);
+        };
+        p.gx.adt_info[id.0 as usize] = (def, n_params);
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
         p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
@@ -1183,8 +1282,7 @@ pub fn collect_mode<'a>(
     generics::build_trait_tables(&mut p, &mut errs);
 
     // Pass 2: fields, variants, derives.
-    let mut adt_index = 0;
-    for item in &ast.items {
+    for (item_idx, item) in ast.items.iter().enumerate() {
         type FieldSrc = (Sym, ast::TyId, Span);
         type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
@@ -1206,8 +1304,7 @@ pub fn collect_mode<'a>(
             }
             _ => continue,
         };
-        let id = AdtId(adt_index);
-        adt_index += 1;
+        let id = adt_id_of_item[item_idx].expect("pass 1 numbered every Adt item");
         // The Adt's own generics scope its field types.
         {
             let (g_ast, w_ast) = match &item.kind {
@@ -1838,7 +1935,7 @@ pub fn collect_mode<'a>(
     // Const and static items: register names first, then evaluate with the
     // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
     // so one bad item reports once; collection fails anyway on the error.
-    eval_const_items(&mut p, &mut errs);
+    eval_const_items(&mut p, &mut errs, &mut def_order.statics);
     eval_assoc_consts(&mut p, &mut errs);
 
     if errs.is_empty() { Ok(p) } else { Err(errs) }
@@ -1866,7 +1963,10 @@ enum PendingState {
 }
 
 /// Registers and evaluates every const and static item in the crate.
-fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
+/// Static indices come from the session `DefOrder` (see `collect`):
+/// top-level statics rank by def hash history, nested statics keep
+/// stmt order after them.
+fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order: &mut Vec<crate::def::DefPathHash>) {
     let ast = p.ast;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
     let mut by_name: HashMap<Sym, usize> = HashMap::default();
@@ -1895,13 +1995,9 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
             ));
             continue;
         }
-        let static_idx = if is_static.is_some() {
-            let i = static_count;
-            static_count += 1;
-            i
-        } else {
-            0
-        };
+        // Static indices are assigned after registration below,
+        // once every surviving static is known (stable ranks).
+        let static_idx = 0;
         if let Some(n) = name {
             let dup = if stmt_idx.is_some() {
                 // A nested name may shadow a top-level one; the by-name map
@@ -1924,6 +2020,33 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>) {
     }
     if pending.is_empty() {
         return;
+    }
+    // Assign static indices now that registration is complete:
+    // top-level statics by session rank, nested statics in stmt
+    // order after them. Evaluation reads these indices, so this
+    // runs before any pending item evaluates.
+    {
+        let top_hashes: Vec<crate::def::DefPathHash> = pending
+            .iter()
+            .filter(|(it, _)| it.is_static.is_some() && it.stmt_idx.is_none())
+            .map(|(it, _)| crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(it.name.unwrap()), 0))
+            .collect();
+        let ranks = stable_ranks(static_order, &top_hashes);
+        let mut top = 0usize;
+        let mut nested = top_hashes.len() as u32;
+        for (it, _) in pending.iter_mut() {
+            if it.is_static.is_none() {
+                continue;
+            }
+            if it.stmt_idx.is_none() {
+                it.static_idx = ranks[top];
+                top += 1;
+            } else {
+                it.static_idx = nested;
+                nested += 1;
+            }
+        }
+        static_count = nested;
     }
     let n = pending.len();
     let mut cx = CollectCx { p, pending, by_name, errs };

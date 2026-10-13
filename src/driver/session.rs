@@ -20,15 +20,25 @@ pub(crate) struct Front {
     pub(crate) ast: Ast,
     /// `None` until the first successful parse.
     pub(crate) env_hash: Option<u64>,
-    /// Hash of the Adt and static item name sequence (structs,
-    /// enums, unions, statics in Ast order) at the last parse.
-    /// `collect` numbers Adts and statics in that order, and cached
-    /// outputs (`FnOut::types`, the glue set, `lust_static_<n>`
-    /// names in emitted C) carry those session-local indices: if the
-    /// sequence changes, cached output is not reusable and a full
-    /// rebuild must clear it. A pure field or layout edit keeps the
-    /// sequence and may preserve it.
-    pub(crate) adt_seq_fp: u64,
+    /// Session-stable Adt and static numbering state, kept across
+    /// requests and passed to every `collect` (see
+    /// `collect::DefOrder`): a def keeps its session-local index
+    /// when other defs are added or reordered, which is what lets
+    /// cached outputs that carry those indices (`FnOut::types`,
+    /// the glue set) survive such edits.
+    pub(crate) def_order: crate::check::collect::DefOrder,
+    /// The Adt index of every Adt def at the last parse, by def
+    /// hash. The slot update compares the next parse's predicted
+    /// indices against these: cached output is reusable only when
+    /// every old def is still present at the same index.
+    pub(crate) prev_adt_ids: FxMap<crate::def::DefPathHash, u32>,
+    /// The static index of every top-level static at the last parse.
+    pub(crate) prev_static_ids: FxMap<crate::def::DefPathHash, u32>,
+    /// True when the last parse had a shape whose derived Adt
+    /// indices (generic instances, nested statics) can shift when
+    /// a def is added even though the defs in `prev_adt_ids` and
+    /// `prev_static_ids` keep theirs. Growth is then not reusable.
+    pub(crate) prev_order_fragile: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -213,7 +223,10 @@ impl Session {
                 known,
                 ast: Ast::default(),
                 env_hash: None,
-                adt_seq_fp: 0,
+                def_order: crate::check::collect::DefOrder::default(),
+                prev_adt_ids: FxMap::default(),
+                prev_static_ids: FxMap::default(),
+                prev_order_fragile: false,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),
