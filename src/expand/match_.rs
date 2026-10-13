@@ -560,17 +560,67 @@ pub struct Matcher<'a> {
     pub strings: &'a [String],
     pub budget: u32,
     pub probe_cache: FxMap<(FragKind, u64), bool>,
-    /// Keyed by (input list pointer, list length, first span start,
-    /// position): the (node id, is-fragment) pairs that were live at
-    /// that position and could begin on the tree there (rustc's
-    /// can-begin sets, not only successful parses).
-    pub consumers: FxMap<(usize, usize, u32, usize), Vec<(u32, bool)>>,
+    /// Keyed by input list id (see `list_id`), one entry per position:
+    /// the matcher nodes that were live at that position and could
+    /// begin on the tree there (rustc's can-begin sets, not only
+    /// successful parses).
+    consumers: FxMap<u32, Vec<Live>>,
+    /// Input list ids: the call input is list 0, and the group at
+    /// position `pos` of list `parent` is `lists[(parent, pos)]`.
+    lists: FxMap<(u32, usize), u32>,
     /// A fragment parser began a parse and failed (rustc's hard error:
     /// the call fails even when a later arm would token-match). Set
     /// during matching of one arm; read by the arm loop.
     pub hard_fail: bool,
     call_span: Span,
+    /// Bindings of partial matches (see `BindEntry`); handle 0 is the
+    /// empty chain.
+    binds: Vec<BindEntry>,
+    /// Repetition iterations (see `IterEntry`).
+    iters: Vec<IterEntry>,
+    /// The variables of each repetition node matched so far, by node id.
+    rep_vars: FxMap<u32, Vec<Sym>>,
 }
+
+/// Partial-match bindings, as entries in the matcher's arena: a handle
+/// is an index into `Matcher::binds`, and each entry adds bindings on
+/// top of an older handle. Extending a partial match pushes one entry,
+/// so the results of a repetition share its earlier iterations instead
+/// of copying them, and matching stays linear in the input.
+/// `match_arm` builds a `BindMap` only for full matches.
+enum BindEntry {
+    /// No bindings (handle 0).
+    Root,
+    /// `name` bound to fragment trees, on top of `prev`.
+    Leaf { name: Sym, trees: Vec<Tt>, prev: u32 },
+    /// The bindings of a group's inner match, on top of `prev`.
+    Join { inner: u32, prev: u32 },
+    /// The variables of repetition node `rep`, each bound to a sequence
+    /// over the iterations that end with `Matcher::iters[last]`
+    /// (`NO_ITER`: zero iterations), on top of `prev`.
+    Rep { rep: u32, last: u32, prev: u32 },
+}
+
+/// One repetition iteration: the bindings of its own match and the
+/// iteration before it (`NO_ITER` for the first).
+struct IterEntry {
+    binds: u32,
+    prev: u32,
+}
+
+const NO_ITER: u32 = u32::MAX;
+
+/// The live nodes at one input position (see `Matcher::consumers`):
+/// the first node id (`NO_NODE`: none yet), whether any of them was a
+/// fragment, and whether any had another id.
+#[derive(Clone, Copy)]
+struct Live {
+    first: u32,
+    frag: bool,
+    other: bool,
+}
+
+const NO_NODE: u32 = u32::MAX;
 
 impl<'a> Matcher<'a> {
     /// A fresh matcher for one macro call at `call_span`.
@@ -582,9 +632,19 @@ impl<'a> Matcher<'a> {
             budget: MATCH_BUDGET,
             probe_cache: FxMap::default(),
             consumers: FxMap::default(),
+            lists: FxMap::default(),
             hard_fail: false,
             call_span,
+            binds: vec![BindEntry::Root],
+            iters: Vec::new(),
+            rep_vars: FxMap::default(),
         }
+    }
+
+    /// Adds one bindings entry and returns its handle.
+    fn bind(&mut self, entry: BindEntry) -> u32 {
+        self.binds.push(entry);
+        (self.binds.len() - 1) as u32
     }
 
     fn step(&mut self) -> Result<(), Diag> {
@@ -595,24 +655,35 @@ impl<'a> Matcher<'a> {
         Ok(())
     }
 
-    /// Records one live matcher node at `pos` for the ambiguity check,
-    /// when the node can begin on the tree there.
-    fn attempt(&mut self, input: &[Tt], pos: usize, id: u32, is_frag: bool, begins: bool) {
+    /// The id of the input list inside the group at `pos` of list
+    /// `parent`. Every visit of one input group gets the same id, so
+    /// all matcher paths that reach a position share its ambiguity
+    /// record, as all live items at a token do in rustc's matcher.
+    fn list_id(&mut self, parent: u32, pos: usize) -> u32 {
+        let next = self.lists.len() as u32 + 1;
+        *self.lists.entry((parent, pos)).or_insert(next)
+    }
+
+    /// Records one live matcher node at `pos` of input list `list` for
+    /// the ambiguity check, when the node can begin on the tree there.
+    fn attempt(&mut self, input: &[Tt], list: u32, pos: usize, id: u32, is_frag: bool, begins: bool) {
         if !begins {
             return;
         }
-        let first = input.first().map_or(0, |t| t.span().lo);
-        let key = (input.as_ptr() as usize, input.len(), first, pos);
-        self.consumers.entry(key).or_default().push((id, is_frag));
+        let lives = self.consumers.entry(list).or_insert_with(|| vec![Live { first: NO_NODE, frag: false, other: false }; input.len() + 1]);
+        let live = &mut lives[pos];
+        if live.first == NO_NODE {
+            live.first = id;
+        }
+        live.frag |= is_frag;
+        live.other |= id != live.first;
     }
 
     /// True when any position had two different live nodes that could
     /// begin there and at least one was a fragment: the call is
     /// locally ambiguous, whether or not either path later matches.
     pub fn ambiguous(&self) -> bool {
-        self.consumers.values().any(|list| {
-            list.iter().any(|&(_, is_frag)| is_frag) && list.iter().map(|&(id, _)| id).collect::<std::collections::HashSet<_>>().len() > 1
-        })
+        self.consumers.values().flatten().any(|live| live.frag && live.other)
     }
 }
 
@@ -634,13 +705,19 @@ pub fn splice_transparent(input: &[Tt]) -> Vec<Tt> {
 /// bindings found (at most `MAX_MATCHES`, longest repetitions first).
 pub fn match_arm(m: &mut Matcher, nodes: &[MNode], input: &[Tt]) -> Result<Vec<BindMap>, Diag> {
     m.consumers.clear();
+    m.lists.clear();
+    m.binds.truncate(1);
+    m.iters.clear();
+    m.rep_vars.clear();
     let input = splice_transparent(input);
     let mut results = Vec::new();
     let mut partial = Vec::new();
-    match_seq(m, nodes, &input, 0, BindMap::default(), &mut partial)?;
+    match_seq(m, nodes, &input, 0, 0, 0, &mut partial)?;
     for (end, binds) in partial {
         if end == input.len() {
-            results.push(binds);
+            let mut map = BindMap::default();
+            materialize(m, binds, &mut map);
+            results.push(map);
             if results.len() >= MAX_MATCHES {
                 break;
             }
@@ -649,24 +726,104 @@ pub fn match_arm(m: &mut Matcher, nodes: &[MNode], input: &[Tt]) -> Result<Vec<B
     Ok(results)
 }
 
-/// Appends every (end position, bindings) that matches `nodes` against
-/// `input` starting at `pos`.
-fn match_seq(
-    m: &mut Matcher,
-    nodes: &[MNode],
-    input: &[Tt],
-    pos: usize,
-    binds: BindMap,
-    out: &mut Vec<(usize, BindMap)>,
-) -> Result<(), Diag> {
-    m.step()?;
-    if out.len() > 4096 {
-        return Ok(());
+/// Builds the transcriber's bindings for one match from its arena chain
+/// (see `BindEntry`). A newer entry wins over an older one, as a later
+/// insert did when partial matches were copied maps.
+fn materialize(m: &Matcher, mut binds: u32, out: &mut BindMap) {
+    loop {
+        match &m.binds[binds as usize] {
+            BindEntry::Root => return,
+            BindEntry::Leaf { name, trees, prev } => {
+                out.entry(*name).or_insert_with(|| Bind::Leaf(trees.clone()));
+                binds = *prev;
+            }
+            BindEntry::Join { inner, prev } => {
+                materialize(m, *inner, out);
+                binds = *prev;
+            }
+            BindEntry::Rep { rep, last, prev } => {
+                // Each variable becomes one `Seq` deeper, with `Empty`
+                // where an iteration did not bind it. Zero iterations
+                // still bind every variable, to an empty `Seq`.
+                let mut iters = Vec::new();
+                let mut it = *last;
+                while it != NO_ITER {
+                    iters.push(m.iters[it as usize].binds);
+                    it = m.iters[it as usize].prev;
+                }
+                let vars = &m.rep_vars[rep];
+                let mut seqs: Vec<Vec<Bind>> = vars.iter().map(|_| Vec::with_capacity(iters.len())).collect();
+                let mut map = BindMap::default();
+                for &iter_binds in iters.iter().rev() {
+                    map.clear();
+                    materialize(m, iter_binds, &mut map);
+                    for (seq, name) in seqs.iter_mut().zip(vars) {
+                        seq.push(map.remove(name).unwrap_or(Bind::Empty));
+                    }
+                }
+                for (seq, &name) in seqs.into_iter().zip(vars) {
+                    out.entry(name).or_insert(Bind::Seq(seq));
+                }
+                binds = *prev;
+            }
+        }
     }
-    let Some((node, rest)) = nodes.split_first() else {
-        out.push((pos, binds));
-        return Ok(());
-    };
+}
+
+/// One choice point of `match_seq`: the alternatives of node `at` (end
+/// position and the bindings after the node), tried in order.
+struct Choice {
+    at: usize,
+    alts: Vec<(usize, u32)>,
+    next: usize,
+}
+
+/// Appends every (end position, bindings) that matches `nodes` against
+/// `input` (list id `list`) starting at `pos`, on top of bindings
+/// `binds`. The search is depth first, each node's alternatives in
+/// order, on an explicit stack of choice points: a long matcher cannot
+/// overflow the native stack. A node with one alternative needs no
+/// choice point.
+fn match_seq(m: &mut Matcher, nodes: &[MNode], input: &[Tt], list: u32, pos: usize, binds: u32, out: &mut Vec<(usize, u32)>) -> Result<(), Diag> {
+    let mut stack: Vec<Choice> = Vec::new();
+    let mut alts = Vec::new();
+    let mut next = Some((0, pos, binds));
+    loop {
+        if let Some((at, pos, binds)) = next.take() {
+            m.step()?;
+            if out.len() <= 4096 {
+                match nodes.get(at) {
+                    None => out.push((pos, binds)),
+                    Some(node) => {
+                        node_alts(m, node, input, list, pos, binds, &mut alts)?;
+                        if let [(end, binds)] = alts[..] {
+                            alts.clear();
+                            next = Some((at + 1, end, binds));
+                            continue;
+                        }
+                        if !alts.is_empty() {
+                            stack.push(Choice { at, alts: std::mem::take(&mut alts), next: 0 });
+                        }
+                    }
+                }
+            }
+        }
+        let Some(top) = stack.last_mut() else { return Ok(()) };
+        match top.alts.get(top.next) {
+            Some(&(end, binds)) => {
+                top.next += 1;
+                next = Some((top.at + 1, end, binds));
+            }
+            None => {
+                stack.pop();
+            }
+        }
+    }
+}
+
+/// Appends the alternatives of matcher node `node` at `pos` to `alts`.
+#[allow(clippy::too_many_arguments)]
+fn node_alts(m: &mut Matcher, node: &MNode, input: &[Tt], list: u32, pos: usize, binds: u32, alts: &mut Vec<(usize, u32)>) -> Result<(), Diag> {
     match node {
         MNode::Tok(pattern, id) => {
             // A `>>` pattern token takes the two touching halves in
@@ -680,48 +837,41 @@ fn match_seq(
             let fused_half = pattern.tok == Tok::Gt && fused_shr(input, pos).is_some();
             let begins = !fused_half
                 && (fused || matches!(input.get(pos), Some(Tt::Tok(actual)) if tok_matches(&pattern.tok, &actual.tok, m.strings)));
-            m.attempt(input, pos, *id, false, begins);
+            m.attempt(input, list, pos, *id, false, begins);
             if begins {
-                match_seq(m, rest, input, pos + if fused { 2 } else { 1 }, binds, out)?;
+                alts.push((pos + if fused { 2 } else { 1 }, binds));
             }
-            Ok(())
         }
-        MNode::Meta { name, kind, id, span } => match_meta(m, *name, *kind, *id, *span, rest, input, pos, binds, out),
+        MNode::Meta { name, kind, id, .. } => match_meta(m, *name, *kind, *id, input, list, pos, binds, alts)?,
         MNode::Group(delim, inner, id) => {
             let begins = matches!(input.get(pos), Some(Tt::Delim(d, _, _)) if d == delim);
-            m.attempt(input, pos, *id, false, begins);
+            m.attempt(input, list, pos, *id, false, begins);
             if let Some(Tt::Delim(d, inner_input, _)) = input.get(pos)
                 && d == delim
             {
                 let inner_input = splice_transparent(inner_input);
+                let inner_list = m.list_id(list, pos);
                 let mut inner_results = Vec::new();
-                match_seq(m, inner, &inner_input, 0, BindMap::default(), &mut inner_results)?;
+                match_seq(m, inner, &inner_input, inner_list, 0, 0, &mut inner_results)?;
                 for (end, inner_binds) in inner_results {
-                    if end != inner_input.len() {
-                        continue;
+                    if end == inner_input.len() {
+                        alts.push((pos + 1, m.bind(BindEntry::Join { inner: inner_binds, prev: binds })));
                     }
-                    let mut merged = binds.clone();
-                    merged.extend(inner_binds);
-                    match_seq(m, rest, input, pos + 1, merged, out)?;
                 }
             }
-            Ok(())
         }
-        MNode::Rep { inner, sep, op, id, vars, .. } => {
-            let mut rep_results = Vec::new();
-            match_rep(m, inner, *sep, *op, *id, vars, input, pos, &[], &mut rep_results)?;
-            for (end, rep_binds) in rep_results {
-                let mut merged = binds.clone();
-                merged.extend(rep_binds);
-                match_seq(m, rest, input, end, merged, out)?;
-            }
-            Ok(())
-        }
+        MNode::Rep { inner, sep, op, id, vars, .. } => match_rep(m, inner, *sep, *op, *id, vars, input, list, pos, binds, alts)?,
     }
+    Ok(())
 }
 
-/// Matches one repetition node, longest runs first. Appends
-/// (end, seq-merged bindings) for every valid iteration count.
+/// Matches one repetition node at `pos`, on top of bindings `prev`.
+/// Appends (end, bindings) for every valid iteration count, each run's
+/// longer extensions before the run itself (longest first on a plain
+/// run). An explicit stack replaces recursion per iteration, and each
+/// iteration links to the one before it (`IterEntry`) instead of
+/// copying the earlier ones: n iterations cost O(n), not O(n^2).
+#[allow(clippy::too_many_arguments)]
 fn match_rep(
     m: &mut Matcher,
     inner: &[MNode],
@@ -730,66 +880,86 @@ fn match_rep(
     rep_id: u32,
     vars: &[Sym],
     input: &[Tt],
+    list: u32,
     pos: usize,
-    iters: &[BindMap],
-    out: &mut Vec<(usize, BindMap)>,
+    prev: u32,
+    out: &mut Vec<(usize, u32)>,
 ) -> Result<(), Diag> {
-    m.step()?;
-    if out.len() > 4096 {
-        return Ok(());
+    /// One run of `count` iterations ending at `pos`. Its alternatives
+    /// (the matches of one more iteration, from `start` after a
+    /// separator) are `pending[lo..end]`, tried from `next`; runs above
+    /// it on the stack keep theirs after `end`.
+    struct Run {
+        pos: usize,
+        start: usize,
+        last: u32,
+        count: usize,
+        lo: usize,
+        next: usize,
+        end: usize,
     }
-    let can_extend = op != RepOp::Question || iters.is_empty();
-    if can_extend {
-        let mut start = pos;
-        let mut sep_ok = true;
-        if !iters.is_empty()
-            && let Some(sep_tok) = sep
-        {
-            let fused = matches!(sep_tok.tok, Tok::Shr | Tok::ShrEq) && fused_shr(input, start) == Some(sep_tok.tok);
-            let fused_half = sep_tok.tok == Tok::Gt && fused_shr(input, start).is_some();
-            let begins = !fused_half
-                && (fused || matches!(input.get(start), Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings)));
-            m.attempt(input, pos, rep_id, false, begins);
-            if fused {
-                start += 2;
-            } else if fused_half {
-                sep_ok = false;
-            } else {
-                match input.get(start) {
-                    Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings) => start += 1,
-                    _ => sep_ok = false,
+    m.rep_vars.entry(rep_id).or_insert_with(|| vars.to_vec());
+    let mut stack: Vec<Run> = Vec::new();
+    let mut pending: Vec<(usize, u32)> = Vec::new();
+    let mut iteration = Vec::new();
+    let mut next = Some((pos, NO_ITER, 0));
+    loop {
+        if let Some((pos, last, count)) = next.take() {
+            m.step()?;
+            if out.len() <= 4096 {
+                let mut start = pos;
+                if op != RepOp::Question || count == 0 {
+                    let mut sep_ok = true;
+                    if count > 0
+                        && let Some(sep_tok) = sep
+                    {
+                        let fused = matches!(sep_tok.tok, Tok::Shr | Tok::ShrEq) && fused_shr(input, pos) == Some(sep_tok.tok);
+                        let fused_half = sep_tok.tok == Tok::Gt && fused_shr(input, pos).is_some();
+                        let begins = !fused_half
+                            && (fused || matches!(input.get(pos), Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings)));
+                        m.attempt(input, list, pos, rep_id, false, begins);
+                        if fused {
+                            start += 2;
+                        } else if fused_half {
+                            sep_ok = false;
+                        } else {
+                            match input.get(pos) {
+                                Some(Tt::Tok(actual)) if tok_matches(&sep_tok.tok, &actual.tok, m.strings) => start += 1,
+                                _ => sep_ok = false,
+                            }
+                        }
+                    }
+                    if sep_ok {
+                        iteration.clear();
+                        match_seq(m, inner, input, list, start, 0, &mut iteration)?;
+                    }
                 }
+                let lo = pending.len();
+                pending.extend_from_slice(&iteration);
+                iteration.clear();
+                stack.push(Run { pos, start, last, count, lo, next: lo, end: pending.len() });
             }
         }
-        if sep_ok {
-            let mut inner_results = Vec::new();
-            match_seq(m, inner, input, start, BindMap::default(), &mut inner_results)?;
-            for (end, iter_binds) in inner_results {
-                // An iteration must consume input: a repetition that can
-                // match empty never advances and rustc rejects the shape.
-                if end == start {
-                    continue;
-                }
-                let mut next_iters: Vec<BindMap> = iters.to_vec();
-                next_iters.push(iter_binds);
-                match_rep(m, inner, sep, op, rep_id, vars, input, end, &next_iters, out)?;
+        let Some(top) = stack.last_mut() else { return Ok(()) };
+        while top.next < top.end {
+            let (end, binds) = pending[top.next];
+            top.next += 1;
+            // An iteration must consume input: a repetition that can
+            // match empty never advances and rustc rejects the shape.
+            if end != top.start {
+                m.iters.push(IterEntry { binds, prev: top.last });
+                next = Some((end, (m.iters.len() - 1) as u32, top.count + 1));
+                break;
+            }
+        }
+        if next.is_none() {
+            let run = stack.pop().unwrap();
+            pending.truncate(run.lo);
+            if op != RepOp::Plus || run.count > 0 {
+                out.push((run.pos, m.bind(BindEntry::Rep { rep: rep_id, last: run.last, prev })));
             }
         }
     }
-    let min_ok = op != RepOp::Plus || !iters.is_empty();
-    if min_ok {
-        // Merge per-iteration bindings: each variable the repetition
-        // binds becomes one `Seq` deeper, with `Empty` where an
-        // iteration did not bind it. Zero iterations still bind every
-        // variable, to an empty `Seq`.
-        let mut merged = BindMap::default();
-        for &name in vars {
-            let seq: Vec<Bind> = iters.iter().map(|it| it.get(&name).cloned().unwrap_or(Bind::Empty)).collect();
-            merged.insert(name, Bind::Seq(seq));
-        }
-        out.push((pos, merged));
-    }
-    Ok(())
 }
 
 /// The span a fragment covers: first to last tree span in its slice.
@@ -897,55 +1067,44 @@ fn meta_can_begin(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> bool
     }
 }
 
-/// Binds `name` to the fragment slice ending at each of `ends` and
-/// matches the rest of the sequence from there.
+/// Binds `name` to the fragment slice ending at each of `ends`, on top
+/// of `binds`, and appends each as an alternative.
 #[allow(clippy::too_many_arguments)]
-fn match_meta_ends(
-    m: &mut Matcher,
-    name: Sym,
-    kind: FragKind,
-    ends: Vec<usize>,
-    rest: &[MNode],
-    input: &[Tt],
-    pos: usize,
-    binds: BindMap,
-    out: &mut Vec<(usize, BindMap)>,
-) -> Result<(), Diag> {
+fn meta_ends(m: &mut Matcher, name: Sym, kind: FragKind, ends: Vec<usize>, input: &[Tt], pos: usize, binds: u32, alts: &mut Vec<(usize, u32)>) {
     let at = input.get(pos).map_or(m.call_span, |t| t.span());
     for end in ends {
         let slice: Vec<Tt> = input[pos..end].to_vec();
         // A whole forwarded fragment rebinds as itself, keeping its
         // kind identity; a longer re-parse wraps the new slice.
-        let value = if let [Tt::Frag(..)] = slice.as_slice() {
-            Bind::Leaf(slice)
+        let trees = if let [Tt::Frag(..)] = slice.as_slice() {
+            slice
         } else if kind.transparent() {
-            Bind::Leaf(slice)
+            slice
         } else {
             let slice = if kind == FragKind::Stmt { stmt_with_semi(slice) } else { slice };
-            Bind::Leaf(vec![Tt::Frag(kind, slice.clone(), frag_span(&slice, at))])
+            let span = frag_span(&slice, at);
+            vec![Tt::Frag(kind, slice, span)]
         };
-        let mut next = binds.clone();
-        next.insert(name, value);
-        match_seq(m, rest, input, end, next, out)?;
+        alts.push((end, m.bind(BindEntry::Leaf { name, trees, prev: binds })));
     }
-    Ok(())
 }
 
-/// Matches one metavariable node, then the rest of the sequence.
+/// Matches one metavariable node at `pos`: appends (end, bindings) for
+/// each way the fragment can end, on top of `binds`.
+#[allow(clippy::too_many_arguments)]
 fn match_meta(
     m: &mut Matcher,
     name: Sym,
     kind: FragKind,
     id: u32,
-    meta_span: Span,
-    rest: &[MNode],
     input: &[Tt],
+    list: u32,
     pos: usize,
-    binds: BindMap,
-    out: &mut Vec<(usize, BindMap)>,
+    binds: u32,
+    alts: &mut Vec<(usize, u32)>,
 ) -> Result<(), Diag> {
-    let _ = meta_span;
-    m.attempt(input, pos, id, true, meta_can_begin(m, kind, input, pos));
+    let begins = meta_can_begin(m, kind, input, pos);
+    m.attempt(input, list, pos, id, true, begins);
     // A forwarded opaque fragment is one unit: it can rebind to a
     // compatible kind (ARCH 6.2), be taken whole as one token tree,
     // or, for a literal target, rebind when it holds just a literal.
@@ -959,18 +1118,18 @@ fn match_meta(
         if fk == kind && parsed_kind(kind) {
             let ends = fragment_ends(m, kind, input, pos)?;
             if !ends.is_empty() {
-                return match_meta_ends(m, name, kind, ends, rest, input, pos, binds, out);
+                meta_ends(m, name, kind, ends, input, pos, binds, alts);
+                return Ok(());
             }
         }
         if can_forward(fk, kind) || (kind == FragKind::Literal && trees_read_literal(inner)) {
-            let mut next = binds;
-            next.insert(name, Bind::Leaf(vec![input[pos].clone()]));
-            return match_seq(m, rest, input, pos + 1, next, out);
+            alts.push((pos + 1, m.bind(BindEntry::Leaf { name, trees: vec![input[pos].clone()], prev: binds })));
         }
         return Ok(());
     }
     let ends = fragment_ends(m, kind, input, pos)?;
-    match_meta_ends(m, name, kind, ends, rest, input, pos, binds, out)
+    meta_ends(m, name, kind, ends, input, pos, binds, alts);
+    Ok(())
 }
 
 /// Gives a matched statement fragment the `;` form it transcribes with:
