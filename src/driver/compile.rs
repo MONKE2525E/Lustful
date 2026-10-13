@@ -1420,16 +1420,14 @@ fn resolved_setup(
     t.lap("ast scan");
     // One synthetic chunk: the tail's slot update reads body idents
     // from chunk scans; per-fn hashes and lines ride in through
-    // `scan_of` below.
-    let lexed = match lexer::lex(&root_text, ROOT_FILE, 0, &front.interner) {
-        Ok(l) => l,
-        Err(mut d) => return Err(errors(std::slice::from_mut(&mut d), &map, &root_text, req)),
-    };
+    // `scan_of` below. Its token list stays empty: only the chunk path
+    // reads chunk tokens, and a route change to that path drops these
+    // chunks first. (Lexing the root again here cost a full serial lex.)
     let n_items = front.ast.items.len();
     front.chunks = vec![Chunk {
         start: 0,
         text: root_text,
-        lexed,
+        lexed: lexer::Lexed { tokens: Vec::new(), strings: Vec::new() },
         lexed_start: 0,
         scan: scan::ChunkScan {
             fns: body_hashes.iter().map(|&body_hash| scan::FnScan { body_hash, nested: false, fn_offset: 0, body: 0..0 }).collect(),
@@ -1579,6 +1577,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.resolved_crate_ids = None;
     }
     let use_resolver = front.resolved_crate || wants_resolver;
+    t.lap("route");
 
     // Source std (S5): if this file can mention a source std fn, load the
     // checked shipped library (once per session) and splice its fns after

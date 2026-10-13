@@ -114,14 +114,80 @@ pub struct ResolveError {
 /// or an `include!` call in its token stream. Token-exact (strings and comments
 /// never count); a `use` of `std` alone also routes here, which costs a
 /// full rebuild but keeps one code path for imports and cfg.
+///
+/// A big file is lexed in pieces in parallel (see `route_pieces`); the
+/// answer is the same as one serial lex.
 pub fn needs_resolve(root_text: &str, interner: &Interner) -> bool {
+    if let Some(pieces) = route_pieces(root_text) {
+        let answers = par_map(&pieces, |&(a, b)| {
+            let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
+            piece_cut_ok(&lexed, b, root_text.len()).then(|| needs_resolve_lexed(&lexed, interner))
+        });
+        if let Some(answers) = answers.into_iter().collect::<Option<Vec<bool>>>() {
+            return answers.contains(&true);
+        }
+    }
     let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return false };
     needs_resolve_lexed(&lexed, interner)
+}
+
+/// Cut points for lexing a big file in parallel: about four pieces per
+/// core, each cut right after a line that ends in `}` or `;`. Each piece
+/// lexes on its own, and `piece_cut_ok` checks that every cut really
+/// falls between tokens; on any doubt the caller lexes serially (a cut
+/// inside a string or comment leaves its start unterminated, so that
+/// piece fails to lex or fails the check). The routing test of a piece
+/// needs no context from its neighbors: a leading `::` triggers with no
+/// previous token as it does after `}` or `;`, and no lookahead reaches
+/// past a trailing `}` or `;`. None for a small file.
+fn route_pieces(text: &str) -> Option<Vec<(usize, usize)>> {
+    const MIN_PIECE: usize = 16 * 1024;
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let target = (text.len() / (cores * 4)).max(MIN_PIECE);
+    if text.len() < 2 * target {
+        return None;
+    }
+    let b = text.as_bytes();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut at = target;
+    while at < b.len() {
+        match b[at..].iter().position(|&c| c == b'\n') {
+            Some(k) => {
+                let nl = at + k;
+                if nl > start && matches!(b[nl - 1], b'}' | b';') && nl + 1 < b.len() {
+                    pieces.push((start, nl + 1));
+                    start = nl + 1;
+                    at = start + target;
+                } else {
+                    at = nl + 1;
+                }
+            }
+            None => break,
+        }
+    }
+    pieces.push((start, b.len()));
+    Some(pieces)
+}
+
+/// True when a piece lexed from `text[..b]` of a file of length `len` may
+/// join its neighbors: the last piece always may; any other must end with
+/// its own `}` or `;` right before the newline at its end. Then the serial
+/// lexer is between tokens there too, in its start state, and no token or
+/// lookahead crosses the cut.
+fn piece_cut_ok(lexed: &lexer::Lexed, b: usize, len: usize) -> bool {
+    let n = lexed.tokens.len();
+    b == len
+        || (n >= 2
+            && matches!(lexed.tokens[n - 2].tok, lexer::Tok::RBrace | lexer::Tok::Semi)
+            && lexed.tokens[n - 2].span.hi as usize == b - 1)
 }
 
 /// The lexed form of `needs_resolve`, for callers that already lexed.
 pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     use crate::lexer::Tok;
+    // Symbols, not texts: this reads every identifier token of the root.
+    let (macro_rules, include) = (interner.intern("macro_rules"), interner.intern("include"));
     let toks = &lexed.tokens;
     for (i, t) in toks.iter().enumerate() {
         match t.tok {
@@ -152,10 +218,10 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                     return true;
                 }
             }
-            Tok::Ident(s) if interner.get(s) == "macro_rules" => return true,
+            Tok::Ident(s) if s == macro_rules => return true,
             // An `include!` can introduce items and macro definitions
             // other chunks would not see (added for W-MACRO).
-            Tok::Ident(s) if interner.get(s) == "include" && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Bang)) => return true,
+            Tok::Ident(s) if s == include && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Bang)) => return true,
             _ => {}
         }
     }
@@ -4453,6 +4519,37 @@ mod tests {
     use crate::driver::graph::Reads;
     use crate::intern::{Interner, Known};
     use crate::protocol::ProfileFlags;
+
+    /// Routing a big file in parallel pieces answers exactly as one serial
+    /// lex: triggers in any piece count (a `use`, a leading `::`, or an
+    /// `include!` mid-file, a `static` at the end), and triggers inside a
+    /// raw string or a block comment that spans a cut do not.
+    #[test]
+    fn parallel_routing_matches_serial() {
+        let filler: String = (0..3000).map(|i| format!("fn f{i}() -> i64 {{ {i} }}\nstruct S{i};\n")).collect();
+        let serial = |t: &str| {
+            let i = Interner::default();
+            needs_resolve_lexed(&lexer::lex(t, FileId(0), 0, &i).unwrap(), &i)
+        };
+        let half = filler.len() / 2;
+        let cut = half + filler[half..].find("}\n").unwrap() + 2;
+        let cases = [
+            filler.clone(),
+            format!("{}use std::fmt;\n{}", &filler[..cut], &filler[cut..]),
+            format!("{}static X: i64 = 1;\n", filler),
+            format!("{}fn h() -> &'static str {{ r#\"\nuse a;\n{}\"# }}\n", &filler[..cut], &filler[cut..]),
+            format!("{}/*\nmod m;\n{}*/\n", &filler[..cut], &filler[cut..]),
+            format!("{}fn g() -> i64 {{ 1 }}\n::std::process::exit(0);\n{}", &filler[..cut], &filler[cut..]),
+            format!("{}include!(\"part.rs\");\n{}", &filler[..cut], &filler[cut..]),
+        ];
+        for (k, text) in cases.iter().enumerate() {
+            assert!(route_pieces(text).is_some_and(|p| p.len() > 1), "case {k} splits");
+            let i = Interner::default();
+            assert_eq!(needs_resolve(text, &i), serial(text), "case {k}");
+        }
+        let answers: Vec<bool> = cases.iter().map(|t| serial(t)).collect();
+        assert_eq!(answers, [false, true, true, false, false, true, true]);
+    }
 
     fn resolve(files: &[(&str, &str)], crate_name: &str) -> Result<ResolvedCrate, ResolveError> {
         let dir = std::env::temp_dir().join(format!("lust-worklist-test-{}-{}", std::process::id(), crate_name));
