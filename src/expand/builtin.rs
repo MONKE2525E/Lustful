@@ -867,7 +867,10 @@ fn thread_local_macro(st: &mut Expander, call: &Call, depth: u32) -> Result<Vec<
         let marker = if const_block.is_some() { crate::parser::TLS_CONST_ATTR } else { crate::parser::TLS_ATTR };
         let init_name = format!("{}#init", st.ctx.interner.get(name));
         let init_fn = Tt::Tok(Token { tok: Tok::Ident(st.ctx.interner.intern(&init_name)), span: name_tok.span });
-        let body = const_block.unwrap_or_else(|| Tt::Delim(Delim::Brace, init, span));
+        // The lazy init in parens: the body re-parses from tokens, and an
+        // expression that starts with a block (`if c { 1 } else { 2 } + 1`)
+        // would end at the block in statement position.
+        let body = const_block.unwrap_or_else(|| Tt::Delim(Delim::Brace, vec![Tt::Delim(Delim::Paren, init, span)], span));
         let mut tpl = st.lex_template("#[__lust_marker] __lust_vis static __lust_name: __lust_ty = __lust_init;", span);
         tpl = splice_placeholders(tpl, "__lust_marker", &[st.ident_tree(marker, span)], st.ctx.interner);
         tpl = splice_placeholders(tpl, "__lust_vis", &vis, st.ctx.interner);

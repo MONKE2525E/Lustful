@@ -86,7 +86,7 @@ pub struct StaticItem {
     pub mutable: bool,
     pub value: crate::ty::consteval::ConstValue,
     /// Set for a `thread_local!` static: `ty` is `LocalKey<T>` and
-    /// `value` the key's zero slot word (check/tls.rs).
+    /// `value` the key's slot word, from 1 (check/tls.rs).
     pub tls: Option<super::tls::TlsKey>,
 }
 
@@ -3517,6 +3517,13 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         .into_iter()
         .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit, tls: None }))
         .collect();
+    // Each `thread_local!` key's slot word: 1, 2, .. in static order
+    // (runtime/thread.c finds the thread's cell by it).
+    let mut slot = 0i128;
+    for st in p.statics.iter_mut().filter(|s| s.tls.is_some()) {
+        slot += 1;
+        st.value = crate::ty::consteval::ConstValue::Int(slot);
+    }
 }
 
 /// The def hash of the static at `stmt_items[sidx]` (ARCH 1.7: a static
@@ -3924,8 +3931,9 @@ impl CollectCx<'_, '_> {
             }
             PendingState::Todo => {}
         }
-        // A `thread_local!` key's value is its zero slot word; its
-        // initializer is the init fn, checked as a body (check/tls.rs).
+        // A `thread_local!` key's value is its slot word (numbered once
+        // every static is placed, `eval_const_items`); its initializer is
+        // the init fn, checked as a body (check/tls.rs).
         if self.pending[idx].0.tls.is_some() {
             let v = crate::ty::consteval::ConstValue::Int(0);
             self.pending[idx].1 = PendingState::Done(v.clone());

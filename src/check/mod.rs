@@ -456,10 +456,13 @@ pub enum Builtin {
     /// path as the callable (`KEY.with(Cell::get)` is `TlsGet`).
     TlsTryGet,
     TlsCloneRc,
-    /// Only made by lower/tls.rs: `(key, init) -> Option<&T>`, the
-    /// thread's value (made by `init` on the first access), or None
-    /// once its destructor ran.
+    /// Only made by lower/tls.rs: `(key, init) -> &T`, the thread's
+    /// value (made by `init` on the first access); Rust's AccessError
+    /// panic once its destructor ran.
     TlsAccess,
+    /// Only made by lower/tls.rs: `(key, init) -> Option<&T>`, as
+    /// `TlsAccess` but None once the destructor ran (`try_with`).
+    TlsTryAccess,
     /// Only made by lower/tls.rs: `(key, value) -> Option<T>`. A lazy
     /// key not yet made on this thread takes `value` as its value
     /// (None comes back); any other state gives `value` back.

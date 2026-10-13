@@ -6,11 +6,12 @@
 // body or C unit can never pair a key with a stale form. Borrowck sees
 // the call as one builtin call: the key borrow, the closure moved in, the
 // result out. Codegen calls `expand` first, and each call becomes plain IR
-// over two runtime accesses (`TlsAccess`, `TlsInitWith`, emitted by
-// cgen.rs): a switch on the value's `Option<&T>`, the closure call, and
-// Rust's AccessError panic once the value is destroyed.
+// over the runtime accesses (`TlsAccess`, `TlsTryAccess`, `TlsInitWith`,
+// emitted by cgen.rs): the value's `&T` (Rust's AccessError panic once it
+// is destroyed, or a switch on `Option<&T>` for `try_with`) and the
+// closure call or Cell and RefCell builtin.
 //
-// Every `emit_*` function starts in `self.cur` and leaves `self.cur` at the
+// Every builder below starts in `self.cur` and leaves `self.cur` at the
 // block that follows the value it wrote.
 use super::Lower;
 use crate::check::Builtin;
@@ -23,7 +24,7 @@ use crate::ty::*;
 type R = Result<(), String>;
 
 /// Rust 1.99's panic text for a key used during or after its destructor.
-const ACCESS_PANIC: &str = "cannot access a Thread Local Storage value during or after destruction: AccessError";
+pub const ACCESS_PANIC: &str = "cannot access a Thread Local Storage value during or after destruction: AccessError";
 
 /// True for the `LocalKey` method builtins: lowering adds the init fn
 /// operand, and `expand` rewrites them.
@@ -213,36 +214,32 @@ impl Ex<'_, '_, '_> {
     // ---------- Key access ----------
 
     /// `&T` of the key's value into a fresh local: the runtime access
-    /// (which runs the init fn on the thread's first access), then
+    /// (which runs the init fn on the thread's first access), with
     /// Rust's AccessError panic when the value is destroyed. With
     /// `on_none`, the destroyed case runs it instead of the panic and
     /// goes on at the returned join block.
     fn access(&mut self, key: &Operand, init: &Operand, t: Ty, on_none: Option<&mut dyn FnMut(&mut Self) -> R>) -> Result<(Local, Option<Bb>), String> {
         let rt = self.body.tys.mk_ref(false, t);
+        let Some(on_none) = on_none else {
+            let r = self.local(rt);
+            self.call(CallTarget::Builtin(Builtin::TlsAccess), vec![key.clone(), init.clone()], Place::local(r));
+            return Ok((r, None));
+        };
         let ot = self.body.tys.mk_option(rt);
         let o = self.local(ot);
-        self.call(CallTarget::Builtin(Builtin::TlsAccess), vec![key.clone(), init.clone()], Place::local(o));
+        self.call(CallTarget::Builtin(Builtin::TlsTryAccess), vec![key.clone(), init.clone()], Place::local(o));
         let d = self.local(int(IntTy::U32));
         self.assign(Place::local(d), Rvalue::Discriminant(Place::local(o)));
         let (some, none) = (self.block(), self.block());
         self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, some)], none));
         self.cur = none;
-        let join = match on_none {
-            Some(k) => {
-                k(self)?;
-                let j = self.block();
-                self.goto(j);
-                Some(j)
-            }
-            None => {
-                self.term(Terminator::Panic(vec![FmtPart::Lit(ACCESS_PANIC.into())]));
-                None
-            }
-        };
+        on_none(self)?;
+        let join = self.block();
+        self.goto(join);
         self.cur = some;
         let r = self.local(rt);
         self.assign(Place::local(r), Rvalue::Use(Operand::Copy(Place::local(o).project(Proj::Downcast(1)).project(Proj::Field(0)))));
-        Ok((r, join))
+        Ok((r, Some(join)))
     }
 
     /// `dest = f(args..)` through `FnOnce` for the callable in local
@@ -445,6 +442,69 @@ impl Ex<'_, '_, '_> {
         self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
         Ok(())
     }
+}
 
-
+#[cfg(test)]
+mod tests {
+    /// The runtime's thread-exit path (runtime/thread.c), which lust code
+    /// cannot reach until `std::thread::spawn` lands (W-THREADS): each
+    /// thread's destructors run newest first when it ends, a destructor
+    /// sees a key destroyed before it, and the main thread's run at
+    /// `lust_tls_exit`. A C harness stands in for codegen: keys with slots
+    /// 1 and 2, `(u8, int)` cells.
+    #[test]
+    fn thread_exit_runs_destructors_newest_first() {
+        let harness = r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <pthread.h>
+void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align);
+void lust_tls_register(void *cell, void (*dtor)(void *));
+void lust_tls_exit(void);
+uint64_t key_a = 1, key_b = 2;
+typedef struct { uint8_t state; int v; } cell_t;
+static void dtor(void *p) {
+    cell_t *c = p;
+    if (c->state != 1) return;
+    c->state = 2;
+    cell_t *b = lust_tls_cell(&key_b, sizeof(cell_t), _Alignof(cell_t));
+    printf("drop %d b=%d\n", c->v, b->state);
+}
+static void touch(uint64_t *key, int v) {
+    cell_t *c = lust_tls_cell(key, sizeof(cell_t), _Alignof(cell_t));
+    if (c->state == 0) { c->v = v; c->state = 1; lust_tls_register(c, dtor); }
+}
+static void *worker(void *arg) {
+    long id = (long)arg;
+    touch(&key_a, (int)(id * 10 + 1));
+    touch(&key_b, (int)(id * 10 + 2));
+    touch(&key_a, 0);
+    return 0;
+}
+int main(void) {
+    for (long i = 1; i <= 2; i++) {
+        pthread_t t;
+        pthread_create(&t, 0, worker, (void *)i);
+        pthread_join(t, 0);
+    }
+    touch(&key_a, 1);
+    printf("main exit\n");
+    lust_tls_exit();
+    return 0;
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("lust-tls-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (rt, h) = (dir.join("rt.c"), dir.join("harness.c"));
+        std::fs::write(&rt, crate::cgen::runtime_unit()).unwrap();
+        std::fs::write(&h, harness).unwrap();
+        let exe = dir.join("prog");
+        let cc = std::process::Command::new("cc").args(["-O0", "-w", "-pthread", "-o"]).arg(&exe).arg(&h).arg(&rt).arg("-lm").output().unwrap();
+        assert!(cc.status.success(), "cc failed: {}", String::from_utf8_lossy(&cc.stderr));
+        let run = std::process::Command::new(&exe).output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+        let want = "drop 12 b=2\ndrop 11 b=2\ndrop 22 b=2\ndrop 21 b=2\nmain exit\ndrop 1 b=0\n";
+        assert_eq!(String::from_utf8(run.stdout).unwrap(), want);
+    }
 }

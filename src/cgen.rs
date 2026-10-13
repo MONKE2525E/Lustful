@@ -3326,7 +3326,7 @@ impl FnGen<'_, '_, '_> {
             | B::TlsCloneRc => {
                 unreachable!("lower/tls.rs expands LocalKey calls before codegen")
             }
-            B::TlsAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys),
+            B::TlsAccess | B::TlsTryAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys, loc),
             B::RcTryUnwrap => {
                 let elem = match &tys[0] { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(CTy::Rc(Box::new(elem.clone()))));
@@ -7369,11 +7369,14 @@ fn tls_glue(p: &Program, g: &Glue, c: &CTy, protos: &mut String, defs: &mut Stri
 }
 
 impl FnGen<'_, '_, '_> {
-    /// `TlsAccess(key, init) -> Option<&T>` and `TlsInitWith(key, value)
-    /// -> Option<T>` (lower/tls.rs), over the runtime's per-thread cells.
-    fn tls_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy]) -> String {
+    /// `TlsAccess(key, init) -> &T`, `TlsTryAccess(key, init) ->
+    /// Option<&T>`, and `TlsInitWith(key, value) -> Option<T>`
+    /// (lower/tls.rs), over the runtime's per-thread cells. The common
+    /// access builds no `Option`: tcc zero-fills each compound literal
+    /// with a memset call.
+    fn tls_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> String {
         let t = match b {
-            Builtin::TlsAccess => match &tys[1] {
+            Builtin::TlsAccess | Builtin::TlsTryAccess => match &tys[1] {
                 CTy::FnPtr(_, r) => (**r).clone(),
                 _ => unreachable!("TlsAccess takes the init fn pointer"),
             },
@@ -7384,9 +7387,15 @@ impl FnGen<'_, '_, '_> {
         let (m, ct) = (mangle(&cell), ctype(&cell));
         let c = self.tmp();
         let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)lust_tls_cell((uint64_t *){}, sizeof({ct}), _Alignof({ct}));", vals[0]);
-        if b == Builtin::TlsAccess {
+        if b != Builtin::TlsInitWith {
             self.want(Glue::TlsInit, &cell);
             let _ = writeln!(self.out, "    if ({c}->f0 != 1) {c} = tlsinit_{m}({c}, (void *){});", vals[1]);
+        }
+        if b == Builtin::TlsAccess {
+            let _ = writeln!(self.out, "    if (!{c}) lust_panic_cstr({}, {loc});", c_string_lit(crate::lower::tls::ACCESS_PANIC.as_bytes()));
+            return format!("(&{c}->f1)");
+        }
+        if b == Builtin::TlsTryAccess {
             let opt = CTy::Option(Box::new(CTy::Ref(Box::new(t))));
             collect_types(&opt, &mut self.sig_types);
             let (some, none) = (self.make_variant(&opt, 1, &[format!("&{c}->f1")]), self.make_variant(&opt, 0, &[]));

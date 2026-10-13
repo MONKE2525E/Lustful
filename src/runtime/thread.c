@@ -6,10 +6,10 @@
    static the thread touched, found by the static's slot, and the list of
    destructors to run when the thread ends.
 
-   A `LocalKey` static is a `uint64_t` global that codegen emits with the
-   value 0: the static's slot plus one, set on the first access from any
-   thread. A cell is codegen's `(u8, T)` tuple: the state byte (0 initial,
-   1 alive, 2 destroyed) and the value. A new cell is all zero bytes.
+   A `LocalKey` static is a `uint64_t` global holding the key's slot,
+   1, 2, .. (collect numbers them). A cell is codegen's `(u8, T)` tuple:
+   the state byte (0 initial, 1 alive, 2 destroyed) and the value. A new
+   cell is all zero bytes.
 
    Destructors run newest first, as glibc's __cxa_thread_atexit_impl
    runs them (Rust std on Linux registers through it): a value that
@@ -48,10 +48,9 @@ typedef struct {
 
 static pthread_key_t lust_tls_key;
 static pthread_once_t lust_tls_once = PTHREAD_ONCE_INIT;
-/* Set once the key exists, so a program that never touches TLS makes
-   no key at exit. */
-static _Atomic int lust_tls_ready;
-static _Atomic uint64_t lust_tls_slots;
+/* Set once the key exists: the fast path reads it before the key, and a
+   program that never touches TLS makes no key at exit. */
+static volatile int lust_tls_ready;
 
 static void lust_tls_run(lust_tls_block *b) {
     while (b->ndtors) {
@@ -76,7 +75,8 @@ static void lust_tls_thread_end(void *p) {
 
 static void lust_tls_make_key(void) {
     if (pthread_key_create(&lust_tls_key, lust_tls_thread_end) != 0) abort();
-    atomic_store(&lust_tls_ready, 1);
+    atomic_thread_fence(memory_order_release);
+    lust_tls_ready = 1;
 }
 
 static lust_tls_block *lust_tls_block_get(void) {
@@ -90,19 +90,9 @@ static lust_tls_block *lust_tls_block_get(void) {
     return b;
 }
 
-static uint64_t lust_tls_slot(uint64_t *key) {
-    _Atomic uint64_t *k = (_Atomic uint64_t *)key;
-    uint64_t s = atomic_load_explicit(k, memory_order_acquire);
-    if (s) return s;
-    uint64_t fresh = atomic_fetch_add(&lust_tls_slots, 1) + 1;
-    uint64_t zero = 0;
-    if (atomic_compare_exchange_strong(k, &zero, fresh)) return fresh;
-    return zero;
-}
-#endif
-
-void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align) LUST_BODY({
-    uint64_t s = lust_tls_slot(key);
+/* The first access to slot `s` on this thread: grows the block and makes
+   a zeroed cell. */
+static void *lust_tls_cell_slow(uint64_t s, uint64_t size, uint64_t align) {
     lust_tls_block *b = lust_tls_block_get();
     if (s > b->cap) {
         uint64_t cap = b->cap ? b->cap : 8;
@@ -120,6 +110,18 @@ void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align) LUST_BODY({
         b->cells[s - 1] = c;
     }
     return c;
+}
+#endif
+
+void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align) LUST_BODY({
+    /* Fast path: plain reads (a key's slot never changes, and the block
+       key exists before any block does). */
+    uint64_t s = *key;
+    if (lust_tls_ready) {
+        lust_tls_block *b = (lust_tls_block *)pthread_getspecific(lust_tls_key);
+        if (b && s <= b->cap && b->cells[s - 1]) return b->cells[s - 1];
+    }
+    return lust_tls_cell_slow(s, size, align);
 })
 
 void lust_tls_register(void *cell, void (*dtor)(void *)) LUST_BODY({
@@ -137,7 +139,7 @@ void lust_tls_register(void *cell, void (*dtor)(void *)) LUST_BODY({
 })
 
 void lust_tls_exit(void) LUST_BODY({
-    if (!atomic_load(&lust_tls_ready)) return;
+    if (!lust_tls_ready) return;
     lust_tls_block *b = (lust_tls_block *)pthread_getspecific(lust_tls_key);
     if (b) lust_tls_run(b);
 })

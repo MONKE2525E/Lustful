@@ -4,12 +4,12 @@
 // static marked `#[thread_local!]` whose value is the path to an init fn
 // `fn NAME#init() -> T { init }` (`#[thread_local!const]` for the
 // `const { e }` form, whose block is the init fn body). Collect types the
-// static as `LocalKey<T>` (its C value is the key's slot word, zero until
-// the first access) and records the init fn here. Method calls on the key
-// type as builtin methods; lowering adds the init fn as an operand
-// (lower/tls.rs), and the expansion after borrowck turns each call into
-// the runtime access plus plain IR (closure calls, Cell and RefCell
-// builtins).
+// static as `LocalKey<T>` with every region of `T` `'static` (its C value
+// is the key's slot word, 1, 2, ..) and records the init fn here. Method
+// calls on the key type as builtin methods; lowering adds the init fn and
+// the key form as operands (lower/tls.rs), and the expansion after borrowck
+// turns each call into the runtime access plus plain IR (closure calls,
+// Cell and RefCell builtins).
 use super::*;
 use crate::ast::{Attr, Item, ItemKind};
 

@@ -383,6 +383,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::TlsTryGet,
     Builtin::TlsCloneRc,
     Builtin::TlsAccess,
+    Builtin::TlsTryAccess,
     Builtin::TlsInitWith,
 ];
 
@@ -769,7 +770,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::TlsTryGet => (&["std::thread::LocalKey<Cell<T>>"], vec![i.intern("try_with")], Call::Method),
         B::TlsCloneRc => (&["std::thread::LocalKey<Rc<T>>"], vec![i.intern("with")], Call::Method),
         // Internal to the thread_local! expansion; no user spelling.
-        B::TlsAccess | B::TlsInitWith => (&["std::thread::LocalKey<T>"], vec![], Call::Method),
+        B::TlsAccess | B::TlsTryAccess | B::TlsInitWith => (&["std::thread::LocalKey<T>"], vec![], Call::Method),
     }
 }
 
