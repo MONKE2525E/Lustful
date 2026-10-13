@@ -3811,7 +3811,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 });
                 let mut out = Vec::with_capacity(elems.len());
                 for (i, &el) in elems.iter().enumerate() {
-                    out.push(self.expr(el, exp.as_ref().map(|v| v[i])));
+                    let want = exp.as_ref().map(|v| v[i]);
+                    // A `&dyn` element is a coercion site, as in rustc's
+                    // tuple check under a tuple expectation.
+                    if let Some(w) = self.dyn_ref_expectation(want) {
+                        self.expect_expr(el, w);
+                        out.push(w);
+                    } else {
+                        out.push(self.expr(el, want));
+                    }
                 }
                 let ts = self.tys.intern_tys(&out);
                 self.tys.intern(TyKind::Tuple(ts))
@@ -5709,12 +5717,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             // Under an `Option<&dyn Tr>` expectation the argument is a
             // coercion site for `&dyn Tr`, as rustc's expected inputs make it.
-            let want = expected.and_then(|t| self.tys.option_elem(self.resolve(t))).filter(|&t| self.dyn_ref_expectation(Some(t)).is_some());
-            if let Some(want) = want {
+            let elem = expected.and_then(|t| self.tys.option_elem(self.resolve(t)));
+            if let Some(want) = elem.filter(|&t| self.dyn_ref_expectation(Some(t)).is_some()) {
                 self.expect_expr(args[0], want);
                 return self.tys.mk_option(want);
             }
-            let t = self.expr(args[0], None);
+            // A dyn deeper in (`Option<(&dyn Tr, u8)>`): the expectation
+            // reaches the coercion sites inside the argument.
+            let hint = elem.filter(|&t| object::mentions_dyn(&self.tys, t));
+            let t = self.expr(args[0], hint);
             return self.tys.mk_option(t);
         }
         if res == Res::ResOk || res == Res::ResErr {
