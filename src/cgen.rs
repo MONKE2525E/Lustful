@@ -76,6 +76,12 @@ pub enum Glue {
     Clone,
     Eq,
     Debug,
+    /// Three-way comparison by structure: `int8_t cmp_T(T *a, T *b)`
+    /// gives -1 (less), 0 (equal), 1 (greater), or 2 (unordered: a
+    /// float NaN decided it), as derived and core `PartialOrd` order.
+    Cmp,
+    /// `T default_T(void)`: the value derived and core `Default` build.
+    Default,
 }
 
 /// Maps a semantic type to its body-independent C form. Builtin Adts reach this
@@ -1575,10 +1581,22 @@ impl FnGen<'_, '_, '_> {
                     // method's own return type.
                     CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
                 };
-                self.emit_assign(dest, mentions, &loc, |s, loc, post| {
-                    let v = s.call_value(*target, args, &dest_cty, loc, post);
-                    if ret_unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
-                });
+                if *target == CallTarget::Builtin(Builtin::DefaultGlue) {
+                    // The default glue of the destination's type.
+                    let v = match &dest_cty {
+                        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(self.p, &dest_cty),
+                        t => {
+                            self.want(Glue::Default, t);
+                            format!("default_{}()", mangle(t))
+                        }
+                    };
+                    self.emit_assign(dest, mentions, &loc, |_, _, _| v);
+                } else {
+                    self.emit_assign(dest, mentions, &loc, |s, loc, post| {
+                        let v = s.call_value(*target, args, &dest_cty, loc, post);
+                        if ret_unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
+                    });
+                }
                 if Some(next.0 as usize) != next_block {
                     let _ = writeln!(self.out, "  goto bb{};", next.0);
                 }
@@ -1944,6 +1962,23 @@ impl FnGen<'_, '_, '_> {
                 let t = cty(&self.body.tys, *ty);
                 let e = self.eq_expr(&t, &a, &b);
                 if *ne { format!("(!{e})") } else { e }
+            }
+            Rvalue::Cmp { op, a, b, ty } => {
+                let (a, at) = self.operand(a, loc, post);
+                let (b, bt) = self.operand(b, loc, post);
+                let a = if matches!(at, CTy::Slice(_)) { format!("(&{a})") } else { a };
+                let b = if matches!(bt, CTy::Slice(_)) { format!("(&{b})") } else { b };
+                let t = cty(&self.body.tys, *ty);
+                self.want(Glue::Cmp, &t);
+                let c = format!("cmp_{}({a}, {b})", mangle(&t));
+                // The code is -1, 0, 1, or 2 (unordered): every
+                // operator is false on 2, as in `PartialOrd`.
+                match op {
+                    BinOp::Lt => format!("({c} == -1)"),
+                    BinOp::Gt => format!("({c} == 1)"),
+                    BinOp::Le => format!("((uint8_t)({c} + 1) <= 1)"),
+                    _ => format!("((uint8_t){c} <= 1)"),
+                }
             }
             Rvalue::StrCmp(op, a, b) => {
                 let (a, _) = self.operand(a, loc, post);
@@ -2393,6 +2428,7 @@ impl FnGen<'_, '_, '_> {
                 );
                 format!("&(*{v})->v")
             }
+            B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
             B::RcTryUnwrap => {
                 let elem = match &tys[0] { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(CTy::Rc(Box::new(elem.clone()))));
@@ -5231,6 +5267,196 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
             }
             let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
         }
+        Glue::Cmp => {
+            let _ = writeln!(protos, "int8_t cmp_{m}({ct} *a, {ct} *b);");
+            // One field pair `x`, `y` (C lvalues): scalars inline, the
+            // rest through their own glue.
+            let cmp_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
+                match t {
+                    CTy::Unit => "0".into(),
+                    CTy::Int(i) if is128(*i) => {
+                        let f = int_fn(*i);
+                        format!("((int8_t)((lust_{f}_cmp({x}, {y}) > 0) - (lust_{f}_cmp({x}, {y}) < 0)))")
+                    }
+                    CTy::Bool | CTy::Char | CTy::Int(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y})))"),
+                    CTy::Float(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y}) ? 1 : ({x}) == ({y}) ? 0 : 2))"),
+                    _ => {
+                        need(Glue::Cmp, t);
+                        format!("cmp_{}(&{x}, &{y})", mangle(t))
+                    }
+                }
+            };
+            // Elements in order; the first one that is not equal (or
+            // is unordered) decides. `len` compares last, as slices do.
+            let seq = |e: &CTy, x: &str, y: &str, n: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
+                let c = cmp_of(e, x, y, need);
+                format!("  for (uint64_t i = 0; i < {n}; i++) {{ int8_t c = {c}; if (c) return c; }}\n")
+            };
+            match t {
+                CTy::String => body.push_str("  int c = lust_str_cmp(lust_string_as_str(a), lust_string_as_str(b));\n  return c < 0 ? -1 : c > 0;\n"),
+                CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  int c = lust_str_cmp(*a, *b);\n  return c < 0 ? -1 : c > 0;\n"),
+                CTy::Option(e) => {
+                    let (af, bf) = (variant_field(p, t, "(*a)", 1, 0), variant_field(p, t, "(*b)", 1, 0));
+                    let c = cmp_of(e, &af, &bf, &mut need);
+                    let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                    let _ = writeln!(body, "  if ({da} != {db}) return {da} < {db} ? -1 : 1;\n  if (!{da}) return 0;\n  return {c};");
+                }
+                CTy::Result(x, y) => {
+                    let ca = cmp_of(x, &variant_field(p, t, "(*a)", 0, 0), &variant_field(p, t, "(*b)", 0, 0), &mut need);
+                    let cb = cmp_of(y, &variant_field(p, t, "(*a)", 1, 0), &variant_field(p, t, "(*b)", 1, 0), &mut need);
+                    let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                    let _ = writeln!(body, "  if ({da} != {db}) return {da} < {db} ? -1 : 1;\n  return {da} ? {cb} : {ca};");
+                }
+                CTy::Tuple(es) => {
+                    body.push_str("  int8_t c;\n");
+                    for (fi, ft) in es.iter().enumerate() {
+                        let c = cmp_of(ft, &format!("a->f{fi}"), &format!("b->f{fi}"), &mut need);
+                        let _ = writeln!(body, "  c = {c}; if (c) return c;");
+                    }
+                    body.push_str("  return 0;\n");
+                }
+                CTy::Array(e, n) => {
+                    body.push_str(&seq(e, "a->v[i]", "b->v[i]", &n.to_string(), &mut need));
+                    body.push_str("  return 0;\n");
+                }
+                CTy::Slice(e) => {
+                    body.push_str("  uint64_t n = a->len < b->len ? a->len : b->len;\n");
+                    body.push_str(&seq(e, "a->ptr[i]", "b->ptr[i]", "n", &mut need));
+                    body.push_str("  return a->len < b->len ? -1 : a->len > b->len;\n");
+                }
+                CTy::Vec(e) => {
+                    let et = ctype(e);
+                    body.push_str("  uint64_t n = a->len < b->len ? a->len : b->len;\n");
+                    body.push_str(&seq(e, &format!("(({et}*)a->ptr)[i]"), &format!("(({et}*)b->ptr)[i]"), "n", &mut need));
+                    body.push_str("  return a->len < b->len ? -1 : a->len > b->len;\n");
+                }
+                CTy::Ref(inner) | CTy::Boxed(inner) => {
+                    let c = cmp_of(inner, "(**a)", "(**b)", &mut need);
+                    let _ = writeln!(body, "  return {c};");
+                }
+                CTy::Rc(inner) => {
+                    let c = cmp_of(inner, "(*a)->v", "(*b)->v", &mut need);
+                    let _ = writeln!(body, "  return {c};");
+                }
+                CTy::Adt(adt_id) => {
+                    let adt = p.adt(*adt_id);
+                    let fields_cmp = |body: &mut String, v: &Variant, pre: &str, need: &mut dyn FnMut(Glue, &CTy)| {
+                        for (fi, f) in v.fields.iter().enumerate() {
+                            let ft = cty(&p.tys, f.ty);
+                            let c = cmp_of(&ft, &format!("a->{pre}f{fi}"), &format!("b->{pre}f{fi}"), need);
+                            let _ = write!(body, " c = {c}; if (c) return c;");
+                        }
+                    };
+                    body.push_str("  int8_t c;\n");
+                    if adt.is_enum {
+                        // Variants order by discriminant value, then
+                        // fields (derived `PartialOrd`). `rk` maps a
+                        // variant index to its rank when the values
+                        // are not increasing in variant order.
+                        let discs: Vec<i128> = adt.variants.iter().map(|v| v.disc).collect();
+                        let (da, db) = (disc_call(p, t, "a"), disc_call(p, t, "b"));
+                        if discs.windows(2).all(|w| w[0] < w[1]) {
+                            let _ = writeln!(body, "  if ({da} != {db}) return {da} < {db} ? -1 : 1;");
+                        } else {
+                            let mut order: Vec<usize> = (0..discs.len()).collect();
+                            order.sort_by_key(|&i| discs[i]);
+                            let mut rank = vec![0usize; discs.len()];
+                            for (r, &i) in order.iter().enumerate() {
+                                rank[i] = r;
+                            }
+                            let list: Vec<String> = rank.iter().map(|r| r.to_string()).collect();
+                            let _ = writeln!(body, "  static const uint32_t rk[] = {{ {} }};", list.join(", "));
+                            let _ = writeln!(body, "  if ({da} != {db}) return rk[{da}] < rk[{db}] ? -1 : 1;");
+                        }
+                        let _ = writeln!(body, "  switch ({da}) {{");
+                        for (vi, v) in adt.variants.iter().enumerate() {
+                            let _ = write!(body, "  case {vi}:");
+                            fields_cmp(&mut body, v, &format!("u.v{vi}."), &mut need);
+                            body.push_str(" break;\n");
+                        }
+                        body.push_str("  }\n  return 0;\n");
+                    } else {
+                        fields_cmp(&mut body, &adt.variants[0], "", &mut need);
+                        body.push_str("\n  return 0;\n");
+                    }
+                }
+                _ => {
+                    let c = cmp_of(t, "(*a)", "(*b)", &mut need);
+                    let _ = writeln!(body, "  return {c};");
+                }
+            }
+            let _ = writeln!(defs, "int8_t cmp_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
+        }
+        Glue::Default => {
+            let _ = writeln!(protos, "{ct} default_{m}(void);");
+            let def_of = |t: &CTy, need: &mut dyn FnMut(Glue, &CTy)| -> String {
+                match t {
+                    CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(p, t),
+                    _ => {
+                        need(Glue::Default, t);
+                        format!("default_{}()", mangle(t))
+                    }
+                }
+            };
+            match t {
+                CTy::String => body.push_str("  return lust_string_new();\n"),
+                CTy::Vec(e) => {
+                    let et = ctype(e);
+                    let _ = writeln!(body, "  return lust_vec_with_capacity(0, sizeof({et}), _Alignof({et}));");
+                }
+                CTy::Option(_) => {
+                    let _ = writeln!(body, "  return {};", variant_lit(p, t, 0, &[]));
+                }
+                CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return ((lust_str){(uint8_t*)\"\", 0});\n"),
+                CTy::Slice(e) => {
+                    let et = ctype(e);
+                    let _ = writeln!(body, "  {ct} r; r.ptr = ({et}*)(uintptr_t)_Alignof({et}); r.len = 0;\n  return r;");
+                }
+                CTy::Tuple(es) => {
+                    let vals: Vec<String> = es.iter().enumerate().map(|(i, e)| format!(".f{i} = {}", def_of(e, &mut need))).collect();
+                    let _ = writeln!(body, "  return (({ct}){{ {} }});", vals.join(", "));
+                }
+                CTy::Array(e, n) => {
+                    if *n == 0 {
+                        let _ = writeln!(body, "  return {};", zero_lit(p, t));
+                    } else {
+                        let d = def_of(e, &mut need);
+                        let _ = writeln!(body, "  {ct} r;\n  for (uint64_t i = 0; i < {n}; i++) r.v[i] = {d};\n  return r;");
+                    }
+                }
+                CTy::Boxed(e) => {
+                    let et = ctype(e);
+                    let d = def_of(e, &mut need);
+                    let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {d};\n  return r;");
+                }
+                CTy::Rc(e) => {
+                    let it = format!("RcI_{}", mangle(e));
+                    let d = def_of(e, &mut need);
+                    let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); r->strong = 1; r->weak = 0; r->v = {d};\n  return r;");
+                }
+                CTy::Adt(adt_id) => {
+                    let adt = p.adt(*adt_id);
+                    if adt.is_enum {
+                        let vi = adt.derives.default_variant.unwrap_or(0) as usize;
+                        let _ = writeln!(body, "  return {};", variant_lit(p, t, vi, &[]));
+                    } else if adt.variants[0].fields.is_empty() {
+                        let _ = writeln!(body, "  return {};", zero_lit(p, t));
+                    } else {
+                        let vals: Vec<String> = adt.variants[0]
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| format!(".f{i} = {}", def_of(&cty(&p.tys, f.ty), &mut need)))
+                            .collect();
+                        let _ = writeln!(body, "  return (({ct}){{ {} }});", vals.join(", "));
+                    }
+                }
+                _ => {
+                    let _ = writeln!(body, "  return {};", def_of(t, &mut need));
+                }
+            }
+            let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{body}}}\n");
+        }
         Glue::Debug => {
             let _ = writeln!(protos, "void dbg_{m}(lust_String *out, {ct} *p);");
             let dbg_of = |t: &CTy, e: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
@@ -5410,7 +5636,12 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
         | Rvalue::MakeDyn { ptr: o, .. }
         | Rvalue::DynUpcast { ptr: o, .. }
         | Rvalue::DynMeta { ptr: o, .. } => op(o),
-        Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
+        Rvalue::Bin(_, a, b)
+        | Rvalue::StrCmp(_, a, b)
+        | Rvalue::StringAdd(a, b)
+        | Rvalue::VecRepeat(_, a, b)
+        | Rvalue::Eq { a, b, .. }
+        | Rvalue::Cmp { a, b, .. } => {
             op(a);
             op(b);
         }

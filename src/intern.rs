@@ -428,6 +428,7 @@ known_syms!(
     weak_count,
     make_mut,
     try_unwrap,
+    default,
 );
 
 impl Known {

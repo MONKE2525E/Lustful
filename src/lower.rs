@@ -1010,7 +1010,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                             TyKind::Int(it) => Const::Int(0, it),
                             TyKind::Bool => Const::Bool(false),
                             TyKind::Char => Const::Char('\0'),
-                            _ => Const::Unit,
+                            TyKind::Unit => Const::Unit,
+                            // Other types build their default value in
+                            // the `default` glue, typed by the call's
+                            // destination.
+                            _ => {
+                                let d = self.call_dest(dest, ty);
+                                self.call_into(CallTarget::Builtin(Builtin::DefaultGlue), Vec::new(), d, span);
+                                return;
+                            }
                         };
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(zero)), ty, span)
                     }
@@ -1698,12 +1706,13 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Calls ----------
 
-    /// A scalar comparison trait method (`Res::PrimCmp`): the
-    /// receiver is borrowed `&self` (so borrowck sees the loan a
-    /// method call would make), both sides are read as scalars,
-    /// and the result is the scalar comparison, an `Ordering`
-    /// value, or an `Option<Ordering>` (`None` only when a float
-    /// comparison is unordered).
+    /// A comparison trait method (`Res::PrimCmp`): the receiver is
+    /// borrowed `&self` (so borrowck sees the loan a method call
+    /// would make), and the result is the comparison, an
+    /// `Ordering` value, or an `Option<Ordering>` (`None` only when
+    /// the comparison is unordered). Scalars compare directly,
+    /// `str` through the string comparison, and other types by
+    /// structure through the `eq` and `cmp` glue.
     fn prim_cmp_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span, kind: PrimCmpKind, derefs: u8) {
         use crate::check::PrimCmpKind as Ck;
         let out_ty = self.ty(e);
@@ -1719,22 +1728,38 @@ impl<'p, 'a> Lower<'p, 'a> {
         let rt_ty = self.ref_ty(false, recv_ty);
         let rt = self.temp(rt_ty);
         self.assign(Place::local(rt), Rvalue::Ref(false, pl), span);
-        let a = Operand::Copy(Place::local(rt).deref());
         let b_ref = self.operand(args[0]);
         let b_pl = self.op_place(b_ref, self.ty(args[0]), span);
-        let b = Operand::Copy(b_pl.deref());
+        // One comparison of the two sides as a `bool` rvalue. The
+        // eq test of `partial_cmp` asks `<=` after `<` failed: that
+        // is "equal" exactly as the type's `partial_cmp` orders,
+        // also for a structure whose `PartialEq` is not derived.
+        let scalar = matches!(self.kind(recv_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char);
+        let is_str = self.kind(recv_ty) == TyKind::Str;
+        let (a_ref, b_ref) = (Operand::Copy(Place::local(rt)), Operand::Copy(b_pl.clone()));
+        let rv = move |op: BinOp| -> Rvalue {
+            if scalar {
+                Rvalue::Bin(op, Operand::Copy(Place::local(rt).deref()), Operand::Copy(b_pl.deref()))
+            } else if is_str {
+                Rvalue::StrCmp(op, a_ref.clone(), b_ref.clone())
+            } else if matches!(op, BinOp::Eq | BinOp::Ne) {
+                Rvalue::Eq { a: a_ref.clone(), b: b_ref.clone(), ty: recv_ty, ne: op == BinOp::Ne }
+            } else {
+                Rvalue::Cmp { op, a: a_ref.clone(), b: b_ref.clone(), ty: recv_ty }
+            }
+        };
         match kind {
-            Ck::Op(op) => self.assign(out, Rvalue::Bin(op, a, b), span),
+            Ck::Op(op) => self.assign(out, rv(op), span),
             Ck::Total(adt) | Ck::Partial(adt) => {
                 let partial = matches!(kind, Ck::Partial(_));
-                let mut cmp = |this: &mut Self, op: BinOp| {
+                let cmp = |this: &mut Self, op: BinOp| {
                     let t = this.temp(BOOL);
-                    this.assign(Place::local(t), Rvalue::Bin(op, a.clone(), b.clone()), span);
+                    this.assign(Place::local(t), rv(op), span);
                     t
                 };
                 let lt = cmp(self, BinOp::Lt);
                 let gt = cmp(self, BinOp::Gt);
-                let eq = if partial { Some(cmp(self, BinOp::Eq)) } else { None };
+                let eq = if partial { Some(cmp(self, if scalar || is_str { BinOp::Eq } else { BinOp::Le })) } else { None };
                 let (ord_ty, ord_pl) = if partial {
                     let t = self.body.tys.option_elem(out_ty).unwrap_or(out_ty);
                     (t, Place::local(self.temp(t)))
@@ -2001,7 +2026,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         };
         let lt = self.ty(lhs);
         let base = self.peel(lt, ld);
-        if op.is_cmp() && !matches!(op, BinOp::Eq | BinOp::Ne) && matches!(self.kind(base), TyKind::Tuple(_) | TyKind::Unit) {
+        if op.is_cmp() && !matches!(op, BinOp::Eq | BinOp::Ne) && matches!(self.kind(base), TyKind::Tuple(_) | TyKind::Unit) && self.expands_ord(base) {
             // Tuple ordering is lexicographic: the first unequal field
             // decides, equal tuples order by the operator's reflexivity.
             let ao = self.operand_derefs(lhs, ld);
@@ -2028,10 +2053,16 @@ impl<'p, 'a> Lower<'p, 'a> {
                     let b = self.str_view(rhs, rd);
                     Rvalue::StrCmp(op, a, b)
                 }
-                _ => {
+                _ if matches!(op, BinOp::Eq | BinOp::Ne) => {
                     let (a, t) = self.borrow_of(lhs, ld);
                     let (b, _) = self.borrow_of(rhs, rd);
                     Rvalue::Eq { a, b, ty: t, ne: op == BinOp::Ne }
+                }
+                // Ordering by structure (`has_ord`): the `cmp` glue.
+                _ => {
+                    let (a, t) = self.borrow_of(lhs, ld);
+                    let (b, _) = self.borrow_of(rhs, rd);
+                    Rvalue::Cmp { op, a, b, ty: t }
                 }
             }
         } else if self.body.tys.is_string_ty(lt) {
@@ -2173,11 +2204,25 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// True when an ordering of `ty` expands in lowering (`ord_into`):
+    /// tuples whose elements are scalars, strings, references to
+    /// such, or tuples of such. Other orderable types compare
+    /// through the `cmp` glue (`Rvalue::Cmp`).
+    fn expands_ord(&self, ty: Ty) -> bool {
+        match self.kind(ty) {
+            TyKind::Unit | TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
+            TyKind::Ref(_, _, e) => self.expands_ord(e),
+            TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec().into_iter().all(|e| self.expands_ord(e)),
+            _ => self.body.tys.is_string_ty(ty),
+        }
+    }
+
     /// Writes the comparison `a <op> b` for orderable places into
     /// `out`. Tuples expand lexicographically, field by field, with a
     /// short circuit on the first unequal field; equality of nested
     /// tuples expands the same way. The checker gates the shapes this
-    /// can see through `has_ord`.
+    /// can see through `has_ord`; the caller sends only the shapes
+    /// `expands_ord` accepts.
     fn ord_into(&mut self, op: BinOp, a: Place, b: Place, ty: Ty, out: Place, span: Span) {
         match self.kind(ty) {
             TyKind::Unit => {

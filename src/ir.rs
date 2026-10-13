@@ -90,6 +90,15 @@ pub enum Rvalue {
         ty: Ty,
         ne: bool,
     },
+    /// `a < b` (and `<=`, `>`, `>=`) for a type that orders by
+    /// structure (`check::has_ord`). Both operands are references to
+    /// `ty`; codegen compares through the `cmp` glue.
+    Cmp {
+        op: BinOp,
+        a: Operand,
+        b: Operand,
+        ty: Ty,
+    },
     /// String comparison. Both operands are `&str`.
     StrCmp(BinOp, Operand, Operand),
     /// `String + &str`.

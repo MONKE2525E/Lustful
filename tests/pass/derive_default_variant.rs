@@ -1,4 +1,3 @@
-// expect: L0522
 #[derive(Default)]
 enum E {
     #[default]

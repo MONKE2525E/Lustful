@@ -3370,12 +3370,17 @@ pub fn add_synthetic_impls(p: &mut Program) {
     for a in 0..n_adts {
         let adt = AdtId(a as u32);
         let (def, n_params) = p.gx.adt_info[a];
-        let derives = p.adt(adt).derives;
-        let wanted: [(bool, DefId, &str); 4] = [
+        let (derives, is_enum) = (p.adt(adt).derives, p.adt(adt).is_enum);
+        let wanted: [(bool, DefId, &str); 9] = [
             (derives.clone, lang.clone, "Clone"),
             (derives.copy, lang.copy, "Copy"),
             (derives.debug, lang.debug, "Debug"),
             (derives.partial_eq, lang.partial_eq, "PartialEq"),
+            (derives.eq, lang.eq, "Eq"),
+            (derives.hash, lang.hash, "Hash"),
+            (derives.partial_ord, lang.partial_ord, "PartialOrd"),
+            (derives.ord, lang.ord, "Ord"),
+            (derives.default, lang.default, "Default"),
         ];
         for (on, trait_def, dname) in wanted {
             if !on {
@@ -3388,12 +3393,20 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 })
                 .collect();
             let self_pat = p.tys.mk_adt(def, &param_args);
-            let rest: Vec<Ty> = if trait_def == lang.partial_eq { vec![self_pat] } else { Vec::new() };
+            let with_rhs = trait_def == lang.partial_eq || trait_def == lang.partial_ord;
+            let rest: Vec<Ty> = if with_rhs { vec![self_pat] } else { Vec::new() };
             let mut preds: Vec<Predicate> = Vec::new();
-            for i in 0..n_params as u32 {
-                let t = p.tys.intern(TyKind::Param(ParamId(i)));
+            // rustc bounds every type parameter by the derived trait,
+            // except `Default` on an enum: its default variant is a
+            // unit variant, so that impl has no bounds at all.
+            let bounded = !(trait_def == lang.default && is_enum);
+            for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
+                if !bounded || param.kind != ParamKind::Type {
+                    continue;
+                }
+                let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
                 let mut tr_args = vec![GenericArg::Ty(t)];
-                if trait_def == lang.partial_eq {
+                if with_rhs {
                     tr_args.push(GenericArg::Ty(t));
                 }
                 let args = p.tys.intern_args(&tr_args);
@@ -3499,15 +3512,27 @@ pub fn add_synthetic_impls(p: &mut Program) {
         params: vec![ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span }],
         predicates: Vec::new(),
     };
-    let pred_on_p0 = |p: &mut Program, trait_def: DefId| -> Vec<Predicate> {
-        let t = p.tys.intern(TyKind::Param(ParamId(0)));
+    let pred_on = |p: &mut Program, trait_def: DefId, t: Ty| -> Predicate {
         let mut a = vec![GenericArg::Ty(t)];
         if trait_def == lang.partial_eq || trait_def == lang.partial_ord {
             a.push(GenericArg::Ty(t));
         }
         let args = p.tys.intern_args(&a);
-        vec![Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS }))]
+        Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS }))
     };
+    let pred_on_p0 = |p: &mut Program, trait_def: DefId| -> Vec<Predicate> {
+        let t = p.tys.intern(TyKind::Param(ParamId(0)));
+        vec![pred_on(p, trait_def, t)]
+    };
+    // An impl whose trait takes `Rhs = Self` (`PartialEq`,
+    // `PartialOrd`) names Self again as its input.
+    let rhs_of = |trait_def: DefId, self_pat: Ty| -> Vec<Ty> {
+        if trait_def == lang.partial_eq || trait_def == lang.partial_ord { vec![self_pat] } else { Vec::new() }
+    };
+    // `str` compares, orders, and hashes by its bytes.
+    for tr in [lang.eq, lang.hash, lang.partial_eq, lang.partial_ord, lang.ord] {
+        insert_synthetic(p, &mut ordinal, tr, STR, &rhs_of(tr, STR), g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     // &T: Copy + Clone unconditionally, the rest through T.
     let ref_p0 = p.tys.mk_ref(false, p0);
     insert_synthetic(p, &mut ordinal, lang.copy, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -3527,24 +3552,21 @@ pub fn add_synthetic_impls(p: &mut Program) {
         insert_synthetic(p, &mut ordinal, lang.display, self_pat, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
     // String and the generic builtin containers.
-    for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default] {
-        insert_synthetic(p, &mut ordinal, tr, STRING, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default, lang.partial_eq, lang.partial_ord, lang.ord] {
+        insert_synthetic(p, &mut ordinal, tr, STRING, &rhs_of(tr, STRING), g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
-    insert_synthetic(p, &mut ordinal, lang.partial_eq, STRING, &[STRING], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     insert_synthetic(p, &mut ordinal, lang.deref, STRING, &[], g0.clone(), vec![(lang.assoc_target, STR)], Synthetic::Lang, false, span);
     let vec_p0 = p.tys.mk_vec(p0);
     let opt_p0 = p.tys.mk_option(p0);
     for (self_pat, with_copy) in [(vec_p0, false), (opt_p0, true)] {
-        for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default] {
+        // `Default` for `Vec<T>` and `Option<T>` holds for every T.
+        insert_synthetic(p, &mut ordinal, lang.default, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.partial_eq, lang.partial_ord, lang.ord] {
             let preds = pred_on_p0(p, tr);
             let mut g1 = one.clone();
             g1.predicates = preds;
-            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &rhs_of(tr, self_pat), g1, Vec::new(), Synthetic::Lang, false, span);
         }
-        let preds = pred_on_p0(p, lang.partial_eq);
-        let mut g1 = one.clone();
-        g1.predicates = preds;
-        insert_synthetic(p, &mut ordinal, lang.partial_eq, self_pat, &[self_pat], g1, Vec::new(), Synthetic::Lang, false, span);
         if with_copy {
             let preds = pred_on_p0(p, lang.copy);
             let mut g1 = one.clone();
@@ -3552,20 +3574,33 @@ pub fn add_synthetic_impls(p: &mut Program) {
             insert_synthetic(p, &mut ordinal, lang.copy, self_pat, &[], g1, Vec::new(), Synthetic::Lang, false, span);
         }
     }
+    // Result<T, E>: the derive-shaped traits through both params.
+    {
+        let two = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("E"), kind: ParamKind::Type, span },
+            ],
+            predicates: Vec::new(),
+        };
+        let res_pat = p.tys.mk_result(p0, p1);
+        for tr in [lang.copy, lang.clone, lang.debug, lang.eq, lang.hash, lang.partial_eq, lang.partial_ord, lang.ord] {
+            let mut g2 = two.clone();
+            g2.predicates = vec![pred_on(p, tr, p0), pred_on(p, tr, p1)];
+            insert_synthetic(p, &mut ordinal, tr, res_pat, &rhs_of(tr, res_pat), g2, Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
     // Box<T>: like Vec for the derive-shaped traits, plus Deref
     // and DerefMut to T with no bounds of their own.
     {
         let box_p0 = p.tys.mk_boxed(p0);
-        for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default] {
+        for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default, lang.partial_eq, lang.partial_ord, lang.ord] {
             let preds = pred_on_p0(p, tr);
             let mut g1 = one.clone();
             g1.predicates = preds;
-            insert_synthetic(p, &mut ordinal, tr, box_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, box_p0, &rhs_of(tr, box_p0), g1, Vec::new(), Synthetic::Lang, false, span);
         }
-        let preds = pred_on_p0(p, lang.partial_eq);
-        let mut g1 = one.clone();
-        g1.predicates = preds;
-        insert_synthetic(p, &mut ordinal, lang.partial_eq, box_p0, &[box_p0], g1, Vec::new(), Synthetic::Lang, false, span);
         for tr in [lang.deref, lang.deref_mut] {
             insert_synthetic(
                 p,
@@ -3586,16 +3621,12 @@ pub fn add_synthetic_impls(p: &mut Program) {
     {
         let rc_p0 = p.tys.mk_rc(p0);
         insert_synthetic(p, &mut ordinal, lang.clone, rc_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
-        for tr in [lang.debug, lang.eq, lang.hash, lang.default] {
+        for tr in [lang.debug, lang.eq, lang.hash, lang.default, lang.partial_eq, lang.partial_ord, lang.ord] {
             let preds = pred_on_p0(p, tr);
             let mut g1 = one.clone();
             g1.predicates = preds;
-            insert_synthetic(p, &mut ordinal, tr, rc_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, rc_p0, &rhs_of(tr, rc_p0), g1, Vec::new(), Synthetic::Lang, false, span);
         }
-        let preds = pred_on_p0(p, lang.partial_eq);
-        let mut g1 = one.clone();
-        g1.predicates = preds;
-        insert_synthetic(p, &mut ordinal, lang.partial_eq, rc_p0, &[rc_p0], g1, Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(
             p,
             &mut ordinal,
@@ -4914,14 +4945,28 @@ fn prove_trait_ref(
 /// structural forms core implements component-wise (tuples,
 /// arrays, references) since those have no impl records here.
 fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: Ty) -> bool {
+    let lang = p.gx.lang;
+    let default = trait_def == lang.default;
     match p.tys.kind(ty) {
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
             elems.iter().all(|&e| prove_field_trait(p, env, trait_def, e))
         }
-        TyKind::Array(e, _) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
+        // core's `Default` impls: arrays of up to 32 elements (any
+        // element type at length 0), `&str` and `&[T]`; no others.
+        TyKind::Array(e, n) if default => match p.tys.const_kind(n) {
+            ConstKind::Int(0) => true,
+            ConstKind::Int(k) if k <= 32 => prove_field_trait(p, env, trait_def, e),
+            _ => false,
+        },
+        TyKind::Ref(_, _, e) if default => matches!(p.tys.kind(e), TyKind::Str | TyKind::Slice(_)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
         _ => {
-            let a = p.tys.intern_args(&[GenericArg::Ty(ty)]);
+            let mut a = vec![GenericArg::Ty(ty)];
+            if trait_def == lang.partial_eq || trait_def == lang.partial_ord {
+                a.push(GenericArg::Ty(ty));
+            }
+            let a = p.tys.intern_args(&a);
             prove_goal(p, env, TraitRef { def: trait_def, args: a, bindings: EMPTY_BINDINGS })
         }
     }
@@ -5110,44 +5155,77 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
-/// `#[derive(Eq)]` requires `PartialEq` and `Eq` fields;
-/// `#[derive(Hash)]` requires `Hash` fields (rustc E0277 for
-/// the generated impls). The derived impl bounds each type
-/// parameter by the derived trait, as rustc writes it.
+/// The derived traits that need more than the field checks in
+/// collect (rustc E0277 for the generated impls): `Eq` needs
+/// `PartialEq` on the type, `PartialOrd` needs `PartialEq`, `Ord`
+/// needs `Eq` and `PartialOrd`; and `Eq`, `Hash`, `PartialOrd`,
+/// `Ord`, and `Default` need every field to implement the trait.
+/// The derived impl bounds each type parameter by the derived
+/// trait, as rustc writes it, so those bounds join the field env.
+/// Derived `Default` on an enum builds its unit `#[default]`
+/// variant and needs nothing of the fields.
 fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
     let lang = p.gx.lang;
     let n = p.gx.adt_info.len();
     for idx in 0..n {
         let adt_id = AdtId(idx as u32);
         let (def, _) = p.gx.adt_info[idx];
-        let (derives, span, field_tys) = {
+        let (derives, span, is_enum, field_tys) = {
             let a = p.adt(adt_id);
-            (a.derives, a.span, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
+            (a.derives, a.span, a.is_enum, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
         };
-        if !derives.eq && !derives.hash {
+        if !(derives.eq || derives.hash || derives.partial_ord || derives.ord || derives.default) {
+            continue;
+        }
+        // The type's own impl of a trait, derived or written.
+        let has_impl = |p: &Program, on: bool, trait_def: DefId| {
+            on || p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
+                matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def)
+            })
+        };
+        let name = p.name(p.adt(adt_id).name).to_string();
+        let mut supers_ok = true;
+        if derives.eq && !has_impl(p, derives.partial_eq, lang.partial_eq) {
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                "deriving `Eq` requires `PartialEq`",
+                "Add `PartialEq` to the derive list, or implement it by hand.",
+            ));
+            supers_ok = false;
+        }
+        if derives.partial_ord && !has_impl(p, derives.partial_eq, lang.partial_eq) {
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                format!("can't compare `{name}` with `{name}`: deriving `PartialOrd` requires `PartialEq`"),
+                "Add `PartialEq` to the derive list, or implement it by hand.",
+            ));
+            supers_ok = false;
+        }
+        if derives.ord && !(has_impl(p, derives.eq, lang.eq) && has_impl(p, derives.partial_ord, lang.partial_ord)) {
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                format!("deriving `Ord` requires `Eq` and `PartialOrd` on `{name}`"),
+                "Add `Eq` and `PartialOrd` to the derive list, or implement them by hand.",
+            ));
+            supers_ok = false;
+        }
+        if !supers_ok {
             continue;
         }
         let base_env = elaborate_env(&mut p.tys, &p.gx.index, &p.gx.adt_generics[idx].predicates.clone());
-        for (wanted, trait_def, dname) in [(derives.eq, lang.eq, "Eq"), (derives.hash, lang.hash, "Hash")] {
+        let wanted = [
+            (derives.eq, lang.eq, "Eq"),
+            (derives.hash, lang.hash, "Hash"),
+            (derives.partial_ord, lang.partial_ord, "PartialOrd"),
+            (derives.ord, lang.ord, "Ord"),
+            (derives.default && !is_enum, lang.default, "Default"),
+        ];
+        for (wanted, trait_def, dname) in wanted {
             if !wanted {
                 continue;
-            }
-            if dname == "Eq" {
-                let has_pe = derives.partial_eq
-                    || p.gx
-                        .index
-                        .impls_of_trait(lang.partial_eq)
-                        .iter()
-                        .any(|&id| matches!(p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)), TyKind::Adt(d, _) if d == def));
-                if !has_pe {
-                    errs.push(Diag::new(
-                        "L0110",
-                        span,
-                        "deriving `Eq` requires `PartialEq`",
-                        "Add `PartialEq` to the derive list, or implement it by hand.",
-                    ));
-                    continue;
-                }
             }
             // The derive's own parameter bounds join the env.
             let mut env = base_env.clone();
@@ -5156,7 +5234,11 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
                     continue;
                 }
                 let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
-                let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
+                let mut a = vec![GenericArg::Ty(t)];
+                if trait_def == lang.partial_ord {
+                    a.push(GenericArg::Ty(t));
+                }
+                let args = p.tys.intern_args(&a);
                 env.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
             }
             let env = elaborate_env(&mut p.tys, &p.gx.index, &env);

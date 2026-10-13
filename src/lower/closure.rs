@@ -322,7 +322,12 @@ fn rewrite_rvalue(up: &Upvars, rv: &mut Rvalue) -> bool {
         Rvalue::Use(o) | Rvalue::Un(_, o) | Rvalue::Cast(o, _) | Rvalue::ArrayRepeat(_, o, _) | Rvalue::Res(_, _, o) => rewrite_operand(up, o),
         Rvalue::Opt(_, o) => o.as_mut().is_none_or(|o| rewrite_operand(up, o)),
         Rvalue::MakeDyn { ptr, .. } | Rvalue::DynUpcast { ptr, .. } | Rvalue::DynMeta { ptr, .. } => rewrite_operand(up, ptr),
-        Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
+        Rvalue::Bin(_, a, b)
+        | Rvalue::StrCmp(_, a, b)
+        | Rvalue::StringAdd(a, b)
+        | Rvalue::VecRepeat(_, a, b)
+        | Rvalue::Eq { a, b, .. }
+        | Rvalue::Cmp { a, b, .. } => {
             rewrite_operand(up, a) & rewrite_operand(up, b)
         }
         Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {

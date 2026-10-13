@@ -99,7 +99,7 @@ Release builds go through the real Rust toolchain on the same source, and lust p
 ## Supported subset
 
 - Items: `fn`, `struct` (named fields or unit), `enum` (unit, tuple, and struct variants), inherent `impl` blocks, `use`.
-- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash` (Hash is accepted, but nothing uses it yet).
+- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default` (with `#[default]` enum variants). The derived bodies are structural: a field type whose impl of the derived trait is written by hand is rejected where the derived method is used. `Hash` answers bounds only; nothing hashes yet.
 - Types: integers (no 128-bit), `bool`, `char`, `String`, `&str`, `Vec<T>`, `Option<T>`, `&T`, `&mut T`.
 - Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns, default binding modes), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.
 - Macros: `macro_rules!` definitions and calls (matching, hygiene, textual and `#[macro_export]` scope, in one file), plus built-ins: `println!`, `print!`, `eprintln!`, `eprint!`, `format!` (`{}`, `{:?}`, positional, and captured names), `vec!`, `panic!`, `assert!`/`assert_eq!`/`assert_ne!`, `debug_assert!` family, `matches!`, `concat!`, `stringify!`, `cfg!`, `env!`, `option_env!`, `line!`, `column!`, `file!`, `module_path!`, `include!`, `include_str!`, `compile_error!`, `dbg!`, `write!`/`writeln!`, `todo!`, `unreachable!`, `unimplemented!`.

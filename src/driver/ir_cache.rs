@@ -178,6 +178,13 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_operand(h, p, tys, b, seen);
             ty(h, *t, seen);
         }
+        Rvalue::Cmp { op, a, b, ty: t } => {
+            24u8.hash(h);
+            std::mem::discriminant(op).hash(h);
+            hash_operand(h, p, tys, a, seen);
+            hash_operand(h, p, tys, b, seen);
+            ty(h, *t, seen);
+        }
         Rvalue::StrCmp(op, a, b) => {
             10u8.hash(h);
             std::mem::discriminant(op).hash(h);
@@ -536,6 +543,7 @@ enum CachedRvalue {
     VecLit(u32, Vec<CachedOperand>),
     VecRepeat(u32, CachedOperand, CachedOperand),
     Eq { a: CachedOperand, b: CachedOperand, ty: u32, ne: bool },
+    Cmp { op: BinOp, a: CachedOperand, b: CachedOperand, ty: u32 },
     StrCmp(BinOp, CachedOperand, CachedOperand),
     StringAdd(CachedOperand, CachedOperand),
     Format(Vec<CachedFmt>),
@@ -835,6 +843,9 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::Eq { a, b: c, ty, ne } => {
             CachedRvalue::Eq { a: cache_operand(b, p, a), b: cache_operand(b, p, c), ty: b.ty(*ty), ne: *ne }
         }
+        Rvalue::Cmp { op, a, b: c, ty } => {
+            CachedRvalue::Cmp { op: *op, a: cache_operand(b, p, a), b: cache_operand(b, p, c), ty: b.ty(*ty) }
+        }
         Rvalue::StrCmp(op, a, c) => CachedRvalue::StrCmp(*op, cache_operand(b, p, a), cache_operand(b, p, c)),
         Rvalue::StringAdd(a, c) => CachedRvalue::StringAdd(cache_operand(b, p, a), cache_operand(b, p, c)),
         Rvalue::Format(parts) => CachedRvalue::Format(cache_fmt(b, p, parts)),
@@ -1001,6 +1012,12 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
                 b: operand(intern, tys, strings, c)?,
                 ty: intern.ty(tys, *ty)?,
                 ne: *ne,
+            },
+            CachedRvalue::Cmp { op, a, b: c, ty } => Rvalue::Cmp {
+                op: *op,
+                a: operand(intern, tys, strings, a)?,
+                b: operand(intern, tys, strings, c)?,
+                ty: intern.ty(tys, *ty)?,
             },
             CachedRvalue::StrCmp(op, a, c) => Rvalue::StrCmp(*op, operand(intern, tys, strings, a)?, operand(intern, tys, strings, c)?),
             CachedRvalue::StringAdd(a, c) => Rvalue::StringAdd(operand(intern, tys, strings, a)?, operand(intern, tys, strings, c)?),

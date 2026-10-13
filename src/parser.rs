@@ -880,21 +880,28 @@ impl<'a> Parser<'a> {
     /// module, impl, trait, or match body, or a permitted block, and those
     /// sites call `inner_attributes` before anything else in the body.
     fn attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(true, false)
+        self.attributes_at(true, false, false)
     }
 
     /// Attributes on a part of an item (a field, parameter, variant, arm, or
     /// statement). `derive` and `test` are not valid there (rustc rejects
     /// them), so they get the unsupported-attribute error, not a free pass.
     fn part_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(false, false)
+        self.attributes_at(false, false, false)
+    }
+
+    /// Attributes on an enum variant: part attributes plus `#[default]`,
+    /// which rustc accepts only there (collect checks that the enum
+    /// derives `Default` and that the variant is a unit variant).
+    fn variant_attributes(&mut self) -> PResult<ParsedAttrs> {
+        self.attributes_at(false, false, true)
     }
 
     /// Parses a run of inner attributes (`#![..]`, `//!` docs) at a site
     /// that permits them. Stops at the first outer attribute, which belongs
     /// to the next item or statement in the body.
     fn inner_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(true, true)
+        self.attributes_at(true, true, false)
     }
 
     /// True when the next tokens start an inner attribute (`#!`).
@@ -902,7 +909,7 @@ impl<'a> Parser<'a> {
         self.peek() == Tok::Pound && self.peek_at(1) == Tok::Bang
     }
 
-    fn attributes_at(&mut self, item_level: bool, inner_only: bool) -> PResult<ParsedAttrs> {
+    fn attributes_at(&mut self, item_level: bool, inner_only: bool, variant: bool) -> PResult<ParsedAttrs> {
         let mut out = ParsedAttrs::default();
         while self.peek() == Tok::Pound {
             if inner_only && !self.at_inner_attr() {
@@ -1037,6 +1044,8 @@ impl<'a> Parser<'a> {
                 // warning infrastructure in v1. No output changes.
                 _ if matches!(name_text.as_str(), "inline" | "cold" | "must_use" | "deprecated") => {}
                 _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}
+                // `#[default]` marks the `Default` variant of a derived enum.
+                _ if variant && !inner && name_text == "default" && matches!(attr.input, AttrInput::None) => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
                     return Err(Diag::new(
                         C_ATTR,
@@ -1775,7 +1784,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
         while self.peek() != Tok::RBrace {
-            let vattrs = self.part_attributes()?;
+            let vattrs = self.variant_attributes()?;
             let (vname, span) = self.ident()?;
             let fields = match self.peek() {
                 Tok::LParen => {

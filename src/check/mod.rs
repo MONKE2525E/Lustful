@@ -279,6 +279,10 @@ pub enum Builtin {
     VecIterLen,
     CharsBytesLeft,
     CharsNextBack,
+    /// `Default::default()` of a type whose default is built by
+    /// structure (`has_default`): the `default` glue of the call's
+    /// destination type.
+    DefaultGlue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1701,6 +1705,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             has_debug(p, &self.tys, self_ty)
         } else if trait_def == lang.partial_eq || trait_def == lang.eq {
             has_eq(p, &self.tys, self_ty)
+        } else if trait_def == lang.partial_ord {
+            has_ord(p, &self.tys, self_ty)
+        } else if trait_def == lang.ord {
+            has_total_ord(p, &self.tys, self_ty)
+        } else if trait_def == lang.hash {
+            has_hash(p, &self.tys, self_ty)
+        } else if trait_def == lang.default {
+            has_default(p, &self.tys, self_ty)
         } else {
             false
         }
@@ -3762,7 +3774,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.exhaustive(st, arms, span);
                 result.unwrap_or(NEVER)
             }
-            Expr::Call { callee, args } => self.call(e, *callee, args, span, expected),
+            Expr::Call { callee, args } => {
+                if let Some(t) = self.self_from_expected_call(e, *callee, args, expected, span) {
+                    return t;
+                }
+                self.call(e, *callee, args, span, expected)
+            }
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
                 self.method_call(e, *recv, *name, *name_span, args, generic_args, expected)
             }
@@ -6088,6 +6105,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let mut hits: Vec<(LocalDefId, Vec<Ty>, Ty)> = Vec::new();
         let mut hit_traits: Vec<DefId> = Vec::new();
+        // A `Default` impl with no method fn (a derive, or core's
+        // impl for a builtin type) that builds its value by
+        // structure: lowering emits the `default` glue.
+        let mut default_glue = false;
         for trait_def in traits {
             let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
             if rec.method_by_name(name).is_none() {
@@ -6116,6 +6137,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         hit_traits.push(trait_def);
                         continue;
                     }
+                    if trait_def == p.gx.lang.default
+                        && mname == "default"
+                        && p.gx.index.get(id).synthetic != crate::traits::index::Synthetic::None
+                        && has_default(p, &self.tys, base)
+                    {
+                        default_glue = true;
+                        hit_traits.push(trait_def);
+                        continue;
+                    }
+                }
+                // A structural answer (tuples, arrays: no impl
+                // record) is not a bound: `Default` builds by glue,
+                // and no other trait method has a body to call.
+                Selection::ParamEvidence(usize::MAX) => {
+                    if trait_def == p.gx.lang.default && self.name(name) == "default" && has_default(p, &self.tys, base) {
+                        default_glue = true;
+                        hit_traits.push(trait_def);
+                        continue;
+                    }
                 }
                 Selection::ParamEvidence(_) => {
                     if let Some(found) = self.stub_instance(e, tr, name, span) {
@@ -6131,7 +6171,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.generic_sites.truncate(sites_len);
         }
         match hits.len() {
-            1 => {
+            0 if default_glue && hit_traits.len() == 1 => {
+                self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
+                self.set_res(callee, Res::DefaultVal);
+                self.set_res(e, Res::DefaultVal);
+                self.check_args(&[], args, span);
+                Some(base)
+            }
+            1 if !default_glue => {
                 let (local, params, ret) = hits.into_iter().next().unwrap();
                 self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
                 self.set_res(e, Res::Fn(local));
@@ -6152,6 +6199,44 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(ERROR)
             }
         }
+    }
+
+    /// `Default::default()` and `From::from(x)` written through the
+    /// trait name, where only the expected type names Self (rustc
+    /// infers it the same way): the call is the assoc call on that
+    /// type. None when the callee is another form, a type of that
+    /// name shadows the trait, or the expected type is not known yet.
+    fn self_from_expected_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], expected: Option<Ty>, span: Span) -> Option<Ty> {
+        let p = self.p;
+        let Expr::Path(segs) = p.ast.expr(callee) else { return None };
+        if segs.len() != 2 || p.type_names.contains_key(&segs[0].name) || p.aliases.contains_key(&segs[0].name) {
+            return None;
+        }
+        if self.body_scope.param_tys.iter().any(|(n, _)| *n == segs[0].name) {
+            return None;
+        }
+        let lang = &p.gx.lang;
+        let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_name(p.interner, segs[0].name)?;
+        let wanted = match self.name(segs[1].name) {
+            "default" if tdef == lang.default && args.is_empty() => true,
+            "from" if tdef == lang.from && args.len() == 1 => true,
+            _ => false,
+        };
+        if !wanted {
+            return None;
+        }
+        let base = self.deep(expected?);
+        if matches!(self.kind(base), TyKind::Infer(v) if !v.is_int() && !v.is_float()) || base == ERROR {
+            return None;
+        }
+        let rec = p.gx.index.trait_record(tdef)?;
+        let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+        for _ in 1..rec.generics.params.len() {
+            tr_args.push(GenericArg::Ty(self.new_var(false)));
+        }
+        let args_id = self.tys.intern_args(&tr_args);
+        let hint = TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS };
+        self.assoc_call(e, callee, base, Some(hint), segs[1].name, args, span)
     }
 
     /// The trait method's signature stub for a call the param env
@@ -7220,7 +7305,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let intlike = matches!(bk, TyKind::Int(_)) || bk.is_int_infer();
         let floatlike = matches!(bk, TyKind::Float(_)) || bk.is_float_infer();
         if !intlike && !floatlike && !matches!(bk, TyKind::Bool | TyKind::Char) {
-            return None;
+            // Other types compare by structure when every part does
+            // (strings, tuples, containers, derived impls): lowering
+            // uses the `eq` and `cmp` glue for them.
+            let ok = match self.name(name) {
+                "partial_cmp" | "lt" | "le" | "gt" | "ge" => has_ord(p, &self.tys, base),
+                "cmp" => has_total_ord(p, &self.tys, base),
+                "eq" | "ne" => has_eq(p, &self.tys, base),
+                _ => false,
+            };
+            if !ok || matches!(bk, TyKind::Param(_) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Error) {
+                return None;
+            }
         }
         let (kind, trait_def) = match self.name(name) {
             "partial_cmp" => (PrimCmpKind::Partial(p.tys.local_adt_of(generics::ordering_def())?), lang.partial_ord),

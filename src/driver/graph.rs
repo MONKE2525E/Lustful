@@ -602,9 +602,9 @@ pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t
 }
 
 /// Folds one Adt's layout-relevant content into `h`: enum-ness, repr,
-/// derives (copy, clone, debug, and equality change what checking and
-/// codegen do with a value, so they are part of this fingerprint, not
-/// only of `Sig`), and per variant its name, shape, discriminant, and
+/// derives (every derived trait and the `#[default]` variant change
+/// what checking and codegen do with a value, so they are part of this
+/// fingerprint, not only of `Sig`), and per variant its name, shape, discriminant, and
 /// field names and deep field types. Builtin Adts (String, Vec, Option)
 /// and unknown defs fold their def hash only: their layout is fixed by
 /// the compiler, never by a user edit.
@@ -622,7 +622,8 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     }
     adt.repr.int.hash(h);
     adt.repr.align.hash(h);
-    (adt.derives.debug, adt.derives.clone, adt.derives.copy, adt.derives.partial_eq).hash(h);
+    let d = adt.derives;
+    (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
     // A generic Adt's parameters and bounds: a bound edit changes what
     // every use of the type must prove (generic reuse, W-PERF).
     if let Some(g) = p.gx.adt_generics.get(a.0 as usize) {

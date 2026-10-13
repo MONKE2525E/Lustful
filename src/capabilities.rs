@@ -264,6 +264,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::VecIterLen,
     Builtin::CharsBytesLeft,
     Builtin::CharsNextBack,
+    Builtin::DefaultGlue,
 ];
 
 /// How a builtin is called.
@@ -524,6 +525,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::VecIterLen => (&["std::vec::IntoIter<T>"], vec![i.intern("len")], Call::Method),
         B::CharsBytesLeft => (&["str::Chars"], vec![i.intern("size_hint")], Call::Method),
         B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
+        B::DefaultGlue => (&["any Default type"], vec![k.default], Call::Associated),
     }
 }
 

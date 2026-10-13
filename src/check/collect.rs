@@ -4,13 +4,16 @@ use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
 use crate::check::generics::{self, GenTables};
 pub use crate::def::{CrateId, DefId, DefPathHash, LocalDefId, StableCrateHash};
 use crate::def::{CrateIds, DiskDefId};
-use crate::diag::{Diag, Span, not_yet, unsupported};
+use crate::diag::{Diag, Span, not_yet};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
 use crate::ty::defs::{DefKind as DefsKind, Vis};
 use crate::ty::lang::ShippedCrate;
 use crate::ty::*;
 
+/// The derive list of one Adt. Derived impls are synthetic impl
+/// records (generics.rs `add_synthetic_impls`); their bodies are
+/// codegen glue over the fields (cgen.rs).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Derives {
     pub debug: bool,
@@ -19,6 +22,11 @@ pub struct Derives {
     pub partial_eq: bool,
     pub eq: bool,
     pub hash: bool,
+    pub partial_ord: bool,
+    pub ord: bool,
+    pub default: bool,
+    /// The `#[default]` variant of an enum that derives `Default`.
+    pub default_variant: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1441,7 +1449,17 @@ pub fn collect_reuse<'a>(
                 name,
                 is_enum: true,
                 variants: vec![variant("Less", -1), variant("Equal", 0), variant("Greater", 1)],
-                derives: Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true },
+                derives: Derives {
+                    debug: true,
+                    clone: true,
+                    copy: true,
+                    partial_eq: true,
+                    eq: true,
+                    hash: true,
+                    partial_ord: true,
+                    ord: true,
+                    ..Derives::default()
+                },
                 span,
                 repr: crate::ty::layout::Repr::default(),
             };
@@ -1670,17 +1688,59 @@ pub fn collect_reuse<'a>(
                 "PartialEq" => d.partial_eq = true,
                 "Eq" => d.eq = true,
                 "Hash" => d.hash = true,
-                n @ ("PartialOrd" | "Ord" | "Default") => errs.push(unsupported(span, &format!("#[derive({n})]"))),
+                "PartialOrd" => d.partial_ord = true,
+                "Ord" => d.ord = true,
+                "Default" => d.default = true,
                 n => errs.push(Diag::new(
                     "L0403",
                     span,
                     format!("cannot derive `{n}`"),
-                    "Lust can derive Debug, Clone, Copy, PartialEq, Eq, and Hash.",
+                    "Lust can derive Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, and Default.",
                 )),
             }
         }
         if d.copy && !d.clone {
             errs.push(Diag::new("L0112", p.adts[id.0 as usize].span, "deriving Copy requires Clone", "Add Clone to the derive list."));
+        }
+        // `#[default]` variants (rustc's rules): only with a `Default`
+        // derive, exactly one per enum, and only on a unit variant.
+        if let ItemKind::Enum(e) = &item.kind {
+            let marked: Vec<(u32, Span)> = e
+                .variants
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    v.attrs.iter().find(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "default").map(|a| (i as u32, a.span))
+                })
+                .collect();
+            if !d.default {
+                if let Some(&(_, sp)) = marked.first() {
+                    errs.push(Diag::new(
+                        "L0402",
+                        sp,
+                        "cannot find attribute `default` in this scope",
+                        "Add `Default` to the derive list, or remove `#[default]`.",
+                    ));
+                }
+            } else if marked.is_empty() {
+                errs.push(Diag::new(
+                    "L0403",
+                    p.adts[id.0 as usize].span,
+                    "`#[derive(Default)]` on enum with no `#[default]`",
+                    "Mark one unit variant with `#[default]`.",
+                ));
+            } else if marked.len() > 1 {
+                errs.push(Diag::new("L0403", marked[1].1, "multiple declared defaults", "Keep `#[default]` on one variant only."));
+            } else if variants.get(marked[0].0 as usize).is_some_and(|v: &Variant| v.shape != VariantShape::Unit) {
+                errs.push(Diag::new(
+                    "L0403",
+                    marked[0].1,
+                    "the `#[default]` attribute may only be used on unit enum variants",
+                    "Move `#[default]` to a variant with no fields.",
+                ));
+            } else {
+                d.default_variant = Some(marked[0].0);
+            }
         }
         // A type parameter must occur in a field (rustc E0392's
         // class): an unused parameter has no layout meaning here.
@@ -3206,17 +3266,160 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-/// True when the ordering operators apply in the subset today:
-/// scalars, strings, and tuples of orderable elements (lowered as a
-/// lexicographic expansion). Arrays, slices, and Adts stay rejects.
+/// True when the ordering operators and `partial_cmp` apply by
+/// structure: scalars, strings, tuples, arrays, slices, `Vec`,
+/// `Option`, `Result`, `Box`, `Rc`, references, and Adts that
+/// derive `PartialOrd` with fields of such types (codegen compares
+/// them with the `cmp` glue; tuples of scalars expand in lowering).
+/// A field type whose `PartialOrd` impl is written by hand needs
+/// that impl's method, which the glue cannot call: false.
 pub fn has_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_cmp(p, tys, t, false, &mut Vec::new())
+}
+
+/// `has_ord` for `Ord`: the same shapes without floats, and Adts
+/// that derive `Ord`.
+pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_cmp(p, tys, t, true, &mut Vec::new())
+}
+
+/// The structural walk behind `has_ord` and `has_total_ord`. `seen`
+/// holds the Adt types on the walk (a recursive type through `Box`
+/// or `Vec` compares by the same glue: the cycle adds no field type).
+fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>) -> bool {
     match tys.kind(t) {
-        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_ord, Some(t)),
-        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Param(_) | TyKind::Projection(..) => {
+            if total {
+                env_proves(tys, t, p.gx.lang.ord, None)
+            } else {
+                env_proves(tys, t, p.gx.lang.partial_ord, Some(t))
+            }
+        }
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Float(_) => !total,
+        TyKind::Infer(v) => v.is_int() || (v.is_float() && !total),
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp(p, tys, e, total, seen),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_cmp(p, tys, e, total, seen)),
+        _ => {
+            if tys.is_string_ty(t) {
+                return true;
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+                return glue_cmp(p, tys, e, total, seen);
+            }
+            if let Some((a, b)) = tys.result_args(t) {
+                return glue_cmp(p, tys, a, total, seen) && glue_cmp(p, tys, b, total, seen);
+            }
+            match tys.local_adt(t) {
+                Some(a) => {
+                    let d = p.adt(a).derives;
+                    if !(if total { d.ord } else { d.partial_ord }) {
+                        return false;
+                    }
+                    // rustc's derived `partial_cmp` on a non-generic
+                    // type that also derives `Ord` is `Some(self.cmp(
+                    // other))`: its fields must then order by `Ord`.
+                    let generic = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some())
+                        || p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
+                    let fields_total = total || (d.ord && !generic);
+                    adt_fields_all(p, a, t, seen, &mut |f, seen| glue_cmp(p, tys, f, fields_total, seen))
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// True when `ok` holds for every field type of Adt `a` (the Adt of
+/// type `t`), or when the fields are a generic template's (a template
+/// body: its instances answer with their own substituted fields).
+/// `seen` stops recursion through recursive types.
+fn adt_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+    let template = p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+        && p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
+    if template || seen.contains(&t) {
+        return true;
+    }
+    seen.push(t);
+    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen)));
+    seen.pop();
+    all
+}
+
+/// True when `t` implements `Hash` by structure: scalars other than
+/// floats, strings, references, tuples, arrays, slices, the builtin
+/// containers of such types, and Adts that derive `Hash` with
+/// fields of such types. (Lust has no `Hasher` yet: this answers
+/// bounds, no hashing code exists.)
+pub fn has_hash(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_hash(p, tys, t, &mut Vec::new())
+}
+
+fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.hash, None),
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_hash(p, tys, e, seen),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
+        _ => {
+            if tys.is_string_ty(t) {
+                return true;
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+                return glue_hash(p, tys, e, seen);
+            }
+            if let Some((a, b)) = tys.result_args(t) {
+                return glue_hash(p, tys, a, seen) && glue_hash(p, tys, b, seen);
+            }
+            match tys.local_adt(t) {
+                Some(a) if p.adt(a).derives.hash => adt_fields_all(p, a, t, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// True when `Default::default()` builds a value of `t` by
+/// structure (the `default` glue): scalars, `String`, `Vec`,
+/// `Option`, tuples, arrays of at most 32 elements, `Box` and `Rc`
+/// of such types, `&str` and `&[T]`, and Adts that derive `Default`
+/// with fields of such types.
+pub fn has_default(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_default(p, tys, t, &mut Vec::new())
+}
+
+fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.default, None),
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
-        TyKind::Ref(_, _, e) => has_ord(p, tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_ord(p, tys, e)),
-        _ => tys.is_string_ty(t),
+        TyKind::Ref(_, _, e) => matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_default(p, tys, e, seen)),
+        TyKind::Array(e, n) => match tys.const_kind(n) {
+            ConstKind::Int(0) => true,
+            ConstKind::Int(k) if k <= 32 => glue_default(p, tys, e, seen),
+            _ => false,
+        },
+        _ => {
+            if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() {
+                return true;
+            }
+            if let Some(e) = tys.smart_elem(t) {
+                return glue_default(p, tys, e, seen);
+            }
+            match tys.local_adt(t) {
+                Some(a) => {
+                    let adt = p.adt(a);
+                    if !adt.derives.default {
+                        return false;
+                    }
+                    // An enum's default is its unit `#[default]` variant.
+                    adt.is_enum || adt_fields_all(p, a, t, seen, &mut |f, seen| glue_default(p, tys, f, seen))
+                }
+                None => false,
+            }
+        }
     }
 }
 
