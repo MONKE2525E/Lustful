@@ -553,6 +553,12 @@ struct Ctx<'p, 'a> {
     /// Generic call sites to turn into instance requests at
     /// finish: (expression index, template, args before zonking).
     generic_sites: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
+    /// Trait associated const reads a template check proved only
+    /// by its bounds: no value is known until an instance picks
+    /// the impl. `finish` gives them a zero placeholder (after
+    /// the overflow lint, so no analysis reads the fake value)
+    /// purely so the template body lowers for borrowck.
+    abstract_consts: Vec<ExprId>,
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
@@ -702,6 +708,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             sc
         },
         generic_sites: Vec::new(),
+        abstract_consts: Vec::new(),
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
@@ -2757,6 +2764,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut args: Vec<GenericArg> = Vec::with_capacity(generics.params.len());
         for (i, param) in generics.params.iter().enumerate() {
             let given = explicit.get(i).copied().flatten();
+            // A written argument of the wrong kind (a type where a
+            // const parameter sits, or the reverse) is an error,
+            // never a silent substitution.
+            let given = match (given, &param.kind) {
+                (Some(GenericArg::Ty(_)), ParamKind::Type)
+                | (Some(GenericArg::Const(_)), ParamKind::Const(_))
+                | (Some(GenericArg::Lifetime(_)), ParamKind::Lifetime)
+                | (None, _) => given,
+                (Some(_), _) => {
+                    self.err(
+                        "L0110",
+                        span,
+                        "generic argument has the wrong kind for its parameter",
+                        "Match each argument to its parameter: a type for a type parameter, a const value for a const parameter.",
+                    );
+                    None
+                }
+            };
             args.push(match (given, &param.kind) {
                 (Some(g), _) => g,
                 (None, ParamKind::Type) => GenericArg::Ty(self.new_var(false)),
@@ -2785,7 +2810,44 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut out = Vec::new();
         for a in written {
             out.push(match a {
-                ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
+                ast::GenericArg::Type(t) => {
+                    // A bare path the parser read as a type may name
+                    // a const (`h::<N>`): rustc reads it by the
+                    // parameter's kind. When the name is no type
+                    // here but is a const item, read the const;
+                    // `instantiate_template` rejects a kind mismatch.
+                    if let ast::TyExpr::Path(segs) = p.ast.ty(*t)
+                        && segs.iter().all(|s| !s.has_args())
+                    {
+                        let is_param =
+                            |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
+                        match segs.as_slice() {
+                            [seg]
+                                if !is_param(self, seg.name)
+                                    && !p.type_names.contains_key(&seg.name)
+                                    && !p.aliases.contains_key(&seg.name)
+                                    && p.const_names.contains_key(&seg.name) =>
+                            {
+                                use crate::ty::consteval::ConstValue;
+                                let idx = p.const_names[&seg.name];
+                                match &p.consts[idx as usize].value {
+                                    ConstValue::Int(v) => u128::try_from(*v)
+                                        .ok()
+                                        .map(|v| GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))),
+                                    ConstValue::Bool(b) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Bool(*b)))),
+                                    ConstValue::Char(c) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Char(*c)))),
+                                    _ => Some(GenericArg::Ty(self.resolve_written(*t))),
+                                }
+                            }
+                            // Multi-segment paths stay type paths:
+                            // a const path as a generic argument
+                            // needs braces in Rust (`h::<{ S::N }>`).
+                            _ => Some(GenericArg::Ty(self.resolve_written(*t))),
+                        }
+                    } else {
+                        Some(GenericArg::Ty(self.resolve_written(*t)))
+                    }
+                }
                 ast::GenericArg::Lifetime(_) => None,
                 ast::GenericArg::Const(e) => {
                     let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
@@ -3670,12 +3732,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
                 ERROR
             }
+            Expr::QPath { self_ty, trait_path, segs } => self.qpath_value(e, *self_ty, trait_path, segs, span),
             // AST v2 expression forms the parser still rejects.
-            Expr::Await(_)
-            | Expr::AsyncBlock { .. }
-            | Expr::UnsafeBlock(_)
-            | Expr::QPath { .. }
-            | Expr::MacroCall(_) => ERROR,
+            Expr::Await(_) | Expr::AsyncBlock { .. } | Expr::UnsafeBlock(_) | Expr::MacroCall(_) => ERROR,
         }
     }
 
@@ -4236,15 +4295,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         // Associated consts of inherent impls (Self::A, Type::A) read
-        // as their evaluated value, like free consts.
+        // as their evaluated value, like free consts. Inherent items
+        // shadow trait items, as in rustc.
         if let Some((adt, item)) = self.assoc_const_key(segs)
-            && let Some(&idx) = p.assoc_const_names.get(&(adt, item))
+            && let Some(idx) = p.inherent_assoc_const(adt, item)
         {
             let c = &p.consts[idx as usize];
             let (v, t) = (c.value.clone(), c.ty);
             let i = self.ei(e);
             self.out.const_exprs[i] = Some(v);
             return self.deep(t);
+        }
+        // Associated consts of traits (`Type::C`, `T::C`,
+        // `Self::C`): the value when an impl is confirmed, the
+        // declared type alone under param evidence.
+        if segs.len() == 2
+            && (self.replay_pick(e).is_some()
+                || !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item)))
+            && let Some(base) = self.assoc_const_base(segs)
+            && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, None, segs[1].name, span)
+        {
+            if let Some(idx) = idx {
+                let v = p.consts[idx as usize].value.clone();
+                let i = self.ei(e);
+                self.out.const_exprs[i] = Some(v);
+            }
+            return t;
         }
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
@@ -7436,16 +7512,333 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return true;
             }
         }
-        if let Some((adt, item)) = self.assoc_const_key(segs) {
-            match p.assoc_const_names.get(&(adt, item)) {
-                Some(&idx) => {
-                    self.const_item_pat(pi, idx, t, span, in_match);
-                    return true;
-                }
-                None => return false,
-            }
+        if let Some((adt, item)) = self.assoc_const_key(segs)
+            && let Some(idx) = p.inherent_assoc_const(adt, item)
+        {
+            self.const_item_pat(pi, idx, t, span, in_match);
+            return true;
+        }
+        // A trait associated const pattern on a concrete type
+        // (`S::C`): only a confirmed impl gives the value a
+        // pattern needs.
+        if segs.len() == 2
+            && !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item))
+            && let Some(base) = self.assoc_const_base(segs)
+            && let Some((Some(idx), _)) = self.trait_assoc_const(None, base, None, segs[1].name, span)
+        {
+            self.const_item_pat(pi, idx, t, span, in_match);
+            return true;
         }
         false
+    }
+
+    /// A qualified path in value position: `<Type>::CONST` or
+    /// `<Type as Trait>::CONST`. Calls through a qualified path
+    /// resolve in the call arm instead. A named trait reads only
+    /// that trait's item; with no trait, inherent items win, as
+    /// on a plain path.
+    fn qpath_value(&mut self, e: ExprId, self_ty: ast::TyId, trait_path: &[ast::PathSeg], segs: &[ast::PathSeg], span: Span) -> Ty {
+        let p = self.p;
+        if segs.len() != 1 {
+            self.err("L0101", span, "cannot find the associated item", "Check the qualified path and the name.");
+            return ERROR;
+        }
+        let name = segs[0].name;
+        let base = self.resolve_written(self_ty);
+        let hint = if trait_path.is_empty() {
+            None
+        } else {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let tref = ast::TraitRefExpr { path: trait_path.to_vec() };
+            match generics::resolve_trait_ref(p.ast, p.interner, p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, &tref, span)
+            {
+                Ok(tr) => Some(tr),
+                Err(d) => {
+                    self.errs.push(d);
+                    return ERROR;
+                }
+            }
+        };
+        if hint.is_none()
+            && let Some(adt) = self.tys.local_adt(self.resolve(base))
+            && let Some(idx) = p.inherent_assoc_const(adt, name)
+        {
+            let c = &p.consts[idx as usize];
+            let (v, t) = (c.value.clone(), c.ty);
+            let i = self.ei(e);
+            self.out.const_exprs[i] = Some(v);
+            return self.deep(t);
+        }
+        let blocked = hint.is_none()
+            && self.replay_pick(e).is_none()
+            && self.tys.local_adt(self.resolve(base)).is_some_and(|adt| self.inherent_value_blocks(adt, name));
+        if !blocked && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, hint, name, span) {
+            if let Some(idx) = idx {
+                let v = p.consts[idx as usize].value.clone();
+                let i = self.ei(e);
+                self.out.const_exprs[i] = Some(v);
+            }
+            return t;
+        }
+        // An inherent associated function as a value
+        // (`<S>::mk`), resolved as the plain two-segment path
+        // is. A trait's function as a value through a qualified
+        // path is not resolved yet.
+        if hint.is_none()
+            && let ast::TyExpr::Path(ty_segs) = p.ast.ty(self_ty)
+            && ty_segs.len() == 1
+        {
+            let mut segs2 = ty_segs.clone();
+            segs2.push(segs[0].clone());
+            if let Some(r) = self.resolve_assoc(&segs2, span) {
+                // Function items only: variant construction
+                // through a qualified path has no lowering yet,
+                // so it rejects with the error below instead.
+                if let Res::Fn(f) = r {
+                    self.set_res(e, r);
+                    return self.fn_value_ty(f, span);
+                }
+            } else {
+                return ERROR;
+            }
+        }
+        self.err(
+            "L0104",
+            span,
+            format!("no associated const named `{}` here", self.name(name)),
+            "Check the spelling against the impl or trait definition.",
+        );
+        ERROR
+    }
+
+    /// True when an inherent associated function or enum variant
+    /// of this name shadows any trait associated const on an Adt
+    /// (inherent items win in rustc's path resolution).
+    fn inherent_value_blocks(&self, adt: AdtId, item: Sym) -> bool {
+        let p = self.p;
+        let template = p.defs.def_of_adt(adt).and_then(|d| p.defs.local_adt(d)).unwrap_or(adt);
+        p.methods.contains_key(&(template, item)) || (p.adt(adt).is_enum && p.adt(adt).variants.iter().any(|v| v.name == item))
+    }
+
+    /// Resolves a trait associated const read (`Type::C`, `T::C`,
+    /// `Self::C`, `<T as Tr>::C`) on self type `base`, like
+    /// `assoc_call` resolves a trait method call: a written trait
+    /// (`hint`), else the template pick, else the bounds on a
+    /// type parameter, else every trait in scope that declares a
+    /// const of this name. Returns the const's type and, when an
+    /// impl is confirmed, its evaluated value as an index into
+    /// `Program::consts` (the impl's own, else the trait
+    /// default). Param evidence gives only the type; the
+    /// instance check replays the pick for the value.
+    fn trait_assoc_const(
+        &mut self,
+        pick_e: Option<ExprId>,
+        base: Ty,
+        hint: Option<TraitRef>,
+        name: Sym,
+        span: Span,
+    ) -> Option<(Option<u32>, Ty)> {
+        let p = self.p;
+        // Every user trait that declares an associated const `name`.
+        let mut by_name: Vec<DefId> = Vec::new();
+        for &assoc in p.gx.trait_assoc_consts.keys() {
+            let Some(t) = p.gx.index.trait_of_assoc(assoc) else { continue };
+            let Some(rec) = p.gx.index.trait_record(t) else { continue };
+            if rec.assoc_items.iter().any(|&(d, n, _)| d == assoc && n == name) && !by_name.contains(&t) {
+                by_name.push(t);
+            }
+        }
+        if by_name.is_empty() {
+            return None;
+        }
+        let base_r = self.resolve(base);
+        let bound: Vec<DefId> = if hint.is_none() && matches!(self.tys.kind(base_r), TyKind::Param(_) | TyKind::Projection(..)) {
+            by_name
+                .iter()
+                .copied()
+                .filter(|&t| {
+                    self.env().iter().any(|pred| {
+                        matches!(pred, Predicate::Trait(b) if b.count == 0 && b.value.def == t
+                            && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(base_r))
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let traits: Vec<DefId> = match (hint, pick_e.and_then(|e| self.replay_pick(e))) {
+            (Some(tr), _) => vec![tr.def],
+            (None, Some(pick)) => vec![pick.trait_def],
+            (None, None) if !bound.is_empty() => bound,
+            (None, None) => by_name.into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
+        };
+        let mut hits: Vec<(Option<u32>, Ty)> = Vec::new();
+        let mut hit_traits: Vec<DefId> = Vec::new();
+        for trait_def in traits {
+            let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
+            let Some(assoc) = rec.assoc_by_name(name).filter(|a| p.gx.trait_assoc_consts.contains_key(a)) else { continue };
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let sites_len = self.generic_sites.len();
+            let tr = match hint {
+                Some(written) if written.def == trait_def => written,
+                _ => {
+                    let n_inputs = rec.generics.params.len().saturating_sub(1);
+                    let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                    for _ in 0..n_inputs {
+                        tr_args.push(GenericArg::Ty(self.new_var(false)));
+                    }
+                    let args_id = self.tys.intern_args(&tr_args);
+                    TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
+                }
+            };
+            let sel = self.select_obligation_at(tr, span, 0);
+            let hit = match sel {
+                // An impl parameter the header could not bind means
+                // the Self type is not known here (a fresh variable
+                // from a missing turbofish): rustc asks for the
+                // annotation, so this is no hit.
+                Selection::Impl { id, ref unbound, .. } if unbound.is_empty() => {
+                    let impl_def = p.gx.index.get(id).def;
+                    p.impl_assoc_consts
+                        .get(&(impl_def, assoc))
+                        .copied()
+                        .or_else(|| p.trait_assoc_const_values.get(&assoc).copied())
+                        .map(|idx| (Some(idx), self.deep(p.consts[idx as usize].ty)))
+                }
+                Selection::ParamEvidence(_) => {
+                    let (declared, _) = p.gx.trait_assoc_consts[&assoc];
+                    let args: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+                    Some((None, subst(&mut self.tys, declared, &args)))
+                }
+                _ => None,
+            };
+            match hit {
+                Some(h) => {
+                    hits.push(h);
+                    hit_traits.push(trait_def);
+                }
+                None => {
+                    self.rollback_vars(snap);
+                    self.obl_truncate(obl_len);
+                    self.generic_sites.truncate(sites_len);
+                }
+            }
+        }
+        match hits.len() {
+            1 => {
+                let hit = hits.into_iter().next().unwrap();
+                if let Some(e) = pick_e {
+                    self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
+                    if hit.0.is_none() {
+                        self.abstract_consts.push(e);
+                    }
+                }
+                Some(hit)
+            }
+            0 => None,
+            _ => {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple trait associated consts named `{}` apply here", self.name(name)),
+                    "Name the trait with a fully qualified path, such as `<Type as Trait>::CONST`.",
+                );
+                Some((None, ERROR))
+            }
+        }
+    }
+
+    /// The self type a two-segment associated const path names:
+    /// a type parameter or `Self` from the body scope, else a
+    /// local Adt (written type arguments fix its parameters,
+    /// fresh variables otherwise, as in `trait_assoc_base`).
+    fn assoc_const_base(&mut self, segs: &[ast::PathSeg]) -> Option<Ty> {
+        let p = self.p;
+        let head = segs[0].name;
+        if let Some(&(_, t)) = self.body_scope.param_tys.iter().find(|(n, _)| *n == head) {
+            return Some(t);
+        }
+        if head == p.known.self_type
+            && let Some(t) = self.body_scope.self_ty
+        {
+            return Some(t);
+        }
+        let a = match self.binding(Namespace::Type, head) {
+            BindingRes::Def(def) => p.adt_by_def(def)?,
+            _ => return None,
+        };
+        let generics = p.gx.adt_generics.get(a.0 as usize).cloned().unwrap_or_default();
+        if generics.params.is_empty() {
+            return Some(self.tys.adt_ty(a));
+        }
+        let written: Vec<Option<GenericArg>> = match &segs[0].args {
+            ast::GenericArgs::Angle(args) => args
+                .iter()
+                .map(|arg| match arg {
+                    ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
+                    ast::GenericArg::Const(e) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e)
+                        .map(|v| GenericArg::Const(self.tys.intern_const(crate::ty::ConstKind::Int(v)))),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if written.len() == generics.params.len() && written.iter().all(|w| w.is_some()) {
+            let args: Vec<GenericArg> = written.into_iter().map(|w| w.unwrap()).collect();
+            return Some(self.tys.mk_adt(p.def_of_adt(a), &args));
+        }
+        let args = self.fresh_args(&generics);
+        Some(self.tys.mk_adt(p.def_of_adt(a), &args))
+    }
+
+    /// A zero const value of one type, for the template-only
+    /// placeholder in `finish`. Reference and other non-const
+    /// shapes have no placeholder: a trait associated const of
+    /// such a type read through a type parameter still fails
+    /// the template check with the unassigned-temp error.
+    fn zero_const(&mut self, t: Ty) -> Option<crate::ty::consteval::ConstValue> {
+        use crate::ty::consteval::ConstValue;
+        let t = self.deep(t);
+        match self.tys.kind(t) {
+            TyKind::Adt(..) if self.tys.option_elem(t).is_some() => Some(ConstValue::Variant(0, Vec::new())),
+            TyKind::Adt(..) => {
+                let p = self.p;
+                let a = self.tys.local_adt(t)?;
+                let (is_enum, field_tys) = {
+                    let adt = p.adt(a);
+                    (adt.is_enum, adt.variants.first()?.fields.iter().map(|f| f.ty).collect::<Vec<Ty>>())
+                };
+                let args: Vec<GenericArg> = match self.tys.adt_parts(t) {
+                    Some((_, args_id)) => self.tys.args(args_id).to_vec(),
+                    None => Vec::new(),
+                };
+                let mut vals = Vec::new();
+                for ft in field_tys {
+                    let ft = if args.is_empty() { ft } else { subst(&mut self.tys, ft, &args) };
+                    vals.push(self.zero_const(ft)?);
+                }
+                Some(if is_enum { ConstValue::Variant(0, vals) } else { ConstValue::Aggregate(vals) })
+            }
+            TyKind::Int(_) => Some(ConstValue::Int(0)),
+            TyKind::Float(f) => Some(ConstValue::Float(0, f)),
+            TyKind::Bool => Some(ConstValue::Bool(false)),
+            TyKind::Char => Some(ConstValue::Char('\0')),
+            TyKind::Unit => Some(ConstValue::Unit),
+            TyKind::Tuple(ts) => {
+                let elems: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                let mut vals = Vec::new();
+                for e in elems {
+                    vals.push(self.zero_const(e)?);
+                }
+                Some(ConstValue::Aggregate(vals))
+            }
+            TyKind::Array(e, c) => {
+                let ConstKind::Int(n) = self.tys.const_kind(self.resolve_const(c)) else { return None };
+                Some(ConstValue::Repeat(Box::new(self.zero_const(e)?), n as u64))
+            }
+            _ => None,
+        }
     }
 
     /// The (Adt, name) key an associated const path (`Self::A`,
@@ -7695,6 +8088,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 if let Some(hi) = hi {
                     bound_tys.push((*hi, self.expr(*hi, Some(t))));
+                }
+                // A range bound that reads a trait associated const
+                // through a type parameter depends on the parameter:
+                // rustc rejects constant patterns that do (E0158).
+                for &(b_e, _) in &bound_tys {
+                    if self.abstract_consts.contains(&b_e) {
+                        let b_span = self.span(b_e);
+                        self.err(
+                            "L0110",
+                            b_span,
+                            "a range pattern bound cannot depend on a generic parameter",
+                            "Use a literal bound, or compare with an `if` guard.",
+                        );
+                    }
                 }
                 // An exclusive range `lo..hi` needs lo < hi (rustc E0579);
                 // an inclusive one needs lo <= hi (rustc E0030).
@@ -10157,6 +10564,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.locals[i].ty = z;
         }
         self.overflow_lint();
+        // Abstract associated const reads (see `abstract_consts`)
+        // get their zero placeholder now: every value-reading
+        // analysis above has run, only lowering is left.
+        for e in std::mem::take(&mut self.abstract_consts) {
+            let i = self.ei(e);
+            if self.out.const_exprs[i].is_none()
+                && let Some(v) = self.zero_const(self.out.expr_ty[i])
+            {
+                self.out.const_exprs[i] = Some(v);
+            }
+        }
         // Generic call sites become instance requests for mono,
         // with their args zonked into place for lowering.
         for (ei, template, args) in std::mem::take(&mut self.generic_sites) {
@@ -10281,6 +10699,21 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             (c.value.clone(), c.ty)
         };
         if let Some(&def) = p.const_defs.get(i as usize) {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        Some(out)
+    }
+    fn assoc_const_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
+        // An inherent associated const read inside body const
+        // evaluation, through the same key as `path_expr`.
+        let p = self.cx.p;
+        let (adt, item) = self.cx.assoc_const_key(segs)?;
+        let idx = p.inherent_assoc_const(adt, item)?;
+        let out = {
+            let c = &p.consts[idx as usize];
+            (c.value.clone(), c.ty)
+        };
+        if let Some(&def) = p.const_defs.get(idx as usize) {
             let _ = p.sig_of(&mut self.cx.out.reads, def);
         }
         Some(out)

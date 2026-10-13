@@ -4018,7 +4018,12 @@ impl Rewrite<'_> {
                         {
                             self.diags.push(private_diag(self.interner.get(item_seg.name), span));
                         }
-                        *segs = vec![PathSeg::plain(info.flat), item_seg];
+                        // The def segment keeps its written generic
+                        // arguments (`W::<u8>::item`): the checker
+                        // reads them as the Self type's arguments.
+                        let mut head = segs[rest.saturating_sub(1)].clone();
+                        head.name = info.flat;
+                        *segs = vec![head, item_seg];
                     }
                 }
             }
@@ -4062,11 +4067,19 @@ impl Rewrite<'_> {
     fn rewrite_path(&mut self, segs: &mut Vec<PathSeg>, ns: Namespace, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
         // Generic arguments hold types and const exprs of their own.
         let mut tys = Vec::new();
+        let mut consts = Vec::new();
         for s in segs.iter() {
             collect_arg_tys(&s.args, &mut tys);
+            collect_arg_consts(&s.args, &mut consts);
         }
         for t in tys {
             self.ty(ast, t, module);
+        }
+        // A const argument's paths resolve like an array length's:
+        // in this module, with no locals in scope.
+        for e in consts {
+            let mut scopes = vec![Frame::default()];
+            self.expr(ast, e, module, &mut scopes);
         }
         let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
         // A leading `::` arrives as a marker segment (parser). Resolve
@@ -4089,6 +4102,23 @@ impl Rewrite<'_> {
             // merged flat tables could answer it. Names no module
             // defines (primitives, builtins) fall through as before.
             if res == PathRes::Absent && names.first().is_some_and(|n| self.local_names.contains_key(n)) {
+                // A bare path in a type position may name a const
+                // item: a const generic argument the parser read as
+                // a type (`Arr<N>`). Rust allows only a
+                // single-segment path there (multi-segment const
+                // paths need braces), so only those rewrite as the
+                // const they name; collect/check kind-check the
+                // position, and a const name in a true type
+                // position still rejects there.
+                if ns == Namespace::Type && names.len() == 1 {
+                    let (vres, _) = self.resolve(&names, Namespace::Value, module, scopes);
+                    if let PathRes::Done(Target::Def(def)) = vres
+                        && self.tables.def_info.get(&def).is_some_and(|i| i.kind == ResKind::Const)
+                    {
+                        self.apply(segs, vres, span, module);
+                        return;
+                    }
+                }
                 let first = self.interner.get(names[0]).to_string();
                 self.diags.push(if ns == Namespace::Type {
                     Diag::new(
@@ -4658,6 +4688,19 @@ impl Rewrite<'_> {
                 for b in blocks {
                     self.block(ast, b, module, scopes);
                 }
+            }
+        }
+    }
+}
+
+/// The generic-argument const expr ids under one segment's args.
+fn collect_arg_consts(args: &GenericArgs, out: &mut Vec<crate::ast::ExprId>) {
+    if let GenericArgs::Angle(args) = args {
+        for a in args {
+            match a {
+                GenericArg::Const(e) => out.push(*e),
+                GenericArg::Binding { kind: BindingKind::EqConst(e), .. } => out.push(*e),
+                _ => {}
             }
         }
     }
