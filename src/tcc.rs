@@ -158,6 +158,11 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
         let out = child.wait_with_output().map_err(|e| format!("tcc failed: {e}"))?;
         if !out.status.success() {
             errors.push_str(&String::from_utf8_lossy(&out.stderr));
+            // A child killed by a signal (for example the out-of-memory killer)
+            // prints nothing; it still failed, and its object is missing or stale.
+            if out.stderr.is_empty() {
+                errors.push_str(&format!("tcc exited with {}\n", out.status));
+            }
         }
     }
     if errors.is_empty() { Ok(()) } else { Err(format!("tcc failed to compile the generated C (this is a lust bug):\n{errors}")) }
