@@ -3166,6 +3166,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     21u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Weak(x) => {
+                    22u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::RefCell(x) => {
+                    23u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Cell(x) => {
+                    24u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::Guard(x, m) => {
+                    (25u8, *m).hash(h);
+                    inner(h, p, x);
+                }
             }
         }
         let mut h = crate::intern::FxHasher::default();

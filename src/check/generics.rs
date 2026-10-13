@@ -1971,7 +1971,11 @@ fn resolve_path_ty(
     if name == known.String {
         return no_generics(STRING);
     }
-    if name == known.Vec || name == known.Option || name == known.Box || name == known.Rc {
+    // Past the checks above, a multi-segment path is a canonical std
+    // path: it names std's type, never a user type of that name.
+    let std_path = segs.len() > 1;
+    // A user type named `Rc` shadows std's (which needs a `use`).
+    if name == known.Vec || name == known.Option || name == known.Box || (name == known.Rc && (std_path || !cx.type_names.contains_key(&name))) {
         let args = match &seg.args {
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, interner.get(name))?,
             _ => {
@@ -2017,6 +2021,25 @@ fn resolve_path_ty(
             tys.mk_option(elem)
         });
     }
+    // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A).
+    if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)
+        && (std_path || !cx.type_names.contains_key(&name))
+    {
+        let args = match &seg.args {
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, n)?,
+            _ => return Err(Diag::new("L0110", span, format!("`{n}` takes one type argument"), "Write it with its element type.")),
+        };
+        let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
+        if matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+            return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
+        }
+        let which: fn(&crate::ty::BuiltinDefs) -> DefId = match n {
+            "Weak" => |d| d.weak,
+            "RefCell" => |d| d.refcell,
+            _ => |d| d.cell,
+        };
+        return Ok(tys.mk_builtin1(which, elem));
+    }
     if name == known.Result {
         let args = match &seg.args {
             GenericArgs::Angle(a) => {
@@ -2029,6 +2052,9 @@ fn resolve_path_ty(
         let mut it = args.iter().filter_map(|g| g.as_ty());
         let (t, e) = (it.next().unwrap_or(ERROR), it.next().unwrap_or(ERROR));
         return Ok(tys.mk_result(t, e));
+    }
+    if std_path && cx.type_names.get(&name).is_none_or(|&a| tys.local_adt_of(ordering_def()) != Some(a)) {
+        return Err(crate::check::collect::std_path_shadowed(interner, name, span));
     }
     if segs.len() == 1
         && let Some(la) = cx.generic_aliases.get(&name)
@@ -2193,7 +2219,7 @@ fn resolve_path_ty(
         return Ok(tys.mk_adt(def, &gargs));
     }
     let n = interner.get(name);
-    if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc", "RefCell", "Cell"].contains(&n) {
+    if ["HashMap", "HashSet", "BTreeMap", "Box", "Rc", "Arc"].contains(&n) {
         return Err(not_yet("L0641", span, &format!("the `{n}` type")));
     }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))

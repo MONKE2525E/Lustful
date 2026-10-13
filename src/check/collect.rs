@@ -362,6 +362,11 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             }
             Some(BuiltinTy::Boxed) => format!("Box<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Rc) => format!("Rc<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::Weak) => format!("std::rc::Weak<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::RefCell) => format!("RefCell<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::Cell) => format!("Cell<{}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::RefGuard) => format!("Ref<'_, {}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
+            Some(BuiltinTy::RefMutGuard) => format!("RefMut<'_, {}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
@@ -696,6 +701,59 @@ fn ty_mentions(ast: &Ast, id: ast::TyId, name: Sym) -> bool {
     }
 }
 
+/// Reports each path that starts with a non-prelude std type lust
+/// knows by name (`ty::lang::STD_IMPORTED_TYPES`), unless the file
+/// defines an item of that name. Only for files with no `use`.
+fn std_names_without_use(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
+    // The driver sends a file with any `use` to the resolver; a bare
+    // collect (unit tests) can still see one here.
+    if ast.items.iter().chain(&ast.stmt_items).any(|it| matches!(it.kind, ItemKind::Use(_))) {
+        return;
+    }
+    let defined = |name: Sym| {
+        ast.items.iter().any(|it| match &it.kind {
+            ItemKind::Struct(s) => s.name == name,
+            ItemKind::Enum(e) => e.name == name,
+            ItemKind::Type(a) => a.name == name,
+            ItemKind::Trait(t) => t.name == name,
+            _ => false,
+        })
+    };
+    let mut report = |first: Sym, span: Span| {
+        let n = interner.get(first);
+        if crate::ty::lang::needs_std_use(n) && !defined(first) {
+            let m = crate::ty::lang::STD_IMPORTED_TYPES.iter().find(|t| t.2 == n).map_or("rc", |t| t.1);
+            errs.push(Diag::new("L0102", span, format!("cannot find type `{n}` in this scope"), format!("Import it: `use std::{m}::{n};`.")));
+        }
+    };
+    for (i, t) in ast.tys.iter().enumerate() {
+        if let ast::TyExpr::Path(segs) = t
+            && let Some(s) = segs.first()
+        {
+            report(s.name, ast.ty_spans[i]);
+        }
+    }
+    for (i, e) in ast.exprs.iter().enumerate() {
+        if let ast::Expr::Path(segs) = e
+            && segs.len() > 1
+            && let Some(s) = segs.first()
+        {
+            report(s.name, ast.expr_spans[i]);
+        }
+    }
+}
+
+/// The reject for a canonical std type path that lust cannot mean
+/// here: its last segment names no builtin, and a user type of that
+/// name must not stand in for std's.
+pub(crate) fn std_path_shadowed(interner: &Interner, name: Sym, span: Span) -> Diag {
+    let n = interner.get(name);
+    if ["HashMap", "HashSet", "BTreeMap", "Arc"].contains(&n) {
+        return not_yet("L0641", span, &format!("the `{n}` type"));
+    }
+    not_yet("L0505", span, &format!("the std path to `{n}` where a user type has the same name"))
+}
+
 /// Resolves a written type. `self_ty` is the type that `Self` means, inside an impl.
 pub fn resolve_ty(
     ast: &Ast,
@@ -792,7 +850,9 @@ pub fn resolve_ty(
                 }
                 return Ok(tys.mk_boxed(e));
             }
-            if name == known.Rc {
+            // A user type named `Rc` shadows std's (which needs a `use`),
+            // but never on a std path.
+            if name == known.Rc && (std_prefixed || !type_names.contains_key(&name)) {
                 let args = seg.type_args();
                 if args.len() != 1 {
                     return Err(Diag::new("L0110", span, "Rc takes one type argument", "Write `Rc<T>`."));
@@ -803,6 +863,26 @@ pub fn resolve_ty(
                 }
                 return Ok(tys.mk_rc(e));
             }
+            // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A; the import
+            // itself is checked where paths resolve).
+            if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)
+                && (std_prefixed || !type_names.contains_key(&name))
+            {
+                let args = seg.type_args();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, format!("{n} takes one type argument"), format!("Write `{n}<T>`.")));
+                }
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
+                if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                    return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
+                }
+                let which: fn(&crate::ty::BuiltinDefs) -> crate::def::DefId = match n {
+                    "Weak" => |d| d.weak,
+                    "RefCell" => |d| d.refcell,
+                    _ => |d| d.cell,
+                };
+                return Ok(tys.mk_builtin1(which, e));
+            }
             if name == known.Result {
                 let args = seg.type_args();
                 if args.len() != 2 {
@@ -812,10 +892,14 @@ pub fn resolve_ty(
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[1], self_ty)?;
                 return Ok(tys.mk_result(t, e));
             }
-            if let Some(&adt) = type_names.get(&name) {
+            // A std path names std's type, never a user type or alias
+            // of the same name (std's `Ordering` is the one std Adt).
+            if let Some(&adt) = type_names.get(&name)
+                && (!std_prefixed || tys.local_adt_of(generics::ordering_def()) == Some(adt))
+            {
                 return no_generics(tys.adt_ty(adt));
             }
-            if let Some(&t) = aliases.get(&name) {
+            if !std_prefixed && let Some(&t) = aliases.get(&name) {
                 // A generic alias needs the scoped resolver (its args and
                 // defaults): callers fall back to it on this error.
                 if tys.flags(t).contains_param() {
@@ -830,7 +914,10 @@ pub fn resolve_ty(
             if name == known.f64 {
                 return no_generics(tys.float_ty(FloatTy::F64));
             }
-            if ["HashMap", "HashSet", "BTreeMap", "Arc", "RefCell", "Cell"].contains(&n) {
+            if std_prefixed {
+                return Err(std_path_shadowed(interner, name, span));
+            }
+            if ["HashMap", "HashSet", "BTreeMap", "Arc"].contains(&n) {
                 return Err(not_yet("L0641", span, &format!("the `{n}` type")));
             }
             Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
@@ -1711,6 +1798,9 @@ pub fn collect_reuse<'a>(
         for k in crate::ty::fmt::FmtTy::ALL {
             insert_builtin(&mut p, b.fmt_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), Generics::default());
         }
+        for (def, n) in [(b.weak, "Weak"), (b.refcell, "RefCell"), (b.cell, "Cell"), (b.ref_guard, "Ref"), (b.ref_mut_guard, "RefMut")] {
+            insert_builtin(&mut p, def, DefsKind::Struct, interner.intern(n), one_ty_param());
+        }
         for k in crate::ty::iter::IterKind::ALL {
             let params = (0..k.n_args())
                 .map(|i| ParamDef { name: interner.intern(["I", "F", "B"][i]), kind: ParamKind::Type, span: dummy })
@@ -1721,6 +1811,12 @@ pub fn collect_reuse<'a>(
     }
     let mut errs = Vec::new();
     let dup = |span: Span, n: &str| Diag::new("L0106", span, format!("`{n}` is defined more than once"), "Rename one of the definitions.");
+    // Without resolver tables the file has no `use` at all (any `use`
+    // routes to the resolver), so a non-prelude std type lust knows by
+    // name cannot be in scope (W-STD-A; the resolver checks its paths).
+    if p.resolved.is_none() {
+        std_names_without_use(ast, interner, &mut errs);
+    }
 
     // Generic pass 0: lang traits and user trait defs, so bounds in
     // every later signature can name them.
@@ -3963,7 +4059,9 @@ pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().any(|&e| contains_ref(tys, e)),
         TyKind::Array(e, _) | TyKind::Slice(e) => contains_ref(tys, e),
         _ if tys.is_chars_ty(t) => true,
-        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+        // A `RefCell` guard holds its borrow of the cell.
+        _ if tys.guard_elem(t).is_some() => true,
+        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.weak_elem(t)).or_else(|| tys.refcell_elem(t)).or_else(|| tys.cell_elem(t)) {
             Some(e) => contains_ref(tys, e),
             None => match tys.result_args(t) {
                 Some((a, b)) => contains_ref(tys, a) || contains_ref(tys, b),
@@ -4099,10 +4197,18 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     if tys.is_string_ty(t) {
         return true;
     }
-    if tys.rc_elem(t).is_some() {
+    if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() {
         return true;
     }
-    if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+    // `Ref`/`RefMut` are not Clone (`Ref::clone` is an associated fn);
+    // `Cell<T>` is Clone for `T: Copy`, `RefCell<T>` for `T: Clone`.
+    if tys.guard_elem(t).is_some() {
+        return false;
+    }
+    if let Some(e) = tys.cell_elem(t) {
+        return is_copy(p, tys, e);
+    }
+    if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
         return glue_clone(p, tys, e, seen);
     }
     if let Some((a, b)) = tys.result_args(t) {
@@ -4428,6 +4534,9 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
             if tys.is_string_ty(t) {
                 return true;
             }
+            if tys.guard_elem(t).is_some() {
+                return false;
+            }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
                 return glue_eq(p, tys, e, seen);
             }
@@ -4461,10 +4570,13 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
             // no such rendering, so it is not Debug here (a reject).
-            if tys.is_string_ty(t) {
+            if tys.is_string_ty(t) || tys.weak_elem(t).is_some() {
                 return true;
             }
-            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+            if let Some(e) = tys.cell_elem(t) {
+                return is_copy(p, tys, e) && glue_debug(p, tys, e, seen);
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
                 return glue_debug(p, tys, e, seen);
             }
             if let Some((a, b)) = tys.result_args(t) {
@@ -4507,8 +4619,11 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Array(e, _) => return needs_drop(p, tys, e),
         _ => {}
     }
-    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() {
+    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() {
         return true;
+    }
+    if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)) {
+        return needs_drop(p, tys, e);
     }
     if let Some(e) = tys.option_elem(t) {
         return needs_drop(p, tys, e);

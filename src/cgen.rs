@@ -60,6 +60,17 @@ pub enum CTy {
     /// An `Rc<dyn Trait>`: an owning `lust_dyn` whose data points at
     /// the value inside the Rc allocation, right after its two counts.
     RcDyn,
+    /// A `rc::Weak<T>`: the same counted-header pointer as `Rc<T>`, or
+    /// `UINTPTR_MAX` for `Weak::new()` (W-STD-A).
+    Weak(Box<CTy>),
+    /// A `RefCell<T>`: the generated struct `RCL_..` of the borrow
+    /// flag `f0` (as Rust's `isize`) and the value `f1`.
+    RefCell(Box<CTy>),
+    /// A `Cell<T>`: the value itself in C; its own type for glue.
+    Cell(Box<CTy>),
+    /// A `Ref<T>` (false) or `RefMut<T>` (true) guard: a pointer to the
+    /// `RefCell`'s struct; drop gives the borrow back.
+    Guard(Box<CTy>, bool),
     /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
     /// the moved-in buffer plus the front index of what it still owns.
     VecIter(Box<CTy>),
@@ -150,6 +161,11 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::Args) => CTy::Args,
             Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
             Some(BuiltinTy::Fmt(k)) => CTy::Fmt(k),
+            Some(BuiltinTy::Weak) => CTy::Weak(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::RefCell) => CTy::RefCell(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Cell) => CTy::Cell(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::RefGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), false),
+            Some(BuiltinTy::RefMutGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), true),
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -207,6 +223,14 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
     }
 }
 
+/// The pointee of a reference CTy (a `&Rc<T>` argument's `Rc<T>`).
+fn deref_cty(t: &CTy) -> CTy {
+    match t {
+        CTy::Ref(inner) => (**inner).clone(),
+        other => other.clone(),
+    }
+}
+
 fn int_c(i: IntTy) -> &'static str {
     match i {
         IntTy::I8 => "int8_t",
@@ -259,6 +283,10 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
+        CTy::Weak(inner) => format!("RcI_{}*", mangle(inner)),
+        CTy::RefCell(inner) => format!("RCL_{}", mangle(inner)),
+        CTy::Cell(inner) => ctype(inner),
+        CTy::Guard(inner, _) => format!("RCL_{}*", mangle(inner)),
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
@@ -309,6 +337,10 @@ fn mangle(t: &CTy) -> String {
         CTy::Boxed(e) => format!("Bx_{}_", mangle(e)),
         CTy::Rc(e) => format!("Rc_{}_", mangle(e)),
         CTy::VecIter(e) => format!("VI_{}_", mangle(e)),
+        CTy::Weak(e) => format!("Wk_{}_", mangle(e)),
+        CTy::RefCell(e) => format!("RCL_{}_", mangle(e)),
+        CTy::Cell(e) => format!("Cl_{}_", mangle(e)),
+        CTy::Guard(e, m) => format!("Gd{}_{}_", if *m { "M" } else { "" }, mangle(e)),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -370,7 +402,19 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) => collect_types(e, out),
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::Cell(e) => collect_types(e, out),
+        CTy::Weak(e) => {
+            out.insert(CTy::Rc(e.clone()));
+            collect_types(e, out);
+        }
+        CTy::RefCell(e) => {
+            out.insert(t.clone());
+            collect_types(e, out);
+        }
+        CTy::Guard(e, _) => {
+            out.insert(CTy::RefCell(e.clone()));
+            collect_types(e, out);
+        }
         CTy::Rc(e) => {
             out.insert(t.clone());
             collect_types(e, out);
@@ -382,9 +426,12 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::Rc(_) => {
+        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) => {
             out.push(t.clone())
         }
+        // `Rc`, `Weak`, and the `RefCell` guards are pointers to forward-
+        // declared structs, so a recursive `Option<Rc<Node>>` field works.
+        CTy::Cell(e) => by_value_deps(e, out),
         // A pointer to a fn pointer still names its typedef, which has
         // no forward form (a closure capturing a fn pointer by ref).
         CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
@@ -414,9 +461,28 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
     }
 }
 
+/// True when a type holds no `Cell` or `RefCell` inline (Rust's
+/// `Freeze`): pointers and buffers do not count, only by-value fields.
+fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
+    match t {
+        CTy::Cell(_) | CTy::RefCell(_) => false,
+        CTy::Tuple(es) => es.iter().all(|e| is_freeze_c(p, e, seen)),
+        CTy::Array(e, _) | CTy::Option(e) => is_freeze_c(p, e, seen),
+        CTy::Result(a, b) => is_freeze_c(p, a, seen) && is_freeze_c(p, b, seen),
+        CTy::Adt(a) => {
+            if !seen.insert(*a) {
+                return true;
+            }
+            p.adt(*a).variants.iter().all(|v| v.fields.iter().all(|f| is_freeze_c(p, &cty(&p.tys, f.ty), seen)))
+        }
+        _ => true,
+    }
+}
+
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -593,6 +659,17 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 Some(plain_layout(size, align))
             }
             CTy::Args => Some(plain_layout(8, 8)),
+            CTy::Weak(_) | CTy::Guard(..) => Some(layout::ptr_layout()),
+            // `UnsafeCell` hides the value's niche, as in Rust.
+            CTy::Cell(e) => go(p, e, seen).map(|mut l| {
+                l.niche = None;
+                l
+            }),
+            CTy::RefCell(e) => {
+                let mut v = go(p, e, seen)?;
+                v.niche = None;
+                layout::struct_layout(&[layout::int_layout(IntTy::Isize), v], layout::Repr { kind: ReprKind::C, ..layout::Repr::default() }).ok()
+            }
             CTy::VecIter(_) => layout::struct_layout(
                 &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)],
                 layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
@@ -781,6 +858,13 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Str => (16, 8),
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::VecIter(_) => (32, 8),
+            CTy::Weak(_) | CTy::Guard(..) => (8, 8),
+            CTy::Cell(e) => go(p, e, seen),
+            CTy::RefCell(e) => {
+                let (es, ea) = go(p, e, seen);
+                let align = ea.max(8);
+                (align_up(align_up(8, ea) + es, align), align)
+            }
             CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
@@ -1463,6 +1547,10 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Deref, CTy::Rc(inner)) => {
                     e = format!("{e}->v");
+                    t = *inner;
+                }
+                (Proj::Deref, CTy::Guard(inner, _)) => {
+                    e = format!("{e}->f1");
                     t = *inner;
                 }
                 (Proj::Field(i), CTy::Adt(a)) => {
@@ -2790,12 +2878,11 @@ impl FnGen<'_, '_, '_> {
             // pointer value is the `&mut T` result.
             B::BoxLeak => vals[0].clone(),
             B::RcNew => {
-                let et = ctype(&tys[0]);
                 let it = format!("RcI_{}", mangle(&tys[0]));
                 let t = self.tmp();
                 let _ = writeln!(
                     self.out,
-                    "    {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 0; {t}->v = {};",
+                    "    {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {t}->v = {};",
                     vals[0]
                 );
                 t
@@ -2805,7 +2892,7 @@ impl FnGen<'_, '_, '_> {
                 format!("((uint64_t *)(*{}).data)[{}]", vals[0], if b == B::RcStrongCount { -2 } else { -1 })
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
-            B::RcWeakCount => format!("(*{})->weak", vals[0]),
+            B::RcWeakCount => format!("((*{})->weak - 1)", vals[0]),
             B::RcGetMut => {
                 let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
                 let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
@@ -2817,13 +2904,12 @@ impl FnGen<'_, '_, '_> {
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
                 let v = &vals[0];
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
-                let _ = writeln!(self.out, "    if ((*{v})->strong == 1 && (*{v})->weak == 0) {{ {field} = &(*{v})->v;{some} }}");
+                let _ = writeln!(self.out, "    if ((*{v})->strong == 1 && (*{v})->weak == 1) {{ {field} = &(*{v})->v;{some} }}");
                 t
             }
             B::RcMakeMut => {
                 let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
                 let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
-                let et = ctype(&elem);
                 let it = format!("RcI_{}", mangle(&elem));
                 let v = &vals[0];
                 let cloned = if is_copy_c(self.p, &elem) {
@@ -2832,12 +2918,13 @@ impl FnGen<'_, '_, '_> {
                     self.want(Glue::Clone, &elem);
                     format!("clone_{}(&(*{v})->v)", mangle(&elem))
                 };
-                // Shared (or weak-held, once Weak exists): clone
-                // the value into a fresh header and leave the
-                // old count one lower, as in Rust.
+                // Shared: clone the value into a fresh header and leave
+                // the old count one lower. Unique but Weak-held: move
+                // the value out and let the Weaks keep the old header
+                // (strong 0, its implicit weak ref gone), as in Rust.
                 let _ = writeln!(
                     self.out,
-                    "    if ((*{v})->strong > 1 || (*{v})->weak > 0) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 0; n->v = {cloned}; (*{v})->strong--; *{v} = n; }}"
+                    "    if ((*{v})->strong > 1) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 1; n->v = {cloned}; (*{v})->strong--; *{v} = n; }}\n    else if ((*{v})->weak > 1) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 1; n->v = (*{v})->v; (*{v})->strong = 0; (*{v})->weak--; *{v} = n; }}"
                 );
                 format!("&(*{v})->v")
             }
@@ -2857,7 +2944,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {rt} {t};");
                 let _ = writeln!(
                     self.out,
-                    "    if ({v}->strong == 1 && {v}->weak == 0) {{ {set_ok} {ok_f} = {v}->v; lust_dealloc((void*){v}, sizeof({it}), _Alignof({it})); }} else {{ {set_err} {err_f} = {v}; }}"
+                    "    if ({v}->strong == 1) {{ {set_ok} {ok_f} = {v}->v; {v}->strong = 0; if (--{v}->weak == 0) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it})); }} else {{ {set_err} {err_f} = {v}; }}"
                 );
                 let _ = et;
                 t
@@ -3209,6 +3296,124 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    if ({v}->front < {v}->len) {{ {field} = (({}*){v}->ptr)[{idx}];{some} }}", ctype(&e));
                 t
             }
+            // `Rc` weak refs, `RefCell`, and `Cell` (W-STD-A, check/cells.rs).
+            // The `RcI` header keeps Rust's counts: `weak` includes the one
+            // implicit weak ref the strong refs hold; `Weak::new()` is the
+            // dangling `UINTPTR_MAX` pointer.
+            B::RcDowngrade => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = *{}; {t}->weak++;", ctype(&deref_cty(&tys[0])), vals[0]);
+                t
+            }
+            B::RcPtrEq | B::WeakPtrEq => format!("(*{} == *{})", vals[0], vals[1]),
+            B::WeakNew => "((void*)~(uint64_t)0)".into(),
+            B::WeakUpgrade => {
+                let w = deref_cty(&tys[0]);
+                let CTy::Weak(e) = &w else { unreachable!("Weak::upgrade on a Weak") };
+                let opt = CTy::Option(Box::new(CTy::Rc(e.clone())));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, p) = (self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {} {p} = *{}; if ({p} != (void*)~(uint64_t)0 && {p}->strong > 0) {{ {p}->strong++; {field} = {p}; {some} }}",
+                    ctype(&w),
+                    vals[0]
+                );
+                t
+            }
+            B::WeakStrongCount => format!("(*{0} == (void*)~(uint64_t)0 ? (uint64_t)0 : (*{0})->strong)", vals[0]),
+            B::WeakWeakCount => format!("(*{0} == (void*)~(uint64_t)0 || (*{0})->strong == 0 ? (uint64_t)0 : (*{0})->weak - 1)", vals[0]),
+            B::RefCellNew => {
+                let t = self.tmp();
+                let rc = CTy::RefCell(Box::new(tys[0].clone()));
+                collect_types(&rc, &mut self.sig_types);
+                let _ = writeln!(self.out, "    {} {t}; {t}.f0 = 0; {t}.f1 = {};", ctype(&rc), vals[0]);
+                t
+            }
+            B::RefCellBorrow => {
+                let t = self.tmp();
+                let rc = deref_cty(&tys[0]);
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {t} = {}; if ({t}->f0 < 0 || {t}->f0 == 0x7fffffffffffffffLL) lust_panic_cstr(\"RefCell already mutably borrowed\", {loc}); {t}->f0++;",
+                    ctype(&rc),
+                    vals[0]
+                );
+                t
+            }
+            B::RefCellBorrowMut => {
+                let t = self.tmp();
+                let rc = deref_cty(&tys[0]);
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {t} = {}; if ({t}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {t}->f0 = -1;",
+                    ctype(&rc),
+                    vals[0]
+                );
+                t
+            }
+            B::RefCellIntoInner => format!("{}.f1", vals[0]),
+            B::RefCellReplace => {
+                let (c, old) = (self.tmp(), self.tmp());
+                let rc = deref_cty(&tys[0]);
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {} {old} = {c}->f1; {c}->f1 = {};",
+                    ctype(&rc),
+                    vals[0],
+                    ctype(&tys[1]),
+                    vals[1]
+                );
+                old
+            }
+            B::RefCellSwap => {
+                let (a, bb, tmp) = (self.tmp(), self.tmp(), self.tmp());
+                let rc = deref_cty(&tys[0]);
+                let CTy::RefCell(e) = &rc else { unreachable!("RefCell::swap on a RefCell") };
+                let _ = writeln!(
+                    self.out,
+                    "    {rt}* {a} = {}; {rt}* {bb} = {}; if ({a}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {a}->f0 = -1; if ({bb}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {et} {tmp} = {a}->f1; {a}->f1 = {bb}->f1; {bb}->f1 = {tmp}; {a}->f0 = 0;",
+                    vals[0],
+                    vals[1],
+                    rt = ctype(&rc),
+                    et = ctype(e)
+                );
+                "((lust_Unit){})".into()
+            }
+            B::RefCellGetMut => format!("(&({})->f1)", vals[0]),
+            B::CellNew | B::CellIntoInner => vals[0].clone(),
+            B::CellGet => format!("(*{})", vals[0]),
+            B::CellGetMut => vals[0].clone(),
+            B::CellSet | B::CellReplace => {
+                let (c, old) = (self.tmp(), self.tmp());
+                let et = ctype(&tys[1]);
+                let _ = writeln!(self.out, "    {et}* {c} = {}; {et} {old} = *{c}; *{c} = {};", vals[0], vals[1]);
+                if b == B::CellReplace {
+                    return old;
+                }
+                if needs_drop_c(self.p, &tys[1]) {
+                    self.want(Glue::Drop, &tys[1]);
+                    let _ = writeln!(self.out, "    drop_{}(&{old});", mangle(&tys[1]));
+                }
+                "((lust_Unit){})".into()
+            }
+            B::CellSwap => {
+                let (a, bb, tmp) = (self.tmp(), self.tmp(), self.tmp());
+                let et = match deref_cty(&tys[0]) {
+                    CTy::Cell(e) => ctype(&e),
+                    other => ctype(&other),
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {et}* {a} = {}; {et}* {bb} = {}; if ({a} != {bb}) {{ {et} {tmp} = *{a}; *{a} = *{bb}; *{bb} = {tmp}; }}",
+                    vals[0],
+                    vals[1]
+                );
+                "((lust_Unit){})".into()
+            }
             // The sort family (W-STD-A, runtime/sort.h): a comparator
             // adapter per call site, then Rust 1.99's driftsort or
             // ipnsort over the element bytes.
@@ -3227,8 +3432,8 @@ impl FnGen<'_, '_, '_> {
                 };
                 let cx = ctx.as_ref().map_or("0".to_string(), |(c, _)| format!("(void*)&{c}"));
                 // Rust picks the small sort by Copy-ness and freeze-ness
-                // (no Cell or RefCell inside); lust has no such types yet.
-                let freeze = 1;
+                // (no Cell or RefCell inline).
+                let freeze = u8::from(is_freeze_c(self.p, &e, &mut HashSet::new()));
                 if matches!(b, B::SliceSort | B::SliceSortBy | B::SliceSortByKey) {
                     let _ = writeln!(self.out, "    lust_sort_stable({ptr}, {len}, {size}, {freeze}, {cx}, {adapter});");
                 } else {
@@ -5129,7 +5334,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
-            CTy::Rc(e) => collect_types(e, &mut inner),
+            CTy::Rc(e) | CTy::RefCell(e) => collect_types(e, &mut inner),
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| collect_types(e, &mut inner));
                 collect_types(r, &mut inner);
@@ -5150,6 +5355,15 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) = t {
             let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
         }
+        match t {
+            CTy::Rc(e) => {
+                let _ = writeln!(out, "typedef struct RcI_{0} RcI_{0};", mangle(e));
+            }
+            CTy::RefCell(e) => {
+                let _ = writeln!(out, "typedef struct RCL_{0} RCL_{0};", mangle(e));
+            }
+            _ => {}
+        }
     }
     // Each definition comes after the types it holds by value.
     fn emit(p: &Program, t: &CTy, emitted: &mut HashSet<CTy>, out: &mut String) {
@@ -5167,7 +5381,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
-            CTy::Rc(e) => by_value_deps(e, &mut deps),
+            CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| by_value_deps(e, &mut deps));
                 by_value_deps(r, &mut deps);
@@ -5237,6 +5451,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             CTy::Rc(e) => {
                 let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
+            }
+            CTy::RefCell(e) => {
+                let _ = writeln!(out, "typedef struct RCL_{0} {{ int64_t f0; {1} f1; }} RCL_{0};", mangle(e), ctype(e));
             }
             CTy::FnPtr(ps, r) => {
                 let ct = ctype(t);
@@ -5417,7 +5634,31 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     } else {
                         String::new()
                     };
-                    let _ = writeln!(body, "  if (--(*p)->strong == 0) {{ {inner}if ((*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it})); }}");
+                    // The strong refs together hold one implicit weak ref
+                    // (Rust's RcInner): the header outlives the value
+                    // drop while any Weak remains.
+                    let _ = writeln!(body, "  if (--(*p)->strong == 0) {{ {inner}if (--(*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it})); }}");
+                }
+                CTy::Weak(e) => {
+                    let it = format!("RcI_{}", mangle(e));
+                    let _ = writeln!(body, "  if (*p != ({it}*)~(uint64_t)0 && --(*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it}));");
+                }
+                CTy::RefCell(e) => {
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  drop_{}(&p->f1);", mangle(e));
+                    }
+                }
+                CTy::Cell(e) => {
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  drop_{}(p);", mangle(e));
+                    }
+                }
+                // A guard gives its borrow back: `Ref` counts down, a
+                // `RefMut` (flag -1) counts back up to 0.
+                CTy::Guard(_, m) => {
+                    let _ = writeln!(body, "  (*p)->f0 {}= 1;", if *m { "+" } else { "-" });
                 }
                 CTy::Option(e) => {
                     need(Glue::Drop, e);
@@ -5523,6 +5764,20 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 }
                 CTy::Rc(_) => {
                     body.push_str("  (*p)->strong++; return *p;\n");
+                }
+                CTy::Weak(e) => {
+                    let it = format!("RcI_{}", mangle(e));
+                    let _ = writeln!(body, "  if (*p != ({it}*)~(uint64_t)0) (*p)->weak++; return *p;");
+                }
+                // `Cell<T>: Clone` needs `T: Copy`: a copy of the value.
+                CTy::Cell(_) => body.push_str("  return *p;\n"),
+                // `RefCell::clone` borrows (and panics as `borrow` does).
+                CTy::RefCell(e) => {
+                    let c = clone_of(e, "p->f1", &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  if (p->f0 < 0) lust_panic_cstr(\"RefCell already mutably borrowed\", 0);\n  {ct} r; r.f0 = 0; r.f1 = {c}; return r;"
+                    );
                 }
                 CTy::Option(e) => {
                     let c = clone_of(e, &pf, &mut need);

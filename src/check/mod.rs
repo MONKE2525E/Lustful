@@ -2,6 +2,7 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod closure;
+pub mod cells;
 pub mod collect;
 pub mod constfn;
 pub mod convert;
@@ -358,6 +359,27 @@ pub enum Builtin {
     SliceBinarySearch,
     SliceBinarySearchBy,
     SliceBinarySearchByKey,
+    RcDowngrade,
+    RcPtrEq,
+    WeakNew,
+    WeakUpgrade,
+    WeakStrongCount,
+    WeakWeakCount,
+    WeakPtrEq,
+    RefCellNew,
+    RefCellBorrow,
+    RefCellBorrowMut,
+    RefCellIntoInner,
+    RefCellReplace,
+    RefCellSwap,
+    RefCellGetMut,
+    CellNew,
+    CellGet,
+    CellSet,
+    CellReplace,
+    CellIntoInner,
+    CellGetMut,
+    CellSwap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7359,6 +7381,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // (`std::vec::Vec::new`, `core::option::Option::Some`):
         // the last two segments name the type and the item, as in
         // the two-segment spelling. Only exact table rows qualify.
+        let std_ty = segs.len() > 2;
         let (ty_name, item) = if segs.len() == 2 {
             (names[0], names[1])
         } else {
@@ -7430,7 +7453,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         }
-        if ty_name == k.Rc {
+        // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
+        if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
+            return r;
+        }
+        // A user type named `Rc` shadows std's (which needs a `use`),
+        // but never on a std path.
+        if ty_name == k.Rc && (std_ty || !self.p.type_names.contains_key(&ty_name)) {
             let b = if item == k.new {
                 Builtin::RcNew
             } else if item == k.clone {
@@ -7490,6 +7519,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         };
+        // A std path names std's type, never a user type of the same
+        // name (std's `Ordering` is the one std Adt here).
+        if std_ty && p.tys.local_adt_of(generics::ordering_def()) != Some(a) {
+            self.errs.push(collect::std_path_shadowed(p.interner, ty_name, span));
+            return None;
+        }
         // The variant and associated-item tables of the Adt are part of its
         // signature read. Associated fns get their own index query when the
         // trait index lands (W-TRAITS-CORE); the method map stays behind
@@ -8980,6 +9015,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let opt = self.tys.mk_option(r);
                         (vec![rm], opt)
                     }
+                    Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
+                        self.cell_call_sig(b, callee)
+                    }
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
                         let rc = self.tys.mk_rc(elem);
@@ -9562,7 +9600,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Rust. Its own `clone` is found before the step (it is
         // the one Box method this wave resolves at step zero),
         // so that name keeps the unpeeled receiver.
-        let (derefs, base) = if name == k.clone { self.autoderef(rt) } else { self.autoderef_smart(rt) };
+        let (derefs, base) = if name == k.clone {
+            // A `RefCell` guard has no `clone` method of its own (only
+            // the associated `Ref::clone`): the call clones the value.
+            let (mut d, mut b) = self.autoderef(rt);
+            while let Some((inner, _)) = self.tys.guard_elem(b) {
+                let (d2, b2) = self.autoderef(self.resolve(inner));
+                d += 1 + d2;
+                b = b2;
+            }
+            (d, b)
+        } else {
+            self.autoderef_smart(rt)
+        };
         self.check_method_vis(base, name, name_span);
         let bk = self.tys.kind(base);
         // ARCH 2.12: a method call needs a known receiver head (rustc
@@ -9791,6 +9841,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             self.errs.push(not_yet("L0614", name_span, "`Ord` methods on this receiver type"));
             return ERROR;
+        }
+        // `Weak`, `RefCell`, and `Cell` methods (check/cells.rs).
+        if let Some(ret) = self.cell_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
         }
         use Builtin as B;
         // Builtin methods dispatch on the v2 builtin def in the first slot and on

@@ -514,7 +514,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Checks the arguments of a rejected call (so their own errors
     /// still report) and answers the error type.
-    fn iter_bail(&mut self, args: &[ExprId]) -> Ty {
+    pub(super) fn iter_bail(&mut self, args: &[ExprId]) -> Ty {
         for &a in args {
             self.expr(a, None);
         }

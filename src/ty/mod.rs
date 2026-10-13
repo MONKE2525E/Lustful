@@ -592,6 +592,13 @@ pub struct BuiltinDefs {
     pub iters: [DefId; iter::IterKind::ALL.len()],
     /// The `core::fmt` structs, by `FmtTy` index (ty/fmt.rs).
     pub fmt_tys: [DefId; fmt::FmtTy::ALL.len()],
+    /// `std::rc::Weak`, `std::cell::{RefCell, Cell}`, and the
+    /// `RefCell` guards `Ref` and `RefMut` (W-STD-A phase 3).
+    pub weak: DefId,
+    pub refcell: DefId,
+    pub cell: DefId,
+    pub ref_guard: DefId,
+    pub ref_mut_guard: DefId,
 }
 
 impl BuiltinDefs {
@@ -617,6 +624,18 @@ impl BuiltinDefs {
             None
         } else if let Some(i) = self.fmt_tys.iter().position(|&d| d == def) {
             Some(BuiltinTy::Fmt(fmt::FmtTy::ALL[i]))
+        } else if def == self.weak {
+            Some(BuiltinTy::Weak)
+        } else if def == self.refcell {
+            Some(BuiltinTy::RefCell)
+        } else if def == self.cell {
+            Some(BuiltinTy::Cell)
+        } else if def == self.ref_guard {
+            Some(BuiltinTy::RefGuard)
+        } else if def == self.ref_mut_guard {
+            Some(BuiltinTy::RefMutGuard)
+        } else if def.krate != BUILTIN_CRATE {
+            None
         } else {
             self.iters.iter().position(|&d| d == def).map(|i| BuiltinTy::Iter(iter::IterKind::ALL[i]))
         }
@@ -639,6 +658,13 @@ pub enum BuiltinTy {
     Iter(iter::IterKind),
     /// A `core::fmt` struct (ty/fmt.rs).
     Fmt(fmt::FmtTy),
+    Weak,
+    RefCell,
+    Cell,
+    /// `cell::Ref<T>`, a shared `RefCell` borrow guard.
+    RefGuard,
+    /// `cell::RefMut<T>`, a mutable `RefCell` borrow guard.
+    RefMutGuard,
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -819,10 +845,34 @@ pub trait TyIntern {
     fn rc_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Rc)).then(|| self.adt_first_ty_arg(t)).flatten()
     }
-    /// The pointee type of a `Box<T>` or an `Rc<T>`: the smart
-    /// pointers method calls, fields, and coercions deref through.
+    /// The pointee type of a `Box<T>`, an `Rc<T>`, or a `RefCell`
+    /// guard (`Ref<T>`, `RefMut<T>`): the smart pointers method calls,
+    /// fields, and coercions deref through.
     fn smart_elem(&self, t: Ty) -> Option<Ty> {
-        self.boxed_elem(t).or_else(|| self.rc_elem(t))
+        self.boxed_elem(t).or_else(|| self.rc_elem(t)).or_else(|| self.guard_elem(t).map(|g| g.0))
+    }
+    /// The value type of a `RefCell` guard and whether it is `RefMut`.
+    fn guard_elem(&self, t: Ty) -> Option<(Ty, bool)> {
+        match self.builtin_of(t)? {
+            BuiltinTy::RefGuard => Some((self.adt_first_ty_arg(t)?, false)),
+            BuiltinTy::RefMutGuard => Some((self.adt_first_ty_arg(t)?, true)),
+            _ => None,
+        }
+    }
+    /// The element type of a `Weak<T>`, `RefCell<T>`, or `Cell<T>`.
+    fn weak_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::Weak)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    fn refcell_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::RefCell)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    fn cell_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::Cell)).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// One of the one-arg builtin Adts by its def field.
+    fn mk_builtin1(&mut self, which: fn(&BuiltinDefs) -> DefId, elem: Ty) -> Ty {
+        let def = which(&self.builtins());
+        self.mk_adt(def, &[GenericArg::Ty(elem)])
     }
     /// The `(T, E)` type arguments of a `Result<T, E>`.
     fn result_args(&self, t: Ty) -> Option<(Ty, Ty)> {
@@ -1001,6 +1051,11 @@ impl GlobalTys {
             args: builtin_def(&["std", "env"], "Args"),
             iters: iter::IterKind::ALL.map(iter::iter_def),
             fmt_tys: fmt::FmtTy::ALL.map(fmt::fmt_def),
+            weak: builtin_def(&["alloc", "rc"], "Weak"),
+            refcell: builtin_def(&["core", "cell"], "RefCell"),
+            cell: builtin_def(&["core", "cell"], "Cell"),
+            ref_guard: builtin_def(&["core", "cell"], "Ref"),
+            ref_mut_guard: builtin_def(&["core", "cell"], "RefMut"),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

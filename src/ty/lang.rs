@@ -775,6 +775,29 @@ pub const STD_FNS: &[StdFnDef] = &[
     },
 ];
 
+/// The std types lust knows by name that are not in the prelude
+/// (W-STD-A): a module names one only after a `use` of its std path
+/// or a glob of its std module, as in Rust. (crates, module, name).
+pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
+    (&["std", "alloc"], "rc", "Rc"),
+    (&["std", "alloc"], "rc", "Weak"),
+    (&["std", "core"], "cell", "RefCell"),
+    (&["std", "core"], "cell", "Cell"),
+];
+
+/// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
+/// brings the std type `name` into scope.
+pub fn std_glob_imports(path: &[&str], name: &str) -> bool {
+    STD_IMPORTED_TYPES
+        .iter()
+        .any(|&(crates, module, n)| n == name && path.len() == 2 && crates.contains(&path[0]) && path[1] == module)
+}
+
+/// True when `name` is one of `STD_IMPORTED_TYPES`.
+pub fn needs_std_use(name: &str) -> bool {
+    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name)
+}
+
 /// True if `src` can mention an implemented source std fn, so the driver
 /// must load std before it compiles. A plain byte scan: it runs on every
 /// compile, so it stays a few memmem passes with no allocation.
@@ -814,6 +837,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/boxed/Box",
     "alloc/rc/Rc",
     "std/rc/Rc",
+    "alloc/rc/Weak",
+    "std/rc/Weak",
     "alloc/sync/Arc",
     "std/sync/Arc",
     "core/cell/Cell",

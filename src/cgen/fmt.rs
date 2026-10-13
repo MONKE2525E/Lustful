@@ -36,6 +36,8 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::FnPtr(..) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
         CTy::Ref(inner) | CTy::Boxed(inner) => fmt_expr(inner, kind, f, &format!("(*{v})"), need),
         CTy::Rc(inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
+        // A `RefCell` guard formats its value (W-STD-A).
+        CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
         _ if debug => {
             need(Glue::Debug, t);
             format!("dbg_{}({f}, {v})", mangle(t))
@@ -153,6 +155,25 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
         CTy::Vec(e) => {
             let et = ctype(e);
             let _ = writeln!(body, "  {}", builder_list("p->len", &format!("&(({et}*)p->ptr)[i]"), e, need));
+        }
+        // std's cell types (W-STD-A): `Weak` prints `(Weak)`, `Cell<T:
+        // Copy>` and `RefCell` a struct of their value, and a mutably
+        // borrowed RefCell `<borrowed>` (its try_borrow fails).
+        CTy::Weak(_) => {
+            let _ = writeln!(body, "  return lust_f_write_str(f, {});", lit("(Weak)"));
+        }
+        CTy::Cell(e) => {
+            let _ = writeln!(body, "  {}", builder_fields("Cell", true, &[("value".to_string(), "p".to_string(), (**e).clone())], need));
+        }
+        CTy::RefCell(e) => {
+            let _ = writeln!(
+                body,
+                "  if (p->f0 < 0) {{ lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_write_str(w, {})); return lust_dstruct_finish(&b); }}",
+                lit("RefCell"),
+                lit("value"),
+                lit("<borrowed>")
+            );
+            let _ = writeln!(body, "  {}", builder_fields("RefCell", true, &[("value".to_string(), "&p->f1".to_string(), (**e).clone())], need));
         }
         CTy::Adt(a) => {
             if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots) {

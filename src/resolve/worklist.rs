@@ -2479,6 +2479,16 @@ fn resolve_one(
         Ok(ds) => inner_diags.extend(ds),
         Err(e) => inner_diags.push(Diag::new("L0506", Span::default(), e, "This is a lust bug; report it.")),
     }
+    // A glob of a std module binds nothing; keep its path so the
+    // rewrite pass can tell a non-prelude std type it imports (W-STD-A).
+    tables.std_globs.clear();
+    for imp in &imports {
+        if let crate::resolve::imports::ImportKind::Glob { path } = &imp.kind
+            && path.first().is_some_and(|s| matches!(interner.get(*s), "std" | "core" | "alloc"))
+        {
+            tables.std_globs.push((imp.module, path.clone()));
+        }
+    }
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, needs_std });
     }
@@ -4284,6 +4294,25 @@ impl Rewrite<'_> {
             // another module defines is not found here, even though the
             // merged flat tables could answer it. Names no module
             // defines (primitives, builtins) fall through as before.
+            // A non-prelude std type lust knows by name needs a `use`
+            // in this module or fn body, as in Rust (W-STD-A). An
+            // explicit one expanded above; a glob is the other way in.
+            if res == PathRes::Absent
+                && let Some(&first) = names.first()
+                && crate::ty::lang::needs_std_use(self.interner.get(first))
+                && !self.local_names.contains_key(&first)
+                && !self.tables.std_glob_imports(module, self.interner.get(first), self.interner)
+            {
+                let n = self.interner.get(first).to_string();
+                let (m, _, _) = crate::ty::lang::STD_IMPORTED_TYPES.iter().find(|t| t.2 == n).map(|t| (t.1, 0, 0)).unwrap_or(("rc", 0, 0));
+                self.diags.push(Diag::new(
+                    "L0102",
+                    span,
+                    format!("cannot find type `{n}` in this scope"),
+                    format!("Import it: `use std::{m}::{n};`."),
+                ));
+                return;
+            }
             if res == PathRes::Absent && names.first().is_some_and(|n| self.local_names.contains_key(n)) {
                 // A bare path in a type position may name a const
                 // item: a const generic argument the parser read as
@@ -4657,7 +4686,24 @@ impl Rewrite<'_> {
                         continue;
                     }
                     match self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner) {
-                        PathRes::Done(Target::Extern(_)) => {}
+                        // A glob of a std module brings the non-prelude
+                        // std types lust knows by name, below any
+                        // explicit binding of the frame (W-STD-A).
+                        PathRes::Done(Target::Extern(i)) => {
+                            if self.tables.externs[i as usize].is_std_lib
+                                && let Some(frame) = scopes.last_mut()
+                            {
+                                let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
+                                for &(_, _, n) in crate::ty::lang::STD_IMPORTED_TYPES {
+                                    if crate::ty::lang::std_glob_imports(&p, n) {
+                                        let name = self.interner.intern(n);
+                                        let mut full = path.clone();
+                                        full.push(name);
+                                        frame.std_imports.entry((name, ns_index(Namespace::Type))).or_insert(full);
+                                    }
+                                }
+                            }
+                        }
                         PathRes::Done(Target::Module(src)) => {
                         let mut entries = Vec::new();
                         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {

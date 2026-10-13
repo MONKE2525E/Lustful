@@ -1921,6 +1921,17 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     }
                     return;
                 }
+                // A `Ref` guard is shared access; a `RefMut` is unique
+                // (DerefMut), like a `Box` for writes.
+                (_, Proj::Deref) if self.body.tys.guard_elem(t).is_some_and(|g| !g.1) => {
+                    if borrow {
+                        self.err("L0308", span, "cannot borrow data in a `Ref` as mutable".into(), "Take the borrow with `borrow_mut()`.");
+                    } else {
+                        self.err("L0309", span, "cannot assign to data in a `Ref`".into(), "Take the borrow with `borrow_mut()`.");
+                    }
+                    return;
+                }
+                (_, Proj::Deref) if self.body.tys.guard_elem(t).is_some() => t = self.body.tys.guard_elem(t).unwrap().0,
                 (_, Proj::Deref) if self.body.tys.boxed_elem(t).is_some() => t = self.body.tys.boxed_elem(t).unwrap(),
                 (_, Proj::Index(_)) if self.body.tys.vec_elem(t).is_some() => t = self.body.tys.vec_elem(t).unwrap(),
                 (TyKind::Array(e, _) | TyKind::Slice(e), Proj::Index(_)) => t = e,

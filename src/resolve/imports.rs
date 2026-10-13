@@ -215,6 +215,12 @@ pub struct ResolvedTables {
     /// one read. Check reads it for intrinsic privilege and to keep
     /// layout queries off adapter types whose layout is not exact.
     pub adapters: Vec<AdapterCrate>,
+    /// Glob `use`s of std modules (`use std::cell::*;`), which bind
+    /// nothing in `maps`: (module, path). They answer whether a
+    /// non-prelude std type lust knows by name
+    /// (`ty::lang::STD_IMPORTED_TYPES`) is in scope by glob; an
+    /// explicit import of one is a `std_aliases` entry instead.
+    pub std_globs: Vec<(ModuleId, Vec<Sym>)>,
 }
 
 /// One adapter crate in a session (see `resolve::adapters`).
@@ -228,6 +234,17 @@ pub struct AdapterCrate {
 }
 
 impl ResolvedTables {
+    /// True when a glob of its std module imports the std type `name`
+    /// into `module` (W-STD-A).
+    pub fn std_glob_imports(&self, module: ModuleId, name: &str, interner: &Interner) -> bool {
+        self.std_globs.iter().any(|(m, path)| {
+            *m == module && {
+                let p: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+                crate::ty::lang::std_glob_imports(&p, name)
+            }
+        })
+    }
+
     /// An empty table set with only the first crate's root module (id
     /// 0, the selected crate; dependency crates join with
     /// `add_crate_root`).
@@ -258,6 +275,7 @@ impl ResolvedTables {
             crate_magic: FxMap::default(),
             std_aliases: FxMap::default(),
             adapters: Vec::new(),
+            std_globs: Vec::new(),
         }
     }
 
@@ -663,6 +681,14 @@ impl ResolvedTables {
                 h.write_u64(*ns as u64);
                 h.write_u64(name.0 as u64);
                 vis(h, v);
+                for s in path {
+                    h.write_u64(s.0 as u64);
+                }
+            });
+        }
+        for (module, path) in &self.std_globs {
+            fold!(0x48, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(module.0 as u64);
                 for s in path {
                     h.write_u64(s.0 as u64);
                 }
