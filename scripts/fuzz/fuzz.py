@@ -15,7 +15,7 @@
 # also requires the full stderr text to match.
 #
 # Usage:
-#   fuzz.py run --edits 2000 --seed 7 --crate small|small2|realish|multi|multi2 [--modules 40] [--strict]
+#   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3 [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
 #   fuzz.py shrink --prev A.rs --cur B.rs --out DIR
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
@@ -224,6 +224,87 @@ fn main() {
     println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());
 }
 '''
+
+# small3: the small2 crate plus the shapes the fuzzers missed when the
+# daemon bugs in them were found by hand: a trait brought in by `use`
+# (removing the use must reject), nested fns in a body, a file inner
+# attribute, lifetime-only signatures, a generic fn, and a dyn impl
+# behind a live vtable. A separate crate kind, like small2: every older
+# constant and edit op stays byte-identical, so old seeds keep their
+# exact streams. Feature edits (make_feature3_edit) run only for small3,
+# on their own RNG and cadence.
+SMALL3_CRATE = "#![allow(dead_code)]\n" + SMALL2_CRATE.replace("fn main() {", '''mod mm {
+    pub trait Go {
+        fn go(&self) -> i64;
+    }
+
+    pub struct Wrap(pub i64);
+
+    impl Go for Wrap {
+        fn go(&self) -> i64 {
+            self.0 + 1
+        }
+    }
+
+    pub fn wv() -> i64 {
+        7
+    }
+}
+
+use mm::Go;
+
+fn use_go() -> i64 {
+    mm::Wrap(4).go()
+}
+
+fn gid<T>(x: T) -> T {
+    x
+}
+
+fn idref(x: &i64) -> &i64 {
+    x
+}
+
+fn uref(x: &'_ i64) -> &'_ i64 {
+    x
+}
+
+fn sref() -> &'static str {
+    "hi"
+}
+
+fn slabel(s: &str) -> &str {
+    s
+}
+
+trait Dv {
+    fn dv(&self) -> i64;
+}
+
+impl Dv for Point {
+    fn dv(&self) -> i64 {
+        self.x * 3
+    }
+}
+
+fn via_dyn(d: &dyn Dv) -> i64 {
+    d.dv()
+}
+
+fn outer_nested() -> i64 {
+    fn inn_a(x: i64) -> i64 {
+        x + 5
+    }
+    fn inn_b(x: i64) -> i64 {
+        inn_a(x) * 2
+    }
+    inn_b(10)
+}
+
+fn main() {''', 1).replace('    println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());',
+                            '    println!("{} {:?} {} {}", pts[0].score(), pick_or(&nums, 0), use_closure(10), byte_sum());\n'
+                            '    let n9 = 9;\n'
+                            '    println!("{} {} {} {} {} {}", use_go(), gid(3i64), via_dyn(&pts[0]), outer_nested(), *idref(&n9) + *uref(&n9), slabel(sref()).len());', 1)
 
 SNIPPETS = ["/*", "*/", '"', "fn zz() {", "}", "#[derive(Debug)]\n", "\n\n", "pub ",
             "struct Qq {", "// note\n", "x", "123", "->", "impl Qq {", 'let q = "abc\n',
@@ -643,11 +724,125 @@ def make_feature_edit(rng, text):
     return text, op
 
 
+def make_feature3_edit(rng, text):
+    """Edits for the classes no fuzzer reached before (small3 only, own
+    RNG and cadence, run-compare after each): `use` add/remove/rename
+    for a trait and for an item, nested items in fn bodies added,
+    removed, and added back, file inner attributes, lifetime-only
+    signature edits (elided, '_ and 'static forms only), an early
+    generic instance (its Adt ids shift the later ones), dyn impl
+    add/remove/body edits behind the live `via_dyn` vtable, and
+    visibility flips inside the module. Some results are invalid Rust
+    on purpose; both sides must reject the same way."""
+    op = rng.choice(["feat3_use_trait", "feat3_use_item", "feat3_nested",
+                     "feat3_inner_attr", "feat3_lifetime", "feat3_early_inst",
+                     "feat3_dyn", "feat3_vis"])
+    n = rng.randint(0, 10**6)
+    if op == "feat3_use_trait":
+        if "use mm::Go;\n" in text:
+            return text.replace("use mm::Go;\n",
+                                rng.choice(["", "use mm::Go as GoAlias;\n"]), 1), op
+        if "use mm::Go as GoAlias;\n" in text:
+            return text.replace("use mm::Go as GoAlias;\n", "use mm::Go;\n", 1), op
+        return text.replace("mod mm {", "use mm::Go;\n\nmod mm {", 1) if "mod mm {" in text else text, op
+    if op == "feat3_use_item":
+        for form in ("use mm::Wrap;\n", "use mm::*;\n", "use mm::wv;\n"):
+            if form in text:
+                return text.replace(form, "", 1), op
+        lines = text.splitlines(keepends=True)
+        b = item_bounds(lines)
+        lines.insert(rng.choice(b) if b else 0,
+                     rng.choice(["use mm::Wrap;\n", "use mm::*;\n", "use mm::wv;\n"]))
+        return "".join(lines), op
+    if op == "feat3_nested":
+        cut = None
+        for head in ("    fn inn_b(x: i64) -> i64 {", "    fn inn_a(x: i64) -> i64 {"):
+            cut = drop_block(text, head)
+            if cut is not None:
+                break
+        if cut is not None and rng.random() < 0.5:
+            return cut, op
+        # Insert a nested fn at the start of one body. Every later nested
+        # fn moves to a new slot, and a body that had none gains one.
+        hosts = [m.end() for m in re.finditer(r"fn (?:outer_nested|use_closure|byte_sum|hit)\([^)]*\)[^{]*\{\n", text)]
+        if hosts:
+            k = rng.choice(hosts)
+            return text[:k] + f"    fn nest{n}(x: i64) -> i64 {{\n        x + {n % 11}\n    }}\n" \
+                   + f"    let _nv{n} = nest{n}(1);\n" + text[k:], op
+        return text, op
+    if op == "feat3_inner_attr":
+        lines = text.splitlines(keepends=True)
+        if lines and lines[0].startswith("#!"):
+            if rng.random() < 0.5:
+                return "".join(lines[1:]), op
+            lines[0] = lines[0].replace("dead_code", "unused") \
+                if "dead_code" in lines[0] else lines[0].replace("unused", "dead_code")
+            return "".join(lines), op
+        return rng.choice(["#![allow(dead_code)]\n", "//! crate doc\n"]) + text, op
+    if op == "feat3_lifetime":
+        pairs = [("fn idref(x: &i64) -> &i64", "fn idref(x: &'_ i64) -> &'_ i64"),
+                 ("fn sref() -> &'static str", "fn sref() -> &str"),
+                 ("fn slabel(s: &str) -> &str", "fn slabel(s: &str) -> &'static str"),
+                 ("fn uref(x: &'_ i64) -> &'_ i64", "fn uref(x: &i64) -> &i64")]
+        rng.shuffle(pairs)
+        for a, b in pairs:
+            if a in text:
+                return text.replace(a, b, 1), op
+            if b in text:
+                return text.replace(b, a, 1), op
+        return text, op
+    if op == "feat3_early_inst":
+        # A caller near the top of the file names a new gid instance
+        # before every existing one in discovery order; removing it
+        # shifts them back.
+        line = rng.choice(["fn early_inst() -> bool { gid(true) }\n",
+                           "fn early_inst() -> u8 { gid(3u8) }\n",
+                           "fn early_inst() -> i32 { gid(-2i32) }\n"])
+        m = re.search(r"fn early_inst\(\)[^\n]*\n", text)
+        if m:
+            return (text[:m.start()] + text[m.end():], op) if rng.random() < 0.5 \
+                else (text[:m.start()] + line + text[m.end():], op)
+        b = item_bounds(text.splitlines(keepends=True))
+        lines = text.splitlines(keepends=True)
+        lines.insert(b[0] if b else 0, line)
+        return "".join(lines), op
+    if op == "feat3_dyn":
+        impl_shape = ("impl Dv for Shape {\n    fn dv(&self) -> i64 {\n"
+                      "        match self {\n            Shape::Dot => 1,\n"
+                      "            Shape::Pair(a, _) => *a,\n        }\n    }\n}\n")
+        if "impl Dv for Shape" in text:
+            cut = drop_block(text, "impl Dv for Shape")
+            return (cut, op) if cut is not None else (text, op)
+        if rng.random() < 0.5 and "self.x * 3" in text:
+            # Body edit inside the impl behind the live vtable: `check`
+            # still passes, only the run-compare sees a stale body.
+            return text.replace("self.x * 3", "self.x * 4", 1), op
+        if "self.x * 4" in text:
+            return text.replace("self.x * 4", "self.x * 3", 1), op
+        lines = text.splitlines(keepends=True)
+        b = item_bounds(lines)
+        lines.insert(rng.choice(b) if b else 0, impl_shape)
+        return "".join(lines), op
+    if op == "feat3_vis":
+        pairs = [("pub trait Go", "trait Go"), ("pub struct Wrap", "struct Wrap"),
+                 ("pub fn wv", "fn wv")]
+        rng.shuffle(pairs)
+        for a, b in pairs:
+            if a in text:
+                return text.replace(a, b, 1), op
+            if b in text:
+                return text.replace(b, a, 1), op
+        return text, op
+    return text, op
+
+
 def crate_text(kind, modules):
     if kind == "small":
         return SMALL_CRATE
     if kind == "small2":
         return SMALL2_CRATE
+    if kind == "small3":
+        return SMALL3_CRATE
     if kind == "realish":
         make = os.path.join(ROOT, "bench/realish/make.py")
         return subprocess.run([sys.executable, make, str(modules)], capture_output=True,
@@ -664,12 +859,14 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
-    if a.crate in ("multi", "multi2"):
-        return cmd_run_multi(a, rename=a.crate == "multi2")
+    if a.crate in ("multi", "multi2", "multi3"):
+        return cmd_run_multi(a, rename=a.crate in ("multi2", "multi3"),
+                             feat3=a.crate == "multi3")
     rng = random.Random(a.seed)
     # Feature edits draw from their own RNG so the main stream keeps
     # the sequence old seeds have always covered (see SMALL2_CRATE).
     frng = random.Random(a.seed ^ 0xFEA7)
+    frng3 = random.Random(a.seed ^ 0x5EED3)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -693,6 +890,8 @@ def cmd_run(a):
             prev = text
             if a.crate == "small2" and it % 13 == 7:
                 text, op = make_feature_edit(frng, text)
+            elif a.crate == "small3" and it % 11 == 5:
+                text, op = make_feature3_edit(frng3, text)
             else:
                 text, op = make_edit(rng, text, snapshots)
             ops[op.split(":")[0]] += 1
@@ -749,7 +948,7 @@ def cmd_run(a):
             # passes; run-compare right after it, not only every 25 edits.
             # Feature edits get the same treatment: a derive or impl edit
             # can change which glue a body runs while `check` still passes.
-            if (it % 25 == 24 or op == "const_edit" or op.startswith("feat_")) and da[0] == 0:
+            if (it % 25 == 24 or op == "const_edit" or op.startswith(("feat_", "feat3_"))) and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
                 if ok and why == "program hang":
                     # The edited program does not terminate on either side:
@@ -880,6 +1079,56 @@ MULTI2_SEED["main.rs"] = MULTI_SEED["main.rs"].replace("fn main() {", """fn read
 
 fn main() {""", 1).replace('println!("multi {} {} {} {} {} {}", p.sum(),', 'println!("multi {} {} {} {} {} {} {}", reads(), p.sum(),', 1)
 
+# multi3: the multi2 seed plus the same missed classes across files: a
+# trait in a.rs brought in by `use` in main.rs, a generic fn, a dyn
+# impl and vtable call, a lifetime-only signature, and file inner
+# attributes. Feature edits (make_feature3_multi) run only for multi3.
+MULTI3_SEED = dict(MULTI2_SEED)
+MULTI3_SEED["a.rs"] = "#![allow(dead_code)]\n" + MULTI2_SEED["a.rs"] + """
+pub trait TrA {
+    fn ta(&self) -> i64;
+}
+
+impl TrA for Point {
+    fn ta(&self) -> i64 {
+        self.x - self.y
+    }
+}
+
+pub trait DvA {
+    fn dv(&self) -> i64;
+}
+
+impl DvA for Point {
+    fn dv(&self) -> i64 {
+        self.x * 3
+    }
+}
+
+pub fn via_a(d: &dyn DvA) -> i64 {
+    d.dv()
+}
+
+pub fn gid<T>(x: T) -> T {
+    x
+}
+
+pub fn idref(x: &i64) -> &i64 {
+    x
+}
+
+pub fn with_nested() -> i64 {
+    fn inn_a(x: i64) -> i64 {
+        x + 5
+    }
+    inn_a(10)
+}
+"""
+MULTI3_SEED["main.rs"] = "#![allow(dead_code)]\n" + MULTI2_SEED["main.rs"].replace(
+    "use crate::a::Point;\n", "use crate::a::Point;\nuse crate::a::TrA;\n", 1).replace(
+    "    o.x + a::pair().1 + l + y + a::Pair(5, 6).0",
+    "    o.x + a::pair().1 + l + y + a::Pair(5, 6).0 + o.ta() + a::via_a(&o) + a::gid(2i64) + *a::idref(&y) + a::with_nested()", 1)
+
 # Visibility pulse sites: every written visibility, and the empty one in
 # front of a private item at a line start.
 VIS_PUB = re.compile(r"\bpub(?:\([^)\n]*\))?[ \t]+")
@@ -906,7 +1155,96 @@ def vis_flip(rng, fs):
     return out, f"vis_flip:{rel}:{old or 'private'}->{new.strip() or 'private'}"
 
 
-def cmd_run_multi(a, rename=False):
+def make_feature3_multi(rng, fs):
+    """The make_feature3_edit classes across files (multi3 only).
+    Returns (files, op). The visibility pulse in cmd_run_multi covers
+    visibility flips for this crate too."""
+    op = rng.choice(["feat3_use_trait", "feat3_use_item", "feat3_nested",
+                     "feat3_inner_attr", "feat3_lifetime", "feat3_early_inst",
+                     "feat3_dyn"])
+    fs = dict(fs)
+    main = fs.get("main.rs", "")
+    atext = fs.get("a.rs", "")
+    if op == "feat3_use_trait" and "main.rs" in fs:
+        if "use crate::a::TrA;\n" in main:
+            fs["main.rs"] = main.replace("use crate::a::TrA;\n",
+                                         rng.choice(["", "use crate::a::TrA as TrAlias;\n"]), 1)
+        elif "use crate::a::TrA as TrAlias;\n" in main:
+            fs["main.rs"] = main.replace("use crate::a::TrA as TrAlias;\n", "use crate::a::TrA;\n", 1)
+        elif "use crate::a::Point;\n" in main:
+            fs["main.rs"] = main.replace("use crate::a::Point;\n",
+                                         "use crate::a::Point;\nuse crate::a::TrA;\n", 1)
+        return fs, op
+    if op == "feat3_use_item" and "main.rs" in fs:
+        for old, new in (("use crate::a::Point;\n", "use crate::a::Point as Pt;\n"),
+                         ("use crate::a::*;\n", "")):
+            if old in main:
+                fs["main.rs"] = main.replace(old, new, 1)
+                return fs, op
+        if "use crate::a::Point as Pt;\n" in main:
+            fs["main.rs"] = main.replace("use crate::a::Point as Pt;\n", "use crate::a::Point;\n", 1)
+            return fs, op
+        fs["main.rs"] = "use crate::a::*;\n" + main
+        return fs, op
+    if op == "feat3_nested" and "a.rs" in fs:
+        cut = drop_block(atext, "    fn inn_a(x: i64) -> i64 {")
+        if cut is not None and rng.random() < 0.5:
+            fs["a.rs"] = cut
+            return fs, op
+        n = rng.randint(0, 10**6)
+        host = "pub fn with_nested() -> i64 {\n"
+        if host in atext:
+            fs["a.rs"] = atext.replace(host, host
+                                       + f"    fn nest{n}(x: i64) -> i64 {{\n        x + {n % 11}\n    }}\n"
+                                       + f"    let _nv{n} = nest{n}(1);\n", 1)
+        return fs, op
+    if op == "feat3_inner_attr":
+        rel = rng.choice([r for r in ("main.rs", "a.rs") if r in fs] or ["main.rs"])
+        lines = fs.get(rel, "").splitlines(keepends=True)
+        if lines and lines[0].startswith("#!"):
+            fs[rel] = "".join(lines[1:]) if rng.random() < 0.5 else \
+                fs[rel].replace("dead_code", "unused", 1) if "dead_code" in lines[0] \
+                else fs[rel].replace("unused", "dead_code", 1)
+        elif rel in fs:
+            fs[rel] = "#![allow(dead_code)]\n" + fs[rel]
+        return fs, op
+    if op == "feat3_lifetime" and "a.rs" in fs:
+        a, b = "pub fn idref(x: &i64) -> &i64", "pub fn idref(x: &'_ i64) -> &'_ i64"
+        if a in atext:
+            fs["a.rs"] = atext.replace(a, b, 1)
+        elif b in atext:
+            fs["a.rs"] = atext.replace(b, a, 1)
+        return fs, op
+    if op == "feat3_early_inst" and "main.rs" in fs:
+        line = rng.choice(["fn early_inst() -> bool { a::gid(true) }\n",
+                           "fn early_inst() -> u8 { a::gid(3u8) }\n"])
+        m = re.search(r"fn early_inst\(\)[^\n]*\n", main)
+        if m:
+            fs["main.rs"] = (main[:m.start()] + main[m.end():]) if rng.random() < 0.5 \
+                else (main[:m.start()] + line + main[m.end():])
+        else:
+            at = main.find("\nfn ")  # first fn: the instance lands early
+            fs["main.rs"] = main[:at + 1] + line + main[at + 1:] if at >= 0 else line + main
+        return fs, op
+    if op == "feat3_dyn" and "a.rs" in fs:
+        impl_pair = ("impl DvA for Pair {\n    fn dv(&self) -> i64 {\n"
+                     "        self.0 + self.1\n    }\n}\n")
+        if "impl DvA for Pair" in atext:
+            cut = drop_block(atext, "impl DvA for Pair")
+            if cut is not None:
+                fs["a.rs"] = cut
+            return fs, op
+        if rng.random() < 0.5 and "self.x * 3" in atext:
+            fs["a.rs"] = atext.replace("self.x * 3", "self.x * 4", 1)
+        elif "self.x * 4" in atext:
+            fs["a.rs"] = atext.replace("self.x * 4", "self.x * 3", 1)
+        else:
+            fs["a.rs"] = atext + "\n" + impl_pair
+        return fs, op
+    return fs, op
+
+
+def cmd_run_multi(a, rename=False, feat3=False):
     """Multi-file mode (W-RESOLVE): the seed crate is a small module tree.
     Each edit applies the single-file edit ops to one random file, or a
     structural op (add/remove a module file, toggle its `mod` line).
@@ -922,7 +1260,8 @@ def cmd_run_multi(a, rename=False):
     rng = random.Random(a.seed)
     frng = random.Random(a.seed ^ 0xFEA7)
     vrng = random.Random(a.seed ^ 0x715)
-    seed_files = MULTI2_SEED if rename else MULTI_SEED
+    frng3 = random.Random(a.seed ^ 0x5EED3)
+    seed_files = MULTI3_SEED if feat3 else MULTI2_SEED if rename else MULTI_SEED
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
     base = os.path.join(h.work, "multi")
@@ -1012,7 +1351,9 @@ def cmd_run_multi(a, rename=False):
         seen_guard = 0
         for it in range(a.edits):
             prev = files
-            if rename and it % 47 == 23:
+            if feat3 and it % 17 == 9:
+                files, op = make_feature3_multi(frng3, files)
+            elif rename and it % 47 == 23:
                 files, op = rename_mod(frng, files)
             elif rng.random() < 0.2:
                 files, op = structural(rng, files)
@@ -1058,7 +1399,7 @@ def cmd_run_multi(a, rename=False):
                 continue
             if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
                 snapshots.append(dict(files))
-            if (it % 25 == 24 or op.endswith(":const_edit")) and da[0] == 0:
+            if (it % 25 == 24 or op.endswith(":const_edit") or op.startswith("feat3_")) and da[0] == 0:
                 ok, why, ra, rb = compare(h, "run", a.strict)
                 if ok and why == "program hang":
                     # Same as single-file mode: matching program hang, but

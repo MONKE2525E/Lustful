@@ -2,7 +2,7 @@
 # CI gate: the daemon must give the same answer as a cold compile (see the equivalence
 # rule at the top of fuzz.py), with no crashes, no hangs, and the fresh-session guard
 # never firing. Exits nonzero on any failure.
-# Usage: scripts/fuzz/run.sh --edits N --seed S [--crate small|small2|realish|multi|multi2] [--modules M]
+# Usage: scripts/fuzz/run.sh --edits N --seed S [--crate small|small2|small3|realish|multi|multi2|multi3] [--modules M]
 #        [--strict] [-- <extra fuzz.py args>]
 set -uo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
