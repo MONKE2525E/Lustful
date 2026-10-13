@@ -14,7 +14,12 @@
 // lives. tcc's in-memory run forks (src/tcc.rs), and a fork copies only the
 // calling thread, so no pool thread may be alive then. The next phase after
 // the guard drops starts the pool again.
-use std::panic::{AssertUnwindSafe, catch_unwind};
+//
+// Unsafe waiver (docs/ARCH.md section 9.6): `run` erases the lifetime of its
+// job to share it with the workers. It is the one `unsafe` in lust's own
+// code that is not a C or libc call; the SAFETY comment there is the proof.
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -38,11 +43,15 @@ struct State {
     wanted: usize,
     /// Workers inside the job now.
     running: usize,
-    panicked: bool,
+    /// The first worker panic of this phase; `run` resumes it in its caller.
+    panic: Option<Box<dyn Any + Send>>,
     /// A phase or a stop holds the pool.
     busy: bool,
     /// Set by `stop`: workers exit.
     quit: bool,
+    /// `stop` calls waiting for the pool. While one waits, no new phase
+    /// takes the pool, so a stream of phases cannot starve a stop.
+    stops: usize,
 }
 
 struct Pool {
@@ -65,15 +74,27 @@ fn lock(p: &Pool) -> MutexGuard<'_, State> {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
-/// The process pool: `cores - 1` workers (the caller is the last core).
+/// The thread count for parallel work: `LUST_THREADS` when it is set to a
+/// number (0 counts as 1), else the core count. Read once per process. It
+/// sizes the pool, caps `par_map`, and sets how many pieces the resolver
+/// cuts a big file into.
+pub fn threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("LUST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores).max(1)
+    })
+}
+
+/// The process pool: `threads() - 1` workers (the caller is the last one).
 /// Its threads start with the first phase (`start_threads`).
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| Pool {
-        state: Mutex::new(State { job: None, epoch: 0, wanted: 0, running: 0, panicked: false, busy: false, quit: false }),
+        state: Mutex::new(State { job: None, epoch: 0, wanted: 0, running: 0, panic: None, busy: false, quit: false, stops: 0 }),
         start: Condvar::new(),
         done: Condvar::new(),
         idle: Condvar::new(),
-        workers: std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(1),
+        workers: threads() - 1,
         helper: Mutex::new(None),
     })
 }
@@ -130,10 +151,14 @@ fn worker(p: &'static Pool) {
             st.running += 1;
             st.job.expect("a phase in progress has a job")
         };
-        let ok = catch_unwind(AssertUnwindSafe(job)).is_ok();
+        let result = catch_unwind(AssertUnwindSafe(job));
         let mut st = lock(p);
         st.running -= 1;
-        st.panicked |= !ok;
+        if let Err(payload) = result
+            && st.panic.is_none()
+        {
+            st.panic = Some(payload);
+        }
         if st.running == 0 {
             p.done.notify_all();
         }
@@ -146,13 +171,13 @@ fn release(p: &Pool) {
     p.idle.notify_all();
 }
 
-/// Ends a phase, also when the caller's own share of the job unwinds:
-/// no more workers may join, and the borrowed job outlives every worker
-/// that took it. `panicked` holds the phase's worker panic flag, read
+/// Ends a phase on every exit path of `run`, a panic included: no more
+/// workers may join, the borrowed job outlives every worker that took it,
+/// and the pool is released. `panic` takes the phase's first worker panic
 /// before the pool is free for the next phase.
 struct EndPhase {
     p: &'static Pool,
-    panicked: bool,
+    panic: Option<Box<dyn Any + Send>>,
 }
 
 impl EndPhase {
@@ -164,7 +189,9 @@ impl EndPhase {
             st = self.p.done.wait(st).unwrap_or_else(|e| e.into_inner());
         }
         st.job = None;
-        self.panicked |= st.panicked;
+        if self.panic.is_none() {
+            self.panic = st.panic.take();
+        }
     }
 }
 
@@ -177,7 +204,9 @@ impl Drop for EndPhase {
 
 /// Runs `job` on this thread and on up to `extra` workers at once, and
 /// returns when every run of it has returned. False (nothing ran) when the
-/// pool is busy with another phase or stopped.
+/// pool is busy with another phase, stopped, or wanted by a `stop`. A
+/// worker's panic resumes here with its own payload (its message was
+/// already printed where it happened).
 fn run(extra: usize, job: &(dyn Fn() + Sync)) -> bool {
     let p = pool();
     if p.workers == 0 {
@@ -185,17 +214,21 @@ fn run(extra: usize, job: &(dyn Fn() + Sync)) -> bool {
     }
     {
         let mut st = lock(p);
-        if st.busy {
+        if st.busy || st.stops > 0 {
             return false;
         }
         st.busy = true;
     }
+    // Made at once, so every exit path from here on, a panic in the
+    // thread start included, ends the phase and releases the pool.
+    let mut end = EndPhase { p, panic: None };
     start_threads(p);
-    // SAFETY: only the lifetime is erased. Workers reach `job` only through
-    // `State::job` while `wanted` lets them join, and `EndPhase` (which runs
-    // before this function returns or unwinds) sets `wanted` to 0 and waits
-    // until no worker is inside the job, then clears it. So no use of the
-    // reference outlives this call, and `job` is `Sync` for shared use.
+    // SAFETY (waiver: docs/ARCH.md 9.6): only the lifetime is erased.
+    // Workers reach `job` only through `State::job` while `wanted` lets them
+    // join, and `EndPhase` (which runs before this function returns or
+    // unwinds) sets `wanted` to 0 and waits until no worker is inside the
+    // job, then clears it. So no use of the reference outlives this call,
+    // and `job` is `Sync` for shared use.
     let job_static: &'static Job = unsafe { std::mem::transmute::<&(dyn Fn() + Sync), &'static Job>(job) };
     {
         let mut st = lock(p);
@@ -203,16 +236,15 @@ fn run(extra: usize, job: &(dyn Fn() + Sync)) -> bool {
         st.epoch += 1;
         st.wanted = extra.min(p.workers);
         st.running = 0;
-        st.panicked = false;
+        st.panic = None;
     }
     p.start.notify_all();
-    let mut end = EndPhase { p, panicked: false };
     job();
     end.finish();
-    let panicked = end.panicked;
+    let panic = end.panic.take();
     drop(end);
-    if panicked {
-        panic!("a parallel compiler task panicked");
+    if let Some(payload) = panic {
+        resume_unwind(payload);
     }
     true
 }
@@ -226,39 +258,44 @@ pub struct Stopped {
 
 impl Drop for Stopped {
     fn drop(&mut self) {
+        lock(self.p).quit = false;
         release(self.p);
     }
 }
 
 /// Stops the pool: waits for a phase in progress (another thread's) to end,
-/// tells every pool thread to quit, and joins them all. Call it where the
-/// process must run no other compiler thread: tcc's in-memory run calls it
-/// before its fork. Never call it from inside a `par_map` task.
+/// tells every pool thread to quit, and joins them all. A waiting stop goes
+/// before any new phase. Call it where the process must run no other
+/// compiler thread: tcc's in-memory run calls it before its fork. Never call
+/// it from inside a `par_map` task.
 pub fn stop() -> Stopped {
     let p = pool();
     {
         let mut st = lock(p);
+        st.stops += 1;
         while st.busy {
             st = p.idle.wait(st).unwrap_or_else(|e| e.into_inner());
         }
+        st.stops -= 1;
         st.busy = true;
         st.quit = true;
     }
+    // Made at once, so a panic below still releases the pool.
+    let stopped = Stopped { p };
     p.start.notify_all();
     let helper = p.helper.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(h) = helper {
         let _ = h.join();
     }
-    lock(p).quit = false;
-    Stopped { p }
+    stopped
 }
 
-/// Runs `f` for each item on all cores (`LUST_THREADS` caps the count).
-/// Results keep the input order. Items are taken in small batches from
-/// one atomic counter, so uneven items still spread over every thread.
+/// Runs `f` for each item on `threads()` threads. Results keep the input
+/// order. Items are taken in small batches from one atomic counter, so
+/// uneven items still spread over every thread. A panic in `f` resumes in
+/// the caller with its own payload.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let n = std::env::var("LUST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores).min(items.len().max(1));
+    let n = threads().min(items.len().max(1));
     if n <= 1 {
         return items.iter().map(f).collect();
     }
@@ -287,7 +324,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     } else {
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..n).map(|_| s.spawn(take)).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|payload| resume_unwind(payload))).collect()
         })
     };
     let mut all: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
@@ -306,6 +343,13 @@ mod tests {
 
     /// Pool threads inside `worker` now: each counts itself while it runs.
     static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held by each test that calls `stop`: one test's stop would join the
+    /// pool threads that another test is counting.
+    fn stop_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     pub(super) struct Live;
 
@@ -334,13 +378,59 @@ mod tests {
         assert_eq!(again, (1..=1000).collect::<Vec<_>>());
     }
 
-    /// A panic in a task reaches the caller, and the pool still works after it.
+    /// A panic in a task reaches the caller with its own payload (on the
+    /// pool or on scoped threads, whichever ran it), and the pool still
+    /// works after it.
     #[test]
     fn par_map_panic_reaches_caller() {
         let items: Vec<u32> = (0..64).collect();
-        let r = std::panic::catch_unwind(|| par_map(&items, |&i| if i == 40 { panic!("task 40") } else { i }));
-        assert!(r.is_err());
+        for _ in 0..20 {
+            let r = std::panic::catch_unwind(|| par_map(&items, |&i| if i == 40 { panic!("task 40") } else { i }));
+            let payload = r.expect_err("the panic reaches the caller");
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"task 40"));
+        }
         assert_eq!(par_map(&items, |&i| i * 3)[63], 189);
+    }
+
+    /// Two threads race `par_map` (a daemon guard compile next to a served
+    /// compile), and a third stops the pool now and then: one phase takes
+    /// the pool, the others use scoped threads, every call returns every
+    /// result in order, and each stop gets its turn (no new phase takes the
+    /// pool while a stop waits).
+    #[test]
+    fn racing_par_maps_and_stops() {
+        let _serial = stop_tests();
+        let items: Vec<u64> = (0..3000).collect();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2u64)
+                .map(|t| {
+                    let items = &items;
+                    s.spawn(move || {
+                        for round in 0..150u64 {
+                            let out = par_map(items, |&i| i * 3 + t + round);
+                            assert!(out.iter().enumerate().all(|(i, &v)| v == i as u64 * 3 + t + round), "racer {t} round {round}");
+                        }
+                    })
+                })
+                .collect();
+            let stopper = s.spawn(|| {
+                let mut stops = 0;
+                loop {
+                    drop(stop());
+                    stops += 1;
+                    if done.load(Ordering::SeqCst) {
+                        return stops;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            for r in racers {
+                r.join().unwrap();
+            }
+            done.store(true, Ordering::SeqCst);
+            assert!(stopper.join().unwrap() > 0, "a stop got its turn");
+        });
     }
 
     /// The live threads of this process with the pool's thread name.
@@ -364,6 +454,7 @@ mod tests {
         if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 || !std::path::Path::new("/proc/self/task").exists() {
             return;
         }
+        let _serial = stop_tests();
         let items: Vec<u64> = (0..4096).collect();
         let slow = |&i: &u64| -> u64 { (0..2000u64).fold(i, |a, k| a.wrapping_mul(31).wrapping_add(k)) };
         let want: Vec<u64> = items.iter().map(slow).collect();
