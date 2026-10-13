@@ -1470,8 +1470,12 @@ pub struct GenTables<'a> {
     pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
     /// Abstract (template-check) instances by the same key.
     pub abstract_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
-    /// Inherent method templates by (Adt template def, name).
-    pub inherent_methods: FxMap<(DefId, Sym), LocalDefId>,
+    /// Inherent method templates by (Adt template def, name), in
+    /// registration order; disjoint Self patterns may share a name.
+    pub inherent_methods: FxMap<(DefId, Sym), Vec<LocalDefId>>,
+    /// Each inherent method's impl Self pattern and impl generics,
+    /// for the inherent overlap check in `finish_collect`.
+    pub inherent_self_pats: FxMap<LocalDefId, (Ty, Generics)>,
     /// Trait defs that declare a method of this name.
     pub traits_by_method: FxMap<Sym, Vec<DefId>>,
     /// The `Drop::drop` instance to call for one concrete Adt,
@@ -1509,6 +1513,7 @@ impl Default for GenTables<'_> {
             instance_by_key: FxMap::default(),
             abstract_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
+            inherent_self_pats: FxMap::default(),
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             has_generics: false,
@@ -3419,9 +3424,12 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg], class
         p.gx.mono_counts.1 += 1;
         // Inherent instances join the compat method table.
         if let Some(owner) = owner
-            && p.gx.inherent_methods.values().any(|&t| t == template)
+            && p.gx.inherent_methods.values().any(|ts| ts.contains(&template))
         {
-            p.methods.insert((owner, name), id);
+            let cands = p.methods.entry((owner, name)).or_default();
+            if !cands.contains(&id) {
+                cands.push(id);
+            }
         }
     }
     id
@@ -3872,6 +3880,34 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
             rec.span,
             format!("this impl of `{trait_name}` overlaps with another impl"),
             "Remove one of the impls, or narrow its types so they cannot both apply.",
+        ));
+    }
+    // Inherent overlap (rustc E0592): two inherent methods of one
+    // Adt with one name whose Self patterns can both apply.
+    let mut inherent_dups: Vec<LocalDefId> = Vec::new();
+    for cands in p.gx.inherent_methods.clone().values() {
+        for (i, &a) in cands.iter().enumerate() {
+            for &b in &cands[i + 1..] {
+                let (Some((pat_a, gen_a)), Some((pat_b, gen_b))) =
+                    (p.gx.inherent_self_pats.get(&a).cloned(), p.gx.inherent_self_pats.get(&b).cloned())
+                else {
+                    continue;
+                };
+                if p.gx.index.inherent_pair_overlaps(&mut p.tys, pat_a, &gen_a, pat_b, &gen_b, &[], &is_local) {
+                    inherent_dups.push(b);
+                }
+            }
+        }
+    }
+    inherent_dups.sort_by_key(|f| f.0);
+    inherent_dups.dedup();
+    for f in inherent_dups {
+        let info = p.fn_info(f);
+        errs.push(Diag::new(
+            "L0106",
+            info.def.name_span,
+            format!("`{}` is defined more than once", p.name(info.name)),
+            "Rename one of the definitions, or narrow one impl's Self type so they cannot both apply.",
         ));
     }
     // Mono runs last: it checks bodies against the finished

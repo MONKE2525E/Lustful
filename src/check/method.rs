@@ -6,13 +6,18 @@
 // projection, or a dyn type, and for every trait method.
 //
 // Probe order is section 2.10 step 2, interleaved with the
-// inherent probes `method_call` already makes: for each autoderef
-// step (builtin derefs only in this wave: references), for each
-// receiver form (by value, then `&`, then `&mut`), inherent first,
-// then traits in scope. Two trait hits in one probe are ambiguous.
-// Every probe records its candidate-set reads: inherent probes go
-// through the `MethodSet` query in `method_call`, trait probes
-// record `ImplSet` reads inside selection.
+// inherent probes `method_call` already makes. It follows rustc:
+// candidates match by receiver type, not by Self type. For each
+// autoderef step `U` (builtin derefs only in this wave:
+// references) the by-value probe takes every method whose
+// receiver type is `U`: the by-value methods of `U` itself, and,
+// when `U` is `&T` or `&mut T`, the `&self` or `&mut self`
+// methods of `T`. Autoref probes (`&U`, then `&mut U`) come
+// after. Inherent candidates win over trait candidates in one
+// probe; two trait hits in one probe are ambiguous. Every probe
+// records its candidate-set reads: inherent probes go through
+// the `MethodSet` query, trait probes record `ImplSet` reads
+// inside selection.
 use super::*;
 use crate::ast::{ExprId, SelfKind};
 use crate::check::generics::TraitMethodTemplate;
@@ -44,6 +49,32 @@ fn autoref_of(form: ReceiverForm) -> Autoref {
         ReceiverForm::Value => Autoref::None,
         ReceiverForm::Ref => Autoref::Ref,
         ReceiverForm::RefMut => Autoref::RefMut,
+    }
+}
+
+/// One receiver-type probe variant at one autoderef step: the
+/// Self type whose inherent impls and trait impls are probed,
+/// the receiver type a matching method must have, the
+/// adjustment lowering applies after the step's derefs, and
+/// the `self` form filter for candidate sets. The by-value
+/// probe at a reference step has two variants: Self = the step
+/// type (by-value methods) and Self = the pointee (`&self`
+/// methods, whose receiver type is the step type itself). A
+/// pointee hit records one extra deref plus autoref, so the
+/// receiver is reborrowed (`&mut *r`), never moved.
+#[derive(Clone, Copy)]
+pub(super) struct RcvProbe {
+    pub self_ty: Ty,
+    pub recv_ty: Ty,
+    pub autoref: Autoref,
+    pub extra_derefs: u8,
+    pub filter: ReceiverForm,
+}
+
+impl RcvProbe {
+    /// The primary variant at one autoderef step and form.
+    pub(super) fn at(cx: &mut Ctx, step: Ty, form: ReceiverForm) -> RcvProbe {
+        RcvProbe { self_ty: step, recv_ty: receiver_for_form(cx, step, form), autoref: autoref_of(form), extra_derefs: 0, filter: form }
     }
 }
 
@@ -103,8 +134,7 @@ fn confirm_method(
     generics: &Generics,
     prefix: &[GenericArg],
     explicit: &[Option<GenericArg>],
-    step: Ty,
-    form: ReceiverForm,
+    probe: RcvProbe,
     derefs: u8,
     args: &[ExprId],
     name_span: Span,
@@ -116,28 +146,28 @@ fn confirm_method(
     full_explicit.extend_from_slice(explicit);
     let (params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
     let want_recv = *params.first()?;
-    let got_recv = receiver_for_form(cx, step, form);
-    if !cx.unify(want_recv, got_recv) {
+    if !cx.unify(want_recv, probe.recv_ty) {
         cx.rollback_vars(snap_vars);
         cx.obl_truncate(obl_len);
         cx.generic_sites.truncate(sites_len);
         return None;
     }
-    cx.set_res(e, Res::Method { f: template, derefs, autoref: autoref_of(form) });
+    cx.set_res(e, Res::Method { f: template, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
     cx.check_args(&params[1.min(params.len())..], args, name_span);
     Some(cx.normalize_here(ret))
 }
 
-/// Probes inherent method templates of one Adt step type at one
-/// receiver form. Plain inherent methods are the existing
-/// `method_set` path in `method_call`; this covers the generic
-/// ones that path would mis-instantiate.
+/// Probes inherent method templates of one probe variant's Self
+/// type. Plain inherent methods are `plain_inherent_probe`;
+/// this covers the generic ones that path would
+/// mis-instantiate. Every registered template is tried: the
+/// receiver unify in `confirm_method` keeps only the ones whose
+/// impl Self pattern matches this receiver.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inherent_template_probe(
     cx: &mut Ctx,
     e: ExprId,
-    step: Ty,
-    form: ReceiverForm,
+    probe: RcvProbe,
     derefs: u8,
     name: Sym,
     name_span: Span,
@@ -145,24 +175,26 @@ pub(super) fn inherent_template_probe(
     explicit: &[Option<GenericArg>],
 ) -> Probe {
     let p = cx.p;
-    let Some((adt_def, _)) = cx.tys.adt_parts(step) else { return Probe::Miss };
-    let Some(&template) = p.gx.inherent_methods.get(&(adt_def, name)) else { return Probe::Miss };
-    let Some(Some(tmpl)) = p.gx.fn_templates.get(template.0 as usize).cloned() else { return Probe::Miss };
-    // The receiver form must be able to match at all; the unify
-    // in confirm_method decides the rest.
-    match confirm_method(cx, e, template, &tmpl.generics.clone(), &[], explicit, step, form, derefs, args, name_span) {
-        Some(ret) => Probe::Hit(ret),
-        None => Probe::Miss,
+    let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return Probe::Miss };
+    let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
+    for template in templates {
+        let Some(Some(tmpl)) = p.gx.fn_templates.get(template.0 as usize).cloned() else { continue };
+        if let Some(ret) = confirm_method(cx, e, template, &tmpl.generics.clone(), &[], explicit, probe, derefs, args, name_span) {
+            return Probe::Hit(ret);
+        }
     }
+    Probe::Miss
 }
 
-/// Probes trait methods at one autoderef step and receiver form.
+/// Probes trait methods for one receiver-type probe group (the
+/// variants of one autoderef step that share a receiver type).
+/// Hits are counted across the whole group, as rustc counts
+/// candidates in one probe.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn trait_method_probe(
     cx: &mut Ctx,
     e: ExprId,
-    step: Ty,
-    form: ReceiverForm,
+    probes: &[RcvProbe],
     derefs: u8,
     name: Sym,
     name_span: Span,
@@ -177,7 +209,7 @@ pub(super) fn trait_method_probe(
     // default) local, the instantiation prefix, and the trait
     // input types a trial argument check inferred (when plain
     // selection with fresh inputs was ambiguous).
-    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>)> = Vec::new();
+    let mut hits: Vec<(DefId, Option<TraitMethodTemplate>, LocalDefId, Vec<GenericArg>, Option<Vec<Ty>>, RcvProbe)> = Vec::new();
     for trait_def in traits {
         if !trait_in_scope(cx, trait_def) {
             continue;
@@ -191,122 +223,126 @@ pub(super) fn trait_method_probe(
         if tmpl.as_ref().is_some_and(|t| t.self_kind.is_none()) {
             continue;
         }
-        // Receiver-form pre-filter for plain receivers; typed
-        // receivers are decided by unification in confirm.
-        match tmpl.as_ref().and_then(|t| t.self_kind) {
-            Some(SelfKind::Value) if form != ReceiverForm::Value => continue,
-            Some(SelfKind::Ref) if form != ReceiverForm::Ref => continue,
-            Some(SelfKind::RefMut) if form != ReceiverForm::RefMut => continue,
-            _ => {}
-        }
-        let n_inputs = rec.generics.params.len().saturating_sub(1);
-        let snap = cx.snapshot_vars();
-        let obl_len = cx.obl_len();
-        let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
-        for _ in 0..n_inputs {
-            tr_args.push(GenericArg::Ty(cx.new_var(false)));
-        }
-        let args_id = cx.tys.intern_args(&tr_args);
-        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
-        let sel = cx.select_obligation(tr);
-        let ambiguous = matches!(sel, Selection::Ambiguous);
-        let found: Option<(LocalDefId, Vec<GenericArg>)> = match sel {
-            Selection::Impl { id, args: impl_args, .. } => {
-                let rec_impl = p.gx.index.get(id);
-                let by_name = rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
-                match by_name {
-                    Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
-                    None => {
-                        // The trait default body, as a template.
-                        p.local_def(method_def.hash).map(|l| {
-                            let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
-                            let deep_args: Vec<GenericArg> = raw
-                                .iter()
-                                .map(|&g| match g {
-                                    GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
-                                    other => other,
-                                })
-                                .collect();
-                            (l, deep_args)
-                        })
-                    }
-                }
+        for &probe in probes {
+            let step = probe.self_ty;
+            let form = probe.filter;
+            // Receiver-form pre-filter for plain receivers; typed
+            // receivers are decided by unification in confirm.
+            match tmpl.as_ref().and_then(|t| t.self_kind) {
+                Some(SelfKind::Value) if form != ReceiverForm::Value => continue,
+                Some(SelfKind::Ref) if form != ReceiverForm::Ref => continue,
+                Some(SelfKind::RefMut) if form != ReceiverForm::RefMut => continue,
+                _ => {}
             }
-            _ => None,
-        };
-        // Roll the probe back either way; the winner re-selects.
-        cx.rollback_vars(snap);
-        cx.obl_truncate(obl_len);
-        if let Some((local, prefix)) = found {
-            hits.push((trait_def, tmpl, local, prefix, None));
-            continue;
-        }
-        // Ambiguous selection with fresh trait inputs is common
-        // with one impl per input (`Convert<u8>` and
-        // `Convert<u16>` for one Self): the written arguments
-        // fix the inputs through the trait method's own
-        // signature. Trial-check the arguments against that
-        // signature (rolled back in full), then select again
-        // with the inferred inputs.
-        if ambiguous && let Some(t) = &tmpl {
+            let n_inputs = rec.generics.params.len().saturating_sub(1);
             let snap = cx.snapshot_vars();
             let obl_len = cx.obl_len();
-            let err_len = cx.errs.len();
-            let sites_len = cx.generic_sites.len();
-            let csites_len = cx.closure_sites.len();
-            let mut input_vars: Vec<Ty> = Vec::new();
-            let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
+            let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
             for _ in 0..n_inputs {
-                let v = cx.new_var(false);
-                input_vars.push(v);
-                full.push(GenericArg::Ty(v));
+                tr_args.push(GenericArg::Ty(cx.new_var(false)));
             }
-            let n_trait_params = rec.generics.params.len();
-            for (i, param) in t.generics.params.iter().enumerate().skip(n_trait_params) {
-                let given = explicit.get(i - n_trait_params).copied().flatten();
-                full.push(match (given, &param.kind) {
-                    (Some(g), _) => g,
-                    (None, ParamKind::Type) => GenericArg::Ty(cx.new_var(false)),
-                    (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
-                    (None, ParamKind::Const(_)) => GenericArg::Const(cx.fresh_const_var()),
-                });
-            }
-            let params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
-            let want_form = receiver_for_form(cx, step, form);
-            let zonked: Option<Vec<Ty>> = if !params.is_empty() && cx.unify(params[0], want_form) {
-                cx.check_args(&params[1..], args, name_span);
-                Some(input_vars.iter().map(|&v| cx.deep(v)).collect())
-            } else {
-                None
-            };
-            cx.rollback_vars(snap);
-            cx.obl_truncate(obl_len);
-            cx.errs.truncate(err_len);
-            cx.generic_sites.truncate(sites_len);
-            cx.closure_sites.truncate(csites_len);
-            if let Some(inputs) = zonked {
-                let snap = cx.snapshot_vars();
-                let obl_len = cx.obl_len();
-                let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
-                tr_args.extend(inputs.iter().map(|&t| GenericArg::Ty(t)));
-                let args_id = cx.tys.intern_args(&tr_args);
-                let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
-                let found: Option<(LocalDefId, Vec<GenericArg>)> = match cx.select_obligation(tr) {
-                    Selection::Impl { id, args: impl_args, .. } => {
-                        let rec_impl = p.gx.index.get(id);
-                        let by_name =
-                            rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
-                        match by_name {
-                            Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
-                            None => p.local_def(method_def.hash).map(|l| (l, tr_args.clone())),
+            let args_id = cx.tys.intern_args(&tr_args);
+            let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+            let sel = cx.select_obligation(tr);
+            let ambiguous = matches!(sel, Selection::Ambiguous);
+            let found: Option<(LocalDefId, Vec<GenericArg>)> = match sel {
+                Selection::Impl { id, args: impl_args, .. } => {
+                    let rec_impl = p.gx.index.get(id);
+                    let by_name = rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
+                    match by_name {
+                        Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
+                        None => {
+                            // The trait default body, as a template.
+                            p.local_def(method_def.hash).map(|l| {
+                                let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+                                let deep_args: Vec<GenericArg> = raw
+                                    .iter()
+                                    .map(|&g| match g {
+                                        GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
+                                        other => other,
+                                    })
+                                    .collect();
+                                (l, deep_args)
+                            })
                         }
                     }
-                    _ => None,
+                }
+                _ => None,
+            };
+            // Roll the probe back either way; the winner re-selects.
+            cx.rollback_vars(snap);
+            cx.obl_truncate(obl_len);
+            if let Some((local, prefix)) = found {
+                hits.push((trait_def, tmpl.clone(), local, prefix, None, probe));
+                continue;
+            }
+            // Ambiguous selection with fresh trait inputs is common
+            // with one impl per input (`Convert<u8>` and
+            // `Convert<u16>` for one Self): the written arguments
+            // fix the inputs through the trait method's own
+            // signature. Trial-check the arguments against that
+            // signature (rolled back in full), then select again
+            // with the inferred inputs.
+            if ambiguous && let Some(t) = &tmpl {
+                let snap = cx.snapshot_vars();
+                let obl_len = cx.obl_len();
+                let err_len = cx.errs.len();
+                let sites_len = cx.generic_sites.len();
+                let csites_len = cx.closure_sites.len();
+                let mut input_vars: Vec<Ty> = Vec::new();
+                let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
+                for _ in 0..n_inputs {
+                    let v = cx.new_var(false);
+                    input_vars.push(v);
+                    full.push(GenericArg::Ty(v));
+                }
+                let n_trait_params = rec.generics.params.len();
+                for (i, param) in t.generics.params.iter().enumerate().skip(n_trait_params) {
+                    let given = explicit.get(i - n_trait_params).copied().flatten();
+                    full.push(match (given, &param.kind) {
+                        (Some(g), _) => g,
+                        (None, ParamKind::Type) => GenericArg::Ty(cx.new_var(false)),
+                        (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
+                        (None, ParamKind::Const(_)) => GenericArg::Const(cx.fresh_const_var()),
+                    });
+                }
+                let params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
+                let want_form = probe.recv_ty;
+                let zonked: Option<Vec<Ty>> = if !params.is_empty() && cx.unify(params[0], want_form) {
+                    cx.check_args(&params[1..], args, name_span);
+                    Some(input_vars.iter().map(|&v| cx.deep(v)).collect())
+                } else {
+                    None
                 };
                 cx.rollback_vars(snap);
                 cx.obl_truncate(obl_len);
-                if let Some((local, prefix)) = found {
-                    hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs)));
+                cx.errs.truncate(err_len);
+                cx.generic_sites.truncate(sites_len);
+                cx.closure_sites.truncate(csites_len);
+                if let Some(inputs) = zonked {
+                    let snap = cx.snapshot_vars();
+                    let obl_len = cx.obl_len();
+                    let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
+                    tr_args.extend(inputs.iter().map(|&t| GenericArg::Ty(t)));
+                    let args_id = cx.tys.intern_args(&tr_args);
+                    let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+                    let found: Option<(LocalDefId, Vec<GenericArg>)> = match cx.select_obligation(tr) {
+                        Selection::Impl { id, args: impl_args, .. } => {
+                            let rec_impl = p.gx.index.get(id);
+                            let by_name =
+                                rec_impl.items.iter().copied().find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == name));
+                            match by_name {
+                                Some(d) => p.local_def(d.hash).map(|l| (l, impl_args.clone())),
+                                None => p.local_def(method_def.hash).map(|l| (l, tr_args.clone())),
+                            }
+                        }
+                        _ => None,
+                    };
+                    cx.rollback_vars(snap);
+                    cx.obl_truncate(obl_len);
+                    if let Some((local, prefix)) = found {
+                        hits.push((trait_def, tmpl.clone(), local, prefix, Some(inputs), probe));
+                    }
                 }
             }
         }
@@ -314,7 +350,8 @@ pub(super) fn trait_method_probe(
     match hits.len() {
         0 => Probe::Miss,
         1 => {
-            let (trait_def, _tmpl, local, prefix, zonked) = hits.into_iter().next().unwrap();
+            let (trait_def, _tmpl, local, prefix, zonked, probe) = hits.into_iter().next().unwrap();
+            let step = probe.self_ty;
             // Re-select to commit the selection bindings and get
             // the confirmed instantiation prefix.
             let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(step)];
@@ -356,16 +393,15 @@ pub(super) fn trait_method_probe(
                         (info.params.clone(), info.ret)
                     };
                     let want_recv = params[0];
-                    let got_recv2 = receiver_for_form(cx, step, form);
-                    if !cx.unify(want_recv, got_recv2) {
+                    if !cx.unify(want_recv, probe.recv_ty) {
                         return Probe::Miss;
                     }
-                    cx.set_res(e, Res::Method { f: local, derefs, autoref: autoref_of(form) });
+                    cx.set_res(e, Res::Method { f: local, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
                     cx.check_args(&params[1..], args, name_span);
                     return Probe::Hit(cx.normalize_here(ret));
                 }
             };
-            match confirm_method(cx, e, local, &generics, &prefix, explicit, step, form, derefs, args, name_span) {
+            match confirm_method(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
                 Some(ret) => Probe::Hit(ret),
                 None => Probe::Miss,
             }
@@ -393,64 +429,64 @@ fn local_is_impl_method(p: &Program, local: LocalDefId, _name: Sym) -> bool {
     p.gx.index.all_impls().any(|(_, rec)| rec.items.contains(&def))
 }
 
-/// The full generic method search over autoderef steps, used
-/// when the plain inherent probe and the builtin table both miss
-/// (and interleaved per form for generic inherent templates via
-/// `inherent_template_probe`). Returns Hit/Miss/Failed like a
-/// single probe.
-#[allow(clippy::too_many_arguments)]
-/// The plain inherent probe of one step+form, through the
+/// The plain inherent probe of one variant, through the
 /// recorded `MethodSet` query (as `method_call` makes it), for
-/// non-template inherent methods.
+/// non-template inherent methods. Every candidate in the set is
+/// tried; templates are left to `inherent_template_probe`, and
+/// associated fns (no `self`) never match here (the fallback in
+/// `method_call` reports them when nothing else applies).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plain_inherent_probe(
     cx: &mut Ctx,
     e: ExprId,
-    step: Ty,
-    form: ReceiverForm,
+    probe: RcvProbe,
     derefs: u8,
     name: Sym,
     name_span: Span,
     args: &[ExprId],
 ) -> Probe {
     let p = cx.p;
-    let head = Head::of(&cx.tys, step);
-    let set = p.method_set(&mut cx.out.reads, head, name, form);
-    let Some(c) = set.first() else { return Probe::Miss };
-    let Some(f) = p.local_def(c.def.hash) else { return Probe::Miss };
-    if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
-        return Probe::Miss; // the template probe handles it
+    let head = Head::of(&cx.tys, probe.self_ty);
+    let set = p.method_set(&mut cx.out.reads, head, name, probe.filter);
+    for c in set.candidates {
+        let Some(f) = p.local_def(c.def.hash) else { continue };
+        if c.receiver.is_none() {
+            continue;
+        }
+        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            continue; // the template probe handles it
+        }
+        let (params, ret) = match p.sig_of(&mut cx.out.reads, c.def) {
+            SigOf::Fn(info) => (info.params.clone(), info.ret),
+            _ => continue,
+        };
+        // The candidate set is keyed by the reference-peeled head
+        // and by the template Adt, so it also surfaces methods
+        // whose receiver type or impl Self pattern does not match
+        // this receiver (a `&self` method of `S` at a `&S` step
+        // under form `Ref`, where lowering would pass `&&S`, or a
+        // method of `impl W<u8>` for a `W<u32>` receiver). Unify
+        // the method's receiver type with what this variant
+        // presents (as `confirm_method` does) and probe on when
+        // they differ.
+        let snap_vars = cx.snapshot_vars();
+        let obl_len = cx.obl_len();
+        let want_recv = params.first().copied();
+        if want_recv.is_none_or(|want| !cx.unify(want, probe.recv_ty)) {
+            cx.rollback_vars(snap_vars);
+            cx.obl_truncate(obl_len);
+            continue;
+        }
+        cx.set_res(e, Res::Method { f, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
+        cx.check_args(&params[1.min(params.len())..], args, name_span);
+        return Probe::Hit(ret);
     }
-    let Some(rcv_form) = c.receiver else {
-        cx.err("L0104", name_span, format!("`{}` is an associated function, not a method", cx.name(name)), "Call it as `Type::name(...)`.");
-        return Probe::Failed;
-    };
-    let _ = rcv_form;
-    let (params, ret) = match p.sig_of(&mut cx.out.reads, c.def) {
-        SigOf::Fn(info) => (info.params.clone(), info.ret),
-        _ => return Probe::Miss,
-    };
-    // The candidate set is keyed by the reference-peeled head, so a
-    // `&self` method of `S` also surfaces at a `&S` step under form
-    // `Ref`, where lowering would pass `&&S`. Unify the method's
-    // receiver type with what this step+form presents (as
-    // `confirm_method` does) and probe on when they differ: the
-    // same method then hits at the derefed step with the right
-    // deref count.
-    let snap_vars = cx.snapshot_vars();
-    let obl_len = cx.obl_len();
-    let want_recv = params.first().copied();
-    let got_recv = receiver_for_form(cx, step, form);
-    if want_recv.is_none_or(|want| !cx.unify(want, got_recv)) {
-        cx.rollback_vars(snap_vars);
-        cx.obl_truncate(obl_len);
-        return Probe::Miss;
-    }
-    cx.set_res(e, Res::Method { f, derefs, autoref: autoref_of(form) });
-    cx.check_args(&params[1.min(params.len())..], args, name_span);
-    Probe::Hit(ret)
+    Probe::Miss
 }
 
+/// The full generic method search over autoderef steps, in
+/// rustc's receiver-type probe order. Returns Hit/Miss/Failed
+/// like a single probe.
 pub(super) fn generic_method_search(
     cx: &mut Ctx,
     e: ExprId,
@@ -472,16 +508,34 @@ pub(super) fn generic_method_search(
         }
     }
     for (step, derefs) in steps {
-        for form in ReceiverForm::PROBE_ORDER {
-            match plain_inherent_probe(cx, e, step, form, derefs, name, name_span, args) {
-                Probe::Miss => {}
-                hit => return hit,
+        // One group per receiver type, in probe order: by value
+        // (the step type itself; at a reference step this group
+        // also has the pointee variant), then `&step`, then
+        // `&mut step`. Inherent probes run for every variant of
+        // the group before the group's trait probe.
+        let mut by_value = vec![RcvProbe::at(cx, step, ReceiverForm::Value)];
+        if let TyKind::Ref(_, m, inner) = cx.tys.kind(step) {
+            by_value.push(RcvProbe {
+                self_ty: cx.resolve(inner),
+                recv_ty: step,
+                autoref: if m == Mut::Mut { Autoref::RefMut } else { Autoref::Ref },
+                extra_derefs: 1,
+                filter: if m == Mut::Mut { ReceiverForm::RefMut } else { ReceiverForm::Ref },
+            });
+        }
+        let groups = [by_value, vec![RcvProbe::at(cx, step, ReceiverForm::Ref)], vec![RcvProbe::at(cx, step, ReceiverForm::RefMut)]];
+        for group in &groups {
+            for &probe in group {
+                match plain_inherent_probe(cx, e, probe, derefs, name, name_span, args) {
+                    Probe::Miss => {}
+                    hit => return hit,
+                }
+                match inherent_template_probe(cx, e, probe, derefs, name, name_span, args, explicit) {
+                    Probe::Miss => {}
+                    hit => return hit,
+                }
             }
-            match inherent_template_probe(cx, e, step, form, derefs, name, name_span, args, explicit) {
-                Probe::Miss => {}
-                hit => return hit,
-            }
-            match trait_method_probe(cx, e, step, form, derefs, name, name_span, args, explicit) {
+            match trait_method_probe(cx, e, group, derefs, name, name_span, args, explicit) {
                 Probe::Miss => {}
                 hit => return hit,
             }

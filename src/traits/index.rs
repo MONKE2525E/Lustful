@@ -768,6 +768,38 @@ impl ImplIndex {
         true
     }
 
+    /// The overlap test for one pair of inherent methods with the
+    /// same name (rustc E0592): their impl Self patterns, over
+    /// their impl generics, unify, and no where clause of either
+    /// is disprovable by the orphan test. `pat_a` and `pat_b` are
+    /// written over `gen_a` and `gen_b` parameters.
+    pub fn inherent_pair_overlaps(
+        &self,
+        tys: &mut impl TyIntern,
+        pat_a: Ty,
+        gen_a: &Generics,
+        pat_b: Ty,
+        gen_b: &Generics,
+        fundamental: &[DefId],
+        is_local: &dyn Fn(DefId) -> bool,
+    ) -> bool {
+        let na = gen_a.params.len();
+        let nb = gen_b.params.len();
+        let pat_b = rename_ty(tys, pat_b, nb, na as u32);
+        let mut map: FxMap<ParamId, Ty> = FxMap::default();
+        if !unify_patterns(tys, &mut map, pat_a, pat_b) {
+            return false;
+        }
+        let mut all = trait_clauses_of_generics(tys, gen_a, 0);
+        all.extend(trait_clauses_of_generics(tys, gen_b, na as u32));
+        for clause in all {
+            if self.clause_cannot_hold(tys, &map, clause, na + nb, fundamental, is_local) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The orphan rule for one impl (section 2.3): the trait must be
     /// local, or the Self type must contain a local type before any
     /// uncovered generic parameter. Parameters under fundamental
@@ -822,6 +854,22 @@ fn orphan_walk(
 fn trait_clauses_of(tys: &mut impl TyIntern, rec: &ImplRecord, offset: u32) -> Vec<TraitRef> {
     let n = rec.generics.params.len();
     rec.generics
+        .predicates
+        .iter()
+        .filter_map(|p| match p {
+            Predicate::Trait(b) if b.count == 0 => Some(b.value),
+            _ => None,
+        })
+        .map(|tr| rename_trait_ref(tys, tr, n, offset))
+        .collect()
+}
+
+/// The trait clauses of one generics list (an inherent impl's),
+/// renamed by `offset`, as `trait_clauses_of` does for an impl
+/// record.
+fn trait_clauses_of_generics(tys: &mut impl TyIntern, generics: &Generics, offset: u32) -> Vec<TraitRef> {
+    let n = generics.params.len();
+    generics
         .predicates
         .iter()
         .filter_map(|p| match p {

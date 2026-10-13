@@ -147,7 +147,10 @@ pub struct MethodSet {
 }
 
 impl MethodSet {
-    /// The first candidate, which method resolution picks (section 2.10).
+    /// The first candidate. Method resolution iterates every
+    /// candidate and unifies the receiver (section 2.10); this
+    /// is for tests that inspect a set.
+    #[cfg(test)]
     pub fn first(&self) -> Option<MethodCandidate> {
         self.candidates.first().copied()
     }
@@ -921,7 +924,8 @@ impl<'a> Program<'a> {
     /// that picked a trait method must recheck when an inherent method of
     /// the same name appears, and only the recorded probes say so.
     ///
-    /// Today only inherent user methods exist, at most one per (Adt, name).
+    /// Today only inherent user methods exist here, one candidate
+    /// per inherent impl that defines the name on this Adt.
     /// Builtin methods on builtin and primitive heads still dispatch through
     /// the compat path in `check` and answer as an empty set here; the read
     /// is still recorded, with the probe itself in the fingerprint (see
@@ -940,18 +944,20 @@ impl<'a> Program<'a> {
         let mut set = MethodSet::default();
         if let Head::Adt(def) = head
             && let Some(a) = self.adt_by_def(def)
-            && let Some(&f) = self.methods.get(&(a, name))
+            && let Some(fs) = self.methods.get(&(a, name))
         {
-            let receiver = match self.fn_info(f).self_kind {
-                Some(SelfKind::Value) | Some(SelfKind::Typed) => Some(ReceiverForm::Value),
-                Some(SelfKind::Ref) => Some(ReceiverForm::Ref),
-                Some(SelfKind::RefMut) => Some(ReceiverForm::RefMut),
-                None => None,
-            };
-            // An associated fn without `self` surfaces in the first probe
-            // only, marked with no receiver (see `MethodCandidate`).
-            if receiver == Some(form) || (receiver.is_none() && form == ReceiverForm::Value) {
-                set.candidates.push(MethodCandidate { def: self.def_id(f), receiver, trait_: None });
+            for &f in fs {
+                let receiver = match self.fn_info(f).self_kind {
+                    Some(SelfKind::Value) | Some(SelfKind::Typed) => Some(ReceiverForm::Value),
+                    Some(SelfKind::Ref) => Some(ReceiverForm::Ref),
+                    Some(SelfKind::RefMut) => Some(ReceiverForm::RefMut),
+                    None => None,
+                };
+                // An associated fn without `self` surfaces in the first probe
+                // only, marked with no receiver (see `MethodCandidate`).
+                if receiver == Some(form) || (receiver.is_none() && form == ReceiverForm::Value) {
+                    set.candidates.push(MethodCandidate { def: self.def_id(f), receiver, trait_: None });
+                }
             }
         }
         set

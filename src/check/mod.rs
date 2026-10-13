@@ -4105,7 +4105,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(v) = is_variant {
             return Some(Res::Variant(a, v as u32));
         }
-        if let Some(&f) = p.methods.get(&(a, item)) {
+        if let Some(&f) = p.methods.get(&(a, item)).and_then(|fs| fs.first()) {
             return Some(Res::Fn(f));
         }
         let tn = self.name(ty_name).to_string();
@@ -4755,60 +4755,66 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 method::Probe::Miss => {}
             }
         }
-        let mut user = None;
+        // Every candidate of every form, in probe order. The set
+        // is keyed by the template Adt head, so a candidate only
+        // counts when its receiver type unifies with this
+        // receiver (a method of `impl W<u8>` does not apply to
+        // `W<u32>`); templates confirm inside their probe.
+        let mut assoc_fn_seen = false;
         for form in ReceiverForm::PROBE_ORDER {
             let set = p.method_set(&mut self.out.reads, head, name, form);
-            if let Some(c) = set.first() {
-                user = Some(c);
-                break;
+            for c in set.candidates {
+                let Some(cform) = c.receiver else {
+                    assoc_fn_seen = true;
+                    continue;
+                };
+                let f = p.local_def(c.def.hash).expect("a method candidate names a local fn");
+                if !turbofish.is_empty() && p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
+                    self.errs.push(not_yet("L0721", name_span, "turbofish on method calls"));
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
+                // A generic inherent method: instantiate it like a
+                // generic call, with the receiver unifying the impl
+                // and method parameters.
+                if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+                    let probe = method::RcvProbe::at(self, base, cform);
+                    match method::inherent_template_probe(self, e, probe, derefs, name, name_span, args, &explicit) {
+                        method::Probe::Hit(ret) => return ret,
+                        method::Probe::Failed => return ERROR,
+                        method::Probe::Miss => continue,
+                    }
+                }
+                let probe = method::RcvProbe::at(self, base, cform);
+                let (params, ret) = match p.sig_of(&mut self.out.reads, c.def) {
+                    SigOf::Fn(info) => (info.params.clone(), info.ret),
+                    _ => return ERROR,
+                };
+                let snap_vars = self.snapshot_vars();
+                let obl_len = self.obl_len();
+                if params.first().is_none_or(|&want| !self.unify(want, probe.recv_ty)) {
+                    self.rollback_vars(snap_vars);
+                    self.obl_truncate(obl_len);
+                    continue;
+                }
+                if probe.autoref != Autoref::None {
+                    self.check_packed_borrow(recv, name_span);
+                }
+                self.set_res(e, Res::Method { f, derefs, autoref: probe.autoref });
+                self.check_args(&params[1.min(params.len())..], args, name_span);
+                return ret;
             }
         }
-        if let Some(c) = user {
-            let f = p.local_def(c.def.hash).expect("a method candidate names a local fn");
-            if !turbofish.is_empty() && p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
-                self.errs.push(not_yet("L0721", name_span, "turbofish on method calls"));
-                for &a in args {
-                    self.expr(a, None);
-                }
-                return ERROR;
-            }
-            // A generic inherent method: instantiate it like a
-            // generic call, with the receiver unifying the impl
-            // and method parameters.
-            if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned()
-                && let Some(form) = c.receiver
-            {
-                match method::inherent_template_probe(self, e, base, form, derefs, name, name_span, args, &explicit) {
-                    method::Probe::Hit(ret) => return ret,
-                    method::Probe::Failed => return ERROR,
-                    method::Probe::Miss => {}
-                }
-                let _ = &tmpl;
-            }
-            let Some(form) = c.receiver else {
-                self.err(
-                    "L0104",
-                    name_span,
-                    format!("`{}` is an associated function, not a method", self.name(name)),
-                    "Call it as `Type::name(...)`.",
-                );
-                return ERROR;
-            };
-            let autoref = match form {
-                ReceiverForm::Value => Autoref::None,
-                ReceiverForm::Ref => Autoref::Ref,
-                ReceiverForm::RefMut => Autoref::RefMut,
-            };
-            let (params, ret) = match p.sig_of(&mut self.out.reads, c.def) {
-                SigOf::Fn(info) => (info.params[1..].to_vec(), info.ret),
-                _ => return ERROR,
-            };
-            if autoref != Autoref::None {
-                self.check_packed_borrow(recv, name_span);
-            }
-            self.set_res(e, Res::Method { f, derefs, autoref });
-            self.check_args(&params, args, name_span);
-            return ret;
+        if assoc_fn_seen {
+            self.err(
+                "L0104",
+                name_span,
+                format!("`{}` is an associated function, not a method", self.name(name)),
+                "Call it as `Type::name(...)`.",
+            );
+            return ERROR;
         }
         // `clone` on a reference to a non-Clone type clones the reference.
         if name == k.clone {

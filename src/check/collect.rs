@@ -133,7 +133,13 @@ pub struct Program<'a> {
     /// Non-generic type aliases by (flat) name, fully resolved.
     pub aliases: HashMap<Sym, Ty>,
     pub fn_names: HashMap<Sym, LocalDefId>,
-    pub methods: HashMap<(AdtId, Sym), LocalDefId>,
+    /// Inherent methods by (template Adt, name), in registration
+    /// order. Several inherent impls of one Adt may define the
+    /// same name under disjoint Self patterns (`impl W<u8>` and
+    /// `impl W<u16>`); the probe unifies the receiver against
+    /// each candidate, and the overlap check in `finish_collect`
+    /// rejects patterns that can both apply.
+    pub methods: HashMap<(AdtId, Sym), Vec<LocalDefId>>,
     pub main: Option<LocalDefId>,
     /// The crate this program was collected as: session-local id and stable hash.
     pub krate: CrateId,
@@ -1652,11 +1658,10 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                         // table under the *template* Adt; instances
                         // get their own entries at materialization.
                         if let Some(owner) = owner {
-                            if p.methods.insert((owner, def.name), id).is_some() {
-                                errs.push(dup(def.name_span, interner.get(def.name)));
-                            }
+                            p.methods.entry((owner, def.name)).or_default().push(id);
                             let adt_def = p.gx.adt_info[owner.0 as usize].0;
-                            p.gx.inherent_methods.insert((adt_def, def.name), id);
+                            p.gx.inherent_methods.entry((adt_def, def.name)).or_default().push(id);
+                            p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
                         }
                     }
                 }
@@ -2170,7 +2175,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             self.p.fn_names.get(&last).copied()
         } else if segs.len() == 2 {
             match self.p.type_names.get(&segs[0].name) {
-                Some(&a) => self.p.methods.get(&(a, last)).copied(),
+                Some(&a) => self.p.methods.get(&(a, last)).and_then(|fs| fs.first()).copied(),
                 None => None,
             }
         } else {
