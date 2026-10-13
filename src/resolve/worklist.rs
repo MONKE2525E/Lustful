@@ -462,6 +462,11 @@ pub struct ResolveCache {
     /// filesystem call per path, and discovery asks for every file
     /// on every request.
     canon: FxMap<PathBuf, String>,
+    /// Set for a one-shot process, which compiles once: no later request
+    /// reads the cache, so it stores nothing (no copies of token streams,
+    /// parsed Asts, or final chunks), and the resolve skips the
+    /// expanded-stream hashes that only key those entries.
+    one_shot: bool,
 }
 
 struct CachedFile {
@@ -557,9 +562,9 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
 }
 
 impl ResolveCache {
-    /// An empty cache.
-    pub fn new() -> ResolveCache {
-        ResolveCache::default()
+    /// An empty cache; `one_shot` for a process that compiles once.
+    pub fn new(one_shot: bool) -> ResolveCache {
+        ResolveCache { one_shot, ..ResolveCache::default() }
     }
 
     /// Drops every entry when the cfg environment changed.
@@ -598,8 +603,11 @@ impl ResolveCache {
         self.peek(key, text_hash, file_id).and_then(|e| e.raw.as_ref()).map(clone_lexed)
     }
 
+    /// Every put stores nothing in a one-shot cache (see `one_shot`).
     fn put_raw(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
-        self.entry(key, text_hash, file_id).raw = Some(clone_lexed(lexed));
+        if !self.one_shot {
+            self.entry(key, text_hash, file_id).raw = Some(clone_lexed(lexed));
+        }
     }
 
     /// The cached outline for one file, when its text and file id stand.
@@ -607,8 +615,10 @@ impl ResolveCache {
         self.peek(key, text_hash, file_id).and_then(|e| e.outline.clone())
     }
 
-    fn put_outline(&mut self, key: &str, text_hash: u64, file_id: FileId, outline: scan::Outline) {
-        self.entry(key, text_hash, file_id).outline = Some(outline);
+    fn put_outline(&mut self, key: &str, text_hash: u64, file_id: FileId, outline: &scan::Outline) {
+        if !self.one_shot {
+            self.entry(key, text_hash, file_id).outline = Some(outline.clone());
+        }
     }
 
     /// The cached expanded token stream for one file, cloned out.
@@ -626,7 +636,9 @@ impl ResolveCache {
     }
 
     fn put_parsed(&mut self, key: &str, text_hash: u64, file_id: FileId, expanded_hash: u64, ast: Ast) {
-        self.entry(key, text_hash, file_id).parsed = Some((expanded_hash, ast));
+        if !self.one_shot {
+            self.entry(key, text_hash, file_id).parsed = Some((expanded_hash, ast));
+        }
     }
 
     /// The rewrite epoch under which one file's final chunk is cached.
@@ -641,7 +653,9 @@ impl ResolveCache {
     }
 
     fn put_final(&mut self, key: &str, text_hash: u64, file_id: FileId, chunk: FinalChunk) {
-        self.entry(key, text_hash, file_id).final_chunk = Some(chunk);
+        if !self.one_shot {
+            self.entry(key, text_hash, file_id).final_chunk = Some(chunk);
+        }
     }
 }
 
@@ -874,7 +888,7 @@ fn crate_magic_name(stable: crate::def::StableCrateHash) -> String {
 
 /// Runs the outline worklist for one crate. See the file header.
 pub fn resolve_crate(input: &CrateInput, interner: &Interner, known: &Known) -> Result<ResolvedCrate, ResolveError> {
-    resolve_crate_cached(input, interner, known, &mut ResolveCache::new())
+    resolve_crate_cached(input, interner, known, &mut ResolveCache::new(true))
 }
 
 /// Runs the outline worklist for the selected crate and every source
@@ -1308,7 +1322,7 @@ fn process_disc_orig(
         Some(o) => o,
         None => {
             let o = scan::outline(&lexed, interner);
-            cache.put_outline(&file_key, text_hash, file_id, o.clone());
+            cache.put_outline(&file_key, text_hash, file_id, &o);
             o
         }
     };
@@ -2154,13 +2168,19 @@ fn resolve_one(
     // Parse the expanded files in parallel, in FileId order. A
     // file whose expanded stream hashes to a cached parse clones
     // that Ast instead of parsing again; the hash runs in parallel
-    // first because the cache itself is serial.
+    // first because the cache itself is serial. A one-shot cache
+    // holds no parse, so it needs no hashes (0 keys nothing).
     let mut order: Vec<usize> = (0..discs.len()).collect();
     order.sort_by_key(|&di| discs[di].file_id.0);
-    let exp_hashes = par_map(&order, |&di| match (expanded[di].as_ref(), discs[di].lexed.as_ref()) {
-        (Some(l), _) | (None, Some(l)) => hash_lexed(l),
-        (None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
-    });
+    let keep = !cache.one_shot;
+    let exp_hashes = if keep {
+        par_map(&order, |&di| match (expanded[di].as_ref(), discs[di].lexed.as_ref()) {
+            (Some(l), _) | (None, Some(l)) => hash_lexed(l),
+            (None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
+        })
+    } else {
+        vec![0; order.len()]
+    };
     // The stream each file parses from. Nothing reads the streams after
     // this phase, so a parse task moves its own out instead of copying it.
     let streams: Vec<std::sync::Mutex<Option<lexer::Lexed>>> =
@@ -2197,7 +2217,7 @@ fn resolve_one(
         let lexed = streams[di].lock().unwrap().take().unwrap_or(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() });
         let ast = parser::parse(&lexed, interner, known)?;
         let outside = reads_outside(&disc.text);
-        let store = if outside { None } else { Some(ast.clone()) };
+        let store = if outside || !keep { None } else { Some(ast.clone()) };
         let key = format!("{}#{}", modules::canonical_string(&disc.path), disc.module.0);
         Ok((
             FileWork {
@@ -2442,7 +2462,7 @@ fn resolve_one(
         }
         w.ast.items = flat_items;
         pendings.push(Pending {
-            cacheable: !w.outside,
+            cacheable: !w.outside && keep,
             key: w.key,
             text_hash: w.text_hash,
             exp_hash: w.exp_hash,
@@ -4669,7 +4689,7 @@ mod tests {
             crate_name: "cachetest".into(),
             deps: Vec::new(),
         };
-        let mut cache = ResolveCache::new();
+        let mut cache = ResolveCache::new(false);
         let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");
         let second = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("cached resolves");
         assert_eq!(first.fn_lines, second.fn_lines);
@@ -4745,7 +4765,7 @@ mod tests {
         assert_eq!(shown("a$C").as_deref(), Some("a::C"));
         assert_eq!(shown("Root"), None, "root defs keep plain names");
         // A warm resolve through the cache rebuilds the same table.
-        let mut cache = ResolveCache::new();
+        let mut cache = ResolveCache::new(false);
         let warm = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("warm resolve");
         assert_eq!(warm.tables.display_names, r.tables.display_names);
         let warm2 = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("cached resolve");
@@ -4773,7 +4793,7 @@ mod tests {
             crate_name: "nestedtest".into(),
             deps: Vec::new(),
         };
-        let mut cache = ResolveCache::new();
+        let mut cache = ResolveCache::new(false);
         for round in 0..2 {
             let r = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("nested resolves");
             let fresh = crate::driver::ast_hash::scan_ast(&r.ast);

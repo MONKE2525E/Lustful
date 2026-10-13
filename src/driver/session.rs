@@ -266,7 +266,7 @@ impl Session {
                 split_mask: None,
                 resolved_crate: false,
                 resolved_crate_ids: None,
-                resolve_cache: crate::resolve::worklist::ResolveCache::new(),
+                resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
             },
             caches: Caches {
                 ok: Vec::new(),
