@@ -366,6 +366,9 @@ pub enum PrimOpKind {
     Un(ast::UnOp),
     /// An assignment operator trait method: `recv.op_assign(rhs)`.
     Assign(ast::BinOp),
+    /// `recv.into()` to a scalar target: the widening cast core's
+    /// `From` impl is, cast to the call's type.
+    IntoCast,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -1455,8 +1458,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if Self::numeric_from_ok(self.kind(input), self.kind(self_ty)) {
                 return Selection::ParamEvidence(usize::MAX);
             }
-            if matches!(self.kind(input), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
-                && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Char | TyKind::Bool)
+            if matches!(self.kind(input), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
+                && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
             {
                 return Selection::NoImpl;
             }
@@ -4642,29 +4645,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// True for the scalar widening conversions `From` provides in
-    /// std (identity is the blanket's job and also answers true).
+    /// True for the scalar conversions `From` provides in core
+    /// (identity is the blanket's job and also answers true).
     fn numeric_from_ok(src: TyKind, dst: TyKind) -> bool {
-        let bits = |k: TyKind| match k {
-            TyKind::Int(i) => Some((i.bits(), i.signed())),
-            TyKind::Bool => Some((1, false)),
-            TyKind::Char => Some((32, false)),
-            _ => None,
-        };
-        match (bits(src), bits(dst)) {
-            (Some((sb, ss)), Some((db, ds))) => {
-                if src == dst {
-                    return true;
-                }
-                if matches!(src, TyKind::Char) {
-                    return matches!(dst, TyKind::Int(IntTy::U32 | IntTy::U64 | IntTy::Usize));
-                }
-                if matches!(src, TyKind::Bool) {
-                    return matches!(dst, TyKind::Int(_));
-                }
-                db > sb && (!ss || ds) || db >= sb && ss == ds && db > sb
-            }
-            _ => src == dst,
+        // Core's exact `From` set between the scalar types (rustc
+        // 1.99 on a 64-bit target; probed exhaustively). Identity
+        // is the blanket's job and also answers true. Notable
+        // non-obvious cells: `usize`/`isize` have no outgoing
+        // impls at all, `usize` is a target only of u8/u16/bool,
+        // `isize` only of u8/i8/i16/bool, int-to-float exists only
+        // where every value is exact (f32: 16-bit ints, f64:
+        // 32-bit ints), and bool converts to every int and float.
+        use IntTy::*;
+        if src == dst {
+            return true;
+        }
+        match (src, dst) {
+            (TyKind::Bool, TyKind::Int(_) | TyKind::Float(_)) => true,
+            (TyKind::Char, TyKind::Int(U32 | U64 | U128)) => true,
+            (TyKind::Int(U8), TyKind::Char) => true,
+            (TyKind::Float(FloatTy::F32), TyKind::Float(FloatTy::F64)) => true,
+            (TyKind::Int(s), TyKind::Int(d)) => match (s, d) {
+                (Usize | Isize, _) => false,
+                (U8 | U16, Usize) => true,
+                (U8 | I8 | I16, Isize) => true,
+                (_, Usize | Isize) => false,
+                _ => d.bits() > s.bits() && (!s.signed() || d.signed()),
+            },
+            (TyKind::Int(s), TyKind::Float(f)) => match f {
+                FloatTy::F32 => matches!(s, U8 | U16 | I8 | I16),
+                FloatTy::F64 => matches!(s, U8 | U16 | U32 | I8 | I16 | I32),
+            },
+            _ => false,
         }
     }
 
@@ -4682,6 +4694,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn trait_assoc_base(&mut self, segs: &[ast::PathSeg], picked: bool) -> Option<Ty> {
         let p = self.p;
         let (ty_name, item) = (segs[0].name, segs[1].name);
+        // A primitive type names itself as the base (`u32::from(x)`):
+        // there is no Adt, and the assoc call probes traits for it.
+        if let Some(it) = p.known.int_ty(ty_name) {
+            return Some(int(it));
+        }
+        if ty_name == p.known.bool {
+            return Some(BOOL);
+        }
+        if ty_name == p.known.char {
+            return Some(CHAR);
+        }
+        if ty_name == p.known.f32 {
+            return Some(self.tys.float_ty(FloatTy::F32));
+        }
+        if ty_name == p.known.f64 {
+            return Some(self.tys.float_ty(FloatTy::F64));
+        }
         let a = if ty_name == p.known.self_type {
             self.self_adt()?
         } else {
@@ -4750,27 +4779,75 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // fn behind it (the lang blanket covers only identity).
         if self.name(name) == "from" && args.len() == 1 && hint.is_none_or(|h| h.def == p.gx.lang.from) {
             let src = self.expr(args[0], None);
-            if Self::numeric_from_ok(self.kind(src), self.kind(base)) {
+            // A written trait (`<M as From<i32>>::from`) fixes the
+            // input type: a literal takes it, and a suffixed
+            // argument of another type is the mismatch rustc
+            // reports through the impl's signature below.
+            let hint_input = hint.and_then(|h| self.tys.args(h.args).get(1).and_then(|g| g.as_ty())).map(|t| self.deep(t));
+            let hint_ok = match hint_input {
+                Some(hi) => self.unify(src, hi),
+                None => true,
+            };
+            let src = self.deep(src);
+            if hint_ok && Self::numeric_from_ok(self.kind(src), self.kind(base)) {
                 self.set_res(callee, Res::FromCast);
                 self.set_res(e, Res::FromCast);
                 return Some(base);
             }
             let src_kind = self.kind(src);
-            if matches!(src_kind, TyKind::Int(_) | TyKind::Char | TyKind::Bool) || src_kind.is_int_infer() || src_kind.is_float_infer() {
+            if matches!(src_kind, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
+                || src_kind.is_int_infer()
+                || src_kind.is_float_infer()
+            {
                 // With the input type known from the argument,
                 // selection can pick between input-specific impls
                 // (or, in a template check, the bounds for each From).
-                let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(src)]);
-                let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
-                let found = match self.select_obligation_at(tr, span, 0) {
-                    Selection::Impl { id, args: impl_args, .. } => self.method_instance_for_impl(e, id, tr, impl_args, "from", span),
-                    Selection::ParamEvidence(_) => self.stub_instance(e, tr, name, span),
-                    _ => None,
+                // An unsuffixed literal with several fitting impls
+                // falls back to i32/f64, as in rustc: try the
+                // written or literal type first, then the fallback.
+                let mut candidates: Vec<TraitRef> = Vec::new();
+                match hint {
+                    Some(h) => candidates.push(h),
+                    None => {
+                        let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(src)]);
+                        candidates.push(TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS });
+                    }
+                }
+                let fallback = if src_kind.is_int_infer() {
+                    Some(int(IntTy::I32))
+                } else if src_kind.is_float_infer() {
+                    Some(self.tys.float_ty(FloatTy::F64))
+                } else {
+                    None
                 };
-                if let Some((local, params, ret)) = found {
-                    self.set_res(e, Res::Fn(local));
-                    self.check_args(&params, args, span);
-                    return Some(self.normalize_here(ret));
+                let n_tries = if fallback.is_some() { 2 } else { 1 };
+                for try_no in 0..n_tries {
+                    let snap = self.snapshot_vars();
+                    let obl_len = self.obl_len();
+                    let sites_len = self.generic_sites.len();
+                    let tr = if try_no == 0 {
+                        candidates[0]
+                    } else {
+                        let fb = fallback.expect("second try has a fallback");
+                        if !self.unify(src, fb) {
+                            break;
+                        }
+                        let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(fb)]);
+                        TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS }
+                    };
+                    let found = match self.select_obligation_at(tr, span, 0) {
+                        Selection::Impl { id, args: impl_args, .. } => self.method_instance_for_impl(e, id, tr, impl_args, "from", span),
+                        Selection::ParamEvidence(_) => self.stub_instance(e, tr, name, span),
+                        _ => None,
+                    };
+                    if let Some((local, params, ret)) = found {
+                        self.set_res(e, Res::Fn(local));
+                        self.check_args(&params, args, span);
+                        return Some(self.normalize_here(ret));
+                    }
+                    self.rollback_vars(snap);
+                    self.obl_truncate(obl_len);
+                    self.generic_sites.truncate(sites_len);
                 }
                 return None;
             }
@@ -5632,6 +5709,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.check_args(&[rhs_ty], args, name_span);
                 UNIT
             }
+            // `prim_into_method` builds this kind, never this match.
+            K::IntoCast => unreachable!(),
         };
         self.set_res(e, Res::PrimOp { kind, derefs });
         Some(ret)
@@ -5698,6 +5777,49 @@ impl<'p, 'a> Ctx<'p, 'a> {
             PrimCmpKind::Total(_) => generics::ordering_ty(&mut self.tys),
             PrimCmpKind::Op(_) => BOOL,
         })
+    }
+
+    /// `x.into()` where the target is a scalar type core has a
+    /// `From` impl for: the call is the same widening cast as
+    /// `Target::from(x)` (lowered as `PrimOpKind::IntoCast`). The target must be
+    /// known here (an annotation, a return type, a template
+    /// replay through an `Into` bound): a target fixed only
+    /// later declines to the trait search, which handles user
+    /// types. A scalar target with no core impl also declines,
+    /// so the plain obligation error can report.
+    #[allow(clippy::too_many_arguments)]
+    fn prim_into_method(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+        builtin_only: bool,
+    ) -> Option<Ty> {
+        if !turbofish.is_empty() || self.name(name) != "into" {
+            return None;
+        }
+        let dst = self.deep(expected?);
+        let src_kind = self.kind(base);
+        let dst_kind = self.kind(dst);
+        if !Self::numeric_from_ok(src_kind, dst_kind) {
+            return None;
+        }
+        // Core's set is between concrete scalar types; an
+        // inference-variable side stays the trait search's call.
+        if !matches!(src_kind, TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char) {
+            return None;
+        }
+        if !builtin_only && self.prim_lang_guard(name, name_span, args, self.p.gx.lang.into, base) {
+            return Some(ERROR);
+        }
+        self.check_args(&[], args, name_span);
+        self.set_res(e, Res::PrimOp { kind: PrimOpKind::IntoCast, derefs });
+        Some(dst)
     }
 
     fn method_call(
@@ -5895,6 +6017,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // Operator trait methods on a scalar receiver, likewise.
         if let Some(ret) = self.prim_op_method(e, recv, base, derefs, name, name_span, args, turbofish, builtin_only) {
+            return ret;
+        }
+        // `into()` to a scalar target core has a `From` impl for.
+        if let Some(ret) = self.prim_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
         use Builtin as B;
