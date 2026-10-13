@@ -3162,6 +3162,20 @@ fn register_items(
                 tables.flat[ns_index(Namespace::Type)].insert(flat, def);
                 a.name = flat;
             }
+            ItemKind::Trait(t) => {
+                let flat = flat_name(tables, flat_prefix, module, t.name, interner);
+                // The ordinal counts same-flat-name traits in
+                // walk order, matching collect's trait defs.
+                let disamb = tables.def_info.values().filter(|i| i.kind == ResKind::Trait && i.flat == flat).count() as u32;
+                let def = DefId {
+                    krate: input.crate_ids.local,
+                    hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::Trait, interner.get(flat), disamb),
+                };
+                bind(tables, Namespace::Type, t.name, Target::Def(def), vis());
+                tables.def_info.insert(def, DefInfo { kind: ResKind::Trait, flat, module, vis: vis() });
+                tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+                t.name = flat;
+            }
             ItemKind::Impl(imp) => {
                 // Associated fn visibility, once the self type resolves
                 // in this module. The rewrite pass resolves the path
@@ -3296,6 +3310,42 @@ impl Rewrite<'_> {
         ast.items = items;
     }
 
+    /// Rewrites the trait paths in one bound list.
+    fn bounds(&mut self, ast: &mut Ast, bounds: &mut Vec<crate::ast::TraitBound>, span: Span, module: ModuleId) {
+        for b in bounds.iter_mut() {
+            if let crate::ast::TraitBound::Trait { trait_ref, .. } = b {
+                self.rewrite_path(&mut trait_ref.path, Namespace::Type, span, module, &[], ast);
+            }
+        }
+    }
+
+    /// Rewrites one item's generic parameter bounds, defaults,
+    /// and where clause (trait paths name traits in this module).
+    fn generics(&mut self, ast: &mut Ast, g: &mut crate::ast::Generics, w: &mut crate::ast::WhereClause, module: ModuleId) {
+        for p in g.params.iter_mut() {
+            match p {
+                crate::ast::GenericParam::Type { bounds, default, span, .. } => {
+                    self.bounds(ast, bounds, *span, module);
+                    if let Some(d) = *default {
+                        self.ty(ast, d, module);
+                    }
+                }
+                crate::ast::GenericParam::Const { ty, .. } => {
+                    let ty = *ty;
+                    self.ty(ast, ty, module);
+                }
+                crate::ast::GenericParam::Lifetime { .. } => {}
+            }
+        }
+        for pred in w.preds.iter_mut() {
+            if let crate::ast::WherePred::Type { ty, bounds, .. } = pred {
+                let ty = *ty;
+                self.ty(ast, ty, module);
+                self.bounds(ast, bounds, w.span, module);
+            }
+        }
+    }
+
     fn items(&mut self, ast: &mut Ast, items: &mut Vec<Item>, fi: usize, module: ModuleId, prefix: &[Sym]) {
         for item in items.iter_mut() {
             match &mut item.kind {
@@ -3305,6 +3355,7 @@ impl Rewrite<'_> {
                     *f = def;
                 }
                 ItemKind::Struct(s) => {
+                    self.generics(ast, &mut s.generics, &mut s.where_clause, module);
                     let fields = match &mut s.fields {
                         VariantFields::Struct(fs) | VariantFields::Tuple(fs) => fs.iter_mut().map(|f| f.ty).collect::<Vec<_>>(),
                         VariantFields::Unit => Vec::new(),
@@ -3314,6 +3365,7 @@ impl Rewrite<'_> {
                     }
                 }
                 ItemKind::Enum(e) => {
+                    self.generics(ast, &mut e.generics, &mut e.where_clause, module);
                     let mut tys = Vec::new();
                     let mut discs = Vec::new();
                     for v in &mut e.variants {
@@ -3333,12 +3385,48 @@ impl Rewrite<'_> {
                     }
                 }
                 ItemKind::Impl(imp) => {
+                    self.generics(ast, &mut imp.generics, &mut imp.where_clause, module);
+                    if let Some(tr) = &mut imp.trait_ref {
+                        let span = imp.span;
+                        self.rewrite_path(&mut tr.path, Namespace::Type, span, module, &[], ast);
+                    }
                     self.ty(ast, imp.self_ty, module);
+                    for at in imp.types.iter_mut() {
+                        self.bounds(ast, &mut at.bounds, at.span, module);
+                        self.generics(ast, &mut at.generics, &mut at.where_clause, module);
+                        if let Some(d) = at.default {
+                            self.ty(ast, d, module);
+                        }
+                    }
+                    let const_tys: Vec<crate::ast::TyId> = imp.consts.iter().map(|c| c.ty).collect();
+                    for t in const_tys {
+                        self.ty(ast, t, module);
+                    }
                     let mut fns = std::mem::take(&mut imp.fns);
                     for f in &mut fns {
                         self.fn_def(ast, f, module);
                     }
                     imp.fns = fns;
+                }
+                ItemKind::Trait(t) => {
+                    self.generics(ast, &mut t.generics, &mut t.where_clause, module);
+                    self.bounds(ast, &mut t.bounds, t.span, module);
+                    for at in t.types.iter_mut() {
+                        self.bounds(ast, &mut at.bounds, at.span, module);
+                        self.generics(ast, &mut at.generics, &mut at.where_clause, module);
+                        if let Some(d) = at.default {
+                            self.ty(ast, d, module);
+                        }
+                    }
+                    let const_tys: Vec<crate::ast::TyId> = t.consts.iter().map(|c| c.ty).collect();
+                    for ty in const_tys {
+                        self.ty(ast, ty, module);
+                    }
+                    let mut fns = std::mem::take(&mut t.fns);
+                    for f in &mut fns {
+                        self.fn_def(ast, f, module);
+                    }
+                    t.fns = fns;
                 }
                 ItemKind::Const(c) => {
                     self.ty(ast, c.ty, module);
@@ -3354,7 +3442,10 @@ impl Rewrite<'_> {
                         self.expr(ast, v, module, &mut scopes);
                     }
                 }
-                ItemKind::Type(a) => self.ty(ast, a.ty, module),
+                ItemKind::Type(a) => {
+                    self.generics(ast, &mut a.generics, &mut a.where_clause, module);
+                    self.ty(ast, a.ty, module);
+                }
                 ItemKind::Mod(m) => {
                     let mut key = prefix.to_vec();
                     key.push(m.name);
@@ -3369,6 +3460,7 @@ impl Rewrite<'_> {
 
     /// Rewrites one fn's signature types and body.
     fn fn_def(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId) {
+        self.generics(ast, &mut def.generics, &mut def.where_clause, module);
         for p in &def.params {
             let t = p.ty;
             self.ty(ast, t, module);
@@ -3620,6 +3712,26 @@ impl Rewrite<'_> {
                 self.ty(ast, inner, module);
                 let mut scopes = vec![Frame::default()];
                 self.expr(ast, len, module, &mut scopes);
+            }
+            TyExpr::Dyn { .. } | TyExpr::ImplTrait { .. } => {
+                let span = ast.ty_span(id);
+                let taken = std::mem::replace(&mut ast.tys[id.0 as usize], TyExpr::Unit);
+                let mut taken = taken;
+                match &mut taken {
+                    TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds } => self.bounds(ast, bounds, span, module),
+                    _ => unreachable!(),
+                }
+                ast.tys[id.0 as usize] = taken;
+            }
+            TyExpr::QPath { .. } => {
+                let span = ast.ty_span(id);
+                let TyExpr::QPath { self_ty, trait_path, segs } = std::mem::replace(&mut ast.tys[id.0 as usize], TyExpr::Unit) else {
+                    return;
+                };
+                let (mut trait_path, segs) = (trait_path, segs);
+                self.ty(ast, self_ty, module);
+                self.rewrite_path(&mut trait_path, Namespace::Type, span, module, &[], ast);
+                ast.tys[id.0 as usize] = TyExpr::QPath { self_ty, trait_path, segs };
             }
             TyExpr::FnPtr { inputs, ret, .. } => {
                 let ins: Vec<TyId> = inputs.iter().map(|p| p.ty).collect();

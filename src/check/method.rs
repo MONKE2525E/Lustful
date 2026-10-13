@@ -78,9 +78,12 @@ impl RcvProbe {
     }
 }
 
-/// True when a trait is in scope for method calls here: a local
-/// trait (defined in this file), a std prelude trait, or a trait
-/// named by a bound in the current param env.
+/// True when a trait is in scope for method calls here: a std
+/// prelude trait, a trait defined in or imported into the
+/// current fn's module (per the resolver tables), or a trait
+/// named by a bound in the current param env. Without resolver
+/// tables (collect-only test paths) every local trait counts
+/// as in scope, as before.
 pub(super) fn trait_in_scope_pub(cx: &Ctx, trait_def: DefId) -> bool {
     trait_in_scope(cx, trait_def)
 }
@@ -88,7 +91,32 @@ pub(super) fn trait_in_scope_pub(cx: &Ctx, trait_def: DefId) -> bool {
 fn trait_in_scope(cx: &Ctx, trait_def: DefId) -> bool {
     let p = cx.p;
     if p.gx.trait_names.values().any(|&d| d == trait_def) {
-        return true;
+        match &p.resolved {
+            Some(res) => match res.def_info.get(&trait_def) {
+                Some(info) => {
+                    if info.module == cx.module {
+                        return true;
+                    }
+                    // Imported into this module under any name
+                    // (including `as _`): a type-namespace
+                    // binding here targets the trait.
+                    use crate::resolve::imports::{BindState, ns_index};
+                    let imported = res
+                        .maps
+                        .get(cx.module.0 as usize)
+                        .is_some_and(|maps| {
+                            maps[ns_index(Namespace::Type)]
+                                .values()
+                                .any(|s| matches!(s, BindState::One(b) if res.target_def(b.target) == trait_def))
+                        });
+                    if imported {
+                        return true;
+                    }
+                }
+                None => return true,
+            },
+            None => return true,
+        }
     }
     let lang = &p.gx.lang;
     if [
@@ -117,7 +145,20 @@ fn trait_in_scope(cx: &Ctx, trait_def: DefId) -> bool {
     {
         return true;
     }
-    cx.env().iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def))
+    let in_env = |preds: &[Predicate]| preds.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def));
+    if in_env(cx.env()) {
+        return true;
+    }
+    // An instance body re-checks its template with concrete
+    // types and an empty env; the template's bounds are what
+    // made the call legal, so they still speak for scope here.
+    if let Some(info) = p.gx.instances.get(&cx.fid)
+        && let Some(tl) = info.template_local
+        && let Some(fs) = p.gx.fn_scopes.get(tl.0 as usize)
+    {
+        return in_env(&fs.env);
+    }
+    false
 }
 
 /// Confirms one method candidate (inherent template, impl

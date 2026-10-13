@@ -100,6 +100,7 @@ pub enum ResKind {
     Static,
     Alias,
     Macro,
+    Trait,
 }
 
 /// Facts the rewrite pass needs about one local def, by DefId.
