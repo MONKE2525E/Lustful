@@ -2424,7 +2424,14 @@ fn resolve_one(
         *c -= 1;
         true
     });
+    // The names a file's top-level item list defines. The item segments
+    // of a big file are one item list, so the set spans them: a duplicate
+    // in two segments is a duplicate (see `item_segments`).
+    let mut file_names: FxMap<(u8, Sym), ()> = FxMap::default();
     for (fi, w) in works.iter_mut().enumerate() {
+        if w.segment == 0 {
+            file_names.clear();
+        }
         strip_file(w, fi, input, interner, &list_module, tables, &mut inner_diags);
         register_items(
             &mut w.ast.items,
@@ -2438,6 +2445,7 @@ fn resolve_one(
             &list_module,
             &mut imports,
             &mut adt_counts,
+            &mut file_names,
             &mut inner_diags,
         );
     }
@@ -3392,14 +3400,15 @@ fn register_items(
     // in registration order: the disambiguator source, without
     // rescanning every recorded def per Adt (quadratic at scale).
     adt_counts: &mut FxMap<Sym, u32>,
-    diags: &mut Vec<Diag>,
-) {
-    // Names this item list defines, per namespace. Two local definitions
+    // Names this item list defines, per namespace (empty at the start of
+    // a list; a file's item segments share one). Two local definitions
     // of one name in one namespace are a duplicate (rustc E0428), even
     // when both hash to the same target (two fns) or to a module the
     // module tree already holds (two `mod` items): the binding insert
     // alone cannot see those. One report per duplicate item.
-    let mut seen: FxMap<(u8, Sym), ()> = FxMap::default();
+    seen: &mut FxMap<(u8, Sym), ()>,
+    diags: &mut Vec<Diag>,
+) {
     let check_dup = |seen: &mut FxMap<(u8, Sym), ()>, ns: Namespace, name: Sym, span: Span, reported: &mut bool, diags: &mut Vec<Diag>| {
         if seen.insert((ns_index(ns) as u8, name), ()).is_some() && !*reported {
             *reported = true;
@@ -3421,7 +3430,7 @@ fn register_items(
         let mut reported = false;
         match &mut item.kind {
             ItemKind::Mod(m) => {
-                check_dup(&mut seen, Namespace::Type, m.name, m.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, m.name, m.name_span, &mut reported, diags);
                 let mut key = prefix.to_vec();
                 key.push(m.name);
                 if let Some(&child) = list_module.get(&(fi, key.clone())) {
@@ -3449,13 +3458,14 @@ fn register_items(
                             list_module,
                             imports,
                             adt_counts,
+                            &mut FxMap::default(),
                             diags,
                         );
                     }
                 }
             }
             ItemKind::Fn(f) => {
-                check_dup(&mut seen, Namespace::Value, f.name, f.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Value, f.name, f.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, f.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, f.name, interner);
                 let def = DefId { krate: input.crate_ids.local, hash: def::free_fn_hash(input.crate_ids.stable, &[], interner.get(flat)) };
@@ -3469,9 +3479,9 @@ fn register_items(
                 // only in the type namespace. Unit and tuple structs also
                 // name their constructor in the value namespace.
                 let has_ctor = !matches!(s.fields, VariantFields::Struct(_));
-                check_dup(&mut seen, Namespace::Type, s.name, s.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, s.name, s.name_span, &mut reported, diags);
                 if has_ctor {
-                    check_dup(&mut seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
+                    check_dup(seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
                 }
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, s.name, interner);
@@ -3488,7 +3498,7 @@ fn register_items(
                 s.name = flat;
             }
             ItemKind::Enum(e) => {
-                check_dup(&mut seen, Namespace::Type, e.name, e.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, e.name, e.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, e.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, e.name, interner);
                 let disamb = *adt_counts.entry(flat).and_modify(|c| *c += 1).or_insert(0);
@@ -3515,7 +3525,7 @@ fn register_items(
             }
             ItemKind::Const(c) => {
                 if let Some(name) = c.name {
-                    check_dup(&mut seen, Namespace::Value, name, c.name_span, &mut reported, diags);
+                    check_dup(seen, Namespace::Value, name, c.name_span, &mut reported, diags);
                     let flat = flat_name(tables, flat_prefix, module, name, interner);
                     record_display(tables, input, flat_prefix, module, flat, name, interner);
                     let def = DefId {
@@ -3529,7 +3539,7 @@ fn register_items(
                 }
             }
             ItemKind::Static(s) => {
-                check_dup(&mut seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Value, s.name, s.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, s.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, s.name, interner);
                 let def = DefId {
@@ -3542,7 +3552,7 @@ fn register_items(
                 s.name = flat;
             }
             ItemKind::Type(a) => {
-                check_dup(&mut seen, Namespace::Type, a.name, a.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, a.name, a.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, a.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, a.name, interner);
                 let def = DefId {
@@ -3555,7 +3565,7 @@ fn register_items(
                 a.name = flat;
             }
             ItemKind::Trait(t) => {
-                check_dup(&mut seen, Namespace::Type, t.name, t.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, t.name, t.name_span, &mut reported, diags);
                 let flat = flat_name(tables, flat_prefix, module, t.name, interner);
                 record_display(tables, input, flat_prefix, module, flat, t.name, interner);
                 // The ordinal counts same-flat-name traits in
@@ -3583,7 +3593,7 @@ fn register_items(
             ItemKind::ExternCrate(e) => {
                 let bind_name = e.rename.unwrap_or(e.name);
                 if bind_name != interner.intern("_") {
-                    check_dup(&mut seen, Namespace::Type, bind_name, e.span, &mut reported, diags);
+                    check_dup(seen, Namespace::Type, bind_name, e.span, &mut reported, diags);
                     let target = if e.name == interner.intern("self") {
                         Some(Target::Module(tables.root_of(module)))
                     } else {
@@ -3595,7 +3605,7 @@ fn register_items(
                 }
             }
             ItemKind::Union(u) => {
-                check_dup(&mut seen, Namespace::Type, u.name, u.name_span, &mut reported, diags);
+                check_dup(seen, Namespace::Type, u.name, u.name_span, &mut reported, diags);
             }
             _ => {}
         }
@@ -5053,6 +5063,21 @@ mod tests {
         let [one, whole] = resolve_both_ways(&text, "segment-error").map(|r| r.err().expect("the resolve fails").diags);
         assert_eq!(format!("{one:?}"), format!("{whole:?}"));
         assert_eq!(format!("{:?}", one[0]), format!("{whole_err:?}"));
+    }
+
+    /// Two definitions of one name in two item segments of a file are a
+    /// duplicate (rustc E0428), as in one piece: the segments share the
+    /// file's name set. Two `mod a` items, or a `mod a` and a `struct a`,
+    /// were accepted when they sat in different segments.
+    #[test]
+    fn duplicates_across_segments_are_rejected() {
+        let fns: String = (0..6000).map(|i| format!("fn f{i}() -> usize {{ let s = \"s{i}\"; s.len() + {i} }}\n")).collect();
+        for (first, last) in [("mod a { pub fn x() {} }", "mod a { pub fn y() {} }"), ("mod a { pub fn x() {} }", "struct a;"), ("fn d() {}", "fn d() {}")] {
+            let text = format!("{first}\n{fns}{last}\nfn main() {{}}\n");
+            let [one, whole] = resolve_both_ways(&text, "segment-dups").map(|r| r.err().expect("a duplicate is an error").diags);
+            assert_eq!(format!("{one:?}"), format!("{whole:?}"), "{last}");
+            assert_eq!(one[0].code, "L0106", "{last}");
+        }
     }
 
     fn resolve(files: &[(&str, &str)], crate_name: &str) -> Result<ResolvedCrate, ResolveError> {
