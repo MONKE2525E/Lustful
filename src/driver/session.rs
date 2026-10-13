@@ -154,7 +154,7 @@ pub(crate) struct Caches {
     pub(crate) table_cap: usize,
     pub(crate) base_units: usize,
     /// Bumped on every base rebuild; used only for the rebuild's temp file name.
-    /// Each finished base is renamed to a content name (`libbase-<hash>.so`)
+    /// Each finished base is renamed to an owner+content name (`libbase-<pid>-<hash>.so`)
     /// in `base_dir`, a persistent directory (the disk cache's `bases/`
     /// subdir), never in `obj_dir`: executables load the base by absolute
     /// rpath at run time, so it must outlive the daemon that built it,
@@ -164,7 +164,7 @@ pub(crate) struct Caches {
     /// output file references them any more (see `base_still_used` and
     /// the manifest sweep in compile.rs), so live binaries keep working.
     pub(crate) base_gen: u64,
-    /// The current base's library name for the linker (`base-<hash>`).
+    /// The current base's library name for the linker (`base-<pid>-<hash>`).
     pub(crate) base_name: String,
     /// The resolved persistent directory for base libraries. None until
     /// this session's first base build picks one (see `resolve_base_dir`).
