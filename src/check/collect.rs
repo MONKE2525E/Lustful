@@ -1094,6 +1094,25 @@ pub fn collect_with_order_resolved<'a>(
     def_order: &mut DefOrder,
     resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
 ) -> Result<Program<'a>, Vec<Diag>> {
+    collect_reuse(ast, interner, known, crate_ids, walk_instances, def_order, resolved, &mut Default::default())
+}
+
+/// `collect_with_order_resolved` with the driver session's generic
+/// reuse cache (driver/gen_reuse.rs, W-PERF): the cache rides in
+/// `GenTables::reuse` for this collect, so template checks and instance
+/// discovery skip bodies whose stored results still hold, and it goes
+/// back to the caller on every return, with what this collect stored.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_reuse<'a>(
+    ast: &'a Ast,
+    interner: &'a Interner,
+    known: &'a Known,
+    crate_ids: CrateIds,
+    walk_instances: bool,
+    def_order: &mut DefOrder,
+    resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+    reuse: &mut crate::driver::gen_reuse::GenReuse,
+) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
         interner,
@@ -1128,6 +1147,8 @@ pub fn collect_with_order_resolved<'a>(
         record_reads: true,
     };
     p.gx.walk_instances = walk_instances;
+    p.gx.reuse = std::mem::take(reuse);
+    p.gx.reuse.begin();
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their
     // code paths stay builtin until source std lands (ARCH 2.1, 9.3).
@@ -2034,6 +2055,7 @@ pub fn collect_with_order_resolved<'a>(
     eval_const_items(&mut p, &mut errs, &mut def_order.statics);
     eval_assoc_consts(&mut p, &mut errs);
 
+    *reuse = std::mem::take(&mut p.gx.reuse);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }
 

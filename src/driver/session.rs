@@ -81,8 +81,23 @@ pub(crate) struct Front {
     /// grouping, and therefore unit keys, survive a restart; a
     /// one-shot session only preserves it across its own stores.
     pub(crate) manifest_per_unit: u32,
-    /// Body hash per slot, at the last parse.
+    /// Body hash per slot, at the last parse. An instance slot of a
+    /// generic program holds its source fingerprint at its last check
+    /// (`gen_reuse::GenReuse::src_of`).
     pub(crate) slot_hash: Vec<u64>,
+    /// True per slot for an instance slot of a generic program
+    /// (appended after collect). The slot update leaves these alone:
+    /// whether an instance is live is known only after collect, and a
+    /// check request makes no generic fn instances at all. A mark
+    /// lives as long as its slot number (it clears only where
+    /// `slot_of` does); `Caches::ok` false marks a stale instance.
+    pub(crate) inst_slot: Vec<bool>,
+    /// How many AST fns the slot assignment covers: `fn_slot` holds
+    /// these first, then the instance slots of a generic program.
+    pub(crate) ast_fn_count: usize,
+    /// Set when a slot compaction renumbered live slots this request:
+    /// cached C of a generic program then cannot be reused as is.
+    pub(crate) slots_renumbered: bool,
     /// Fn head hash per slot (`ast_hash::fn_head_hash`), at the last
     /// parse. A slot whose head changed always rechecks: its body is
     /// checked against that head (parameter names and patterns bind
@@ -211,6 +226,16 @@ pub(crate) struct Caches {
     pub(crate) objects: Option<bool>,
     /// A daemon session builds against libbase.so; a one-shot session links statically.
     pub(crate) persistent: bool,
+    /// Generic reuse (driver/gen_reuse.rs): template check and instance
+    /// discovery results of a generic program, valid while `gen_key`
+    /// (the item-level environment and AST fn count they were made
+    /// under) holds.
+    pub(crate) gen_reuse: super::gen_reuse::GenReuse,
+    pub(crate) gen_key: Option<u64>,
+    /// Fingerprint of the instance Adt numbering (id, instance key) the
+    /// current `out` entries of a generic program were generated under.
+    /// C names Adts by id, so cached C is reusable only while it holds.
+    pub(crate) inst_adt_fp: u64,
     /// Units whose current code is in an overlay object, not in libbase.so.
     pub(crate) overlays: std::collections::BTreeSet<usize>,
 }
@@ -259,6 +284,9 @@ impl Session {
                 slot_manifest_stored: 0,
                 manifest_per_unit: 0,
                 slot_hash: Vec::new(),
+                inst_slot: Vec::new(),
+                ast_fn_count: 0,
+                slots_renumbered: false,
                 slot_head: Vec::new(),
                 chunks: Vec::new(),
                 src: String::new(),
@@ -292,6 +320,9 @@ impl Session {
                 objects: None,
                 persistent,
                 overlays: Default::default(),
+                gen_reuse: Default::default(),
+                gen_key: None,
+                inst_adt_fp: 0,
             },
             std_cache: None,
             disk_cache: None,

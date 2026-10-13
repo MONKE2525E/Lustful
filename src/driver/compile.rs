@@ -146,15 +146,11 @@ impl Stats {
 }
 
 /// The generic front-end work collect did for one program, for the
-/// stats line: (template checks, bodies checked by instance
-/// discovery). Discovery checks every plain fn and every instance it
-/// made; a program with no generics does neither.
-fn generic_work(p: &collect::Program) -> (usize, usize) {
-    use crate::check::generics::FnClass;
-    if !p.gx.has_generics {
-        return (0, 0);
-    }
-    (p.gx.mono_counts.0, p.gx.fn_class.iter().filter(|c| matches!(c, FnClass::Plain | FnClass::Instance)).count())
+/// stats line: (template checks run, discovery checks run). Generic
+/// reuse (driver/gen_reuse.rs) skips the bodies whose stored results
+/// held; a program with no generics runs neither.
+fn generic_work(reuse: &super::gen_reuse::GenReuse) -> (usize, usize) {
+    (reuse.templates_checked, reuse.discovery_checked)
 }
 
 /// Folds each fn's own source text, from the start of its first line
@@ -210,6 +206,32 @@ fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, 
     std::hash::Hash::hash(&hash, &mut h);
     std::hash::Hash::hash(&map.line_col(head).0.wrapping_sub(line), &mut h);
     std::hash::Hash::hash(&text.as_bytes()[start..hi], &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+/// Empties one slot like a dead fn: no C, no reads, no IR.
+fn wipe_slot(caches: &mut Caches, s: usize) {
+    caches.out[s] = FnOut::default();
+    caches.has_out[s] = true;
+    caches.ok[s] = true;
+    caches.slot_reads[s] = None;
+    caches.slot_used[s].clear();
+    caches.slot_fp[s] = 0;
+    caches.slot_ir[s] = None;
+}
+
+/// The fingerprint of a generic program's instance Adt numbering: each
+/// instance Adt's id with its stable instance key. C names Adts by id
+/// (`A<id>`), so cached C of a generic program is reusable only while
+/// this holds.
+fn inst_adt_fingerprint(p: &collect::Program) -> u64 {
+    let mut h = crate::intern::FxHasher::default();
+    for (a, inst) in p.gx.adt_instance_of.iter().enumerate() {
+        if let Some((def, args)) = inst {
+            let key = p.instance_key_hash(&crate::driver::graph::InstanceKey { def: *def, args: *args });
+            std::hash::Hash::hash(&(a, key.0), &mut h);
+        }
+    }
     std::hash::Hasher::finish(&h)
 }
 
@@ -978,6 +1000,10 @@ fn slot_update(
             head: std::mem::take(&mut front.slot_head),
         };
         remap = Some((front.slot_of.clone(), old));
+        // Instance slots are not remapped: they get new numbers after
+        // collect and recheck there (`slots_renumbered`).
+        front.inst_slot.clear();
+        front.slots_renumbered = true;
         front.slot_of.clear();
         front.slot_paths.clear();
         front.slot_manifest_stored = 0;
@@ -999,6 +1025,7 @@ fn slot_update(
             front.slot_of.clear();
             front.slot_paths.clear();
             front.slot_manifest_stored = 0;
+            front.inst_slot.clear();
         }
         caches.ok.clear();
         caches.out.clear();
@@ -1061,6 +1088,7 @@ fn slot_update(
         fn_slot.push(slot);
     }
     front.fn_slot = fn_slot;
+    front.ast_fn_count = front.fn_slot.len();
     let n_slots = front.slot_of.len();
     caches.ok.resize(n_slots, false);
     caches.has_out.resize(n_slots, false);
@@ -1071,6 +1099,7 @@ fn slot_update(
     caches.slot_ir.resize_with(n_slots, || None);
     front.slot_hash.resize(n_slots, 0);
     front.slot_head.resize(n_slots, 0);
+    front.inst_slot.resize(n_slots, false);
     // Compaction remap: move each live fn's per-slot state from its
     // old slot to its new one, by stable identity.
     if let Some((old_map, mut old)) = remap {
@@ -1112,7 +1141,9 @@ fn slot_update(
     })
     .into_iter()
     .unzip();
-    for slot in (0..n_slots).filter(|&s| !live[s]) {
+    // Instance slots are not AST fns: the generic block in `compile`
+    // decides after collect which are live.
+    for slot in (0..n_slots).filter(|&s| !live[s] && !front.inst_slot[s]) {
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
         caches.ok[slot] = true;
@@ -1517,7 +1548,7 @@ fn resolved_setup(
     // through `slot_update` with no changed names to name: a changed
     // body hash (or a fn whose last check failed) is exactly its
     // recheck rule, and the Ast is already freshly parsed here.
-    let bodies_only = front.env_hash == Some(env) && front.fn_slot.len() == fn_count;
+    let bodies_only = front.env_hash == Some(env) && front.ast_fn_count == fn_count;
     let changed_names = if bodies_only {
         Some(Vec::new())
     } else if front.env_hash.is_none() {
@@ -1647,6 +1678,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.fn_slot.clear();
         front.slot_hash.clear();
         front.slot_head.clear();
+        front.ast_fn_count = 0;
         front.chunks.clear();
         front.src.clear();
         front.map = SourceMap::default();
@@ -1902,7 +1934,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     front.map = map.clone();
 
     // Which rule applies (see the top of this file).
-    let bodies_only = front.env_hash == Some(env) && front.fn_slot.len() == fn_count;
+    let bodies_only = front.env_hash == Some(env) && front.ast_fn_count == fn_count;
     let changed_names = if bodies_only || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
     let mode = if bodies_only {
         "bodies"
@@ -2088,10 +2120,35 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver path computes crate identity from the Cargo graph;
     // the single-file path keeps the session key's identity.
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
+    // Generic reuse (driver/gen_reuse.rs, W-PERF): template checks and
+    // instance discovery of a generic program are stored per stable def
+    // and reused while the item-level environment (the item-scan hash
+    // and the AST fn count) holds. Anything else drops them: a const fn
+    // body edit (const values move), a nested static (its index can
+    // move), or a slot compaction (cached C carries slot numbers).
+    let gen_key = front.env_hash.map(|env| {
+        let mut h = crate::intern::FxHasher::default();
+        std::hash::Hash::hash(&(env, fn_count), &mut h);
+        std::hash::Hasher::finish(&h)
+    });
+    let nested_static = front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
+    let gen_ok = caches.persistent
+        && gen_key.is_some()
+        && caches.gen_key == gen_key
+        && !const_fn_changed
+        && !nested_static
+        && !front.slots_renumbered;
+    if !gen_ok {
+        caches.gen_reuse.clear();
+    }
+    front.slots_renumbered = false;
+    caches.gen_key = gen_key;
+    caches.gen_reuse.on = caches.persistent && gen_key.is_some() && !nested_static;
+    caches.gen_reuse.ast_src.clone_from(&body_hashes_all);
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).
-    let mut program = match collect::collect_with_order_resolved(
+    let mut program = match collect::collect_reuse(
         &front.ast,
         &front.interner,
         &front.known,
@@ -2099,6 +2156,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         req.cmd == Cmd::Build,
         &mut front.def_order,
         resolved_tables.map(Box::new),
+        &mut caches.gen_reuse,
     ) {
         Ok(p) => p,
         Err(mut ds) => {
@@ -2154,9 +2212,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // instance disk identity, exactly like AST fns in slot_update;
     // templates and trait-method stubs are emptied like dead slots
     // so only plain fns and instances are checked and generated.
-    // A generic program always runs its whole concrete work set:
-    // instance discovery is a whole-program walk, and the
-    // incremental reuse paths key on AST fns only.
+    // Instance slots keep their check state across requests (generic
+    // reuse): `slot_hash` holds the source fingerprint of the last
+    // check, and `ok` false marks one stale.
+    front.fn_slot.truncate(fn_count);
     if program.gx.has_generics {
         for i in fn_count..program.fns.len() {
             let disk = program.disk_id(LocalDefId(i as u32));
@@ -2183,6 +2242,30 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.slot_fp.resize(n_slots, 0);
         caches.slot_ir.resize_with(n_slots, || None);
         front.slot_hash.resize(n_slots, 0);
+        front.inst_slot.resize(n_slots, false);
+        let mut present = vec![false; n_slots];
+        for i in fn_count..program.fns.len() {
+            let s = front.fn_slot[i] as usize;
+            front.inst_slot[s] = true;
+            present[s] = true;
+        }
+        for s in 0..n_slots {
+            if !front.inst_slot[s] {
+                continue;
+            }
+            if !gen_ok {
+                // Checked under another environment.
+                caches.ok[s] = false;
+            }
+            // An instance slot with no instance in a build is dead: its
+            // C must leave the units. A check makes no generic fn
+            // instances at all, so there an absent slot keeps its
+            // state for the next build.
+            if !present[s] && req.cmd == Cmd::Build {
+                wipe_slot(caches, s);
+                caches.ok[s] = false;
+            }
+        }
         for i in 0..program.fns.len() {
             if !matches!(
                 program.gx.fn_class.get(i),
@@ -2194,6 +2277,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 caches.ok[s] = true;
                 caches.slot_reads[s] = None;
                 caches.slot_used[s].clear();
+            }
+        }
+    } else {
+        // No generics: every instance slot is dead. The marks stay
+        // with the slot numbers, so the slot update never treats one
+        // as a dead AST fn (passing, no C) that a later instance of the
+        // same key could reuse.
+        for s in 0..front.inst_slot.len().min(caches.ok.len()) {
+            if front.inst_slot[s] && caches.ok[s] {
+                wipe_slot(caches, s);
+                caches.ok[s] = false;
             }
         }
     }
@@ -2306,17 +2400,55 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if req.cmd == Cmd::Build {
         work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
     }
+    // The instance Adt numbering this build generates C under.
+    let inst_adt_fp = if program.gx.has_generics && req.cmd == Cmd::Build { inst_adt_fingerprint(&program) } else { 0 };
     if program.gx.has_generics {
-        // The whole concrete set, every compile (see the instance
-        // slot block above).
+        // Generic reuse: under an unchanged environment, a plain fn
+        // rechecks when its body changed, an instance when its source
+        // (its template's body) changed, and either when its last
+        // check failed or a build has no C for it. C names Adts by
+        // id and instance Adt ids are creation order, so a build whose
+        // instance Adt numbering moved regenerates every body. Without
+        // reuse, the whole concrete set rechecks, every compile.
+        let build = req.cmd == Cmd::Build;
+        let regenerate_all = !gen_ok || (build && inst_adt_fp != caches.inst_adt_fp);
+        if build && inst_adt_fp != caches.inst_adt_fp {
+            caches.glue_stale = true;
+        }
+        let mut body_changed = vec![false; fn_count];
+        for &i in &changed {
+            if i < fn_count {
+                body_changed[i] = true;
+            }
+        }
+        let concrete = |i: usize| {
+            matches!(
+                program.gx.fn_class.get(i),
+                Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance | crate::check::generics::FnClass::Closure)
+                    | None
+            )
+        };
+        let reuse = &caches.gen_reuse;
         work = (0..program.fns.len())
+            .filter(|&i| concrete(i))
             .filter(|&i| {
-                matches!(
-                    program.gx.fn_class.get(i),
-                    Some(crate::check::generics::FnClass::Plain | crate::check::generics::FnClass::Instance | crate::check::generics::FnClass::Closure) | None
-                )
+                let s = front.fn_slot[i] as usize;
+                regenerate_all
+                    || !caches.ok[s]
+                    || (build && !caches.has_out[s])
+                    || if i < fn_count {
+                        body_changed[i]
+                    } else {
+                        reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s])
+                    }
             })
             .collect();
+        // A recheck leaves the slot's C stale until codegen replaces
+        // it; a check request, or a build that stops on errors, never
+        // gets there.
+        for &i in &work {
+            caches.has_out[front.fn_slot[i] as usize] = false;
+        }
     }
     // A one-shot check needs no IR after borrowck: dropping each body on
     // its worker lets the allocator reuse the memory for the next body,
@@ -2335,6 +2467,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut diags: Vec<Diag> = Vec::new();
     for (k, &i) in work.iter().enumerate() {
         caches.ok[slot(i)] = results[k].1.is_empty();
+        // An instance slot remembers the source it was checked from.
+        if i >= fn_count
+            && let Some(src) = caches.gen_reuse.src_of(&program, LocalDefId(i as u32))
+        {
+            front.slot_hash[slot(i)] = src;
+        }
         // Store the read set with the result (section 8.2 rule 2): the
         // next signature-only edit replays it in the dirty walk above.
         // Only passing functions get one; a failing function always
@@ -2385,8 +2523,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 reused: reads_reused,
                 invalidated: reads_invalidated,
                 instances: front.fn_slot.len(),
-                templates: generic_work(&program).0,
-                discovered: generic_work(&program).1,
+                templates: generic_work(&caches.gen_reuse).0,
+                discovered: generic_work(&caches.gen_reuse).1,
                 ..Default::default()
             }
             .render(&mut resp.stderr);
@@ -2412,11 +2550,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // from cached IR above.
     let mut bodies: Vec<(usize, ir::Body)> = work.iter().copied().zip(results).filter_map(|(i, r)| r.0.map(|b| (i, b))).collect();
     bodies.extend(reemit);
-    // An instance's lines and body span are its template's.
-    let line_base_of = |front: &Front, i: usize| -> u32 {
-        let scan_i = program.gx.instances.get(&LocalDefId(i as u32)).and_then(|info| info.template_local).map_or(i, |t| t.0 as usize);
-        if scan_i < fn_count { scan_of(front, scan_i).1 } else { 0 }
-    };
+    // Each fn's base line: cgen stores its line numbers relative to it
+    // and the main unit adds each slot's base back, so a reused body's
+    // C stays right when its source text moves. An instance's base is
+    // its source fn's line (`GenReuse::source`): the template's, a
+    // closure's host fn's, or a trait default method's own first line.
+    let line_bases: Vec<u32> = (0..program.fns.len())
+        .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
+            Some(s) if (s.0 as usize) < fn_count => scan_of(front, s.0 as usize).1,
+            Some(s) => map.line_col(map.call_site(program.fn_info(s).def.name_span)).0,
+            None => 0,
+        })
+        .collect();
+    let line_base_of = |_: &Front, i: usize| -> u32 { line_bases.get(i).copied().unwrap_or(0) };
     let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot));
     if let Some(e) = outs.iter().find_map(|o| o.error.clone()) {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
@@ -2461,6 +2607,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
             *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
         }
+    }
+    // Every live slot's C of a generic program is now under this
+    // numbering (a moved numbering regenerated all of it above).
+    if program.gx.has_generics {
+        caches.inst_adt_fp = inst_adt_fp;
     }
     // Derived glue (Debug, Clone, Eq, Drop) is keyed by Adt id but
     // generated from field and variant types, and the glue unit also
@@ -2898,8 +3049,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
             instances: front.fn_slot.len(),
             reemitted,
-            templates: generic_work(&program).0,
-            discovered: generic_work(&program).1,
+            templates: generic_work(&caches.gen_reuse).0,
+            discovered: generic_work(&caches.gen_reuse).1,
         }
         .render(&mut resp.stderr);
     }

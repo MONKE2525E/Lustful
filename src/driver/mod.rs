@@ -7,6 +7,7 @@ mod ir_cache;
 pub mod buildscript;
 pub mod cache;
 mod compile;
+pub(crate) mod gen_reuse;
 pub mod graph;
 mod session;
 

@@ -1740,6 +1740,10 @@ pub struct GenTables<'a> {
     /// generic fns (closure body fns are made either way; see
     /// `materialize`).
     pub walk_instances: bool,
+    /// The driver session's generic reuse cache, lent to this collect
+    /// (`collect::collect_reuse`): template checks and discovery skip
+    /// bodies whose stored results still hold (W-PERF).
+    pub reuse: crate::driver::gen_reuse::GenReuse,
 }
 
 impl Default for GenTables<'_> {
@@ -1779,6 +1783,7 @@ impl Default for GenTables<'_> {
             trait_picks: FxMap::default(),
             trait_method_stubs: FxMap::default(),
             walk_instances: true,
+            reuse: Default::default(),
         }
     }
 }
@@ -3085,8 +3090,11 @@ pub fn add_synthetic_impls(p: &mut Program) {
 /// An owned snapshot of a type from any store (see `lift_ty`).
 /// A body overlay borrows the global store, so a type cannot be
 /// lifted by walking it while interning into the globals; the
-/// snapshot breaks that borrow.
-enum OwnedTy {
+/// snapshot breaks that borrow. It names defs by `DefId`, so it also
+/// outlives the program: the driver's generic reuse cache keeps
+/// discovery output in this form across requests (driver/gen_reuse.rs).
+#[derive(Clone)]
+pub(crate) enum OwnedTy {
     Leaf(TyKind),
     Ref(Region, Mut, Box<OwnedTy>),
     RawPtr(Mut, Box<OwnedTy>),
@@ -3102,7 +3110,8 @@ enum OwnedTy {
     Dyn(Binder<Vec<OwnedArg>>, Vec<(u32, Vec<OwnedArg>)>, AutoTraits, Region),
 }
 
-enum OwnedArg {
+#[derive(Clone)]
+pub(crate) enum OwnedArg {
     Ty(OwnedTy),
     Lifetime(Region),
     Const(ConstKind),
@@ -3426,7 +3435,17 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         p.gx.template_checks.insert(t, t);
     }
     let mut errs: Vec<Diag> = Vec::new();
+    let mut reuse = std::mem::take(&mut p.gx.reuse);
     for t in templates {
+        // A template whose stored check still holds (driver session
+        // reuse) contributes its picks and closure call kinds without
+        // a recheck. A body with closure expressions always rechecks:
+        // its check also registers closure body fns.
+        if let Some((picks, calls)) = reuse.template(p, t) {
+            p.gx.trait_picks.extend(picks);
+            record_template_closures(p, t, Vec::new(), calls);
+            continue;
+        }
         // Closures first: their body fns must exist before the body
         // lowers (its closure calls name them), and the capture
         // analysis is recorded for the instances. Only bodies with
@@ -3457,6 +3476,10 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
             }
             (e, picks, calls)
         };
+        reuse.templates_checked += 1;
+        if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
+            reuse.store_template(p, t, &picks, &calls);
+        }
         record_template_closures(p, t, Vec::new(), calls);
         errs.extend(body_errs);
         for (call, pick) in picks {
@@ -3464,6 +3487,7 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         }
         p.gx.mono_counts.0 += 1;
     }
+    p.gx.reuse = reuse;
     errs
 }
 
@@ -3564,7 +3588,8 @@ fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKin
 
 /// One closure of a checked body, snapshotted out of its store so
 /// the program can grow while it registers (see `register_closures`).
-struct OwnedClosure {
+#[derive(Clone)]
+pub(crate) struct OwnedClosure {
     def: DefId,
     kind: crate::check::closure::ClosureKind,
     env: OwnedTy,
@@ -3892,6 +3917,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
     let mut drop_done = 0u32;
+    let mut reuse = std::mem::take(&mut p.gx.reuse);
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -3908,9 +3934,14 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             let depth = depths.get(&fid).copied().unwrap_or(0);
             // Snapshot everything the instance requests name,
             // then drop the checked body: it borrows the program
-            // this loop is about to extend.
-            let (adt_tys_owned, requests_owned, closures_owned) = {
-                let (checked, _discarded) = crate::check::check_fn(p, fid);
+            // this loop is about to extend. A body whose stored
+            // discovery still holds (driver session reuse) replays it.
+            let replayed = reuse.discovered(p, fid);
+            let (adt_tys_owned, requests_owned, closures_owned) = if let Some(stored) = replayed {
+                stored
+            } else {
+                reuse.discovery_checked += 1;
+                let (checked, discarded) = crate::check::check_fn(p, fid);
                 let closures_owned = snapshot_closures(&checked).unwrap_or_default();
                 let mut adt_tys: Vec<OwnedTy> = Vec::new();
                 for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
@@ -3944,6 +3975,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                     if ok {
                         reqs.push((*template, owned));
                     }
+                }
+                if discarded.is_empty() {
+                    reuse.store_discovered(p, fid, &adt_tys, &reqs, &closures_owned);
                 }
                 (adt_tys, reqs, closures_owned)
             };
@@ -4003,6 +4037,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         }
         queue = next_queue;
     }
+    p.gx.reuse = reuse;
     errs
 }
 

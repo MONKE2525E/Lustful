@@ -38,6 +38,12 @@
 #      (spaces inside a body, comment lines above a fn) keeps a warm
 #      build's panic line and column equal to a cold build's, on the
 #      single-file and the multi-file path.
+#  12. generic reuse: in a program with traits, generic fns, and
+#      closures, a body edit rechecks only what it touched (template
+#      checks and discovery counters), check and build requests
+#      alternate, and every answer equals a cold one-shot build,
+#      including panic lines and columns after edits that only move
+#      text (comment lines above a closure, spaces inside a body).
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -449,6 +455,71 @@ def case_positions():
     d.kill()
 
 
+def case_generic_reuse():
+    # 12. Generic reuse (driver/gen_reuse.rs).
+    work = tempfile.mkdtemp(prefix="lust-driver-generic-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    text = (
+        "trait Score {\n    fn score(&self) -> u8;\n    fn twice(&self) -> u8 {\n        self.score() * 2\n    }\n}\n\n"
+        "struct A {\n    v: u8,\n}\n\nimpl Score for A {\n    fn score(&self) -> u8 {\n        self.v\n    }\n}\n\n"
+        "fn total<T: Score>(xs: &[T]) -> u8 {\n    let mut s = 0;\n    for x in xs {\n        s += x.twice();\n    }\n    s\n}\n\n"
+        "fn apply<F: Fn(u8) -> u8>(f: F, x: u8) -> u8 {\n    f(x)\n}\n\n"
+        "fn other() -> u8 {\n    1\n}\n\n"
+        "fn main() {\n    let xs = [A { v: 3 }, A { v: 4 }];\n    let t = total(&xs);\n    let k = 2;\n"
+        "    let r = apply(|v| v + 240 + k, t + other());\n    println!(\"{} {}\", t, r);\n}\n")
+    open(src, "w").write(text)
+
+    def cold():
+        env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
+        cout = os.path.join(work, "xc")
+        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
+        r = subprocess.run([cout], capture_output=True, text=True)
+        return r.returncode, r.stdout, r.stderr
+
+    def edit(old, new):
+        text = open(src).read()
+        assert old in text, old
+        open(src, "w").write(text.replace(old, new, 1))
+
+    def same(name, st, prog):
+        check(f"generic {name}: warm equals cold", (prog.returncode, prog.stdout, prog.stderr) == cold(),
+              f"{prog.stdout}{prog.stderr} {st}")
+
+    d.start()
+    st, prog = d.build(src, out)
+    same("cold build", st, prog)
+    # A template body edit: one template check, no plain fn rechecked.
+    edit("        s += x.twice();", "        s += x.twice() + 1;")
+    r = d.run(["check", src])
+    cst = {k: int(v) for k, _, v in (kv.partition("=") for kv in r.stderr.split("lust-stats:")[-1].split()) if v.isdigit()}
+    check("generic template edit checks one template", cst.get("templates") == 1 and cst.get("discovered") == 0, str(cst))
+    st, prog = d.build(src, out)
+    same("template edit", st, prog)
+    check("generic template edit rebuilds only its instances", (st.get("rechecked") or 99) <= 2, str(st))
+    # Comment lines above `other` move the panic in main's closure down.
+    edit("fn other() -> u8 {", "// one\n// two\nfn other() -> u8 {")
+    st, prog = d.build(src, out)
+    same("lines moved above a closure", st, prog)
+    check("generic moved lines recheck nothing", st.get("rechecked") == 0, str(st))
+    # Spaces inside the closure move the panic column.
+    edit("|v| v + 240 + k", "|v|   v + 240 + k")
+    st, prog = d.build(src, out)
+    same("spaces inside a body", st, prog)
+    # An item edit seen only by a check (full mode, caches cleared, no
+    # generic fn instances made), then a body edit, then a build: the
+    # instance slots of the trait default method must not come back
+    # as passing with no C.
+    edit("struct A {", "struct Unused {\n    n: u8,\n}\n\nstruct A {")
+    d.run(["check", src])
+    edit("    1\n}", "    2\n}")
+    d.run(["check", src])
+    st, prog = d.build(src, out)
+    same("item edit, check, body edit, check, build", st, prog)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -460,6 +531,7 @@ def main():
     case_restart_add_file()
     case_empty_units_restart()
     case_positions()
+    case_generic_reuse()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
