@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # `lust run` tests, cold (no daemon). Small programs (one function unit) must run in memory
-# (see tcc::run_in_memory) and behave exactly like the built executable: same stdout, same
+# (see tcc::run_in_memory). That run forks only when the OS lists one thread in the process,
+# so the in-memory check is also the thread count check at every fork point. The programs
+# must behave exactly like the built executable: same stdout, same
 # stderr (panic text included), same exit status. Both must also match rustc on stdout and
 # exit status. Programs run with two extra arguments, so `std::env::args().count()` counts
 # them. Usage: scripts/runtest.sh [filter]

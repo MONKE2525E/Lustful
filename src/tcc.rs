@@ -40,9 +40,6 @@ unsafe extern "C" {
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(code: c_int) -> !;
     fn fflush(stream: *mut c_void) -> c_int;
-    fn pipe(fds: *mut c_int) -> c_int;
-    fn dup2(old: c_int, new: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
 }
 
 /// libtcc's allocator hook. Size 0 means free.
@@ -250,41 +247,29 @@ pub fn cached_runtime_object(runtime_src: &str, debug: bool) -> Result<PathBuf, 
     Ok(obj)
 }
 
-/// The result of an in-memory run. `code` follows the file-based `lust run` exactly: the
-/// program's exit code, or 134 when it died by a signal (a panic aborts). The output strings
-/// are filled only in capture mode; otherwise the program wrote to our own stdout and stderr.
-pub struct MemRun {
-    pub code: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
 /// Compiles `units` (C sources; object paths are ignored) plus the cached runtime object into
-/// memory and runs the program's `main` with `argv` (argv[0] included). No object files, no
-/// link, no exec of a built binary. Use only for small programs: libtcc compiles serially here.
+/// memory and runs the program's `main` with `argv` (argv[0] included). Returns the exit code
+/// exactly as the file-based `lust run` reports it: the program's own code, or 134 when it died
+/// by a signal (a panic aborts). No object files, no link, no exec of a built binary. Use only
+/// for small programs in a one-shot process: libtcc compiles serially here.
 ///
 /// Compilation, relocation, and the symbol lookup happen in this process and can fail with
 /// Err (the caller then falls back to the file-based path; user code has not run). The call
 /// into user code happens in a forked child, so a panic or crash in the program cannot kill
-/// this process (which may be the daemon), exit codes match the file-based path, and the
-/// child's C stdio buffering sees the same fds a real executable would. All compiler threads
-/// must be joined before this call (the fork would not copy them). The persistent thread pool
-/// is stopped here (`pool::stop`: every pool thread joined) and stays stopped until this call
-/// returns; never call this from inside a `par_map` task.
+/// this process, exit codes match the file-based path, and the child's C stdio buffering sees
+/// the same fds a real executable would. The child inherits our stdout and stderr.
 ///
-/// In capture mode the child's stdout and stderr go to pipes and come back in the result
-/// (for a daemon, whose own stdout is not the user's terminal). Otherwise the child inherits
-/// our stdout and stderr. On non-Unix targets this always returns Err.
-pub fn run_in_memory(
-    units: &[(PathBuf, String)],
-    runtime_obj: &Path,
-    argv: &[String],
-    capture: bool,
-    debug: bool,
-) -> Result<MemRun, String> {
+/// The fork contract: a fork copies only the calling thread, and a thread that holds a lock at
+/// the fork (the allocator's, stdio's) leaves it held in the child for good. So no other thread
+/// may live at the fork. This call stops the compiler's pool (`pool::stop` joins every pool
+/// thread), then `lone_thread` checks the OS thread list and any other live thread gives Err
+/// before the fork. The pool stays stopped only until the fork returns. The caller runs this
+/// only in one-shot sessions (a daemon runs guard compiles on other threads), and never from
+/// inside a `par_map` task. On non-Unix targets this always returns Err.
+pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[String], debug: bool) -> Result<i32, String> {
     #[cfg(not(unix))]
     {
-        let _ = (units, runtime_obj, argv, capture, debug);
+        let _ = (units, runtime_obj, argv, debug);
         return Err("in-memory run is Unix-only".into());
     }
     #[cfg(unix)]
@@ -319,18 +304,11 @@ pub fn run_in_memory(
             // The generated main has C's standard signature: int main(int argc, char **argv).
             std::mem::transmute::<*mut c_void, extern "C" fn(c_int, *mut *mut c_char) -> c_int>(sym)
         };
-        // Pipes for capture mode: (read, write) per stream. -1 means unused (inherit the fd).
-        let (mut out_pipe, mut err_pipe) = ([-1; 2], [-1; 2]);
-        if capture {
-            // SAFETY: two-element arrays, as pipe(2) requires.
-            unsafe {
-                if pipe(out_pipe.as_mut_ptr()) != 0 || pipe(err_pipe.as_mut_ptr()) != 0 {
-                    return Err("cannot create pipes for an in-memory run".into());
-                }
-            }
+        // No other thread may live at the fork (see above).
+        let pool_stopped = crate::pool::stop();
+        if !lone_thread() {
+            return Err("another thread is alive, and an in-memory run forks".into());
         }
-        // No pool thread may live across the fork; the pool restarts on the next phase.
-        let _pool_stopped = crate::pool::stop();
         // Flush Rust and C buffers before the fork, so the child does not write them twice.
         {
             use std::io::Write as _;
@@ -339,74 +317,76 @@ pub fn run_in_memory(
             // SAFETY: fflush(NULL) flushes all C streams.
             unsafe { fflush(std::ptr::null_mut()) };
         }
-        // SAFETY: no other compiler threads run now (the pool is stopped above); the child
-        // only calls main and _exit.
+        // SAFETY: this is the process's only thread (checked above); the child only calls main
+        // and _exit.
         let pid = unsafe { fork() };
-        if pid < 0 {
-            // SAFETY: the fds came from pipe above and are closed once. -1 is not passed here.
-            unsafe {
-                for fd in [out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]] {
-                    if fd >= 0 {
-                        close(fd);
-                    }
-                }
-            }
-            return Err("fork failed for an in-memory run".into());
-        }
         if pid == 0 {
             // Child. Do not return, drop, or panic: call user code, flush, _exit.
-            // SAFETY: fd setup as described; main_sym was relocated before the fork.
+            // SAFETY: main_sym was relocated before the fork; cargv outlives the call.
             unsafe {
-                if capture {
-                    dup2(out_pipe[1], 1);
-                    dup2(err_pipe[1], 2);
-                    for fd in [out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]] {
-                        if fd > 2 {
-                            close(fd);
-                        }
-                    }
-                }
                 let code = main_sym(cargs.len() as c_int, cargv.as_mut_ptr());
                 fflush(std::ptr::null_mut());
                 _exit(code);
             }
         }
-        // Parent. Read the pipes to end-of-file (on threads, so a child cannot deadlock on a
-        // full pipe), then wait.
-        let read_pipe = |fd: c_int| -> std::thread::JoinHandle<String> {
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-                use std::os::fd::FromRawFd as _;
-                let mut s = String::new();
-                if fd >= 0 {
-                    // SAFETY: we own the read end; the write end is closed below in the parent.
-                    let _ = unsafe { std::fs::File::from_raw_fd(fd) }.read_to_string(&mut s);
-                }
-                s
-            })
-        };
-        // SAFETY: the fds came from pipe above and are closed once. Closing the write ends in
-        // the parent gives the readers end-of-file when the child exits.
-        unsafe {
-            if out_pipe[1] >= 0 {
-                close(out_pipe[1]);
-            }
-            if err_pipe[1] >= 0 {
-                close(err_pipe[1]);
-            }
+        // Parent. The child is its own process now, so the pool may start again while the
+        // program runs.
+        drop(pool_stopped);
+        if pid < 0 {
+            return Err("fork failed for an in-memory run".into());
         }
-        let out_thread = read_pipe(out_pipe[0]);
-        let err_thread = read_pipe(err_pipe[0]);
         let mut status: c_int = 0;
         // SAFETY: pid is our child; status is a valid out-pointer.
-        let waited = unsafe { waitpid(pid, &mut status, 0) };
-        let (stdout, stderr) = (out_thread.join().unwrap_or_default(), err_thread.join().unwrap_or_default());
-        if waited < 0 {
+        if unsafe { waitpid(pid, &mut status, 0) } < 0 {
             return Err("waitpid failed for an in-memory run".into());
         }
         // WIFEXITED: the low 7 bits are zero and the code is in the next byte. Any signal death
         // maps to 134, as `protocol::finish` does for the file-based run.
-        let code = if status & 0x7f == 0 { (status >> 8) & 0xff } else { 134 };
-        Ok(MemRun { code, stdout, stderr })
+        Ok(if status & 0x7f == 0 { (status >> 8) & 0xff } else { 134 })
+    }
+}
+
+/// True when the OS lists no thread in this process but the caller (Linux:
+/// /proc/self/task). A thread joined just before can stay listed for a
+/// moment while it exits, so this waits up to 50 ms for the list to settle.
+/// False when the list cannot be read. Other Unix targets have no such list
+/// and return true: there the pins in `run_in_memory`'s contract must hold.
+#[cfg(unix)]
+fn lone_thread() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let start = std::time::Instant::now();
+        loop {
+            let Ok(list) = std::fs::read_dir("/proc/self/task") else { return false };
+            if list.count() <= 1 {
+                return true;
+            }
+            if start.elapsed() > std::time::Duration::from_millis(50) {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    /// `lone_thread` counts every thread the OS lists, not only pool threads:
+    /// a parked thread makes it false. The other side, one thread at the
+    /// fork of a one-shot `lust run`, is what scripts/runtest.sh checks:
+    /// every small program must take the in-memory path, and
+    /// `run_in_memory` forks only when `lone_thread` holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lone_thread_sees_other_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        assert!(!super::lone_thread());
+        drop(tx);
+        parked.join().unwrap();
     }
 }

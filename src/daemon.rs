@@ -722,6 +722,9 @@ pub fn serve(sock: &Path) -> ! {
         };
         let resp = match req {
             Some(req) => {
+                // A daemon never runs user code in memory: that run forks,
+                // and guard compiles run on other threads here (src/tcc.rs).
+                assert!(req.run_args.is_none(), "the daemon wire carries no run arguments");
                 // Finished guard checks for this key land before its next
                 // compile, so a marked recompute takes effect here.
                 jobs.drain(&mut sessions);

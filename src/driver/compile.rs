@@ -1382,9 +1382,11 @@ fn resolved_setup(
     let fn_count = fn_lines.len();
     // Dropping the previous merged Ast walks every node string and
     // Vec; at crate scale that is milliseconds on the request path.
-    // A large old Ast drops on a side thread.
+    // A large old Ast drops on a side thread in a daemon session. A
+    // one-shot session drops it here: its process may fork for an
+    // in-memory run, and no other thread may live at the fork (tcc.rs).
     let old_ast = std::mem::replace(&mut front.ast, ast);
-    if old_ast.exprs.len() > 20_000 {
+    if old_ast.exprs.len() > 20_000 && caches.persistent {
         std::thread::spawn(move || drop(old_ast));
     }
     front.map = map.clone();
@@ -2499,8 +2501,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // it there, with no object files, link, or exec. The runtime comes from a cached object.
     // libtcc compiles serially, so bigger programs keep the parallel file-based path below.
     // Any setup failure falls back to that path (user code has not run yet). A debug run also
-    // keeps the file path, so a debugger sees a real binary.
+    // keeps the file path, so a debugger sees a real binary. One-shot sessions only: the run
+    // forks, no other thread may live at the fork (tcc.rs), and a daemon runs guard compiles
+    // on other threads. The daemon wire carries no run arguments (`protocol::read_request`);
+    // this check keeps that a pin, not a hope.
     if let Some(run_args) = &req.run_args
+        && !caches.persistent
         && fresh_base
         && groups.len() == 1
         && !req.debug
@@ -2509,18 +2515,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mem_units: Vec<(PathBuf, String)> = units.iter().filter(|(o, _)| *o != base_obj(2)).cloned().collect();
         let mut argv = vec![req.out.to_string_lossy().into_owned()];
         argv.extend(run_args.iter().cloned());
-        if let Ok(run) = crate::tcc::run_in_memory(&mem_units, &runtime_obj, &argv, caches.persistent, req.debug) {
+        if let Ok(code) = crate::tcc::run_in_memory(&mem_units, &runtime_obj, &argv, req.debug) {
             t.lap("tcc compile + run (memory)");
-            resp.code = run.code;
+            resp.code = code;
             resp.ran = true;
-            resp.stdout = run.stdout;
             if req.timings {
                 let kb = mem_units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
-                let _ =
-                    writeln!(resp.stderr, "lust run {path}: exit {} ({} functions, {kb} KB of C, in memory)", run.code, program.fns.len());
+                let _ = writeln!(resp.stderr, "lust run {path}: exit {code} ({} functions, {kb} KB of C, in memory)", program.fns.len());
                 t.render(&mut resp.stderr);
             }
-            resp.stderr.push_str(&run.stderr);
             if leak_at_exit {
                 std::mem::forget(bodies);
                 std::mem::forget(units);
