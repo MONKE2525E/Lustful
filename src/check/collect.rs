@@ -989,6 +989,19 @@ fn variant_fields_src(interner: &Interner, vf: &VariantFields) -> (VariantShape,
 /// Builds the program tables. `crate_ids` names the crate for stable def
 /// identity (docs/ARCH.md section 1.7). Returns all collection errors.
 pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate_ids: CrateIds) -> Result<Program<'a>, Vec<Diag>> {
+    collect_mode(ast, interner, known, crate_ids, true)
+}
+
+/// `collect` for one command: a build walks every reachable generic
+/// instance (mono); `lust check` passes `walk_instances` false and
+/// stops at the template checks, like rustc check (ARCH 4.1).
+pub fn collect_mode<'a>(
+    ast: &'a Ast,
+    interner: &'a Interner,
+    known: &'a Known,
+    crate_ids: CrateIds,
+    walk_instances: bool,
+) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
         interner,
@@ -1021,6 +1034,7 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
         resolved: None,
         gx: GenTables::default(),
     };
+    p.gx.walk_instances = walk_instances;
     // The builtin Adt defs join the table with their one type param where they take
     // one, so `Generics` queries answer for builtins and user types alike. Their
     // code paths stay builtin until source std lands (ARCH 2.1, 9.3).

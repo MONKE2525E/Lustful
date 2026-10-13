@@ -1867,7 +1867,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver path computes crate identity from the Cargo graph;
     // the single-file path keeps the session key's identity.
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
-    let mut program = match collect::collect(&front.ast, &front.interner, &front.known, crate_ids) {
+    let mut program = match collect::collect_mode(&front.ast, &front.interner, &front.known, crate_ids, req.cmd == Cmd::Build) {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;

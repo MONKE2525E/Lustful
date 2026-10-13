@@ -194,15 +194,21 @@ mod tests {
     use crate::intern::{Interner, Known};
     use crate::{lexer, parser};
 
-    /// Collects one sample file, then runs `run` on the program.
-    fn with_program(src: &str, run: impl FnOnce(&Interner, &Program)) {
+    /// Collects one sample file in build (`walk` true) or check mode,
+    /// then runs `run` on the program.
+    fn with_mode(src: &str, walk: bool, run: impl FnOnce(&Interner, &Program)) {
         let interner = Interner::default();
         let known = Known::new(&interner);
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect_mode(&ast, &interner, &known, ids, walk).unwrap();
         run(&interner, &program);
+    }
+
+    /// `with_mode` for a build.
+    fn with_program(src: &str, run: impl FnOnce(&Interner, &Program)) {
+        with_mode(src, true, run);
     }
 
     /// The template check records the call through the bound with the
@@ -219,5 +225,15 @@ mod tests {
             assert_eq!(picks[0].trait_def, g);
             assert_eq!((picks[0].derefs, picks[0].form), (1, super::ReceiverForm::Ref));
         });
+    }
+
+    /// `lust check` makes closure instances (they check closure bodies)
+    /// but no generic fn instances; a build makes both (ARCH 4.1).
+    #[test]
+    fn check_mode_makes_no_generic_fn_instances() {
+        let src = "fn id<T>(t: T) -> T { t }\nfn main() { let f = |x: u8| x + 1; println!(\"{} {}\", id(5u8), f(1)); }\n";
+        let count = |p: &Program| p.gx.fn_class.iter().filter(|&&c| c == crate::check::generics::FnClass::Instance).count();
+        with_mode(src, true, |_, p| assert_eq!(count(p), 2));
+        with_mode(src, false, |_, p| assert_eq!(count(p), 1));
     }
 }
