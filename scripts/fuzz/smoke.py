@@ -738,6 +738,28 @@ fn grown() -> i64 { 1 }
             open(edit_p, "w").write(base)
             check(f"trait use edit, {name}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
 
+        # 21. Regression (fuzz-sheriff3 small3, w-borrow note 08:49): a
+        # lifetime-only signature edit (`&str` -> `&'static str` param)
+        # changes no erased type, so the caller's borrowck verdict must
+        # still be redone warm: main passes a temporary, cold rejects
+        # L0306, warm used to accept. Region signatures are in the Sig
+        # fingerprint since e86a33fc.
+        lf = os.path.join(work, "lifetime_sig.rs")
+        lf_base = ('fn take_s(s: &str) -> usize { s.len() }\n'
+                   'fn lab() -> String { String::from("tmp") }\n'
+                   'fn main() { println!("{}", take_s(&lab())); }\n')
+        lf_static = lf_base.replace("fn take_s(s: &str)", "fn take_s(s: &'static str)", 1)
+        steps, ok = [], True
+        for text in (lf_base, lf_static, lf_base):
+            open(lf, "w").write(text)
+            rcw, _, errw = run_lust(["check", lf])
+            r = subprocess.run([LUST, "check", lf], cwd=work, env=cold_env,
+                               capture_output=True, text=True, timeout=20)
+            want = 1 if text is lf_static else 0
+            ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
+            steps.append(f"want {want}: warm {rcw} {first_code(errw)} cold {r.returncode} {first_code(r.stderr)}")
+        check("lifetime-only signature edit: warm answer equals cold (fuzz-sheriff3)", ok, "; ".join(steps))
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).

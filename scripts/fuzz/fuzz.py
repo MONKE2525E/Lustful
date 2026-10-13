@@ -785,6 +785,9 @@ def make_feature3_edit(rng, text):
         return rng.choice(["#![allow(dead_code)]\n", "//! crate doc\n"]) + text, op
     if op == "feat3_lifetime":
         pairs = [("fn idref(x: &i64) -> &i64", "fn idref(x: &'_ i64) -> &'_ i64"),
+                 # Named lifetimes landed in w-borrow step B (7ccfef35);
+                 # elided <-> named must not move any verdict.
+                 ("fn idref(x: &i64) -> &i64", "fn idref<'a>(x: &'a i64) -> &'a i64"),
                  ("fn sref() -> &'static str", "fn sref() -> &str"),
                  ("fn slabel(s: &str) -> &str", "fn slabel(s: &str) -> &'static str"),
                  ("fn uref(x: &'_ i64) -> &'_ i64", "fn uref(x: &i64) -> &i64"),
