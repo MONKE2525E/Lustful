@@ -842,7 +842,11 @@ pub fn eval_array_len(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
 /// associated const for two (`Type::CONST`, by flat type name).
 /// Signature-form const resolution uses this before the const
 /// tables exist; the scan is by written (flat) name, as the
-/// scalar interpreter's own lookups are.
+/// scalar interpreter's own lookups are. An associated const
+/// answers only from one defining impl without type or const
+/// params: same-name consts in disjoint impls (`impl G<u8>`,
+/// `impl G<i32>`) and impl params the path must fix need the
+/// typed pick, which knows the written type.
 fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
     match names {
         [name] => {
@@ -857,6 +861,7 @@ fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
             None
         }
         [ty_name, name] => {
+            let mut found = None;
             for item in &ast.items {
                 let ItemKind::Impl(imp) = &item.kind else { continue };
                 if imp.trait_ref.is_some() {
@@ -870,11 +875,15 @@ fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
                     if c.name == *name
                         && let Some(v) = c.default
                     {
-                        return Some(v);
+                        let generic = imp.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. }));
+                        if found.is_some() || generic {
+                            return None;
+                        }
+                        found = Some(v);
                     }
                 }
             }
-            None
+            found
         }
         _ => None,
     }
@@ -1294,7 +1303,10 @@ fn eval_scalar(
         Expr::Path(segs) if segs.len() == 2 => {
             // An inherent associated const (`Type::CONST`), found by
             // scanning the crate's impls like a free const above.
-            if let Some(v) = named_const_expr(ast, &[segs[0].name, segs[1].name]) {
+            // Written type args (`G::<i32>::N`) need the typed pick.
+            if !segs[0].has_args()
+                && let Some(v) = named_const_expr(ast, &[segs[0].name, segs[1].name])
+            {
                 let mut empty = Vec::new();
                 let out = val(ast, interner, known, v, depth + 1, &mut empty, steps);
                 return SFlow::V(out);
