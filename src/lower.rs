@@ -39,6 +39,25 @@ struct Lower<'p, 'a> {
     /// parallel to the checker's locals, `None` outside a guard.
     /// `place` consults it before `local_map`.
     guard_places: Vec<Option<Place>>,
+    /// For each or-pattern with bindings that `test_pat` has
+    /// tested, the local holding the index of the alternative
+    /// that matched: `bind_pat` switches on it because bindings
+    /// move only after the whole pattern (and any guard) pass.
+    or_tags: Vec<(PatId, Local)>,
+    /// While one expanded guard row lowers (see `match_into`),
+    /// the alternative each or-pattern is fixed to for the row.
+    or_forced: Vec<(PatId, usize)>,
+    /// The guard temporary already made for a checker local, so
+    /// every alternative (and guard row) that binds it writes
+    /// the one temporary a guard later reads.
+    guard_temps: Vec<(u32, Local)>,
+    /// The IR local a pattern binding was created as, by
+    /// checker local: all or-pattern alternatives of one name
+    /// share a checker local and must assign the same IR local.
+    bind_reuse: Vec<(u32, Local)>,
+    /// Depth of `bind_pat` recursion, for tag cleanup at the
+    /// outermost call (see `bind_pat`).
+    bind_depth: u32,
 }
 
 /// Lowers one checked function body to IR.
@@ -65,6 +84,11 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         drop_ty: Default::default(),
         upvars: None,
         guard_places: Vec::new(),
+        or_tags: Vec::new(),
+        or_forced: Vec::new(),
+        guard_temps: Vec::new(),
+        bind_reuse: Vec::new(),
+        bind_depth: 0,
     };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
@@ -76,6 +100,23 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         let l = lw.new_local(ty, m, Some(name));
         lw.local_map[cl as usize] = l;
         lw.scopes[0].push(l);
+    }
+    // Pattern parameters bind out of their argument locals
+    // before the body: the bindings drop first, then the parts
+    // of the arguments they did not move drop with the locals
+    // above, as in a destructuring `let`.
+    {
+        let skip = usize::from(f.def.self_param.is_some());
+        let param_pats: Vec<(ast::PatId, Local)> = f
+            .def
+            .params
+            .iter()
+            .zip(lw.ck.param_locals.iter().skip(skip))
+            .filter_map(|(param, &cl)| param.pat.map(|pat| (pat, lw.local_map[cl as usize])))
+            .collect();
+        for (pat, arg) in param_pats {
+            lw.bind_pat(pat, Place::local(arg));
+        }
     }
     // The parser only builds fns with bodies today; a declaration shape
     // lowers to an empty return so this can never panic.
@@ -2556,9 +2597,6 @@ impl<'p, 'a> Lower<'p, 'a> {
         let sp = self.pattern_place(sp, self.ty(scrut), &arm_pats, span);
         let end = self.new_block();
         for arm in arms {
-            let next = self.new_block();
-            self.test_pat(arm.pat, sp.clone(), next);
-            self.scopes.push(Vec::new());
             // A guard reads the arm's bindings by shared reference
             // (rustc binds pattern variables by reference for the
             // guard, then by their declared mode in the arm body):
@@ -2569,41 +2607,87 @@ impl<'p, 'a> Lower<'p, 'a> {
             // read through, a binding for the middle of a slice
             // pattern, keeps the move-first order for now.
             let by_ref_guard = arm.guard.is_some() && !self.pat_has_slice_middle_binding(arm.pat);
-            let mut guard_bound: Vec<u32> = Vec::new();
-            if by_ref_guard {
-                self.scopes.push(Vec::new());
-                self.bind_pat_guard(arm.pat, sp.clone(), &mut guard_bound);
-            } else {
-                self.bind_pat(arm.pat, sp.clone());
+            // Under a guard, an or-pattern arm runs as one row
+            // per combination of alternatives: a guard that
+            // fails on one row's bindings tries the next row, as
+            // in Rust, before the next arm. Rows beyond a bound
+            // keep the single tag-switched test; the checker
+            // accepts those programs, so cap the expansion and
+            // report it below instead of risking such a split.
+            let rows: Vec<Vec<(PatId, usize)>> =
+                if by_ref_guard && self.pat_has_or_binding(arm.pat) { self.or_rows(arm.pat) } else { vec![Vec::new()] };
+            if rows.len() > 64 {
+                self.body.lower_errs.push(crate::diag::Diag::new(
+                    "L9001",
+                    span,
+                    "a match guard over this many or-pattern alternatives is not supported yet",
+                    "Split the arm into several arms, one per alternative.",
+                ));
             }
-            if let Some(g) = arm.guard {
-                let gspan = self.span(g);
-                self.scopes.push(Vec::new());
-                let c = self.operand(g);
-                // Mutable: the same local is written again on every
-                // pass when the match sits in a loop.
-                let cl = self.new_local(BOOL, true, None);
-                self.assign(Place::local(cl), Rvalue::Use(c), gspan);
-                self.pop_scope(gspan);
-                for l in &guard_bound {
-                    self.guard_places[*l as usize] = None;
-                }
-                let (ok, fail) = (self.new_block(), self.new_block());
-                let b = &mut self.body.blocks[self.cur.0 as usize];
-                b.term = Terminator::If(Operand::Copy(Place::local(cl)), ok, fail);
-                self.cur = fail;
-                let arm_locals = self.scopes.last().unwrap().clone();
-                self.emit_drops(&arm_locals, gspan);
-                self.goto(next, gspan);
-                self.cur = ok;
+            let expanded = rows.len() > 1 && rows.len() <= 64;
+            let rows: Vec<Vec<(PatId, usize)>> = if expanded { rows } else { vec![Vec::new()] };
+            let next = self.new_block();
+            let body_bb = self.new_block();
+            let row_starts: Vec<Bb> = (0..rows.len()).map(|r| if r == 0 { self.cur } else { self.new_block() }).collect();
+            // A match nested in this arm's guard manages its own
+            // rows; the outer rows resume after it.
+            let saved_forced = std::mem::take(&mut self.or_forced);
+            self.scopes.push(Vec::new());
+            for (r, row) in rows.iter().enumerate() {
+                self.cur = row_starts[r];
+                let row_fail = if r + 1 < rows.len() { row_starts[r + 1] } else { next };
+                self.or_forced = row.clone();
+                self.test_pat(arm.pat, sp.clone(), row_fail);
+                let mut guard_bound: Vec<u32> = Vec::new();
+                let guard_popped;
                 if by_ref_guard {
-                    // End the guard bindings' storage before the
-                    // real binding moves out of the same places.
-                    self.emit_drops(&arm_locals, gspan);
-                    self.scopes.pop();
+                    self.scopes.push(Vec::new());
+                    self.bind_pat_guard(arm.pat, sp.clone(), &mut guard_bound);
+                    guard_popped = false;
+                } else {
                     self.bind_pat(arm.pat, sp.clone());
+                    guard_popped = true;
                 }
+                match arm.guard {
+                    Some(g) => {
+                        let gspan = self.span(g);
+                        self.scopes.push(Vec::new());
+                        let c = self.operand(g);
+                        // Mutable: the same local is written again on every
+                        // pass when the match sits in a loop.
+                        let cl = self.new_local(BOOL, true, None);
+                        self.assign(Place::local(cl), Rvalue::Use(c), gspan);
+                        self.pop_scope(gspan);
+                        for l in &guard_bound {
+                            self.guard_places[*l as usize] = None;
+                        }
+                        let (ok, fail) = (self.new_block(), self.new_block());
+                        let b = &mut self.body.blocks[self.cur.0 as usize];
+                        b.term = Terminator::If(Operand::Copy(Place::local(cl)), ok, fail);
+                        self.cur = fail;
+                        let arm_locals = self.scopes.last().unwrap().clone();
+                        self.emit_drops(&arm_locals, gspan);
+                        self.goto(row_fail, gspan);
+                        self.cur = ok;
+                        if by_ref_guard {
+                            // End the guard bindings' storage before the
+                            // real binding moves out of the same places.
+                            self.emit_drops(&arm_locals, gspan);
+                            self.scopes.pop();
+                            self.bind_pat(arm.pat, sp.clone());
+                        }
+                    }
+                    None => {
+                        debug_assert!(!expanded, "rows only expand under a guard");
+                    }
+                }
+                if by_ref_guard && !guard_popped && arm.guard.is_none() {
+                    self.scopes.pop();
+                }
+                self.goto(body_bb, span);
             }
+            self.or_forced = saved_forced;
+            self.cur = body_bb;
             self.expr_into(arm.body, dest);
             self.pop_scope(span);
             self.goto(end, span);
@@ -2640,6 +2724,85 @@ impl<'p, 'a> Lower<'p, 'a> {
         walk(self.p, pat)
     }
 
+    /// The direct sub-patterns of one pattern, in source order.
+    fn pat_children(&self, pat: PatId) -> Vec<PatId> {
+        match self.p.ast.pat(pat) {
+            Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.clone(),
+            Pat::Struct { fields, .. } => fields.iter().map(|&(_, s)| s).collect(),
+            Pat::Slice { prefix, middle, suffix } => {
+                let mut out: Vec<PatId> = prefix.clone();
+                if let Some(m) = middle {
+                    out.push(*m);
+                }
+                out.extend(suffix.iter().copied());
+                out
+            }
+            Pat::Paren(i) | Pat::Ref { inner: i, .. } | Pat::At { inner: i, .. } => vec![*i],
+            _ => Vec::new(),
+        }
+    }
+
+    /// True when the pattern binds any name, itself or below.
+    fn pat_has_binding(&self, pat: PatId) -> bool {
+        matches!(self.ck.pat_res(pat), PatRes::Binding { .. }) || self.pat_children(pat).iter().any(|&s| self.pat_has_binding(s))
+    }
+
+    /// True when some or-pattern in the pattern binds a name:
+    /// the shape whose alternatives a guard must retry.
+    fn pat_has_or_binding(&self, pat: PatId) -> bool {
+        if matches!(self.p.ast.pat(pat), Pat::Or(_)) && self.pat_has_binding(pat) {
+            return true;
+        }
+        self.pat_children(pat).iter().any(|&s| self.pat_has_or_binding(s))
+    }
+
+    /// The alternative a guard row fixes this or-pattern to.
+    fn or_forced(&self, pat: PatId) -> Option<usize> {
+        self.or_forced.iter().find(|&&(q, _)| q == pat).map(|&(_, i)| i)
+    }
+
+    /// The tag local for an or-pattern, made on first test.
+    fn or_tag(&mut self, pat: PatId) -> Local {
+        if let Some(&(_, l)) = self.or_tags.iter().find(|&&(q, _)| q == pat) {
+            return l;
+        }
+        let l = self.temp(int(IntTy::U32));
+        self.or_tags.push((pat, l));
+        l
+    }
+
+    /// Every combination of or-pattern alternatives in one
+    /// pattern, as a list of (or-pattern, alternative index)
+    /// rows. Rust tries the rows in this order under a guard:
+    /// a later or-pattern's alternatives cycle first.
+    fn or_rows(&self, pat: PatId) -> Vec<Vec<(PatId, usize)>> {
+        if let Pat::Or(alts) = self.p.ast.pat(pat) {
+            let mut rows = Vec::new();
+            for (i, &alt) in alts.iter().enumerate() {
+                for sub in self.or_rows(alt) {
+                    let mut row = vec![(pat, i)];
+                    row.extend(sub);
+                    rows.push(row);
+                }
+            }
+            return rows;
+        }
+        let mut rows: Vec<Vec<(PatId, usize)>> = vec![Vec::new()];
+        for child in self.pat_children(pat) {
+            let sub = self.or_rows(child);
+            let mut next = Vec::with_capacity(rows.len() * sub.len());
+            for row in &rows {
+                for s in &sub {
+                    let mut r = row.clone();
+                    r.extend(s.iter().copied());
+                    next.push(r);
+                }
+            }
+            rows = next;
+        }
+        rows
+    }
+
     /// Records one pattern binding for guard evaluation: a fresh
     /// shared-reference local that borrows `place`, with
     /// `guard_places` set so the guard reads the binding through
@@ -2651,16 +2814,30 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// borrow of the same place. The temporaries go in the
     /// innermost scope and need no drop.
     fn guard_binding(&mut self, local: u32, mode: BindMode, value_ty: Ty, place: Place, span: Span, bound: &mut Vec<u32>) {
-        let name = self.p.name(self.ck.locals[local as usize].name).to_string();
-        let rt = self.ref_ty(false, value_ty);
-        let t = self.new_local(rt, false, Some(name));
-        self.scopes.last_mut().unwrap().push(t);
+        // Every alternative (and guard row) that binds this
+        // local writes the one guard temporary: the blocks
+        // merge before the guard reads it.
+        let t = match self.guard_temps.iter().find(|&&(l, _)| l == local) {
+            Some(&(_, t)) => t,
+            None => {
+                let name = self.p.name(self.ck.locals[local as usize].name).to_string();
+                let rt = self.ref_ty(false, value_ty);
+                let t = self.new_local(rt, false, Some(name));
+                self.guard_temps.push((local, t));
+                t
+            }
+        };
+        if !self.scopes.last().unwrap().contains(&t) {
+            self.scopes.last_mut().unwrap().push(t);
+        }
         self.assign(Place::local(t), Rvalue::Ref(false, place), span);
         self.guard_places[local as usize] = Some(match mode {
             BindMode::Move => Place::local(t).deref(),
             BindMode::Ref(_) => Place::local(t),
         });
-        bound.push(local);
+        if !bound.contains(&local) {
+            bound.push(local);
+        }
     }
 
     /// Binds an already-tested pattern for a match guard, mirroring
@@ -2725,6 +2902,54 @@ impl<'p, 'a> Lower<'p, 'a> {
             (Pat::At { inner, .. }, PatRes::Binding { local, mode }) => {
                 self.bind_pat_guard(*inner, place.clone(), bound);
                 self.guard_binding(local, mode, self.ck.pat_ty(pat), place, span, bound);
+            }
+            (Pat::Or(alts), _) => {
+                // Bind by reference for the alternative that
+                // matched: the row's forced alternative, else a
+                // switch on the test's tag (see `test_pat`).
+                if !self.pat_has_binding(pat) || alts.is_empty() {
+                    return;
+                }
+                if let Some(i) = self.or_forced(pat) {
+                    self.bind_pat_guard(alts[i], place, bound);
+                    return;
+                }
+                let alts = alts.clone();
+                match self.or_tags.iter().find(|&&(q, _)| q == pat).map(|&(_, l)| l) {
+                    Some(tag) => {
+                        let end = self.new_block();
+                        // The otherwise edge cannot run (a test
+                        // set the tag), and must not look like a
+                        // path where the bindings stay unassigned.
+                        let bad = self.new_block();
+                        self.body.blocks[bad.0 as usize].term = Terminator::Unreachable;
+                        let branches: Vec<(u32, Bb)> = (0..alts.len()).map(|i| (i as u32, self.new_block())).collect();
+                        let b = &mut self.body.blocks[self.cur.0 as usize];
+                        b.term = Terminator::Switch(Operand::Copy(Place::local(tag)), branches.clone(), bad);
+                        b.term_span = span;
+                        for (i, &(_, bb)) in branches.iter().enumerate() {
+                            self.cur = bb;
+                            self.bind_pat_guard(alts[i], place.clone(), bound);
+                            self.goto(end, span);
+                        }
+                        self.cur = end;
+                    }
+                    None => {
+                        // No test ran (a `let` or parameter bind
+                        // reached a guard bind first): try each
+                        // alternative, as `bind_pat` does.
+                        let end = self.new_block();
+                        for &alt in &alts {
+                            let next = self.new_block();
+                            self.test_pat(alt, place.clone(), next);
+                            self.bind_pat_guard(alt, place.clone(), bound);
+                            self.goto(end, span);
+                            self.cur = next;
+                        }
+                        self.terminate(Terminator::Unreachable, span);
+                        self.cur = end;
+                    }
+                }
             }
             _ => {}
         }
@@ -2935,10 +3160,28 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Pat::Or(alts) => {
+                // One guard row tests only its fixed alternative.
+                if let Some(i) = self.or_forced(pat) {
+                    self.test_pat(alts[i], place, fail);
+                    return;
+                }
+                let alts = alts.clone();
+                // With bindings, remember which alternative
+                // matched in a tag: the binding moves happen
+                // only after the whole pattern and guard pass,
+                // when the merged block no longer knows.
+                let tag = if self.pat_has_binding(pat) { Some(self.or_tag(pat)) } else { None };
                 let cont = self.new_block();
-                for &alt in alts {
+                for (i, &alt) in alts.iter().enumerate() {
                     let next = self.new_block();
                     self.test_pat(alt, place.clone(), next);
+                    if let Some(tag) = tag {
+                        self.assign(
+                            Place::local(tag),
+                            Rvalue::Use(Operand::Const(Const::Int(i as u128, IntTy::U32))),
+                            span,
+                        );
+                    }
                     self.goto(cont, span);
                     self.cur = next;
                 }
@@ -2981,23 +3224,55 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// Binds one checker local from `place` by `mode`. The
+    /// first call for a local makes its IR local; later calls
+    /// (the other or-pattern alternatives of the same name, the
+    /// other guard rows, an unrolled loop's copies) assign into
+    /// that same local, and scope membership is per bind site.
+    fn bind_one(&mut self, local: u32, mode: BindMode, place: Place, value_ty: Ty, span: Span) {
+        let l = match self.bind_reuse.iter().find(|&&(c, _)| c == local) {
+            Some(&(_, l)) => l,
+            None => {
+                let info = &self.ck.locals[local as usize];
+                let (ty, m, name) = (info.ty, info.mutable, self.p.name(info.name).to_string());
+                let l = self.new_local(ty, m, Some(name));
+                self.bind_reuse.push((local, l));
+                l
+            }
+        };
+        self.local_map[local as usize] = l;
+        let rv = match mode {
+            BindMode::Move => Rvalue::Use(self.operand_from(place, value_ty)),
+            BindMode::Ref(m) => Rvalue::Ref(m, place),
+        };
+        self.assign(Place::local(l), rv, span);
+        if !self.scopes.last().unwrap().contains(&l) {
+            self.scopes.last_mut().unwrap().push(l);
+        }
+    }
+
     /// Binds the variables of an already-tested pattern.
     fn bind_pat(&mut self, pat: PatId, place: Place) {
+        // Or-pattern tags a re-test inside this bind made belong
+        // to this one bind: a statically repeated bind of the
+        // same pattern (an unrolled loop) tests again.
+        let snap = if self.bind_depth == 0 { Some(self.or_tags.len()) } else { None };
+        self.bind_depth += 1;
+        self.bind_pat_go(pat, place);
+        self.bind_depth -= 1;
+        if let Some(snap) = snap {
+            self.or_tags.truncate(snap);
+        }
+    }
+
+    fn bind_pat_go(&mut self, pat: PatId, place: Place) {
         let p = self.p;
         let place = Self::derefs(place, self.ck.pat_derefs(pat));
         let span = p.ast.pat_span(pat);
         match (p.ast.pat(pat), self.ck.pat_res(pat)) {
             (Pat::Binding { .. }, PatRes::Binding { local, mode }) => {
-                let info = &self.ck.locals[local as usize];
-                let (ty, m, name) = (info.ty, info.mutable, p.name(info.name).to_string());
-                let l = self.new_local(ty, m, Some(name));
-                self.local_map[local as usize] = l;
-                let rv = match mode {
-                    BindMode::Move => Rvalue::Use(self.operand_from(place, self.ck.pat_ty(pat))),
-                    BindMode::Ref(m) => Rvalue::Ref(m, place),
-                };
-                self.assign(Place::local(l), rv, span);
-                self.scopes.last_mut().unwrap().push(l);
+                let value_ty = self.ck.pat_ty(pat);
+                self.bind_one(local, mode, place, value_ty, span);
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Opt(true)) => {
                 self.bind_pat(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)));
@@ -3114,16 +3389,56 @@ impl<'p, 'a> Lower<'p, 'a> {
                 // whole value movable for the `@` binding, as in Rust. A
                 // moving subpattern then makes the whole move an error.
                 self.bind_pat(*inner, place.clone());
-                let info = &self.ck.locals[local as usize];
-                let (ty, m, name) = (info.ty, info.mutable, p.name(info.name).to_string());
-                let l = self.new_local(ty, m, Some(name));
-                self.local_map[local as usize] = l;
-                let rv = match mode {
-                    BindMode::Move => Rvalue::Use(self.operand_from(place.clone(), self.ck.pat_ty(pat))),
-                    BindMode::Ref(m) => Rvalue::Ref(m, place.clone()),
-                };
-                self.assign(Place::local(l), rv, span);
-                self.scopes.last_mut().unwrap().push(l);
+                let value_ty = self.ck.pat_ty(pat);
+                self.bind_one(local, mode, place, value_ty, span);
+            }
+            (Pat::Or(alts), _) => {
+                // Bind the alternative that matched (see
+                // `bind_pat_guard` for the same three shapes).
+                if !self.pat_has_binding(pat) || alts.is_empty() {
+                    return;
+                }
+                if let Some(i) = self.or_forced(pat) {
+                    self.bind_pat(alts[i], place);
+                    return;
+                }
+                let alts = alts.clone();
+                match self.or_tags.iter().find(|&&(q, _)| q == pat).map(|&(_, l)| l) {
+                    Some(tag) => {
+                        let end = self.new_block();
+                        // The otherwise edge cannot run (a test
+                        // set the tag), and must not look like a
+                        // path where the bindings stay unassigned.
+                        let bad = self.new_block();
+                        self.body.blocks[bad.0 as usize].term = Terminator::Unreachable;
+                        let branches: Vec<(u32, Bb)> = (0..alts.len()).map(|i| (i as u32, self.new_block())).collect();
+                        let b = &mut self.body.blocks[self.cur.0 as usize];
+                        b.term = Terminator::Switch(Operand::Copy(Place::local(tag)), branches.clone(), bad);
+                        b.term_span = span;
+                        for (i, &(_, bb)) in branches.iter().enumerate() {
+                            self.cur = bb;
+                            self.bind_pat(alts[i], place.clone());
+                            self.goto(end, span);
+                        }
+                        self.cur = end;
+                    }
+                    None => {
+                        // No test ran before this bind (a plain
+                        // `let`, a parameter, a loop binding):
+                        // the pattern cannot fail there, so find
+                        // the matching alternative now.
+                        let end = self.new_block();
+                        for &alt in &alts {
+                            let next = self.new_block();
+                            self.test_pat(alt, place.clone(), next);
+                            self.bind_pat(alt, place.clone());
+                            self.goto(end, span);
+                            self.cur = next;
+                        }
+                        self.terminate(Terminator::Unreachable, span);
+                        self.cur = end;
+                    }
+                }
             }
             _ => {}
         }
