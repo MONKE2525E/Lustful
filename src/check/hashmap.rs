@@ -146,6 +146,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if tys.is_string_ty(k) {
             return q == STR;
         }
+        if let Some(b) = crate::check::collect::cow_arg(tys, k) {
+            return b == q;
+        }
         if let Some(e) = tys.vec_elem(k) {
             return matches!(tys.kind(q), TyKind::Slice(x) if x == e);
         }

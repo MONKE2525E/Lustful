@@ -698,6 +698,11 @@ impl Solver {
         if head_of(cx.tys(), self_deep, &|t| t).is_none() {
             return false;
         }
+        // A trait that needs `Self: Sized` never holds for an unsized
+        // head.
+        if index.sized_only.contains(&tr.def) && matches!(cx.tys().kind(self_deep), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) {
+            return true;
+        }
         // Traits answered by structure: an empty bucket is no answer.
         if let Some(holds) = cx.structural(tr) {
             return !holds;

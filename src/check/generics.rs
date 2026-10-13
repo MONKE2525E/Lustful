@@ -551,6 +551,13 @@ pub fn fmt_error_def() -> DefId {
     lang_def(&["core", "fmt"], crate::def::DefKind::Adt, "Error")
 }
 
+/// The def of `alloc::borrow::Cow` (W-STD-B): a synthetic generic enum
+/// collect registers like `Ordering`, reached only through std paths
+/// (`std::borrow::Cow` and imports of it), never by a bare name.
+pub fn cow_def() -> DefId {
+    lang_def(&["alloc", "borrow"], crate::def::DefKind::Adt, "Cow")
+}
+
 /// The `core::fmt::Error` type.
 pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(fmt_error_def(), EMPTY_ARGS))
@@ -620,9 +627,10 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// The synthetic std Adts collect always registers, as (index, name,
 /// def, is_enum). A user type, alias, or trait of the same name shadows
 /// only the flat name (check/collect.rs); `fmt::Error` and
-/// `atomic::Ordering` never have one (see `std_adt_has_flat_name`).
-/// The driver predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 9] {
+/// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
+/// generic `Cow` (W-STD-B) is built apart in collect. The driver
+/// predicts the same list.
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 10] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
@@ -633,6 +641,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 9] {
         (6, "TryRecvError", try_recv_error_def(), true),
         (7, "TypeId", type_id_def(), false),
         (8, "Location", location_def(), false),
+        (9, "Cow", cow_def(), true),
     ]
 }
 
@@ -2522,6 +2531,10 @@ pub(crate) fn resolve_path_ty(
                 }
                 return Ok(type_id_ty(tys));
             }
+            // `std::borrow::Cow<'a, B>` (W-STD-B).
+            if path.len() == 3 && path[1] == "borrow" && path[2] == "Cow" {
+                return resolve_cow_path(ast, interner, known, cx, tys, scope, segs.last().unwrap(), span);
+            }
             // The owning std iterators (W-STD-B, ty/iter.rs).
             if let Some(k) = crate::ty::iter::owning_by_path(&path) {
                 let seg = segs.last().unwrap();
@@ -2927,6 +2940,39 @@ pub(crate) fn resolve_path_ty(
         return Err(crate::ty::hash::not_imported(k, span));
     }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
+}
+
+/// `std::borrow::Cow<'a, B>` (W-STD-B): the synthetic enum at `B`, its
+/// lifetime kept first in a region signature like a user Adt's.
+#[allow(clippy::too_many_arguments)]
+fn resolve_cow_path(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    seg: &ast::PathSeg,
+    span: Span,
+) -> Result<Ty, Diag> {
+    let usage = || Diag::new("L0110", span, "`Cow` takes one type argument", "Write `Cow<'a, str>`, for example.");
+    let GenericArgs::Angle(a) = &seg.args else { return Err(usage()) };
+    let written: Vec<ast::Lifetime> = a.iter().filter_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect();
+    if written.len() > 1 {
+        return Err(Diag::new("L0110", span, "`Cow` takes 1 lifetime argument", "Write one lifetime, or none."));
+    }
+    let args: Vec<GenericArg> = resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], span, "Cow")?
+        .into_iter()
+        .filter(|g| g.as_ty().is_some())
+        .collect();
+    if args.len() != 1 {
+        return Err(usage());
+    }
+    if matches!(scope.regions, RegionMode::Keep { .. }) {
+        let r = scope_region(interner, scope, written.first().copied(), span)?;
+        return Ok(tys.mk_adt(cow_def(), &[GenericArg::Lifetime(r), args[0]]));
+    }
+    Ok(tys.mk_adt(cow_def(), &args))
 }
 
 /// A hashed collection or hasher type by its std path (W-STD-B):
@@ -3949,6 +3995,7 @@ pub fn init_lang(p: &mut Program) {
     p.gx.index.structural = vec![lang.sized, lang.send, lang.sync, lang.unpin];
     p.gx.index.derive_family =
         vec![lang.copy, lang.clone, lang.debug, lang.partial_eq, lang.eq, lang.partial_ord, lang.ord, lang.hash, lang.default];
+    p.gx.index.sized_only = vec![lang.sized, lang.clone, lang.copy, lang.default];
 }
 
 /// How many type/const parameters an AST generics list declares
@@ -5982,6 +6029,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let mut g1 = one.clone();
         g1.predicates = pred_on_p0(p, lang.clone);
         insert_synthetic(p, &mut ordinal, lang.to_owned, slice_p0, &[], g1.clone(), vec![(lang.assoc_owned, vec_p0)], Synthetic::Lang, false, span);
+        // The blanket `impl<T: Clone> ToOwned for T` has core's implicit
+        // `T: Sized`, which keeps `[T]` and `str` out of it.
+        g1.predicates.extend(pred_on_p0(p, lang.sized));
         insert_synthetic(p, &mut ordinal, lang.to_owned, p0, &[], g1, vec![(lang.assoc_owned, p0)], Synthetic::Lang, false, span);
     }
     // Iterator for the builtin iterator structs (ty/iter.rs, W-STD-A):
@@ -6063,6 +6113,19 @@ pub fn add_synthetic_impls(p: &mut Program) {
         for (self_pat, it, item) in entries {
             let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
             insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
+        }
+    }
+    // `Cow<'_, B>` (W-STD-B): Clone for every B (the Owned value clones
+    // through `ToOwned`), the rest through B, as std's impls deref.
+    {
+        let cow_p0 = p.tys.mk_adt(cow_def(), &[GenericArg::Ty(p0)]);
+        insert_synthetic(p, &mut ordinal, lang.clone, cow_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        // `Borrow<B>` (map lookups of `Cow<str>` keys by `&str`).
+        insert_synthetic(p, &mut ordinal, lang.borrow, cow_p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        for tr in [lang.debug, lang.display, lang.eq, lang.hash, lang.partial_eq, lang.partial_ord, lang.ord] {
+            let mut g1 = one.clone();
+            g1.predicates = pred_on_p0(p, tr);
+            insert_synthetic(p, &mut ordinal, tr, cow_p0, &rhs_of(tr, cow_p0), g1, Vec::new(), Synthetic::Lang, false, span);
         }
     }
     // The std hashers and hashed collections (ty/hash.rs, W-STD-B), as
@@ -6725,10 +6788,26 @@ pub fn normalize_global_in(p: &mut Program, env: &[Predicate], t: Ty) -> Ty {
         let out = crate::traits::solve::normalize(&mut solver, &mut cx, &p.gx.index, env, t);
         snapshot_ty(&cx.tys, out)
     };
-    match owned {
+    let t = match owned {
         Some(owned) => build_owned_ty(p, &owned),
         None => t,
+    };
+    // `<[T] as ToOwned>::Owned` and `<str as ToOwned>::Owned` (the
+    // `Cow` Owned field, W-STD-B): a pure solver cannot refute the
+    // blanket `impl<T: Clone> ToOwned for T` at an unsized head (its
+    // `Clone` and `Sized` clauses are answered by structure in a body),
+    // so the lang facts' answers are read off here.
+    if let TyKind::Projection(assoc, a) = p.tys.kind(t)
+        && assoc.0 == p.gx.lang.assoc_owned
+        && let Some(b) = p.tys.args(a).first().and_then(|g| g.as_ty())
+    {
+        return match p.tys.kind(b) {
+            TyKind::Str => STRING,
+            TyKind::Slice(e) => p.tys.mk_vec(e),
+            _ => t,
+        };
     }
+    t
 }
 
 /// A const or static item's type with its projections normalized

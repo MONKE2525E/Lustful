@@ -3125,6 +3125,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashIterNew)) && self.call_hash_iter(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowToMut)) && self.call_cow_to_mut(&avs, &dv) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
@@ -3616,6 +3617,22 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             self.relate(t, &a, t, &b, var);
             at += n;
         }
+        true
+    }
+
+    /// `cow.to_mut()` (W-STD-B): `&'r mut Owned` from `&'x mut Cow<'a,
+    /// B>`. The loan outlives the result, and the Owned value's regions
+    /// are B's (one invariant class, as behind `&mut`). The Cow's own
+    /// `'a` does not reach the result: after the call it is Owned and
+    /// holds no borrow of `'a` data.
+    fn call_cow_to_mut(&mut self, avs: &[(Ty, Vec<u32>)], dv: &[u32]) -> bool {
+        let Some((_, v0)) = avs.first() else { return false };
+        let (Some((&x, cv)), Some((&r, ov))) = (v0.split_first(), dv.split_first()) else { return false };
+        let Some(b_slots) = cv.get(1..) else { return false };
+        self.edge(x, r);
+        let mut class = b_slots.to_vec();
+        class.extend_from_slice(ov);
+        self.equate_all(&class, &[]);
         true
     }
 

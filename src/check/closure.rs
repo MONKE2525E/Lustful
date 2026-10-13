@@ -1002,6 +1002,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // An owning unsizing (`Box<T>` to `Box<dyn Tr>`) moves the
             // value: the plain consume.
             Coerce::Unsize(t) if !matches!(self.kind(t), TyKind::Ref(..)) => return false,
+            // Builtin derefs down to the Cow, whose `Deref` borrows it.
+            Coerce::CowDeref(n, _) => (n as usize, CaptureMode::Ref),
             // A dyn coercion reborrows the source at the target's
             // mutability before it builds the fat pointer.
             Coerce::Unsize(t) => (1, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref }),

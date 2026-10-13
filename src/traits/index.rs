@@ -236,6 +236,11 @@ pub struct ImplIndex {
     /// core implements them for tuples, arrays, slices, references,
     /// and closures by structure, with no impl records for those.
     pub derive_family: Vec<DefId>,
+    /// Traits that need `Self: Sized` in core (`Sized`, `Clone`,
+    /// `Copy`, `Default`): provably false for `str`, `[T]`, and
+    /// `dyn Trait`, so a blanket `impl<T: Clone> X for T` leaves the
+    /// unsized heads to their own impls (W-STD-B: `[T]: ToOwned`).
+    pub sized_only: Vec<DefId>,
 }
 
 impl ImplIndex {

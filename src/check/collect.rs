@@ -850,6 +850,16 @@ pub fn resolve_ty(
                 {
                     return Ok(tys.intern(TyKind::Adt(def, EMPTY_ARGS)));
                 }
+                // `std::borrow::Cow<'a, B>` (W-STD-B), regions erased.
+                if path.len() == 3 && path[1] == "borrow" && path[2] == "Cow" {
+                    let seg = segs.last().unwrap();
+                    let targs = seg.type_args();
+                    let [b] = targs.as_slice() else {
+                        return Err(Diag::new("L0110", span, "`Cow` takes one type argument", "Write `Cow<'a, str>`, for example."));
+                    };
+                    let b = resolve_ty(ast, interner, known, type_names, aliases, tys, *b, self_ty)?;
+                    return Ok(tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(b)]));
+                }
                 // The owning std iterators (W-STD-B, ty/iter.rs).
                 if let Some(k) = crate::ty::iter::owning_by_path(&path) {
                     let seg = segs.last().unwrap();
@@ -2017,6 +2027,10 @@ pub fn collect_reuse<'a>(
     for (k, name, def, is_enum) in generics::std_adts() {
         adt_srcs.push((usize::MAX - k, interner.intern(name), Span::default(), is_enum, def.hash));
     }
+    // A program that names `Cow` (W-STD-B) instantiates it: mono runs.
+    if ast_mentions(ast, interner.intern("Cow")) {
+        p.gx.has_generics = true;
+    }
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -2042,6 +2056,56 @@ pub fn collect_reuse<'a>(
     }
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
+        // `Cow` is entry 9 of `std_adts`.
+        if item_idx == usize::MAX - 9 {
+            // `enum Cow<'a, B: ?Sized + ToOwned> { Borrowed(&'a B),
+            // Owned(<B as ToOwned>::Owned) }`, as std declares it. The
+            // instance at a concrete B normalizes the Owned field
+            // (`Cow<str>` holds a String). Its traits are lang facts with
+            // glue in cgen (generics.rs, cgen/fmt.rs).
+            let id = AdtId(adt_base as u32 + rank);
+            let def = generics::cow_def();
+            let b = p.tys.intern(TyKind::Param(ParamId(0)));
+            let rb = p.tys.mk_ref(false, b);
+            let owned = {
+                let a = p.tys.intern_args(&[GenericArg::Ty(b)]);
+                p.tys.intern(TyKind::Projection(AssocId(p.gx.lang.assoc_owned), a))
+            };
+            let zero = interner.intern("0");
+            let variant = |n: &str, ty: Ty, disc: i128| Variant {
+                name: interner.intern(n),
+                shape: VariantShape::Tuple,
+                fields: vec![Field { name: zero, ty }],
+                disc,
+            };
+            p.adts[id.0 as usize] = AdtDef {
+                name,
+                is_enum: true,
+                variants: vec![variant("Borrowed", rb, 0), variant("Owned", owned, 1)],
+                derives: Derives::default(),
+                span,
+                repr: crate::ty::layout::Repr::default(),
+            };
+            p.gx.adt_info[id.0 as usize] = (def, 1);
+            p.gx.adt_lifetimes.insert(def, vec![interner.intern("a")]);
+            let to_owned = {
+                let a = p.tys.intern_args(&[GenericArg::Ty(b)]);
+                Predicate::Trait(Binder::plain(TraitRef { def: p.gx.lang.to_owned, args: a, bindings: EMPTY_BINDINGS }))
+            };
+            p.gx.adt_generics[id.0 as usize] = Generics {
+                parent: None,
+                params: vec![ParamDef { name: interner.intern("B"), kind: ParamKind::Type, span }],
+                predicates: vec![to_owned.clone()],
+            };
+            p.gx.adt_envs[id.0 as usize] = vec![to_owned];
+            let regioned = p.tys.intern(TyKind::Ref(Region::Param(0), Mut::Shared, b));
+            p.regions.adt_fields.insert(def, vec![vec![regioned], vec![owned]]);
+            p.tys.register_adt(def, id);
+            let mut data = DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span);
+            data.generics = p.gx.adt_generics[id.0 as usize].clone();
+            p.defs.insert_adt(def, id, data);
+            continue;
+        }
         if item_idx > usize::MAX - generics::std_adts().len() {
             // A synthetic std Adt (see above): variants, fields, and
             // derives are std's, written here directly (no AST item).
@@ -4470,6 +4534,16 @@ impl CollectCx<'_, '_> {
         // `Self` in an inherent associated const's initializer names the
         // owning Adt (`Self(1)`, `Self::A`, `Self { .. }`).
         let head = |n: Sym| if n == self.p.known.self_type { self.self_name.unwrap_or(n) } else { n };
+        // `std::borrow::Cow::Borrowed` and `Owned` (W-STD-B).
+        if segs.len() == 4
+            && matches!(self.p.interner.get(segs[0].name), "std" | "alloc")
+            && self.p.interner.get(segs[1].name) == "borrow"
+            && self.p.interner.get(segs[2].name) == "Cow"
+            && let Some(a) = self.p.tys.local_adt_of(generics::cow_def())
+        {
+            let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
+            return Some((a, v as u32));
+        }
         // `std::cmp::Ordering::Less`: the same std variant paths
         // `resolve_assoc` answers, for const contexts.
         if segs.len() >= 4 {
@@ -4640,6 +4714,10 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 /// The walk behind `has_clone`; `seen` stops recursive generic types.
 fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    // `Cow<B>` clones its Owned value (`B: ToOwned` holds by its WF).
+    if cow_arg(tys, t).is_some() {
+        return true;
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => return env_proves(tys, t, p.gx.lang.clone, None),
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| glue_clone(p, tys, e, seen)),
@@ -4718,6 +4796,10 @@ pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// holds the Adt types on the walk (a recursive type through `Box`
 /// or `Vec` compares by the same glue: the cycle adds no field type).
 fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>) -> bool {
+    // `Cow<B>` compares as the `B` it derefs to (W-STD-B).
+    if let Some(b) = cow_arg(tys, t) {
+        return glue_cmp(p, tys, b, total, seen);
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => {
             if total {
@@ -4955,6 +5037,9 @@ pub fn has_hash(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    if let Some(b) = cow_arg(tys, t) {
+        return glue_hash(p, tys, b, seen);
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.hash, None),
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
@@ -5043,6 +5128,9 @@ pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 /// The walk behind `has_eq`; `seen` stops recursive generic types.
 fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    if let Some(b) = cow_arg(tys, t) {
+        return glue_eq(p, tys, b, seen);
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_eq, Some(t)),
         // Fn pointers compare by address in Rust; fn items do not.
@@ -5085,6 +5173,9 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 /// The walk behind `has_debug`; `seen` stops recursive generic types.
 fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    if let Some(b) = cow_arg(tys, t) {
+        return glue_debug(p, tys, b, seen);
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.debug),
@@ -5143,6 +5234,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
 }
 
 pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    if let Some(b) = cow_arg(tys, t) {
+        return has_display(p, tys, b);
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.display, None),
         TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.display),
@@ -5275,4 +5369,27 @@ impl crate::ty::layout::AdtShapes for Program<'_> {
             discs: adt.variants.iter().map(|v| v.disc).collect(),
         })
     }
+}
+
+/// True when a type, value, or pattern path of the crate has a segment
+/// named `name` (W-STD-B: whether a synthetic generic std enum is used).
+fn ast_mentions(ast: &Ast, name: Sym) -> bool {
+    let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| s.name == name);
+    ast.tys.iter().any(|t| matches!(t, TyExpr::Path(segs) if hit(segs)))
+        || ast.exprs.iter().any(|e| matches!(e, ast::Expr::Path(segs) if hit(segs)))
+        || ast.pats.iter().any(|p| match p {
+            ast::Pat::Path(segs) => hit(segs),
+            ast::Pat::TupleStruct { path, .. } => hit(path),
+            _ => false,
+        })
+}
+
+/// The `B` of a `Cow<'a, B>` type (W-STD-B): its Debug, Display,
+/// equality, order, and hash are those of `B` (std derefs to it).
+pub fn cow_arg(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    let (d, a) = tys.adt_parts(t)?;
+    if d != generics::cow_def() {
+        return None;
+    }
+    tys.args(a).iter().find_map(|g| g.as_ty())
 }

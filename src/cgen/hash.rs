@@ -252,6 +252,16 @@ pub(super) fn hash_value_body(p: &Program, slots: &[u32], key: &CTy, need: &mut 
     let (t, hc) = (&parts[0], &parts[1]);
     let isize_call = |disc: &str| hasher_call(p, slots, hc, write_int(IntTy::Isize), "h", &format!("(int64_t)({disc})"));
     let mut body = String::new();
+    // `Cow<B>` hashes as the `B` it derefs to (std: `Hash::hash(&**self)`).
+    if let Some((rb, decl)) = super::fmt::cow_view(p, t, "p", "v_") {
+        let (bt, bp) = match rb {
+            CTy::Ref(inner) if *inner != CTy::Str => (*inner, "v_".to_string()),
+            CTy::Ref(_) => (CTy::Str, "(&v_)".to_string()),
+            sl => (sl, "(&v_)".to_string()),
+        };
+        let _ = writeln!(body, "  {decl}\n  {}", hash_stmts(p, slots, &bt, hc, "h", &bp, need));
+        return body;
+    }
     match t {
         CTy::Option(e) => {
             let disc = disc_call(p, t, "p");
@@ -388,7 +398,7 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
-                let borrowed = borrow_expr(&k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
+                let borrowed = borrow_expr(p, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
                 let eq = eq_expr(p, q, &format!("({qc}*)ctx"), &borrowed, need);
                 (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {eq};\n"))
             }
@@ -400,7 +410,7 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
 /// A `Q*` expression for `<K as Borrow<Q>>::borrow` of the key at `k`
 /// (a `K*`): String to str, Vec<T> to [T], one deref of Box/Rc/&T, or
 /// the key itself. The result points at a temporary for the fat forms.
-fn borrow_expr(k: &CTy, q: &CTy, kp: &str) -> String {
+fn borrow_expr(p: &Program, k: &CTy, q: &CTy, kp: &str) -> String {
     if k == q {
         return kp.to_string();
     }
@@ -411,6 +421,12 @@ fn borrow_expr(k: &CTy, q: &CTy, kp: &str) -> String {
         // `&str` and `Box<str>` are the fat str value itself.
         (CTy::Ref(inner) | CTy::Boxed(inner), CTy::Str) if **inner == CTy::Str => kp.to_string(),
         (CTy::Boxed(_) | CTy::Ref(_), _) => format!("(*{kp})"),
+        // `Cow<B>` borrows as the `B` it derefs to.
+        (CTy::Adt(_), _) => match super::fmt::cow_view_expr(p, k, kp) {
+            Some((CTy::Ref(inner), e)) if *inner != CTy::Str => e,
+            Some((rb, e)) => format!("(({}[]){{ {e} }})", ctype(&rb)),
+            None => kp.to_string(),
+        },
         (CTy::Rc(_), _) => format!("(&(*{kp})->v)"),
         _ => kp.to_string(),
     }

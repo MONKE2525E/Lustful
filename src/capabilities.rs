@@ -417,6 +417,9 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::HashExtend,
     Builtin::HashExtendReserve,
     Builtin::HashReserve,
+    Builtin::CowIntoOwned,
+    Builtin::CowToMut,
+    Builtin::CowDeref,
 ];
 
 /// How a builtin is called.
@@ -772,6 +775,11 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
                 i.intern("into_keys"),
                 i.intern("into_values"),
             ],
+            Call::Method,
+        ),
+        B::CowIntoOwned | B::CowToMut | B::CowDeref => (
+            &["Cow<'a, B>"],
+            vec![i.intern("into_owned"), i.intern("to_mut"), i.intern("as_ref"), i.intern("borrow"), i.intern("deref")],
             Call::Method,
         ),
         B::HashExtend | B::HashExtendReserve | B::HashReserve => {

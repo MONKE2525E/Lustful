@@ -11,6 +11,7 @@ pub mod utf8;
 pub mod collect;
 pub mod constfn;
 pub mod convert;
+pub mod cow;
 pub mod defaults;
 pub mod fmt;
 pub mod generics;
@@ -478,6 +479,11 @@ pub enum Builtin {
     /// key not yet made on this thread takes `value` as its value
     /// (None comes back); any other state gives `value` back.
     TlsInitWith,
+    /// `Cow` methods (check/cow.rs, W-STD-B): `into_owned`, `to_mut`,
+    /// and the `&B` view (`as_ref`, `borrow`, `deref`).
+    CowIntoOwned,
+    CowToMut,
+    CowDeref,
     /// The hashed collections (W-STD-B, check/hashmap.rs, cgen/hash.rs):
     /// constructors (the result type tells map, set, or hasher), table
     /// queries, map and set methods, and the Entry methods.
@@ -822,6 +828,9 @@ pub enum Coerce {
     /// `Checked::deref_coerce`; the payload is the target reference
     /// type.
     UserDeref(Ty),
+    /// `&Cow<B>` (behind this many references in all) to `&B`, the
+    /// payload's type (W-STD-B): the Cow's `Deref`.
+    CowDeref(u8, Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2763,6 +2772,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Normalizes one type here (section 2.5) through this body's
     /// solver. The solver state is taken out for the call because
     /// the context itself is the `SolveCx`.
+    /// One field type of a generic Adt at the given args, with its
+    /// projections normalized (`Owned(<B as ToOwned>::Owned)`).
+    fn subst_field(&mut self, t: Ty, args: &[GenericArg]) -> Ty {
+        let t = subst(&mut self.tys, t, args);
+        if self.tys.flags(t).contains_projection() { self.normalize_here(t) } else { t }
+    }
+
     fn normalize_here(&mut self, t: Ty) -> Ty {
         if !self.tys.flags(t).contains_projection() {
             return t;
@@ -4017,6 +4033,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if self.kind(s) == TyKind::Str && self.tys.is_string_ty(self.resolve(fbase)) =>
             {
                 Coerce::StrFromString
+            }
+            // `&Cow<B>` to `&B` (W-STD-B), when the types do not already
+            // unify (an exact match wins, as in the arms below).
+            (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, y))
+                if !dyn_target
+                    && ed == 1
+                    && crate::check::collect::cow_arg(&self.tys, self.resolve(fbase)).is_some()
+                    && {
+                        let snap_vars = self.snapshot_vars();
+                        let obl_len = self.obl_len();
+                        let exact = self.unify(found, expected);
+                        self.rollback_vars(snap_vars);
+                        self.obl_truncate(obl_len);
+                        !exact
+                    }
+                    && crate::check::collect::cow_arg(&self.tys, self.resolve(fbase)).is_some_and(|b| self.unify(b, y)) =>
+            {
+                Coerce::CowDeref(fd, expected)
             }
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
                 if self.kind(s) == TyKind::Str
@@ -8145,6 +8179,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         {
             return Some(Res::Variant(a, 0));
         }
+        // `std::borrow::Cow::Borrowed` and `Owned` (W-STD-B): the
+        // synthetic generic enum collect registers.
+        if names.len() == 4
+            && (names[0] == k.std || self.name(names[0]) == "alloc")
+            && self.name(names[1]) == "borrow"
+            && self.name(names[2]) == "Cow"
+            && let Some(a) = p.tys.local_adt_of(generics::cow_def())
+            && let Some(v) = p.adt(a).variants.iter().position(|v| v.name == names[3])
+        {
+            return Some(Res::Variant(a, v as u32));
+        }
         // `mpsc::RecvError`, the unit struct value (W-THREADS).
         if names.len() == 4
             && names[0] == k.std
@@ -10881,6 +10926,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(ret) = self.tls_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
+        // The inherent methods of `alloc::borrow::Cow` (W-STD-B).
+        if let Some(ret) = self.cow_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
         // Generic and trait receivers go through the full 2.10
         // search (check/method.rs), which probes plain inherent
         // methods with the same recorded reads, in step+form
@@ -13567,7 +13616,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 let mut vals = Vec::new();
                 for ft in field_tys {
-                    let ft = if args.is_empty() { ft } else { subst(&mut self.tys, ft, &args) };
+                    let ft = if args.is_empty() { ft } else { self.subst_field(ft, &args) };
                     vals.push(self.zero_const(ft)?);
                 }
                 Some(if is_enum { ConstValue::Variant(0, vals) } else { ConstValue::Aggregate(vals) })
@@ -16938,6 +16987,16 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
 
 /// The (Adt, variant) a path denotes in the compat tables.
 fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+    // `std::borrow::Cow::Borrowed` and `Owned` (W-STD-B).
+    if segs.len() == 4
+        && matches!(p.interner.get(segs[0].name), "std" | "alloc")
+        && p.interner.get(segs[1].name) == "borrow"
+        && p.interner.get(segs[2].name) == "Cow"
+        && let Some(a) = p.tys.local_adt_of(generics::cow_def())
+    {
+        let v = p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
+        return Some((a, v as u32));
+    }
     // `std::cmp::Ordering::Less`: the same std variant paths
     // `resolve_assoc` answers, for const contexts.
     if segs.len() >= 4 {

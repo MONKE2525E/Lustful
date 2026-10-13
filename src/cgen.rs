@@ -3357,7 +3357,10 @@ impl FnGen<'_, '_, '_> {
             | B::ConvStrBytes
             | B::ConvArraySlice
             | B::ConvDeref
-            | B::ConvRcInner => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
+            | B::ConvRcInner
+            | B::CowIntoOwned
+            | B::CowToMut
+            | B::CowDeref => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             // The operand was moved into the call: no drop ever runs.
             B::MemForget => "((lust_Unit){})".into(),
             // Interior writes of std source cells (W-STD-C): the slot is
@@ -7011,9 +7014,16 @@ fn glue_def(
                     }
                 }
             };
+            let cow = (fmt::cow_view(p, t, "a", "va"), fmt::cow_view(p, t, "b", "vb"));
             match t {
                 CTy::ExitCode => body.push_str("  return *a == *b;\n"),
                 CTy::AccessError => body.push_str("  return 1;\n"),
+                // `Cow<B>` compares the `B` views (W-STD-B).
+                _ if cow.0.is_some() => {
+                    let ((rb, da), (_, db)) = (cow.0.clone().unwrap(), cow.1.clone().unwrap());
+                    let c = eq_of(&rb, "va", "vb", &mut need);
+                    let _ = writeln!(body, "  {da}\n  {db}\n  return {c};");
+                }
                 CTy::String => body.push_str("  return lust_str_eq(lust_string_as_str(a), lust_string_as_str(b));\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return lust_str_eq(*a, *b);\n"),
                 CTy::Option(e) => {
@@ -7139,7 +7149,14 @@ fn glue_def(
                 let c = cmp_of(e, x, y, need);
                 format!("  for (uint64_t i = 0; i < {n}; i++) {{ int8_t c = {c}; if (c) return c; }}\n")
             };
+            let cow = (fmt::cow_view(p, t, "a", "va"), fmt::cow_view(p, t, "b", "vb"));
             match t {
+                // `Cow<B>` orders the `B` views (W-STD-B).
+                _ if cow.0.is_some() => {
+                    let ((rb, da), (_, db)) = (cow.0.clone().unwrap(), cow.1.clone().unwrap());
+                    let c = cmp_of(&rb, "va", "vb", &mut need);
+                    let _ = writeln!(body, "  {da}\n  {db}\n  return {c};");
+                }
                 CTy::String => body.push_str("  int c = lust_str_cmp(lust_string_as_str(a), lust_string_as_str(b));\n  return c < 0 ? -1 : c > 0;\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  int c = lust_str_cmp(*a, *b);\n  return c < 0 ? -1 : c > 0;\n"),
                 CTy::Option(e) => {
@@ -7321,7 +7338,7 @@ fn glue_def(
         }
         Glue::Display => {
             let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
-            let body = fmt::display_glue_body(p, t, slots, types);
+            let body = fmt::display_glue_body(p, t, slots, &mut need, types);
             let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
         }
         Glue::HashValue

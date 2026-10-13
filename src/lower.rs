@@ -748,6 +748,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let root = self.apply_deref_steps(place, ty, steps, span);
                 if matches!(self.kind(target), TyKind::Ref(_, m, _) if m.is_mut()) { Operand::Move(root) } else { Operand::Copy(root) }
             }
+            Coerce::CowDeref(n, target) => {
+                // Down to the `&Cow`, then the Cow's `&B` view (W-STD-B).
+                let place = self.op_place(op, ty, span);
+                let place = Self::derefs(place, n - 1);
+                let tmp = self.temp(target);
+                self.call_into(CallTarget::Builtin(Builtin::CowDeref), vec![Operand::Copy(place)], Place::local(tmp), span);
+                Operand::Copy(Place::local(tmp))
+            }
         }
     }
 
@@ -759,7 +767,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match self.ck.coerce(e) {
             Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
-            Coerce::Unsize(t) | Coerce::UserDeref(t) => t,
+            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) => t,
             Coerce::Deref(n) => self.peel(ty, n),
             Coerce::BoxToRef(n, m) => {
                 let elem = self.peel(ty, n);

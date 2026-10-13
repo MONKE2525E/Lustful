@@ -1194,6 +1194,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/fmt/DebugMap",
     "core/sync/atomic/Ordering",
     "std/sync/atomic/Ordering",
+    "std/borrow/Cow",
+    "alloc/borrow/Cow",
     "std/vec/IntoIter",
     "alloc/vec/IntoIter",
     "std/collections/hash_map/IntoIter",

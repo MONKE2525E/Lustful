@@ -137,6 +137,10 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
 
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
 pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    // `Cow<B>` prints the `B` it derefs to, with no variant name.
+    if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
+        return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Debug, "f", "(&v_)", need));
+    }
     let disc_p = disc_call(p, t, "p");
     let mut body = String::new();
     match t {
@@ -282,7 +286,11 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
 
 /// The body of `disp_<m>`: only types with a user Display impl reach
 /// Display glue (every other Display type is a leaf in `fmt_expr`).
-pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut Vec<CTy>) -> String {
+pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    // `Cow<B>` displays the `B` it derefs to (W-STD-B).
+    if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
+        return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Display, "f", "(&v_)", need));
+    }
     match t {
         // `impl Display for fmt::Error`: str Display of core's text.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
@@ -681,6 +689,66 @@ impl FnGen<'_, '_, '_> {
                 };
                 self.fmt_result_of(&call)
             }
+            // `Cow` (check/cow.rs, W-STD-B).
+            B::CowDeref => {
+                let cow = match &tys[0] {
+                    CTy::Ref(inner) => (**inner).clone(),
+                    t => t.clone(),
+                };
+                cow_view_expr(self.p, &cow, &vals[0]).map(|(_, e)| e)?
+            }
+            B::CowIntoOwned | B::CowToMut => {
+                let (cow, ptr) = match &tys[0] {
+                    CTy::Ref(inner) => ((**inner).clone(), vals[0].clone()),
+                    t => {
+                        let c = self.tmp();
+                        let _ = writeln!(self.out, "    {} {c} = {};", ctype(t), vals[0]);
+                        (t.clone(), format!("(&{c})"))
+                    }
+                };
+                let CTy::Adt(a) = &cow else { return None };
+                let oc = cty(&self.p.tys, self.p.adt(*a).variants[1].fields[0].ty);
+                let (rb, view) = cow_view_expr(self.p, &cow, &ptr)?;
+                let disc = disc_call(self.p, &cow, &ptr);
+                let f1 = variant_field(self.p, &cow, &format!("(*{ptr})"), 1, 0);
+                let o = self.tmp();
+                // `<B as ToOwned>::to_owned` of the borrowed view: str to
+                // an exact String, `[T]` to an exact Vec of clones.
+                let mut want_clone = |this: &mut Self, t: &CTy, x: &str| -> String {
+                    if is_copy_c(this.p, t) {
+                        x.to_string()
+                    } else {
+                        this.want(Glue::Clone, t);
+                        format!("clone_{}(&{x})", mangle(t))
+                    }
+                };
+                let to_owned = match &rb {
+                    CTy::Ref(inner) if **inner == CTy::Str => format!("    {} {o} = lust_string_from({view});", ctype(&oc)),
+                    CTy::Slice(e) => {
+                        let et = ctype(e);
+                        let c = want_clone(self, e, "s_.ptr[i_]");
+                        format!(
+                            "    {} {o}; {{ {} s_ = {view}; {o} = lust_vec_with_capacity(s_.len, sizeof({et}), _Alignof({et})); for (uint64_t i_ = 0; i_ < s_.len; i_++) (({et}*){o}.ptr)[i_] = {c}; {o}.len = s_.len; }}",
+                            ctype(&oc),
+                            ctype(&rb)
+                        )
+                    }
+                    CTy::Ref(inner) => {
+                        let c = want_clone(self, inner, &format!("(*{view})"));
+                        format!("    {} {o} = {c};", ctype(&oc))
+                    }
+                    _ => return None,
+                };
+                if b == B::CowIntoOwned {
+                    let r = self.tmp();
+                    let _ = writeln!(self.out, "    {} {r}; if ({disc}) {r} = {f1}; else {{\n{to_owned}\n    {r} = {o}; }}", ctype(&oc));
+                    r
+                } else {
+                    let set = self.make_variant(&cow, 1, &[o.clone()]);
+                    let _ = writeln!(self.out, "    if (!({disc})) {{\n{to_owned}\n    *{ptr} = {set}; }}");
+                    format!("(&{f1})")
+                }
+            }
             // Conversion trait methods (check/convert.rs).
             B::ConvIdent => vals[0].clone(),
             B::ConvDeref => format!("(*{})", vals[0]),
@@ -756,4 +824,36 @@ impl FnGen<'_, '_, '_> {
         }
         self.fmt_result_of(&format!("{s}e"))
     }
+}
+
+/// For a `Cow<'a, B>` instance Adt (W-STD-B): the C type of `&B` and a
+/// declaration of local `name` holding the `&B` the Cow at `ptr` (a
+/// pointer) derefs to: the borrowed reference, or a view of the owned
+/// value (`String` as `str`, `Vec<T>` as `[T]`, `T` by address). None
+/// for every other type.
+pub(super) fn cow_view(p: &Program, t: &CTy, ptr: &str, name: &str) -> Option<(CTy, String)> {
+    let (rb, e) = cow_view_expr(p, t, ptr)?;
+    Some((rb.clone(), format!("{} {name} = {e};", ctype(&rb))))
+}
+
+/// `cow_view` as one C expression (the `&B` value).
+pub(super) fn cow_view_expr(p: &Program, t: &CTy, ptr: &str) -> Option<(CTy, String)> {
+    let CTy::Adt(a) = t else { return None };
+    let (def, args) = p.gx.adt_instance_of.get(a.0 as usize).copied().flatten()?;
+    if def != crate::check::generics::cow_def() {
+        return None;
+    }
+    let b = p.tys.args(args).iter().find_map(|g| g.as_ty())?;
+    let (f0, f1) = (variant_field(p, t, &format!("(*{ptr})"), 0, 0), variant_field(p, t, &format!("(*{ptr})"), 1, 0));
+    let (rb, owned) = match p.tys.kind(b) {
+        TyKind::Str => (CTy::Ref(Box::new(CTy::Str)), format!("lust_string_as_str(&{f1})")),
+        TyKind::Slice(e) => {
+            let sl = CTy::Slice(Box::new(cty(&p.tys, e)));
+            let view = format!("(({}){{ ({}*)({f1}).ptr, ({f1}).len }})", ctype(&sl), ctype(&cty(&p.tys, e)));
+            (sl, view)
+        }
+        _ => (CTy::Ref(Box::new(cty(&p.tys, b))), format!("(&{f1})")),
+    };
+    let disc = disc_call(p, t, ptr);
+    Some((rb, format!("(({disc}) ? {owned} : {f0})")))
 }
