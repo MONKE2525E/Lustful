@@ -3459,8 +3459,11 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
 }
 
 /// Definitions of the program's statics as C globals (ARCH 2.13 static data).
+/// The extern declarations come first: statics emit in stable def order,
+/// so one static's initializer can name a later static (`static S: &[u8] = &A;`
+/// before `A` in hash order), and C needs the name declared before use.
 fn static_defs(p: &Program) -> String {
-    let mut pre = String::new();
+    let mut pre = static_decls(p);
     let mut out = String::new();
     let mut counter = 0u32;
     for (i, st) in p.statics.iter().enumerate() {
