@@ -2526,7 +2526,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut diverges = false;
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { pat, ty, init, .. } => {
+                Stmt::Let { pat, ty, init, els, .. } => {
                     let declared = ty.map(|t| self.resolve_written(t));
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {
@@ -2547,6 +2547,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                         (None, None) => self.new_var(false),
                     };
+                    // The `else` block runs when the pattern does not
+                    // match, so it is checked before the pattern binds
+                    // anything (its names are not in scope there), and
+                    // it must diverge, as in Rust.
+                    if let Some(els_b) = els {
+                        let et = self.block(*els_b, None);
+                        if self.kind(et) != TyKind::Never {
+                            self.err(
+                                "L0110",
+                                self.p.ast.block(*els_b).span,
+                                "the `else` block of a `let...else` must diverge",
+                                "End it with `return`, `break`, `continue`, or a panic.",
+                            );
+                        }
+                    }
                     match self.p.ast.pat(*pat) {
                         // A plain name that resolves to a const, static,
                         // or unit path is a pattern, not a fresh binding:
@@ -2563,12 +2578,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 self.pattern(*pat, ty, false);
                                 if !self.irrefutable(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
-                                    self.err(
-                                        "L0110",
-                                        s,
-                                        "refutable pattern in local binding",
-                                        "Use `match` or `if let` for a pattern that can fail.",
-                                    );
+                                    if els.is_none() {
+                                        self.err(
+                                            "L0110",
+                                            s,
+                                            "refutable pattern in local binding",
+                                            "Use `match`, `if let`, or `let...else` for a pattern that can fail.",
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2595,12 +2612,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 self.pattern(*pat, ty, false);
                                 if !self.irrefutable(*pat) {
                                     let s = self.p.ast.pat_span(*pat);
-                                    self.err(
-                                        "L0110",
-                                        s,
-                                        "refutable pattern in local binding",
-                                        "Use `match` or `if let` for a pattern that can fail.",
-                                    );
+                                    if els.is_none() {
+                                        self.err(
+                                            "L0110",
+                                            s,
+                                            "refutable pattern in local binding",
+                                            "Use `match`, `if let`, or `let...else` for a pattern that can fail.",
+                                        );
+                                    }
                                 }
                             }
                         }

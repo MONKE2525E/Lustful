@@ -513,7 +513,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("`impl Trait` types", "L0602"),
     ("`dyn Trait` types", "L0602"),
     ("items other than `use` inside function bodies", "L0820"),
-    ("let-else", "L0820"),
     ("capturing closures", "L0820"),
     ("patterns in closure parameters", "L0820"),
     ("closures returning references", "L0820"),
@@ -571,6 +570,7 @@ const TYPES: &[&str] = &[
 const CONTROL_FLOW: &[&str] = &[
     "if / else",
     "if let and let chains",
+    "let-else",
     "match (guards, or patterns, ranges, nested patterns)",
     "loop (break with a value)",
     "while",

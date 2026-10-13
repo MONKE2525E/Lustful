@@ -1040,7 +1040,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.scopes.push(Vec::new());
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { pat, init, span, .. } => self.let_stmt(*pat, *init, *span),
+                Stmt::Let { pat, init, els, span, .. } => match els {
+                    Some(els_b) => self.let_else_stmt(*pat, *init, *els_b, *span),
+                    None => self.let_stmt(*pat, *init, *span),
+                },
                 // Body items and statement macros are rejected by the parser today.
                 Stmt::Item(_) | Stmt::Macro { .. } => {}
                 Stmt::Expr { expr, .. } => {
@@ -1156,6 +1159,41 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
         }
+    }
+
+    /// `let PAT = init else { ... };`: test the pattern against the
+    /// scrutinee place (a place initializer directly, any other
+    /// initializer through a block-scope temporary, as in `let_stmt`),
+    /// bind on success, and run the diverging else block on failure.
+    /// The scrutinee temporary stays in the block scope before the
+    /// bindings, so parts the pattern does not move drop at scope
+    /// exit on both paths (the else block's own exits drop it through
+    /// the usual scope cleanup).
+    fn let_else_stmt(&mut self, pat: PatId, init: Option<ExprId>, els: ast::BlockId, span: Span) {
+        let Some(init) = init else { return };
+        let sp = if self.is_place_expr(init) {
+            self.scopes.push(Vec::new());
+            let pl = self.place(init);
+            let temps = self.scopes.pop().unwrap();
+            self.scopes.last_mut().unwrap().extend(temps);
+            pl
+        } else {
+            let tty = self.ty(init);
+            let t = self.new_local(tty, true, None);
+            self.scopes.push(Vec::new());
+            self.expr_into(init, Some(&Place::local(t)));
+            self.pop_scope(span);
+            self.scopes.last_mut().unwrap().push(t);
+            Place::local(t)
+        };
+        let fail = self.new_block();
+        self.test_pat(pat, sp.clone(), fail);
+        let cont = self.cur;
+        self.cur = fail;
+        self.block_into(els, None);
+        self.terminate(Terminator::Unreachable, span);
+        self.cur = cont;
+        self.bind_pat(pat, sp);
     }
 
     // ---------- Calls ----------

@@ -2026,11 +2026,37 @@ impl<'a> Parser<'a> {
                 let pat = self.pattern()?;
                 let ty = if self.eat(Tok::Colon) { Some(self.ty()?) } else { None };
                 let init = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
-                if self.peek() == Tok::Else {
-                    return Err(self.reject(C_CORE, "let-else"));
-                }
+                let els = if self.peek() == Tok::Else {
+                    // Rust grammar: a let-else scrutinee may not end
+                    // with a `}` and may not be a top-level lazy boolean.
+                    // Both are parse errors in rustc, so they are here.
+                    let bad_scrutinee = match init {
+                        None => true,
+                        Some(i) => matches!(
+                            self.ast.expr(i),
+                            Expr::StructLit { .. }
+                                | Expr::Block(_)
+                                | Expr::If { .. }
+                                | Expr::While { .. }
+                                | Expr::Loop { .. }
+                                | Expr::For { .. }
+                                | Expr::Match { .. }
+                                | Expr::Binary { op: BinOp::And | BinOp::Or, .. }
+                        ),
+                    };
+                    if bad_scrutinee {
+                        return Err(syntax(
+                            self.span(),
+                            "this expression cannot be a `let...else` scrutinee; wrap it in parentheses",
+                        ));
+                    }
+                    self.bump();
+                    Some(self.block()?)
+                } else {
+                    None
+                };
                 self.expect(Tok::Semi, "`;`")?;
-                stmts.push(Stmt::Let { pat, ty, init, els: None, attrs: stmt_attrs.attrs, span: s.to(self.prev_span()) });
+                stmts.push(Stmt::Let { pat, ty, init, els, attrs: stmt_attrs.attrs, span: s.to(self.prev_span()) });
                 continue;
             }
             let labeled = matches!(self.peek(), Tok::Lifetime(_)) && self.peek_at(1) == Tok::Colon;

@@ -747,12 +747,19 @@ impl Evaluator {
         let mut out = (ConstValue::Unit, UNIT);
         for stmt in &block.stmts {
             match stmt {
-                ast::Stmt::Let { pat, ty, init, .. } => {
+                ast::Stmt::Let { pat, ty, init, els, .. } => {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
                     let exp = ty.map(|t| cx.resolve_ty(t));
                     let v = self.value(cx, env, *init, exp)?;
                     let mut binds = Vec::new();
                     if !self.match_pat(cx, env, *pat, &v.0.clone(), v.1, true, &mut binds)? {
+                        // A let-else runs its (diverging) else block
+                        // instead; its flow is the block's flow.
+                        if let Some(els_b) = els {
+                            let flow = self.block(cx, env, *els_b, None)?;
+                            env.truncate(saved);
+                            return Ok(flow);
+                        }
                         return Err(outside(cx.ast().pat_span(*pat), "a refutable pattern"));
                     }
                     env.extend(binds);
