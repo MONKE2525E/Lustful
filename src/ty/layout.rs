@@ -783,7 +783,7 @@ fn compute(
             }
             let mut fields = Vec::with_capacity(elems.len());
             for e in elems {
-                fields.push(go(tys, shapes, e, memo, active)?);
+                fields.push(go(tys, shapes, e, env, frames, memo, active)?);
             }
             tuple_layout(&fields)
         }
