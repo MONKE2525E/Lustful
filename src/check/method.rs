@@ -856,6 +856,12 @@ pub(super) fn plain_inherent_probe(
         if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
             continue; // the template probe handles it
         }
+        // A mono instance of an inherent template: the template probe
+        // handles the call too, so the template's bounds are proved at
+        // every call (`lust build` checks after mono made the instance).
+        if p.gx.fn_class.get(f.0 as usize) == Some(&crate::check::generics::FnClass::Instance) {
+            continue;
+        }
         let (params, ret) = match p.sig_of(&mut cx.out.reads, c.def) {
             SigOf::Fn(info) => (info.params.clone(), info.ret),
             _ => continue,
