@@ -44,6 +44,10 @@
 #      alternate, and every answer equals a cold one-shot build,
 #      including panic lines and columns after edits that only move
 #      text (comment lines above a closure, spaces inside a body).
+#  13. moved instance Adt ids: an edit that makes a new generic Adt
+#      instance first in discovery moves the ids (and C names) of the
+#      others; a warm build must rebuild the glue unit and every unit
+#      whose names moved, and print what a cold build prints.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -520,6 +524,34 @@ def case_generic_reuse():
     d.kill()
 
 
+def case_moved_instance_ids():
+    # 13. W<u8> and W<u16> Debug glue is each shared by several units;
+    # the edit adds W<u32> at the top of the first fn.
+    work = tempfile.mkdtemp(prefix="lust-driver-moved-ids-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    fns = ["#[derive(Debug, Clone)]\nstruct W<T> {\n    a: T,\n    b: u8,\n}\n",
+           "fn f0() -> usize {\n    let w = W { a: 5u8, b: 6 };\n    format!(\"{:?}\", w).len()\n}\n"]
+    fns += [f"fn f{i}() -> usize {{\n    let w = W {{ a: {i}u8, b: 9 }};\n    format!(\"{{:?}}\", w).len()\n}}\n" for i in range(1, 49)]
+    fns += [f"fn f{i}() -> usize {{\n    let w = W {{ a: {i}u16, b: 3 }};\n    format!(\"{{:?}}\", w).len()\n}}\n" for i in range(49, 97)]
+    main = ("fn main() {\n    let mut t = 0;\n" + "".join(f"    t += f{i}();\n" for i in range(97))
+            + "    println!(\"{}\", t);\n    println!(\"{:?}\", W { a: 1u8, b: 2 });\n}\n")
+    open(src, "w").write("\n".join(fns) + main)
+    d.start()
+    d.build(src, out)
+    text = open(src).read()
+    open(src, "w").write(text.replace("fn f0() -> usize {\n", "fn f0() -> usize {\n    let z = W { a: 70000u32, b: 1 };\n"
+                                      "    let _ = format!(\"{:?}\", z);\n", 1))
+    _, prog = d.build(src, out)
+    env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold"))
+    subprocess.run([LUST, "build", src, "-o", out + "c"], cwd=work, env=env, capture_output=True)
+    cold = subprocess.run([out + "c"], capture_output=True, text=True)
+    check("moved instance ids: warm equals cold", prog.stdout == cold.stdout and prog.returncode == cold.returncode,
+          f"warm {prog.stdout[-60:]!r} cold {cold.stdout[-60:]!r}")
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -532,6 +564,7 @@ def main():
     case_empty_units_restart()
     case_positions()
     case_generic_reuse()
+    case_moved_instance_ids()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

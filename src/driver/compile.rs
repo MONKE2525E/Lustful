@@ -2413,7 +2413,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let build = req.cmd == Cmd::Build;
         let regenerate_all = !gen_ok || (build && inst_adt_fp != caches.inst_adt_fp);
         if build && inst_adt_fp != caches.inst_adt_fp {
-            caches.glue_stale = true;
+            // Moved ids rename types and glue (`A<id>`, `drop_A<id>`):
+            // the glue set and every unit object, the glue unit's
+            // included, rebuild from the regenerated C. Comparing glue
+            // text cannot see this: `W<u8>` and `W<u16>` share it.
+            caches.glue = GlueSet::default();
+            caches.objects = None;
         }
         let mut body_changed = vec![false; fn_count];
         for &i in &changed {
@@ -2781,9 +2786,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // unrelated unit's key: its object is copied from disk and tcc
     // never sees it.
     let manifest = crate::driver::graph::SlotManifest::from_disk_slots(&front.slot_of);
-    // The stable hash of one C type for unit keys: Adts by def plus
-    // layout fingerprint (the unit header prints their definitions),
-    // everything else structural.
+    // The stable hash of one C type for unit keys: Adts by C name (the
+    // id: `A<id>`, and glue symbols such as `drop_A<id>` that other
+    // units call by name) plus the layout fingerprint of their def (the
+    // unit header prints their definitions), everything else
+    // structural. Instance Adt ids are creation order, so an edit that
+    // adds an instance early moves the names of later ones; a unit
+    // whose C names moved must miss.
     fn cty_fp(p: &collect::Program, c: &cgen::CTy) -> u64 {
         fn inner(h: &mut crate::intern::FxHasher, p: &collect::Program, c: &cgen::CTy) {
             use std::hash::Hash;
@@ -2807,7 +2816,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     inner(h, p, x);
                 }
                 cgen::CTy::Adt(a) => {
-                    9u8.hash(h);
+                    (9u8, a.0).hash(h);
                     crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
                 }
                 cgen::CTy::Args => 10u8.hash(h),
