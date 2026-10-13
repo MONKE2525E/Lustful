@@ -3164,8 +3164,9 @@ impl Ex<'_, '_, '_> {
     }
 
     /// A bool operand for `a > b` over an `Ord` type lust compares
-    /// (check/iter.rs `has_total_ord`): scalars and strings, through
-    /// references, and tuples lexicographically.
+    /// (check/collect.rs `has_total_ord`): scalars and strings, through
+    /// references, and tuples lexicographically, inline; any other type
+    /// (a derived `Ord`) through the `cmp` glue.
     fn greater(&mut self, a: Place, b: Place, ty: Ty) -> Result<Operand, String> {
         use crate::ast::BinOp::*;
         match self.body.tys.kind(ty) {
@@ -3213,7 +3214,12 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(c), Rvalue::StrCmp(Gt, Operand::Copy(Place::local(sa)), Operand::Copy(Place::local(sb))));
                 Ok(Operand::Copy(Place::local(c)))
             }
-            _ => Err("iterator expansion: cannot compare this item type".into()),
+            _ => {
+                let (ra, rb) = (self.ref_to(false, a, ty), self.ref_to(false, b, ty));
+                let c = self.local(BOOL);
+                self.assign(Place::local(c), Rvalue::Cmp { op: Gt, a: Operand::Copy(Place::local(ra)), b: Operand::Copy(Place::local(rb)), ty });
+                Ok(Operand::Copy(Place::local(c)))
+            }
         }
     }
 

@@ -15078,9 +15078,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         for (t, span) in std::mem::take(&mut self.deferred_ord) {
             let t = self.deep(t);
-            if !iter::has_total_ord(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
+            if !has_total_ord(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
                 let tn = self.tn(t);
-                self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Compare integers, chars, strings, or tuples of them.");
+                self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Derive Ord on the type, or compare integers, chars, strings, or tuples of them.");
             }
         }
         for i in 0..self.out.expr_ty.len() {

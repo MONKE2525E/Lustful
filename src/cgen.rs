@@ -2659,7 +2659,7 @@ impl FnGen<'_, '_, '_> {
 
     /// C statements (into `out`) comparing the values at pointer
     /// expressions `a` and `b` of an Ord type lust compares
-    /// (check/iter.rs `has_total_ord`); returns the name of an int32_t
+    /// (check/collect.rs `has_total_ord`); returns the name of an int32_t
     /// that is negative, zero, or positive like `Ord::cmp`.
     fn cmp3_c(&mut self, out: &mut String, t: &CTy, a: &str, b: &str) -> String {
         if let CTy::Ref(inner) = t
@@ -2693,7 +2693,11 @@ impl FnGen<'_, '_, '_> {
                     let _ = writeln!(out, "  {v} = {c}; }}");
                 }
             }
-            _ => panic!("internal: sort comparison of a type check does not allow"),
+            // A derived `Ord` (check/collect.rs `has_total_ord`).
+            _ => {
+                self.want(Glue::Cmp, t);
+                let _ = writeln!(out, "  int32_t {v} = cmp_{}({a}, {b});", mangle(t));
+            }
         }
         v
     }

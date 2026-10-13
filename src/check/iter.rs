@@ -125,7 +125,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// The sort and binary-search family on a Vec, slice, or array
     /// (runtime/sort.h ports Rust 1.99's algorithms). Comparators are
     /// closures; `sort`, `binary_search`, and the `_by_key` keys need
-    /// an `Ord` type lust compares (`has_total_ord`).
+    /// an `Ord` type lust compares (collect.rs `has_total_ord`).
     #[allow(clippy::too_many_arguments)]
     fn seq_sort(&mut self, e: ExprId, recv: ExprId, el: Ty, derefs: u8, n: &str, span: Span, args: &[ExprId]) -> Ty {
         use Builtin as B;
@@ -705,15 +705,3 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 }
 
-/// True when `t` implements `Ord` in a way lust can compare today:
-/// integers, `bool`, `char`, `()`, `str` and `String`, references to
-/// those, and tuples of them. Floats are only `PartialOrd`, as in Rust.
-pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    match tys.kind(t) {
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str => true,
-        TyKind::Infer(v) => v.is_int(),
-        TyKind::Ref(_, _, e) => has_total_ord(p, tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_total_ord(p, tys, e)),
-        _ => tys.is_string_ty(t),
-    }
-}

@@ -91,6 +91,26 @@ each with `#[lust_lang = "..."]` (alone on the line above the item
 until the parser learns the attribute) and flips its row to
 required in the same change.
 
+## Builtin std surface (moves to source with W-STD)
+
+These are compiler builtins today, not source std. Each keeps Rust
+1.99 behavior (values, panics, drop order, layout) and moves to
+source when the generic std pipeline can carry it.
+
+| Surface | Where | Notes |
+|---|---|---|
+| Iterators over Vec, slices, arrays, ranges, Chars (21 kinds, adapters and consumers) | ty/iter.rs, check/iter.rs, lower/iter.rs | Expanded into IR after borrowck. Pull counts, Zip, and collect capacity follow core and alloc. |
+| `sort`, `sort_unstable`, `binary_search` families | runtime/sort.h | C port of driftsort and ipnsort: same comparator calls and order of equal elements. |
+| `Rc`, `rc::Weak`, `RefCell` (with `Ref`/`RefMut`), `Cell` | check/cells.rs, cgen.rs | Implicit weak count; borrow panics as Rust; region rules in borrowck/regions.rs. |
+| `process::ExitCode` | check/process.rs | `main` may return it, or `Result<ExitCode, E>`. |
+| `String::from_utf8`, `str::from_utf8`, `FromUtf8Error`, `Utf8Error` | check/utf8.rs, runtime core.c | The error types are synthetic std Adts (check/collect.rs), so derived Debug/Clone/Eq are the struct machinery. |
+| `Box<[T]>` | cgen.rs `CTy::BoxSlice` | `into_boxed_slice`, `into_vec`, deref to `[T]`. No `Box<[T; N]>` coercion and no by-value `into_iter` yet. |
+| `Result` methods without closures | check/mod.rs `Res*` | Stopgap: is_ok, is_err, ok, err, unwrap, expect, unwrap_err, expect_err, unwrap_or. The closure methods wait for the source move (phase-1 WIP on a2/w-std-a-srcopt-wip). |
+
+Non-prelude std types (`Rc`, `Weak`, `RefCell`, `Cell`, `Ordering`,
+`ExitCode`, `FromUtf8Error`, `Utf8Error`) need a `use` as in Rust
+(`ty::lang::STD_IMPORTED_TYPES`); a full std path works without one.
+
 ## Rules for new source std fns (until W-RESOLVE)
 
 1. Add the fn in the right `library/<crate>/src/<module>.rs`, in the

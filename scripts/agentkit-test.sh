@@ -108,7 +108,7 @@ cap = json.load(open(sys.argv[1]))
 root = pathlib.Path(sys.argv[2])
 assert cap["schema"] == 1 and cap["kind"] == "capabilities"
 assert "push" in cap["methods"]["Vec<T>"] and "unwrap" in cap["methods"]["Option<T>"]
-assert cap["associated_functions"]["String"] == ["from", "new", "with_capacity"]
+assert cap["associated_functions"]["String"] == ["from", "from_utf8", "new", "with_capacity"]
 assert cap["functions"] == {"std::env": ["args"], "std::mem": ["drop"], "core::mem": ["replace", "swap", "take"], "core::cmp": ["max", "min"], "std::process": ["exit"]}
 assert len(cap["integer_types"]) == 12
 # Every literal at an unsupported(...) call site is named in the rejected list.
