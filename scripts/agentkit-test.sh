@@ -143,10 +143,10 @@ assert all(r["code"] in codes for r in cap["rejected"])
 assert len(codes) == 87
 PYEOF
 check cap-content $? "see the python assert above"
-"$lust" capabilities | grep -q "methods on Vec<T>"; check cap-human $? "human output must list methods"
+"$lust" capabilities > "$work/cap.txt" 2>/dev/null; grep -q "methods on Vec<T>" "$work/cap.txt"; check cap-human $? "human output must list methods"
 
 # --- 5. test command edges (parity with rustc is in testtest.sh) ---
-"$lust" test "$root/tests/testrun/basic.rs" --list | grep -q "test_add: test"; check test-list $? "--list must name the tests"
+"$lust" test "$root/tests/testrun/basic.rs" --list > "$work/test-list.txt" 2>/dev/null; grep -q "test_add: test" "$work/test-list.txt"; check test-list $? "--list must name the tests"
 printf '#[test]\nfn t(x: i32) {}\n' > "$work/badsig.rs"
 "$lust" test "$work/badsig.rs" >/dev/null 2>&1; [ $? -eq 101 ]; check test-badsig $? "bad test signature must exit 101"
 printf 'fn main() { let x: i32 = "s"; }\n#[test]\nfn t() {}\n' > "$work/badbuild.rs"
