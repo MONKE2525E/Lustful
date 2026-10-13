@@ -160,6 +160,17 @@ pub enum Builtin {
     OptUnwrap,
     OptExpect,
     OptUnwrapOr,
+    /// `Result` methods without closures (W-STD-A phase 3): a stopgap
+    /// until the source std move of Option and Result.
+    ResIsOk,
+    ResIsErr,
+    ResUnwrap,
+    ResExpect,
+    ResUnwrapErr,
+    ResExpectErr,
+    ResOk,
+    ResErr,
+    ResUnwrapOr,
     VecPop,
     VecGet,
     VecFirst,
@@ -944,6 +955,8 @@ struct Ctx<'p, 'a> {
     /// Item or key types an iterator method needs to be Ord (`min`,
     /// `max`, `min_by_key`, `max_by_key`), re-tested at finish.
     deferred_ord: Vec<(Ty, Span)>,
+    /// Types a `Result` method formats with Debug in its panic message.
+    deferred_debug: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -1161,6 +1174,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
+        deferred_debug: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -10131,6 +10145,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
+            (Some(BuiltinTy::Result), _) => {
+                let (ok, err) = self.tys.result_args(base).unwrap_or((ERROR, ERROR));
+                match self.name(name) {
+                    "is_ok" => Some((B::ResIsOk, Autoref::Ref, vec![], BOOL)),
+                    "is_err" => Some((B::ResIsErr, Autoref::Ref, vec![], BOOL)),
+                    "unwrap" | "expect" => {
+                        // The panic message shows the error with Debug.
+                        self.deferred_debug.push((err, name_span));
+                        if name == k.unwrap { Some((B::ResUnwrap, Autoref::None, vec![], ok)) } else { Some((B::ResExpect, Autoref::None, vec![REF_STR], ok)) }
+                    }
+                    "unwrap_err" => {
+                        self.deferred_debug.push((ok, name_span));
+                        Some((B::ResUnwrapErr, Autoref::None, vec![], err))
+                    }
+                    "expect_err" => {
+                        self.deferred_debug.push((ok, name_span));
+                        Some((B::ResExpectErr, Autoref::None, vec![REF_STR], err))
+                    }
+                    "ok" => Some((B::ResOk, Autoref::None, vec![], self.tys.mk_option(ok))),
+                    "err" => Some((B::ResErr, Autoref::None, vec![], self.tys.mk_option(err))),
+                    "unwrap_or" => Some((B::ResUnwrapOr, Autoref::None, vec![ok], ok)),
+                    _ => None,
+                }
+            }
             (Some(BuiltinTy::Chars), _) => {
                 let opt = self.tys.mk_option(CHAR);
                 if name == k.next {
@@ -15029,6 +15067,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_debug) {
+            let t = self.deep(t);
+            if !has_debug(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("`{tn}` does not implement Debug"), "Add #[derive(Debug)] to the type.");
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_ord) {

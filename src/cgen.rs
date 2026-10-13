@@ -3373,6 +3373,92 @@ impl FnGen<'_, '_, '_> {
                 };
                 format!("({disc} ? {} : {d})", variant_field(self.p, &tys[0], &t, 1, 0))
             }
+            B::ResIsOk | B::ResIsErr => {
+                let CTy::Ref(r) = &tys[0] else { unreachable!("is_ok on a &Result") };
+                let disc = disc_call(self.p, r, &format!("({})", vals[0]));
+                format!("({disc} {} 0)", if b == B::ResIsOk { "==" } else { "!=" })
+            }
+            B::ResUnwrap | B::ResExpect | B::ResUnwrapErr | B::ResExpectErr => {
+                // The other variant panics with its value in Debug form,
+                // after `msg: ` (expect) or Rust's fixed text (unwrap).
+                let rt = tys[0].clone();
+                let CTy::Result(okt, errt) = &rt else { unreachable!("unwrap on a Result") };
+                let want_err = matches!(b, B::ResUnwrapErr | B::ResExpectErr);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = {};", ctype(&rt), vals[0]);
+                let disc = disc_call(self.p, &rt, &format!("(&{t})"));
+                let (bad, shown_t, shown) = if want_err {
+                    (format!("({disc} == 0)"), (**okt).clone(), variant_field(self.p, &rt, &t, 0, 0))
+                } else {
+                    (format!("({disc} != 0)"), (**errt).clone(), variant_field(self.p, &rt, &t, 1, 0))
+                };
+                let s = self.tmp();
+                let _ = writeln!(self.out, "    if {bad} {{\n    lust_String {s} = lust_string_new();");
+                match b {
+                    B::ResUnwrap => {
+                        let _ = writeln!(self.out, "    lust_string_push_cstr(&{s}, \"called `Result::unwrap()` on an `Err` value: \");");
+                    }
+                    B::ResUnwrapErr => {
+                        let _ = writeln!(self.out, "    lust_string_push_cstr(&{s}, \"called `Result::unwrap_err()` on an `Ok` value: \");");
+                    }
+                    _ => {
+                        let _ = writeln!(self.out, "    lust_string_push_str(&{s}, {}); lust_string_push_cstr(&{s}, \": \");", vals[1]);
+                    }
+                }
+                // Rust's panic hook drops a Debug error (the text stops there).
+                let mut want: Vec<(Glue, CTy)> = Vec::new();
+                let e = fmt::fmt_expr(&shown_t, FmtKind::Debug, &format!("(&{s}f)"), &format!("(&{shown})"), &mut |g, t| want.push((g, t.clone())));
+                for (g, t) in want {
+                    self.want(g, &t);
+                }
+                let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, &{s}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); (void)({e});");
+                let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n    }}");
+                variant_field(self.p, &rt, &t, usize::from(want_err), 0)
+            }
+            B::ResOk | B::ResErr => {
+                // The other side is dropped, as in Rust.
+                let rt = tys[0].clone();
+                let CTy::Result(okt, errt) = &rt else { unreachable!("ok on a Result") };
+                let want = usize::from(b == B::ResErr);
+                let (keep, other) = if want == 0 { (okt, errt) } else { (errt, okt) };
+                let opt = CTy::Option(keep.clone());
+                let (t, o) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {} {t} = {}; {} {o};", ctype(&rt), vals[0], ctype(&opt));
+                let disc = disc_call(self.p, &rt, &format!("(&{t})"));
+                let drop_other = if needs_drop_c(self.p, other) {
+                    self.want(Glue::Drop, other);
+                    format!("drop_{}(&{}); ", mangle(other), variant_field(self.p, &rt, &t, 1 - want, 0))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    if ({disc} == {want}) {{ {} = {}; {} }} else {{ {drop_other}{} }}",
+                    variant_field(self.p, &opt, &o, 1, 0),
+                    variant_field(self.p, &rt, &t, want, 0),
+                    disc_set(self.p, &opt, &o, 1),
+                    disc_set(self.p, &opt, &o, 0)
+                );
+                o
+            }
+            B::ResUnwrapOr => {
+                // Ok drops the unused default; Err drops its error.
+                let rt = tys[0].clone();
+                let CTy::Result(okt, errt) = &rt else { unreachable!("unwrap_or on a Result") };
+                let (t, d, isok) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {} {t} = {}; {} {d} = {};", ctype(&rt), vals[0], ctype(okt), vals[1]);
+                let disc = disc_call(self.p, &rt, &format!("(&{t})"));
+                let _ = writeln!(self.out, "    int {isok} = ({disc} == 0);");
+                if needs_drop_c(self.p, okt) {
+                    self.want(Glue::Drop, okt);
+                    let _ = writeln!(self.out, "    if ({isok}) drop_{}(&{d});", mangle(okt));
+                }
+                if needs_drop_c(self.p, errt) {
+                    self.want(Glue::Drop, errt);
+                    let _ = writeln!(self.out, "    if (!{isok}) drop_{}(&{});", mangle(errt), variant_field(self.p, &rt, &t, 1, 0));
+                }
+                format!("({isok} ? {} : {d})", variant_field(self.p, &rt, &t, 0, 0))
+            }
             B::OptUnwrapOr => {
                 let CTy::Option(inner) = &tys[0] else { unreachable!() };
                 let (t, d) = (self.tmp(), self.tmp());
