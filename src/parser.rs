@@ -262,6 +262,84 @@ fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
 }
 
+/// One byte escape at `b[i]` (the byte after the backslash): the byte
+/// and the index just past the escape. Byte escapes take the full
+/// `\xHH` range; `\u` is not a byte escape.
+fn byte_escape(b: &[u8], i: usize) -> Option<(u8, usize)> {
+    let c = *b.get(i)?;
+    Some(match c {
+        b'n' => (b'\n', i + 1),
+        b't' => (b'\t', i + 1),
+        b'r' => (b'\r', i + 1),
+        b'0' => (0, i + 1),
+        b'\\' => (b'\\', i + 1),
+        b'\'' => (b'\'', i + 1),
+        b'"' => (b'"', i + 1),
+        b'x' => {
+            let h = |c: u8| (c as char).to_digit(16).map(|v| v as u8);
+            let v = h(*b.get(i + 1)?)? * 16 + h(*b.get(i + 2)?)?;
+            (v, i + 3)
+        }
+        _ => return None,
+    })
+}
+
+/// The bytes of a byte char literal's verbatim token text (`b'x'`),
+/// when it holds exactly one ASCII byte or byte escape.
+fn decode_byte_char(text: &str) -> Option<u8> {
+    let inner = text.strip_prefix("b'")?.strip_suffix('\'')?;
+    let b = inner.as_bytes();
+    match b.first() {
+        Some(b'\\') => {
+            let (v, next) = byte_escape(b, 1)?;
+            if next == b.len() { Some(v) } else { None }
+        }
+        Some(&c) if b.len() == 1 && c.is_ascii() && c != b'\'' => Some(c),
+        _ => None,
+    }
+}
+
+/// The bytes of a byte string literal's verbatim token text (`b".."`
+/// or a raw `br".."`, `br#".."#`). Non-ASCII text is not a byte
+/// string in Rust, so it rejects here like any bad escape.
+fn decode_byte_str(text: &str) -> Option<Vec<u8>> {
+    if let Some(rest) = text.strip_prefix("br") {
+        let hashes = rest.bytes().take_while(|&c| c == b'#').count();
+        let close = format!("\"{}", "#".repeat(hashes));
+        let inner = rest[hashes..].strip_prefix('"')?.strip_suffix(&close)?;
+        if inner.bytes().any(|c| !c.is_ascii()) {
+            return None;
+        }
+        return Some(inner.bytes().collect());
+    }
+    let inner = text.strip_prefix("b\"")?.strip_suffix('"')?;
+    let b = inner.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if b.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                    while i < b.len() && b[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                let (v, next) = byte_escape(b, i + 1)?;
+                out.push(v);
+                i = next;
+            }
+            c if c.is_ascii() => {
+                out.push(c);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// A token's name for error messages. Never shows the payload, so internal ids (interned
 /// symbol numbers, string indexes) cannot leak into diagnostics.
 fn tok_name(t: Tok) -> &'static str {
@@ -2698,7 +2776,29 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Float(i + self.str_base)
             }
-            Tok::ByteStr(_) | Tok::ByteChar(_) => return Err(not_yet(C_LIT, start, "byte string and byte char literals")),
+            Tok::ByteChar(i) => {
+                self.bump();
+                let text = self.ast.strings[(i + self.str_base) as usize].clone();
+                match decode_byte_char(&text) {
+                    Some(v) => Expr::Int(v as u128, Some(crate::lexer::IntSuffix::U8)),
+                    None => return Err(syntax(start, "invalid byte char literal")),
+                }
+            }
+            Tok::ByteStr(i) => {
+                self.bump();
+                let text = self.ast.strings[(i + self.str_base) as usize].clone();
+                if text.starts_with('c') {
+                    return Err(not_yet(C_LIT, start, "C string literals"));
+                }
+                // A byte string expands to a reference to a byte array
+                // literal, which is its Rust type (`&[u8; N]`). Patterns
+                // keep the byte literal reject for now.
+                let Some(bytes) = decode_byte_str(&text) else { return Err(syntax(start, "invalid byte string literal")) };
+                let elems: Vec<ExprId> =
+                    bytes.iter().map(|&b| self.push_expr(Expr::Int(b as u128, Some(crate::lexer::IntSuffix::U8)), start)).collect();
+                let arr = self.push_expr(Expr::Array(elems), start);
+                Expr::Ref { mutable: false, raw: false, expr: arr }
+            }
             Tok::Str(i) => {
                 self.bump();
                 Expr::Str(i + self.str_base)
