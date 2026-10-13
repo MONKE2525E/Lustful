@@ -1,11 +1,10 @@
 // The generic half of a realish module (bench/realish/make_generic.py):
 // user traits with a default method, generic structs with a generic
-// impl, trait impls, generic fns, and non-capturing closures passed to
-// generic fns. make_generic.py appends one renamed copy of this file to
-// each warehouse module, so the crate mixes plain and generic code the
-// way ts-rust does (see the density note in make_generic.py). Fields
-// are pub(crate) only to dodge a lust false reject: generic instance
-// bodies check in the root module today (perf-incr NOTE in LANDINGS.md).
+// impl, trait impls, generic fns, and closures (capturing and not)
+// passed to generic fns. make_generic.py appends one renamed copy of
+// this file to each warehouse module, so the crate mixes plain and
+// generic code the way ts-rust does (see the density note in
+// make_generic.py).
 
 trait Scored {
     fn score(&self) -> i64;
@@ -20,14 +19,14 @@ trait Merge {
 
 #[derive(Debug, Clone)]
 struct Pair<A, B> {
-    pub(crate) a: A,
-    pub(crate) b: B,
+    a: A,
+    b: B,
 }
 
 #[derive(Debug, Clone)]
 struct Ledger<T> {
-    pub(crate) items: Vec<T>,
-    pub(crate) total: i64,
+    items: Vec<T>,
+    total: i64,
 }
 
 impl<T: Scored + Clone> Ledger<T> {
@@ -71,15 +70,15 @@ impl<T: Scored + Clone> Ledger<T> {
 
 #[derive(Debug, Clone)]
 struct Widget {
-    pub(crate) id: u32,
-    pub(crate) weight: i64,
+    id: u32,
+    weight: i64,
 }
 
 #[derive(Debug, Clone)]
 struct Gadget {
-    pub(crate) id: u32,
-    pub(crate) power: i64,
-    pub(crate) cost: i64,
+    id: u32,
+    power: i64,
+    cost: i64,
 }
 
 impl Scored for Widget {
@@ -141,7 +140,20 @@ fn closure_mix(seed: i64) -> i64 {
     let b = apply_twice(|x| x % 97 + 5, a);
     let c = apply_twice(inc, b) + apply_twice(dbl, 3);
     let d = apply_twice(|x| if x > 50 { x / 2 } else { x + 11 }, c);
-    inc(d) + dbl(a)
+    // Capturing closures: by reference into a generic fn, and an FnMut
+    // that counts.
+    let step = seed % 7 + 1;
+    let shift = |x: i64| x + step;
+    let scale = |x: i64| x * step % 1009;
+    let e = apply_twice(shift, d) + apply_twice(scale, b);
+    let f = apply_twice(|x| x - step + a % 5, e);
+    let mut calls = 0;
+    let mut note = |x: i64| {
+        calls += 1;
+        x % 13
+    };
+    let g = note(e) + note(f) + note(c);
+    inc(d) + dbl(a) + f + g + calls
 }
 
 fn run_generic() -> i64 {

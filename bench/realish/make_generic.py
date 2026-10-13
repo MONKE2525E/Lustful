@@ -6,9 +6,9 @@
 # Density per module, against ts-rust's handwritten code
 # (/tmp/lust-ts/inventory/INVENTORY.md): 61 fns with bodies; generic
 # fns and methods 9 (15%; ts-rust 3%), trait impl methods 4 (7%;
-# ts-rust 11%), non-capturing closures 8 (0.13 per fn; ts-rust 0.33),
-# 2 traits, 2 generic structs. So the crate is denser than ts-rust in
-# generic fns and thinner in closures; every module has both.
+# ts-rust 11%), closures 12, 4 of them capturing (0.2 per fn; ts-rust
+# 0.33), 2 traits, 2 generic structs. So the crate is denser than
+# ts-rust in generic fns and thinner in closures; every module has both.
 # Usage: python3 make_generic.py <modules> <outdir>
 import os
 import re
