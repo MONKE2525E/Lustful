@@ -75,6 +75,12 @@ pub(crate) struct Front {
     /// (loaded at session start, then every store). The manifest is
     /// rewritten only when assignment grows past this count.
     pub(crate) slot_manifest_stored: usize,
+    /// The unit size recorded in the disk slot manifest (loaded at
+    /// session start, then every store; 0 = none recorded). A
+    /// persistent session adopts it as `Caches::per_unit` so unit
+    /// grouping, and therefore unit keys, survive a restart; a
+    /// one-shot session only preserves it across its own stores.
+    pub(crate) manifest_per_unit: u32,
     /// Body hash per slot, at the last parse.
     pub(crate) slot_hash: Vec<u64>,
     /// Fn head hash per slot (`ast_hash::fn_head_hash`), at the last
@@ -171,7 +177,10 @@ pub(crate) struct Caches {
     /// the glue. Same reason as `statics_fp`: the edit and the build
     /// that must react to it are usually different requests.
     pub(crate) glue_stale: bool,
-    /// Slots per function unit. Fixed until the next full rebuild, so units stay stable.
+    /// Slots per function unit. Chosen at a full rebuild and fixed
+    /// until the next one, so units stay stable; a persistent
+    /// session adopts the slot manifest's recorded value instead,
+    /// so grouping also stays stable across restarts.
     pub(crate) per_unit: usize,
     /// Slot capacity of `lust_fns` in libbase.so, and how many function units it has.
     pub(crate) table_cap: usize,
@@ -248,6 +257,7 @@ impl Session {
                 slot_of: FxMap::default(),
                 slot_paths: FxMap::default(),
                 slot_manifest_stored: 0,
+                manifest_per_unit: 0,
                 slot_hash: Vec::new(),
                 slot_head: Vec::new(),
                 chunks: Vec::new(),
@@ -310,25 +320,31 @@ impl Session {
 }
 
 /// The slot manifest byte shape: magic, entry count, then one 20-byte
-/// entry per slot (`DiskDefId` bytes + slot), sorted by slot. Only stable disk
+/// entry per slot (`DiskDefId` bytes + slot), sorted by slot, then the
+/// unit size (`Caches::per_unit`) the stored objects were grouped with
+/// as a trailing u32 (0 = not recorded; files without the trailer,
+/// written before it existed, still decode with 0). Only stable disk
 /// pairs are stored, so a restarted daemon that loads these bytes recovers the
 /// same slot assignment in any crate load or discovery order (docs/ARCH.md
-/// sections 4.2 and 8.4). The in-memory manifest type is
+/// sections 4.2 and 8.4). The unit size rides along because unit keys
+/// depend on the grouping: a restarted daemon that regrouped by its
+/// own fn count would orphan every stored object. The in-memory manifest type is
 /// `driver::graph::SlotManifest`; the bytes live in the disk cache
 /// (`driver::cache::Cache::load_slot_manifest`).
 const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS1";
 
-/// Serializes a slot map. See `SLOT_MANIFEST_MAGIC`.
-pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>) -> Vec<u8> {
+/// Serializes a slot map and its unit size. See `SLOT_MANIFEST_MAGIC`.
+pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>, per_unit: u32) -> Vec<u8> {
     let mut entries: Vec<(u32, DiskDefId)> = slot_of.iter().map(|(k, &s)| (s, *k)).collect();
     entries.sort_unstable();
-    let mut out = Vec::with_capacity(8 + entries.len() * 20);
+    let mut out = Vec::with_capacity(12 + entries.len() * 20);
     out.extend_from_slice(SLOT_MANIFEST_MAGIC);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (slot, key) in entries {
         out.extend_from_slice(&key.to_bytes());
         out.extend_from_slice(&slot.to_le_bytes());
     }
+    out.extend_from_slice(&per_unit.to_le_bytes());
     out
 }
 
@@ -385,17 +401,28 @@ pub(crate) fn decode_def_order(b: &[u8], stable: crate::def::StableCrateHash) ->
     Some(order)
 }
 
-/// Reads bytes written by `encode_slot_manifest`. None on any shape error (bad
-/// magic, a truncated or trailing byte, or one slot claimed twice), so a bad
-/// file is a cache miss, never a wrong slot.
-pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<FxMap<DiskDefId, u32>> {
+/// Reads bytes written by `encode_slot_manifest`: the slot map and
+/// the stored unit size (0 when the file predates the trailer).
+/// None on any shape error (bad magic, a truncated or trailing
+/// byte, one slot claimed twice, or an implausible unit size), so
+/// a bad file is a cache miss, never a wrong slot.
+pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<(FxMap<DiskDefId, u32>, u32)> {
     if b.get(..4)? != SLOT_MANIFEST_MAGIC {
         return None;
     }
     let n = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
-    if b.len() != 8 + n.checked_mul(20)? {
+    let body = n.checked_mul(20)?.checked_add(8)?;
+    let per_unit = if b.len() == body {
+        0
+    } else if b.len() == body.checked_add(4)? {
+        let pu = u32::from_le_bytes(b[body..body + 4].try_into().ok()?);
+        if pu > 4096 {
+            return None;
+        }
+        pu
+    } else {
         return None;
-    }
+    };
     let mut map = FxMap::default();
     let mut slots: Vec<u32> = Vec::with_capacity(n);
     for i in 0..n {
@@ -407,7 +434,7 @@ pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<FxMap<DiskDefId, u32>> {
         }
         slots.push(slot);
     }
-    Some(map)
+    Some((map, per_unit))
 }
 
 #[cfg(test)]
@@ -448,10 +475,14 @@ mod tests {
         m.insert(key(1, 20), 1);
         m.insert(key(1, 30), 5);
         m.insert(key(2, 10), 3);
-        let back = decode_slot_manifest(&encode_slot_manifest(&m)).unwrap();
-        assert_eq!(back, m);
+        let back = decode_slot_manifest(&encode_slot_manifest(&m, 18)).unwrap();
+        assert_eq!(back, (m.clone(), 18), "slots and unit size round-trip");
+        // A pre-trailer file (no unit size recorded) still decodes.
+        let mut old = encode_slot_manifest(&m, 18);
+        old.truncate(old.len() - 4);
+        assert_eq!(decode_slot_manifest(&old), Some((m, 0)), "old shape keeps its slots");
         let empty: FxMap<DiskDefId, u32> = FxMap::default();
-        assert_eq!(decode_slot_manifest(&encode_slot_manifest(&empty)), Some(empty));
+        assert_eq!(decode_slot_manifest(&encode_slot_manifest(&empty, 0)), Some((empty, 0)));
     }
 
     /// The def order round-trips (a restarted daemon numbers defs
@@ -492,7 +523,7 @@ mod tests {
     fn slot_manifest_rejects_bad_bytes() {
         let mut m = FxMap::default();
         m.insert(key(1, 10), 0);
-        let bytes = encode_slot_manifest(&m);
+        let bytes = encode_slot_manifest(&m, 16);
         assert_eq!(decode_slot_manifest(&bytes[..bytes.len() - 1]), None, "truncated");
         let mut tail = bytes.clone();
         tail.push(0);

@@ -250,13 +250,13 @@ impl Cache {
     /// count) is rejected here even though the codec allows it as
     /// bytes: slot assignment appends at the entry count and would
     /// collide with the sparse slot later.
-    pub fn load_slot_manifest(&self, session: &SessionKey) -> Option<FxMap<DiskDefId, u32>> {
+    pub fn load_slot_manifest(&self, session: &SessionKey) -> Option<(FxMap<DiskDefId, u32>, u32)> {
         let bytes = std::fs::read(self.slot_manifest_path(session)).ok()?;
-        let map = super::session::decode_slot_manifest(&bytes)?;
+        let (map, per_unit) = super::session::decode_slot_manifest(&bytes)?;
         if map.values().copied().max().is_some_and(|m| m as usize >= map.len()) {
             return None;
         }
-        Some(map)
+        Some((map, per_unit))
     }
 
     /// The def-order file for one session selection, next to its
@@ -282,8 +282,8 @@ impl Cache {
     }
 
     /// Stores the slot manifest for `session` (atomic, as every write here).
-    pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>) {
-        let bytes = super::session::encode_slot_manifest(slot_of);
+    pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>, per_unit: u32) {
+        let bytes = super::session::encode_slot_manifest(slot_of, per_unit);
         self.write(&self.slot_manifest_path(session), &bytes);
     }
 
@@ -520,13 +520,13 @@ mod tests {
         slots.insert(disk(10), 0);
         slots.insert(disk(20), 1);
         assert_eq!(cache.load_slot_manifest(&key), None, "miss before store");
-        cache.store_slot_manifest(&key, &slots);
-        assert_eq!(cache.load_slot_manifest(&key), Some(slots.clone()));
+        cache.store_slot_manifest(&key, &slots, 18);
+        assert_eq!(cache.load_slot_manifest(&key), Some((slots.clone(), 18)));
         let other = SessionKey::synthetic(Path::new("/tmp/x/other.rs"), false);
         assert_eq!(cache.load_slot_manifest(&other), None, "another selection has its own manifest");
         let mut sparse = FxMap::default();
         sparse.insert(disk(10), 5);
-        cache.store_slot_manifest(&other, &sparse);
+        cache.store_slot_manifest(&other, &sparse, 0);
         assert_eq!(cache.load_slot_manifest(&other), None, "sparse manifests are rejected");
         let _ = std::fs::remove_dir_all(&dir);
     }

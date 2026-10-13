@@ -938,9 +938,16 @@ fn slot_update(
         caches.overlays.clear();
         // Cold builds gain nothing from many small units: each extra unit pays a tcc process
         // start and a header parse. Use about one unit per core. The daemon keeps small
-        // units, so an edit recompiles little code.
-        caches.per_unit =
-            if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
+        // units, so an edit recompiles little code. A persistent session
+        // that adopted the manifest's recorded unit size keeps it: the
+        // stored objects were grouped with it, and this session's own
+        // fn count would regroup them into misses.
+        if caches.persistent && front.manifest_per_unit != 0 {
+            caches.per_unit = front.manifest_per_unit as usize;
+        } else {
+            caches.per_unit =
+                if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
+        }
     }
     if full_walk && nonfn_changed {
         // A type or impl edit can change the C type definitions and
@@ -1491,10 +1498,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         session.disk_cache = crate::driver::cache::Cache::open(&req.file);
         if session.front.slot_of.is_empty()
             && let Some(cache) = &session.disk_cache
-            && let Some(manifest) = cache.load_slot_manifest(&session.key)
+            && let Some((manifest, per_unit)) = cache.load_slot_manifest(&session.key)
         {
             session.front.slot_manifest_stored = manifest.len();
             session.front.slot_of = manifest;
+            session.front.manifest_per_unit = per_unit;
+            // A restarted daemon groups fns into units exactly as
+            // the daemon that stored the disk objects did, or every
+            // unit key moves and the objects orphan. A one-shot
+            // session keeps its own grouping and only preserves
+            // the recorded value across its stores.
+            if session.caches.persistent && per_unit != 0 {
+                session.caches.per_unit = per_unit as usize;
+            }
         }
         if session.front.def_order.adts.is_empty()
             && session.front.def_order.statics.is_empty()
@@ -1954,14 +1970,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         (body_hashes_all[i], fn_lines_all[i])
     };
 
-    // Persist slot assignment when it grew (or was compacted): the next
-    // daemon seeds from this file even if this compile later fails,
-    // because the assignment itself is already in use by cached C.
-    if front.slot_of.len() != front.slot_manifest_stored {
+    // Persist slot assignment when it grew (or was compacted), and
+    // the unit size with it when a daemon session chose one the
+    // manifest does not record yet: the next daemon seeds from this
+    // file even if this compile later fails, because the assignment
+    // itself is already in use by cached C. A one-shot session
+    // writes back the recorded unit size unchanged, so its slot
+    // stores never erase a daemon's grouping.
+    let store_per_unit = if caches.persistent { caches.per_unit as u32 } else { front.manifest_per_unit };
+    if front.slot_of.len() != front.slot_manifest_stored || store_per_unit != front.manifest_per_unit {
         if let Some(cache) = disk_cache {
-            cache.store_slot_manifest(&session_key, &front.slot_of);
+            cache.store_slot_manifest(&session_key, &front.slot_of, store_per_unit);
         }
         front.slot_manifest_stored = front.slot_of.len();
+        front.manifest_per_unit = store_per_unit;
     }
 
     // The resolver path computes crate identity from the Cargo graph;
