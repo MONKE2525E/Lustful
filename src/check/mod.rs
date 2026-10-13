@@ -366,6 +366,14 @@ pub enum Builtin {
     /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
     /// an `i8`: `partial_cmp` and `cmp` read it once.
     CmpCode,
+    /// `Option::as_ref`, `as_mut`, `take`, `replace`, and
+    /// `Result::as_ref`, `as_mut` (W-STD-A phase 3).
+    OptAsRef,
+    OptAsMut,
+    OptTake,
+    OptReplace,
+    ResAsRef,
+    ResAsMut,
     SliceSort,
     SliceSortUnstable,
     SliceSortBy,
@@ -10169,7 +10177,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.record_glue_reads(p.gx.lang.default, inner);
                     Some((B::OptUnwrapOrDefault, Autoref::None, vec![], inner))
                 } else {
-                    None
+                    match self.name(name) {
+                        "as_ref" => {
+                            let r = self.tys.mk_ref(false, inner);
+                            Some((B::OptAsRef, Autoref::Ref, vec![], self.tys.mk_option(r)))
+                        }
+                        "as_mut" => {
+                            let r = self.tys.mk_ref(true, inner);
+                            Some((B::OptAsMut, Autoref::RefMut, vec![], self.tys.mk_option(r)))
+                        }
+                        "take" => Some((B::OptTake, Autoref::RefMut, vec![], base)),
+                        "replace" => Some((B::OptReplace, Autoref::RefMut, vec![inner], base)),
+                        _ => None,
+                    }
                 }
             }
             (Some(BuiltinTy::Result), _) => {
@@ -10193,6 +10213,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "ok" => Some((B::ResOk, Autoref::None, vec![], self.tys.mk_option(ok))),
                     "err" => Some((B::ResErr, Autoref::None, vec![], self.tys.mk_option(err))),
                     "unwrap_or" => Some((B::ResUnwrapOr, Autoref::None, vec![ok], ok)),
+                    "as_ref" | "as_mut" => {
+                        let m = self.name(name) == "as_mut";
+                        let (ro, re) = (self.tys.mk_ref(m, ok), self.tys.mk_ref(m, err));
+                        let b = if m { B::ResAsMut } else { B::ResAsRef };
+                        Some((b, if m { Autoref::RefMut } else { Autoref::Ref }, vec![], self.tys.mk_result(ro, re)))
+                    }
                     _ => None,
                 }
             }

@@ -3402,6 +3402,62 @@ impl FnGen<'_, '_, '_> {
                 self.want(Glue::Cmp, &t);
                 format!("cmp_{}({a}, {b})", mangle(&t))
             }
+            B::OptAsRef | B::OptAsMut => {
+                // A reference to the payload, or None.
+                let CTy::Ref(opt) = &tys[0] else { unreachable!("as_ref on an &Option") };
+                let CTy::Option(inner) = &**opt else { unreachable!("as_ref on an &Option") };
+                let res = CTy::Option(Box::new(CTy::Ref(inner.clone())));
+                let (p, t) = (self.tmp(), self.tmp());
+                let disc = disc_call(self.p, opt, &p);
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {p} = {}; {} {t}; if ({disc}) {{ {} = &{}; {} }} else {{ {} }}",
+                    ctype(opt),
+                    vals[0],
+                    ctype(&res),
+                    variant_field(self.p, &res, &t, 1, 0),
+                    variant_field(self.p, opt, &format!("(*{p})"), 1, 0),
+                    disc_set(self.p, &res, &t, 1),
+                    disc_set(self.p, &res, &t, 0)
+                );
+                t
+            }
+            B::OptTake | B::OptReplace => {
+                // The old value moves out; the place keeps None (take)
+                // or Some(value) (replace).
+                let CTy::Ref(opt) = &tys[0] else { unreachable!("take on an &mut Option") };
+                let (p, t) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {}* {p} = {}; {} {t} = *{p};", ctype(opt), vals[0], ctype(opt));
+                let place = format!("(*{p})");
+                if b == B::OptTake {
+                    let _ = writeln!(self.out, "    {}", disc_set(self.p, opt, &place, 0));
+                } else {
+                    let _ = writeln!(self.out, "    {} = {}; {}", variant_field(self.p, opt, &place, 1, 0), vals[1], disc_set(self.p, opt, &place, 1));
+                }
+                t
+            }
+            B::ResAsRef | B::ResAsMut => {
+                let CTy::Ref(r) = &tys[0] else { unreachable!("as_ref on an &Result") };
+                let CTy::Result(okt, errt) = &**r else { unreachable!("as_ref on an &Result") };
+                let res = CTy::Result(Box::new(CTy::Ref(okt.clone())), Box::new(CTy::Ref(errt.clone())));
+                let (p, t) = (self.tmp(), self.tmp());
+                let disc = disc_call(self.p, r, &p);
+                let src = format!("(*{p})");
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {p} = {}; {} {t}; if ({disc} == 0) {{ {} = &{}; {} }} else {{ {} = &{}; {} }}",
+                    ctype(r),
+                    vals[0],
+                    ctype(&res),
+                    variant_field(self.p, &res, &t, 0, 0),
+                    variant_field(self.p, r, &src, 0, 0),
+                    disc_set(self.p, &res, &t, 0),
+                    variant_field(self.p, &res, &t, 1, 0),
+                    variant_field(self.p, r, &src, 1, 0),
+                    disc_set(self.p, &res, &t, 1)
+                );
+                t
+            }
             B::OptUnwrapOrDefault => {
                 let CTy::Option(inner) = &tys[0] else { unreachable!() };
                 let t = self.tmp();
