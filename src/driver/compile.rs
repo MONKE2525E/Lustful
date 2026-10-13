@@ -2589,10 +2589,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let reuse = &caches.gen_reuse;
         let env = gen_env.unwrap_or(0);
         let mut memo = FxMap::default();
+        // Slots some fn of this program holds. A body whose stored C
+        // names any other slot rebuilds it: that callee's identity moved
+        // to a new slot (a nested fn's `#nested{k}` index) while this
+        // body's source stayed, as in `slot_update` for AST fns.
+        let mut held = vec![false; front.slot_of.len()];
+        for &s in &front.fn_slot {
+            if let Some(h) = held.get_mut(s as usize) {
+                *h = true;
+            }
+        }
         work = Vec::new();
         for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
             let s = front.fn_slot[i] as usize;
-            let mut recheck = regenerate_all || !caches.ok[s] || (build && !caches.has_out[s]);
+            let calls_dead = build && caches.slot_used[s].iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
+            let mut recheck = regenerate_all || !caches.ok[s] || (build && !caches.has_out[s]) || calls_dead;
             if !recheck && i < fn_count {
                 recheck = body_changed[i];
             } else if !recheck {

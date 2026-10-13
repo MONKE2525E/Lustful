@@ -699,6 +699,46 @@ def case_moved_and_revived_slots():
     d.kill()
 
 
+def undefined_calls(prefix):
+    # Slots the emitted C calls that no emitted unit defines (the table
+    # size declaration `lust_fnptr lust_fns[N];` is not a call).
+    defined, called = set(), set()
+    for p in glob.glob(prefix + ".u*.c"):
+        text = open(p).read()
+        defined |= {int(n) for n in re.findall(r"^static [^\n(]*\bf(\d+)\(", text, re.M)}
+        called |= {int(n) for n in re.findall(r"(?<!lust_fnptr )\blust_(?:fns|tramps)\[(\d+)\]", text)}
+    return sorted(called - defined)
+
+
+def case_instance_calls_moved_slot():
+    # 17. A generic fn's nested fn moves to a new slot (`#nested{k}`)
+    # while the template text stays, here because another nested fn
+    # moves between two other bodies (bodies mode on the resolver
+    # path). The reused instance C called the dead old slot; the old
+    # base often still held that fn, so the binary only crashed
+    # sometimes. The emitted C must call only slots it defines.
+    work = tempfile.mkdtemp(prefix="lust-driver-inst-moved-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    head = ("use std::fmt::Debug;\n\ntrait Tr {\n    fn t(&self) -> i64;\n}\n\n"
+            "impl Tr for i64 {\n    fn t(&self) -> i64 {\n        *self\n    }\n}\n\n")
+    gen = "fn f1<T: Tr>(tv: T) -> i64 {\n    fn g1() -> i64 { 2 }\n    tv.t() + g1()\n}\n\n"
+    tail = 'fn main() {\n    println!("{}", f0() + f1(5i64) + f2());\n}\n'
+    z = "    fn z() -> i64 { 7 }\n"
+    before = head + "fn f0() -> i64 {\n" + z + "    9 + z()\n}\n\n" + gen + "fn f2() -> i64 {\n    5\n}\n\n" + tail
+    after = head + "fn f0() -> i64 {\n    9\n}\n\n" + gen + "fn f2() -> i64 {\n" + z + "    5 + z()\n}\n\n" + tail
+    d.start()
+    for name, text in (("base", before), ("nested fn moved", after)):
+        open(src, "w").write(text)
+        emit = os.path.join(work, name.replace(" ", "-"))
+        r = d.run(["build", src, "-o", out, "--emit-c", emit], expect=None)
+        prog = subprocess.run([out], capture_output=True, text=True) if r.returncode == 0 else None
+        got = (prog.returncode, prog.stdout.strip()) if prog else r.stderr[-200:]
+        check(f"instance calls moved slot, {name}", got == (0, "28") and not undefined_calls(emit), f"{got} undefined {undefined_calls(emit)}")
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -715,6 +755,7 @@ def main():
     case_new_empty_unit()
     case_nested_items()
     case_moved_and_revived_slots()
+    case_instance_calls_moved_slot()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
