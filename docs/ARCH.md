@@ -2876,7 +2876,10 @@ method's signature; a call of a trait impl method also
 instantiates the trait's (rustc checks calls against the
 trait item, and an impl may refine it). A callee's `T:
 'static` bound (and a struct's, for each local) makes the
-regions bound to `T` outlive `'static`.
+regions bound to `T` outlive `'static`, and so does a
+bound `P: Tr` when `Tr` or a supertrait is `'static`, or
+when the impl selected for `P`'s type has `X: 'static`
+where-clauses (on the parts of `P` those params match).
 
 Closures follow a contract computed from their capture
 types (`closure_roles`): a shared capture `&'c T` makes
@@ -2897,7 +2900,18 @@ arguments are items, free regions, sources (and sinks
 behind a `&mut`), except the outer reference of an `&item`
 argument (`filter`, `find`); the creator links them to the
 call's other arguments (the iterator's sources, `fold`'s
-initial value), write-backs only to element regions.
+initial value), write-backs only to element regions. A
+closure passed straight to a generic fn whose `Fn` bound
+takes a type param or projection there (`F: FnOnce(T) ->
+U`) gets the same free arguments, linked at that call. A
+parameter annotation that names a lifetime (`|x: &'a T|`,
+`|m: &'static Message|`) is that region of the enclosing
+fn: free in the body, tied to it by the creator, and a
+direct call's arguments flow into it; a return annotation
+may pin output slots to `'static` (the body then proves
+its result is `'static` itself). Named output lifetimes,
+and named parameters of a closure called from another
+closure, are L0203.
 
 Templates are checked with abstract type params. Instance
 bodies are borrow-checked too, without the universal
