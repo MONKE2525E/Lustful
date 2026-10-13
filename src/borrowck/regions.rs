@@ -3102,6 +3102,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && self.relate(el, &av[1..], rl, &dv, Variance::Co) => {}
             _ if let CallTarget::Builtin(b) = target
                 && self.call_cell(b, &avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(b) = target
+                && self.call_tls(b, &avs, dt, &dv) => {}
             _ => {
                 self.call_opaque(&avs, dt, &dv);
                 if matches!(target, CallTarget::Fn(_)) {
@@ -3335,6 +3337,39 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
         }
+        true
+    }
+
+    /// The `LocalKey` method builtins (W-TLS, check/tls.rs). A key's
+    /// value type is a static's type, so each of its regions is
+    /// `'static` (the erased type does not say so: pin them here). `set`
+    /// and `replace` on a `Cell` or `RefCell` key move their argument
+    /// into the thread's value, so it flows into those slots, as a store
+    /// through `Cell::set` does (`call_cell`). The rest is the opaque
+    /// rule. False for any other call (the caller goes on).
+    fn call_tls(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::check::Builtin as B;
+        if !crate::lower::tls::is_key_method(b) {
+            return false;
+        }
+        let tys = &self.body.tys;
+        let Some((kt, kv)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, key) = tys.kind(*kt) else { return false };
+        let Some(t) = tys.local_key_elem(key) else { return false };
+        let u = tys.cell_elem(t).or_else(|| tys.refcell_elem(t));
+        let tv = kv.get(1..).unwrap_or_default().to_vec();
+        for &v in &tv {
+            self.edge(v, 0);
+        }
+        // `Cell<U>` and `RefCell<U>` carry no regions of their own.
+        if matches!(b, B::TlsSet | B::TlsReplace)
+            && let Some(u) = u
+            && let Some((xt, xv)) = avs.get(1)
+            && !self.relate(*xt, xv, u, &tv, Variance::Co)
+        {
+            self.flow_all(xv, &tv);
+        }
+        self.call_opaque(avs, dt, dv);
         true
     }
 

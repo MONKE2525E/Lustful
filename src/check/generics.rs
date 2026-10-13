@@ -1222,8 +1222,9 @@ fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_ref
 }
 
 /// `t` with every reference region `'static`: the region form of a type
-/// alias body, which may only use `'static` (W-BORROW, increment 1).
-fn staticize(tys: &mut impl TyIntern, t: Ty) -> Ty {
+/// alias body, which may only use `'static` (W-BORROW, increment 1), and
+/// of a `thread_local!` value type (check/tls.rs).
+pub(crate) fn staticize(tys: &mut impl TyIntern, t: Ty) -> Ty {
     match tys.kind(t) {
         TyKind::Ref(_, m, inner) => {
             let i = staticize(tys, inner);

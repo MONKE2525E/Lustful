@@ -105,19 +105,106 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             _ => {
-                let tn = self.tn(base);
-                self.err(
-                    "L0104",
-                    span,
-                    format!("no method `{n}` on type `{tn}`"),
-                    "`set`, `get`, `take`, `replace`, and the `with_borrow` methods need a `Cell` or `RefCell` value.",
-                );
-                return Some(self.tls_bail(args));
+                // `LocalKey<Cell<U>>` and `LocalKey<RefCell<U>>` methods.
+                let cell = self.tys.cell_elem(t);
+                let refcell = self.tys.refcell_elem(t);
+                let found = match (n.as_str(), cell, refcell) {
+                    ("with_borrow" | "with_borrow_mut", _, Some(u)) => {
+                        let r = self.new_var(false);
+                        let ut = self.tys.mk_ref(n == "with_borrow_mut", u);
+                        let f = self.fn_once_param(&[ut], r, span);
+                        Some(if n == "with_borrow" { (B::TlsWithBorrow, vec![f], r) } else { (B::TlsWithBorrowMut, vec![f], r) })
+                    }
+                    ("set", Some(u), _) | ("set", _, Some(u)) => Some((B::TlsSet, vec![u], UNIT)),
+                    ("replace", Some(u), _) | ("replace", _, Some(u)) => Some((B::TlsReplace, vec![u], u)),
+                    ("get", Some(u), _) => {
+                        self.deferred_copy.push((u, span));
+                        Some((B::TlsGet, vec![], u))
+                    }
+                    ("take", Some(u), _) | ("take", _, Some(u)) => {
+                        self.deferred_default.push((u, span));
+                        Some((B::TlsTake, vec![], u))
+                    }
+                    _ => None,
+                };
+                let Some(found) = found else {
+                    let tn = self.tn(base);
+                    let need = if n.starts_with("with_borrow") { "a `RefCell` value" } else { "a `Cell` or `RefCell` value (`get`: a `Cell`)" };
+                    self.err("L0104", span, format!("no method `{n}` on type `{tn}`"), format!("`LocalKey::{n}` needs {need}."));
+                    return Some(self.tls_bail(args));
+                };
+                found
             }
         };
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
         self.check_args(&params, args, span);
         Some(ret)
+    }
+
+    /// The `const { .. }` form of `thread_local!`: rustc makes its block
+    /// a `const` item, so the block must be a const initializer. Lust
+    /// evaluates the value at run time (the init fn) like a lazy one,
+    /// which is the same value: const evaluation has no side effects.
+    /// So this proves the const part only: the const constructors of
+    /// builtin types (`Cell::new`, `RefCell::new`, `Vec::new`,
+    /// `String::new`) and aggregates of const parts are const by their
+    /// shape; every other part must pass the bounded const evaluator, as
+    /// an inline `const` block does. Runs after the init fn's body check.
+    pub(super) fn tls_const_init_check(&mut self) {
+        let fid = self.fid;
+        if !self.p.statics.iter().any(|s| s.tls.is_some_and(|k| k.eager && k.init == fid)) {
+            return;
+        }
+        let def = self.p.fn_info(fid).def;
+        if let Some(b) = def.body {
+            self.tls_const_block(b, def.name_span);
+        }
+    }
+
+    fn tls_const_block(&mut self, b: ast::BlockId, span: Span) {
+        let blk = self.p.ast.block(b);
+        match (blk.stmts.is_empty(), blk.tail) {
+            (true, Some(t)) => self.tls_const_expr(t),
+            _ => self.err(
+                "L0640",
+                span,
+                "statements in a `thread_local!` `const { .. }` initializer are not supported yet",
+                "Write the initializer as one expression.",
+            ),
+        }
+    }
+
+    fn tls_const_expr(&mut self, e: ExprId) {
+        use Builtin as B;
+        let p = self.p;
+        let res = self.out.expr_res[self.ei(e)];
+        let parts: Vec<ExprId> = match p.ast.expr(e) {
+            ast::Expr::Call { args, .. }
+                if matches!(
+                    res,
+                    Res::Builtin(B::CellNew | B::RefCellNew | B::VecNew | B::StringNew) | Res::OptSome | Res::ResOk | Res::ResErr | Res::Variant(..)
+                ) =>
+            {
+                args.clone()
+            }
+            ast::Expr::StructLit { fields, update: None, .. } => fields.iter().map(|f| f.2).collect(),
+            ast::Expr::Tuple(es) | ast::Expr::Array(es) => es.clone(),
+            ast::Expr::Block(b) => {
+                let span = self.span(e);
+                return self.tls_const_block(*b, span);
+            }
+            _ => {
+                let t = self.out.expr_ty[self.ei(e)];
+                let mut ccx = CheckCx { cx: self };
+                if let Err(d) = crate::ty::consteval::eval(&mut ccx, e, Some(t)) {
+                    ccx.cx.errs.push(d);
+                }
+                return;
+            }
+        };
+        for a in parts {
+            self.tls_const_expr(a);
+        }
     }
 
     /// Checks the arguments of a rejected call (so their own errors

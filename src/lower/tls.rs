@@ -1,7 +1,9 @@
 // `LocalKey` method calls (check/tls.rs) in lowering and after borrowck.
 //
-// Lowering gives each key method call the static's init fn as its last
-// operand (`init_operand`), as an `fn() -> T` pointer value. Borrowck sees
+// Lowering gives each key method call two more operands: the static's
+// init fn as an `fn() -> T` pointer value, and whether the key is the
+// `const` form (`Lower::tls_operands`). Both live in the IR, so a cached
+// body or C unit can never pair a key with a stale form. Borrowck sees
 // the call as one builtin call: the key borrow, the closure moved in, the
 // result out. Codegen calls `expand` first, and each call becomes plain IR
 // over two runtime accesses (`TlsAccess`, `TlsInitWith`, emitted by
@@ -31,10 +33,11 @@ pub fn is_key_method(b: Builtin) -> bool {
 }
 
 impl Lower<'_, '_> {
-    /// The init fn of the `thread_local!` static a key method's receiver
-    /// names (the checker allows no other receiver), as an `fn() -> T`
-    /// pointer value.
-    pub(super) fn tls_init_operand(&mut self, recv: crate::ast::ExprId, span: Span) -> Operand {
+    /// The extra operands of a key method call: the init fn of the
+    /// `thread_local!` static its receiver names (the checker allows no
+    /// other receiver), as an `fn() -> T` pointer value, then the key's
+    /// `const` form flag.
+    pub(super) fn tls_operands(&mut self, recv: crate::ast::ExprId, span: Span) -> [Operand; 2] {
         let crate::check::Res::Static(idx) = self.ck.res(recv) else { unreachable!("check/tls.rs: a key method names its static") };
         let st = &self.p.statics[idx as usize];
         let (key, ty) = (st.tls.expect("check/tls.rs: a key method names a thread_local! static"), st.ty);
@@ -44,7 +47,7 @@ impl Lower<'_, '_> {
         let fp = self.body.tys.intern(TyKind::FnPtr(sig));
         let l = self.temp(fp);
         self.assign(Place::local(l), Rvalue::FnValue(key.init, fp), span);
-        Operand::Copy(Place::local(l))
+        [Operand::Copy(Place::local(l)), Operand::Const(Const::Bool(key.eager))]
     }
 }
 
@@ -178,9 +181,14 @@ impl Ex<'_, '_, '_> {
     /// Moves an operand into a fresh local of its own.
     fn own(&mut self, o: Operand) -> Result<(Local, Ty), String> {
         let ty = self.op_ty(&o)?;
+        Ok((self.own_as(o, ty), ty))
+    }
+    /// Moves an operand of known type `ty` (a constant too) into a fresh
+    /// local of its own.
+    fn own_as(&mut self, o: Operand, ty: Ty) -> Local {
         let l = self.local(ty);
         self.assign(Place::local(l), Rvalue::Use(o));
-        Ok((l, ty))
+        l
     }
 
     // ---------- Key access ----------
@@ -261,9 +269,11 @@ impl Ex<'_, '_, '_> {
     // ---------- Methods ----------
 
     /// One key method call: `args` are the key reference, the method's
-    /// own arguments, then the init fn (see `Lower::tls_init_operand`).
+    /// own arguments, then the init fn and the `const` form flag (see
+    /// `Lower::tls_operands`).
     fn method(&mut self, b: Builtin, mut args: Vec<Operand>, dest: Place) -> R {
         use Builtin as B;
+        let Some(Operand::Const(Const::Bool(eager))) = args.pop() else { return Err("thread_local expansion: missing key form".into()) };
         let init = args.pop().ok_or("thread_local expansion: missing init fn")?;
         let key = args.first().cloned().ok_or("thread_local expansion: missing key")?;
         let init_ty = self.op_ty(&init)?;
@@ -298,8 +308,100 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
                 Ok(())
             }
-            _ => Err(format!("thread_local expansion: `{b:?}` is not supported yet")),
+            B::TlsWithBorrow | B::TlsWithBorrowMut => {
+                // `self.with(|cell| f(&cell.borrow()))`: the guard lives
+                // until `f` returns.
+                let m = b == B::TlsWithBorrowMut;
+                let u = self.body.tys.refcell_elem(t).ok_or("thread_local expansion: with_borrow on a non-RefCell")?;
+                let (f, fty) = self.own(args.get(1).cloned().ok_or("thread_local expansion: missing closure")?)?;
+                let (r, _) = self.access(&key, &init, t, None)?;
+                let g = self.guard(r, u, m);
+                let ut = self.body.tys.mk_ref(m, u);
+                let ur = self.local(ut);
+                self.assign(Place::local(ur), Rvalue::Ref(m, Place::local(g).deref()));
+                self.call_once(f, fty, vec![Operand::Move(Place::local(ur))], dest)?;
+                self.drop_local(g);
+                Ok(())
+            }
+            B::TlsGet | B::TlsTake | B::TlsReplace => {
+                // `self.with(|cell| cell.get())` and kin.
+                let (r, _) = self.access(&key, &init, t, None)?;
+                let refcell = self.body.tys.refcell_elem(t).is_some();
+                let (op, ops) = match (b, refcell) {
+                    (B::TlsGet, _) => (B::CellGet, vec![]),
+                    (B::TlsTake, false) => (B::CellTake, vec![]),
+                    (B::TlsTake, true) => (B::RefCellTake, vec![]),
+                    (_, false) => (B::CellReplace, vec![args.get(1).cloned().ok_or("thread_local expansion: missing value")?]),
+                    (_, true) => (B::RefCellReplace, vec![args.get(1).cloned().ok_or("thread_local expansion: missing value")?]),
+                };
+                let mut all = vec![Operand::Copy(Place::local(r))];
+                all.extend(ops);
+                self.call(CallTarget::Builtin(op), all, dest);
+                Ok(())
+            }
+            B::TlsSet => self.set(&key, &init, t, eager, args.get(1).cloned().ok_or("thread_local expansion: missing value")?, dest),
+            _ => Err(format!("thread_local expansion: `{b:?}` is not a key method")),
         }
     }
+
+    /// A `RefCell` guard over the cell at `&RefCell<U>` local `r`
+    /// (`borrow` or `borrow_mut`, with their panics), in a fresh local.
+    fn guard(&mut self, r: Local, u: Ty, m: bool) -> Local {
+        let gt = self.body.tys.mk_builtin1(if m { |d| d.ref_mut_guard } else { |d| d.ref_guard }, u);
+        let g = self.local(gt);
+        let op = if m { Builtin::RefCellBorrowMut } else { Builtin::RefCellBorrow };
+        self.call(CallTarget::Builtin(op), vec![Operand::Copy(Place::local(r))], Place::local(g));
+        g
+    }
+
+    /// `set(value)` on a `Cell` or `RefCell` key, as Rust's
+    /// `initialize_with`: a lazy key not yet made on this thread takes
+    /// the new cell as its value and never runs its initializer; else
+    /// the value goes into the live cell (`Cell::set`, or
+    /// `*cell.borrow_mut() = value`, which drops the old value while the
+    /// cell is borrowed). A `const` key is made from the start.
+    fn set(&mut self, key: &Operand, init: &Operand, t: Ty, eager: bool, value: Operand, dest: Place) -> R {
+        use Builtin as B;
+        let refcell = self.body.tys.refcell_elem(t);
+        let u = refcell.or_else(|| self.body.tys.cell_elem(t)).ok_or("thread_local expansion: set on a non-cell key")?;
+        let vl = self.own_as(value, u);
+        let mut join = None;
+        if !eager {
+            let cl = self.local(t);
+            let new = if refcell.is_some() { B::RefCellNew } else { B::CellNew };
+            self.call(CallTarget::Builtin(new), vec![Operand::Move(Place::local(vl))], Place::local(cl));
+            let ot = self.body.tys.mk_option(t);
+            let back = self.local(ot);
+            self.call(CallTarget::Builtin(B::TlsInitWith), vec![key.clone(), Operand::Move(Place::local(cl))], Place::local(back));
+            let d = self.local(int(IntTy::U32));
+            self.assign(Place::local(d), Rvalue::Discriminant(Place::local(back)));
+            let (some, none) = (self.block(), self.block());
+            self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, some)], none));
+            join = Some(none);
+            // The cell came back: the key was made already. Its value
+            // goes into the live cell below.
+            self.cur = some;
+            let c2 = self.local(t);
+            self.assign(Place::local(c2), Rvalue::Use(Operand::Move(Place::local(back).project(Proj::Downcast(1)).project(Proj::Field(0)))));
+            let into = if refcell.is_some() { B::RefCellIntoInner } else { B::CellIntoInner };
+            self.call(CallTarget::Builtin(into), vec![Operand::Move(Place::local(c2))], Place::local(vl));
+        }
+        let (r, _) = self.access(key, init, t, None)?;
+        if refcell.is_some() {
+            let g = self.guard(r, u, true);
+            self.assign(Place::local(g).deref(), Rvalue::Use(Operand::Move(Place::local(vl))));
+            self.drop_local(g);
+        } else {
+            let unit = self.local(UNIT);
+            self.call(CallTarget::Builtin(B::CellSet), vec![Operand::Copy(Place::local(r)), Operand::Move(Place::local(vl))], Place::local(unit));
+        }
+        if let Some(j) = join {
+            self.goto(j);
+            self.cur = j;
+        }
+        self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
+        Ok(())
+    }
+
 
 }

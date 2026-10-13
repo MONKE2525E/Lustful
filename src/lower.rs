@@ -2802,8 +2802,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         if let Callee::Builtin(b) = callee
             && tls::is_key_method(b)
         {
-            let init = self.tls_init_operand(recv, span);
-            ops.push(init);
+            ops.extend(self.tls_operands(recv, span));
         }
         let target = match callee {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),

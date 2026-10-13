@@ -1139,6 +1139,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
             item.mutable.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
             hash_const_value(&mut h, p, &item.value, 0);
+            // A `thread_local!` key's form and init fn (W-TLS): key
+            // method calls carry both in their IR (lower/tls.rs).
+            if let Some(k) = item.tls {
+                k.eager.hash(&mut h);
+                hash_def_pub(&mut h, p, p.def_id(k.init));
+            }
         } else if let Some(ty) = p.aliases.get(&data.name) {
             1u8.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);

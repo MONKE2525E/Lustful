@@ -3311,8 +3311,15 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             ));
             continue;
         }
-        // A `thread_local!` static's own type is `LocalKey<T>`.
-        let ty = if tls.is_some() { p.tys.mk_local_key(ty) } else { ty };
+        // A `thread_local!` static's own type is `LocalKey<T>`. Every
+        // region in a static's type is `'static`; the key's value type
+        // says so, so closure params and results carry it.
+        let ty = if tls.is_some() {
+            let t = generics::staticize(&mut p.tys, ty);
+            p.tys.mk_local_key(t)
+        } else {
+            ty
+        };
         // A static is shared by every thread: its type must be `Sync`
         // (rustc E0277), proven by the auto trait walk (ARCH 2.7).
         if is_static.is_some() {
@@ -3482,8 +3489,15 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                     }
                     p.static_defs[item.static_idx as usize] = def;
                     p.static_names.insert(name, item.static_idx);
-                } else if p.static_defs.len() <= item.static_idx as usize {
-                    p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
+                } else {
+                    // A nested static's identity (ARCH 1.7): its C symbol
+                    // and cached IR name it by this hash, so two nested
+                    // statics must never share one.
+                    let def = DefId { krate: p.krate, hash: nested_static_hash(p, item.stmt_idx.unwrap(), name) };
+                    if p.static_defs.len() <= item.static_idx as usize {
+                        p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
+                    }
+                    p.static_defs[item.static_idx as usize] = def;
                 }
                 let tls = match item.tls {
                     Some(eager) => match super::tls::init_fn(p, item.expr, item.stmt_idx) {
@@ -3503,6 +3517,36 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         .into_iter()
         .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit, tls: None }))
         .collect();
+}
+
+/// The def hash of the static at `stmt_items[sidx]` (ARCH 1.7: a static
+/// in a body is its parent fn's hash, its name, and its ordinal among the
+/// same-name statics of that fn). The parent is the innermost fn whose
+/// body holds the item; edits elsewhere in the file do not move it.
+fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathHash {
+    let ast = p.ast;
+    let at = ast.stmt_items[sidx as usize].span;
+    let parent = |span: Span| {
+        let mut best: Option<(u32, usize)> = None;
+        for (i, f) in p.fns.iter().enumerate() {
+            let Some(b) = f.def.body else { continue };
+            let s = ast.block(b).span;
+            if s.file == span.file && s.lo <= span.lo && span.hi <= s.hi && best.is_none_or(|(w, _)| s.hi - s.lo < w) {
+                best = Some((s.hi - s.lo, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    };
+    let me = parent(at);
+    let ordinal = ast.stmt_items[..sidx as usize]
+        .iter()
+        .filter(|it| matches!(&it.kind, ItemKind::Static(s) if s.name == name) && parent(it.span) == me)
+        .count() as u32;
+    let parent_hash = match me {
+        Some(i) => p.fn_defs[i].hash,
+        None => crate::def::item_hash(p.stable_crate, &["#body"], crate::def::DefKind::Static, "", 0),
+    };
+    crate::def::child_hash(parent_hash, crate::def::DefKind::Static, p.interner.get(name), ordinal)
 }
 
 /// Registers the associated consts of inherent impls, trait

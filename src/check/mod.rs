@@ -16103,6 +16103,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Derive Ord on the type, or compare integers, chars, strings, or tuples of them.");
             }
         }
+        // A `thread_local!` `const { .. }` init fn proves its const part (check/tls.rs).
+        self.tls_const_init_check();
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
