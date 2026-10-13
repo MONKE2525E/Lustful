@@ -933,8 +933,17 @@ impl OwnSig {
             let n = sc.slots(t) as usize;
             let mut out = Vec::with_capacity(n);
             if l == 0 {
-                for _ in 0..n {
-                    out.push(fresh(self, "the closure's return lifetime"));
+                // A return annotation's `'static` slots are `'static`.
+                let mut named: Vec<Region> = Vec::new();
+                let entry = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d));
+                let paired = entry
+                    .and_then(|c| c.output_region)
+                    .is_some_and(|r| regioned_slots(sc, r, t, &mut named) && named.len() == n);
+                for k in 0..n {
+                    match named.get(k) {
+                        Some(Region::Static) if paired => out.push(0),
+                        _ => out.push(fresh(self, "the closure's return lifetime")),
+                    }
                 }
             } else if l == 1 {
                 let cl = match sc.tys.kind(t) {
@@ -964,11 +973,22 @@ impl OwnSig {
         // slot behind `&mut`, the output). Higher-ranked argument slots
         // take no part.
         let inputs: Vec<Ty> = (2..=body.arg_count).map(|l| body.locals[l].ty).collect();
-        let mut arg_roles = Vec::new();
-        closure_arg_roles(sc, &inputs, free.as_deref(), &mut arg_roles);
+        let entry = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d));
+        let arg_roles: Vec<Option<(bool, bool)>> = match entry.map(|c| closure_arg_slots(sc, c)) {
+            Some(Ok(slots)) => slots.into_iter().map(|(r, _)| r).collect(),
+            // Unpaired annotations are the creator's error; every slot is
+            // higher-ranked here.
+            _ => {
+                let mut v = Vec::new();
+                closure_arg_roles(sc, &inputs, free.as_deref(), &mut v);
+                v
+            }
+        };
         let args: Vec<Univ> = self.slots.iter().skip(2).flatten().copied().collect();
         let mut cap_srcs: Vec<Univ> = Vec::new();
-        let mut snks: Vec<Univ> = self.slots.first().cloned().unwrap_or_default();
+        // Output slots pinned to `'static` (a return annotation) take no
+        // contract facts: the body shows its result lives that long itself.
+        let mut snks: Vec<Univ> = self.slots.first().map(|v| v.iter().copied().filter(|&u| u != 0).collect()).unwrap_or_default();
         for (i, &(src, snk)) in roles.iter().enumerate() {
             if let Some(&u) = env_caps.get(i) {
                 if src {
@@ -1101,6 +1121,81 @@ pub(super) fn closure_arg_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, inp
                 arg_slot_roles(sc, inner, false, out);
             }
             _ => arg_slot_roles(sc, t, false, out),
+        }
+    }
+}
+
+/// The argument slots of a closure, in slot order: its role (`None`:
+/// higher-ranked; see `closure_arg_roles`) and, for a slot its annotation
+/// names (`|x: &'a T|`), the enclosing fn's region it is: such a slot is
+/// free, and the creator ties it to that region. `Err` when an annotated
+/// type does not pair with the argument's erased type.
+pub(super) fn closure_arg_slots<T: TyIntern>(
+    sc: &mut SlotCx<'_, '_, '_, T>,
+    c: &crate::check::generics::ClosureEntry,
+) -> Result<Vec<(Option<(bool, bool)>, Option<Region>)>, ()> {
+    let mut roles = Vec::new();
+    closure_arg_roles(sc, &c.inputs, c.free_args.as_deref(), &mut roles);
+    let mut free_roles = Vec::new();
+    closure_arg_roles(sc, &c.inputs, Some(&vec![false; c.inputs.len()]), &mut free_roles);
+    let mut named: Vec<Region> = Vec::with_capacity(roles.len());
+    for (i, &e) in c.inputs.iter().enumerate() {
+        let n = sc.slots(e) as usize;
+        match c.input_regions.get(i).copied().flatten() {
+            Some(r) => {
+                let start = named.len();
+                if !regioned_slots(sc, r, e, &mut named) || named.len() - start != n {
+                    return Err(());
+                }
+            }
+            None => named.extend(std::iter::repeat_n(Region::Erased, n)),
+        }
+    }
+    Ok(roles
+        .into_iter()
+        .zip(free_roles)
+        .zip(named)
+        .map(|((r, fr), nr)| match nr {
+            Region::Param(_) | Region::Static => (fr, Some(nr)),
+            _ => (r, None),
+        })
+        .collect())
+}
+
+/// The region a regioned type `r` gives each slot of erased type `e`, in
+/// slot order (`Erased` where `r` names none). False when they differ in
+/// shape.
+fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
+    let tys = sc.tys;
+    match (tys.kind(r), tys.kind(e)) {
+        (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
+            out.push(rr);
+            regioned_slots(sc, ri, ei, out)
+        }
+        (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
+            let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+            for k in 0..adt_regions(sc.p, tys, e) as usize {
+                out.push(lts.get(k).copied().unwrap_or(Region::Erased));
+            }
+            let rargs: Vec<Ty> = tys.args(ra).iter().filter_map(|g| g.as_ty()).collect();
+            let eargs: Vec<Ty> = tys.args(ea).iter().filter_map(|g| g.as_ty()).collect();
+            rargs.len() == eargs.len() && rargs.into_iter().zip(eargs).all(|(x, y)| regioned_slots(sc, x, y, out))
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            let (xs, ys) = (tys.tys_of(a).to_vec(), tys.tys_of(b).to_vec());
+            xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| regioned_slots(sc, x, y, out))
+        }
+        (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+            regioned_slots(sc, a, b, out)
+        }
+        (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
+            out.push(rr);
+            true
+        }
+        _ => {
+            let n = sc.slots(e) as usize;
+            out.extend(std::iter::repeat_n(Region::Erased, n));
+            r == e || n == 0
         }
     }
 }
@@ -2053,6 +2148,24 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                                 }
                             }
                         }
+                        // Free argument slots (a named annotation): the
+                        // call's arguments flow into them.
+                        if let TyKind::Closure(def, _) = self.body.tys.kind(ct)
+                            && let Some(vars) = self.closure_arg_vars(def, &roles, &caps)
+                            && let Some(inputs) = self.p.gx.closures.get(&def).map(|c| c.inputs.clone())
+                        {
+                            let mut at = 0usize;
+                            for (k, it) in inputs.into_iter().enumerate() {
+                                let n = self.sc.slots(it) as usize;
+                                if let (Some((at_ty, av)), Some(pv)) = (avs.get(1 + k), vars.get(at..at + n)) {
+                                    let pv = pv.to_vec();
+                                    if !av.is_empty() {
+                                        self.relate(*at_ty, av, it, &pv, Variance::Co);
+                                    }
+                                }
+                                at += n;
+                            }
+                        }
                     }
                 }
             }
@@ -2283,11 +2396,44 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             return Some(v.clone());
         }
         let c = self.p.gx.closures.get(&def)?;
-        let free = c.free_args.clone()?;
-        let inputs = c.inputs.clone();
-        let mut arg_roles = Vec::new();
-        closure_arg_roles(&mut self.sc, &inputs, Some(&free), &mut arg_roles);
+        let slots = match closure_arg_slots(&mut self.sc, c) {
+            Ok(s) => s,
+            Err(()) => {
+                self.errs.push(Diag::new(
+                    "L0203",
+                    self.span,
+                    "an explicit lifetime in this closure parameter's annotation is not supported yet",
+                    "Drop the lifetime from the annotation, or write `'_`.",
+                ));
+                return None;
+            }
+        };
+        if slots.iter().all(|(r, _)| r.is_none()) {
+            return None;
+        }
+        let arg_roles: Vec<Option<(bool, bool)>> = slots.iter().map(|&(r, _)| r).collect();
         let vars: Vec<u32> = arg_roles.iter().map(|_| self.fresh()).collect();
+        // A slot the annotation names is that region of the creator.
+        for (i, &(_, link)) in slots.iter().enumerate() {
+            let u = match link {
+                Some(Region::Static) => Some(0),
+                Some(Region::Param(k)) if !self.own.closure && k < self.own.n_univ => Some(k + 1),
+                Some(_) => {
+                    self.errs.push(Diag::new(
+                        "L0203",
+                        self.span,
+                        "a named lifetime in a closure parameter inside a closure is not supported yet",
+                        "Move the closure out of the enclosing closure, or drop the lifetime.",
+                    ));
+                    None
+                }
+                None => None,
+            };
+            if let Some(u) = u {
+                self.edge(vars[i], u);
+                self.edge(u, vars[i]);
+            }
+        }
         let mut srcs: Vec<u32> = Vec::new();
         let mut snks: Vec<u32> = Vec::new();
         for (i, r) in arg_roles.iter().enumerate() {
@@ -2337,13 +2483,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     fn link_closure_args(&mut self, avs: &[(Ty, Vec<u32>)]) {
         for (k, (t, v)) in avs.iter().enumerate() {
             let TyKind::Closure(def, args) = self.body.tys.kind(*t) else { continue };
-            let Some(free) = self.p.gx.closures.get(&def).and_then(|c| c.free_args.clone()) else { continue };
+            let Some(c) = self.p.gx.closures.get(&def) else { continue };
+            let Ok(slots) = closure_arg_slots(&mut self.sc, c) else { continue };
             let mut roles = Vec::new();
             closure_roles(&mut self.sc, args, &mut roles);
             let Some(vars) = self.closure_arg_vars(def, &roles, v) else { continue };
-            let inputs = self.p.gx.closures.get(&def).map(|c| c.inputs.clone()).unwrap_or_default();
-            let mut arg_roles = Vec::new();
-            closure_arg_roles(&mut self.sc, &inputs, Some(&free), &mut arg_roles);
+            let arg_roles: Vec<Option<(bool, bool)>> = slots.into_iter().map(|(r, _)| r).collect();
             let mut items: Vec<u32> = Vec::new();
             let mut elems: Vec<u32> = Vec::new();
             for (j, (ot, ov)) in avs.iter().enumerate() {

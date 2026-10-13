@@ -3526,17 +3526,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// a reject (L0203).
     fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId) {
         let p = self.p;
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        let mut sc = self.body_scope.clone();
-        sc.annotation = true;
-        sc.infer_cell = None;
-        sc.regions = generics::RegionMode::Keep { next: None, elided: Some(Region::Erased) };
-        let Ok(r) = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &sc) else {
-            // `_` inside the annotation (no region form without inference).
-            let s = p.ast.ty_span(t);
-            self.err("L0203", s, "an explicit lifetime in a type annotation with `_` is not supported yet", "Write the full type, or drop the lifetime.");
-            return;
-        };
+        let Some(r) = self.regioned_annotation(t) else { return };
         if !self.annotate_pat(pat, r) {
             let s = p.ast.pat_span(pat);
             self.err(
@@ -3545,6 +3535,27 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "an explicit lifetime in the annotation of this pattern is not supported yet",
                 "Bind a plain name (`let x: T = ..`), or a tuple of names.",
             );
+        }
+    }
+
+    /// The regioned form of an annotation that names lifetimes (W-BORROW):
+    /// `'static` and the fn's named lifetimes keep their regions, elided
+    /// ones are free (`Region::Erased`). None after reporting `_` inside
+    /// the annotation (no region form without inference, L0203).
+    fn regioned_annotation(&mut self, t: ast::TyId) -> Option<Ty> {
+        let p = self.p;
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let mut sc = self.body_scope.clone();
+        sc.annotation = true;
+        sc.infer_cell = None;
+        sc.regions = generics::RegionMode::Keep { next: None, elided: Some(Region::Erased) };
+        match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &sc) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                let s = p.ast.ty_span(t);
+                self.err("L0203", s, "an explicit lifetime in a type annotation with `_` is not supported yet", "Write the full type, or drop the lifetime.");
+                None
+            }
         }
     }
 

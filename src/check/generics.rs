@@ -2537,6 +2537,10 @@ pub struct ClosureEntry {
     pub output: Ty,
     /// `ClosureInfo::free_args` (W-BORROW).
     pub free_args: Option<Vec<bool>>,
+    /// `ClosureInfo::input_regions` (W-BORROW).
+    pub input_regions: Vec<Option<Ty>>,
+    /// `ClosureInfo::output_region` (W-BORROW).
+    pub output_region: Option<Ty>,
 }
 
 /// A template's capture analysis without types: (root local,
@@ -5067,6 +5071,8 @@ pub(crate) struct OwnedClosure {
     pub(crate) inputs: Vec<OwnedTy>,
     pub(crate) output: OwnedTy,
     pub(crate) free_args: Option<Vec<bool>>,
+    pub(crate) input_regions: Vec<Option<OwnedTy>>,
+    pub(crate) output_region: Option<OwnedTy>,
 }
 
 /// Snapshots the closures of one checked body. None when a closure
@@ -5081,6 +5087,8 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
             inputs: cl.inputs.iter().map(|&t| snapshot_ty(&c.tys, t)).collect::<Option<Vec<_>>>()?,
             output: snapshot_ty(&c.tys, cl.output)?,
             free_args: cl.free_args.clone(),
+            input_regions: cl.input_regions.iter().map(|o| o.and_then(|t| snapshot_ty(&c.tys, t))).collect(),
+            output_region: cl.output_region.and_then(|t| snapshot_ty(&c.tys, t)),
         });
     }
     Some(out)
@@ -5136,6 +5144,8 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let env = build_owned_ty(p, &oc.env);
         let inputs: Vec<Ty> = oc.inputs.iter().map(|t| build_owned_ty(p, t)).collect();
         let output = build_owned_ty(p, &oc.output);
+        let input_regions: Vec<Option<Ty>> = oc.input_regions.iter().map(|o| o.as_ref().map(|t| build_owned_ty(p, t))).collect();
+        let output_region: Option<Ty> = oc.output_region.as_ref().map(|t| build_owned_ty(p, t));
         let env_param = match oc.kind {
             ClosureKind::Fn => p.tys.mk_ref(false, env),
             ClosureKind::FnMut => p.tys.mk_ref(true, env),
@@ -5169,7 +5179,7 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let scope = p.gx.fn_scopes.get(parent.0 as usize).cloned().unwrap_or_default();
         p.gx.fn_scopes.push(scope);
         p.gx.fn_class.push(class);
-        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone() });
+        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), input_regions, output_region });
         p.gx.closure_fns.insert(id, oc.def);
         out.push(id);
     }

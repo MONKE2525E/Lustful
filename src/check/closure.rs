@@ -67,6 +67,13 @@ pub struct ClosureInfo {
     /// per argument, true when it is `&item` (that outer reference is
     /// higher-ranked). `None`: every argument region is higher-ranked.
     pub free_args: Option<Vec<bool>>,
+    /// W-BORROW: per argument, its annotation's regioned type when it
+    /// names a lifetime (`|x: &'a T|`: the enclosing fn's `'a`, a free
+    /// region the creator ties to that universal).
+    pub input_regions: Vec<Option<Ty>>,
+    /// W-BORROW: the return annotation's regioned type when it names a
+    /// lifetime (only `'static` is supported there).
+    pub output_region: Option<Ty>,
 }
 
 /// The env field type of one capture.
@@ -232,11 +239,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let first_local = self.out.locals.len() as u32;
         let scope_len = self.scopes.len();
         let mut inputs: Vec<Ty> = Vec::with_capacity(params.len());
+        let mut input_regions: Vec<Option<Ty>> = Vec::with_capacity(params.len());
         for (i, prm) in params.iter().enumerate() {
             let exp = expected_inputs.as_ref().and_then(|v| v.get(i).copied());
+            let named = prm.ty.is_some_and(|w| generics::names_lifetime(self.p.ast, self.p.interner, w));
+            input_regions.push(if named { prm.ty.and_then(|w| self.regioned_annotation(w)) } else { None });
             let t = match (prm.ty, exp) {
                 (Some(w), exp) => {
-                    let t = self.resolve_written(w);
+                    let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
                     if let Some(x) = exp
                         && !self.unify(t, x)
                     {
@@ -253,9 +263,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             inputs.push(t);
         }
+        // W-BORROW: a return annotation may name `'static` (its slots are
+        // `'static` in the body); another named lifetime there is L0203.
+        let mut output_region: Option<Ty> = None;
         let output = match (ret, sig.and_then(|s| s.1)) {
             (Some(w), exp) => {
-                let t = self.resolve_written(w);
+                let named = generics::names_lifetime(self.p.ast, self.p.interner, w);
+                if named {
+                    output_region = self.regioned_annotation(w);
+                    let mut rs = Vec::new();
+                    if let Some(r) = output_region {
+                        crate::borrowck::regions_of(&self.tys, r, &mut rs);
+                    }
+                    if rs.iter().any(|r| matches!(r, Region::Param(_))) {
+                        let s = self.p.ast.ty_span(w);
+                        self.err(
+                            "L0203",
+                            s,
+                            "a named lifetime in a closure's return type is not supported yet",
+                            "Drop the return annotation, or use `'static`.",
+                        );
+                    }
+                }
+                let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
                 if let Some(x) = exp
                     && !self.unify(t, x)
                 {
@@ -290,7 +320,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, input_regions, output_region });
         ty
     }
 
