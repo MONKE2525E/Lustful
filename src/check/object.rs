@@ -797,7 +797,9 @@ pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// `'static` (an unsizing to a `'static` dyn type).
 pub fn may_borrow_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Param(_) | TyKind::Projection(..) => !env.iter().any(|q| matches!(q, Predicate::TypeOutlives(x, Region::Static) if *x == t)),
+        TyKind::Param(_) | TyKind::Projection(..) => {
+            !env.iter().any(|q| matches!(q, Predicate::TypeOutlives(x, Region::Static) if *x == t))
+        }
         TyKind::Ref(..) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Closure(..) => true,
         TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
         TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow_in(p, tys, env, e),
