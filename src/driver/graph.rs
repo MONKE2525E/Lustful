@@ -1028,6 +1028,11 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // `fn f(x: &str)` and `fn f(x: &'static str)` erase alike;
         // callers' borrow checks read the region signature (W-BORROW).
         hash_region_sig(&mut h, p, p.regions.fns.get(&local));
+        // Callers of a trait impl method see the trait's signature too
+        // (`trait_view`): a trait-only region edit moves the impl's.
+        if let Some(m) = crate::borrowck::impl_trait_method(p, local) {
+            hash_region_sig(&mut h, p, p.regions.trait_methods.get(&m));
+        }
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
         // A generic fn's parameters and bounds (its impl's too, merged
         // in by collect): callers prove the bounds (generic reuse).

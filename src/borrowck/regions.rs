@@ -1039,6 +1039,10 @@ pub(super) struct Builder<'b, 'p, 'a> {
     stmt_base: &'b [usize],
     /// Errors the constraint walk finds (annotations it cannot follow).
     errs: Vec<Diag>,
+    /// While a trait's signature is instantiated over an impl method's
+    /// types (`trait_view`): fresh vars per projection, which the impl's
+    /// own instantiation constrains.
+    proj: Option<FxMap<Ty, Vec<u32>>>,
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
@@ -1058,6 +1062,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             stmt_base,
             own,
             errs: Vec::new(),
+            proj: None,
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -1682,6 +1687,49 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         Callee::Opaque
     }
 
+    /// The trait method behind a vtable call. Lowering upcasts the
+    /// receiver to the method's own trait first, so the receiver's
+    /// principal owns the slot.
+    fn dyn_method(&self, recv: Ty, slot: u32) -> Option<DefId> {
+        let TyKind::Ref(_, _, obj) = self.body.tys.kind(recv) else { return None };
+        let owner = crate::check::object::principal_of(&self.body.tys, obj)?;
+        let info = self.p.gx.dyn_infos.get(&owner.def)?;
+        let j = slot.checked_sub(crate::check::object::VT_HEADER + info.supers.len() as u32)?;
+        Some(info.methods.get(j as usize)?.def)
+    }
+
+    /// A call of a trait impl method also takes the trait method's
+    /// signature: rustc checks every call against the trait item, and an
+    /// impl may refine it (take `&str` where the trait takes `&'static
+    /// str`, return `&'static str` or its own `'a` where the trait borrows
+    /// `self`). The trait's signature is instantiated over the called fn's
+    /// erased types, on top of the impl's own constraints, which the
+    /// trait's imply (`impl_contract`). A std trait has no region
+    /// signature; its methods elide, so a returned reference borrows
+    /// `self`.
+    fn trait_view(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) {
+        let p = self.p;
+        let Some(tmeth) = impl_trait_method(p, f) else { return };
+        if let Some(tsig) = p.regions.trait_methods.get(&tmeth) {
+            let info = p.fn_info(f);
+            self.proj = Some(FxMap::default());
+            let ok = self.call_sig_with(tsig, &info.params, info.ret, avs, dt, dv);
+            self.proj = None;
+            if !ok {
+                self.call_opaque(avs, dt, dv);
+            }
+        } else if let Some(lm) = p.gx.lang_method_sigs.get(&tmeth)
+            && matches!(lm.self_kind, Some(crate::ast::SelfKind::Ref | crate::ast::SelfKind::RefMut))
+            && matches!(p.tys.kind(lm.ret), TyKind::Ref(..))
+            && let Some((rt, rv)) = avs.first()
+            && matches!(self.body.tys.kind(*rt), TyKind::Ref(..))
+            && matches!(self.body.tys.kind(dt), TyKind::Ref(..))
+            && let (Some(&s), Some(&d)) = (rv.first(), dv.first())
+        {
+            self.edge(s, d);
+        }
+    }
+
     fn call(&mut self, target: CallTarget, args: &[Operand], dest: &Place) {
         let mut avs: Vec<(Ty, Vec<u32>)> = Vec::with_capacity(args.len());
         for o in args {
@@ -1691,6 +1739,21 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
         let dt = self.place(dest, &mut dv, &mut d);
+        // A vtable call takes the trait method's signature, which every
+        // impl satisfies (`impl_contract`). The object's hidden regions
+        // stay alive through the pointer's region (`MakeDyn`), so a
+        // `-> &'static str` method borrows nothing and a `&'static str`
+        // argument must be `'static`.
+        if let CallTarget::Dyn(slot) = target
+            && let Some(def) = avs.first().and_then(|(rt, _)| self.dyn_method(*rt, slot))
+            && let Some(sig) = self.p.regions.trait_methods.get(&def)
+            && let Some(t) = self.p.gx.trait_methods.get(&def)
+        {
+            if !self.call_sig_with(sig, &t.params, t.ret, &avs, dt, &dv) {
+                self.call_opaque(&avs, dt, &dv);
+            }
+            return;
+        }
         let callee = match target {
             CallTarget::Fn(f) => Some((f, self.callee(f))),
             _ => None,
@@ -1700,6 +1763,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 if !self.call_sig(f, sig, &avs, dt, &dv) {
                     self.call_opaque(&avs, dt, &dv);
                 }
+                self.trait_view(f, &avs, dt, &dv);
             }
             Some((_, Callee::Closure)) => {
                 // The env's captured regions and the result are one class.
@@ -1943,14 +2007,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// the signature cannot be paired with the call's types.
     fn call_sig(&mut self, f: LocalDefId, sig: &RegionSig, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let info = self.p.fn_info(f);
-        if info.params.len() != sig.params.len() || avs.len() != sig.params.len() {
+        self.call_sig_with(sig, &info.params, info.ret, avs, dt, dv)
+    }
+
+    /// `call_sig` over the callee's erased param and return types.
+    fn call_sig_with(&mut self, sig: &RegionSig, params: &[Ty], ret: Ty, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        if params.len() != sig.params.len() || avs.len() != sig.params.len() {
             return false;
         }
         let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         let mut ok = true;
         for i in 0..avs.len() {
-            let et = info.params[i];
+            let et = params[i];
             let mut pv = Vec::new();
             ok &= self.inst(sig.params[i], et, &univ, &mut binds, &mut pv);
             let (at, av) = &avs[i];
@@ -1959,9 +2028,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
         }
         let mut rv = Vec::new();
-        ok &= self.inst(sig.ret, info.ret, &univ, &mut binds, &mut rv);
+        ok &= self.inst(sig.ret, ret, &univ, &mut binds, &mut rv);
         if !dv.is_empty() {
-            ok &= self.relate(info.ret, &rv, dt, dv, Variance::Co);
+            ok &= self.relate(ret, &rv, dt, dv, Variance::Co);
         }
         for &(a, b) in &sig.facts {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
@@ -2013,6 +2082,22 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                         let v: Vec<u32> = (0..n).map(|_| self.fresh()).collect();
                         out.extend_from_slice(&v);
                         binds.insert(j.0, v);
+                    }
+                }
+                true
+            }
+            (TyKind::Projection(..), _) if self.proj.is_some() => {
+                let n = self.sc.slots(e) as usize;
+                let have = self.proj.as_ref().and_then(|m| m.get(&r)).cloned();
+                match have {
+                    Some(v) if v.len() == n => out.extend_from_slice(&v),
+                    Some(_) => return false,
+                    None => {
+                        let v: Vec<u32> = (0..n).map(|_| self.fresh()).collect();
+                        out.extend_from_slice(&v);
+                        if let Some(m) = self.proj.as_mut() {
+                            m.insert(r, v);
+                        }
                     }
                 }
                 true
@@ -2377,6 +2462,15 @@ fn tarjan(n: usize, start: &[u32], adj: &[u32]) -> (Vec<u32>, usize) {
     (comp, n_comp as usize)
 }
 
+/// The trait method an impl method implements, for a fn of a trait impl
+/// (or an instance of one); None for inherent methods and plain fns.
+pub fn impl_trait_method(p: &Program, f: LocalDefId) -> Option<DefId> {
+    let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+    let impl_def = p.defs.parent_of(p.def_id(src))?;
+    let (_, rec) = p.gx.index.by_def(impl_def)?;
+    p.gx.index.trait_record(rec.trait_def)?.method_by_name(p.fn_info(src).name)
+}
+
 /// The trait-contract check of an impl method's regions (W-BORROW, rustc
 /// compare_impl_method): the trait's signature must be a subtype of the
 /// impl's for every choice of the trait's lifetimes. The trait's
@@ -2387,11 +2481,8 @@ fn tarjan(n: usize, start: &[u32], adj: &[u32]) -> (Vec<u32>, usize) {
 /// `'static` result where the trait borrows), never less.
 pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
     let own = p.regions.fns.get(&f)?;
-    let def = p.def_id(f);
-    let impl_def = p.defs.parent_of(def)?;
-    let (_, rec) = p.gx.index.by_def(impl_def)?;
     let info = p.fn_info(f);
-    let tmeth = p.gx.index.trait_record(rec.trait_def)?.method_by_name(info.name)?;
+    let tmeth = impl_trait_method(p, f)?;
     let tsig = p.regions.trait_methods.get(&tmeth)?;
     if tsig.params.len() != own.params.len() {
         return None;
