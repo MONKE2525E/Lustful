@@ -12763,6 +12763,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let iter_args_id = self.tys.intern_args(&[GenericArg::Ty(iter_ty)]);
         let tr2 = TraitRef { def: lang.iterator, args: iter_args_id, bindings: EMPTY_BINDINGS };
         let next_local = match self.select_obligation(tr2) {
+            // A builtin iterator (`type IntoIter = vec::IntoIter<T>`): its
+            // `next` is the builtin call, marked by the sentinel id.
+            Selection::Impl { id: id2, .. }
+                if p.gx.index.get(id2).items.is_empty() && crate::ty::iter::is_iter(&self.tys, self.resolve(iter_ty)) =>
+            {
+                LocalDefId(u32::MAX)
+            }
             Selection::Impl { id: id2, args: impl_args2, .. } => self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0,
             Selection::ParamEvidence(_) => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
             // A template bound `T: IntoIterator` proves into_iter from

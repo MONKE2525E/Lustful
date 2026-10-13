@@ -670,7 +670,9 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
         CTy::Hash(k, a) => {
-            hash::is_table(*k) || k.is_owning_iter() || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k)))
+            hash::is_table(*k)
+                || k.is_owning_iter()
+                || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k)))
         }
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),

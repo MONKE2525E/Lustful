@@ -850,6 +850,23 @@ pub fn resolve_ty(
                 {
                     return Ok(tys.intern(TyKind::Adt(def, EMPTY_ARGS)));
                 }
+                // The owning std iterators (W-STD-B, ty/iter.rs).
+                if let Some(k) = crate::ty::iter::owning_by_path(&path) {
+                    let seg = segs.last().unwrap();
+                    let mut args = Vec::new();
+                    for &a in seg.type_args().iter() {
+                        args.push(resolve_ty(ast, interner, known, type_names, aliases, tys, a, self_ty)?);
+                    }
+                    if args.len() != k.n_args() {
+                        return Err(Diag::new(
+                            "L0110",
+                            span,
+                            format!("`{}` takes {} type argument(s)", k.display(), k.n_args()),
+                            "Write the type arguments.",
+                        ));
+                    }
+                    return Ok(crate::ty::iter::mk_iter(tys, k, &args));
+                }
                 // The hashed collections and hashers (W-STD-B): written
                 // args, with the default `S = RandomState` filled.
                 if let Some(k) = crate::ty::hash::HashTy::by_name(path[path.len() - 1])

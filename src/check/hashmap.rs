@@ -320,7 +320,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             if hash_parts(&self.tys, inner).is_some_and(|(k, _)| k == kind) {
                                 // There is no `IntoIterator for &mut HashSet`.
                                 if !(set && m.is_mut()) {
-                                    let ik = if set { K::SetIter } else if m.is_mut() { K::MapIterMut } else { K::MapIter };
+                                    let ik = if set {
+                                        K::SetIter
+                                    } else if m.is_mut() {
+                                        K::MapIterMut
+                                    } else {
+                                        K::MapIter
+                                    };
                                     found = Some((ik, Autoref::None, j));
                                 }
                                 break;
@@ -386,7 +392,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let it_t = self.deep(item);
             if matches!(self.kind(it_t), TyKind::Ref(..)) || matches!(self.kind(it_t), TyKind::Tuple(_)) {
                 let tn = self.tn(it_t);
-                self.err("L0640", self.span(*a), format!("`extend` from items of type `{tn}` is not implemented yet"), "Extend with owned items (`.copied()` or `.cloned()`).");
+                self.err(
+                    "L0640",
+                    self.span(*a),
+                    format!("`extend` from items of type `{tn}` is not implemented yet"),
+                    "Extend with owned items (`.copied()` or `.cloned()`).",
+                );
             } else {
                 self.mismatch(self.span(*a), want, it_t);
             }

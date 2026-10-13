@@ -3343,8 +3343,9 @@ impl<'p, 'a> Lower<'p, 'a> {
         let item = self.temp(item_ty);
         if let Res::ForTrait { into_iter, next } = self.ck.res(for_e) {
             // `for x in it`: into_iter() then next() until None,
-            // the Chars arm's shape with user methods.
-            let next_f = self.resolve_generic_fn(iter, next);
+            // the Chars arm's shape with user methods. A builtin
+            // iterator's `next` (sentinel id) is the builtin call.
+            let next_f = (next.0 != u32::MAX).then(|| self.resolve_generic_fn(iter, next));
             // The std blanket IntoIterator is synthetic with the
             // sentinel id: the receiver is already the iterator.
             let (iter_ty, it) = if into_iter.0 == u32::MAX {
@@ -3365,9 +3366,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             let mt = self.ref_ty(true, iter_ty);
             let r = self.temp(mt);
             self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
-            let ot = p.fn_info(next_f).ret;
+            let (ot, target) = match next_f {
+                Some(f) => (p.fn_info(f).ret, CallTarget::Fn(f)),
+                None => (self.body.tys.mk_option(item_ty), CallTarget::Builtin(Builtin::IterNext)),
+            };
             let nx = self.temp(ot);
-            self.call_into(CallTarget::Fn(next_f), vec![Operand::Move(Place::local(r))], Place::local(nx), span);
+            self.call_into(target, vec![Operand::Move(Place::local(r))], Place::local(nx), span);
             let d = self.temp(int(IntTy::U32));
             self.assign(Place::local(d), Rvalue::Discriminant(Place::local(nx)), span);
             let b = &mut self.body.blocks[self.cur.0 as usize];

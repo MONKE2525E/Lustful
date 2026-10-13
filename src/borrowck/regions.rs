@@ -3602,7 +3602,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let Some((ik, _)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
         let Some((_, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
         let (Some((&r, mv)), Some((&i, iv))) = (v0.split_first(), dv.split_first()) else { return false };
-        let parts: Vec<(Ty, usize)> = margs.iter().take(if ik == K::SetIter { 1 } else { 2 }).map(|&t| (t, self.sc.slots(t) as usize)).collect();
+        let parts: Vec<(Ty, usize)> =
+            margs.iter().take(if ik == K::SetIter { 1 } else { 2 }).map(|&t| (t, self.sc.slots(t) as usize)).collect();
         let n: usize = parts.iter().map(|p| p.1).sum();
         if mv.len() < n || iv.len() < n {
             return false;

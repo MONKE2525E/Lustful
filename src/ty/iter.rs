@@ -412,6 +412,22 @@ pub fn hash_for_iter(tys: &mut impl TyIntern, t: Ty) -> Option<Option<Ty>> {
     Some(Some(mk_iter(tys, kind, &args)))
 }
 
+/// The owning std iterator a full std type path names (W-STD-B):
+/// `vec::IntoIter<T>` and the hash `IntoIter`, `IntoKeys`, and
+/// `IntoValues`. The borrowing iterators (`slice::Iter<'a, T>`) carry a
+/// lifetime the region signatures do not model yet, so they stay
+/// unknown types.
+pub fn owning_by_path(path: &[&str]) -> Option<IterKind> {
+    Some(match path {
+        ["std" | "alloc", "vec", "IntoIter"] => IterKind::VecIntoIter,
+        ["std", "collections", "hash_map", "IntoIter"] => IterKind::MapIntoIter,
+        ["std", "collections", "hash_map", "IntoKeys"] => IterKind::MapIntoKeys,
+        ["std", "collections", "hash_map", "IntoValues"] => IterKind::MapIntoValues,
+        ["std", "collections", "hash_set", "IntoIter"] => IterKind::SetIntoIter,
+        _ => return None,
+    })
+}
+
 /// The iterator an `IntoIterator` argument (`extend`) turns into: a
 /// builtin iterator as itself, a Vec by value as `vec::IntoIter`, `&X`
 /// or `&mut X` over a Vec, slice, or array as a slice iterator, and a

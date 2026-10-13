@@ -2522,6 +2522,29 @@ pub(crate) fn resolve_path_ty(
                 }
                 return Ok(type_id_ty(tys));
             }
+            // The owning std iterators (W-STD-B, ty/iter.rs).
+            if let Some(k) = crate::ty::iter::owning_by_path(&path) {
+                let seg = segs.last().unwrap();
+                let args: Vec<Ty> = match &seg.args {
+                    GenericArgs::Angle(a) => {
+                        let kinds = vec![false; a.len()];
+                        resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, k.path().1)?
+                            .into_iter()
+                            .filter_map(|g| g.as_ty())
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                if args.len() != k.n_args() {
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        format!("`{}` takes {} type argument(s)", k.display(), k.n_args()),
+                        "Write the type arguments.",
+                    ));
+                }
+                return Ok(crate::ty::iter::mk_iter(tys, k, &args));
+            }
             // The hashed collections and hashers (W-STD-B, ty/hash.rs).
             if let Some(k) = crate::ty::hash::HashTy::by_name(path[path.len() - 1])
                 && matches!(path[1], "collections" | "hash")

@@ -550,7 +550,11 @@ impl Ex<'_, '_, '_> {
         let (kind, targs) = crate::ty::hash::hash_parts(&self.body.tys, t).ok_or("iterator expansion: extend of a non-table")?;
         let (lo, _) = self.hint(itp.clone(), ty)?;
         let u = self.local(UNIT);
-        self.call_builtin(Builtin::HashExtendReserve, vec![Operand::Copy(Place::local(table)), Operand::Copy(Place::local(lo))], Place::local(u));
+        self.call_builtin(
+            Builtin::HashExtendReserve,
+            vec![Operand::Copy(Place::local(table)), Operand::Copy(Place::local(lo))],
+            Place::local(u),
+        );
         let map = kind == crate::ty::hash::HashTy::HashMap;
         let old_ty = if map { self.body.tys.mk_option(targs[1]) } else { BOOL };
         self.each(&itp, ty, &mut |this, x, _| {
