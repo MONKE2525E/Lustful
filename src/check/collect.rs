@@ -1952,59 +1952,15 @@ pub fn collect_reuse<'a>(
                 d.default_variant = Some(marked[0].0);
             }
         }
-        // A type parameter must occur in a field (rustc E0392's
-        // class): an unused parameter has no layout meaning here.
-        {
-            let agx = &p.gx.adt_generics[id.0 as usize];
-            for (i, param) in agx.params.iter().enumerate() {
-                if param.kind != ParamKind::Type {
-                    continue;
-                }
-                let used = variants.iter().any(|v| v.fields.iter().any(|f| generics::ty_uses_param(&p.tys, f.ty, i as u32)));
-                if !used {
-                    errs.push(Diag::new(
-                        "L0110",
-                        param.span,
-                        format!("type parameter `{}` is never used", interner.get(param.name)),
-                        "Use the parameter in a field type, or remove it.",
-                    ));
-                }
-            }
-        }
-        // Regioned field types (W-BORROW), and a lifetime param must occur
-        // in a field (rustc E0392).
+        // Regioned field types (W-BORROW). Unused type and lifetime
+        // params (rustc E0392) are checked after every Adt has its
+        // fields (`variance::check_unused_params`).
         {
             let def = p.gx.adt_info[id.0 as usize].0;
             let mut by_variant: Vec<Vec<Ty>> = variants.iter().map(|v| v.fields.iter().map(|f| f.ty).collect()).collect();
             for &(vi, fi, r) in &region_fields {
                 if let Some(slot) = by_variant.get_mut(vi).and_then(|v| v.get_mut(fi)) {
                     *slot = r;
-                }
-            }
-            if let Some(names) = p.gx.adt_lifetimes.get(&def).cloned() {
-                let mut used: Vec<Region> = Vec::new();
-                for v in &by_variant {
-                    for &t in v {
-                        crate::borrowck::regions_of(&p.tys, t, &mut used);
-                    }
-                }
-                let spans: Vec<Span> = match &item.kind {
-                    ItemKind::Struct(st) => &st.generics.params,
-                    ItemKind::Enum(e) => &e.generics.params,
-                    _ => &[][..],
-                }
-                .iter()
-                .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.span) } else { None })
-                .collect();
-                for (i, n) in names.iter().enumerate() {
-                    if !used.contains(&Region::Param(i as u32)) {
-                        errs.push(Diag::new(
-                            "L0110",
-                            spans.get(i).copied().unwrap_or(p.adts[id.0 as usize].span),
-                            format!("lifetime parameter `'{}` is never used", interner.get(*n)),
-                            "Use the lifetime in a field type, or remove it.",
-                        ));
-                    }
                 }
             }
             p.regions.adt_fields.insert(def, by_variant);
@@ -2114,6 +2070,13 @@ pub fn collect_reuse<'a>(
                 }
             }
         }
+    }
+
+    // Unused type and lifetime params, now that every Adt has its
+    // fields (a use through another Adt reads that Adt's own uses).
+    {
+        let templates: Vec<(AdtId, usize)> = adt_id_of_item.iter().enumerate().filter_map(|(i, a)| a.map(|a| (a, i))).collect();
+        crate::check::variance::check_unused_params(&p, &templates, &mut errs);
     }
 
     // Derived traits need every field type to have the trait too.

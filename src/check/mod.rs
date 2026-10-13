@@ -11,6 +11,7 @@ pub mod method;
 pub mod object;
 pub mod obligations;
 pub mod picks;
+pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
@@ -1651,6 +1652,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         <Self as SolveCx>::rollback(self, snap);
     }
 
+    /// True when a fn item's signature unifies with a fn pointer type
+    /// (binding inference variables on either side). A failed probe
+    /// rolls its bindings back.
+    fn fn_item_ptr_unifies(&mut self, item: Ty, ptr: Ty) -> bool {
+        let Some((params, ret)) = self.callable_sig(item) else { return false };
+        let fp = self.fn_ptr_ty(&params, ret);
+        let snap = self.snapshot_vars();
+        if self.unify(fp, ptr) {
+            return true;
+        }
+        self.rollback_vars(snap);
+        false
+    }
+
     /// How many obligations wait, for probe rollback.
     fn obl_len(&self) -> usize {
         self.obl.len()
@@ -2543,6 +2558,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let b = self.tys.intern_dyn_bounds(bounds);
                 self.tys.intern(TyKind::Dyn(b, r))
             }
+            TyKind::FnPtr(sig) => {
+                let b = self.tys.sig(sig);
+                let old: Vec<Ty> = self.tys.tys_of(b.value.inputs).to_vec();
+                let new: Vec<Ty> = old.iter().map(|&e| self.rebuild(e, zonk)).collect();
+                let inputs = self.tys.intern_tys(&new);
+                let output = self.rebuild(b.value.output, zonk);
+                let sig = self.tys.intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..b.value } });
+                self.tys.intern(TyKind::FnPtr(sig))
+            }
             _ => t,
         }
     }
@@ -2638,6 +2662,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::FnDef(d, x), TyKind::FnDef(e, y)) => d == e && self.unify_args(x, y),
             (TyKind::Closure(d, x), TyKind::Closure(e, y)) => d == e && self.unify_args(x, y),
             (TyKind::Opaque(d, x), TyKind::Opaque(e, y)) => d == e && self.unify_args(x, y),
+            // Fn pointers unify part by part. Their binders hold only
+            // elided (late-bound) regions, which are erased here.
+            (TyKind::FnPtr(x), TyKind::FnPtr(y)) => {
+                let (sx, sy) = (self.tys.sig(x).value, self.tys.sig(y).value);
+                let n = self.tys.tys_of(sx.inputs).len();
+                if sx.is_unsafe != sy.is_unsafe || sx.extern_c != sy.extern_c || n != self.tys.tys_of(sy.inputs).len() {
+                    return false;
+                }
+                for i in 0..n {
+                    let (u, v) = (self.tys.tys_of(sx.inputs)[i], self.tys.tys_of(sy.inputs)[i]);
+                    if !self.unify(u, v) {
+                        return false;
+                    }
+                }
+                self.unify(sx.output, sy.output)
+            }
             // Two dyn types are equal when the principals and the written
             // auto traits are; regions are erased here, as for references.
             (TyKind::Dyn(x, _), TyKind::Dyn(y, _)) => {
@@ -2691,6 +2731,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(pr) => self.tys.args(pr.value.args).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|e| self.occurs(v, e))),
                 None => false,
             },
+            TyKind::FnPtr(sig) => {
+                let s = self.tys.sig(sig).value;
+                self.tys.tys_of(s.inputs).to_vec().into_iter().chain([s.output]).any(|e| self.occurs(v, e))
+            }
+            TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+                self.tys.args(a).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|e| self.occurs(v, e)))
+            }
             _ => false,
         }
     }
@@ -2868,10 +2915,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             // A plain fn item coerces to a function pointer with the
             // same signature (the value materializes as its trampoline).
-            (TyKind::FnDef(..), TyKind::FnPtr(_))
-                if self.is_fn_item(found)
-                    && self.callable_sig(found).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(expected)) =>
-            {
+            (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(found) && self.fn_item_ptr_unifies(found, expected) => {
                 // The expression now has the pointer type, so lowering
                 // materializes the trampoline value for it.
                 if let Some(e) = e {
@@ -4115,8 +4159,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // expression the pointer type for lowering.
                 let fn_cast = match (self.kind(t), self.kind(target)) {
                     (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) => {
-                        self.callable_sig(t).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(target))
-                            && self.coerce_at(t, target, span, Some(*expr))
+                        self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr))
                     }
                     (TyKind::FnPtr(_), TyKind::FnPtr(_)) => match (self.callable_sig(t), self.callable_sig(target)) {
                         (Some((pa, ra)), Some((pb, rb))) => {
