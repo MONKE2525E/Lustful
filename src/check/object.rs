@@ -109,8 +109,9 @@ pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
     for d in defs {
         info_of(p, d, &mut memo, &mut Vec::new());
     }
-    // Collect drops lifetime bounds, so the `'static` ones come from
-    // the AST; supertraits pass them down.
+    // A trait's own `'static` bound comes from the AST (collect keeps it
+    // only as a predicate); supertraits pass it down. The walk has no
+    // depth limit: a stopped walk would answer "not `'static`".
     let own: Vec<DefId> = p
         .ast
         .items
@@ -120,10 +121,19 @@ pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
             _ => None,
         })
         .collect();
-    fn via(memo: &FxMap<DefId, DynInfo>, own: &[DefId], d: DefId, depth: u32) -> bool {
-        own.contains(&d) || (depth < 64 && memo.get(&d).is_some_and(|i| i.supers.iter().any(|s| via(memo, own, s.def, depth + 1))))
+    // `seen` ends cycles (reported elsewhere) and skips a shared
+    // supertrait already searched without a hit.
+    fn via(memo: &FxMap<DefId, DynInfo>, own: &[DefId], d: DefId, seen: &mut Vec<DefId>) -> bool {
+        if own.contains(&d) {
+            return true;
+        }
+        if seen.contains(&d) {
+            return false;
+        }
+        seen.push(d);
+        memo.get(&d).is_some_and(|i| i.supers.iter().any(|s| via(memo, own, s.def, seen)))
     }
-    let flags: Vec<(DefId, bool)> = memo.keys().map(|&d| (d, via(&memo, &own, d, 0))).collect();
+    let flags: Vec<(DefId, bool)> = memo.keys().map(|&d| (d, via(&memo, &own, d, &mut Vec::new()))).collect();
     for (d, f) in flags {
         memo.get_mut(&d).unwrap().static_bound = f;
     }
@@ -680,6 +690,11 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
 // otherwise they are L0705. That rejects some programs rustc accepts,
 // never the reverse.
 
+/// The depth at which the lifetime walks over a type stop. A walk that
+/// reaches it has proved nothing, so it answers "cannot prove" (L0705
+/// or L0612), never "no error".
+pub const LIFETIME_WALK_LIMIT: u32 = 64;
+
 /// True when a dyn type an impl header names as its Self type has a
 /// `'static` object lifetime: `impl dyn Tr` and `impl X for dyn Tr` (the
 /// default outside a reference), or a written `+ 'static`. `+ '_` takes
@@ -740,8 +755,9 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     fn go(p: &Program, tys: &impl TyIntern, t: Ty, inv: bool, depth: u32) -> bool {
         let args_go = |a: crate::ty::ArgsId, inv: bool| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(p, tys, e, inv, depth + 1)));
-        if depth > 32 {
-            return false;
+        // Too deep to tell: count it as erased, so the body is not clean.
+        if depth > LIFETIME_WALK_LIMIT {
+            return true;
         }
         match tys.kind(t) {
             TyKind::Dyn(..) => (inv && !dyn_is_static(p, tys, t)) || principal_of(tys, t).is_some_and(|pr| args_go(pr.args, true)),
@@ -772,13 +788,22 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
 /// an erased object lifetime, a borrowing std iterator, or anything
 /// holding one.
 pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    may_borrow_in(p, tys, &[], t)
+}
+
+/// `may_borrow` under the param env `env`: a type parameter or
+/// projection the env bounds by `'static` (written, or implied by a
+/// `'static` trait) holds no borrow. Used where the value must be
+/// `'static` (an unsizing to a `'static` dyn type).
+pub fn may_borrow_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty) -> bool {
     match tys.kind(t) {
-        TyKind::Ref(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Closure(..) => true,
+        TyKind::Param(_) | TyKind::Projection(..) => !env.iter().any(|q| matches!(q, Predicate::TypeOutlives(x, Region::Static) if *x == t)),
+        TyKind::Ref(..) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Closure(..) => true,
         TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
-        TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow(p, tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow(p, tys, e)),
+        TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow_in(p, tys, env, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow_in(p, tys, env, e)),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) => {
-            tys.is_chars_ty(t) || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow(p, tys, e)))
+            tys.is_chars_ty(t) || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow_in(p, tys, env, e)))
         }
         _ => false,
     }
@@ -812,8 +837,8 @@ pub fn has_static_ref(tys: &impl TyIntern, t: Ty) -> bool {
 pub fn header_type_static(p: &Program, env: &[Predicate], t: Ty, dyn_self: bool) -> bool {
     fn go(p: &Program, env: &[Predicate], t: Ty, top: bool, depth: u32) -> bool {
         let args_ok = |a: ArgsId| p.tys.args(a).iter().all(|g| g.as_ty().is_none_or(|e| go(p, env, e, false, depth + 1)));
-        if depth > 32 {
-            return true;
+        if depth > LIFETIME_WALK_LIMIT {
+            return false;
         }
         match p.tys.kind(t) {
             TyKind::Ref(..) => false,

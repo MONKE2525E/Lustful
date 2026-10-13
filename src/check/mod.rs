@@ -1901,11 +1901,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// E0310); a dyn type needs a `'static` object lifetime, and a
     /// reference to one a written `&'static` (L0705). Other references
     /// pass: lust erases their lifetimes, a known gap shared with every
-    /// non-dyn reference.
+    /// non-dyn reference. A type that nests past the walk limit is
+    /// L0705: nothing is proved there.
     fn static_bound_err(&mut self, t: Ty, depth: u32) -> Option<(&'static str, String)> {
         let p = self.p;
-        if depth > 32 {
-            return None;
+        if depth > object::LIFETIME_WALK_LIMIT {
+            return Some(("L0705", "this type nests too deeply for lust to prove that it lives for `'static`".to_string()));
         }
         let in_args = |cx: &mut Self, a: ArgsId| {
             let args: Vec<GenericArg> = cx.tys.args(a).to_vec();
@@ -2737,11 +2738,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// `dyn_regions` over two unified types, in parallel. Sets
     /// `need_static` for a `'static` object lifetime that needs proof;
-    /// returns the reason when the regions cannot match.
+    /// returns the reason when the regions cannot match, or when the
+    /// types nest past the walk limit (nothing is proved there).
     fn region_walk(&mut self, f: Ty, e: Ty, invariant: bool, need_static: &mut bool, depth: u32) -> Option<String> {
         let p = self.p;
-        if depth > 32 || f == e {
+        if f == e {
             return None;
+        }
+        if depth > object::LIFETIME_WALK_LIMIT {
+            return Some("these types nest too deeply for lust to check their object lifetimes".to_string());
         }
         match (self.tys.kind(f), self.tys.kind(e)) {
             (TyKind::Dyn(bf, _), TyKind::Dyn(be, _)) => {
@@ -2977,6 +2982,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
             _ => AutoTraits::default(),
         };
+        // A `'static` target: written (`+ 'static`), or implied by a
+        // `'static` bound on the principal or one of its supertraits.
+        let to_static = object::dyn_is_static(p, &self.tys, y);
         if let Some(from) = object::principal_of(&self.tys, x) {
             let have = object::dyn_auto(p, &self.tys, x);
             let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
@@ -2989,7 +2997,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.mismatch(span, expected, found);
                 return None;
             }
-            if matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static)) && !object::dyn_is_static(p, &self.tys, x) {
+            if to_static && !object::dyn_is_static(p, &self.tys, x) {
                 self.obl.push(obligations::Obligation::DynStatic { span });
             }
             return Some(Coerce::Unsize(expected));
@@ -3004,8 +3012,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         }
-        let to_static = matches!(self.tys.kind(y), TyKind::Dyn(_, Region::Static));
-        let borrows = object::may_borrow(p, &self.tys, x);
+        // The source of a `'static` target must be `'static` itself; a
+        // type param passes with a `'static` bound in the env.
+        let borrows = if to_static { object::may_borrow_in(p, &self.tys, self.env(), x) } else { object::may_borrow(p, &self.tys, x) };
         if !to_static && borrows {
             self.dyn_borrow_src = true;
         }
@@ -3015,7 +3024,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "L0705",
                 span,
                 format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
-                "Use a type without references here, or drop the `'static` bound from the `dyn` type.",
+                "Use a type without references here, or drop the `'static` bound from the `dyn` type or its trait.",
             );
             return None;
         }
