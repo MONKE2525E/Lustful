@@ -5523,14 +5523,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str => true,
                 k if k.is_int_infer() || k.is_float_infer() || self.tys.is_string_ty(lb) => true,
                 _ if matches!(op, Eq | Ne) => has_eq(self.p, &self.tys, lb),
-                _ => false,
+                _ => has_ord(self.p, &self.tys, lb),
             };
             if !ok {
                 let tn = self.tn(lb);
                 let fix = if matches!(op, Eq | Ne) {
                     "Add #[derive(PartialEq)] to the type."
                 } else {
-                    "Ordering is only supported for integers, bool, char, and strings."
+                    "Ordering is only supported for integers, floats, bool, char, strings, and tuples of those."
                 };
                 self.err("L0112", span, format!("type `{tn}` cannot be compared with `{}`", op.symbol()), fix);
             }

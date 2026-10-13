@@ -2391,6 +2391,19 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
+/// True when the ordering operators apply in the subset today:
+/// scalars, strings, and tuples of orderable elements (lowered as a
+/// lexicographic expansion). Arrays, slices, and Adts stay rejects.
+pub fn has_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int() || v.is_float(),
+        TyKind::Ref(_, _, e) => has_ord(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| has_ord(p, tys, e)),
+        _ => tys.is_string_ty(t),
+    }
+}
+
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         // Fn pointers compare by address in Rust; fn items do not.

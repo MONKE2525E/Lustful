@@ -1277,6 +1277,16 @@ impl<'p, 'a> Lower<'p, 'a> {
         };
         let lt = self.ty(lhs);
         let base = self.peel(lt, ld);
+        if op.is_cmp() && !matches!(op, BinOp::Eq | BinOp::Ne) && matches!(self.kind(base), TyKind::Tuple(_) | TyKind::Unit) {
+            // Tuple ordering is lexicographic: the first unequal field
+            // decides, equal tuples order by the operator's reflexivity.
+            let ao = self.operand_derefs(lhs, ld);
+            let ap = self.op_place(ao, base, span);
+            let bo = self.operand_derefs(rhs, rd);
+            let bp = self.op_place(bo, base, span);
+            self.ord_into(op, ap, bp, base, out, span);
+            return;
+        }
         let rv = if op.is_cmp() {
             match self.kind(base) {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
@@ -1310,6 +1320,99 @@ impl<'p, 'a> Lower<'p, 'a> {
             Rvalue::Bin(op, a, b)
         };
         self.assign(out, rv, span);
+    }
+
+    /// A `&str` operand for a String or str place (a tuple field in an
+    /// ordering expansion).
+    fn str_place_view(&mut self, place: Place, ty: Ty, span: Span) -> Operand {
+        let rt = self.ref_ty(false, ty);
+        let r = self.temp(rt);
+        self.assign(Place::local(r), Rvalue::Ref(false, place), span);
+        if self.body.tys.is_string_ty(ty) {
+            let t = self.temp(REF_STR);
+            self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(Place::local(r))], Place::local(t), span);
+            Operand::Copy(Place::local(t))
+        } else {
+            Operand::Copy(Place::local(r))
+        }
+    }
+
+    /// Writes the comparison `a <op> b` for orderable places into
+    /// `out`. Tuples expand lexicographically, field by field, with a
+    /// short circuit on the first unequal field; equality of nested
+    /// tuples expands the same way. The checker gates the shapes this
+    /// can see through `has_ord`.
+    fn ord_into(&mut self, op: BinOp, a: Place, b: Place, ty: Ty, out: Place, span: Span) {
+        match self.kind(ty) {
+            TyKind::Unit => {
+                self.assign(out, Rvalue::Use(Operand::Const(Const::Bool(matches!(op, BinOp::Eq | BinOp::Le | BinOp::Ge)))), span)
+            }
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
+                let (x, y) = (self.operand_from(a, ty), self.operand_from(b, ty));
+                self.assign(out, Rvalue::Bin(op, x, y), span);
+            }
+            TyKind::Ref(_, _, inner) => self.ord_into(op, a.deref(), b.deref(), inner, out, span),
+            TyKind::Str => {
+                let (x, y) = (self.str_place_view(a, ty, span), self.str_place_view(b, ty, span));
+                self.assign(out, Rvalue::StrCmp(op, x, y), span);
+            }
+            _ if self.body.tys.is_string_ty(ty) => {
+                let (x, y) = (self.str_place_view(a, ty, span), self.str_place_view(b, ty, span));
+                self.assign(out, Rvalue::StrCmp(op, x, y), span);
+            }
+            TyKind::Tuple(ts) => {
+                let elems: Vec<Ty> = self.body.tys.tys_of(ts).to_vec();
+                let res = Place::local(self.temp(BOOL));
+                let end = self.new_block();
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.assign(res.clone(), Rvalue::Use(Operand::Const(Const::Bool(true))), span);
+                    for (i, &ety) in elems.iter().enumerate() {
+                        if self.kind(ety) == TyKind::Unit {
+                            continue;
+                        }
+                        let eq = Place::local(self.temp(BOOL));
+                        self.ord_into(BinOp::Eq, a.project(Proj::Field(i as u32)), b.project(Proj::Field(i as u32)), ety, eq.clone(), span);
+                        let (next, fail) = (self.new_block(), self.new_block());
+                        let blk = &mut self.body.blocks[self.cur.0 as usize];
+                        blk.term = Terminator::If(Operand::Copy(eq), next, fail);
+                        blk.term_span = span;
+                        self.cur = fail;
+                        self.assign(res.clone(), Rvalue::Use(Operand::Const(Const::Bool(false))), span);
+                        self.goto(end, span);
+                        self.cur = next;
+                    }
+                    self.goto(end, span);
+                    self.cur = end;
+                    if op == BinOp::Ne {
+                        self.assign(out, Rvalue::Un(crate::ast::UnOp::Not, Operand::Copy(res)), span);
+                    } else {
+                        self.assign(out, Rvalue::Use(Operand::Copy(res)), span);
+                    }
+                } else {
+                    self.assign(res.clone(), Rvalue::Use(Operand::Const(Const::Bool(matches!(op, BinOp::Le | BinOp::Ge)))), span);
+                    for (i, &ety) in elems.iter().enumerate() {
+                        if self.kind(ety) == TyKind::Unit {
+                            continue;
+                        }
+                        let (af, bf) = (a.project(Proj::Field(i as u32)), b.project(Proj::Field(i as u32)));
+                        let eq = Place::local(self.temp(BOOL));
+                        self.ord_into(BinOp::Eq, af.clone(), bf.clone(), ety, eq.clone(), span);
+                        let (next, decide) = (self.new_block(), self.new_block());
+                        let blk = &mut self.body.blocks[self.cur.0 as usize];
+                        blk.term = Terminator::If(Operand::Copy(eq), next, decide);
+                        blk.term_span = span;
+                        self.cur = decide;
+                        self.ord_into(op, af, bf, ety, res.clone(), span);
+                        self.goto(end, span);
+                        self.cur = next;
+                    }
+                    self.goto(end, span);
+                    self.cur = end;
+                    self.assign(out, Rvalue::Use(Operand::Copy(res)), span);
+                }
+            }
+            _ => self.assign(out, Rvalue::Use(Operand::Const(Const::Bool(false))), span),
+        }
     }
 
     /// A `&str` view of a String or str value reached through `n` references.
