@@ -4164,6 +4164,27 @@ pub(super) fn fn_item_coercions(p: &Program, body: &Body) -> Vec<Diag> {
                     format!("`{}` has an early-bound lifetime, so it cannot become a fn pointer that is generic over it", p.display_name(p.fn_info(*f).name)),
                     "Call the fn directly, or remove the bound that makes its lifetime early-bound.",
                 ));
+                continue;
+            }
+            // A fn pointer type names no lifetime (each is its own,
+            // late-bound), so an input that must be `'static` is less
+            // general than the pointer (rustc E0308; W-CHECK-G).
+            if sig.is_some_and(|s| {
+                let mut rs: Vec<Region> = Vec::new();
+                for &t in &s.params {
+                    regions_of(&p.tys, t, &mut rs);
+                }
+                rs.contains(&Region::Static)
+            }) {
+                out.push(Diag::new(
+                    "L0110",
+                    s.span,
+                    format!(
+                        "`{}` takes a `'static` borrow, so it cannot become a fn pointer that accepts any lifetime",
+                        p.display_name(p.fn_info(*f).name)
+                    ),
+                    "Call the fn directly, or take the parameter with an elided lifetime.",
+                ));
             }
         }
     }
