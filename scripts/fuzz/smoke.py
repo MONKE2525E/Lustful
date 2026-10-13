@@ -538,6 +538,25 @@ fn grown() -> i64 { 1 }
                              f"cold {r.returncode} {first_code(r.stderr)}")
             check(f"visibility edit, {name}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
 
+        # 17. Regression (fuzz seed 658, iter 374): the slot count crossed
+        # a unit boundary on dead slots only. A check gave 40 new fns slots
+        # past the first fn unit, the next edit removed them, and the warm
+        # run relinked the base over a new unit that no build compiled
+        # (`u5.o` not found). Every new unit must get an object.
+        gr = os.path.join(work, "grow_dead.rs")
+        gr_base = "".join(f"fn f{i}() -> i64 {{ {i} }}\n" for i in range(14))
+        gr_base += 'fn main() { println!("{}", ' + " + ".join(f"f{i}()" for i in range(14)) + "); }\n"
+        gr_dead = "".join(f"fn x{i}() -> i64 {{ {i} }}\n" for i in range(40))
+        open(gr, "w").write(gr_base)
+        rc1, out1, _ = run_lust(["run", gr, "-o", os.path.join(work, "gr.bin")])
+        open(gr, "w").write(gr_base + gr_dead)
+        rc2, _, _ = run_lust(["check", gr])
+        open(gr, "w").write(gr_base)
+        rc3, out3, err3 = run_lust(["run", gr, "-o", os.path.join(work, "gr.bin")])
+        check("dead slots past a unit boundary: warm run links and runs (seed 658)",
+              rc1 == 0 and out1 == "91\n" and rc2 == 0 and rc3 == 0 and out3 == "91\n",
+              f"rc1={rc1} rc2={rc2} rc3={rc3} out3={out3!r} err3={err3[:160]!r}")
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).
