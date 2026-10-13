@@ -597,6 +597,54 @@ fn grown() -> i64 { 1 }
                 ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
                 steps.append(f"want {want}: warm {rcw} {first_code(errw)} cold {r.returncode} {first_code(r.stderr)}")
             check(f"inner attributes, {name}: warm and cold give the rustc answer", ok, "; ".join(steps))
+        # 19. Regression (fx-append-chunk, found by fx-seed658): a chunk
+        # re-parse must replace that chunk's body items, not append next
+        # to the old ones. Step 1 checks a file with a fn nested in
+        # `main`; step 2 changes another fn's signature and runs. The
+        # stale nested fn made collect see one fn more than `fn_slot`
+        # and the warm build panicked (index out of bounds, caught by
+        # the daemon guard). A body-only edit of the outer fn and a
+        # delete/re-add of the nested fn must also stay exact.
+        logpath = os.path.join(work, "daemon.log")
+
+        def panics():
+            log.flush()
+            return open(logpath).read().count("panicked")
+
+        before_panics = panics()
+        nx = os.path.join(work, "nest.rs")
+        open(nx, "w").write(
+            'fn f0(x: i64) -> i64 {\n    x\n}\n\n'
+            'fn main() {\n    let p = 1;\n    fn zed() -> i64 { 3 }\n'
+            '    println!("{} {}", p + f0(1), zed());\n}\n')
+        rc1, _, _ = run_lust(["check", nx])
+        open(nx, "w").write(
+            'fn f0(x: i64, _z: i64) -> i64 {\n    x\n}\n\n'
+            'fn main() {\n    let p = 1;\n    fn zed() -> i64 { 3 }\n'
+            '    println!("{} {}", p + f0(1, 2), zed());\n}\n')
+        rc, out, err = run_lust(["run", nx, "-o", os.path.join(work, "nx.bin")])
+        check("signature edit with a nested fn runs warm (fx-append-chunk)",
+              rc1 == 0 and rc == 0 and out == "2 3\n" and panics() == before_panics,
+              f"rc1={rc1} rc={rc} out={out!r} err={err!r} panics={panics()}")
+        open(nx, "w").write(
+            'fn f0(x: i64, _z: i64) -> i64 {\n    x\n}\n\n'
+            'fn main() {\n    let p = 10;\n    fn zed() -> i64 { 3 }\n'
+            '    println!("{} {}", p + f0(1, 2), zed());\n}\n')
+        rc, out, err = run_lust(["run", nx, "-o", os.path.join(work, "nx.bin")])
+        check("body edit of the outer fn runs warm (fx-append-chunk)",
+              rc == 0 and out == "11 3\n" and panics() == before_panics,
+              f"rc={rc} out={out!r} err={err!r}")
+        open(nx, "w").write('fn main() {\n    println!("{}", 7);\n}\n')
+        rc, out, err = run_lust(["run", nx, "-o", os.path.join(work, "nx.bin")])
+        check("nested fn deleted: warm runs the new body (fx-append-chunk)",
+              rc == 0 and out == "7\n" and panics() == before_panics,
+              f"rc={rc} out={out!r} err={err!r}")
+        open(nx, "w").write(
+            'fn main() {\n    fn zed() -> i64 { 9 }\n    println!("{}", zed());\n}\n')
+        rc, out, err = run_lust(["run", nx, "-o", os.path.join(work, "nx.bin")])
+        check("nested fn re-added: warm runs the new body (fx-append-chunk)",
+              rc == 0 and out == "9\n" and panics() == before_panics,
+              f"rc={rc} out={out!r} err={err!r}")
 
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
