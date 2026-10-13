@@ -1187,6 +1187,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 if let Some(i) = info.ret_borrows_from {
                     self.holds_of(&args[i], st, &mut new_holds);
                     self.origins_of(&args[i], st, &mut new_origins);
+                } else if contains_ref(&self.body.tys, self.dest_ty(dest)) {
+                    // A result that holds references with no single
+                    // source parameter (a generic `fn keep<F>(f: F) -> F`
+                    // called with a closure that borrows): it may hold
+                    // any argument's loans, as in the indirect case.
+                    for o in args {
+                        self.holds_of(o, st, &mut new_holds);
+                        self.origins_of(o, st, &mut new_origins);
+                    }
                 }
                 self.flow_into_mut_args(args, st, span);
             }

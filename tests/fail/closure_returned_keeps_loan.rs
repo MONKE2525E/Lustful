@@ -1,4 +1,4 @@
-// expect: L0202
+// expect: L0303
 fn keep<F: Fn() -> usize>(f: F) -> F {
     f
 }
