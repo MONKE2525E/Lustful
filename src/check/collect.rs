@@ -742,6 +742,15 @@ fn std_names_without_use(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
             report(s.name, ast.expr_spans[i]);
         }
     }
+    // Variant patterns (`Ordering::Less =>`).
+    for (i, pat) in ast.pats.iter().enumerate() {
+        if let ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } = pat
+            && segs.len() > 1
+            && let Some(s) = segs.first()
+        {
+            report(s.name, ast.pat_spans[i]);
+        }
+    }
 }
 
 /// The reject for a canonical std type path that lust cannot mean

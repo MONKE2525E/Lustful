@@ -783,6 +783,7 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std", "alloc"], "rc", "Weak"),
     (&["std", "core"], "cell", "RefCell"),
     (&["std", "core"], "cell", "Cell"),
+    (&["std", "core"], "cmp", "Ordering"),
     (&["std"], "process", "ExitCode"),
 ];
 
