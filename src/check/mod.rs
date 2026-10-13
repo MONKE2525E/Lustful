@@ -232,6 +232,14 @@ pub enum Res {
         len: Builtin,
         elem: u64,
     },
+    /// A comparison trait method (`partial_cmp`, `cmp`, `eq`, `lt`,
+    /// and kin) on a scalar receiver: lowering emits the scalar
+    /// comparison directly, as the binary operators do. `derefs`
+    /// counts autoderefs from the receiver to the scalar.
+    PrimCmp {
+        kind: PrimCmpKind,
+        derefs: u8,
+    },
     /// A binary operator through an operator trait: the trait
     /// method to call (a template until mono rewrites it through
     /// `Checked::generic_args`), with operand deref counts.
@@ -278,6 +286,19 @@ pub enum Res {
         kind: closure::ClosureKind,
         derefs: u8,
     },
+}
+
+/// Which scalar comparison a `Res::PrimCmp` call computes. The
+/// Adt is `core::cmp::Ordering`'s session-local index (variants
+/// Less, Equal, Greater in that order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimCmpKind {
+    /// `PartialOrd::partial_cmp` -> `Option<Ordering>`.
+    Partial(AdtId),
+    /// `Ord::cmp` -> `Ordering`.
+    Total(AdtId),
+    /// `eq`/`ne`/`lt`/`le`/`gt`/`ge` -> `bool`, the binary comparison.
+    Op(ast::BinOp),
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -4091,6 +4112,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Some(Res::Builtin(Builtin::F32FromBits));
             }
         }
+        // `std::cmp::Ordering::Less` and kin: the one four-segment
+        // value path in the subset today (the enum is the synthetic
+        // Adt collect registers under its builtin def).
+        if names.len() == 4
+            && (names[0] == k.std || names[0] == k.core)
+            && self.name(names[1]) == "cmp"
+            && self.name(names[2]) == "Ordering"
+            && let Some(a) = p.tys.local_adt_of(generics::ordering_def())
+        {
+            return match p.adt(a).variants.iter().position(|v| v.name == names[3]) {
+                Some(v) => Some(Res::Variant(a, v as u32)),
+                None => {
+                    self.err(
+                        "L0104",
+                        span,
+                        format!("no variant `{}` on `Ordering`", self.name(names[3])),
+                        "Check the name: `Less`, `Equal`, or `Greater`.",
+                    );
+                    None
+                }
+            };
+        }
         if segs.len() != 2 {
             self.errs.push(not_yet("L0505", span, "module paths"));
             return None;
@@ -4922,6 +4965,110 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// A comparison trait method on a scalar receiver in method
+    /// form (`a.partial_cmp(b)`, `a.cmp(b)`, `a.eq(b)`, `a.lt(b)`,
+    /// and kin): core's impls for the scalar types are the scalar
+    /// comparisons themselves, so the call resolves here and
+    /// lowering emits them (`Res::PrimCmp`). This is also where a
+    /// template pick for one of these traits lands in an instance
+    /// (`builtin_only`: the trait was fixed by the template check,
+    /// so no ambiguity question is asked again). Without a pick,
+    /// another in-scope trait with an impl of the same method name
+    /// for this receiver makes the call ambiguous in rustc: the
+    /// probe then reports the ambiguity itself.
+    #[allow(clippy::too_many_arguments)]
+    fn prim_cmp_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        builtin_only: bool,
+    ) -> Option<Ty> {
+        if !turbofish.is_empty() {
+            return None;
+        }
+        let p = self.p;
+        let lang = &p.gx.lang;
+        let bk = self.kind(base);
+        let intlike = matches!(bk, TyKind::Int(_)) || bk.is_int_infer();
+        let floatlike = matches!(bk, TyKind::Float(_)) || bk.is_float_infer();
+        if !intlike && !floatlike && !matches!(bk, TyKind::Bool | TyKind::Char) {
+            return None;
+        }
+        let (kind, trait_def) = match self.name(name) {
+            "partial_cmp" => (PrimCmpKind::Partial(p.tys.local_adt_of(generics::ordering_def())?), lang.partial_ord),
+            "cmp" if !floatlike => (PrimCmpKind::Total(p.tys.local_adt_of(generics::ordering_def())?), lang.ord),
+            "eq" => (PrimCmpKind::Op(BinOp::Eq), lang.partial_eq),
+            "ne" => (PrimCmpKind::Op(BinOp::Ne), lang.partial_eq),
+            "lt" => (PrimCmpKind::Op(BinOp::Lt), lang.partial_ord),
+            "le" => (PrimCmpKind::Op(BinOp::Le), lang.partial_ord),
+            "gt" => (PrimCmpKind::Op(BinOp::Gt), lang.partial_ord),
+            "ge" => (PrimCmpKind::Op(BinOp::Ge), lang.partial_ord),
+            _ => return None,
+        };
+        if !builtin_only {
+            // Prelude traits are always in scope; a second in-scope
+            // trait with an impl for this receiver would make the
+            // call ambiguous (rustc E0034), never silently this one.
+            let others: Vec<DefId> = p
+                .gx
+                .traits_by_method
+                .get(&name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&d| d != trait_def && method::trait_in_scope_pub(self, d))
+                .collect();
+            for other in others {
+                let Some(rec) = p.gx.index.trait_record(other) else { continue };
+                let snap = self.snapshot_vars();
+                let obl_len = self.obl_len();
+                let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+                for _ in 1..rec.generics.params.len() {
+                    tr_args.push(GenericArg::Ty(self.new_var(false)));
+                }
+                let args_id = self.tys.intern_args(&tr_args);
+                let tr = TraitRef { def: other, args: args_id, bindings: EMPTY_BINDINGS };
+                let hits = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
+                self.rollback_vars(snap);
+                self.obl_truncate(obl_len);
+                if hits {
+                    // Declining would let the generic search below
+                    // take the other trait alone (the lang candidate
+                    // has no impl method fn there), which accepts a
+                    // call rustc rejects as ambiguous: report it here.
+                    self.err(
+                        "L0720",
+                        name_span,
+                        format!("multiple trait methods named `{}` apply here", self.name(name)),
+                        "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
+                    );
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return Some(ERROR);
+                }
+            }
+        }
+        self.check_packed_borrow(recv, name_span);
+        let other_ty = self.tys.mk_ref(false, base);
+        self.check_args(&[other_ty], args, name_span);
+        self.set_res(e, Res::PrimCmp { kind, derefs });
+        Some(match kind {
+            PrimCmpKind::Partial(_) => {
+                let ord = generics::ordering_ty(&mut self.tys);
+                self.tys.mk_option(ord)
+            }
+            PrimCmpKind::Total(_) => generics::ordering_ty(&mut self.tys),
+            PrimCmpKind::Op(_) => BOOL,
+        })
+    }
+
     fn method_call(
         &mut self,
         e: ExprId,
@@ -5088,6 +5235,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.check_args(&[], args, name_span);
                 return base;
             }
+        }
+        // Comparison trait methods on a scalar receiver
+        // (`partial_cmp`, `cmp`, `eq`, `lt`, and kin in method
+        // form): the template side is the lang stub, the instance
+        // side is the scalar comparison itself.
+        if let Some(ret) = self.prim_cmp_method(e, recv, base, derefs, name, name_span, args, turbofish, builtin_only) {
+            return ret;
         }
         use Builtin as B;
         // Builtin methods dispatch on the v2 builtin def in the first slot and on
@@ -9348,6 +9502,17 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
 
 /// The (Adt, variant) a path denotes in the compat tables.
 fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+    // `std::cmp::Ordering::Less`: the same four-segment path
+    // `resolve_assoc` answers, for const contexts.
+    if segs.len() == 4
+        && matches!(p.interner.get(segs[0].name), "std" | "core")
+        && p.interner.get(segs[1].name) == "cmp"
+        && p.interner.get(segs[2].name) == "Ordering"
+        && let Some(a) = p.tys.local_adt_of(generics::ordering_def())
+    {
+        let v = p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
+        return Some((a, v as u32));
+    }
     if segs.len() == 1 {
         let &a = p.type_names.get(&segs[0].name)?;
         if p.adt(a).is_enum {

@@ -1,7 +1,7 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
 use crate::ast::{self, BinOp, Expr, ExprId, FmtPiece, MacroKind, Pat, PatId, Stmt};
 use crate::check::collect::*;
-use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, Res};
+use crate::check::{Autoref, BindMode, Builtin, Checked, Coerce, PatRes, PrimCmpKind, Res};
 use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
@@ -1326,7 +1326,106 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Calls ----------
 
+    /// A scalar comparison trait method (`Res::PrimCmp`): the
+    /// receiver is borrowed `&self` (so borrowck sees the loan a
+    /// method call would make), both sides are read as scalars,
+    /// and the result is the scalar comparison, an `Ordering`
+    /// value, or an `Option<Ordering>` (`None` only when a float
+    /// comparison is unordered).
+    fn prim_cmp_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span, kind: PrimCmpKind, derefs: u8) {
+        use crate::check::PrimCmpKind as Ck;
+        let out_ty = self.ty(e);
+        let out = match dest {
+            Some(d) => d.clone(),
+            None => Place::local(self.temp(out_ty)),
+        };
+        if args.is_empty() {
+            return;
+        }
+        let recv_ty = self.peel(self.ty(recv), derefs);
+        let pl = Self::derefs(self.place(recv), derefs);
+        let rt_ty = self.ref_ty(false, recv_ty);
+        let rt = self.temp(rt_ty);
+        self.assign(Place::local(rt), Rvalue::Ref(false, pl), span);
+        let a = Operand::Copy(Place::local(rt).deref());
+        let b_ref = self.operand(args[0]);
+        let b_pl = self.op_place(b_ref, self.ty(args[0]), span);
+        let b = Operand::Copy(b_pl.deref());
+        match kind {
+            Ck::Op(op) => self.assign(out, Rvalue::Bin(op, a, b), span),
+            Ck::Total(adt) | Ck::Partial(adt) => {
+                let partial = matches!(kind, Ck::Partial(_));
+                let mut cmp = |this: &mut Self, op: BinOp| {
+                    let t = this.temp(BOOL);
+                    this.assign(Place::local(t), Rvalue::Bin(op, a.clone(), b.clone()), span);
+                    t
+                };
+                let lt = cmp(self, BinOp::Lt);
+                let gt = cmp(self, BinOp::Gt);
+                let eq = if partial { Some(cmp(self, BinOp::Eq)) } else { None };
+                let (ord_ty, ord_pl) = if partial {
+                    let t = self.body.tys.option_elem(out_ty).unwrap_or(out_ty);
+                    (t, Place::local(self.temp(t)))
+                } else {
+                    (out_ty, out.clone())
+                };
+                let _ = ord_ty;
+                let (less_b, gt_b, greater_b, eq_b, equal_b, none_b, wrap_b, end) = (
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                    self.new_block(),
+                );
+                let branch = |this: &mut Self, cond: Local, t: Bb, f: Bb| {
+                    let bb = &mut this.body.blocks[this.cur.0 as usize];
+                    bb.term = Terminator::If(Operand::Copy(Place::local(cond)), t, f);
+                    bb.term_span = span;
+                };
+                branch(self, lt, less_b, gt_b);
+                self.cur = less_b;
+                self.assign(ord_pl.clone(), Rvalue::Aggregate(adt, 0, Vec::new()), span);
+                self.goto(wrap_b, span);
+                self.cur = gt_b;
+                branch(self, gt, greater_b, eq_b);
+                self.cur = greater_b;
+                self.assign(ord_pl.clone(), Rvalue::Aggregate(adt, 2, Vec::new()), span);
+                self.goto(wrap_b, span);
+                self.cur = eq_b;
+                match eq {
+                    // `Ord::cmp`: not less and not greater is Equal.
+                    None => {
+                        self.assign(ord_pl.clone(), Rvalue::Aggregate(adt, 1, Vec::new()), span);
+                        self.goto(wrap_b, span);
+                    }
+                    Some(eq) => branch(self, eq, equal_b, none_b),
+                }
+                self.cur = equal_b;
+                self.assign(ord_pl.clone(), Rvalue::Aggregate(adt, 1, Vec::new()), span);
+                self.goto(wrap_b, span);
+                self.cur = none_b;
+                if partial {
+                    self.assign(out.clone(), Rvalue::Opt(out_ty, None), span);
+                }
+                self.goto(end, span);
+                self.cur = wrap_b;
+                if partial {
+                    self.assign(out, Rvalue::Opt(out_ty, Some(Operand::Copy(ord_pl))), span);
+                }
+                self.goto(end, span);
+                self.cur = end;
+            }
+        }
+    }
+
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
+        if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
+            self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
+            return;
+        }
         let (callee, derefs, autoref) = match self.ck.res(e) {
             Res::Method { f, derefs, autoref } => (Ok(f), derefs, autoref),
             Res::BuiltinMethod { b, derefs, autoref } => (Err(b), derefs, autoref),

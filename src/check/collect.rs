@@ -1165,6 +1165,19 @@ pub fn collect_with_order<'a>(
             adt_srcs.push((idx, name, span, is_enum, hash));
         }
     }
+    // `core::cmp::Ordering` is an ordinary fieldless enum Adt with a
+    // builtin def (lang signatures name it; its variants and derives
+    // are the plain enum machinery). It takes part in the same stable
+    // ranking as user Adts (the driver predicts the same set: see
+    // `predicted_def_ids`). A user type, alias, or trait of the same
+    // name shadows it in the flat name table, as with any name here.
+    let ordering_name = interner.intern("Ordering");
+    let ordering_taken = adt_srcs.iter().any(|s| s.1 == ordering_name)
+        || p.gx.trait_names.contains_key(&ordering_name)
+        || ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Type(a) if a.name == ordering_name));
+    if !ordering_taken {
+        adt_srcs.push((usize::MAX, ordering_name, Span::default(), true, generics::ordering_def().hash));
+    }
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -1190,6 +1203,27 @@ pub fn collect_with_order<'a>(
     }
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
+        if item_idx == usize::MAX {
+            // The synthetic `Ordering` Adt (see above): variants and
+            // derives are core's, written here directly (no AST item).
+            let id = AdtId(adt_base as u32 + rank);
+            let def = generics::ordering_def();
+            let variant = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc };
+            p.adts[id.0 as usize] = AdtDef {
+                name,
+                is_enum: true,
+                variants: vec![variant("Less", -1), variant("Equal", 0), variant("Greater", 1)],
+                derives: Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true },
+                span,
+                repr: crate::ty::layout::Repr::default(),
+            };
+            p.gx.adt_info[id.0 as usize] = (def, 0);
+            p.type_names.insert(name, id);
+            p.tys.register_adt(def, id);
+            p.defs.insert_adt(def, id, DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span));
+            p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
+            continue;
+        }
         let item = &ast.items[item_idx];
         let id = AdtId(adt_base as u32 + rank);
         adt_id_of_item[item_idx] = Some(id);
@@ -2552,6 +2586,17 @@ impl CollectCx<'_, '_> {
 
     /// The (Adt, variant) a two-segment path or a struct name denotes.
     fn variant_of(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        // `std::cmp::Ordering::Less`: the same four-segment path
+        // `resolve_assoc` answers, for const contexts.
+        if segs.len() == 4
+            && matches!(self.p.interner.get(segs[0].name), "std" | "core")
+            && self.p.interner.get(segs[1].name) == "cmp"
+            && self.p.interner.get(segs[2].name) == "Ordering"
+            && let Some(a) = self.p.tys.local_adt_of(generics::ordering_def())
+        {
+            let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
+            return Some((a, v as u32));
+        }
         if segs.len() == 1 {
             let &a = self.p.type_names.get(&segs[0].name)?;
             if self.p.adt(a).is_enum {

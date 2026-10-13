@@ -227,6 +227,36 @@ mod tests {
         });
     }
 
+    /// The lang signature table is built from the lang trait
+    /// records: `PartialOrd::partial_cmp` exists with an
+    /// `Option<Ordering>` return, the comparison defaults exist,
+    /// and methods a bound cannot call (`Hash::hash`,
+    /// `Debug::fmt`) have no entry.
+    #[test]
+    fn lang_sigs_come_from_the_records() {
+        use crate::ty::TyIntern as _;
+        let src = "fn main() { println!(\"x\"); }\n";
+        with_program(src, |interner, p| {
+            let lang = &p.gx.lang;
+            let sig_of = |trait_def, name: &str| {
+                let rec = p.gx.index.trait_record(trait_def).expect("lang record");
+                let m = rec.method_by_name(interner.intern(name)).expect("record method");
+                p.gx.lang_method_sigs.get(&m)
+            };
+            let pc = sig_of(lang.partial_ord, "partial_cmp").expect("partial_cmp sig");
+            assert_eq!(pc.self_kind, Some(crate::ast::SelfKind::Ref));
+            let elem = p.tys.option_elem(pc.ret).expect("Option return");
+            assert_eq!(p.tys.adt_parts(elem).map(|(d, _)| d), Some(crate::check::generics::ordering_def()));
+            assert!(sig_of(lang.partial_ord, "lt").is_some());
+            assert!(sig_of(lang.ord, "cmp").is_some());
+            assert!(sig_of(lang.add, "add").is_some());
+            assert!(sig_of(lang.add_assign, "add_assign").is_some());
+            assert!(sig_of(lang.hash, "hash").is_none());
+            assert!(sig_of(lang.debug, "fmt").is_none());
+            assert!(sig_of(lang.drop, "drop").is_none());
+        });
+    }
+
     /// `lust check` makes closure body fns (they check closure bodies)
     /// but no generic fn instances; a build makes both (ARCH 4.1).
     #[test]

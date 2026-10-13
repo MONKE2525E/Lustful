@@ -291,6 +291,13 @@ pub(super) fn trait_probe_for(
     // Traits whose selection stays ambiguous after the argument
     // trial: (trait, method template, inferred inputs, variant).
     let mut deferred: Vec<(DefId, TraitMethodTemplate, Vec<Ty>, RcvProbe)> = Vec::new();
+    // Lang traits selection picks an impl for but that have no
+    // impl method fn to call (a derived or synthetic impl, or a
+    // core default method like `PartialOrd::lt`): rustc counts
+    // them as candidates all the same, so they still make a call
+    // ambiguous next to a real hit. Alone they stay a miss (the
+    // builtin dispatch or the no-method error answers).
+    let mut lang_hits: Vec<DefId> = Vec::new();
     for trait_def in traits {
         if only.is_none() && !trait_in_scope(cx, trait_def) {
             continue;
@@ -298,18 +305,32 @@ pub(super) fn trait_probe_for(
         let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
         let Some(method_def) = rec.method_by_name(name) else { continue };
         // Lang traits have no method templates: the receiver
-        // form and signature come from the impl method itself
-        // once selection picks it (below).
+        // form comes from the lang signature table instead, and
+        // the signature from the impl method itself once
+        // selection picks it (below).
         let tmpl = p.gx.trait_methods.get(&method_def).cloned();
         if tmpl.as_ref().is_some_and(|t| t.self_kind.is_none()) {
             continue;
         }
+        let lang_self_kind = if tmpl.is_none() {
+            match p.gx.lang_method_sigs.get(&method_def) {
+                Some(sig) => {
+                    if sig.self_kind.is_none() {
+                        continue;
+                    }
+                    sig.self_kind
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         for &probe in probes {
             let step = probe.self_ty;
             let form = probe.filter;
             // Receiver-form pre-filter for plain receivers; typed
             // receivers are decided by unification in confirm.
-            match tmpl.as_ref().and_then(|t| t.self_kind) {
+            match tmpl.as_ref().and_then(|t| t.self_kind).or(lang_self_kind) {
                 Some(SelfKind::Value) if form != ReceiverForm::Value => continue,
                 Some(SelfKind::Ref) if form != ReceiverForm::Ref => continue,
                 Some(SelfKind::RefMut) if form != ReceiverForm::RefMut => continue,
@@ -335,6 +356,7 @@ pub(super) fn trait_probe_for(
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
             let sel = cx.select_obligation(tr);
             let ambiguous = matches!(sel, Selection::Ambiguous);
+            let was_impl = matches!(sel, Selection::Impl { .. });
             let found: Option<(LocalDefId, Vec<GenericArg>, Option<(Ty, Ty)>)> = match sel {
                 Selection::Impl { id, args: impl_args, .. } => {
                     let rec_impl = p.gx.index.get(id);
@@ -404,6 +426,15 @@ pub(super) fn trait_probe_for(
             if let Some((local, prefix, bridge)) = found {
                 hits.push((trait_def, tmpl.clone(), local, prefix, zonked_inputs, probe, bridge));
                 continue;
+            }
+            if was_impl
+                && !rec.local
+                && trait_def != p.gx.lang.into
+                && !matches!(trait_def, d if d == p.gx.lang.fn_ || d == p.gx.lang.fn_mut || d == p.gx.lang.fn_once)
+                && p.gx.lang_method_sigs.get(&method_def).is_some_and(|s| s.self_kind.is_some())
+                && !lang_hits.contains(&trait_def)
+            {
+                lang_hits.push(trait_def);
             }
             // Ambiguous selection with fresh trait inputs is common
             // with one impl per input (`Convert<u8>` and
@@ -513,6 +544,22 @@ pub(super) fn trait_probe_for(
                 }
             }
         }
+    }
+    // A lang candidate with no callable method fn still ties
+    // with a real hit or a deferred call (rustc E0034).
+    let lang_only: Vec<DefId> =
+        lang_hits.iter().copied().filter(|d| !hits.iter().any(|h| h.0 == *d) && !deferred.iter().any(|h| h.0 == *d)).collect();
+    if !lang_only.is_empty() && hits.len() + deferred.len() >= 1 {
+        cx.err(
+            "L0720",
+            name_span,
+            format!("multiple trait methods named `{}` apply here", cx.name(name)),
+            "Call the method with a fully qualified path, such as `<Type as Trait>::method(...)`.",
+        );
+        for &a in args {
+            cx.expr(a, None);
+        }
+        return Probe::Failed;
     }
     // Only ambiguous traits: one is the call (its impl is picked at
     // body end), two are ambiguous between traits (rustc E0034).

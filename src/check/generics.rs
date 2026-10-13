@@ -318,7 +318,7 @@ impl LangTraits {
     }
 
     /// True for lang traits whose last input defaults to Self
-    /// (`PartialEq<Rhs = Self>`, the binary operators).
+    /// (`PartialEq<Rhs = Self>`, the binary and assignment operators).
     pub fn input_defaults_to_self(&self, def: DefId) -> bool {
         [
             self.partial_eq,
@@ -333,6 +333,16 @@ impl LangTraits {
             self.bit_xor,
             self.shl,
             self.shr,
+            self.add_assign,
+            self.sub_assign,
+            self.mul_assign,
+            self.div_assign,
+            self.rem_assign,
+            self.bit_and_assign,
+            self.bit_or_assign,
+            self.bit_xor_assign,
+            self.shl_assign,
+            self.shr_assign,
         ]
         .contains(&def)
     }
@@ -388,7 +398,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.display, "Display", 0, vec![], vec![], &["fmt"]),
         rec(lang.partial_eq, "PartialEq", 1, vec![], vec![], &["eq", "ne"]),
         rec(lang.eq, "Eq", 0, vec![self_pred(tys, lang.partial_eq, &[0])], vec![], &[]),
-        rec(lang.partial_ord, "PartialOrd", 1, vec![self_pred(tys, lang.partial_eq, &[0])], vec![], &["partial_cmp"]),
+        rec(lang.partial_ord, "PartialOrd", 1, vec![self_pred(tys, lang.partial_eq, &[1])], vec![], &["partial_cmp", "lt", "le", "gt", "ge"]),
         rec(lang.ord, "Ord", 0, vec![self_pred(tys, lang.eq, &[]), self_pred(tys, lang.partial_ord, &[0])], vec![], &["cmp"]),
         rec(lang.hash, "Hash", 0, vec![], vec![], &["hash"]),
         rec(lang.default, "Default", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["default"]),
@@ -439,6 +449,157 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.fn_mut, "FnMut", 1, vec![self_pred(tys, lang.fn_once, &[1])], vec![], &["call_mut"]),
         rec(lang.fn_once, "FnOnce", 1, vec![], vec![(lang.output_of(lang.fn_once).unwrap(), "Output")], &["call_once"]),
     ]
+}
+
+/// The def of `core::cmp::Ordering`, the fieldless enum lang
+/// signatures below name. Collect registers a local Adt for it
+/// (its variants, layout, and derives are the ordinary enum
+/// machinery); this def is its stable identity.
+pub fn ordering_def() -> DefId {
+    lang_def(&["core", "cmp"], crate::def::DefKind::Adt, "Ordering")
+}
+
+/// The `core::cmp::Ordering` type.
+pub fn ordering_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(ordering_def(), EMPTY_ARGS))
+}
+
+/// The signature of one lang trait method over the trait's generics
+/// (Self at 0, then the inputs): receiver form, parameter types
+/// with the receiver first, return type, and which parameter a
+/// returned reference borrows from. This is the lang half of
+/// `TraitMethodTemplate` (lang methods have no AST def or body);
+/// `add_trait_method_stubs` turns each entry into the stub fn a
+/// template check calls through a bound.
+#[derive(Clone, Debug)]
+pub struct LangMethodSig {
+    pub self_kind: Option<ast::SelfKind>,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    pub ret_borrows_from: Option<usize>,
+}
+
+/// Builds the lang method signatures from the lang trait records:
+/// one entry per (trait, method) the records declare, keyed by
+/// method def. The match is by trait and method name together, so
+/// a method only ever gets its own trait's signature; the operator
+/// families are the closed list of lang operator traits. Methods
+/// with no entry are ones a body cannot call through a bound in
+/// this subset: `fmt` and `hash` name types lust has no def for
+/// yet (`Formatter`, `Hasher`), `from_iter` has a method-level
+/// generic the stub form cannot state, and `drop` is not callable.
+pub fn lang_method_sigs(lang: &LangTraits, interner: &Interner, tys: &mut impl TyIntern, records: &[TraitRecord]) -> FxMap<DefId, LangMethodSig> {
+    use ast::SelfKind::{Ref, RefMut, Value};
+    let p0 = tys.intern(TyKind::Param(ParamId(0)));
+    let p1 = tys.intern(TyKind::Param(ParamId(1)));
+    let r0 = tys.mk_ref(false, p0);
+    let m0 = tys.mk_ref(true, p0);
+    let r1 = tys.mk_ref(false, p1);
+    let ord = ordering_ty(tys);
+    let proj = |tys: &mut dyn TyIntern, assoc: DefId, args: &[Ty]| {
+        let a: Vec<GenericArg> = args.iter().map(|&t| GenericArg::Ty(t)).collect();
+        let a = tys.intern_args(&a);
+        tys.intern(TyKind::Projection(AssocId(assoc), a))
+    };
+    let binops = [
+        (lang.add, "add"),
+        (lang.sub, "sub"),
+        (lang.mul, "mul"),
+        (lang.div, "div"),
+        (lang.rem, "rem"),
+        (lang.bit_and, "bitand"),
+        (lang.bit_or, "bitor"),
+        (lang.bit_xor, "bitxor"),
+        (lang.shl, "shl"),
+        (lang.shr, "shr"),
+    ];
+    let unops = [(lang.neg, "neg"), (lang.not, "not")];
+    let assigns = [
+        (lang.add_assign, "add_assign"),
+        (lang.sub_assign, "sub_assign"),
+        (lang.mul_assign, "mul_assign"),
+        (lang.div_assign, "div_assign"),
+        (lang.rem_assign, "rem_assign"),
+        (lang.bit_and_assign, "bitand_assign"),
+        (lang.bit_or_assign, "bitor_assign"),
+        (lang.bit_xor_assign, "bitxor_assign"),
+        (lang.shl_assign, "shl_assign"),
+        (lang.shr_assign, "shr_assign"),
+    ];
+    let mut out: FxMap<DefId, LangMethodSig> = FxMap::default();
+    for rec in records {
+        for &(method_def, name) in &rec.methods {
+            let name: &str = interner.get(name);
+            let sig = match (rec.def, name) {
+                (d, "clone") if d == lang.clone => LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: p0, ret_borrows_from: None },
+                (d, "next") if d == lang.iterator => {
+                    let item = proj(tys, lang.assoc_item, &[p0]);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                }
+                (d, "into_iter") if d == lang.into_iterator => {
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: proj(tys, lang.assoc_into_iter, &[p0]), ret_borrows_from: None }
+                }
+                (d, "deref") if d == lang.deref => {
+                    let t = proj(tys, lang.assoc_target, &[p0]);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: tys.mk_ref(false, t), ret_borrows_from: Some(0) }
+                }
+                (d, "deref_mut") if d == lang.deref_mut => {
+                    let t = proj(tys, lang.assoc_target, &[p0]);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_ref(true, t), ret_borrows_from: Some(0) }
+                }
+                (d, "from") if d == lang.from => LangMethodSig { self_kind: None, params: vec![p1], ret: p0, ret_borrows_from: None },
+                (d, "into") if d == lang.into => LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: p1, ret_borrows_from: None },
+                (d, "default") if d == lang.default => LangMethodSig { self_kind: None, params: Vec::new(), ret: p0, ret_borrows_from: None },
+                (d, "eq" | "ne") if d == lang.partial_eq => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: BOOL, ret_borrows_from: None }
+                }
+                (d, "partial_cmp") if d == lang.partial_ord => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: tys.mk_option(ord), ret_borrows_from: None }
+                }
+                (d, "lt" | "le" | "gt" | "ge") if d == lang.partial_ord => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: BOOL, ret_borrows_from: None }
+                }
+                (d, "cmp") if d == lang.ord => LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None },
+                (d, "len") if d == lang.exact_size_iterator => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: USIZE, ret_borrows_from: None }
+                }
+                (d, "index") if d == lang.index => {
+                    let o = proj(tys, lang.assoc_index_output, &[p0, p1]);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, p1], ret: tys.mk_ref(false, o), ret_borrows_from: Some(0) }
+                }
+                (d, "index_mut") if d == lang.index_mut => {
+                    let o = proj(tys, lang.assoc_index_output, &[p0, p1]);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0, p1], ret: tys.mk_ref(true, o), ret_borrows_from: Some(0) }
+                }
+                (d, "call" | "call_mut" | "call_once") if lang.output_of(d).is_some() => {
+                    let out_ty = proj(tys, lang.output_of(d).unwrap(), &[p0, p1]);
+                    let (kind, recv) = match name {
+                        "call" => (Some(Ref), r0),
+                        "call_mut" => (Some(RefMut), m0),
+                        _ => (Some(Value), p0),
+                    };
+                    LangMethodSig { self_kind: kind, params: vec![recv, p1], ret: out_ty, ret_borrows_from: None }
+                }
+                (d, n) if binops.contains(&(d, n)) => {
+                    // Binary operators: `fn add(self, rhs: Rhs) -> Self::Output`.
+                    let o = proj(tys, lang.output_of(d).unwrap(), &[p0, p1]);
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0, p1], ret: o, ret_borrows_from: None }
+                }
+                (d, n) if unops.contains(&(d, n)) => {
+                    // Unary operators: `fn neg(self) -> Self::Output`.
+                    let o = proj(tys, lang.output_of(d).unwrap(), &[p0]);
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: o, ret_borrows_from: None }
+                }
+                (d, n) if assigns.contains(&(d, n)) => {
+                    // Assignment operators: `fn add_assign(&mut self, rhs: Rhs)`.
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0, p1], ret: UNIT, ret_borrows_from: None }
+                }
+                _ => continue,
+            };
+            out.insert(method_def, sig);
+        }
+    }
+    out
 }
 
 /// One type that associated types can be projected from in a
@@ -1505,6 +1666,10 @@ pub struct GenTables<'a> {
     pub trait_names: FxMap<Sym, DefId>,
     pub trait_scopes: FxMap<DefId, Scope>,
     pub trait_methods: FxMap<DefId, TraitMethodTemplate<'a>>,
+    /// Signatures of the lang trait methods, by method def
+    /// (`lang_method_sigs`, built from the lang trait records in
+    /// `init_lang`): the lang counterpart of `trait_methods`.
+    pub lang_method_sigs: FxMap<DefId, LangMethodSig>,
     /// Associated type defaults from trait definitions, in trait
     /// signature form (over the trait's params, Self at 0).
     pub trait_assoc_defaults: FxMap<DefId, Ty>,
@@ -1585,6 +1750,7 @@ impl Default for GenTables<'_> {
             trait_names: FxMap::default(),
             trait_scopes: FxMap::default(),
             trait_methods: FxMap::default(),
+            lang_method_sigs: FxMap::default(),
             trait_assoc_defaults: FxMap::default(),
             trait_unsafe: FxMap::default(),
             trait_assoc_consts: FxMap::default(),
@@ -1644,6 +1810,7 @@ pub fn ty_uses_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
 /// def table. Runs first in generic collection.
 pub fn init_lang(p: &mut Program) {
     let records = lang_trait_records(&p.gx.lang, p.interner, &mut p.tys);
+    p.gx.lang_method_sigs = lang_method_sigs(&p.gx.lang, p.interner, &mut p.tys, &records);
     for rec in records {
         let mut data =
             crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Trait, None, rec.name, crate::ty::defs::Vis::Pub, Span::default());
@@ -3173,77 +3340,6 @@ pub fn instance_for(p: &Program, src: &dyn TyIntern, template: LocalDefId, args:
     None
 }
 
-/// The signature of one lang trait method as a fn over the trait's
-/// generics (Self at 0, then the inputs): (receiver form, params with
-/// the receiver first, return type, which param a returned reference
-/// borrows from). None for methods a body cannot call through a bound
-/// in this subset (`fmt`, `hash`, `cmp`, `partial_cmp`, `drop`).
-fn lang_method_sig(p: &mut Program, trait_def: DefId, method: &str) -> Option<(Option<ast::SelfKind>, Vec<Ty>, Ty, Option<usize>)> {
-    use ast::SelfKind::{Ref, RefMut, Value};
-    let lang = p.gx.lang;
-    let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
-    let p1 = p.tys.intern(TyKind::Param(ParamId(1)));
-    let r0 = p.tys.mk_ref(false, p0);
-    let m0 = p.tys.mk_ref(true, p0);
-    let proj = |p: &mut Program, assoc: DefId, args: &[Ty]| {
-        let a: Vec<GenericArg> = args.iter().map(|&t| GenericArg::Ty(t)).collect();
-        let a = p.tys.intern_args(&a);
-        p.tys.intern(TyKind::Projection(AssocId(assoc), a))
-    };
-    Some(match method {
-        "clone" if trait_def == lang.clone => (Some(Ref), vec![r0], p0, None),
-        "next" if trait_def == lang.iterator => {
-            let item = proj(p, lang.assoc_item, &[p0]);
-            (Some(RefMut), vec![m0], p.tys.mk_option(item), None)
-        }
-        "into_iter" if trait_def == lang.into_iterator => (Some(Value), vec![p0], proj(p, lang.assoc_into_iter, &[p0]), None),
-        "deref" if trait_def == lang.deref => {
-            let t = proj(p, lang.assoc_target, &[p0]);
-            (Some(Ref), vec![r0], p.tys.mk_ref(false, t), Some(0))
-        }
-        "deref_mut" if trait_def == lang.deref_mut => {
-            let t = proj(p, lang.assoc_target, &[p0]);
-            (Some(RefMut), vec![m0], p.tys.mk_ref(true, t), Some(0))
-        }
-        "from" if trait_def == lang.from => (None, vec![p1], p0, None),
-        "into" if trait_def == lang.into => (Some(Value), vec![p0], p1, None),
-        "default" if trait_def == lang.default => (None, Vec::new(), p0, None),
-        "eq" | "ne" if trait_def == lang.partial_eq => {
-            let r1 = p.tys.mk_ref(false, p1);
-            (Some(Ref), vec![r0, r1], BOOL, None)
-        }
-        "len" if trait_def == lang.exact_size_iterator => (Some(Ref), vec![r0], USIZE, None),
-        "index" if trait_def == lang.index => {
-            let o = proj(p, lang.assoc_index_output, &[p0, p1]);
-            (Some(Ref), vec![r0, p1], p.tys.mk_ref(false, o), Some(0))
-        }
-        "index_mut" if trait_def == lang.index_mut => {
-            let o = proj(p, lang.assoc_index_output, &[p0, p1]);
-            (Some(RefMut), vec![m0, p1], p.tys.mk_ref(true, o), Some(0))
-        }
-        "call" | "call_mut" | "call_once" => {
-            let out = proj(p, lang.output_of(trait_def)?, &[p0, p1]);
-            let recv = match method {
-                "call" => (Some(Ref), r0),
-                "call_mut" => (Some(RefMut), m0),
-                _ => (Some(Value), p0),
-            };
-            (recv.0, vec![recv.1, p1], out, None)
-        }
-        _ => {
-            let out = lang.output_of(trait_def)?;
-            let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len() - 1;
-            if n_inputs == 1 {
-                // Binary operators: `fn add(self, rhs: Rhs) -> Self::Output`.
-                (Some(Value), vec![p0, p1], proj(p, out, &[p0, p1]), None)
-            } else {
-                // Unary operators: `fn neg(self) -> Self::Output`.
-                (Some(Value), vec![p0], proj(p, out, &[p0]), None)
-            }
-        }
-    })
-}
-
 /// One signature fn per method of each trait a template's env names,
 /// for the calls a template check proves through its param env
 /// (`t.m()` with `T: Tr` in the bounds, no impl to select). It is the callee that lowering and borrowck
@@ -3286,8 +3382,10 @@ fn add_trait_method_stubs(p: &mut Program) {
         let (def, self_kind, params, ret, ret_borrows_from, generics) = match p.gx.trait_methods.get(&method_def) {
             Some(t) => (t.def, t.self_kind, t.params.clone(), t.ret, t.ret_borrows_from, t.generics.clone()),
             None => {
-                let mname = p.name(name).to_string();
-                let Some((self_kind, params, ret, rb)) = lang_method_sig(p, trait_def, &mname) else { continue };
+                // A lang trait method: its signature comes from the
+                // table built out of the lang trait records.
+                let Some(sig) = p.gx.lang_method_sigs.get(&method_def).cloned() else { continue };
+                let (self_kind, params, ret, rb) = (sig.self_kind, sig.params, sig.ret, sig.ret_borrows_from);
                 let Some(rec) = p.gx.index.trait_record(trait_def) else { continue };
                 let generics = Generics { parent: None, params: rec.generics.params.clone(), predicates: Vec::new() };
                 // Lang methods have no AST def; stubs are never

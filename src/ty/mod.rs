@@ -780,13 +780,16 @@ pub trait TyIntern {
     }
     /// The session-local index of a user Adt type. None for builtin Adts and
     /// non-Adt types; builtin checks must run first where both can appear.
-    /// The builtin sentinel crate answers without a table lookup, which keeps
-    /// this at the old closed-kind match cost on builtin receivers. A
-    /// generic application answers with its materialized instance
-    /// when mono has made one, and with the template otherwise.
+    /// The builtin def list answers without a table lookup, which keeps
+    /// this at the old closed-kind match cost on builtin receivers. (Not
+    /// the builtin crate as a whole: `core::cmp::Ordering` carries a
+    /// builtin-crate def but is registered as a local Adt in collect,
+    /// so it must answer here like a user enum.) A generic application
+    /// answers with its materialized instance when mono has made one,
+    /// and with the template otherwise.
     fn local_adt(&self, t: Ty) -> Option<AdtId> {
         let (def, args) = self.adt_parts(t)?;
-        if def.krate == BUILTIN_CRATE {
+        if self.builtins().kind_of(def).is_some() {
             return None;
         }
         if args != EMPTY_ARGS

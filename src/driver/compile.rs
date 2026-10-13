@@ -757,6 +757,19 @@ fn predicted_def_ids(
             _ => {}
         }
     }
+    // Collect also numbers the synthetic `core::cmp::Ordering` Adt
+    // (check/collect.rs pass 1) unless a user type, alias, or trait
+    // of that name shadows it: predict the same extra hash.
+    let ordering_taken = ast.items.iter().any(|item| match &item.kind {
+        ItemKind::Struct(s) => interner.get(s.name) == "Ordering",
+        ItemKind::Enum(e) => interner.get(e.name) == "Ordering",
+        ItemKind::Trait(t) => interner.get(t.name) == "Ordering",
+        ItemKind::Type(a) => interner.get(a.name) == "Ordering",
+        _ => false,
+    });
+    if !ordering_taken {
+        adt_hashes.push(crate::check::generics::ordering_def().hash);
+    }
     let to_map = |hashes: &[crate::def::DefPathHash], ranks: Vec<u32>| -> FxMap<crate::def::DefPathHash, u32> {
         hashes.iter().copied().zip(ranks).collect()
     };
@@ -2897,7 +2910,13 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
             let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
             let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
             for (hash, &id) in &adts {
-                let def = crate::def::DefId { krate: ids.local, hash: *hash };
+                // The synthetic `Ordering` Adt carries its builtin
+                // def, not a local-crate one (check/collect.rs).
+                let def = if *hash == crate::check::generics::ordering_def().hash {
+                    crate::check::generics::ordering_def()
+                } else {
+                    crate::def::DefId { krate: ids.local, hash: *hash }
+                };
                 assert_eq!(program.adt_by_def(def).map(|a| a.0), Some(id), "predicted Adt index");
             }
             for (hash, &idx) in &statics {
