@@ -32,7 +32,7 @@ use crate::lexer;
 use crate::scan;
 use crate::{borrowck, check, ir, lower, parser};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -139,14 +139,110 @@ impl Stats {
     }
 }
 
-/// True if any known output file built against base generation `g` still exists and still
-/// names `libbase-<g>.so` (an overwritten output names its newer base instead).
-fn base_still_used(users: &[(u64, PathBuf)], g: u64) -> bool {
-    let soname = format!("libbase-{g}.so");
-    users
-        .iter()
-        .filter(|(u, _)| *u == g)
-        .any(|(_, out)| std::fs::read(out).is_ok_and(|bytes| bytes.windows(soname.len()).any(|w| w == soname.as_bytes())))
+/// True if `out` exists and still names `soname` (an overwritten output names its newer base instead).
+fn output_names_base(out: &Path, soname: &str) -> bool {
+    std::fs::read(out).is_ok_and(|bytes| bytes.windows(soname.len()).any(|w| w == soname.as_bytes()))
+}
+
+/// True if any known output file built against base file `soname` still exists and still names it.
+fn base_still_used(users: &[(String, PathBuf)], soname: &str) -> bool {
+    users.iter().filter(|(u, _)| u == soname).any(|(_, out)| output_names_base(out, soname))
+}
+
+/// The persistent directory for this session's base libraries. Executables
+/// load a base by absolute rpath, so the base must sit somewhere stable:
+/// the disk cache dir's `bases/` subdir first (per source tree, next to
+/// other lust state), then the user cache dir, and as a last resort the
+/// session object dir (old behavior; those bases die with the daemon's
+/// temp dir, like any file in temp space). The disk cache being off
+/// (`LUST_NO_CACHE`) does not apply here: a base is a run-time part of a
+/// built executable, not a cache entry. Resolved once per session.
+fn resolve_base_dir(caches: &mut Caches, src_file: &Path) -> PathBuf {
+    if let Some(dir) = &caches.base_dir {
+        return dir.clone();
+    }
+    let mut candidates = vec![crate::driver::cache::cache_dir(src_file).join("bases")];
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(xdg).join("lust").join("bases"));
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(home).join(".cache").join("lust").join("bases"));
+    }
+    let dir = candidates
+        .into_iter()
+        .find(|d| std::fs::create_dir_all(d).is_ok())
+        .unwrap_or_else(|| caches.obj_dir.clone());
+    caches.base_dir = Some(dir.clone());
+    dir
+}
+
+/// Records one executable's use of a base in `<base_dir>/manifest`
+/// (`soname <TAB> output` per line), so a later daemon can tell which
+/// base files a kept executable still needs after this daemon is gone.
+fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
+    use std::io::Write as _;
+    let line = format!("{soname}\t{}\n", out.to_string_lossy());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(base_dir.join("manifest")) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Deletes base files in `base_dir` that the manifest proves dead: every
+/// recorded output for the base is gone or now names a different base.
+/// Files with no manifest entry are kept (an entry is appended right
+/// after its executable links, so an unrecorded file may be in use by a
+/// concurrent build). Also deletes half-written rebuild temp files
+/// (`libbase-tmp-<pid>-*.so`) whose pid is gone. The manifest is
+/// rewritten with only the live, deduplicated entries. Called on a
+/// session's first base build and on daemon exit.
+pub fn sweep_bases(base_dir: &Path) {
+    // Half-written temp bases from crashed builds. /proc presence is
+    // the liveness probe (Linux hosts only; elsewhere the file stays).
+    if let Ok(rd) = std::fs::read_dir(base_dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix("libbase-tmp-")
+                && let Some(pid) = rest.split('-').next()
+                && pid.parse::<u32>().is_ok()
+                && pid != std::process::id().to_string()
+                && !Path::new(&format!("/proc/{pid}")).exists()
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let manifest = base_dir.join("manifest");
+    let Ok(text) = std::fs::read_to_string(&manifest) else { return };
+    // (soname, outputs) in first-seen order, outputs deduplicated.
+    let mut entries: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for line in text.lines() {
+        let Some((soname, out)) = line.split_once('\t') else { continue };
+        if soname.is_empty() || out.is_empty() {
+            continue;
+        }
+        match entries.iter_mut().find(|(s, _)| s == soname) {
+            Some((_, outs)) => {
+                let p = PathBuf::from(out);
+                if !outs.contains(&p) {
+                    outs.push(p);
+                }
+            }
+            None => entries.push((soname.to_string(), vec![PathBuf::from(out)])),
+        }
+    }
+    let mut kept = String::new();
+    for (soname, outs) in &entries {
+        if outs.iter().any(|o| output_names_base(o, soname)) {
+            for o in outs {
+                kept.push_str(&format!("{soname}\t{}\n", o.to_string_lossy()));
+            }
+        } else {
+            let _ = std::fs::remove_file(base_dir.join(soname));
+        }
+    }
+    let tmp = base_dir.join(format!("manifest.tmp{}", std::process::id()));
+    if std::fs::write(&tmp, kept).is_ok() && std::fs::rename(&tmp, &manifest).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Runs `f` for each item on all cores. Results keep the input order.
@@ -2385,37 +2481,79 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         objs.extend(all_base);
         crate::tcc::link(&objs, &req.out, req.debug)
     } else {
-        if rebuild_base {
+        // The base library lives in a persistent dir under a content name
+        // (see `resolve_base_dir`): the executable loads it by absolute
+        // rpath at run time, so it must survive this daemon and its
+        // per-daemon temp dir (`dir`, deleted on daemon exit). A content
+        // name also means two sessions or daemons can never overwrite
+        // each other's base under a running executable.
+        let base_dir = resolve_base_dir(caches, &req.file);
+        if !caches.base_swept {
+            sweep_bases(&base_dir);
+            caches.base_swept = true;
+        }
+        let base = if rebuild_base {
             caches.base_gen += 1;
-            caches.base_gens.push_back(caches.base_gen);
-        }
-        let name = format!("base-{}", caches.base_gen);
-        let base = if rebuild_base { crate::tcc::link_shared(&all_base, &dir.join(format!("lib{name}.so")), req.debug) } else { Ok(()) };
-        if rebuild_base {
+            let tmp = base_dir.join(format!("libbase-tmp-{}-{}.so", std::process::id(), caches.base_gen));
+            let built = crate::tcc::link_shared(&all_base, &tmp, req.debug).and_then(|_| {
+                let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read {}: {e}", tmp.display()))?;
+                let (a, b) = crate::driver::cache::hash128(&[&bytes], 41);
+                caches.base_name = format!("base-{a:016x}{b:016x}");
+                let soname = format!("lib{}.so", caches.base_name);
+                let dest = base_dir.join(&soname);
+                if dest.exists() {
+                    let _ = std::fs::remove_file(&tmp);
+                } else if let Err(e) = std::fs::rename(&tmp, &dest) {
+                    // A concurrent build may have won the rename race.
+                    if dest.exists() {
+                        let _ = std::fs::remove_file(&tmp);
+                    } else {
+                        return Err(format!("cannot move the base library to {}: {e}", dest.display()));
+                    }
+                }
+                if !caches.base_files.contains(&soname) {
+                    caches.base_files.push_back(soname);
+                }
+                Ok(())
+            });
+            if built.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             t.lap("link libbase.so");
-        }
+            built
+        } else {
+            Ok(())
+        };
+        let name = caches.base_name.clone();
         let mut objs = vec![base_obj(0)];
         objs.extend(caches.overlays.iter().map(|&u| overlay_obj(u)));
-        base.and_then(|_| crate::tcc::link_with_base(&objs, &dir, &name, &req.out, req.debug))
+        base.and_then(|_| crate::tcc::link_with_base(&objs, &base_dir, &name, &req.out, req.debug))
     };
     if let Err(e) = linked {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
-    // Reference-counted cleanup: record this build as a user of the current base, then delete
-    // old generations past a small grace count while no known output file still references
-    // them. A binary the user kept keeps its base; one that was overwritten or deleted does
-    // not. A running program keeps its mapped copy after unlink.
-    if caches.persistent && caches.base_gen > 0 {
-        caches.base_users.push((caches.base_gen, req.out.clone()));
+    // Reference-counted cleanup: record this build as a user of the current base (in memory
+    // and in the base dir manifest, for after this daemon exits), then delete old bases past
+    // a small grace count while no known output file still references them. A binary the user
+    // kept keeps its base; one that was overwritten or deleted does not. A running program
+    // keeps its mapped copy after unlink.
+    if caches.persistent && !caches.base_name.is_empty() {
+        let soname = format!("lib{}.so", caches.base_name);
+        if let Some(base_dir) = caches.base_dir.clone() {
+            record_base_user(&base_dir, &soname, &req.out);
+        }
+        caches.base_users.push((soname, req.out.clone()));
     }
     const KEEP_BASES: usize = 4;
-    let excess: Vec<u64> = caches.base_gens.iter().take(caches.base_gens.len().saturating_sub(KEEP_BASES)).copied().collect();
-    for g in excess {
-        if !base_still_used(&caches.base_users, g) {
-            caches.base_gens.retain(|&x| x != g);
-            caches.base_users.retain(|(u, _)| *u != g);
-            let _ = std::fs::remove_file(dir.join(format!("libbase-{g}.so")));
+    let excess: Vec<String> = caches.base_files.iter().take(caches.base_files.len().saturating_sub(KEEP_BASES)).cloned().collect();
+    for soname in excess {
+        if !base_still_used(&caches.base_users, &soname) {
+            caches.base_files.retain(|x| x != &soname);
+            caches.base_users.retain(|(u, _)| u != &soname);
+            if let Some(base_dir) = &caches.base_dir {
+                let _ = std::fs::remove_file(base_dir.join(&soname));
+            }
         }
     }
     t.lap("link");

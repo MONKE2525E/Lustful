@@ -51,7 +51,8 @@ const DEFAULT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Two-lane multiply-xor hash over 8-byte chunks. One multiply per chunk per lane,
 /// so hashing the source plus the tcc runtime (about 2 MB) stays under a millisecond.
 /// The cache is local and trusted, so 128 bits of a fast hash is the right tool.
-fn hash128(parts: &[&[u8]], seed: u64) -> (u64, u64) {
+/// Also used to content-name base libraries (driver::compile).
+pub(crate) fn hash128(parts: &[&[u8]], seed: u64) -> (u64, u64) {
     let (mut a, mut b) = (seed ^ 0x243F_6A88_85A3_08D3, seed ^ 0x1319_8A2E_0370_7344);
     let mut total: u64 = 0;
     let step = |h: u64, x: u64, rot: u32, prime: u64| (h.rotate_left(rot) ^ x).wrapping_mul(prime);

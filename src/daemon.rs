@@ -6,7 +6,15 @@
 // whole life. A second daemon sees the lock taken and exits without touching the socket, so
 // a stale socket file can always be removed safely by the lock holder.
 // The daemon exits on its own after an idle span (`LUST_DAEMON_IDLE`, default 30 minutes;
-// see protocol::daemon_idle) and removes its socket on the way out.
+// see protocol::daemon_idle) and removes its socket on the way out. SIGTERM and SIGINT
+// take the same controlled exit (a flag plus a self-pipe wakeup; the serve loop does
+// the cleanup, never the signal handler).
+// Temp state: sessions work under `<temp>/lust-daemon-<pid>/`, which every controlled
+// exit deletes, and which a starting daemon also deletes for any pid that is gone
+// (that is what cleans up after SIGKILL and crashes). Deleting it is safe for built
+// executables: base libraries live in a persistent dir, not here (see
+// `resolve_base_dir` in driver/compile.rs). On exit each base dir is swept too, so
+// bases of deleted executables are removed while bases of kept executables stay.
 // Two safety nets watch the warm answers:
 //   - A panic in one request is caught. That crate's session is dropped, the request is
 //     answered by a fresh session at once, and the daemon keeps serving.
@@ -24,15 +32,43 @@ use crate::driver::{self, Request, Session};
 use crate::protocol::{self, Response, SessionKey};
 use std::collections::HashMap;
 use std::io::{BufReader, Seek, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn pipe(fds: *mut i32) -> i32;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    fn getuid() -> u32;
+}
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
+
+/// Set by the SIGTERM/SIGINT handler; the serve loop sees it and exits
+/// through the same cleanup as the idle timeout.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The write end of the wakeup pipe the handler pokes, so a `poll` for
+/// the idle timeout wakes at once instead of sleeping through a signal.
+static WAKE_W: AtomicI32 = AtomicI32::new(-1);
+
+/// Async-signal-safe: only a flag store and one pipe byte.
+extern "C" fn on_shutdown_signal(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    let fd = WAKE_W.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: `fd` is the pipe write end installed by `serve`; one byte.
+        unsafe { write(fd, b"x".as_ptr(), 1) };
+    }
 }
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
@@ -45,13 +81,100 @@ struct PollFd {
     revents: i16,
 }
 
-/// Waits until `listener` can accept, or `timeout` passes. None timeout waits forever.
-/// This is how the idle exit costs no latency: no sleep-based polling.
-fn wait_readable(listener: &UnixListener, timeout: Option<std::time::Duration>) -> bool {
-    let mut pfd = PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 };
+/// Waits until `listener` can accept, a shutdown signal pokes the wake
+/// pipe, or `timeout` passes. None timeout waits forever. True only for
+/// a readable listener; the caller checks `SHUTDOWN` itself. This is how
+/// the idle exit costs no latency: no sleep-based polling.
+fn wait_readable(listener: &UnixListener, wake: i32, timeout: Option<std::time::Duration>) -> bool {
+    let mut pfds = [
+        PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
+        PollFd { fd: wake, events: POLLIN, revents: 0 },
+    ];
     let ms = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
-    // SAFETY: one valid pollfd over a live listener fd, for the duration of the call.
-    unsafe { poll(&mut pfd, 1, ms) > 0 && pfd.revents & POLLIN != 0 }
+    // SAFETY: two valid pollfds over live fds, for the duration of the call.
+    unsafe { poll(pfds.as_mut_ptr(), 2, ms) > 0 && pfds[0].revents & POLLIN != 0 }
+}
+
+/// The pid in a lust temp name (`lust-daemon-<pid>`, `lust-<pid>`,
+/// `lust-test-<pid>`, `lust-rustc-check-<pid>.rmeta`), if the name is
+/// exactly one of those shapes. Prefixes only: a name like
+/// `lust-daemon-glue-<random>` is a test harness dir, not pid-owned.
+fn stale_temp_pid(name: &str) -> Option<u32> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix("lust-rustc-check-")
+        && let Some(pid) = rest.strip_suffix(".rmeta")
+    {
+        return if digits(pid) { pid.parse().ok() } else { None };
+    }
+    for prefix in ["lust-daemon-", "lust-test-", "lust-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return if digits(rest) { rest.parse().ok() } else { None };
+        }
+    }
+    None
+}
+
+/// True when a process with `pid` exists. Signal 0 plus the /proc
+/// fallback for a pid owned by another user (where signal 0 fails).
+/// A reused pid reads as alive, which only keeps a stale dir longer.
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only probes whether the pid exists.
+    (pid > 0 && unsafe { kill(pid as i32, 0) } == 0) || Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Deletes lust temp dirs and files from processes that are gone:
+/// at daemon start, this is the cleanup for daemons and cold compiles
+/// that died without one (SIGKILL, crash). Only exact pid-named
+/// entries owned by the current user are removed; symlinks and
+/// anything still running are left alone. Built executables do not
+/// depend on these dirs (base libraries moved to a persistent dir).
+fn sweep_stale_temp_dirs() {
+    let tmp = std::env::temp_dir();
+    let me = std::process::id();
+    // SAFETY: getuid has no arguments and cannot fail.
+    let uid = unsafe { getuid() };
+    let Ok(rd) = std::fs::read_dir(&tmp) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = stale_temp_pid(&name) else { continue };
+        if pid == me || pid_alive(pid) {
+            continue;
+        }
+        let path = e.path();
+        let Ok(meta) = path.symlink_metadata() else { continue };
+        if meta.uid() != uid {
+            continue;
+        }
+        if meta.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else if meta.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The one controlled daemon exit (idle timeout and shutdown signals):
+/// sweep each session's base dir (dead executables lose their bases,
+/// kept executables keep theirs), delete the per-daemon temp dir and
+/// the socket, then exit. Guard workers may still run on a signal
+/// exit; they die with the process, and any dir they recreate in the
+/// last instant is stale-pid swept by the next daemon.
+fn shutdown(sock: &Path, base: &Path, sessions: &HashMap<SessionKey, Entry>, why: &str) -> ! {
+    let mut base_dirs: Vec<PathBuf> = Vec::new();
+    for entry in sessions.values() {
+        if let Some(dir) = entry.session.base_dir()
+            && !base_dirs.iter().any(|d| d == dir)
+        {
+            base_dirs.push(dir.to_path_buf());
+        }
+    }
+    for dir in &base_dirs {
+        driver::sweep_bases(dir);
+    }
+    let _ = std::fs::remove_dir_all(base);
+    let _ = std::fs::remove_file(sock);
+    eprintln!("lust daemon: {why}, exiting");
+    std::process::exit(0);
 }
 
 /// The per-request refresh key of one crate selection: the Cargo graph
@@ -117,6 +240,17 @@ impl Entry {
             recompute_next: false,
         }
     }
+}
+
+/// Replaces the entry's session with a brand-new one and deletes the
+/// old session's object dir. Object dirs are pure temp state now that
+/// base libraries live in a persistent dir, so a replaced session
+/// (panic recovery, guard mismatch, graph change) must not leave its
+/// dir behind for the daemon's whole life.
+fn replace_session(entry: &mut Entry, key: &SessionKey) {
+    let dir = entry.fresh_dir();
+    let old = std::mem::replace(&mut entry.session, Session::new(dir, true, key.clone()));
+    let _ = std::fs::remove_dir_all(old.obj_dir());
 }
 
 /// What one background fresh-session check found.
@@ -226,8 +360,7 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
                 && done.served > entry.replaced_gen
             {
                 eprintln!("guard: background fresh compile panicked for {file}; dropping the session, next answer recomputed");
-                let dir = entry.fresh_dir();
-                entry.session = Session::new(dir, true, done.key.clone());
+                replace_session(entry, &done.key);
                 entry.replaced_gen = done.served;
                 entry.recompute_next = true;
             }
@@ -252,7 +385,8 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
                         first_line(&done.warm.stderr),
                         first_line(&fresh.stderr)
                     );
-                    entry.session = done.session.take().expect("a fresh outcome carries its session");
+                    let old = std::mem::replace(&mut entry.session, done.session.take().expect("a fresh outcome carries its session"));
+                    let _ = std::fs::remove_dir_all(old.obj_dir());
                     entry.replaced_gen = done.served;
                     entry.recompute_next = true;
                     eprintln!("guard-check: done {seq} mismatch for {file}");
@@ -274,13 +408,14 @@ fn compile_fresh(entry: &mut Entry, req: &Request) -> (Response, bool) {
     let mut fresh = Session::new(dir, true, req.session.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut fresh))) {
         Ok(r) => {
-            entry.session = fresh;
+            let old = std::mem::replace(&mut entry.session, fresh);
+            let _ = std::fs::remove_dir_all(old.obj_dir());
             (r, true)
         }
         Err(_) => {
             eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
-            let dir = entry.fresh_dir();
-            entry.session = Session::new(dir, true, req.session.clone());
+            let _ = std::fs::remove_dir_all(fresh.obj_dir());
+            replace_session(entry, &req.session);
             (Response { stderr: "error: internal: compile failed in a fresh session\n".into(), code: 3, ..Default::default() }, false)
         }
     }
@@ -355,6 +490,10 @@ fn entry_for<'m>(sessions: &'m mut HashMap<SessionKey, Entry>, base: &Path, key:
 
 /// Serves requests until idle. Each crate selection (`SessionKey`) has its own session.
 pub fn serve(sock: &Path) -> ! {
+    // Clean up temp dirs of daemons and cold compiles that died without
+    // a cleanup (SIGKILL, crash). Pid and owner checks protect anything
+    // live, including a daemon already serving this socket.
+    sweep_stale_temp_dirs();
     // Single instance, decided before anything touches the socket.
     let lock_path = protocol::daemon_lock_path(sock);
     let mut lock_file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap_or_else(|e| {
@@ -381,6 +520,23 @@ pub fn serve(sock: &Path) -> ! {
         eprintln!("error: cannot set {} nonblocking", sock.display());
         std::process::exit(2);
     }
+    // Shutdown signals take the controlled exit: the handler only sets
+    // a flag and pokes this pipe (see `wait_readable` and `shutdown`).
+    let mut wake_fds = [0i32; 2];
+    // SAFETY: `wake_fds` has room for the two fds pipe(2) writes.
+    if unsafe { pipe(wake_fds.as_mut_ptr()) } != 0 {
+        eprintln!("error: cannot create the daemon wakeup pipe");
+        std::process::exit(2);
+    }
+    let (wake_r, wake_w) = (wake_fds[0], wake_fds[1]);
+    // SAFETY: fcntl F_SETFD on the fds just made; tcc children must not inherit them.
+    unsafe {
+        fcntl(wake_r, F_SETFD, FD_CLOEXEC);
+        fcntl(wake_w, F_SETFD, FD_CLOEXEC);
+        WAKE_W.store(wake_w, Ordering::SeqCst);
+        signal(SIGINT, on_shutdown_signal as usize);
+        signal(SIGTERM, on_shutdown_signal as usize);
+    }
     eprintln!("lust daemon: listening on {}", sock.display());
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
@@ -396,11 +552,16 @@ pub fn serve(sock: &Path) -> ! {
     {
         let start = std::time::Instant::now();
         // SAFETY: signal 0 only probes whether the pid exists.
-        while unsafe { kill(pid, 0) } == 0 && start.elapsed() < std::time::Duration::from_secs(60) {
+        while unsafe { kill(pid, 0) } == 0
+            && start.elapsed() < std::time::Duration::from_secs(60)
+            && !SHUTDOWN.load(Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
-    if let Ok(file) = std::env::var("LUST_DAEMON_PREWARM") {
+    if !SHUTDOWN.load(Ordering::SeqCst)
+        && let Ok(file) = std::env::var("LUST_DAEMON_PREWARM")
+    {
         let file = PathBuf::from(file);
         let req = protocol::Request {
             cmd: protocol::Cmd::Check,
@@ -420,6 +581,9 @@ pub fn serve(sock: &Path) -> ! {
         last = std::time::Instant::now();
     }
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            shutdown(sock, &base, &sessions, "shutdown signal");
+        }
         // Apply any finished guard checks before waiting, so a mismatch
         // replaces its session before the next request for that key.
         jobs.drain(&mut sessions);
@@ -431,11 +595,9 @@ pub fn serve(sock: &Path) -> ! {
             let cap = std::time::Duration::from_millis(20);
             left = Some(left.map_or(cap, |d| d.min(cap)));
         }
-        if !wait_readable(&listener, left) {
+        if !wait_readable(&listener, wake_r, left) {
             if jobs.pending == 0 && idle.is_some_and(|d| last.elapsed() >= d) {
-                let _ = std::fs::remove_file(sock);
-                eprintln!("lust daemon: idle timeout, exiting");
-                std::process::exit(0);
+                shutdown(sock, &base, &sessions, "idle timeout");
             }
             continue;
         }
@@ -461,8 +623,7 @@ pub fn serve(sock: &Path) -> ! {
                 let rk = refresh_key(&req.session);
                 if entry.refresh_key != rk {
                     eprintln!("lust daemon: graph or build script changed for crate {}; starting a fresh session", req.session.describe());
-                    let dir = entry.fresh_dir();
-                    entry.session = Session::new(dir, true, req.session.clone());
+                    replace_session(entry, &req.session);
                     entry.refresh_key = rk;
                 }
                 compile_guarded(entry, &req, &mut jobs)
@@ -528,6 +689,66 @@ mod tests {
         assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "match keeps the session");
         assert!(entry.recompute_next, "the earlier recompute mark stands");
         assert_ne!(entry.session.obj_dir(), warm_dir.as_path());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Only exact pid-named lust temp entries are sweep candidates.
+    #[test]
+    fn stale_temp_pid_parses_only_pid_names() {
+        assert_eq!(stale_temp_pid("lust-daemon-123"), Some(123));
+        assert_eq!(stale_temp_pid("lust-123"), Some(123));
+        assert_eq!(stale_temp_pid("lust-test-123"), Some(123));
+        assert_eq!(stale_temp_pid("lust-rustc-check-123.rmeta"), Some(123));
+        assert_eq!(stale_temp_pid("lust-daemon-glue-abc"), None);
+        assert_eq!(stale_temp_pid("lust-daemon-"), None);
+        assert_eq!(stale_temp_pid("lust-daemon-12a"), None);
+        assert_eq!(stale_temp_pid("lust-runtime-0123456789abcdef.o"), None);
+        assert_eq!(stale_temp_pid("other-123"), None);
+    }
+
+    /// The startup sweep deletes dead-pid lust dirs and files, and keeps
+    /// live-pid dirs and non-pid names.
+    #[test]
+    fn sweep_removes_dead_pid_dirs_and_keeps_live_ones() {
+        let tmp = std::env::temp_dir();
+        // A pid far above pid_max is never alive on Linux.
+        let dead = 4_000_000_001u32;
+        let dead_dir = tmp.join(format!("lust-daemon-{dead}"));
+        let dead_cold = tmp.join(format!("lust-{dead}"));
+        let dead_file = tmp.join(format!("lust-rustc-check-{dead}.rmeta"));
+        let live_dir = tmp.join(format!("lust-daemon-{}", std::process::id()));
+        let other_dir = tmp.join(format!("lust-daemon-glue-sweeptest{}", std::process::id()));
+        for d in [&dead_dir, &dead_cold, &live_dir, &other_dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("x.o"), b"x").unwrap();
+        }
+        std::fs::write(&dead_file, b"x").unwrap();
+        sweep_stale_temp_dirs();
+        assert!(!dead_dir.exists(), "dead daemon dir swept");
+        assert!(!dead_cold.exists(), "dead cold dir swept");
+        assert!(!dead_file.exists(), "dead rmeta file swept");
+        assert!(live_dir.exists(), "own pid dir kept");
+        assert!(other_dir.exists(), "non-pid name kept");
+        let _ = std::fs::remove_dir_all(&live_dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// A replaced session's object dir is deleted at replacement time,
+    /// not left until daemon exit.
+    #[test]
+    fn replace_session_deletes_the_old_obj_dir() {
+        let base = std::env::temp_dir().join(format!("lust-replace-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base, &key);
+        let old_dir = entry.session.obj_dir().to_path_buf();
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("u1.o"), b"x").unwrap();
+        replace_session(entry, &key);
+        assert_ne!(entry.session.obj_dir(), old_dir.as_path(), "session moved to a fresh dir");
+        assert!(!old_dir.exists(), "old obj dir deleted");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

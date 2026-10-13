@@ -97,7 +97,16 @@ fn main() {
             }
             let dir = std::env::temp_dir().join(format!("lust-{}", std::process::id()));
             let mut session = driver::Session::new(dir, false, req.session.clone());
-            let resp = driver::compile(&req, &mut session);
+            // A panicking compile must not leave its temp dir behind:
+            // clean up, then let the panic run its normal course.
+            let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(&req, &mut session)));
+            let resp = match compiled {
+                Ok(resp) => resp,
+                Err(payload) => {
+                    remove_obj_dir(session.obj_dir());
+                    std::panic::resume_unwind(payload);
+                }
+            };
             remove_obj_dir(session.obj_dir());
             if let (Some(cache), Some(src)) = (&cache, &src) {
                 cache.store(&req, src, &resp);

@@ -153,15 +153,27 @@ pub(crate) struct Caches {
     /// Slot capacity of `lust_fns` in libbase.so, and how many function units it has.
     pub(crate) table_cap: usize,
     pub(crate) base_units: usize,
-    /// Bumped on every base rebuild. Each base is a new file (libbase-<n>.so), so an executable
-    /// built earlier keeps loading the base it was linked with, even after a later rebuild.
-    /// `base_gens` holds the generations still on disk, oldest first. Old generations are
-    /// deleted only when no known output file references them any more (see `base_still_used`),
-    /// so live binaries keep working and the cache grows only with binaries that still exist.
+    /// Bumped on every base rebuild; used only for the rebuild's temp file name.
+    /// Each finished base is renamed to a content name (`libbase-<hash>.so`)
+    /// in `base_dir`, a persistent directory (the disk cache's `bases/`
+    /// subdir), never in `obj_dir`: executables load the base by absolute
+    /// rpath at run time, so it must outlive the daemon that built it,
+    /// while `obj_dir` is per-daemon temp state the daemon deletes on
+    /// exit. `base_files` holds the base file names this session put on
+    /// disk, oldest first. Old bases are deleted only when no known
+    /// output file references them any more (see `base_still_used` and
+    /// the manifest sweep in compile.rs), so live binaries keep working.
     pub(crate) base_gen: u64,
-    pub(crate) base_gens: std::collections::VecDeque<u64>,
-    /// (generation, output file) for every executable linked against a base in this session.
-    pub(crate) base_users: Vec<(u64, PathBuf)>,
+    /// The current base's library name for the linker (`base-<hash>`).
+    pub(crate) base_name: String,
+    /// The resolved persistent directory for base libraries. None until
+    /// this session's first base build picks one (see `resolve_base_dir`).
+    pub(crate) base_dir: Option<PathBuf>,
+    /// True once this session swept dead entries from `base_dir`'s manifest.
+    pub(crate) base_swept: bool,
+    pub(crate) base_files: std::collections::VecDeque<String>,
+    /// (base file name, output file) for every executable linked against a base in this session.
+    pub(crate) base_users: Vec<(String, PathBuf)>,
     pub(crate) obj_dir: PathBuf,
     /// Units compiled into `obj_dir` with the current layout, and with which debug setting.
     pub(crate) objects: Option<bool>,
@@ -233,7 +245,10 @@ impl Session {
                 table_cap: 0,
                 base_units: 0,
                 base_gen: 0,
-                base_gens: std::collections::VecDeque::new(),
+                base_name: String::new(),
+                base_dir: None,
+                base_swept: false,
+                base_files: std::collections::VecDeque::new(),
                 base_users: Vec::new(),
                 obj_dir,
                 objects: None,
@@ -247,6 +262,11 @@ impl Session {
     }
     pub fn obj_dir(&self) -> &Path {
         &self.caches.obj_dir
+    }
+
+    /// The persistent base library directory, once a base was built.
+    pub fn base_dir(&self) -> Option<&Path> {
+        self.caches.base_dir.as_deref()
     }
 
     /// Both crate identities for stable defs: the session-local id (one crate

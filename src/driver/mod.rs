@@ -11,5 +11,5 @@ pub mod graph;
 mod session;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
-pub use compile::compile;
+pub use compile::{compile, sweep_bases};
 pub use session::Session;
