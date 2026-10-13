@@ -2348,6 +2348,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.flow_all(&from, &dv);
             }
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone)) && self.call_clone(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
@@ -2359,6 +2360,18 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
         }
+    }
+
+    /// `fold(init, f)`: the result is the initial value or what the body
+    /// returns (the closure's sources, which `call` added from its
+    /// requirements); the iterator's own borrow reaches it only through
+    /// the body. False when the closure's body does not solve.
+    fn call_fold(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let [_, (it, iv), (ct, _)] = avs else { return false };
+        let TyKind::Closure(def, args) = self.body.tys.kind(*ct) else { return false };
+        let mut roles = Vec::new();
+        closure_roles(&mut self.sc, args, &mut roles);
+        self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, dt, dv, Variance::Co))
     }
 
     /// `Clone::clone(&self) -> Self` (derived and builtin clones): the
@@ -2740,6 +2753,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             let Some(c) = self.p.gx.closures.get(&def) else { continue };
             let Ok(slots) = closure_arg_slots(&mut self.sc, c) else { continue };
             let inputs = c.inputs.clone();
+            let c_output = c.output;
             let mut roles = Vec::new();
             closure_roles(&mut self.sc, args, &mut roles);
             let Some(vars) = self.closure_arg_vars(def, &roles, v) else { continue };
@@ -2763,6 +2777,32 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 if k > 0 && by_ref_item(b) && n > 0 && arg_roles.get(range.start).is_some_and(|r| r.is_some()) {
                     self.not_general_enough();
                     continue;
+                }
+                // `fold`'s accumulator: the initial value, then what the
+                // body returns (`closure_reqs`), round after round.
+                if k == 2
+                    && pi == 0
+                    && b == Some(crate::check::Builtin::IterFold)
+                    && let Some((it0, iv0)) = avs.get(1)
+                    && self.sc.slots(c_output) as usize == n
+                    && let Some(reqs) = self.closure_reqs(def, &roles)
+                {
+                    let pv: Vec<u32> = vars.get(range.clone()).map(<[u32]>::to_vec).unwrap_or_default();
+                    // A constant initial value (`""`) holds no loan.
+                    if pv.len() == n && (iv0.is_empty() || self.relate(*it0, iv0, pt, &pv, Variance::Co)) {
+                        for &(x, y) in reqs.iter() {
+                            let End::Out(q) = y else { continue };
+                            let from = match x {
+                                End::Cap(i) => v.get(i as usize).copied(),
+                                End::Arg(j) => vars.get(j as usize).copied(),
+                                End::Static | End::Out(_) => None,
+                            };
+                            if let (Some(from), Some(&a)) = (from, pv.get(q as usize)) {
+                                self.edge(from, a);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 let item_param = k > 0 && !cands.is_empty() && !(b == Some(crate::check::Builtin::IterFold) && pi == 0);
                 if item_param {

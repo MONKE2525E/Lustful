@@ -2876,8 +2876,9 @@ argument's regions. An iterator item call (`next`,
 exactly the item's regions when the receiver names them
 (`iter_items`: `slice::Iter<'a, T>` yields `&'a T`, an
 adapter its inner iterator's items, `copied` drops the
-outer reference); items a `map` closure makes take the
-conservative rule. `to_vec` is a receiver rule (the
+outer reference, a `map` closure's what its body returns);
+`fold`'s accumulator and result take its initial value and
+what its closure returns. `to_vec` is a receiver rule (the
 elements are the slice's). A dyn call instantiates the trait
 method's signature; a call of a trait impl method also
 instantiates the trait's (rustc checks calls against the

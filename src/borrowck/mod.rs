@@ -349,7 +349,7 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
 /// regions and `'static`, and what its output slots may hold (rustc's
 /// closure requirements; `regions::End`), for its creator. None when the
 /// body has lowering errors or an `impl Trait` value.
-pub(super) fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, regions::End)>> {
+fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, regions::End)>> {
     if !body.lower_errs.is_empty() || body.locals.iter().any(|l| mentions_opaque(&body.tys, l.ty)) {
         return None;
     }
