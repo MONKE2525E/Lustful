@@ -2001,7 +2001,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver path computes crate identity from the Cargo graph;
     // the single-file path keeps the session key's identity.
     let crate_ids = if let Some(ids) = front.resolved_crate_ids.take() { ids } else { crate_ids };
-    let mut program = match collect::collect_with_order(&front.ast, &front.interner, &front.known, crate_ids, req.cmd == Cmd::Build, &mut front.def_order) {
+    // The resolver tables enter here, before collect's own body
+    // checks (mono's template checks) run, so every body checks
+    // with the visibility tables attached (see `Program::resolved`).
+    let mut program = match collect::collect_with_order_resolved(
+        &front.ast,
+        &front.interner,
+        &front.known,
+        crate_ids,
+        req.cmd == Cmd::Build,
+        &mut front.def_order,
+        resolved_tables.map(Box::new),
+    ) {
         Ok(p) => p,
         Err(mut ds) => {
             front.env_hash = None;
@@ -2017,9 +2028,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             cache.store_def_order(&session_key, &front.def_order, crate_ids.stable);
         }
         front.def_order_stored = front.def_order.adts.len() + front.def_order.statics.len();
-    }
-    if let Some(tables) = resolved_tables {
-        program.resolved = Some(Box::new(tables));
     }
     // Read sets serve the next request's dirty walk; a one-shot process
     // has none, so its body checks skip recording and fingerprinting.

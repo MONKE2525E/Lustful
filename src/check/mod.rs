@@ -514,6 +514,53 @@ struct Ctx<'p, 'a> {
     open_binops: Vec<(ExprId, BinOp, Ty)>,
 }
 
+/// The module a body checks in: the module of the def that owns
+/// the body, exactly as a non-generic body in that module sees it
+/// (ARCH 1.5). AST fns read `fn_module` by `LocalDefId`. Fns mono
+/// appends are past that vec: an instance takes its template's
+/// module, and a trait-default template (or a template with no
+/// local form) takes the module its def was defined in. Closure
+/// body fns never reach here (`check_fn` checks them as their
+/// parent). Without resolver tables every body is in the root.
+fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
+    let root = crate::ty::defs::ROOT_MODULE;
+    let Some(tables) = &p.resolved else { return root };
+    // A def's defining module from the resolver table. Associated
+    // defs (trait methods) are not module items, so the walk
+    // climbs to their parent def (the trait), which is one.
+    let module_of_def = |p: &Program, mut def: crate::def::DefId| -> crate::ty::defs::ModuleId {
+        for _ in 0..4 {
+            if let Some(info) = tables.def_info.get(&def) {
+                return info.module;
+            }
+            // The parent def, or (trait methods carry none) the
+            // trait the index files the def under.
+            let parent = p.defs.parent_of(def).or_else(|| p.gx.index.trait_of_method(def)).or_else(|| p.gx.index.trait_of_assoc(def));
+            let Some(parent) = parent else { break };
+            def = parent;
+        }
+        root
+    };
+    let mut cur = fid;
+    // Instances name their template directly, so this walks at
+    // most one hop in practice; the bound guards only against a
+    // malformed table.
+    for _ in 0..8 {
+        if let Some(m) = tables.fn_module.get(cur.0 as usize) {
+            return *m;
+        }
+        if let Some(info) = p.gx.instances.get(&cur) {
+            if let Some(template) = info.template_local {
+                cur = template;
+                continue;
+            }
+            return module_of_def(p, info.template_def);
+        }
+        return p.fn_defs.get(cur.0 as usize).map_or(root, |&def| module_of_def(p, def));
+    }
+    root
+}
+
 /// Type-checks one function body. A closure body fn checks as its
 /// parent fn (closures share their parent's inference); the parent's
 /// own entry reports any errors, so the closure fn reports none and
@@ -533,7 +580,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
     let mut cx = Ctx {
         p,
         f,
-        module: p.resolved.as_ref().and_then(|t| t.fn_module.get(fid.0 as usize).copied()).unwrap_or(crate::ty::defs::ROOT_MODULE),
+        module: defining_module(p, fid),
         tys: Tys::new(&p.tys),
         vars: Vec::new(),
         out: Checked {

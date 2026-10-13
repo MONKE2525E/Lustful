@@ -164,8 +164,11 @@ pub struct Program<'a> {
     /// Empty when no std source was spliced. Filled by the driver.
     pub shipped_ranges: Vec<(u32, u32, ShippedCrate)>,
     /// The module binding tables of section 1.3, when the crate went
-    /// through the resolver. Filled by the driver after collection; the
-    /// S7 `Binding` query fns in driver/graph.rs read through it.
+    /// through the resolver. Attached by the driver at collection
+    /// (`collect_with_order_resolved`), before any body is checked:
+    /// template and instance checks read their defining module and
+    /// the visibility tables from it. The S7 `Binding` query fns in
+    /// driver/graph.rs read through it.
     pub resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
     /// The generic tables (traits, templates, instances) built by
     /// `check::generics` during collection and finished by mono.
@@ -1073,6 +1076,24 @@ pub fn collect_with_order<'a>(
     walk_instances: bool,
     def_order: &mut DefOrder,
 ) -> Result<Program<'a>, Vec<Diag>> {
+    collect_with_order_resolved(ast, interner, known, crate_ids, walk_instances, def_order, None)
+}
+
+/// `collect_with_order` with the resolver's module tables (section
+/// 1.3) attached from the start. The tables must be in place before
+/// collection's body checks run (mono's template checks in
+/// `finish_collect`): every checked body reads its defining module
+/// and the visibility tables from `Program::resolved`.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_with_order_resolved<'a>(
+    ast: &'a Ast,
+    interner: &'a Interner,
+    known: &'a Known,
+    crate_ids: CrateIds,
+    walk_instances: bool,
+    def_order: &mut DefOrder,
+    resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
         interner,
@@ -1102,7 +1123,7 @@ pub fn collect_with_order<'a>(
         def_by_hash: HashMap::default(),
         std_fns: Vec::new(),
         shipped_ranges: Vec::new(),
-        resolved: None,
+        resolved,
         gx: GenTables::default(),
         record_reads: true,
     };
