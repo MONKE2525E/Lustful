@@ -859,13 +859,46 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         st
     }
 
+    /// The blocks reachable from the entry, in reverse postorder: every
+    /// block comes after all its predecessors except along back edges.
+    fn reverse_postorder(&self) -> Vec<u32> {
+        let nb = self.body.blocks.len();
+        let mut seen = vec![false; nb];
+        let mut post = Vec::with_capacity(nb);
+        // (block, next successor index), an explicit DFS stack.
+        let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            match self.succs[b as usize].get(k) {
+                Some(s) => {
+                    top.1 += 1;
+                    if !seen[s.0 as usize] {
+                        seen[s.0 as usize] = true;
+                        stack.push((s.0, 0));
+                    }
+                }
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
     fn dataflow(&mut self) {
         let nb = self.body.blocks.len();
         let mut entry: Vec<Option<State>> = vec![None; nb];
         entry[0] = Some(self.entry_state());
-        let mut work: Vec<u32> = vec![0];
-        let mut queued = vec![false; nb];
-        queued[0] = true;
+        // Visit pending blocks in reverse postorder, in rounds: a block's
+        // predecessors (back edges aside) run before it in the same round,
+        // so most blocks run once and only loops take another round. The
+        // fixpoint is the same in any visit order.
+        let rpo = self.reverse_postorder();
+        let mut pending = vec![false; nb];
+        pending[0] = true;
         // Fixpoint without reporting, then one reporting pass over the final states.
         // `st` is the one scratch state: each visit copies a block's entry state
         // into it, so no visit allocates.
@@ -878,23 +911,27 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         // every block's last visit runs on its final entry state.
         self.collecting = true;
         let mut st = State::new(self.sh);
-        while let Some(b) = work.pop() {
-            queued[b as usize] = false;
-            st.w.copy_from_slice(&entry[b as usize].as_ref().unwrap().w);
-            self.run_block(b, &mut st);
-            for k in 0..self.succs[b as usize].len() {
-                let s = self.succs[b as usize][k];
-                let si = s.0 as usize;
-                let changed = match &mut entry[si] {
-                    None => {
-                        entry[si] = Some(st.clone());
-                        true
-                    }
-                    Some(e) => e.join(&st),
-                };
-                if changed && !queued[si] {
-                    queued[si] = true;
-                    work.push(s.0);
+        while pending.contains(&true) {
+            for &b in &rpo {
+                if !pending[b as usize] {
+                    continue;
+                }
+                pending[b as usize] = false;
+                st.w.copy_from_slice(&entry[b as usize].as_ref().unwrap().w);
+                self.run_block(b, &mut st);
+                for k in 0..self.succs[b as usize].len() {
+                    let s = self.succs[b as usize][k];
+                    let si = s.0 as usize;
+                    let changed = match &mut entry[si] {
+                        None => {
+                            entry[si] = Some(st.clone());
+                            true
+                        }
+                        Some(e) => e.join(&st),
+                    };
+                    // A successor later in the order runs in this round; one at
+                    // or before `b` (a back edge) runs in the next.
+                    pending[si] |= changed;
                 }
             }
         }
