@@ -580,6 +580,27 @@ pub(super) fn trait_probe_for(
             }
         }
     }
+    // Typed receivers put several receiver variants of one step in one
+    // group (`Rc<N>`, `&Rc<N>`, `&mut Rc<N>`): rustc probes them in that
+    // order, so only the hits at the first autoref level that has any
+    // compete (`self: Rc<Self>` wins over `self: &Rc<Self>`).
+    // The rank is the receiver type against the group's step (the first
+    // variant's receiver): the step itself, `&step`, or `&mut step`.
+    if let Some(step) = probes.first().map(|pr| pr.recv_ty) {
+        let (by_ref, by_mut) = (cx.tys.mk_ref(false, step), cx.tys.mk_ref(true, step));
+        let rank = |r: Ty| {
+            if r == by_ref {
+                1u8
+            } else if r == by_mut {
+                2
+            } else {
+                0
+            }
+        };
+        if let Some(best) = hits.iter().map(|h| rank(h.5.recv_ty)).min() {
+            hits.retain(|h| rank(h.5.recv_ty) == best);
+        }
+    }
     // A lang candidate with no callable method fn still ties
     // with a real hit or a deferred call (rustc E0034).
     let lang_only: Vec<DefId> =
