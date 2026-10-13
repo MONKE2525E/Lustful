@@ -378,6 +378,25 @@ fn grown() -> i64 { 1 }
         check("vanished bases dir: binary runs", r.stdout == "heal 2\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
 
+        # 13. Regression (fuzz realish seed 1, iters 358/477): an impl
+        # inside a fn body makes the token scan count one more fn than
+        # the Ast fn list. slot_update indexed the Ast-side arrays by
+        # the scan count and the compiler panicked (cold rc 101, the
+        # daemon's fresh session reported an internal error). Both
+        # sides must now give collect's L0820, byte for byte.
+        ib = os.path.join(work, "implbody.rs")
+        open(ib, "w").write('fn first() {}\nfn main() {}\n')
+        rc1, _, _ = run_lust(["check", ib])
+        open(ib, "w").write('struct S;\nfn outer() {\nfn inner() {\n}\nimpl S {\n    fn m(&self) {\n    }\n}\n}\nfn main() { outer(); }\n')
+        rcw, _, errw = run_lust(["check", ib])
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        r = subprocess.run([LUST, "check", ib], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("impl in fn body: scan/Ast count split does not panic (realish seed 1)",
+              rc1 == 0 and rcw == 1 and r.returncode == 1
+              and "L0820" in errw and errw == r.stderr and "panicked" not in r.stderr,
+              f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).
