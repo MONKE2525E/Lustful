@@ -529,6 +529,23 @@ impl FnGen<'_, '_, '_> {
                 };
                 self.fmt_result_of(&call)
             }
+            // Conversion trait methods (check/convert.rs).
+            B::ConvIdent => vals[0].clone(),
+            B::ConvDeref => format!("(*{})", vals[0]),
+            B::ConvRcInner => format!("(&(*{})->v)", vals[0]),
+            B::ConvStrBytes | B::ConvArraySlice => {
+                let (elem, ptr, len) = match &tys[0] {
+                    CTy::Ref(inner) => match &**inner {
+                        CTy::Array(e, n) => ((**e).clone(), format!("{}->v", vals[0]), format!("((uint64_t){n})")),
+                        _ => (CTy::Int(IntTy::U8), format!("{}.ptr", vals[0]), format!("{}.len", vals[0])),
+                    },
+                    _ => (CTy::Int(IntTy::U8), format!("{}.ptr", vals[0]), format!("{}.len", vals[0])),
+                };
+                let sl = CTy::Slice(Box::new(elem));
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = {{ {ptr}, {len} }};", ctype(&sl));
+                t
+            }
             B::FmtCallDisplay | B::FmtCallDebug => {
                 let kind = if b == B::FmtCallDisplay { FmtKind::Display } else { FmtKind::Debug };
                 let inner = match &tys[0] {

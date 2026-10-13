@@ -80,6 +80,14 @@ pub struct LangTraits {
     pub fn_mut: DefId,
     pub fn_once: DefId,
     pub exact_size_iterator: DefId,
+    /// The conversion traits of `core::convert` and `core::borrow`
+    /// (W-STD-B, check/convert.rs), and `ToOwned` with its `Owned`.
+    pub as_ref: DefId,
+    pub as_mut: DefId,
+    pub borrow: DefId,
+    pub borrow_mut: DefId,
+    pub to_owned: DefId,
+    pub assoc_owned: DefId,
     /// `Iterator::Item`.
     pub assoc_item: DefId,
     /// `IntoIterator::IntoIter` (its `Item` is a distinct def).
@@ -162,6 +170,11 @@ impl LangTraits {
         let into_iterator = lang_trait(&["core", "iter"], "IntoIterator");
         let from_iterator = lang_trait(&["core", "iter"], "FromIterator");
         let exact_size_iterator = lang_trait(&["core", "iter"], "ExactSizeIterator");
+        let as_ref = lang_trait(&["core", "convert"], "AsRef");
+        let as_mut = lang_trait(&["core", "convert"], "AsMut");
+        let borrow = lang_trait(&["core", "borrow"], "Borrow");
+        let borrow_mut = lang_trait(&["core", "borrow"], "BorrowMut");
+        let to_owned = lang_trait(&["alloc", "borrow"], "ToOwned");
         let from = lang_trait(&["core", "convert"], "From");
         let into = lang_trait(&["core", "convert"], "Into");
         let assoc_out = |t: DefId| lang_assoc(t, "Output");
@@ -216,6 +229,12 @@ impl LangTraits {
             fn_mut,
             fn_once,
             exact_size_iterator,
+            as_ref,
+            as_mut,
+            borrow,
+            borrow_mut,
+            to_owned,
+            assoc_owned: lang_assoc(to_owned, "Owned"),
             assoc_item: lang_assoc(iterator, "Item"),
             assoc_into_iter: lang_assoc(into_iterator, "IntoIter"),
             assoc_into_item: lang_assoc(into_iterator, "Item"),
@@ -308,6 +327,11 @@ impl LangTraits {
             "IntoIterator" => self.into_iterator,
             "FromIterator" => self.from_iterator,
             "ExactSizeIterator" => self.exact_size_iterator,
+            "AsRef" => self.as_ref,
+            "AsMut" => self.as_mut,
+            "Borrow" => self.borrow,
+            "BorrowMut" => self.borrow_mut,
+            "ToOwned" => self.to_owned,
             "From" => self.from,
             "Into" => self.into,
             "Fn" => self.fn_,
@@ -457,6 +481,11 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         ),
         rec(lang.from_iterator, "FromIterator", 1, vec![], vec![], &["from_iter"]),
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
+        rec(lang.as_ref, "AsRef", 1, vec![], vec![], &["as_ref"]),
+        rec(lang.as_mut, "AsMut", 1, vec![], vec![], &["as_mut"]),
+        rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
+        rec(lang.borrow_mut, "BorrowMut", 1, vec![self_pred(tys, lang.borrow, &[1])], vec![], &["borrow_mut"]),
+        rec(lang.to_owned, "ToOwned", 0, vec![], vec![(lang.assoc_owned, "Owned")], &["to_owned", "clone_into"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
         rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
         rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![], &["call"]),
@@ -607,6 +636,17 @@ pub fn lang_method_sigs(
                 }
                 (d, "cmp") if d == lang.ord => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0, r0], ret: ord, ret_borrows_from: None }
+                }
+                (d, "as_ref" | "borrow") if d == lang.as_ref || d == lang.borrow => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: r1, ret_borrows_from: Some(0) }
+                }
+                (d, "as_mut" | "borrow_mut") if d == lang.as_mut || d == lang.borrow_mut => {
+                    let m1 = tys.mk_ref(true, p1);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: m1, ret_borrows_from: Some(0) }
+                }
+                (d, "to_owned") if d == lang.to_owned => {
+                    let owned = proj(tys, lang.assoc_owned, &[p0]);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: owned, ret_borrows_from: None }
                 }
                 (d, "fmt") if d == lang.debug || d == lang.display => {
                     // `fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result` (W-STD-B).
@@ -772,6 +812,16 @@ impl ResolveCx<'_> {
     /// A trait def by its written name: user traits, then lang.
     pub fn trait_by_name(&self, interner: &Interner, name: Sym) -> Option<DefId> {
         self.trait_names.get(&name).copied().or_else(|| self.lang.by_name(interner.get(name)))
+    }
+    /// A trait by a bare (one-segment) name: a local trait, or a lang
+    /// trait of the Rust 2024 prelude. A non-prelude std trait needs a
+    /// `use`, which the resolver's rewrite turns into its full std path
+    /// (W-STD-B: a bare `Display` with no import was a false accept).
+    pub fn trait_by_bare_name(&self, interner: &Interner, name: Sym) -> Option<DefId> {
+        self.trait_names.get(&name).copied().or_else(|| {
+            let n = interner.get(name);
+            crate::ty::lang::is_prelude_trait(n).then(|| self.lang.by_name(n)).flatten()
+        })
     }
     /// The template def and parameter count of one user Adt.
     pub fn adt_info_of(&self, adt: AdtId) -> (DefId, usize) {
@@ -1140,13 +1190,14 @@ pub(crate) fn trait_def_of_path(
             ));
         }
     }
-    cx.trait_by_name(interner, last.name).ok_or_else(|| {
-        Diag::new(
-            "L0102",
-            span,
-            format!("unknown trait `{}`", crate::intern::source_path(interner.get(last.name))),
-            "Check the spelling, or define the trait.",
-        )
+    let found = if segs.len() == 1 { cx.trait_by_bare_name(interner, last.name) } else { cx.trait_by_name(interner, last.name) };
+    found.ok_or_else(|| {
+        let n = crate::intern::source_path(interner.get(last.name));
+        let fix = match crate::ty::lang::std_trait_module(&n) {
+            Some(m) => format!("Import it: `use std::{m}::{n};`."),
+            None => "Check the spelling, or define the trait.".to_string(),
+        };
+        Diag::new("L0102", span, format!("unknown trait `{n}`"), fix)
     })
 }
 
@@ -3984,6 +4035,72 @@ pub fn add_synthetic_impls(p: &mut Program) {
             predicates: vec![Predicate::Trait(Binder::plain(TraitRef { def: lang.from, args, bindings: EMPTY_BINDINGS }))],
         };
         insert_synthetic(p, &mut ordinal, lang.into, p0, &[p1], g2, Vec::new(), Synthetic::Lang, false, span);
+    }
+    // The conversion traits (W-STD-B, check/convert.rs), as core and
+    // alloc declare them for the types lust has. Arrays answer by
+    // structure in the method probe (no const-param records yet).
+    {
+        let tp = |p: &mut Program, tr: DefId, s: Ty, r: Ty| {
+            let a = p.tys.intern_args(&[GenericArg::Ty(s), GenericArg::Ty(r)]);
+            Predicate::Trait(Binder::plain(TraitRef { def: tr, args: a, bindings: EMPTY_BINDINGS }))
+        };
+        let two = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("U"), kind: ParamKind::Type, span },
+            ],
+            predicates: Vec::new(),
+        };
+        let bytes = p.tys.intern(TyKind::Slice(int(IntTy::U8)));
+        let slice_p0 = p.tys.intern(TyKind::Slice(p0));
+        let vec_p0 = p.tys.mk_vec(p0);
+        let box_p0 = p.tys.mk_boxed(p0);
+        let rc_p0 = p.tys.mk_rc(p0);
+        let ref_p0 = p.tys.mk_ref(false, p0);
+        let mut_p0 = p.tys.mk_ref(true, p0);
+        // AsRef: through & and &mut, str and String to str and [u8],
+        // [T] and Vec<T> to [T], Vec<T> to itself, Box and Rc to T.
+        for self_pat in [ref_p0, mut_p0] {
+            let mut g = two.clone();
+            g.predicates = vec![tp(p, lang.as_ref, p0, p1)];
+            insert_synthetic(p, &mut ordinal, lang.as_ref, self_pat, &[p1], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+        for (s, t) in [(STR, STR), (STR, bytes), (STRING, STR), (STRING, bytes)] {
+            insert_synthetic(p, &mut ordinal, lang.as_ref, s, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        for (s, t) in [(slice_p0, slice_p0), (vec_p0, slice_p0), (vec_p0, vec_p0), (box_p0, p0), (rc_p0, p0)] {
+            insert_synthetic(p, &mut ordinal, lang.as_ref, s, &[t], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // AsMut: through &mut, str and String to str, [T] and Vec<T>
+        // to [T], Vec<T> to itself, Box to T.
+        {
+            let mut g = two.clone();
+            g.predicates = vec![tp(p, lang.as_mut, p0, p1)];
+            insert_synthetic(p, &mut ordinal, lang.as_mut, mut_p0, &[p1], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+        for (s, t) in [(STR, STR), (STRING, STR)] {
+            insert_synthetic(p, &mut ordinal, lang.as_mut, s, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        for (s, t) in [(slice_p0, slice_p0), (vec_p0, slice_p0), (vec_p0, vec_p0), (box_p0, p0)] {
+            insert_synthetic(p, &mut ordinal, lang.as_mut, s, &[t], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // Borrow: T to itself, &T and &mut T to T, String to str, Vec<T>
+        // to [T], Box and Rc to T. BorrowMut: T, &mut T, String, Vec, Box.
+        for (s, t) in [(p0, p0), (ref_p0, p0), (mut_p0, p0), (vec_p0, slice_p0), (box_p0, p0), (rc_p0, p0)] {
+            insert_synthetic(p, &mut ordinal, lang.borrow, s, &[t], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, &mut ordinal, lang.borrow, STRING, &[STR], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        for (s, t) in [(p0, p0), (mut_p0, p0), (vec_p0, slice_p0), (box_p0, p0)] {
+            insert_synthetic(p, &mut ordinal, lang.borrow_mut, s, &[t], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, &mut ordinal, lang.borrow_mut, STRING, &[STR], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        // ToOwned: str to String, [T: Clone] to Vec<T>, T: Clone to T.
+        insert_synthetic(p, &mut ordinal, lang.to_owned, STR, &[], g0.clone(), vec![(lang.assoc_owned, STRING)], Synthetic::Lang, false, span);
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.clone);
+        insert_synthetic(p, &mut ordinal, lang.to_owned, slice_p0, &[], g1.clone(), vec![(lang.assoc_owned, vec_p0)], Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.to_owned, p0, &[], g1, vec![(lang.assoc_owned, p0)], Synthetic::Lang, false, span);
     }
     // Iterator for the builtin iterator structs (ty/iter.rs, W-STD-A):
     // selection and `Item` normalization only; `next` and the

@@ -293,6 +293,11 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::FmtWriteFmt,
     Builtin::FmtCallDisplay,
     Builtin::FmtCallDebug,
+    Builtin::ConvIdent,
+    Builtin::ConvStrBytes,
+    Builtin::ConvArraySlice,
+    Builtin::ConvDeref,
+    Builtin::ConvRcInner,
 ];
 
 /// How a builtin is called.
@@ -585,6 +590,11 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         ),
         B::FmtWriteFmt => (&["fmt::Formatter", "String"], vec![i.intern("write_fmt")], Call::Method),
         B::FmtCallDisplay | B::FmtCallDebug => (&["builtin Display and Debug types"], vec![i.intern("fmt")], Call::Method),
+        B::ConvIdent | B::ConvStrBytes | B::ConvArraySlice | B::ConvDeref | B::ConvRcInner => (
+            &["str", "String", "[T]", "[T; N]", "Vec<T>", "Box<T>", "Rc<T>", "&T"],
+            vec![i.intern("as_ref"), i.intern("as_mut"), i.intern("borrow"), i.intern("borrow_mut")],
+            Call::Method,
+        ),
     }
 }
 

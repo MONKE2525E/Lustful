@@ -1013,6 +1013,55 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/cmp/Ordering/Greater",
 ];
 
+/// True for a trait of the Rust 2024 prelude (and the prelude's
+/// marker traits), which a bare name reaches with no `use`.
+pub fn is_prelude_trait(name: &str) -> bool {
+    matches!(
+        name,
+        "Copy"
+            | "Send"
+            | "Sized"
+            | "Sync"
+            | "Unpin"
+            | "Drop"
+            | "Fn"
+            | "FnMut"
+            | "FnOnce"
+            | "AsMut"
+            | "AsRef"
+            | "From"
+            | "Into"
+            | "DoubleEndedIterator"
+            | "ExactSizeIterator"
+            | "Extend"
+            | "IntoIterator"
+            | "Iterator"
+            | "Clone"
+            | "Default"
+            | "Eq"
+            | "Ord"
+            | "PartialEq"
+            | "PartialOrd"
+            | "ToOwned"
+            | "ToString"
+            | "TryFrom"
+            | "TryInto"
+            | "FromIterator"
+            | "Future"
+            | "IntoFuture"
+    )
+}
+
+/// The std module of a non-prelude trait lust knows by name, for the
+/// import hint of a bare name.
+pub fn std_trait_module(name: &str) -> Option<&'static str> {
+    STD_TRAIT_PATHS.iter().find_map(|row| {
+        let mut parts = row.split('/');
+        let (krate, module, n) = (parts.next()?, parts.next()?, parts.next()?);
+        (krate == "std" && n == name && parts.next().is_none()).then_some(module)
+    })
+}
+
 fn std_row_eq(row: &str, path: &[&str]) -> bool {
     row.split('/').eq(path.iter().copied())
 }

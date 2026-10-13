@@ -102,6 +102,8 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
     // path or the impl's own trait (W-STD-B, check/fmt.rs); bounds below.
     if (trait_def == lang.display && cx.fmt_trait_in_scope(crate::ast::FmtKind::Display))
         || (trait_def == lang.debug && cx.fmt_trait_in_scope(crate::ast::FmtKind::Debug))
+        || (trait_def == lang.borrow && cx.std_trait_imported("borrow", "Borrow"))
+        || (trait_def == lang.borrow_mut && cx.std_trait_imported("borrow", "BorrowMut"))
     {
         return true;
     }
@@ -120,6 +122,10 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.from_iterator,
         lang.from,
         lang.into,
+        // Prelude conversion traits (W-STD-B).
+        lang.as_ref,
+        lang.as_mut,
+        lang.to_owned,
         lang.deref,
         lang.deref_mut,
         lang.index,

@@ -69,19 +69,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
             FmtKind::Display => (p.gx.lang.display, "Display"),
             _ => (p.gx.lang.debug, "Debug"),
         };
-        if self.enclosing_impl_trait() == Some(trait_def) {
-            return true;
-        }
+        self.enclosing_impl_trait() == Some(trait_def) || self.std_trait_imported("fmt", name)
+    }
+
+    /// True when this module imports the std trait `module::name` by a
+    /// `use` of its std path (`use std::fmt::Write;`, any rename). Globs
+    /// and `as _` imports do not count yet, which can only reject.
+    pub(super) fn std_trait_imported(&self, module: &str, name: &str) -> bool {
+        let p = self.p;
         let Some(res) = &p.resolved else { return false };
         let ns = crate::resolve::imports::ns_index(Namespace::Type) as u8;
         res.std_aliases.iter().any(|(&(m, n, _), (_, path))| {
             m == self.module
                 && n == ns
                 && path.len() == 3
-                && matches!(p.interner.get(path[0]), "std" | "core")
-                && p.interner.get(path[1]) == "fmt"
+                && matches!(p.interner.get(path[0]), "std" | "core" | "alloc")
+                && p.interner.get(path[1]) == module
                 && p.interner.get(path[2]) == name
         })
+    }
+
+    /// `enclosing_impl_trait` for the other std trait modules.
+    pub(super) fn enclosing_impl_trait_pub(&self) -> Option<DefId> {
+        self.enclosing_impl_trait()
     }
 
     /// The trait of the impl this body's fn is a method of, walking out
@@ -314,17 +324,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// True when `fmt::Write` is in scope by a `use` of its std path.
     fn fmt_write_in_scope(&self) -> bool {
-        let p = self.p;
-        let Some(res) = &p.resolved else { return false };
-        let ns = crate::resolve::imports::ns_index(Namespace::Type) as u8;
-        res.std_aliases.iter().any(|(&(m, n, _), (_, path))| {
-            m == self.module
-                && n == ns
-                && path.len() == 3
-                && matches!(p.interner.get(path[0]), "std" | "core")
-                && p.interner.get(path[1]) == "fmt"
-                && p.interner.get(path[2]) == "Write"
-        })
+        self.std_trait_imported("fmt", "Write")
     }
 
     /// `t: Display` or `t: Debug` for a format argument whose type the

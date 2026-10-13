@@ -3,6 +3,7 @@
 // Signature collection runs before body checking, in `collect`.
 pub mod closure;
 pub mod collect;
+pub mod convert;
 pub mod fmt;
 pub mod generics;
 pub mod iter;
@@ -317,6 +318,15 @@ pub enum Builtin {
     FmtWriteFmt,
     FmtCallDisplay,
     FmtCallDebug,
+    /// Conversion trait methods on builtin values (W-STD-B,
+    /// check/convert.rs): `&T` unchanged, `&str` to `&[u8]`, an array
+    /// to its slice, one deref (`&Box<T>` and `&&T` to `&T`), and an
+    /// Rc's value.
+    ConvIdent,
+    ConvStrBytes,
+    ConvArraySlice,
+    ConvDeref,
+    ConvRcInner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6466,7 +6476,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let lang = &p.gx.lang;
-        let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_name(p.interner, segs[0].name)?;
+        let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, segs[0].name)?;
         let wanted = match self.name(segs[1].name) {
             "default" if tdef == lang.default && args.is_empty() => true,
             "from" if tdef == lang.from && args.len() == 1 => true,
@@ -6909,7 +6919,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // assoc call itself).
                 if segs.len() == 2 && !args.is_empty() {
                     let cxr = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                    if let Some(tdef) = cxr.trait_by_name(p.interner, segs[0].name)
+                    if let Some(tdef) = cxr.trait_by_bare_name(p.interner, segs[0].name)
                         && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
                         && rec.method_by_name(segs[1].name).is_some()
                     {
@@ -7866,6 +7876,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ret;
             }
             if let Some(ret) = self.fmt_method(e, recv, rt, base, derefs, name, name_span, args) {
+                return ret;
+            }
+            // AsRef, AsMut, Borrow, BorrowMut, ToOwned on builtin values
+            // (check/convert.rs, W-STD-B).
+            if let Some(ret) = self.convert_method(e, recv, rt, name, name_span, args, expected) {
                 return ret;
             }
         }

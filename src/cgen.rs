@@ -2410,7 +2410,12 @@ impl FnGen<'_, '_, '_> {
             | B::FmtFinishNonExhaustive
             | B::FmtWriteFmt
             | B::FmtCallDisplay
-            | B::FmtCallDebug => unreachable!("fmt builtins emit in cgen/fmt.rs"),
+            | B::FmtCallDebug
+            | B::ConvIdent
+            | B::ConvStrBytes
+            | B::ConvArraySlice
+            | B::ConvDeref
+            | B::ConvRcInner => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.
