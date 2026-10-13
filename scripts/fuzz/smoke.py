@@ -516,13 +516,17 @@ fn grown() -> i64 { 1 }
             m = re.search(r"error\[(L\d+)\]", s)
             return m.group(1) if m else None
 
-        for k, (name, body, old, new, start_narrow) in enumerate(vis_cases):
+        # Each kind runs twice: a plain program, and one with a trait
+        # (a generic program, which takes the generic reuse path).
+        marker = 'trait Marker { fn mark(&self) -> i32 { 1 } }\nimpl Marker for u8 {}\n'
+        for k, (name, body, old, new, start_narrow) in enumerate(vis_cases * 2):
+            generic = k >= len(vis_cases)
             main_p = os.path.join(vis_dir, f"vmain{k}.rs")
             pa_p = os.path.join(vis_dir, "pa.rs")
             open(main_p, "w").write(
                 'mod pa;\n'
                 f'fn show() -> i32 {{ {body} }}\n'
-                'fn main() { println!("{}", show()); }\n')
+                'fn main() { println!("{}", show()); }\n' + (marker if generic else ''))
             assert old in vis_pa, old
             narrow = vis_pa.replace(old, new, 1)
             states = [narrow, vis_pa, narrow] if start_narrow else [vis_pa, narrow, vis_pa, narrow, vis_pa]
@@ -536,7 +540,40 @@ fn grown() -> i64 { 1 }
                 ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
                 steps.append(f"{'narrow' if text is narrow else 'pub'}: warm {rcw} {first_code(errw)} "
                              f"cold {r.returncode} {first_code(r.stderr)}")
-            check(f"visibility edit, {name}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
+            kind = f"{name}{', program with a trait' if generic else ''}"
+            check(f"visibility edit, {kind}: warm answer equals cold (fx-vis-fp)", ok, "; ".join(steps))
+
+        # 17. Regression (fx-vis-fp audit): `Self::item` paths from an impl
+        # in another module check the item's visibility (rustc E0624) and
+        # read `Sig(adt)`, so a warm check sees a visibility flip; and an
+        # associated const read bakes the value in, so it records the
+        # const's `Sig` read: a value edit must reach the warm run (the
+        # warm run printed the old value before).
+        sp_pa = 'pub struct S { pub x: i32 }\nimpl S { pub const C: i32 = 3; pub fn get(&self) -> i32 { self.x } }\n'
+        sp_dir = os.path.join(work, "selfpath")
+        os.makedirs(sp_dir, exist_ok=True)
+        sp_main_p = os.path.join(sp_dir, "main.rs")
+        for name, reader, old, new, rejects in (
+                ("Self:: method made private", "Self::get(self)", "pub fn get", "fn get", True),
+                ("Self:: assoc const made private", "Self::C", "pub const C", "const C", True),
+                ("assoc const value edit", "Self::C * 10 + pa::S::C", "C: i32 = 3", "C: i32 = 4", False)):
+            open(sp_main_p, "w").write(
+                'mod pa;\n'
+                f'impl pa::S {{ fn other(&self) -> i32 {{ {reader} }} }}\n'
+                'fn main() { println!("{}", pa::S { x: 1 }.other()); }\n')
+            steps, ok = [], True
+            edited = sp_pa.replace(old, new, 1)
+            for text in (sp_pa, edited, sp_pa, edited):
+                open(os.path.join(sp_dir, "pa.rs"), "w").write(text)
+                outs = []
+                for e in (env, cold_env):
+                    r = subprocess.run([LUST, "run", sp_main_p, "-o", os.path.join(sp_dir, "x.bin")], cwd=work, env=e,
+                                       capture_output=True, text=True, timeout=30)
+                    outs.append((r.returncode, r.stdout, first_code(r.stderr)))
+                want_rc = 1 if rejects and text is edited else 0
+                ok &= outs[0] == outs[1] and outs[0][0] == want_rc
+                steps.append(f"warm {outs[0]} cold {outs[1]}")
+            check(f"{name}: warm run equals cold (fx-vis-fp)", ok, "; ".join(steps))
 
         # 17. Regression (fuzz seed 658, iter 374): the slot count crossed
         # a unit boundary on dead slots only. A check gave 40 new fns slots

@@ -1359,20 +1359,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Inherent method visibility for a method call on a user type.
     fn check_method_vis(&mut self, base: Ty, name: Sym, span: Span) {
+        if let Some(a) = self.tys.local_adt(base) {
+            self.check_assoc_vis(a, name, "method", span);
+        }
+    }
+
+    /// Inherent associated item visibility: a method call, or a
+    /// `Self::item` or `Type::item` path that check resolves. The
+    /// resolver checks written type paths as well; `Self` paths reach
+    /// only this check. `what` names the item kind in the message.
+    fn check_assoc_vis(&mut self, a: AdtId, name: Sym, what: &str, span: Span) {
         let p = self.p;
         let Some(tables) = &p.resolved else { return };
-        let Some(a) = self.tys.local_adt(base) else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
-        if let Some(methods) = tables.assoc_vis.get(&def)
-            && let Some((vis, def_mod)) = methods.get(&name)
+        if let Some(items) = tables.assoc_vis.get(&def)
+            && let Some((vis, def_mod)) = items.get(&name)
             && !tables.visible(vis, *def_mod, self.module, p.interner)
         {
             self.err(
                 "L0510",
                 span,
-                format!("method `{}` is private", self.name(name)),
-                "Make the method `pub(crate)` (the smallest widening that works).",
+                format!("{what} `{}` is private", self.name(name)),
+                format!("Make the {what} `pub(crate)` (the smallest widening that works)."),
             );
         }
     }
@@ -5494,10 +5503,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // Associated consts of inherent impls (Self::A, Type::A) read
         // as their evaluated value, like free consts. Inherent items
-        // shadow trait items, as in rustc.
+        // shadow trait items, as in rustc. The value is baked into this
+        // body, so the const's `Sig` read (its fingerprint folds the
+        // value) is recorded, as `const_item_pat` does.
         if let Some((adt, item)) = self.assoc_const_key(segs)
             && let Some(idx) = p.inherent_assoc_const(adt, item)
         {
+            if let Some(&def) = p.const_defs.get(idx as usize) {
+                let _ = p.sig_of(&mut self.out.reads, def);
+            }
+            self.check_assoc_vis(adt, item, "associated constant", span);
             let c = &p.consts[idx as usize];
             let (v, t) = (c.value.clone(), c.ty);
             let i = self.ei(e);
@@ -5822,6 +5837,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(Res::Variant(a, v as u32));
         }
         if let Some(&f) = p.methods.get(&(a, item)).and_then(|fs| fs.first()) {
+            let what = if p.fn_info(f).self_kind.is_some() { "method" } else { "associated function" };
+            self.check_assoc_vis(a, item, what, span);
             return Some(Res::Fn(f));
         }
         let tn = self.name(ty_name).to_string();
@@ -9351,6 +9368,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some((adt, item)) = self.assoc_const_key(segs)
             && let Some(idx) = p.inherent_assoc_const(adt, item)
         {
+            self.check_assoc_vis(adt, item, "associated constant", span);
             self.const_item_pat(pi, idx, t, span, in_match);
             return true;
         }
