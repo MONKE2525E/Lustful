@@ -3065,15 +3065,34 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 // borrows what the iterator's sources borrow, not the
                 // temporary `&mut` of the iterator; a closure that returns
                 // borrows adds its sources. W-STD-A, ty/iter.rs.
-                let mut from: Vec<u32> = Vec::new();
+                // An item that holds `&mut` (`iter_mut`) is invariant in
+                // what it points to: the element regions equal the
+                // iterator's, and only the loan regions flow into the
+                // item's top-level references (else a write through the
+                // item could store a shorter borrow, rustc E0597).
+                let mutable = has_mut_ref(&self.body.tys, dt);
+                let (mut from, mut loans): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
                 for (t, v) in &avs {
                     let (inner, vars) = match self.body.tys.kind(*t) {
                         TyKind::Ref(_, _, inner) if !v.is_empty() => (inner, &v[1..]),
                         _ => (*t, &v[..]),
                     };
-                    self.non_closure_slots(inner, vars, &mut 0, &mut from);
+                    if mutable {
+                        self.iter_slot_split(inner, vars, &mut 0, &mut loans, &mut from);
+                    } else {
+                        self.non_closure_slots(inner, vars, &mut 0, &mut from);
+                    }
                 }
-                self.flow_all(&from, &dv);
+                if mutable {
+                    let (mut tops, mut rest) = (Vec::new(), Vec::new());
+                    self.item_slot_split(dt, &dv, &mut 0, &mut tops, &mut rest);
+                    loans.extend(from.iter().copied());
+                    self.flow_all(&loans, &tops);
+                    from.append(&mut rest);
+                    self.equate_all(&from, &[]);
+                } else {
+                    self.flow_all(&from, &dv);
+                }
                 // An item that can write through shared memory (`&RefCell`)
                 // is its source's own regions, both ways.
                 if has_interior(&self.body.tys, dt) {
@@ -3556,6 +3575,67 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         };
         self.closure_reqs.insert(def, r.clone());
         r
+    }
+
+    /// Splits an iterator argument's slots (in `non_closure_slots`
+    /// order) into the loan regions of the builtin iterator structs in
+    /// it (their `adt_regions` slots) and the element regions (every
+    /// other slot). Closures are skipped.
+    fn iter_slot_split(&mut self, t: Ty, vars: &[u32], at: &mut usize, loans: &mut Vec<u32>, elems: &mut Vec<u32>) {
+        let TyKind::Adt(_, args) = self.body.tys.kind(t) else {
+            return self.non_closure_slots(t, vars, at, elems);
+        };
+        if !crate::ty::iter::is_iter(&self.body.tys, t) {
+            return self.non_closure_slots(t, vars, at, elems);
+        }
+        for _ in 0..adt_regions(self.p, &self.body.tys, t) {
+            if let Some(&v) = vars.get(*at) {
+                loans.push(v);
+            }
+            *at += 1;
+        }
+        for g in self.body.tys.args(args).to_vec() {
+            if let GenericArg::Ty(e) = g {
+                self.iter_slot_split(e, vars, at, loans, elems);
+            }
+        }
+    }
+
+    /// Splits a result type's slots into its top-level reference regions
+    /// (references reached through tuples, arrays, and Adt args without
+    /// passing another reference, and builtin structs' own regions) and
+    /// the rest.
+    fn item_slot_split(&mut self, t: Ty, vars: &[u32], at: &mut usize, tops: &mut Vec<u32>, rest: &mut Vec<u32>) {
+        let take = |at: &mut usize, n: usize, out: &mut Vec<u32>| {
+            out.extend(vars.iter().skip(*at).take(n).copied());
+            *at += n;
+        };
+        match self.body.tys.kind(t) {
+            TyKind::Ref(_, _, inner) => {
+                take(at, 1, tops);
+                let n = self.sc.slots(inner) as usize;
+                take(at, n, rest);
+            }
+            TyKind::Adt(_, args) => {
+                let n = adt_regions(self.p, &self.body.tys, t) as usize;
+                take(at, n, tops);
+                for g in self.body.tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.item_slot_split(e, vars, at, tops, rest);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in self.body.tys.tys_of(ts).to_vec() {
+                    self.item_slot_split(e, vars, at, tops, rest);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.item_slot_split(e, vars, at, tops, rest),
+            _ => {
+                let n = self.sc.slots(t) as usize;
+                take(at, n, rest);
+            }
+        }
     }
 
     /// The argument slot vars of a closure with free arguments, made at
