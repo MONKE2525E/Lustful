@@ -1258,7 +1258,10 @@ impl FnGen<'_, '_, '_> {
             let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
             let _ = writeln!(self.out, "   {drop_old}\n    {d} = {t};\n   {refill}");
         } else {
-            if dt == CTy::Str {
+            // A plain local of str type is a compiler place temporary
+            // holding the fat value itself; assigning it is a fat copy.
+            // A projected str place would be an unsized byte copy.
+            if dt == CTy::Str && !dest.proj.is_empty() {
                 panic!("unsized assignment");
             }
             if self.out.len() == body_start && post.is_empty() {
@@ -1462,7 +1465,15 @@ impl FnGen<'_, '_, '_> {
                     None => len.clone(),
                 };
                 let incl = if *inclusive { 1 } else { 0 };
-                let _ = writeln!(self.out, "    uint64_t {end} = lust_slice_range({lo_v}, {hi_v}, {incl}, {len}, {loc});");
+                // A str or String base slices to a str: the runtime
+                // check also validates the char boundaries.
+                let range_fn = if matches!(t, CTy::Str | CTy::String) { "lust_str_range" } else { "lust_slice_range" };
+                let range_args = if range_fn == "lust_str_range" {
+                    format!("{ptr}, {lo_v}, {hi_v}, {incl}, {len}, {loc}")
+                } else {
+                    format!("{lo_v}, {hi_v}, {incl}, {len}, {loc}")
+                };
+                let _ = writeln!(self.out, "    uint64_t {end} = {range_fn}({range_args});");
                 let _ = writeln!(self.out, "    {ct} {tmp} = {{ {ptr} + {lo_v}, {end} - {lo_v} }};");
                 tmp
             }
@@ -1829,7 +1840,7 @@ impl FnGen<'_, '_, '_> {
         match t {
             CTy::Array(_, n) => (format!("{e}.v"), n.to_string()),
             CTy::Vec(el) => (format!("(({}*){e}.ptr)", ctype(el)), format!("{e}.len")),
-            CTy::Slice(_) => (format!("{e}.ptr"), format!("{e}.len")),
+            CTy::Slice(_) | CTy::Str | CTy::String => (format!("{e}.ptr"), format!("{e}.len")),
             _ => (format!("(({e}))"), "0".into()),
         }
     }

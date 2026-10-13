@@ -337,6 +337,23 @@ uint64_t lust_slice_range(uint64_t lo, uint64_t hi, int inclusive, uint64_t len,
     return end;
 })
 
+/* The end of a str slice range: the slice range checks, plus both
+   bounds must lie on UTF-8 char boundaries (the end of the string or
+   a byte that is not a continuation byte), as Rust checks. */
+uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
+    uint64_t end = lust_slice_range(lo, hi, inclusive, len, loc);
+    int lo_ok = lo == len || (ptr[lo] & 0xC0) != 0x80;
+    int end_ok = end == len || (ptr[end] & 0xC0) != 0x80;
+    if (!lo_ok || !end_ok) {
+        lust_String s = lust_string_new();
+        lust_string_push_cstr(&s, "byte index ");
+        lust_fmt_u64(&s, lo_ok ? end : lo);
+        lust_string_push_cstr(&s, " is not a char boundary");
+        lust_panic(&s, loc);
+    }
+    return end;
+})
+
 /* Exact float remainder (Rust `%`, truncating division), computed on the
    mantissa integers so no libm link is needed. The algorithm is the
    standard normalize-and-subtract loop over the exponent difference. */

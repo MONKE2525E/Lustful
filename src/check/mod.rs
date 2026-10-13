@@ -3252,6 +3252,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.expect_expr(*b, USIZE);
                     }
                     self.set(*index, UNIT);
+                    // A range index into a string makes a str place; the
+                    // runtime range check also validates char boundaries.
+                    if self.kind(inner) == TyKind::Str || self.tys.is_string_ty(inner) {
+                        self.set_res(e, Res::SliceIndex { derefs });
+                        return STR;
+                    }
                     let elem = match self.kind(inner) {
                         TyKind::Array(elem, _) | TyKind::Slice(elem) => Some(elem),
                         _ => self.tys.vec_elem(inner),
@@ -3268,7 +3274,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                     "L0113",
                                     span,
                                     format!("cannot slice a value of type `{tn}`"),
-                                    "Slice an array, a Vec, or a slice.",
+                                    "Slice an array, a Vec, a slice, or a string.",
                                 );
                             }
                             return ERROR;

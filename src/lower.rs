@@ -262,13 +262,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                 };
                 let lo = bound(self, lo_e).unwrap_or(Operand::Const(Const::Int(0, IntTy::Usize)));
                 let hi = bound(self, hi_e);
-                let elem = match self.kind(self.ty(e)) {
-                    TyKind::Slice(el) => el,
+                // The temporary holds the slice place itself (bare `[T]`
+                // or `str` type, a fat value in codegen).
+                let slice = match self.kind(self.ty(e)) {
+                    TyKind::Slice(el) => self.body.tys.intern(TyKind::Slice(el)),
+                    TyKind::Str => STR,
                     _ => ERROR,
                 };
-                let slice = self.body.tys.intern(TyKind::Slice(elem));
-                // The temporary holds the slice place itself (bare `[T]` type,
-                // a fat value in codegen), like a `str` place.
                 let t = self.temp(slice);
                 let span = self.span(e);
                 let mutable = self.mut_index > 0;
