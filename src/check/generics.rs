@@ -4200,7 +4200,10 @@ fn prove_trait_ref(
 /// arrays, references) since those have no impl records here.
 fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: Ty) -> bool {
     match p.tys.kind(ty) {
-        TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().all(|&e| prove_field_trait(p, env, trait_def, e)),
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
+            elems.iter().all(|&e| prove_field_trait(p, env, trait_def, e))
+        }
         TyKind::Array(e, _) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
         _ => {
             let a = p.tys.intern_args(&[GenericArg::Ty(ty)]);
