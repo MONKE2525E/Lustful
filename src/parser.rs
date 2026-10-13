@@ -980,6 +980,11 @@ impl<'a> Parser<'a> {
                 _ if name_text == "doc" => {}
                 _ if name_text == "repr" => {}
                 _ if first == k.allow || first == k.warn || first == k.deny => {}
+                // Advisory attributes are accepted and ignored, as
+                // ARCH 1.6 gives them: `inline` and `cold` are hints,
+                // `must_use` and `deprecated` are lints with no
+                // warning infrastructure in v1. No output changes.
+                _ if matches!(name_text.as_str(), "inline" | "cold" | "must_use" | "deprecated") => {}
                 _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
                     return Err(Diag::new(

@@ -560,7 +560,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("lifetime names such as 'a", "L0203"),
     ("macro calls with no expanded form yet, such as format_args!", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
-    ("known attributes such as repr, inline, and must_use (named in the message)", "L0522"),
+    ("known attributes such as repr and track_caller (named in the message)", "L0522"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, Hash (named in the message)", "L0403"),
     ("`unsafe` blocks and functions", "L0404"),
     ("`async` functions and blocks", "L0405"),
