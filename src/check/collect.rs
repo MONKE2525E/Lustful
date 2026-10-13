@@ -1669,6 +1669,9 @@ pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate
                     ));
                     continue;
                 }
+                if trait_ref.is_none() {
+                    p.gx.wf_headers.push((self_pat, impl_generics.clone(), imp.span));
+                }
                 // The impl's trait is an assoc source on the Self
                 // pattern inside its method signatures.
                 if let Some(tr) = &trait_ref

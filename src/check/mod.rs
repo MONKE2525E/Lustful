@@ -2522,6 +2522,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn resolve_written(&mut self, t: ast::TyId) -> Ty {
         let p = self.p;
+        let written_span = p.ast.ty_span(t);
         // A written type name in a body is a type-namespace binding read.
         // Primitive names and `Self` are scope layers, not bindings.
         if let ast::TyExpr::Path(segs) = p.ast.ty(t) {
@@ -2548,11 +2549,66 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
             Ok(t) => {
                 let t = self.instantiate_infers(t);
-                self.normalize_here(t)
+                let t = self.normalize_here(t);
+                // A written type must be well-formed: the
+                // bounds of every local Adt it applies become
+                // obligations here (rustc E0277 at the type).
+                self.wf_check_written(t, written_span);
+                t
             }
             Err(d) => {
                 self.errs.push(d);
                 ERROR
+            }
+        }
+    }
+
+    /// Queues the well-formedness obligations of one body
+    /// type: for every application of a local Adt inside it,
+    /// the Adt's parameter bounds under the written arguments.
+    fn wf_check_written(&mut self, t: Ty, span: Span) {
+        if !self.p.gx.has_generics {
+            return;
+        }
+        let mut stack: Vec<Ty> = vec![t];
+        let mut seen: Vec<Ty> = Vec::new();
+        while let Some(t) = stack.pop() {
+            let t = self.deep(t);
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            match self.tys.kind(t) {
+                TyKind::Adt(d, a) => {
+                    let argv: Vec<GenericArg> = self.tys.args(a).to_vec();
+                    if let Some(idx) = self.p.gx.adt_info.iter().position(|&(def, _)| def == d) {
+                        let preds = self.p.gx.adt_generics[idx].predicates.clone();
+                        if !preds.is_empty() {
+                            self.push_predicates(&preds, &argv, span);
+                        }
+                    }
+                    for g in argv {
+                        if let Some(e) = g.as_ty() {
+                            stack.push(e);
+                        }
+                    }
+                }
+                TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => stack.push(e),
+                TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
+                TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+                    let argv: Vec<GenericArg> = self.tys.args(a).to_vec();
+                    for g in argv {
+                        if let Some(e) = g.as_ty() {
+                            stack.push(e);
+                        }
+                    }
+                }
+                TyKind::FnPtr(sig) => {
+                    let b = self.tys.sig(sig);
+                    stack.extend(self.tys.tys_of(b.value.inputs).iter().copied());
+                    stack.push(b.value.output);
+                }
+                _ => {}
             }
         }
     }
@@ -4700,6 +4756,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
                     let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
                     self.check_args(&params, args, span);
+                    // Forming the type owes its parameter bounds.
+                    let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
+                    if !preds.is_empty() {
+                        self.push_predicates(&preds, &gen_args, span);
+                    }
                     self.tys.mk_adt(adef, &gen_args)
                 }
             }
@@ -5708,6 +5769,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 format!("missing fields: {}", missing.join(", ")),
                 "Set every field, or fill the rest from another value with `..base`.",
             );
+        }
+        // Forming the type owes its parameter bounds.
+        if !gen_args.is_empty() {
+            let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
+            if !preds.is_empty() {
+                self.push_predicates(&preds, &gen_args, span);
+            }
         }
         if gen_args.is_empty() {
             self.tys.adt_ty(a)

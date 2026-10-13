@@ -911,8 +911,10 @@ fn projection_of(
 
 /// A `dyn` type in signature form. The principal trait ref keeps
 /// its bindings; supertraits come from the index; auto bounds
-/// become the bound bits. Dyn compatibility errors are collect's
-/// (they need the trait's methods); this only forms the type.
+/// become the bound bits. Dyn types are not supported yet: the
+/// type is formed to keep resolution going, then rejected with
+/// L0701 (a later wave adds dyn compatibility checks and calls,
+/// ARCH 2.8).
 fn resolve_dyn(
     ast: &Ast,
     interner: &Interner,
@@ -972,8 +974,13 @@ fn resolve_dyn(
     };
     // Auto traits a supertrait requires join the bits: a lang
     // supertrait chain into Send/Sync is visible in the records.
-    let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: supertraits.into(), auto });
-    Ok(tys.intern(TyKind::Dyn(bounds_id, Region::Erased)))
+    let _bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: supertraits.into(), auto });
+    Err(Diag::new(
+        "L0701",
+        span,
+        "trait object types (`dyn Trait`) are not supported yet",
+        "Use a generic parameter or an enum instead.",
+    ))
 }
 
 /// A path type: parameters, primitives, builtin Adts, user Adts
@@ -1453,6 +1460,10 @@ pub struct GenTables<'a> {
     /// Associated consts of user traits: the written type (over
     /// the trait's params) and whether a default value is given.
     pub trait_assoc_consts: FxMap<DefId, (Ty, bool)>,
+    /// Inherent impl headers awaiting the finish-side WF check:
+    /// (Self pattern, impl generics, span). Trait impls are
+    /// read back from their index records instead.
+    pub wf_headers: Vec<(Ty, Generics, Span)>,
     /// Per user Adt (templates first, instances appended): the
     /// template def and declared parameter count.
     pub adt_info: Vec<(DefId, usize)>,
@@ -1506,6 +1517,7 @@ impl Default for GenTables<'_> {
             trait_assoc_defaults: FxMap::default(),
             trait_unsafe: FxMap::default(),
             trait_assoc_consts: FxMap::default(),
+            wf_headers: Vec::new(),
             adt_info: Vec::new(),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
@@ -4416,6 +4428,150 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// Collects the trait goals one type owes to be well-formed:
+/// for every application of a local Adt inside it, the Adt's
+/// parameter predicates under the written arguments.
+fn wf_goals(p: &mut Program, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>) {
+    use crate::traits::index::subst_predicate;
+    if seen.contains(&t) || t == ERROR {
+        return;
+    }
+    seen.push(t);
+    let in_args = |p: &mut Program, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>, a: ArgsId| {
+        let argv: Vec<GenericArg> = p.tys.args(a).to_vec();
+        for g in argv {
+            if let Some(e) = g.as_ty() {
+                wf_goals(p, e, seen, out);
+            }
+        }
+    };
+    match p.tys.kind(t) {
+        TyKind::Adt(d, a) => {
+            if let Some(idx) = p.gx.adt_info.iter().position(|&(def, _)| def == d) {
+                let argv: Vec<GenericArg> = p.tys.args(a).to_vec();
+                for &pred in &p.gx.adt_generics[idx].predicates.clone() {
+                    if let Predicate::Trait(b) = subst_predicate(&mut p.tys, pred, &argv)
+                        && b.count == 0
+                    {
+                        out.push(b.value);
+                    }
+                }
+            }
+            in_args(p, seen, out, a);
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, e, seen, out),
+        TyKind::Tuple(ts) => {
+            for e in p.tys.tys_of(ts).to_vec() {
+                wf_goals(p, e, seen, out);
+            }
+        }
+        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(p, seen, out, a),
+        TyKind::FnPtr(sig) => {
+            let b = p.tys.sig(sig);
+            for e in p.tys.tys_of(b.value.inputs).to_vec() {
+                wf_goals(p, e, seen, out);
+            }
+            wf_goals(p, b.value.output, seen, out);
+        }
+        _ => {}
+    }
+}
+
+/// Well-formedness of written types at collect: every type in
+/// a signature, a field list, or an impl header must satisfy
+/// the parameter bounds of the Adts it names, under the item's
+/// own bounds (rustc E0277 at the type). Body-level written
+/// types and literals queue the same obligations in the
+/// checker. A where-clause predicate that mentions no
+/// parameter of its item is a plain fact and must hold as
+/// written.
+fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
+    use crate::traits::index::Synthetic;
+    // (types, item predicates, span, item generics for the
+    // param-free predicate rule)
+    let mut items: Vec<(Vec<Ty>, Generics, Span)> = Vec::new();
+    for i in 0..p.fns.len() {
+        let info = p.fn_info(LocalDefId(i as u32));
+        let mut tys: Vec<Ty> = info.params.clone();
+        tys.push(info.ret);
+        // Plain fns keep their generics (with any where clause)
+        // only in the def table, so read them from there.
+        let generics = match p.gx.fn_templates.get(i).cloned().flatten() {
+            Some(t) => t.generics,
+            None => p.defs.get(p.def_id(LocalDefId(i as u32))).map_or_else(Generics::default, |d| d.generics.clone()),
+        };
+        items.push((tys, generics, info.def.name_span));
+    }
+    for tmpl in p.gx.trait_methods.values() {
+        let mut tys: Vec<Ty> = tmpl.params.clone();
+        tys.push(tmpl.ret);
+        items.push((tys, tmpl.generics.clone(), tmpl.def.name_span));
+    }
+    for idx in 0..p.gx.adt_info.len() {
+        let a = p.adt(AdtId(idx as u32));
+        let tys: Vec<Ty> = a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        items.push((tys, p.gx.adt_generics[idx].clone(), a.span));
+    }
+    for (_, rec) in p.gx.index.all_impls() {
+        if rec.synthetic != Synthetic::None || !rec.local {
+            continue;
+        }
+        let mut tys: Vec<Ty> = p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect();
+        tys.extend(rec.assoc_tys.iter().map(|&(_, t)| t));
+        items.push((tys, rec.generics.clone(), rec.span));
+    }
+    for (ty, generics, span) in &p.gx.wf_headers {
+        items.push((vec![*ty], generics.clone(), *span));
+    }
+    for rec in p.gx.trait_names.values().filter_map(|&d| p.gx.index.trait_record(d)).cloned().collect::<Vec<_>>() {
+        items.push((Vec::new(), rec.generics.clone(), rec.span));
+    }
+    for (tys, generics, span) in items {
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
+        let mut goals: Vec<TraitRef> = Vec::new();
+        let mut seen: Vec<Ty> = Vec::new();
+        for t in tys {
+            wf_goals(p, t, &mut seen, &mut goals);
+        }
+        // A predicate over no parameter of the item must hold
+        // outright (`where String: Copy`).
+        for pred in &generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 {
+                continue;
+            }
+            let n_params = generics.params.len() as u32;
+            let mentions_param = p
+                .tys
+                .args(b.value.args)
+                .iter()
+                .filter_map(|g| g.as_ty())
+                .any(|t| (0..n_params).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)));
+            if !mentions_param && !prove_goal(p, &[], b.value) {
+                let gname = p.gx.index.trait_record(b.value.def).map_or("?", |r| p.name(r.name));
+                errs.push(Diag::new(
+                    "L0612",
+                    span,
+                    format!("the bound `{gname}` in this item's where clause does not hold"),
+                    "Remove the bound, or change the types so it holds.",
+                ));
+            }
+        }
+        for goal in goals {
+            if !prove_goal(p, &env, goal) {
+                let gname = p.gx.index.trait_record(goal.def).map_or("?", |r| p.name(r.name));
+                errs.push(Diag::new(
+                    "L0612",
+                    span,
+                    format!("a type here does not satisfy the `{gname}` bound its definition requires"),
+                    format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
+                ));
+                break;
+            }
+        }
+    }
+}
+
 /// The last collect step before mono: synthetic impls, then
 /// coherence over the whole index (section 2.6).
 pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
@@ -4426,6 +4582,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_impl_obligations(p, errs);
     check_copy_impls(p, errs);
     check_derive_bounds(p, errs);
+    check_written_wf(p, errs);
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;
     let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];

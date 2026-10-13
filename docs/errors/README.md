@@ -85,6 +85,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0650](L0650.md) | `offset_of!` on a default-repr type |
 | [L0651](L0651.md) | reference to a packed field |
 | [L0652](L0652.md) | unsupported layout form |
+| [L0701](L0701.md) | trait object types are not supported yet |
 | [L0720](L0720.md) | ambiguous method |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0721](L0721.md) | this method form is not supported yet |
