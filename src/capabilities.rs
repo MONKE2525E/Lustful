@@ -797,6 +797,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("typed `self` parameters on smart-pointer types (Box, Rc, Arc)", "L0641"),
     ("generic parameter defaults that name a lifetime", "L0614"),
     ("negative impls", "L0614"),
+    ("generic constructors as values, and generic fns as values through a qualified path", "L0614"),
     ("associated consts", "L0621"),
     ("dependency crates with no lust adapter or shim yet (named in the message)", "L0508"),
     ("`impl Trait` types", "L0602"),

@@ -1450,6 +1450,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.check_ctor_vis(a, span);
             }
             let Some((params, ret)) = self.callable_sig(peeled) else { return ERROR };
+            // A generic fn item calls its instance: the call site
+            // records the item's args, as a path call does.
+            if let (Res::Fn(f), TyKind::FnDef(_, fargs)) = (r, self.kind(peeled))
+                && !self.tys.args(fargs).is_empty()
+            {
+                let fargs = self.tys.args(fargs).to_vec();
+                let ei = self.ei(e);
+                self.generic_sites.push((ei, f, fargs));
+            }
             self.set_res(e, r);
             self.check_args(&params, args, span);
             return ret;

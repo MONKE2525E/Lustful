@@ -841,6 +841,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Res::Fn(f) => {
                     // A fn item used as a value: zero-sized at its FnDef
                     // type, the slot trampoline where a fn pointer goes.
+                    // A generic fn names its mono instance.
+                    let f = self.resolve_generic_fn(e, f);
                     let want = match dest {
                         Some(d) if d.proj.is_empty() => {
                             let dt = self.body.locals[d.local as usize].ty;

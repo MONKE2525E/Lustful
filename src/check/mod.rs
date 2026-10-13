@@ -1611,12 +1611,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.tys.intern(TyKind::FnPtr(sig))
     }
 
-    /// The zero-sized fn-item type of a plain (non-generic) fn used as a
-    /// value. Generic fns as values are not supported yet.
-    fn fn_value_ty(&mut self, f: LocalDefId, span: Span) -> Ty {
-        if matches!(self.p.gx.fn_templates.get(f.0 as usize), Some(Some(_))) {
-            self.errs.push(not_yet("L0614", span, "generic functions as values"));
-            return ERROR;
+    /// The zero-sized fn-item type of a fn used as a value. A generic
+    /// fn named by a plain path instantiates as a call does (turbofish
+    /// args or fresh variables, bounds queued, the site recorded for
+    /// mono), and its `FnDef` carries those args. Qualified paths
+    /// (`<S as Tr>::mk`) to generic fns are not supported yet.
+    fn fn_value_ty(&mut self, e: ExprId, f: LocalDefId, span: Span) -> Ty {
+        if let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() {
+            if !matches!(self.p.ast.expr(e), Expr::Path(_)) {
+                self.errs.push(not_yet("L0614", span, "generic functions as values through a qualified path"));
+                return ERROR;
+            }
+            let explicit = self.explicit_call_args(e);
+            let (_, _, args) = self.instantiate_template(e, f, &tmpl.generics, &explicit, span);
+            self.unify_written_self(e, f, &args, span);
+            let args = self.tys.intern_args(&args);
+            return self.tys.intern(TyKind::FnDef(self.p.def_id(f), args));
         }
         self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS))
     }
@@ -1664,17 +1674,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((params, self.tys.adt_ty(a)))
                 } else {
                     let f = p.local_def(def.hash)?;
+                    let fargs: Vec<GenericArg> = self.tys.args(args).to_vec();
                     match p.sig_of(&mut self.out.reads, def) {
-                        SigOf::Fn(info) => Some((info.params.clone(), p.ret_view(f))),
-                        _ => {
-                            let _ = f;
-                            None
+                        SigOf::Fn(info) if fargs.is_empty() => Some((info.params.clone(), p.ret_view(f))),
+                        // A generic fn item: its signature under the
+                        // item's args (see `fn_value_ty`).
+                        SigOf::Fn(info) => {
+                            let params = info.params.iter().map(|&t| subst(&mut self.tys, t, &fargs)).collect();
+                            Some((params, subst(&mut self.tys, info.ret, &fargs)))
                         }
+                        _ => None,
                     }
                 }
             }
             _ => None,
         }
+    }
+
+    /// rustc's LUB of two fn or constructor items: the same item (args
+    /// that unify) keeps its zero-sized type, and only differing items
+    /// reify to a fn pointer. Unifies the args when it answers true.
+    fn same_fn_item(&mut self, a: Ty, b: Ty) -> bool {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        let (TyKind::FnDef(da, _), TyKind::FnDef(db, _)) = (self.kind(a), self.kind(b)) else { return false };
+        if da != db {
+            return false;
+        }
+        let snap = self.snapshot_vars();
+        if self.unify(a, b) {
+            return true;
+        }
+        self.rollback_vars(snap);
+        false
     }
 
     /// True when `t` is a plain fn's item type (not a constructor), so it
@@ -4752,7 +4783,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // which is zero-sized (rustc's LUB coercion).
                         if elems.len() > 1 && self.is_fn_item(elt) {
                             let rest: Vec<Ty> = elems[1..].iter().map(|&el_e| self.expr(el_e, None)).collect();
-                            if rest.iter().all(|&t| self.resolve(t) == elt) {
+                            if rest.iter().all(|&t| self.same_fn_item(elt, t)) {
                                 let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
                                 return self.tys.intern(TyKind::Array(elt, c));
                             }
@@ -5145,6 +5176,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // coercion does; lowering makes each a trampoline value.
         if let Some(fp) = self.closure_lub(a, b) {
             return fp;
+        }
+        if self.same_fn_item(a, b) {
+            return a;
         }
         // Two plain fn items (or an item and a pointer) with one
         // signature join as a function pointer.
@@ -5865,7 +5899,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // top-level one (its type was the error type with no
                     // diagnostic, so `k as fn(..)` built a null pointer).
                     self.set_res(e, Res::Fn(f));
-                    return self.fn_value_ty(f, span);
+                    return self.fn_value_ty(e, f, span);
                 }
                 Some(crate::check::collect::BodyItem::Const(ci)) => {
                     let c = &p.body_consts[ci as usize];
@@ -5900,7 +5934,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && let Some(f) = p.local_def(def.hash)
             {
                 self.set_res(e, Res::Fn(f));
-                return self.fn_value_ty(f, span);
+                return self.fn_value_ty(e, f, span);
             }
             if let BindingRes::Def(def) = bound {
                 match p.binding_kind(def) {
@@ -6124,18 +6158,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if variant.shape == VariantShape::Tuple {
                     return self.ctor_value_ty(a, v, span);
                 }
+                self.err("L0101", span, "expected value, found struct variant", "Write a struct literal: `Enum::Variant { .. }`.");
+                return ERROR;
             }
             if let Res::Fn(f) = r {
-                return self.fn_value_ty(f, span);
+                return self.fn_value_ty(e, f, span);
             }
-            if matches!(
-                r,
-                Res::Builtin(
-                    Builtin::MemDrop | Builtin::MemSwap | Builtin::MemReplace | Builtin::MemTake | Builtin::CmpMax | Builtin::CmpMin
-                )
-            ) {
-                self.errs.push(unsupported(span, "this std function used as a value"));
-            }
+            // Std fns (`String::from`, `Box::new`, `Option::Some`)
+            // have no value form yet. An error type without a
+            // diagnostic would reach codegen, so report every one.
+            self.errs.push(unsupported(span, "this std function used as a value"));
             return ERROR;
         }
         ERROR
@@ -10615,7 +10647,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // so it rejects with the error below instead.
                 if let Res::Fn(f) = r {
                     self.set_res(e, r);
-                    return self.fn_value_ty(f, span);
+                    return self.fn_value_ty(e, f, span);
                 }
             } else {
                 return ERROR;
@@ -10625,7 +10657,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(found) = self.trait_fn_value(self.resolve(base), hint, name, span) {
             let Some(f) = found else { return ERROR };
             self.set_res(e, Res::Fn(f));
-            return self.fn_value_ty(f, span);
+            return self.fn_value_ty(e, f, span);
         }
         self.err(
             "L0104",
