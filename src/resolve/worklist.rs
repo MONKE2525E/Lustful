@@ -142,7 +142,7 @@ pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::
 }
 
 /// Cut points for lexing a big file in parallel: about four pieces per
-/// core, each cut right after a line that ends in `}` or `;`. Each piece
+/// thread (`pool::threads`), each cut right after a line that ends in `}` or `;`. Each piece
 /// lexes on its own, and `piece_cut_ok` checks that every cut really
 /// falls between tokens; on any doubt the caller lexes serially (a cut
 /// inside a string or comment leaves its start unterminated, so that
@@ -152,8 +152,7 @@ pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::
 /// past a trailing `}` or `;`. None for a small file.
 fn route_pieces(text: &str) -> Option<Vec<(usize, usize)>> {
     const MIN_PIECE: usize = 16 * 1024;
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let target = (text.len() / (cores * 4)).max(MIN_PIECE);
+    let target = (text.len() / (crate::pool::threads() * 4)).max(MIN_PIECE);
     if text.len() < 2 * target {
         return None;
     }
@@ -231,29 +230,33 @@ fn join_lexed(parts: Vec<lexer::Lexed>) -> lexer::Lexed {
     out
 }
 
-/// Item-aligned token ranges for parsing one big file in parallel (one-shot
-/// resolves only; see the parse phase). A cut sits between a `}` or `;` at
-/// bracket depth zero and a token that can only begin an item there (an
-/// attribute, `pub`, `fn`, `struct`, `enum`, `impl`, `trait`, `mod`, `use`,
-/// `const`, `static`, `type`), so every range holds whole items and
-/// `parser::parse_items` parses each as `parse` would in place. Cutting stops
-/// at the first unbalanced closer. One range for a file under about 200 KB
-/// (the parse phase already runs files in parallel, and segments of a small
-/// file would only nest), and for a file whose items do not stand alone: one
-/// with an inner attribute anywhere (`#` then `!` as tokens; strip reads a
-/// file-level cfg from the first item, and the parser takes `#!` before any
-/// item) or one that mentions `macro_rules`.
-fn item_segments(text: &str, toks: &[lexer::Token]) -> Vec<std::ops::Range<usize>> {
+/// Item-aligned ranges of a file's parse stream (its expanded tokens when it
+/// has macros) for parsing one big file in parallel (one-shot resolves
+/// only; see the parse phase). A cut sits between a `}` or `;` at bracket
+/// depth zero and a token that `starts_item` says can only begin an item
+/// there. Cutting stops at the first unbalanced closer.
+///
+/// Why a segment parse equals the parse in place (`parser::parse_items`):
+/// expansion runs on the whole file before this, so no macro is left to
+/// expand across a cut; a `;` or `}` at depth zero followed by an item start
+/// ends an item, so every range holds whole items, and an item parse reads
+/// only its own tokens; between items the parser keeps no state but a
+/// deferred error, which fails its segment. Any segment error makes the
+/// caller parse the whole file again, so a cut never changes a diagnostic.
+///
+/// One range for a file under about 200 KB (the parse phase already runs
+/// files in parallel, and segments of a small file would only nest), and
+/// for a file with an inner attribute anywhere (`#` then `!` as tokens):
+/// strip reads a file-level cfg from the first item, and the parser takes
+/// `#!` only before any item.
+fn item_segments(toks: &[lexer::Token], interner: &Interner) -> Vec<std::ops::Range<usize>> {
     use crate::lexer::Tok;
     const MIN_SEGMENT: usize = 4096;
-    if toks.len() < 16 * MIN_SEGMENT
-        || text.contains("macro_rules")
-        || toks.windows(2).any(|w| w[0].tok == Tok::Pound && w[1].tok == Tok::Bang)
-    {
+    if toks.len() < 16 * MIN_SEGMENT || toks.windows(2).any(|w| w[0].tok == Tok::Pound && w[1].tok == Tok::Bang) {
         return vec![0..toks.len()];
     }
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let target = (toks.len() / (cores * 4)).max(MIN_SEGMENT);
+    let union = interner.intern("union");
+    let target = (toks.len() / (crate::pool::threads() * 4)).max(MIN_SEGMENT);
     let mut out = Vec::new();
     let (mut start, mut depth) = (0usize, 0i64);
     for i in 0..toks.len().saturating_sub(1) {
@@ -265,31 +268,64 @@ fn item_segments(text: &str, toks: &[lexer::Token]) -> Vec<std::ops::Range<usize
         if depth < 0 {
             break;
         }
-        if depth == 0
-            && i + 1 - start >= target
-            && matches!(toks[i].tok, Tok::RBrace | Tok::Semi)
-            && matches!(
-                toks[i + 1].tok,
-                Tok::Pound
-                    | Tok::Pub
-                    | Tok::Fn
-                    | Tok::Struct
-                    | Tok::Enum
-                    | Tok::Impl
-                    | Tok::Trait
-                    | Tok::Mod
-                    | Tok::Use
-                    | Tok::Const
-                    | Tok::Static
-                    | Tok::Type
-            )
-        {
+        if depth == 0 && i + 1 - start >= target && matches!(toks[i].tok, Tok::RBrace | Tok::Semi) && starts_item(toks, i + 1, union) {
             out.push(start..i + 1);
             start = i + 1;
         }
     }
     out.push(start..toks.len());
     out
+}
+
+/// True when `toks[i]` can only begin an item where `item_segments` cuts:
+/// right after a `}` or `;` at bracket depth zero of a file's top level.
+/// Rule for this list: a token may enter it only if it cannot continue a
+/// top-level item there. An item goes on after such a `}` only inside a
+/// `const` or `static` value (`= { 1 } + 2;`), where none of these can come
+/// next. A missing start only loses a cut.
+fn starts_item(toks: &[lexer::Token], i: usize, union: Sym) -> bool {
+    use crate::lexer::Tok;
+    let next = toks.get(i + 1).map(|t| t.tok);
+    match toks[i].tok {
+        Tok::Pound
+        | Tok::Pub
+        | Tok::Fn
+        | Tok::Struct
+        | Tok::Enum
+        | Tok::Impl
+        | Tok::Trait
+        | Tok::Mod
+        | Tok::Use
+        | Tok::Const
+        | Tok::Static
+        | Tok::Type
+        | Tok::Extern
+        | Tok::Unsafe
+        | Tok::Async => true,
+        // `union U` (a contextual keyword), and a macro call `name!` or `path::name!`.
+        Tok::Ident(s) => (s == union && matches!(next, Some(Tok::Ident(_)))) || is_macro_call(toks, i),
+        Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep => is_macro_call(toks, i),
+        _ => false,
+    }
+}
+
+/// True when `toks[i..]` is a macro call head: a path (`a::b`, a leading
+/// `::` allowed) then `!`.
+fn is_macro_call(toks: &[lexer::Token], mut i: usize) -> bool {
+    use crate::lexer::Tok;
+    if toks.get(i).map(|t| t.tok) == Some(Tok::PathSep) {
+        i += 1;
+    }
+    loop {
+        if !matches!(toks.get(i).map(|t| t.tok), Some(Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower)) {
+            return false;
+        }
+        match toks.get(i + 1).map(|t| t.tok) {
+            Some(Tok::Bang) => return true,
+            Some(Tok::PathSep) => i += 2,
+            _ => return false,
+        }
+    }
 }
 
 /// The lexed form of `needs_resolve`, for callers that already lexed.
@@ -2312,7 +2348,7 @@ fn resolve_one(
         // can move where an error in bad text shows (an item cut before
         // its missing `;` ends at the cut), and the answer must be the
         // one-piece answer.
-        let segments = if keep { vec![0..lexed.tokens.len()] } else { item_segments(&disc.text, &lexed.tokens) };
+        let segments = if keep { vec![0..lexed.tokens.len()] } else { item_segments(&lexed.tokens, interner) };
         let asts: Vec<Ast> = if segments.len() == 1 {
             vec![parser::parse(&lexed, interner, known)?]
         } else {
@@ -4899,11 +4935,51 @@ mod tests {
         assert!(later(|t| matches!(t, lexer::Tok::DocStr(_))));
     }
 
+    /// Resolves `text` as a one-file crate two ways: one-shot (a big file
+    /// parses in item segments) and with a daemon cache (whole files).
+    fn resolve_both_ways(text: &str, name: &str) -> [Result<ResolvedCrate, ResolveError>; 2] {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let dir = std::env::temp_dir().join(format!("lust-worklist-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("main.rs");
+        std::fs::write(&root, text).unwrap();
+        let input = CrateInput {
+            root_path: root,
+            root_text: text.to_string(),
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{name}"), "bin", name, false) },
+            crate_name: name.into(),
+            deps: Vec::new(),
+        };
+        let out = [true, false].map(|one_shot| resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(one_shot)));
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Both resolves of `resolve_both_ways` succeed with equal crates: fn
+    /// lines, body hashes, the structure hash, every item and body scan, and
+    /// fn modules. Scans hash string, float, byte string, and byte char
+    /// literals, so a literal that read another segment's string would show.
+    fn assert_segmented_equals_whole(text: &str, name: &str) {
+        let interner = Interner::default();
+        let toks = lexer::lex(text, FileId(0), 0, &interner).unwrap().tokens;
+        assert!(item_segments(&toks, &interner).len() > 1, "the file splits");
+        let [one, whole] = resolve_both_ways(text, name);
+        let one = one.ok().expect("segmented resolves");
+        let whole = whole.ok().expect("whole resolves");
+        assert_eq!(one.fn_lines, whole.fn_lines);
+        assert_eq!(one.body_hashes, whole.body_hashes);
+        assert_eq!(one.structure_hash, whole.structure_hash);
+        assert_eq!(one.scans.bodies, whole.scans.bodies);
+        let item_hashes = |r: &ResolvedCrate| r.scans.items.iter().map(|i| (i.hash, i.fn_name)).collect::<Vec<_>>();
+        assert_eq!(item_hashes(&one), item_hashes(&whole));
+        assert_eq!(one.tables.fn_module, whole.tables.fn_module);
+    }
+
     /// A one-shot resolve parses a big file in item segments; the crate it
-    /// returns equals the whole-file resolve of a daemon (persistent) cache:
-    /// fn lines, body hashes, the structure hash, and every item and body
-    /// scan. Scans hash string, float, byte string, and byte char literals,
-    /// so a literal that read another segment's string would show.
+    /// returns equals the whole-file resolve of a daemon (persistent) cache.
     #[test]
     fn segmented_resolve_matches_whole_file() {
         let mut text = String::from("mod m {\n    pub fn g() -> i64 { 1 }\n}\nuse m::g;\n");
@@ -4913,33 +4989,70 @@ mod tests {
             );
         }
         text += "fn main() {\n    f0();\n}\n";
+        assert_segmented_equals_whole(&text, "segments");
+    }
+
+    /// Macros do not stop segmenting: expansion runs on the whole file first,
+    /// so segments cut the expanded stream. Macro-made items and a macro
+    /// defined mid-file (used only after it, across later cuts) give the
+    /// same crate as the whole-file resolve.
+    #[test]
+    fn segmented_resolve_with_macros_matches_whole_file() {
+        let mut text = String::from(
+            "macro_rules! twice { ($e:expr) => { $e * 2 }; }\nmacro_rules! mk { ($n:ident) => { fn $n() -> usize { twice!(3) } }; }\n",
+        );
+        for i in 0..6000 {
+            if i == 3000 {
+                text += "macro_rules! late { ($n:ident, $v:expr) => { fn $n() -> usize { $v + twice!(1) } }; }\n";
+            }
+            if i % 500 == 7 {
+                text += &format!("mk!(g{i});\n");
+            }
+            if i > 3000 && i % 500 == 9 {
+                text += &format!("late!(h{i}, {i});\n");
+            }
+            text += &format!("fn f{i}() -> usize {{ let s = \"s{i}\"; s.len() + twice!({i}) }}\n");
+        }
+        text += "fn main() {\n    f0();\n}\n";
+        assert_segmented_equals_whole(&text, "segments-macros");
+    }
+
+    /// A bad item right before a cut: its segment ends at the cut, so the
+    /// segment's own parse fails at the end of input instead of at the next
+    /// item. The one-shot resolve parses the whole file again and gives the
+    /// whole-file diagnostic.
+    #[test]
+    fn segment_error_gives_whole_file_diagnostic() {
         let interner = Interner::default();
         let known = Known::new(&interner);
-        let toks = lexer::lex(&text, FileId(0), 0, &interner).unwrap().tokens;
-        assert!(item_segments(&text, &toks).len() > 1, "the file splits");
-        let dir = std::env::temp_dir().join(format!("lust-worklist-test-{}-segments", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("main.rs");
-        std::fs::write(&root, &text).unwrap();
-        let input = CrateInput {
-            root_path: root,
-            root_text: text,
-            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
-            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:segments", "bin", "segments", false) },
-            crate_name: "segments".into(),
-            deps: Vec::new(),
-        };
-        let one = resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(true)).ok().expect("segmented resolves");
-        let whole = resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(false)).ok().expect("whole resolves");
-        assert_eq!(one.fn_lines, whole.fn_lines);
-        assert_eq!(one.body_hashes, whole.body_hashes);
-        assert_eq!(one.structure_hash, whole.structure_hash);
-        assert_eq!(one.scans.bodies, whole.scans.bodies);
-        let item_hashes = |r: &ResolvedCrate| r.scans.items.iter().map(|i| (i.hash, i.fn_name)).collect::<Vec<_>>();
-        assert_eq!(item_hashes(&one), item_hashes(&whole));
-        assert_eq!(one.tables.fn_module, whole.tables.fn_module);
-        let _ = std::fs::remove_dir_all(&dir);
+        let fns: Vec<String> = (0..6000).map(|i| format!("fn f{i}() -> usize {{ let s = \"s{i}\"; s.len() + {i} }}\n")).collect();
+        let main = "fn main() {}\n";
+        // A const with no `;`. Its value ends in a block at depth zero, so
+        // a cut fits right after it, and it is long enough to pass the
+        // segment's size target on its own.
+        let bad = format!("const C: usize = {{ {} }}\n", vec!["1"; 80].join(" + "));
+        let good = fns.concat() + main;
+        let good_toks = lexer::lex(&good, FileId(0), 0, &interner).unwrap().tokens;
+        let first_cut = item_segments(&good_toks, &interner)[1].start;
+        let k = good[..good_toks[first_cut].span.lo as usize].matches('\n').count();
+        // Put the const before one of the items near the first cut, so that
+        // the cut moves right after it.
+        let (text, lexed, seg) = (k.saturating_sub(3)..=k)
+            .find_map(|j| {
+                let text = fns[..j].concat() + &bad + &fns[j..].concat() + main;
+                let close = fns[..j].iter().map(|f| f.len()).sum::<usize>() + bad.len() - 2;
+                let lexed = lexer::lex(&text, FileId(0), 0, &interner).unwrap();
+                let seg =
+                    item_segments(&lexed.tokens, &interner).into_iter().find(|r| lexed.tokens[r.end - 1].span.lo as usize == close)?;
+                Some((text, lexed, seg))
+            })
+            .expect("a cut lands right after the bad const");
+        let seg_err = parser::parse_items(&lexed, seg, &interner, &known).err().expect("the segment fails");
+        let whole_err = parser::parse(&lexed, &interner, &known).err().expect("the file fails");
+        assert_ne!(format!("{:?}", seg_err), format!("{:?}", whole_err), "the cut moves the error");
+        let [one, whole] = resolve_both_ways(&text, "segment-error").map(|r| r.err().expect("the resolve fails").diags);
+        assert_eq!(format!("{one:?}"), format!("{whole:?}"));
+        assert_eq!(format!("{:?}", one[0]), format!("{whole_err:?}"));
     }
 
     fn resolve(files: &[(&str, &str)], crate_name: &str) -> Result<ResolvedCrate, ResolveError> {
