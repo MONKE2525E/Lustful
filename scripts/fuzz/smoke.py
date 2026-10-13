@@ -557,6 +557,47 @@ fn grown() -> i64 { 1 }
               rc1 == 0 and out1 == "91\n" and rc2 == 0 and rc3 == 0 and out3 == "91\n",
               f"rc1={rc1} rc2={rc2} rc3={rc3} out3={out3!r} err3={err3[:160]!r}")
 
+        # 18. Regression (fx-seed658): file inner attributes under the chunked
+        # parse. Each chunk parses on its own, so a warm chunk that started at
+        # a `#![..]` took it as file attributes even after an item, and a kept
+        # chunk kept the crate allow it was parsed under after the allow was
+        # removed (both warm false accepts). A crate allow must also reach fns
+        # in other chunks, warm and in a cold file over 64 KB. Each walk runs
+        # in its own session; every step must give the rustc answer (`want`)
+        # warm and cold, with the same first error code.
+        ia_main = 'fn a() -> i64 {\n    1\n}\n\nfn main() {\n    println!("{}", a());\n}\n'
+        ia_over = 'fn g() -> u8 {\n    let x: u8 = 255 + 1;\n    x\n}\n\nfn main() {\n    println!("{}", g());\n}\n'
+        ia_ok = ia_over.replace("let x: u8 = 255 + 1;\n    x", "1")
+        ia_walks = [
+            ("item put above a crate attribute",
+             [("#![allow(dead_code)]\n" + ia_main, 0), ("struct Zed;\n\n#![allow(dead_code)]\n" + ia_main, 1)]),
+            ("inner attribute put after a kept item",
+             [(ia_main, 0), ("struct Zed;\n\n" + ia_main, 0), ("struct Zed;\n\n#![allow(dead_code)]\n" + ia_main, 1)]),
+            ("crate allow put above a kept fn",
+             [(ia_over, 1), ("#![allow(arithmetic_overflow)]\n" + ia_over, 0)]),
+            # The kept second chunk was parsed under the crate allow; removing
+            # the allow re-parsed only the first chunk (signatures mode).
+            ("crate allow removed over a kept chunk",
+             [(ia_ok, 0),
+              ("#![allow(arithmetic_overflow)]\nfn zed() -> i64 {\n    3\n}\n\n" + ia_ok, 0),
+              ("#![allow(arithmetic_overflow)]\nfn zed() -> i64 {\n    3\n}\n\n" + ia_over + "struct S;\n", 0),
+              ("fn zed() -> i64 {\n    3\n}\n\n" + ia_over + "struct S;\n", 1)]),
+            ("crate allow over a file of many chunks",
+             [("#![allow(arithmetic_overflow)]\n"
+               + "".join(f"fn filler{i}(x: i64) -> i64 {{\n    x * {i} + 1\n}}\n\n" for i in range(2500)) + ia_over, 0)]),
+        ]
+        for k, (name, walk) in enumerate(ia_walks):
+            ia = os.path.join(work, f"inner_attr{k}.rs")
+            steps, ok = [], True
+            for text, want in walk:
+                open(ia, "w").write(text)
+                rcw, _, errw = run_lust(["check", ia])
+                r = subprocess.run([LUST, "check", ia], cwd=work, env=cold_env,
+                                   capture_output=True, text=True, timeout=20)
+                ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
+                steps.append(f"want {want}: warm {rcw} {first_code(errw)} cold {r.returncode} {first_code(r.stderr)}")
+            check(f"inner attributes, {name}: warm and cold give the rustc answer", ok, "; ".join(steps))
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).

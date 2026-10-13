@@ -149,6 +149,9 @@ pub(crate) struct Chunk {
     /// with content hashes, env values; see `expand::Dep`). The chunk is
     /// dropped instead of reused when one changes (added for W-MACRO).
     pub(crate) expand_deps: Vec<crate::expand::Dep>,
+    /// The tokens hold an inner attribute opener (`compile::has_inner_attr`),
+    /// computed once at lex time so a kept chunk is not scanned again.
+    pub(crate) inner_attr: bool,
 }
 
 /// Per-slot results and build state.

@@ -681,6 +681,18 @@ fn chunk_pos_sensitive(c: &Chunk) -> bool {
     ["line!", "column!", "file!", "stringify!", "dbg!"].iter().any(|n| c.text.contains(n))
 }
 
+/// True when `lexed` holds an inner attribute opener (`#` then `!`). A file
+/// with one compiles as one chunk, as the resolver keeps it one segment
+/// (`item_segments`). Chunks parse on their own: a later chunk would take a
+/// `#![..]` at its start as file attributes even after an item, and a kept
+/// chunk would keep the file allows it was parsed under after an edit
+/// changed them (`chunk_seed_allows` seeds re-parsed chunks only). Both
+/// were warm false accepts. So a split file never has a leading inner run
+/// to seed from.
+fn has_inner_attr(lexed: &lexer::Lexed) -> bool {
+    lexed.tokens.windows(2).any(|w| w[0].tok == lexer::Tok::Pound && w[1].tok == lexer::Tok::Bang)
+}
+
 /// True when a chunk's expansion reads files outside the source
 /// (`include!` and kin): such a chunk is never reused, because the
 /// included file can change while the source text stays the same.
@@ -1606,6 +1618,7 @@ fn resolved_setup(
         },
         items: Some(0..n_items),
         expand_deps,
+        inner_attr: false,
     }];
     let env = scan::env_hash(item_scans.iter());
     // The same mode split as the single-file path. Bodies mode goes
@@ -1912,7 +1925,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             |(l, deps)| {
                 let mut sc = scan::scan(&l);
                 fold_fn_text(&mut sc, &l, &src);
-                (l, sc, deps)
+                let inner_attr = has_inner_attr(&l);
+                (l, sc, deps, inner_attr)
             },
         )
     });
@@ -1921,16 +1935,28 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mut d = d.clone();
         return errors(std::slice::from_mut(&mut d), &map, &src, req);
     }
-    if fresh.iter().any(|l| l.is_err()) {
-        // A chunk cut a comment or string the scanner did not see, or the text is bad: lex the
-        // whole file. Its error is the answer; if it lexes, compile as one chunk. Never panic.
+    let split_inner_attr = ranges.len() > 1
+        && (reused.iter().flatten().any(|c| c.inner_attr) || fresh.iter().flatten().any(|&(_, _, _, inner_attr)| inner_attr));
+    if split_inner_attr || fresh.iter().any(|l| l.is_err()) {
+        // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
+        // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
+        // answer; if it lexes, compile as one chunk. Never panic.
         match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok((whole, deps)) => {
                 let mut sc = scan::scan(&whole);
                 fold_fn_text(&mut sc, &whole, &src);
-                front.chunks =
-                    vec![Chunk { start: 0, text: src.clone(), lexed: whole, lexed_start: 0, scan: sc, items: None, expand_deps: deps }];
+                let inner_attr = has_inner_attr(&whole);
+                front.chunks = vec![Chunk {
+                    start: 0,
+                    text: src.clone(),
+                    lexed: whole,
+                    lexed_start: 0,
+                    scan: sc,
+                    items: None,
+                    expand_deps: deps,
+                    inner_attr,
+                }];
             }
         }
     } else {
@@ -1955,9 +1981,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     c
                 }
                 None => {
-                    let (_, (lexed, sc, deps)) = next_fresh.take().unwrap();
+                    let (_, (lexed, sc, deps, inner_attr)) = next_fresh.take().unwrap();
                     next_fresh = fresh.next();
-                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None, expand_deps: deps }
+                    Chunk { start: a, text: src[a..b].to_string(), lexed, lexed_start: a, scan: sc, items: None, expand_deps: deps, inner_attr }
                 }
             };
             front.chunks.push(chunk);
