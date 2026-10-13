@@ -397,6 +397,43 @@ fn grown() -> i64 { 1 }
               and "L0820" in errw and errw == r.stderr and "panicked" not in r.stderr,
               f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
 
+        # 14. Duplicate definitions through warm edits: adding a second
+        # trait of one name (or a second `mod` of one name) must reject
+        # with L0106 warm exactly as cold does, byte for byte, and
+        # removing the duplicate must accept again. The cold duplicate
+        # trait used to panic in collect (pass 1.5 looked the second
+        # trait's methods up in the first trait's record).
+        dp = os.path.join(work, "dup.rs")
+        ok_src = 'trait T {\n    fn a(&self) -> i64;\n}\nstruct S;\nimpl T for S {\n    fn a(&self) -> i64 { 1 }\n}\nfn main() { println!("{}", S.a()); }\n'
+        dup_src = ok_src.replace(
+            'struct S;\n', 'trait T {\n    fn b(&self) -> i64;\n}\nstruct S;\n')
+        assert dup_src != ok_src
+        cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
+        open(dp, "w").write(ok_src)
+        rc1, _, _ = run_lust(["check", dp])
+        open(dp, "w").write(dup_src)
+        rcw, _, errw = run_lust(["check", dp])
+        r = subprocess.run([LUST, "check", dp], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("warm duplicate trait rejects like cold (no panic)",
+              rc1 == 0 and rcw == 1 and r.returncode == 1
+              and "L0106" in errw and errw == r.stderr and "panicked" not in r.stderr,
+              f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+        dup_mod_src = ok_src.replace(
+            'fn main()', 'mod m {}\nmod m {}\nfn main()')
+        open(dp, "w").write(dup_mod_src)
+        rcw, _, errw = run_lust(["check", dp])
+        r = subprocess.run([LUST, "check", dp], cwd=work, env=cold_env,
+                           capture_output=True, text=True, timeout=20)
+        check("warm duplicate mod rejects like cold",
+              rcw == 1 and r.returncode == 1
+              and "L0106" in errw and errw == r.stderr,
+              f"warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
+        open(dp, "w").write(ok_src)
+        rc, out, err = run_lust(["run", dp, "-o", os.path.join(work, "dup.bin")])
+        check("duplicate removed: warm accepts and runs again",
+              rc == 0 and out == "1\n", f"rc={rc} out={out!r} err={err!r}")
+
         # 12. Temp cleanup: SIGTERM removes the daemon's temp dir, and
         # executables built against its base libraries still run (bases
         # live in `.lust-cache/bases`, section 4).

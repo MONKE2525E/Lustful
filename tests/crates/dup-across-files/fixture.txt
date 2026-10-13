@@ -1,0 +1,2 @@
+# Both reject: `f` is defined twice in the submodule file.
+expect=L0106
