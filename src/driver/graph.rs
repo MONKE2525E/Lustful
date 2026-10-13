@@ -670,6 +670,66 @@ pub(crate) fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// Folds the regions of one regioned type (W-BORROW, `p.regions`) into
+/// `h`: its structure with regions, then the regioned fields of every
+/// user Adt it names, transitively. Erased types hide what the borrow
+/// checker reads here (`&'static str` and `&str` are one erased type;
+/// an Adt's variance comes from its fields' regions), so a region-only
+/// edit must move the `Sig` fingerprint of what it changed.
+fn hash_regions_deep(h: &mut FxHasher, p: &Program, t: Ty, seen: &mut Vec<DefId>) {
+    hash_ty(h, p, &p.tys, t);
+    let mut defs = Vec::new();
+    collect_adt_defs(p, &p.tys, t, &mut defs);
+    for def in defs {
+        if seen.contains(&def) {
+            "region-cycle".hash(h);
+            hash_def_pub(h, p, def);
+            continue;
+        }
+        seen.push(def);
+        hash_adt_regions(h, p, def, seen);
+        seen.pop();
+    }
+}
+
+/// Folds one Adt's lifetime params and regioned field types into `h`
+/// (see `hash_regions_deep`).
+fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<DefId>) {
+    "adt-regions-v1".hash(h);
+    hash_def_pub(h, p, def);
+    (p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len()) as u64).hash(h);
+    let Some(variants) = p.regions.adt_fields.get(&def) else { return 0u8.hash(h) };
+    (variants.len() as u64).hash(h);
+    for fields in variants {
+        (fields.len() as u64).hash(h);
+        for &t in fields {
+            hash_regions_deep(h, p, t, seen);
+        }
+    }
+}
+
+/// Folds a fn's region signature into `h`: regioned params and return
+/// (deeply), outlives facts, and early-bound flags. A caller's borrow
+/// check reads all of them; the erased signature shows none.
+fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::RegionSig>) {
+    "region-sig-v1".hash(h);
+    let Some(rs) = rs else { return 0u8.hash(h) };
+    1u8.hash(h);
+    rs.n_univ.hash(h);
+    let mut seen: Vec<DefId> = Vec::new();
+    (rs.params.len() as u64).hash(h);
+    for &t in &rs.params {
+        hash_regions_deep(h, p, t, &mut seen);
+    }
+    hash_regions_deep(h, p, rs.ret, &mut seen);
+    (rs.facts.len() as u64).hash(h);
+    for &(a, b) in &rs.facts {
+        hash_region(h, a);
+        hash_region(h, b);
+    }
+    rs.early.hash(h);
+}
+
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved
 /// def in disk form, or ambiguous, or absent). Wave A also folds the
 /// resolved def's `Sig` fingerprint in: read-based reuse must not keep a
@@ -918,7 +978,7 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
 /// (W-TRAITS-CORE); today they are empty for every user def.
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
-    "sig-v3".hash(&mut h);
+    "sig-v4".hash(&mut h);
     hash_vis_facts(&mut h, p, def);
     hash_def_pub(&mut h, p, def);
     let mut seen: Vec<DefId> = Vec::new();
@@ -962,6 +1022,9 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // the first needs a `'static` receiver (check::object).
         p.gx.static_dyn_fns.contains(&local).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
+        // `fn f(x: &str)` and `fn f(x: &'static str)` erase alike;
+        // callers' borrow checks read the region signature (W-BORROW).
+        hash_region_sig(&mut h, p, p.regions.fns.get(&local));
         f.ret_borrows_from.map(|i| i as u64 + 1).unwrap_or(0).hash(&mut h);
         // A generic fn's parameters and bounds (its impl's too, merged
         // in by collect): callers prove the bounds (generic reuse).
@@ -972,6 +1035,10 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     } else if p.adt_by_def(def).is_some() {
         1u8.hash(&mut h);
         layout_fingerprint(p, def).0.hash(&mut h);
+        // Lifetime params and field regions (W-BORROW): `&'a T` and
+        // `&'static T` fields erase alike.
+        let mut seen = vec![def];
+        hash_adt_regions(&mut h, p, def, &mut seen);
     } else if let Some(data) = p.defs.get(def) {
         2u8.hash(&mut h);
         // Const and static payloads are found by def; aliases by flat
@@ -993,6 +1060,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         }
     } else {
         3u8.hash(&mut h);
+    }
+    // A trait method's region signature (W-BORROW): calls through a
+    // bound or a stub read it, and the trait item's text alone does not
+    // reach this node.
+    if let Some(rs) = p.regions.trait_methods.get(&def) {
+        hash_region_sig(&mut h, p, Some(rs));
     }
     Fingerprint(h.finish())
 }
