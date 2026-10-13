@@ -425,7 +425,8 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
         | Rvalue::Opt(_, Some(o))
         | Rvalue::Res(_, _, o)
         | Rvalue::MakeDyn { ptr: o, .. }
-        | Rvalue::DynUpcast { ptr: o, .. } => f(o),
+        | Rvalue::DynUpcast { ptr: o, .. }
+        | Rvalue::DynMeta { ptr: o, .. } => f(o),
         Rvalue::Opt(_, None) => {}
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::Eq { a, b, .. } => {
             f(a);

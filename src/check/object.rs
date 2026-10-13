@@ -32,6 +32,9 @@ use crate::ty::*;
 
 /// Words before the first super slot: drop, size, align.
 pub const VT_HEADER: u32 = 3;
+/// The header words `size_of_val` and `align_of_val` read.
+pub const VT_SIZE: u32 = 1;
+pub const VT_ALIGN: u32 = 2;
 
 /// How a vtable method takes its receiver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,7 +294,9 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         }
         match recv {
             Some(recv) => info.methods.push(DynMethod { def: mdef, name: mname, recv }),
-            None if tm.self_kind.is_some() => info.uncallable.push((mname, mdef, "it takes `self` by value, and a `dyn` value has no size")),
+            None if tm.self_kind.is_some() => {
+                info.uncallable.push((mname, mdef, "it takes `self` by value, and a `dyn` value has no size"))
+            }
             None => {}
         }
     }

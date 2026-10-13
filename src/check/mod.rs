@@ -297,6 +297,9 @@ pub enum Res {
         kind: PrimOpKind,
         derefs: u8,
     },
+    /// `size_of_val` or `align_of_val` on a dyn value: reads this
+    /// header word of the argument's vtable (`object::VT_SIZE`, `VT_ALIGN`).
+    DynMeta(u32),
     /// A binary operator through an operator trait: the trait
     /// method to call (a template until mono rewrites it through
     /// `Checked::generic_args`), with operand deref counts.
@@ -5309,6 +5312,106 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(self.normalize_here(ret))
     }
 
+    /// Some(true) for a callee that names std's `align_of_val`, Some(false)
+    /// for `size_of_val`: the bare prelude name (since Rust 1.80) unless a
+    /// user fn of that name shadows it, or a `std::mem`/`core::mem` path.
+    fn layout_of_val_callee(&mut self, callee: ExprId) -> Option<bool> {
+        let Expr::Path(segs) = self.p.ast.expr(callee) else { return None };
+        let last = match segs.iter().map(|s| self.name(s.name)).collect::<Vec<_>>().as_slice() {
+            [n] | ["mem", n] | ["std" | "core", "mem", n] => *n,
+            _ => return None,
+        };
+        let align = match last {
+            "size_of_val" => false,
+            "align_of_val" => true,
+            _ => return None,
+        };
+        if let [seg] = segs.as_slice()
+            && (self.body_item_of(seg.name, self.span(callee).ctxt).is_some() || self.binding_fn(seg.name).is_some())
+        {
+            return None;
+        }
+        Some(align)
+    }
+
+    /// `size_of_val(&value)` or `align_of_val(&value)`: a constant from
+    /// the layout of the value's type, or for a dyn value the size or
+    /// align word of its vtable.
+    fn layout_of_val(&mut self, e: ExprId, args: &[ExprId], align: bool, span: Span) -> Ty {
+        let p = self.p;
+        let what = if align { "align_of_val" } else { "size_of_val" };
+        if args.len() != 1 {
+            self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one reference.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return ERROR;
+        }
+        let at = self.expr(args[0], None);
+        let at = self.deep(at);
+        let inner = match self.kind(at) {
+            TyKind::Ref(_, _, inner) => inner,
+            _ => {
+                let tn = self.tn(at);
+                self.err("L0110", span, format!("`{what}` takes a reference, found `{tn}`"), "Pass `&value`.");
+                return ERROR;
+            }
+        };
+        let inner = self.deep(inner);
+        if matches!(self.kind(inner), TyKind::Dyn(..)) {
+            self.set_res(e, Res::DynMeta(if align { object::VT_ALIGN } else { object::VT_SIZE }));
+            return USIZE;
+        }
+        p.record_layout_reads(&mut self.out.reads, &self.tys, inner);
+        // A template check has no layout for a type over its
+        // params (`size_of_val(t)` with `T: ?Sized` included);
+        // each instance answers with its own, as in
+        // `layout_query`. No Sized proof is needed here.
+        if self.is_template_check() && self.tys.flags(inner).contains_param() {
+            self.set_res(e, Res::ConstUsize(0));
+            return USIZE;
+        }
+        match crate::ty::layout::layout_of_ty(&self.tys, p, inner) {
+            Ok(l) => {
+                self.set_res(e, Res::ConstUsize(if align { l.align } else { l.size }));
+                USIZE
+            }
+            Err(()) => {
+                // Unsized tails with a runtime length: a slice is
+                // `len * size_of::<elem>()`, a `str` is its byte
+                // length; the align of both is the element's. Other
+                // unsized forms (a generic Adt with an unsized last
+                // field) stay the layout reject.
+                let tail = match self.kind(inner) {
+                    TyKind::Slice(elem) => {
+                        crate::ty::layout::layout_of_ty(&self.tys, p, elem).ok().map(|l| (Builtin::SliceLen, l.size, l.align))
+                    }
+                    TyKind::Str => Some((Builtin::StrLen, 1, 1)),
+                    _ => None,
+                };
+                match tail {
+                    Some((_, _, elem_align)) if align => {
+                        self.set_res(e, Res::ConstUsize(elem_align));
+                        USIZE
+                    }
+                    Some((len, elem, _)) => {
+                        self.set_res(e, Res::SizeOfVal { len, elem });
+                        USIZE
+                    }
+                    None => {
+                        self.err(
+                            "L0652",
+                            span,
+                            format!("unsupported layout form: `{}`", self.tn(inner)),
+                            "Use a type inside the supported layout grammar.",
+                        );
+                        ERROR
+                    }
+                }
+            }
+        }
+    }
+
     fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span, expected: Option<Ty>) -> Ty {
         let p = self.p;
         // A callee that names a local (or is not a path at all)
@@ -5348,80 +5451,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return UNIT;
             }
         }
-        // `std::mem::size_of_val(&value)`: the size of the value's type.
-        if let Expr::Path(segs) = p.ast.expr(callee) {
-            let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
-            let is_sov = matches!(names.as_slice(), ["size_of_val"] | ["mem", "size_of_val"])
-                || matches!(names.as_slice(), ["std" | "core", "mem", "size_of_val"]);
-            if is_sov {
-                if args.len() != 1 {
-                    self.err(
-                        "L0105",
-                        span,
-                        "this function takes 1 argument but a different number was given",
-                        "Pass exactly one reference.",
-                    );
-                    for &a in args {
-                        self.expr(a, None);
-                    }
-                    return ERROR;
-                }
-                let at = self.expr(args[0], None);
-                let at = self.deep(at);
-                let inner = match self.kind(at) {
-                    TyKind::Ref(_, _, inner) => inner,
-                    _ => {
-                        let tn = self.tn(at);
-                        self.err("L0110", span, format!("`size_of_val` takes a reference, found `{tn}`"), "Pass `&value`.");
-                        return ERROR;
-                    }
-                };
-                let inner = self.deep(inner);
-                p.record_layout_reads(&mut self.out.reads, &self.tys, inner);
-                // A template check has no layout for a type over its
-                // params (`size_of_val(t)` with `T: ?Sized` included);
-                // each instance answers with its own, as in
-                // `layout_query`. No Sized proof is needed here.
-                if self.is_template_check() && self.tys.flags(inner).contains_param() {
-                    self.set_res(e, Res::ConstUsize(0));
-                    return USIZE;
-                }
-                return match crate::ty::layout::layout_of_ty(&self.tys, p, inner) {
-                    Ok(l) => {
-                        self.set_res(e, Res::ConstUsize(l.size));
-                        USIZE
-                    }
-                    Err(()) => {
-                        // Unsized tails with a runtime length: a slice
-                        // is `len * size_of::<elem>()`, a `str` is its
-                        // byte length. Other unsized forms (a generic
-                        // Adt with an unsized last field, `dyn`) stay
-                        // the layout reject.
-                        let tail = match self.kind(inner) {
-                            TyKind::Slice(elem) => {
-                                crate::ty::layout::layout_of_ty(&self.tys, p, elem).ok().map(|l| (Builtin::SliceLen, l.size))
-                            }
-                            TyKind::Str => Some((Builtin::StrLen, 1)),
-                            _ => None,
-                        };
-                        match tail {
-                            Some((len, elem)) => {
-                                self.set_res(e, Res::SizeOfVal { len, elem });
-                                USIZE
-                            }
-                            None => {
-                                self.err(
-                                    "L0652",
-                                    span,
-                                    format!("unsupported layout form: `{}`", self.tn(inner)),
-                                    "Use a type inside the supported layout grammar.",
-                                );
-                                ERROR
-                            }
-                        }
-                    }
-                };
-            }
+        if let Some(align) = self.layout_of_val_callee(callee) {
+            return self.layout_of_val(e, args, align, span);
         }
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {

@@ -848,6 +848,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                             );
                         }
                     }
+                    // Only reads the vtable, so a `&mut dyn` argument is
+                    // reborrowed, not moved, as rustc's `&mut` to `&` is.
+                    Res::DynMeta(word) => {
+                        let ptr = match ops.into_iter().next().unwrap() {
+                            Operand::Move(pl) => Operand::Copy(pl),
+                            o => o,
+                        };
+                        self.set_or_temp(dest, Rvalue::DynMeta { ptr, word }, ty, span)
+                    }
                     Res::FromCast => self.set_or_temp(dest, Rvalue::Cast(ops.into_iter().next().unwrap(), ty), ty, span),
                     Res::DefaultVal => {
                         let zero = match self.kind(ty) {

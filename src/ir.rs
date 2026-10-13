@@ -137,6 +137,10 @@ pub enum Rvalue {
     /// Trait upcasting: the same data pointer, with the vtable reached
     /// by loading each super slot word index in `path` in turn.
     DynUpcast { ptr: Operand, path: Vec<u32> },
+    /// One header word of a dyn reference's vtable as a `usize`: the
+    /// size or the align of the value behind it (`size_of_val` and
+    /// `align_of_val` on a dyn value; word indexes in `check::object`).
+    DynMeta { ptr: Operand, word: u32 },
 }
 
 #[derive(Clone, Debug)]

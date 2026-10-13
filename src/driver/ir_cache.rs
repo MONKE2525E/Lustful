@@ -264,6 +264,10 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_operand(h, p, tys, ptr, seen);
             path.hash(h);
         }
+        Rvalue::DynMeta { ptr, word } => {
+            (25u8, word).hash(h);
+            hash_operand(h, p, tys, ptr, seen);
+        }
     }
 }
 
@@ -547,6 +551,7 @@ enum CachedRvalue {
     FnValue(DiskDefId, u32),
     MakeDyn(CachedOperand, u32, u32),
     DynUpcast(CachedOperand, Vec<u32>),
+    DynMeta(CachedOperand, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -851,6 +856,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::FnValue(f, t) => CachedRvalue::FnValue(p.disk_id(*f), b.ty(*t)),
         Rvalue::MakeDyn { ptr, src, dyn_ty } => CachedRvalue::MakeDyn(cache_operand(b, p, ptr), b.ty(*src), b.ty(*dyn_ty)),
         Rvalue::DynUpcast { ptr, path } => CachedRvalue::DynUpcast(cache_operand(b, p, ptr), path.clone()),
+        Rvalue::DynMeta { ptr, word } => CachedRvalue::DynMeta(cache_operand(b, p, ptr), *word),
     }
 }
 
@@ -1019,6 +1025,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
                 Rvalue::MakeDyn { ptr: operand(intern, tys, strings, o)?, src: intern.ty(tys, *src)?, dyn_ty: intern.ty(tys, *dyn_ty)? }
             }
             CachedRvalue::DynUpcast(o, path) => Rvalue::DynUpcast { ptr: operand(intern, tys, strings, o)?, path: path.clone() },
+            CachedRvalue::DynMeta(o, word) => Rvalue::DynMeta { ptr: operand(intern, tys, strings, o)?, word: *word },
         })
     }
     let mut blocks = Vec::with_capacity(cached.blocks.len());

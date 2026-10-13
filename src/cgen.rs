@@ -1977,6 +1977,10 @@ impl FnGen<'_, '_, '_> {
                 }
                 t
             }
+            Rvalue::DynMeta { ptr, word } => {
+                let (v, _) = self.operand(ptr, loc, post);
+                format!("((uint64_t)(uintptr_t)({v}).vt[{word}])")
+            }
         }
     }
 
@@ -5238,7 +5242,8 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
         | Rvalue::ArrayRepeat(_, o, _)
         | Rvalue::Res(_, _, o)
         | Rvalue::MakeDyn { ptr: o, .. }
-        | Rvalue::DynUpcast { ptr: o, .. } => op(o),
+        | Rvalue::DynUpcast { ptr: o, .. }
+        | Rvalue::DynMeta { ptr: o, .. } => op(o),
         Rvalue::Bin(_, a, b) | Rvalue::StrCmp(_, a, b) | Rvalue::StringAdd(a, b) | Rvalue::VecRepeat(_, a, b) | Rvalue::Eq { a, b, .. } => {
             op(a);
             op(b);
