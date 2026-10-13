@@ -2785,6 +2785,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             todo.extend(fn_units.iter().map(|&u| (u, false)));
         } else {
             let mut units: Vec<usize> = caches.overlays.iter().copied().chain(dirty_fn_units.iter().copied()).collect();
+            // A unit new since the last base has no object yet, dirty or
+            // not: one that holds only template or stub slots gets no
+            // fresh C, but the base links every unit.
+            units.extend(fn_units.iter().copied().filter(|&u| u >= FIRST_FN_UNIT + caches.base_units));
             units.sort_unstable();
             units.dedup();
             todo.extend(units.into_iter().map(|u| (u, false)));

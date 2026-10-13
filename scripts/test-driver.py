@@ -51,6 +51,9 @@
 #      instance first in discovery moves the ids (and C names) of the
 #      others; a warm build must rebuild the glue unit and every unit
 #      whose names moved, and print what a cold build prints.
+#  14. a new fn unit with no C: a 16-slot program gains an unused
+#      generic fn, whose template slot starts a unit of its own; the
+#      warm build must still link (every base unit needs an object).
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -580,6 +583,24 @@ def case_moved_instance_ids():
     d.kill()
 
 
+def case_new_empty_unit():
+    # 14. 15 fns + main fill one 16-slot unit; the template is slot 17.
+    work = tempfile.mkdtemp(prefix="lust-driver-empty-unit-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    fns = [f"fn f{i}() -> i64 {{ {i} }}" for i in range(15)]
+    main = 'fn main() { println!("{}", ' + " + ".join(f"f{i}()" for i in range(15)) + "); }"
+    open(src, "w").write("\n".join(fns + [main]) + "\n")
+    d.start()
+    d.build(src, out)
+    open(src, "a").write("fn g<T: Copy>(t: T) -> T {\n    t\n}\n")
+    r = d.run(["build", src, "-o", out], expect=None)
+    prog = subprocess.run([out], capture_output=True, text=True)
+    check("new template-only unit links", r.returncode == 0 and prog.stdout.strip() == "105", r.stderr[-200:] + prog.stdout)
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -593,6 +614,7 @@ def main():
     case_positions()
     case_generic_reuse()
     case_moved_instance_ids()
+    case_new_empty_unit()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 
