@@ -695,7 +695,7 @@ fn lifetime_error(span: Span) -> Diag {
         "L0203",
         span,
         "a lifetime is not supported in this position yet",
-        "Lifetime params work on fns, structs, enums, and impls; elsewhere, elide the lifetime or use `'static`.",
+        "Lifetime params work on fns, structs, enums, impls, and type aliases; elsewhere, elide the lifetime or use `'static`.",
     )
 }
 
@@ -1365,7 +1365,7 @@ impl<'a> Parser<'a> {
     fn type_alias_def(&mut self) -> PResult<TypeAliasDef> {
         let start = self.expect(Tok::Type, "`type`")?;
         let (name, name_span) = self.ident()?;
-        let generics = self.generics(false)?;
+        let generics = self.generics(true)?;
         // For an alias the where clause follows the target type.
         self.expect(Tok::Eq, "`=`")?;
         let ty = self.ty()?;

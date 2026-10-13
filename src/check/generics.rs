@@ -763,6 +763,11 @@ pub struct Scope {
     /// a `dyn` type right under a reference (`&'a dyn Tr` is
     /// `&'a (dyn Tr + 'a)`); none means `'static` (`Box<dyn Tr>`).
     pub obj_default: Option<Region>,
+    /// W-BORROW: inside a lifetime alias's body (`type R<'a> = &'a str`),
+    /// its lifetime params and the regions the use site gives them.
+    pub alias_lifetimes: Vec<(Sym, Region)>,
+    /// Nesting of alias bodies being resolved (a cycle guard).
+    pub alias_depth: u32,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -796,6 +801,20 @@ impl Scope {
 }
 
 /// What scoped resolution needs from the program being built.
+/// A type alias whose generics are lifetimes only (`type R<'a> = &'a str`,
+/// W-BORROW). Its body resolves at each use with the alias's lifetimes
+/// mapped to the use site's regions (`resolve_lifetime_alias`), so a
+/// generic Adt target works too.
+#[derive(Clone, Debug)]
+pub struct LifetimeAlias {
+    pub lifetimes: Vec<Sym>,
+    pub ty: ast::TyId,
+    /// The erased body, once collect validated it (`ERROR` before).
+    pub erased: Ty,
+    /// The alias item's token hash (driver fingerprints).
+    pub body_hash: u64,
+}
+
 pub struct ResolveCx<'x> {
     /// User Adt name to its session-local (template) index.
     pub type_names: &'x FxMap<Sym, AdtId>,
@@ -808,6 +827,8 @@ pub struct ResolveCx<'x> {
     pub trait_names: &'x FxMap<Sym, DefId>,
     /// Non-generic type aliases by name (collect pass 1.5).
     pub aliases: &'x FxMap<Sym, Ty>,
+    /// Type aliases whose generics are lifetimes only (W-BORROW).
+    pub lifetime_aliases: &'x FxMap<Sym, LifetimeAlias>,
     pub index: &'x ImplIndex,
     pub lang: &'x LangTraits,
 }
@@ -861,6 +882,7 @@ fn check_lifetime(interner: &Interner, scope: &Scope, lt: ast::Lifetime) -> Resu
     match interner.get(lt.name) {
         "static" | "_" => Ok(Region::Erased),
         _ if scope.lifetimes.iter().any(|(n, _)| *n == lt.name) => Ok(Region::Erased),
+        _ if scope.alias_lifetimes.iter().any(|(n, _)| *n == lt.name) => Ok(Region::Erased),
         name => Err(Diag::new(
             "L0203",
             lt.span,
@@ -875,6 +897,11 @@ fn check_lifetime(interner: &Interner, scope: &Scope, lt: ast::Lifetime) -> Resu
 /// `'static` is not supported yet: the annotation's region would be
 /// lost, and lust must not accept a borrow rustc rejects (L0203).
 fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
+    if let Some(lt) = lt
+        && let Some(&(_, r)) = scope.alias_lifetimes.iter().find(|(n, _)| *n == lt.name)
+    {
+        return Ok(r);
+    }
     let name = lt.map(|lt| interner.get(lt.name));
     if let Some(lt) = lt {
         check_lifetime(interner, scope, lt)?;
@@ -1819,6 +1846,11 @@ fn resolve_path_ty(
         return Ok(tys.mk_result(t, e));
     }
     if segs.len() == 1
+        && let Some(la) = cx.lifetime_aliases.get(&name)
+    {
+        return resolve_lifetime_alias(ast, interner, known, cx, tys, scope, la, seg, span);
+    }
+    if segs.len() == 1
         && let Some(&alias_ty) = cx.aliases.get(&name)
     {
         return if seg.has_args() {
@@ -1946,6 +1978,69 @@ fn resolve_fmt_path(tys: &mut impl TyIntern, name: &str, seg: &ast::PathSeg, spa
             None => Err(Diag::new("L0102", span, format!("unknown type `{name}`"), "Check the spelling, or define the type.")),
         },
     }
+}
+
+/// A use of a lifetime alias (W-BORROW): lifetime args only, none (each
+/// elided under the use site's rules) or one per param (rustc E0107);
+/// the body resolves in a scope of its own where the alias's lifetimes
+/// are the use site's regions.
+#[allow(clippy::too_many_arguments)]
+fn resolve_lifetime_alias(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    la: &LifetimeAlias,
+    seg: &ast::PathSeg,
+    span: Span,
+) -> Result<Ty, Diag> {
+    let (written, other): (Vec<ast::Lifetime>, bool) = match &seg.args {
+        GenericArgs::Angle(a) => (
+            a.iter().filter_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect(),
+            a.iter().any(|g| !matches!(g, AstArg::Lifetime(_))),
+        ),
+        GenericArgs::None => (Vec::new(), false),
+        _ => (Vec::new(), true),
+    };
+    let alias = crate::intern::source_name(interner.get(seg.name)).to_string();
+    if other {
+        return Err(Diag::new("L0110", span, format!("`{alias}` takes no type arguments"), "Pass lifetime arguments only."));
+    }
+    if !written.is_empty() && written.len() != la.lifetimes.len() {
+        return Err(Diag::new(
+            "L0110",
+            span,
+            format!("`{alias}` takes {} lifetime argument(s), but {} were given", la.lifetimes.len(), written.len()),
+            "Match the number of lifetime parameters in the alias.",
+        ));
+    }
+    if scope.infer_cell.is_some()
+        && !scope.annotation
+        && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
+    {
+        return Err(Diag::new(
+            "L0203",
+            lt.span,
+            "an explicit lifetime in a type annotation inside a body is not supported yet",
+            "Remove the annotation and let the type be inferred, or write `'_`.",
+        ));
+    }
+    if scope.alias_depth > 32 {
+        return Err(Diag::new("L0601", span, format!("cycle detected in type alias `{alias}`"), "An alias must not name itself, directly or through other aliases."));
+    }
+    let mut regions = Vec::with_capacity(la.lifetimes.len());
+    for i in 0..la.lifetimes.len() {
+        regions.push(scope_region(interner, scope, written.get(i).copied(), span)?);
+    }
+    let body = Scope {
+        regions: scope.regions.clone(),
+        alias_lifetimes: la.lifetimes.iter().copied().zip(regions).collect(),
+        alias_depth: scope.alias_depth + 1,
+        ..Scope::default()
+    };
+    resolve_scoped(ast, interner, known, cx, tys, la.ty, &body)
 }
 
 /// Converts one written bound on `lhs` into predicates. `?Sized`
@@ -2470,6 +2565,8 @@ pub struct GenTables<'a> {
     /// (W-BORROW). They are not in `adt_generics`: lifetimes leave type
     /// param indexes and instance keys as before.
     pub adt_lifetimes: FxMap<DefId, Vec<Sym>>,
+    /// Type aliases whose generics are lifetimes only, by name (W-BORROW).
+    pub lifetime_aliases: FxMap<Sym, LifetimeAlias>,
     pub adt_generics: Vec<Generics>,
     pub adt_envs: Vec<Vec<Predicate>>,
     pub adt_scopes: Vec<Scope>,
@@ -2598,6 +2695,7 @@ impl Default for GenTables<'_> {
             wf_headers: Vec::new(),
             adt_info: Vec::new(),
             adt_lifetimes: FxMap::default(),
+            lifetime_aliases: FxMap::default(),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
             adt_scopes: Vec::new(),
@@ -2651,6 +2749,7 @@ impl GenTables<'_> {
             adt_lifetimes: &self.adt_lifetimes,
             trait_names: &self.trait_names,
             aliases,
+            lifetime_aliases: &self.lifetime_aliases,
             index: &self.index,
             lang: &self.lang,
         }

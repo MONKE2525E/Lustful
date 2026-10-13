@@ -1099,6 +1099,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         } else if let Some(ty) = p.aliases.get(&data.name) {
             1u8.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);
+        } else if let Some(la) = p.gx.lifetime_aliases.get(&data.name) {
+            // A lifetime alias (W-BORROW) resolves at each use: its tokens
+            // carry the regions, its erased body the type.
+            2u8.hash(&mut h);
+            la.body_hash.hash(&mut h);
+            hash_ty_deep(&mut h, p, &p.tys, la.erased, &mut seen);
         } else {
             p.name(data.name).hash(&mut h);
         }

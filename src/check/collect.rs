@@ -464,7 +464,13 @@ fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
         TyExpr::Tuple(elems) => elems.iter().find_map(|&e| hidden_lifetime(p, e)),
         TyExpr::Path(segs) => {
             let last = segs.last()?;
-            let lts = p.type_names.get(&last.name).and_then(|&a| p.gx.adt_lifetimes.get(&p.gx.adt_info[a.0 as usize].0)).map_or(0, |v| v.len());
+            let lts = p
+                .type_names
+                .get(&last.name)
+                .and_then(|&a| p.gx.adt_lifetimes.get(&p.gx.adt_info[a.0 as usize].0))
+                .map(|v| v.len())
+                .or_else(|| p.gx.lifetime_aliases.get(&last.name).map(|a| a.lifetimes.len()))
+                .unwrap_or(0);
             let written = match &last.args {
                 ast::GenericArgs::Angle(a) => a.iter().any(|g| matches!(g, ast::GenericArg::Lifetime(_))),
                 _ => false,
@@ -481,34 +487,36 @@ fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
     }
 }
 
-/// Lifetime errors in a type alias body (W-BORROW): an alias names no
-/// lifetime params yet, so a reference must say `'static` (an elided one
-/// is rustc E0106, L0202) and any other name is undeclared (E0261, L0203).
-/// Elided lifetimes inside fn pointer types are the pointer's own.
-fn alias_lifetimes(ast: &Ast, interner: &Interner, id: ast::TyId, errs: &mut Vec<Diag>) {
+/// Lifetime errors in a type alias body (W-BORROW): a reference must name
+/// `'static` or one of the alias's lifetime params `lts` (an elided one is
+/// rustc E0106, L0202; any other name is undeclared, E0261, L0203).
+/// Elided lifetimes inside fn pointer types are the pointer's own; the
+/// lifetime args of paths resolve with the body (`LifetimeAlias`).
+fn alias_lifetimes(ast: &Ast, interner: &Interner, id: ast::TyId, lts: &[Sym], errs: &mut Vec<Diag>) {
     match ast.ty(id) {
         TyExpr::Ref { lifetime, inner, .. } => {
-            match lifetime.map(|lt| (interner.get(lt.name), lt.span)) {
-                None | Some(("_", _)) => errs.push(Diag::new(
+            match lifetime.map(|lt| (interner.get(lt.name), lt.span, lt.name)) {
+                None | Some(("_", _, _)) => errs.push(Diag::new(
                     "L0202",
                     ast.ty_span(id),
                     "missing lifetime specifier in a type alias",
-                    "Write `&'static`, or use an owned type.",
+                    "Write `&'static`, name a lifetime parameter of the alias, or use an owned type.",
                 )),
-                Some(("static", _)) => {}
-                Some((_, span)) => errs.push(crate::check::generics::lifetime_diag(span)),
+                Some(("static", _, _)) => {}
+                Some((_, _, n)) if lts.contains(&n) => {}
+                Some((_, span, _)) => errs.push(crate::check::generics::lifetime_diag(span)),
             }
-            alias_lifetimes(ast, interner, *inner, errs);
+            alias_lifetimes(ast, interner, *inner, lts, errs);
         }
-        TyExpr::Tuple(elems) => elems.iter().for_each(|&e| alias_lifetimes(ast, interner, e, errs)),
-        TyExpr::Paren(i) | TyExpr::Slice(i) => alias_lifetimes(ast, interner, *i, errs),
-        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => alias_lifetimes(ast, interner, *inner, errs),
+        TyExpr::Tuple(elems) => elems.iter().for_each(|&e| alias_lifetimes(ast, interner, e, lts, errs)),
+        TyExpr::Paren(i) | TyExpr::Slice(i) => alias_lifetimes(ast, interner, *i, lts, errs),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => alias_lifetimes(ast, interner, *inner, lts, errs),
         TyExpr::Path(segs) => {
             for seg in segs {
                 if let ast::GenericArgs::Angle(args) = &seg.args {
                     for g in args {
                         if let ast::GenericArg::Type(t) = g {
-                            alias_lifetimes(ast, interner, *t, errs);
+                            alias_lifetimes(ast, interner, *t, lts, errs);
                         }
                     }
                 }
@@ -1719,8 +1727,33 @@ pub fn collect_reuse<'a>(
                     continue;
                 }
                 seen_aliases.push(a.name);
-                alias_lifetimes(ast, interner, a.ty, &mut errs);
-                pending.push(a);
+                // W-BORROW: an alias whose generics are lifetimes only
+                // resolves at each use (`generics::resolve_lifetime_alias`);
+                // its body is checked once below, after Adts and traits.
+                let lts: Vec<Sym> = a
+                    .generics
+                    .params
+                    .iter()
+                    .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.name) } else { None })
+                    .collect();
+                let only_lts = !lts.is_empty() && lts.len() == a.generics.params.len();
+                alias_lifetimes(ast, interner, a.ty, &lts, &mut errs);
+                if only_lts {
+                    for (i, n) in lts.iter().enumerate() {
+                        if lts[..i].contains(n) {
+                            errs.push(Diag::new(
+                                "L0110",
+                                a.name_span,
+                                format!("the lifetime `'{}` is declared twice on this alias", interner.get(*n)),
+                                "Give each lifetime parameter its own name.",
+                            ));
+                        }
+                    }
+                    let body_hash = crate::driver::ast_hash::item_hash(ast, item);
+                    p.gx.lifetime_aliases.insert(a.name, generics::LifetimeAlias { lifetimes: lts, ty: a.ty, erased: ERROR, body_hash });
+                } else {
+                    pending.push(a);
+                }
                 let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::TypeAlias, interner.get(a.name), 0);
                 let def = DefId { krate: p.krate, hash };
                 p.defs.insert(def, DefData::skeleton(DefsKind::TypeAlias, None, a.name, Vis::Priv, a.name_span));
@@ -2295,6 +2328,26 @@ pub fn collect_reuse<'a>(
         p.gx.fn_class.push(if is_template { generics::FnClass::Template } else { generics::FnClass::Plain });
         id
     };
+    // W-BORROW: each lifetime alias's body, checked once like rustc does
+    // (an unused alias with an unknown type is still an error), and its
+    // erased form kept for the driver's fingerprints.
+    let mut aliases: Vec<(Sym, generics::LifetimeAlias)> = p.gx.lifetime_aliases.iter().map(|(&n, a)| (n, a.clone())).collect();
+    aliases.sort_by_key(|(_, a)| a.ty.0);
+    for (name, la) in aliases {
+        let scope = generics::Scope { alias_lifetimes: la.lifetimes.iter().map(|&n| (n, Region::Erased)).collect(), alias_depth: 1, ..generics::Scope::default() };
+        let res = {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, la.ty, &scope)
+        };
+        match res {
+            Ok(t) => {
+                if let Some(e) = p.gx.lifetime_aliases.get_mut(&name) {
+                    e.erased = t;
+                }
+            }
+            Err(d) => errs.push(d),
+        }
+    }
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
     // Top-level fn and method hashes by body block: the parents of fns
     // nested in bodies (`def::nested_fn_ids`).

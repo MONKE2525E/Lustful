@@ -2783,7 +2783,12 @@ DESIGN-TS). Do not cap the region count.
 
 Step A (landed with W-BORROW increment 1): `'static`
 and `'_` with real region checks. Step B (increment 2):
-named lifetime params on fns, structs, enums, and impls.
+named lifetime params on fns, structs, enums, and impls;
+then on type aliases whose generics are lifetimes only
+(`type R<'a> = &'a str`): the body resolves at each use
+with the alias's lifetimes mapped to the use site's
+regions, so a generic Adt target works; collect checks
+each body once, and the driver fingerprints its tokens.
 
 Representation. The types that check, mono, and cgen
 read stay region-erased: lifetime params do not enter
