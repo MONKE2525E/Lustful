@@ -2292,10 +2292,16 @@ pub fn collect_reuse<'a>(
         id
     };
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    // Top-level fn and method hashes by body block: the parents of fns
+    // nested in bodies (`def::nested_fn_ids`).
+    let mut top_hashes: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
     for item in &ast.items {
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = crate::def::free_fn_hash(p.stable_crate, &[], interner.get(def.name));
+                if let Some(b) = def.body {
+                    top_hashes.insert(b, hash);
+                }
                 let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
                 // The first value of a name owns it. A unit or tuple struct
                 // constructor is a value of the struct's name too, so a fn
@@ -2328,6 +2334,11 @@ pub fn collect_reuse<'a>(
                 let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
                 impl_ordinals.insert(header.clone(), ordinal + 1);
                 let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
+                for def in &imp.fns {
+                    if let Some(b) = def.body {
+                        top_hashes.insert(b, crate::def::method_hash(parent, interner.get(def.name)));
+                    }
+                }
                 let impl_def = DefId { krate: p.krate, hash: parent };
                 p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, known.self_type, Vis::Priv, imp.span));
 
@@ -2502,12 +2513,21 @@ pub fn collect_reuse<'a>(
     // Items inside function bodies: nested fns join the fn table (their
     // names are block-scoped, so they stay out of `fn_names`); nested
     // consts and statics evaluate with the top-level pass below. Type
-    // items in bodies are not in the subset yet.
+    // items in bodies are not in the subset yet. A nested fn's identity
+    // is its parent fn's plus its name (section 1.7), as the driver's
+    // slot keys compute it.
+    let krate = p.stable_crate;
+    let nested_hashes = crate::def::nested_fn_ids(
+        ast,
+        interner,
+        |b| top_hashes.get(&b).copied(),
+        |&parent, name, disamb| crate::def::child_hash(parent, crate::def::DefKind::Fn, name, disamb),
+        |seg, name| crate::def::free_fn_hash(krate, &[seg], name),
+    );
     for (idx, item) in ast.stmt_items.iter().enumerate() {
         match &item.kind {
             ItemKind::Fn(def) => {
-                let path = format!("#nested{idx}");
-                let hash = crate::def::free_fn_hash(p.stable_crate, &[path.as_str()], interner.get(def.name));
+                let hash = nested_hashes[idx].expect("every nested fn has an identity");
                 let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
                 p.body_items.insert(idx as u32, BodyItem::Fn(id));
             }

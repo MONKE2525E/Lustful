@@ -1235,8 +1235,9 @@ fn slot_update(
         caches.slot_fp[slot] = 0;
         caches.slot_ir[slot] = None;
         // A fn of the same identity and text can come back (an edit
-        // undone, a nested fn's `#nested{k}` index moving back). It
-        // must not look unchanged and passing with this empty C.
+        // undone, a nested fn's ordinal among same-name fns of its
+        // parent moving back). It must not look unchanged and passing
+        // with this empty C.
         front.slot_hash[slot] = 0;
         front.slot_head[slot] = 0;
     }
@@ -1290,8 +1291,10 @@ fn slot_update(
         // A body whose C names a slot that is dead now rechecks, so its
         // C is made again. Slots are append-only, so that callee lives
         // at a new slot: its stable identity moved while this caller's
-        // text stayed (a nested fn's `#nested{k}` index moves when an
-        // earlier body gains or loses an item). No read covers it.
+        // text stayed (a nested fn whose parent is not found by span
+        // keeps its body item index, which moves when an earlier body
+        // gains or loses an item; see `def::nested_fn_parents`). No
+        // read covers it.
         let calls_dead = caches.slot_used[slot].iter().any(|&u| live.get(u as usize) == Some(&false) && !front.inst_slot[u as usize]);
         if calls_dead {
             caches.ok[slot] = false;
@@ -1381,15 +1384,14 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
         impl_paths.push(path);
     }
     let key = |hash, path, free, name| FnKey { disk: DiskDefId { krate: stable, hash }, path, free, name };
-    par_map(fn_loc, |&(item, sub)| match (item != usize::MAX, sub) {
+    let mut keys = par_map(fn_loc, |&(item, sub)| match (item != usize::MAX, sub) {
         (false, Some(k)) => {
             let d = match &ast.stmt_items[k].kind {
                 ItemKind::Fn(d) => d,
                 _ => unreachable!("fn_loc points at a function"),
             };
-            let seg = format!("#nested{k}");
-            let (hash, path) = def::free_fn_path(stable, &[seg.as_str()], interner.get(d.name));
-            key(hash, path, true, d.name)
+            // A nested fn's identity folds from its parent's, below.
+            key(def::DefPathHash(0), String::new(), true, d.name)
         }
         _ => match (&ast.items[item].kind, sub) {
             (ItemKind::Fn(d), None) => {
@@ -1403,7 +1405,37 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
             }
             _ => unreachable!("fn_loc points at a function"),
         },
-    })
+    });
+    // Nested fns: the parent fn's identity plus the name (section 1.7),
+    // exactly as `collect` folds its def ids.
+    let mut nested_at: Vec<Option<usize>> = vec![None; ast.stmt_items.len()];
+    let mut top_at: FxMap<crate::ast::BlockId, usize> = FxMap::default();
+    for (i, &(item, sub)) in fn_loc.iter().enumerate() {
+        match (item != usize::MAX, sub) {
+            (false, Some(k)) => nested_at[k] = Some(i),
+            _ => {
+                if let Some(b) = fn_def_at(ast, item, sub).body {
+                    top_at.insert(b, i);
+                }
+            }
+        }
+    }
+    if nested_at.iter().any(Option::is_some) {
+        let ids = def::nested_fn_ids(
+            ast,
+            interner,
+            |b| top_at.get(&b).map(|&i| (keys[i].disk.hash, keys[i].path.clone())),
+            |(hash, path), name, disamb| def::child_path(*hash, path, def::DefKind::Fn, name, disamb),
+            |seg, name| def::free_fn_path(stable, &[seg], name),
+        );
+        for (k, id) in ids.into_iter().enumerate() {
+            if let (Some(i), Some((hash, path))) = (nested_at[k], id) {
+                keys[i].disk.hash = hash;
+                keys[i].path = path;
+            }
+        }
+    }
+    keys
 }
 
 /// LocalDefId order: top-level functions and impl methods, in item order. Same as `collect`.
@@ -2705,8 +2737,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mut memo = FxMap::default();
         // Slots some fn of this program holds. A body whose stored C
         // names any other slot rebuilds it: that callee's identity moved
-        // to a new slot (a nested fn's `#nested{k}` index) while this
-        // body's source stayed, as in `slot_update` for AST fns.
+        // to a new slot (a nested fn's body item index, when its parent
+        // is not found) while this body's source stayed, as in
+        // `slot_update` for AST fns.
         let mut held = vec![false; front.slot_of.len()];
         for &s in &front.fn_slot {
             if let Some(h) = held.get_mut(s as usize) {
@@ -3522,6 +3555,67 @@ impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
             assert_eq!(program.local_def(k.disk.hash), Some(local), "fn {i}");
         }
         assert_eq!(program.main.map(|m| program.def_id(m)), keys.get(2).map(|k| crate::def::DefId { krate: ids.local, hash: k.disk.hash }));
+    }
+
+    /// A nested fn's identity is its parent fn's plus its name and an
+    /// ordinal among same-name fns of that parent (section 1.7). The
+    /// driver's keys equal collect's def ids at any depth, same-name
+    /// fns in one body differ, and an item added to another body (or
+    /// above, in the same file) keeps every other nested fn's key.
+    #[test]
+    fn nested_fn_keys_follow_the_parent() {
+        let a = "\
+fn f() -> i32 {
+    fn g() -> i32 { 1 }
+    g()
+}
+struct S;
+impl S { fn m(&self) -> i32 { fn g() -> i32 { 5 } g() } }
+fn k() -> i32 {
+    { fn g() -> i32 { 2 } }
+    fn m() -> i32 {
+        fn g() -> i32 { 3 }
+        g()
+    }
+    { fn g() -> i32 { 4 } g() + m() }
+}
+fn main() { println!(\"{}\", f() + k() + S.m()); }
+";
+        let b = a.replace("    fn g() -> i32 { 1 }\n", "    fn h() {}\n    fn g() -> i32 { 1 }\n");
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
+        let keys_of = |src: &str| {
+            let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
+            assert_eq!(keys.len(), program.fns.len());
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(k.disk, program.disk_id(LocalDefId(i as u32)), "fn {i} ({})", k.path);
+            }
+            keys.into_iter().map(|k| (k.path, k.disk)).collect::<Vec<_>>()
+        };
+        let (ka, kb) = (keys_of(a), keys_of(&b));
+        let paths: Vec<&str> = ka.iter().map(|(p, _)| p.as_str()).collect();
+        for want in [
+            "fn:f#0::fn:g#0",
+            "impl:S#0::method:m#0::fn:g#0",
+            "fn:k#0::fn:g#0",
+            "fn:k#0::fn:m#0::fn:g#0",
+            "fn:k#0::fn:g#1",
+            "fn:k#0::fn:m#0",
+        ] {
+            assert!(paths.contains(&want), "missing {want} in {paths:?}");
+        }
+        let mut sorted = ka.iter().map(|(_, d)| *d).collect::<Vec<_>>();
+        sorted.sort_by_key(|d| d.hash.0);
+        sorted.dedup();
+        assert_eq!(sorted.len(), ka.len(), "nested keys are unique");
+        // `f` gained `h`: every key of `a` stays.
+        for (p, d) in &ka {
+            assert!(kb.iter().any(|(q, e)| q == p && e == d), "{p} moved");
+        }
     }
 
     /// Adt and static indices are stable under reordering and

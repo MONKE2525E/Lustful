@@ -54,6 +54,10 @@
 #  14. a new fn unit with no C: a 16-slot program gains an unused
 #      generic fn, whose template slot starts a unit of its own; the
 #      warm build must still link (every base unit needs an object).
+#  15-17. nested fns: each parse mode, removed and moved nested fns,
+#      instance C that calls a moved nested fn (see each case).
+#  18. nested fn identity follows the parent fn, and a sibling that
+#      shadows a name an unchanged nested fn calls rechecks it.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -739,6 +743,56 @@ def case_instance_calls_moved_slot():
     d.kill()
 
 
+def case_nested_identity_and_shadowing():
+    # 18. A nested fn's identity is its parent fn's plus its name (and an
+    # ordinal among same-name fns of that parent). (a) An item added to
+    # one fn's body keeps the identity of the fns nested in other bodies,
+    # so a check rechecks only the edited fn and its own nested fns. (b)
+    # A nested fn reads the names of the blocks around it with no
+    # recorded read: an added sibling `h` that shadows the top-level `h`
+    # the unchanged nested `g` calls must recheck `g` (warm kept `g` and
+    # its C: a false accept and wrong output), single-file and multi-file.
+    work = tempfile.mkdtemp(prefix="lust-driver-nested-id-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    d.start()
+
+    def tree(extra):
+        parts = ["fn f0() -> i64 {\n    fn g() -> i64 { 1 }\n" + extra + "    g()\n}"]
+        for i in range(1, 4):
+            parts.append(f"fn f{i}() -> i64 {{\n    fn g() -> i64 {{ {i} }}\n    fn h() -> i64 {{ 10 }}\n    g() + h()\n}}")
+        return "\n\n".join(parts + ['fn main() {\n    println!("{}", f0() + f1() + f2() + f3());\n}']) + "\n"
+
+    open(src, "w").write(tree(""))
+    d.run(["check", src])
+    open(src, "w").write(tree("    fn e() -> i64 { 5 }\n"))
+    r = d.run(["check", src])
+    stats = parse_stats(r.stderr)
+    # f0, its nested g (its enclosing body changed), and the new e.
+    check("nested identity: other bodies' nested fns keep their slots", stats.get("rechecked") == 3, str(stats))
+
+    top = "fn h() -> i32 { 1 }\n"
+    base = top + "fn f() -> i32 {\n    fn g() -> i32 { h() }\n    g()\n}\nfn main() { println!(\"{}\", f()); }\n"
+    shadow = base.replace("    g()\n", "    fn h() -> i32 { 2 }\n    g()\n")
+    bad = base.replace("    g()\n", "    fn h() -> bool { true }\n    g()\n")
+    mwork = os.path.join(work, "m")
+    os.makedirs(os.path.join(mwork, "src"))
+    main_rs = os.path.join(mwork, "src", "main.rs")
+    open(main_rs, "w").write("mod a;\nfn main() { println!(\"{}\", a::f()); }\n")
+    for path, entry, wrap in ((src, src, lambda t: t),
+                              (os.path.join(mwork, "src", "a.rs"), main_rs, lambda t: t.split("fn main")[0].replace("fn f()", "pub fn f()"))):
+        kind = "multi-file" if entry == main_rs else "single-file"
+        for step, text, want in (("base", base, "1"), ("shadowing sibling", shadow, "2"), ("shadowing sibling of another type", bad, None), ("back", base, "1")):
+            open(path, "w").write(wrap(text))
+            out = os.path.join(work, "x")
+            c = d.run(["check", entry], expect=None)
+            b = d.run(["build", entry, "-o", out], expect=None)
+            prog = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+            got = (c.returncode, prog.stdout.strip() if prog else None)
+            check(f"nested shadowing, {kind}, {step}", got == ((0, want) if want else (1, None)), str(got))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -756,6 +810,7 @@ def main():
     case_nested_items()
     case_moved_and_revived_slots()
     case_instance_calls_moved_slot()
+    case_nested_identity_and_shadowing()
     print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
     sys.exit(1 if failures else 0)
 

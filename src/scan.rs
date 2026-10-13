@@ -65,6 +65,15 @@ fn hash_tok(h: &mut FxHasher, t: &Tok, strings: &[String]) {
     }
 }
 
+/// A nested fn's body hash with the body hash of the top-level fn or method
+/// that holds it folded in. The resolver path's Ast scan uses it too.
+pub fn fold_outer(nested: u64, outer: u64) -> u64 {
+    let mut h = FxHasher::default();
+    "nested-in".hash(&mut h);
+    (nested, outer).hash(&mut h);
+    h.finish()
+}
+
 /// Scans one lexed chunk. Chunks start at top-level items, so brace depth starts at 0.
 pub fn scan(lexed: &Lexed) -> ChunkScan {
     let toks = &lexed.tokens;
@@ -99,6 +108,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             let mut d = 0usize;
             let mut body = FxHasher::default();
             let mut idents = Vec::new();
+            let nested_start = nested_fns.len();
             while k < toks.len() {
                 // A nested fn item: record its body as its own scan. The
                 // outer walk continues over its tokens, so deeper nesting
@@ -157,7 +167,15 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             if d != 0 {
                 complete = false;
             }
-            fns.push(FnScan { body_hash: body.finish(), nested: false, fn_offset: toks[i].span.lo, body: j..k + 1 });
+            let body_hash = body.finish();
+            // A nested fn reads the items of the blocks around it (a
+            // sibling fn, const, or `use` that shadows a name), and no
+            // recorded read covers those names. Its hash takes in the
+            // whole enclosing body, so any edit there rechecks it.
+            for f in &mut nested_fns[nested_start..] {
+                f.body_hash = fold_outer(f.body_hash, body_hash);
+            }
+            fns.push(FnScan { body_hash, nested: false, fn_offset: toks[i].span.lo, body: j..k + 1 });
             idents.sort_unstable();
             idents.dedup();
             body_idents.push(idents);
@@ -569,6 +587,22 @@ fn main() { println!(\"{}\", 1); }
         let src = "fn f() { let mod_name = 1; println!(\"{}\", mod_name); }\nstruct S;\nimpl S { fn m(&self) {} }\n";
         let (o, _) = scan_outline(src);
         assert!(o.mods.is_empty() && o.uses.is_empty() && o.macros.is_empty());
+    }
+
+    // A nested fn's hash takes in its enclosing top-level fn body: a
+    // sibling item can shadow a name the nested fn calls, and no recorded
+    // read covers it. An edit in another fn keeps the hash.
+    #[test]
+    fn nested_fn_hash_covers_its_enclosing_body() {
+        let interner = Interner::default();
+        let nested_hash = |src: &str| {
+            let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            scan(&lexed).fns.iter().find(|f| f.nested).map(|f| f.body_hash).unwrap()
+        };
+        let src = "fn h() -> i32 { 1 }\nfn f() -> i32 {\n    fn g() -> i32 { h() }\n    g()\n}\n";
+        let a = nested_hash(src);
+        assert_ne!(a, nested_hash(&src.replace("    g()\n", "    fn h() -> i32 { 2 }\n    g()\n")));
+        assert_eq!(a, nested_hash(&src.replace("{ 1 }", "{ 3 }")));
     }
 
     // The driver's fn table joins scan order to collect's LocalDefId order

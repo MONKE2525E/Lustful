@@ -23,9 +23,14 @@ pub struct AstScans {
     pub bodies: Vec<(u64, Vec<Sym>)>,
 }
 
-/// One item's scan and its fns' body scans.
-fn scan_item(ast: &Ast, item: &Item) -> (scan::ItemScan, Vec<(u64, Vec<Sym>)>) {
-    let mut w = Walker { ast, idents: None };
+/// One item's scan, its fns' body scans, and the body items (`stmt_items`
+/// indexes) at any depth inside it.
+type ItemScans = (scan::ItemScan, Vec<(u64, Vec<Sym>)>, Vec<u32>);
+
+/// One item's scan and its fns' body scans (see `ItemScans`).
+fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
+    let mut inner = Vec::new();
+    let mut w = Walker { ast, idents: None, inner: Some(&mut inner) };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
     let fn_name = match &item.kind {
@@ -34,24 +39,39 @@ fn scan_item(ast: &Ast, item: &Item) -> (scan::ItemScan, Vec<(u64, Vec<Sym>)>) {
     };
     let scan = scan::ItemScan { hash: h.finish(), fn_name };
     let bodies: Vec<(u64, Vec<Sym>)> = match &item.kind {
-        ItemKind::Fn(f) => vec![body_scan(ast, f)],
-        ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f)).collect(),
+        ItemKind::Fn(f) => vec![body_scan(ast, f, Some(&mut inner))],
+        ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f, Some(&mut inner))).collect(),
         _ => Vec::new(),
     };
-    (scan, bodies)
+    (scan, bodies, inner)
 }
 
-fn assemble(ast: &Ast, per_item: Vec<(scan::ItemScan, Vec<(u64, Vec<Sym>)>)>) -> AstScans {
+fn assemble(ast: &Ast, per_item: Vec<ItemScans>) -> AstScans {
     let mut items = Vec::with_capacity(per_item.len());
     let mut bodies = Vec::new();
-    for (scan, bs) in per_item {
+    // The content hash (header and bodies) of the top-level item that
+    // holds each body item: `scan::fold_outer` takes it into a nested
+    // fn's body hash, as the token scan does, so any edit around a
+    // nested fn rechecks it (it reads the names of the blocks around it).
+    let mut outer = vec![0u64; ast.stmt_items.len()];
+    for (scan, bs, inner) in per_item {
+        let mut h = FxHasher::default();
+        scan.hash.hash(&mut h);
+        bs.iter().for_each(|b| b.0.hash(&mut h));
+        let content = h.finish();
+        for i in inner {
+            if let Some(o) = outer.get_mut(i as usize) {
+                *o = content;
+            }
+        }
         items.push(scan);
         bodies.extend(bs);
     }
     // Nested fns follow the top-level fns, in stmt item order (collect's order).
-    for item in &ast.stmt_items {
+    for (i, item) in ast.stmt_items.iter().enumerate() {
         if let ItemKind::Fn(f) = &item.kind {
-            bodies.push(body_scan(ast, f));
+            let (hash, idents) = body_scan(ast, f, None);
+            bodies.push((scan::fold_outer(hash, outer[i]), idents));
         }
     }
     AstScans { items, bodies }
@@ -75,7 +95,7 @@ pub(crate) fn scan_ast_seq(ast: &Ast) -> AstScans {
 /// The structural hash of one item without fn bodies (the item-scan
 /// hash of `scan_ast`). A trait item hashes its default bodies too.
 pub(crate) fn item_hash(ast: &Ast, item: &Item) -> u64 {
-    let mut w = Walker { ast, idents: None };
+    let mut w = Walker { ast, idents: None, inner: None };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
     h.finish()
@@ -88,17 +108,18 @@ pub(crate) fn item_hash(ast: &Ast, item: &Item) -> u64 {
 /// itself, even when its body hash and caller-visible `Sig`
 /// fingerprint (which excludes parameter names) both stand.
 pub(crate) fn fn_head_hash(ast: &Ast, f: &FnDef) -> u64 {
-    let mut w = Walker { ast, idents: None };
+    let mut w = Walker { ast, idents: None, inner: None };
     let mut h = FxHasher::default();
     "ast-fn-head-v1".hash(&mut h);
     w.fn_head(&mut h, f, false);
     h.finish()
 }
 
-/// The body hash and sorted identifier set of one fn.
-fn body_scan(ast: &Ast, f: &FnDef) -> (u64, Vec<Sym>) {
+/// The body hash and sorted identifier set of one fn. `inner`, when set,
+/// gains the body items inside it.
+fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (u64, Vec<Sym>) {
     let mut idents = Vec::new();
-    let mut w = Walker { ast, idents: Some(&mut idents) };
+    let mut w = Walker { ast, idents: Some(&mut idents), inner };
     let mut h = FxHasher::default();
     "ast-body-v1".hash(&mut h);
     match f.body {
@@ -116,6 +137,8 @@ struct Walker<'a> {
     ast: &'a Ast,
     /// When set (body scans), every hashed identifier is also recorded.
     idents: Option<&'a mut Vec<Sym>>,
+    /// When set (top-level item scans), every body item walked is recorded.
+    inner: Option<&'a mut Vec<u32>>,
 }
 
 impl Walker<'_> {
@@ -488,6 +511,9 @@ impl Walker<'_> {
             }
             Stmt::Item(i) => {
                 2u8.hash(h);
+                if let Some(inner) = self.inner.as_deref_mut() {
+                    inner.push(*i);
+                }
                 // A body-local item is part of this body's meaning:
                 // hash it whole, fn bodies included.
                 let item = &self.ast.stmt_items[*i as usize];
@@ -1312,5 +1338,19 @@ fn main() { let f = Foo { x: helper(1) }; println!(\"{}\", f.get()); }
         assert_ne!(a.items[0].hash, b.items[0].hash);
         assert_eq!(a.items[2].hash, b.items[2].hash);
         assert_eq!(a.bodies.iter().map(|b| b.0).collect::<Vec<_>>(), b.bodies.iter().map(|b| b.0).collect::<Vec<_>>());
+    }
+
+    /// A nested fn's body hash takes in its top-level fn: an item added
+    /// next to it (one that can shadow a name it calls) rehashes it, and
+    /// an edit in another top-level fn does not.
+    #[test]
+    fn nested_fn_hash_covers_its_enclosing_fn() {
+        let src = "fn h() -> i32 { 1 }\nfn f() -> i32 {\n    fn g() -> i32 { h() }\n    g()\n}\nfn main() { println!(\"{}\", f()); }\n";
+        let a = scan_src(src);
+        let b = scan_src(&src.replace("    g()\n", "    fn h() -> i32 { 2 }\n    g()\n"));
+        let c = scan_src(&src.replace("{ 1 }", "{ 3 }"));
+        // Fn order: h, f, main, then the nested g (and the new h in b).
+        assert_ne!(a.bodies[3].0, b.bodies[3].0, "a sibling item rechecks g");
+        assert_eq!(a.bodies[3].0, c.bodies[3].0, "another fn's body edit keeps g");
     }
 }

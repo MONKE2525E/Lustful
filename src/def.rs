@@ -297,6 +297,120 @@ pub fn method_hash(impl_hash: DefPathHash, name: &str) -> DefPathHash {
     child_hash(impl_hash, DefKind::Method, name, 0)
 }
 
+/// The fn whose body holds a fn nested in a body (see `nested_fn_parents`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NestParent {
+    /// A top-level fn or an impl method, by its body block.
+    Top(crate::ast::BlockId),
+    /// Another nested fn, by its `Ast::stmt_items` index.
+    Nested(u32),
+    /// No fn body holds it by span: a fn from a macro expansion, or one in a
+    /// const initializer or a trait default body.
+    Unknown,
+}
+
+/// The parent and the disambiguator of each fn nested in a body (section 1.7),
+/// by `Ast::stmt_items` index; other entries are `(Unknown, 0)`. The parent is
+/// the innermost top-level fn, impl method, or nested fn whose body span holds
+/// the item's span. The disambiguator counts the same-name fns of that parent
+/// before it, in body item order. A nested fn's identity is its parent's
+/// identity plus its name and disambiguator, so an item added to one body does
+/// not move the identity of the fns nested in other bodies. Spans only find the
+/// parent; they never enter a hash. Every answer is unique (a parent identity
+/// is unique, and the disambiguator splits same-name fns of one parent), so a
+/// parent missed (macro spans) costs only reuse. `collect` (def ids) and the
+/// driver (slot keys) both call this, so the two agree.
+pub fn nested_fn_parents(ast: &crate::ast::Ast) -> Vec<(NestParent, u32)> {
+    use crate::ast::ItemKind;
+    let mut out = vec![(NestParent::Unknown, 0u32); ast.stmt_items.len()];
+    if !ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Fn(_))) {
+        return out;
+    }
+    // A fn body span opens a scope (`Some(parent)`); a nested fn item span
+    // (`None`, with its stmt index) takes the innermost open scope. Sorted
+    // by file, start, and longest first, the open scopes form a stack.
+    let mut spans: Vec<(crate::diag::Span, Option<NestParent>, u32)> = Vec::new();
+    let body = |spans: &mut Vec<_>, f: &crate::ast::FnDef, nested: Option<u32>| {
+        if let Some(b) = f.body {
+            let parent = nested.map_or(NestParent::Top(b), NestParent::Nested);
+            spans.push((ast.block(b).span, Some(parent), 0));
+        }
+    };
+    for item in &ast.items {
+        match &item.kind {
+            ItemKind::Fn(f) => body(&mut spans, f, None),
+            ItemKind::Impl(imp) => imp.fns.iter().for_each(|f| body(&mut spans, f, None)),
+            _ => {}
+        }
+    }
+    for (j, it) in ast.stmt_items.iter().enumerate() {
+        if let ItemKind::Fn(f) = &it.kind {
+            body(&mut spans, f, Some(j as u32));
+            spans.push((it.span, None, j as u32));
+        }
+    }
+    spans.retain(|s| s.0.ctxt == crate::diag::CtxtId::ROOT);
+    spans.sort_by_key(|s| (s.0.file.0, s.0.lo, std::cmp::Reverse(s.0.hi)));
+    let mut open: Vec<(crate::diag::Span, NestParent)> = Vec::new();
+    for (span, parent, j) in spans {
+        while open.last().is_some_and(|(s, _)| s.file != span.file || s.hi <= span.lo) {
+            open.pop();
+        }
+        match parent {
+            Some(p) => open.push((span, p)),
+            None => {
+                if let Some(&(s, p)) = open.last()
+                    && span.hi <= s.hi
+                {
+                    out[j as usize].0 = p;
+                }
+            }
+        }
+    }
+    let mut seen: crate::intern::FxMap<(NestParent, crate::intern::Sym), u32> = Default::default();
+    for (j, it) in ast.stmt_items.iter().enumerate() {
+        if let ItemKind::Fn(f) = &it.kind {
+            let n = seen.entry((out[j].0, f.name)).or_insert(0);
+            out[j].1 = *n;
+            *n += 1;
+        }
+    }
+    out
+}
+
+/// The identity of each fn nested in a body, by `Ast::stmt_items` index (None
+/// for other items), folded down from `nested_fn_parents`: `child(parent id,
+/// name, disambiguator)`, or `fallback(segment, name)` when the parent is
+/// unknown, where the segment is the body item index (unique, but it moves
+/// when an earlier body gains or loses an item). `top` gives the identity of
+/// a top-level fn or impl method by its body block. `collect` folds hashes;
+/// the driver folds hashes with path texts. Parents end after their nested
+/// fns, so they come later in body item order and fold first.
+pub fn nested_fn_ids<T: Clone>(
+    ast: &crate::ast::Ast,
+    interner: &crate::intern::Interner,
+    top: impl Fn(crate::ast::BlockId) -> Option<T>,
+    child: impl Fn(&T, &str, u32) -> T,
+    fallback: impl Fn(&str, &str) -> T,
+) -> Vec<Option<T>> {
+    let nest = nested_fn_parents(ast);
+    let mut ids: Vec<Option<T>> = vec![None; ast.stmt_items.len()];
+    for j in (0..ast.stmt_items.len()).rev() {
+        let crate::ast::ItemKind::Fn(f) = &ast.stmt_items[j].kind else { continue };
+        let name = interner.get(f.name);
+        let parent = match nest[j].0 {
+            NestParent::Top(b) => top(b),
+            NestParent::Nested(k) if k as usize > j => ids[k as usize].clone(),
+            _ => None,
+        };
+        ids[j] = Some(match parent {
+            Some(p) => child(&p, name, nest[j].1),
+            None => fallback(&format!("#nested{j}"), name),
+        });
+    }
+    ids
+}
+
 /// Two distinct def paths with one hash. This is an internal error, not a user
 /// error: the caller stops the compile (the driver answers with code 3). No
 /// collision-resolution scheme is added; the check makes the 64-bit hash safe
