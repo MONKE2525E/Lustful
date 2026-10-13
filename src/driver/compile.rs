@@ -167,10 +167,7 @@ fn resolve_base_dir(caches: &mut Caches, src_file: &Path) -> PathBuf {
     } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         candidates.push(PathBuf::from(home).join(".cache").join("lust").join("bases"));
     }
-    let dir = candidates
-        .into_iter()
-        .find(|d| std::fs::create_dir_all(d).is_ok())
-        .unwrap_or_else(|| caches.obj_dir.clone());
+    let dir = candidates.into_iter().find(|d| std::fs::create_dir_all(d).is_ok()).unwrap_or_else(|| caches.obj_dir.clone());
     caches.base_dir = Some(dir.clone());
     dir
 }

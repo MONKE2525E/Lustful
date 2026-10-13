@@ -86,10 +86,7 @@ struct PollFd {
 /// a readable listener; the caller checks `SHUTDOWN` itself. This is how
 /// the idle exit costs no latency: no sleep-based polling.
 fn wait_readable(listener: &UnixListener, wake: i32, timeout: Option<std::time::Duration>) -> bool {
-    let mut pfds = [
-        PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
-        PollFd { fd: wake, events: POLLIN, revents: 0 },
-    ];
+    let mut pfds = [PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 }, PollFd { fd: wake, events: POLLIN, revents: 0 }];
     let ms = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
     // SAFETY: two valid pollfds over live fds, for the duration of the call.
     unsafe { poll(pfds.as_mut_ptr(), 2, ms) > 0 && pfds[0].revents & POLLIN != 0 }
@@ -552,10 +549,7 @@ pub fn serve(sock: &Path) -> ! {
     {
         let start = std::time::Instant::now();
         // SAFETY: signal 0 only probes whether the pid exists.
-        while unsafe { kill(pid, 0) } == 0
-            && start.elapsed() < std::time::Duration::from_secs(60)
-            && !SHUTDOWN.load(Ordering::SeqCst)
-        {
+        while unsafe { kill(pid, 0) } == 0 && start.elapsed() < std::time::Duration::from_secs(60) && !SHUTDOWN.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
