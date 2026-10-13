@@ -213,6 +213,25 @@ mod tests {
         assert_eq!(t.classify("item.mod.path_attr").unwrap().id, "modules.path_attr");
         assert_eq!(t.classify("std.use.std::sync::Arc").unwrap().id, "threads.sync");
         assert!(t.classify("method.len").is_none());
+        // Split features added by the port-scan-sync probes.
+        assert_eq!(t.classify("macro.thread_local").unwrap().id, "threads.thread_local");
+        assert_eq!(t.classify("expr.unsafe").unwrap().id, "unsafe.blocks");
+        assert_eq!(t.classify("attr.cfg").unwrap().id, "attrs.cfg");
+        assert_eq!(t.classify("attr.track_caller").unwrap().id, "attrs.unsupported");
+        assert_eq!(t.classify("dyn.std::ops::Fn").unwrap().id, "dyn.fn");
+        assert_eq!(t.classify("dyn.std::io::Write").unwrap().id, "dyn.std");
+        assert_eq!(t.classify("dyn_in.Box").unwrap().id, "dyn.boxed");
+        assert_eq!(t.classify("dyn_in.&").unwrap().id, "dyn.trait");
+        assert_eq!(t.classify("type.impl_trait.ret").unwrap().id, "traits.impl_trait_ret");
+        assert_eq!(t.classify("std.type.std::rc::Rc").unwrap().id, "std.rc");
+        assert_eq!(t.classify("std.type.std::rc::Weak").unwrap().id, "std.rc_refcell");
+        assert_eq!(t.classify("std.type.std::borrow::Cow").unwrap().id, "std.cow");
+        assert_eq!(t.classify("std.type.std::borrow::ToOwned").unwrap().id, "supported.std_core");
+        assert_eq!(t.classify("type.fn_ptr.lifetime").unwrap().id, "closures.fn_ptr_lifetime");
+        assert_eq!(t.classify("map.hasher_arg").unwrap().id, "std.hashmap_hasher");
+        assert_eq!(t.classify("std.type.std::collections::HashMap").unwrap().id, "std.hashmap");
+        assert_eq!(t.classify("macro.write").unwrap().id, "macros.std_unsupported");
+        assert_eq!(t.classify("macro.matches").unwrap().id, "macros.std_missing");
     }
 
     #[test]

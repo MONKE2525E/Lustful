@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "description": "Maps raw scanner keys (from the syn visitor in src/analyze.rs) to lust feature status. The orchestrator updates status and milestone as lust grows. A later `lust capabilities --json` can feed this file: use --capabilities <file> with the same {features:[{id,status,milestone}]} shape to override entries by id. Patterns are globs: * matches any text, all other characters are literal. First matching feature in file order wins for a raw key, so specific rules come before general ones. primary_keys select which raw keys create a finding; keys select which raw keys block a file in the coverage curve.",
+ "description": "Maps raw scanner keys (from the syn visitor in src/analyze.rs) to lust feature status. The orchestrator updates status and milestone as lust grows. A later `lust capabilities --json` can feed this file: use --capabilities <file> with the same {features:[{id,status,milestone}]} shape to override entries by id. Patterns are globs: * matches any text, all other characters are literal. First matching feature in file order wins for a raw key, so specific rules come before general ones. primary_keys select which raw keys create a finding; keys select which raw keys block a file in the coverage curve. Statuses are measured, not hand-kept: scripts/port-scan-sync.py runs the probes in tools/lust-port/tests/features/ against rustc and writes status plus milestone (notes stay hand-written). Run it after each wave, then run it again with --coverage.",
  "milestones": [
   {
    "n": 0,
@@ -74,24 +74,28 @@
     "macro.std::println",
     "macro.std::format",
     "macro.std::vec",
-    "macro.std::panic"
+    "macro.std::panic",
+    "fmt.spec.display",
+    "fmt.spec.debug",
+    "fmt.inline_capture",
+    "type.ref",
+    "type.ref_mut",
+    "type.ref_str",
+    "type.unit"
    ]
   },
   {
    "id": "macros.user",
    "title": "User macro_rules! definitions and calls",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "0",
    "root_cause": "macros",
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "PLAN milestone 4 adds native macro_rules!. Until then a codemod can expand calls; expansion keeps the same machine code.",
-   "primary_keys": [
-    "macro.user_call",
-    "item.macro_rules"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/macros_user.rs and macros_user_b.rs pass against rustc 1.99 (expr, ident, ty and recursive tt macros).",
+   "primary_keys": [],
    "keys": [
     "macro.user_call",
     "macro.user_call.*",
@@ -101,17 +105,15 @@
   {
    "id": "modules.path_attr",
    "title": "#[path] module attribute",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "0",
    "root_cause": "modules",
    "fix_class": "mechanical",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "The scan follows #[path]. Lust modules arrive in milestone 4; a file move is release-safe.",
-   "primary_keys": [
-    "item.mod.path_attr"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/modules_path_attr.rs passes (sibling file through #[path]).",
+   "primary_keys": [],
    "keys": [
     "item.mod.path_attr"
    ]
@@ -143,14 +145,14 @@
   {
    "id": "traits.impl_trait_arg",
    "title": "impl Trait in argument position",
-   "status": "unsupported",
+   "status": "partial",
    "milestone": 5,
    "inventory_step": "0",
    "root_cause": "traits-generics",
    "fix_class": "mechanical",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Rewrite to a named type parameter. Same machine code.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_arg.rs passes (impl Display used by format). _b and _c fail: a method call on an impl Iterator arg (L0104) and impl Into<String> from &str (L0612, From solving). The rewrite to a named type parameter stays release-safe.",
    "primary_keys": [
     "type.impl_trait.arg"
    ],
@@ -200,17 +202,15 @@
   {
    "id": "closures.hrtb_bounds",
    "title": "Implicit higher-ranked Fn(&T) bounds",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "4",
    "root_cause": "closures",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Fn(&T) sugar makes a for<'a> bound. Covered by general closures in milestone 5.",
-   "primary_keys": [
-    "lt.implicit_hrtb"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/closures_hrtb_bounds.rs passes (Fn(&T) and FnMut(&str) bounds). Explicit for<'a> stays in lifetimes.hrtb.",
+   "primary_keys": [],
    "keys": [
     "lt.implicit_hrtb",
     "lt.implicit_hrtb.*"
@@ -219,20 +219,15 @@
   {
    "id": "threads.send_sync_bounds",
    "title": "Send and Sync bounds",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "8",
    "root_cause": "threads-sync",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Auto traits arrive with threads in milestone 7.",
-   "primary_keys": [
-    "bound.std::marker::Send",
-    "bound.std::marker::Sync",
-    "dyn.std::marker::Send",
-    "dyn.std::marker::Sync"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/threads_send_sync_bounds.rs and _b pass. Send and Sync are accepted as marker bounds, also on dyn. Real threads stay in threads.sync.",
+   "primary_keys": [],
    "keys": [
     "bound.std::marker::Send",
     "bound.std::marker::Sync",
@@ -243,17 +238,15 @@
   {
    "id": "core.drop_impl",
    "title": "impl Drop",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Drop is in milestone 4, earlier than other trait impls.",
-   "primary_keys": [
-    "impl.trait.std::ops::Drop"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_drop_impl.rs passes, drop runs at scope end in rustc order.",
+   "primary_keys": [],
    "keys": [
     "impl.trait.std::ops::Drop"
    ]
@@ -261,14 +254,14 @@
   {
    "id": "lifetimes.static_anon",
    "title": "'static and '_ lifetimes, std lifetime carriers",
-   "status": "unsupported",
+   "status": "partial",
    "milestone": 6,
    "inventory_step": "7a",
    "root_cause": "lifetimes",
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Cheapest big win in PLAN.md: no region inference is needed. '_ in fn signatures can also be deleted by codemod; impl headers cannot.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_static_anon.rs and _b pass: &'static refs and fields, T: 'static, and Formatter<'_> in Display impls. lifetimes_static_anon_c.rs fails: a named std carrier in a return type (slice Iter<'_>) is an unknown type (L0102).",
    "primary_keys": [
     "lt.ref.static",
     "lt.ref.anon",
@@ -328,24 +321,15 @@
   {
    "id": "lifetimes.named",
    "title": "Named lifetimes, lifetime params on user types, reference fields",
-   "status": "unsupported",
-   "milestone": 6,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "7b",
    "root_cause": "lifetimes",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Restricted Rust lifetime model in milestone 6. Codemods that change data structures slow the release binary, so do not use them.",
-   "primary_keys": [
-    "lt.ref.named",
-    "lt.path_arg.named",
-    "item.struct.lifetime",
-    "item.enum.lifetime",
-    "impl.lifetime_params",
-    "lt.field.ref",
-    "lt.field.ref_nested",
-    "sig.lifetime_params"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_named.rs, _b and _c pass: lifetime params on structs and enums, ref fields, named fn lifetimes, outlives, and &'a self receivers. Fn-pointer lifetime types are split into closures.fn_ptr_lifetime.",
+   "primary_keys": [],
    "keys": [
     "lt.*",
     "sig.lifetime_params",
@@ -396,7 +380,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "runtime-review",
-   "notes": "Lust aborts on panic today. Milestone 7 adds unwinding with drops.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/panic_recovery.rs fails at the std::panic::catch_unwind path form (L0505). Lust aborts on panic today. Milestone 7 adds unwinding with drops.",
    "primary_keys": [
     "std.expr.std::panic::*",
     "std.type.std::panic::*",
@@ -409,8 +393,8 @@
    ]
   },
   {
-   "id": "threads.sync",
-   "title": "Threads and synchronization (Arc, Mutex, atomics, mpsc, thread_local!)",
+   "id": "threads.thread_local",
+   "title": "thread_local! statics",
    "status": "unsupported",
    "milestone": 7,
    "inventory_step": "8",
@@ -418,18 +402,55 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Real threads are required; a one-thread rewrite slows the shipped binary.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/threads_thread_local.rs fails with the unsafe reject inside the macro form (L0404). Split from threads.sync: ts-rust keeps per-thread caches in program.rs and the scanner.",
+   "primary_keys": [
+    "macro.thread_local"
+   ],
+   "keys": [
+    "macro.thread_local"
+   ]
+  },
+  {
+   "id": "unsafe.blocks",
+   "title": "unsafe blocks and unsafe fns",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "unsafe",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/unsafe_blocks.rs fails (L0404). PLAN.md keeps unsafe opt-in for C shims. Split from cinterop.system so plain unsafe use does not count as a system crate.",
+   "primary_keys": [
+    "expr.unsafe",
+    "fn.unsafe"
+   ],
+   "keys": [
+    "expr.unsafe",
+    "fn.unsafe",
+    "attr.unsafe*"
+   ]
+  },
+  {
+   "id": "threads.sync",
+   "title": "Threads and synchronization (Arc, Mutex, atomics, mpsc)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "8",
+   "root_cause": "threads-sync",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/threads_sync.rs and _b fail at the Arc and atomic type names (L0101, L0102). thread_local! is split into threads.thread_local. Real threads are required; a one-thread rewrite slows the shipped binary.",
    "primary_keys": [
     "std.type.std::sync::*",
-    "std.type.std::thread::*",
-    "macro.thread_local"
+    "std.type.std::thread::*"
    ],
    "keys": [
     "std.type.std::sync::*",
     "std.expr.std::sync::*",
     "std.type.std::thread::*",
     "std.expr.std::thread::*",
-    "macro.thread_local",
     "closure.arg_of.spawn",
     "closure.arg_of.spawn_scoped",
     "method.lock"
@@ -450,8 +471,7 @@
     "item.foreign_mod",
     "fn.extern_abi",
     "type.raw_ptr",
-    "attr.global_allocator",
-    "expr.unsafe"
+    "attr.global_allocator"
    ],
    "keys": [
     "ext.type.rustix::*",
@@ -499,30 +519,31 @@
     "item.foreign_mod",
     "fn.extern_abi",
     "type.raw_ptr",
-    "attr.global_allocator",
-    "expr.unsafe",
-    "attr.unsafe*"
+    "attr.global_allocator"
    ]
   },
   {
    "id": "attrs.cfg",
-   "title": "Attributes and cfg (cfg, cfg_attr, cfg!, inline, repr, must_use, allow)",
-   "status": "unsupported",
-   "milestone": 4,
+   "title": "Attributes and cfg lust accepts (cfg, cfg_attr, inline, cold, repr, must_use, allow)",
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "2",
    "root_cause": "attrs-cfg",
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Most attributes only need parse and ignore. cfg must be evaluated. The scanner evaluates cfg for the scan target where it can.",
-   "primary_keys": [
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_cfg.rs, _b and _c pass: cfg, cfg!, cfg_attr, inline, cold, must_use, allow, repr and path. Attribute names lust rejects are split into attrs.unsupported.",
+   "primary_keys": [],
+   "keys": [
     "attr.cfg",
     "attr.cfg_attr",
+    "attr.inline",
+    "attr.must_use",
+    "attr.allow",
+    "attr.cold",
     "attr.repr",
-    "macro.cfg"
-   ],
-   "keys": [
-    "attr.*",
+    "attr.path",
+    "attr.inner.*",
     "cfg.*",
     "inline.*",
     "repr.*",
@@ -533,6 +554,26 @@
     "deny.*",
     "cfg_attr.*",
     "macro.cfg"
+   ]
+  },
+  {
+   "id": "attrs.unsupported",
+   "title": "Attribute names lust rejects (track_caller, non_exhaustive, serde)",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "2",
+   "root_cause": "attrs-cfg",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0522). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
+   "primary_keys": [
+    "attr.track_caller",
+    "attr.non_exhaustive",
+    "attr.serde*"
+   ],
+   "keys": [
+    "attr.*"
    ]
   },
   {
@@ -562,8 +603,8 @@
    ]
   },
   {
-   "id": "dyn.trait",
-   "title": "dyn Trait objects and impl Trait returns",
+   "id": "dyn.fn",
+   "title": "dyn Fn, FnMut and FnOnce objects",
    "status": "unsupported",
    "milestone": 5,
    "inventory_step": "6",
@@ -571,24 +612,117 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Vtables for Box, Rc, Arc, & and &mut dyn in milestone 5. impl Trait returns need the same work or a manual redesign today.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_fn.rs, _b and _c fail (L0820, L0702): &dyn Fn, &mut dyn FnMut and Rc<dyn Fn> fields, the callback shape in ts-rust program.rs.",
    "primary_keys": [
+    "dyn.std::ops::Fn",
+    "dyn.std::ops::FnMut",
+    "dyn.std::ops::FnOnce"
+   ],
+   "keys": [
+    "dyn.std::ops::Fn",
+    "dyn.std::ops::FnMut",
+    "dyn.std::ops::FnOnce"
+   ]
+  },
+  {
+   "id": "dyn.std",
+   "title": "dyn over std traits (io::Write, fmt, Future)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "6",
+   "root_cause": "dyn-trait",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_std.rs fails (L0102): &mut dyn io::Write. Lust dyn covers crate traits (dyn.trait); std trait objects need their own vtables. dyn Fn, Any, and Send and Sync claims come earlier in this table.",
+   "primary_keys": [
+    "dyn.std::*"
+   ],
+   "keys": [
+    "dyn.std::*"
+   ]
+  },
+  {
+   "id": "dyn.trait",
+   "title": "&dyn and &mut dyn Trait over crate traits",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "6",
+   "root_cause": "dyn-trait",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_trait.rs passes: &dyn and &mut dyn over crate traits. Owned dyn, dyn Fn, dyn over std traits and impl Trait returns are split into dyn.boxed, dyn.fn, dyn.std and traits.impl_trait_ret.",
+   "primary_keys": [],
+   "keys": [
     "type.dyn",
+    "dyn.*",
+    "dyn_in.&",
+    "dyn_in.&mut"
+   ]
+  },
+  {
+   "id": "dyn.boxed",
+   "title": "Owned dyn values (Box<dyn>, Rc<dyn>, Arc<dyn>)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "6",
+   "root_cause": "dyn-trait",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_boxed.rs fails (L0641, a Box of an unsized type). dyn_in.& and dyn_in.&mut stay in dyn.trait, which comes first; every other dyn_in wrapper lands here.",
+   "primary_keys": [
+    "dyn_in.Box",
+    "dyn_in.Rc",
+    "dyn_in.Arc"
+   ],
+   "keys": [
+    "dyn_in.*"
+   ]
+  },
+  {
+   "id": "traits.impl_trait_ret",
+   "title": "impl Trait in return position",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "6",
+   "root_cause": "traits-generics",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs fails (L0602). Split from dyn.trait: the return form needs opaque-type handling, not a vtable. Argument position is traits.impl_trait_arg.",
+   "primary_keys": [
     "type.impl_trait.ret",
     "type.impl_trait.other"
    ],
    "keys": [
-    "type.dyn",
-    "dyn.*",
-    "dyn_in.*",
     "type.impl_trait.ret",
     "type.impl_trait.other",
     "impl_trait.ret*"
    ]
   },
   {
+   "id": "std.rc",
+   "title": "Rc (plain, sized)",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_rc.rs passes: Rc::new, clone and strong_count on a sized type. Weak and the cell types stay in std.rc_refcell, Rc<dyn> in dyn.boxed.",
+   "primary_keys": [],
+   "keys": [
+    "std.type.std::rc::Rc",
+    "std.type.std::rc::Rc::*",
+    "std.expr.std::rc::Rc*"
+   ]
+  },
+  {
    "id": "std.rc_refcell",
-   "title": "Rc, Weak, RefCell, Cell, OnceCell and Cow",
+   "title": "Weak, RefCell, Cell and OnceCell",
    "status": "unsupported",
    "milestone": 5,
    "inventory_step": "5",
@@ -596,24 +730,41 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 5 std runtime. Rewriting to other data structures would slow the release binary.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_rc_refcell_b.rs, _c and _d fail: Weak is an unknown type (L0102), RefCell and Cell are not implemented (L0641), OnceCell is unknown (L0102). Plain Rc is split into std.rc; Cow is split into std.cow.",
    "primary_keys": [
-    "std.type.std::rc::*",
-    "std.type.std::cell::*",
-    "std.type.std::borrow::Cow"
+    "std.type.std::rc::Weak",
+    "std.type.std::cell::*"
    ],
    "keys": [
-    "std.type.std::rc::*",
-    "std.expr.std::rc::*",
+    "std.type.std::rc::Weak*",
+    "std.expr.std::rc::Weak*",
     "std.type.std::cell::*",
     "std.expr.std::cell::*",
-    "std.type.std::borrow::*",
-    "std.expr.std::borrow::*",
     "nest.*",
     "method.borrow",
     "method.borrow_mut",
     "method.upgrade",
     "fn.receiver.typed*"
+   ]
+  },
+  {
+   "id": "std.cow",
+   "title": "Cow (borrowed or owned strings and slices)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_cow.rs fails (L0102): Cow<'_, str> returns, as in ts-rust normalize_slashes_cow. Split from std.rc_refcell, which held every std::borrow path.",
+   "primary_keys": [
+    "std.type.std::borrow::Cow"
+   ],
+   "keys": [
+    "std.type.std::borrow::Cow",
+    "std.type.std::borrow::Cow::*",
+    "std.expr.std::borrow::Cow*"
    ]
   },
   {
@@ -738,21 +889,35 @@
    ]
   },
   {
+   "id": "closures.fn_ptr_lifetime",
+   "title": "Fn pointer types with lifetimes",
+   "status": "unsupported",
+   "milestone": 6,
+   "inventory_step": "7b",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/closures_fn_ptr_lifetime.rs fails (L0203): fn(&'a str) -> &'a str stored in a struct field, as in ts-rust ast/synthetic. The scanner emits type.fn_ptr.lifetime for this form; plain fn pointers pass under closures.general.",
+   "primary_keys": [
+    "type.fn_ptr.lifetime"
+   ],
+   "keys": [
+    "type.fn_ptr.lifetime"
+   ]
+  },
+  {
    "id": "closures.general",
    "title": "General closures, fn pointers and fn-valued fields",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "4",
    "root_cause": "closures",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Stored, moved, passed to user fns, Rc<dyn Fn>. The fused adapters are only a first part.",
-   "primary_keys": [
-    "closure",
-    "type.fn_ptr",
-    "field.fn_value"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/closures_general.rs passes: closures to user fns, move captures, fn pointer values. Dyn Fn forms are split into dyn.fn and dyn.boxed.",
+   "primary_keys": [],
    "keys": [
     "closure",
     "closure.*",
@@ -767,22 +932,20 @@
   {
    "id": "iterators.chains",
    "title": "Iterator chains, adapters, collect and for over method calls",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "4",
    "root_cause": "iterators",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Beyond s.chars(). Fused chains with unfused fallback in milestone 5.",
-   "primary_keys": [
-    "iter.chain"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/iterators_chains.rs and _b pass: map, filter, collect, sum, skip, take, for over arrays, Vec, &Vec, ranges and chars.",
+   "primary_keys": [],
    "keys": [
     "iter.chain",
     "iter.chain.*",
     "collect.*",
-    "for.over.method.*"
+    "for.over.*"
    ]
   },
   {
@@ -808,21 +971,15 @@
   {
    "id": "traits.generics",
    "title": "User traits, trait impls, generics, bounds and associated types",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "3",
    "root_cause": "traits-generics",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Monomorphized generics, associated types and consts, deterministic impl index in milestone 5. Blanket impls are counted here.",
-   "primary_keys": [
-    "item.trait",
-    "item.impl.trait",
-    "fn.generic",
-    "fn.generic_method",
-    "impl.blanket"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_generics.rs, _b and _c pass: user traits, default and associated items, where clauses, operator impls and a blanket impl.",
+   "primary_keys": [],
    "keys": [
     "item.trait",
     "trait.*",
@@ -848,20 +1005,15 @@
   {
    "id": "modules.imports",
    "title": "Modules, glob imports and re-exports",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "modules",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Lust has no modules today. Milestone 4 adds modules with globs and re-exports.",
-   "primary_keys": [
-    "item.mod.file",
-    "item.mod.inline",
-    "use.glob.*",
-    "use.reexport"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/modules_imports.rs and _b pass: inline and file mods, globs, re-exports, renames and trait imports as _.",
+   "primary_keys": [],
    "keys": [
     "item.mod.*",
     "use.glob*",
@@ -875,23 +1027,15 @@
   {
    "id": "core.items",
    "title": "const, static, const fn, type aliases, tuple structs, explicit discriminants, nested fns",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4 core items.",
-   "primary_keys": [
-    "item.const.*",
-    "item.static",
-    "item.type_alias",
-    "item.struct.tuple",
-    "enum.discriminant",
-    "fn.kind.nested",
-    "fn.const"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_items.rs passes: const, static, const fn, aliases, tuple structs, explicit discriminants and nested fns.",
+   "primary_keys": [],
    "keys": [
     "item.const*",
     "const.type*",
@@ -908,21 +1052,15 @@
   {
    "id": "core.tuples_arrays_slices",
    "title": "Tuples, arrays, slices and range indexing",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4.",
-   "primary_keys": [
-    "expr.tuple",
-    "type.tuple",
-    "expr.array",
-    "type.slice",
-    "expr.index.range"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_tuples_arrays_slices.rs passes, including inferred and never types in annotations.",
+   "primary_keys": [],
    "keys": [
     "expr.tuple",
     "expr.tuple_field",
@@ -941,22 +1079,15 @@
   {
    "id": "core.patterns_control",
    "title": "Labels, struct update, if-let chains, let-else, reference/tuple/slice patterns, const blocks",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4.",
-   "primary_keys": [
-    "expr.let_else",
-    "expr.if_let_chain",
-    "expr.struct_lit.update_syntax",
-    "expr.break_label",
-    "pat.tuple",
-    "pat.deref_ref"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_patterns_control.rs, _b and _c pass: let-else, let chains, labels, struct update, slice, tuple, struct, or, range, nested and ref patterns, and let without init.",
+   "primary_keys": [],
    "keys": [
     "expr.let_else",
     "expr.break_label",
@@ -973,25 +1104,29 @@
     "pat.at_binding",
     "pat.rest",
     "pat.const_block",
-    "pat.struct.rest"
+    "pat.struct.rest",
+    "stmt.let.uninit",
+    "pat.ref_binding",
+    "pat.ref_mut_binding",
+    "pat.or",
+    "pat.range",
+    "pat.nested_enum",
+    "pat.struct",
+    "expr.break_value"
    ]
   },
   {
    "id": "core.result_try",
    "title": "Result, ? operator and Box",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4. let-else is in core.patterns_control.",
-   "primary_keys": [
-    "expr.try_q",
-    "std.type.std::result::Result",
-    "std.type.std::boxed::Box"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_result_try.rs and _b pass: ? with a From conversion, Result matching, Box deref and recursive Box fields.",
+   "primary_keys": [],
    "keys": [
     "expr.try_q",
     "std.type.std::result::*",
@@ -1001,8 +1136,8 @@
    ]
   },
   {
-   "id": "core.std_basics",
-   "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
+   "id": "std.hashmap_hasher",
+   "title": "HashMap and HashSet with an explicit hasher type",
    "status": "unsupported",
    "milestone": 4,
    "inventory_step": "1",
@@ -1010,10 +1145,52 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4 names mem, env, fs, io, path and time; time paths are in std.runtime per the inventory steps. Only env::args().count() exists today.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap_hasher.rs fails (L0641). The scanner emits map.hasher_arg when a collections map has a third type arg, the shape behind FxHashMap aliases and ts-rust CacheKeyHasher maps. Keeps blocking after a plain HashMap lands.",
+   "primary_keys": [
+    "map.hasher_arg"
+   ],
+   "keys": [
+    "map.hasher_arg"
+   ]
+  },
+  {
+   "id": "std.hashmap",
+   "title": "HashMap and HashSet",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap.rs fails (L0641, the HashMap type is not supported yet). Split from core.std_basics so mem and cmp files do not count as blocked by maps they never use.",
    "primary_keys": [
     "std.type.std::collections::HashMap",
-    "std.type.std::collections::HashSet",
+    "std.type.std::collections::HashSet"
+   ],
+   "keys": [
+    "std.type.std::collections::HashMap*",
+    "std.expr.std::collections::HashMap*",
+    "std.type.std::collections::HashSet*",
+    "std.expr.std::collections::HashSet*",
+    "std.type.std::collections::hash_map::*",
+    "std.expr.std::collections::hash_map::*",
+    "std.type.std::collections::hash_set::*",
+    "std.expr.std::collections::hash_set::*"
+   ]
+  },
+  {
+   "id": "core.std_basics",
+   "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
+   "status": "partial",
+   "milestone": 4,
+   "inventory_step": "1",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_std_basics.rs passes: mem::take and swap, cmp helpers, str methods. _b, _c and _d fail: std::fs::metadata path form (L0505), the Path type and io::Write into a Vec (L0101), and primitive From paths such as i64::from (L0101). HashMap is split into std.hashmap.",
+   "primary_keys": [
     "std.expr.std::mem::*"
    ],
    "keys": [
@@ -1040,26 +1217,22 @@
     "std.type.std::slice::*",
     "std.expr.std::slice::*",
     "std.type.std::collections::*",
-    "std.expr.std::collections::*"
+    "std.expr.std::collections::*",
+    "prim.path.*"
    ]
   },
   {
    "id": "core.numbers_format",
    "title": "u128/i128, f32/f64, float literals and extended format specs",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Milestone 4 needs exact float printing. Basic {} and {:?} specs work today.",
-   "primary_keys": [
-    "prim.f64",
-    "prim.u128",
-    "lit.float",
-    "fmt.spec.width_prec_align"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_numbers_format.rs and _b pass: u128, f32 and f64, width, precision and radix specs, radix, byte, char, raw-string and suffix literals.",
+   "primary_keys": [],
    "keys": [
     "prim.u128",
     "prim.i128",
@@ -1073,25 +1246,29 @@
     "lit.float.*",
     "fmt.spec.width_prec_align",
     "fmt.spec.radix_or_exp",
-    "fmt.spec.debug_pretty"
+    "fmt.spec.debug_pretty",
+    "lit.int.radix",
+    "lit.int.suffix.*",
+    "lit.int.over_u64",
+    "lit.byte",
+    "lit.byte_str",
+    "lit.char",
+    "lit.str",
+    "lit.str.raw"
    ]
   },
   {
    "id": "core.derives_extra",
    "title": "Derives Default, PartialOrd and Ord",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "core-syntax",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Clone, Debug, PartialEq, Copy, Eq and Hash work today.",
-   "primary_keys": [
-    "derive.Default",
-    "derive.PartialOrd",
-    "derive.Ord"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/core_derives_extra.rs passes: Default, PartialOrd and Ord derives drive comparisons and default values.",
+   "primary_keys": [],
    "keys": [
     "derive.Default",
     "derive.PartialOrd",
@@ -1099,23 +1276,39 @@
    ]
   },
   {
-   "id": "macros.std_missing",
-   "title": "Missing std macros (matches!, debug_assert!, write!, include!, cfg! values and others)",
+   "id": "macros.std_unsupported",
+   "title": "Std macros lust does not expand yet (write!, writeln!, include_bytes!)",
    "status": "unsupported",
    "milestone": 4,
    "inventory_step": "1",
    "root_cause": "macros",
    "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs and _b fail (L0104): write! into a String needs write_fmt, and include_bytes! expands through str::as_bytes. Split from macros.std_missing by macro name.",
+   "primary_keys": [
+    "macro.write",
+    "macro.include_bytes"
+   ],
+   "keys": [
+    "macro.write",
+    "macro.writeln",
+    "macro.format_args",
+    "macro.include_bytes"
+   ]
+  },
+  {
+   "id": "macros.std_missing",
+   "title": "Std macros by name that lust expands (matches!, debug_assert!, include_str!, env!, concat!)",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "1",
+   "root_cause": "macros",
+   "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "About 25 std macro names are needed; lust has 12 today.",
-   "primary_keys": [
-    "macro.matches",
-    "macro.debug_assert",
-    "macro.write",
-    "macro.include_bytes",
-    "macro.vec.repeat"
-   ],
+   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_missing.rs and _c pass: matches!, debug_assert!, vec! repeat, concat!, stringify!, env!, include_str!, line! and file!. The write! family and include_bytes! are split into macros.std_unsupported. Names not probed (option_env!, include!, compile_error!, module_path!, column!) follow the lust capabilities macro list.",
+   "primary_keys": [],
    "keys": [
     "macro.matches",
     "macro.debug_assert",
@@ -1123,10 +1316,6 @@
     "macro.debug_assert_ne",
     "macro.debug_assert_matches",
     "macro.assert_matches",
-    "macro.write",
-    "macro.writeln",
-    "macro.format_args",
-    "macro.include_bytes",
     "macro.include_str",
     "macro.include",
     "macro.option_env",
@@ -1164,7 +1353,6 @@
     "item.trait_alias",
     "item.extern_crate.*",
     "fn.variadic",
-    "fn.unsafe",
     "expr.try_block",
     "pat.box",
     "pat.verbatim",

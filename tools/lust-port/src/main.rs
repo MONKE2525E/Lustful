@@ -28,6 +28,7 @@ use std::time::Instant;
 const USAGE: &str = "\
 usage: lust-port scan --manifest-path <Cargo.toml> [-p pkg] [--target triple] [--json | --markdown] [--summary]
               [--features features.json] [--capabilities caps.json] [--dependencies dependencies.json]
+              [--keys-json keys.json]
        lust-port --help";
 
 struct Args {
@@ -40,6 +41,7 @@ struct Args {
     features: Option<PathBuf>,
     capabilities: Option<PathBuf>,
     dependencies: Option<PathBuf>,
+    keys_json: Option<PathBuf>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -59,6 +61,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         features: None,
         capabilities: None,
         dependencies: None,
+        keys_json: None,
     };
     while let Some(x) = it.next() {
         let take = |it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -74,6 +77,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--features" => a.features = Some(PathBuf::from(take(&mut it)?)),
             "--capabilities" => a.capabilities = Some(PathBuf::from(take(&mut it)?)),
             "--dependencies" => a.dependencies = Some(PathBuf::from(take(&mut it)?)),
+            "--keys-json" => a.keys_json = Some(PathBuf::from(take(&mut it)?)),
             "--help" | "-h" => return Err(USAGE.to_string()),
             _ if x.starts_with("--manifest-path=") => a.manifest = PathBuf::from(&x["--manifest-path=".len()..]),
             _ if x.starts_with("--target=") => a.target = Some(x["--target=".len()..].to_string()),
@@ -89,6 +93,35 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 fn read_file(p: &Path) -> Result<String, String> {
     std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))
+}
+
+/// Writes every raw scanner key with its count and the feature it maps
+/// to (null when no rule matches). A null feature means the coverage
+/// curve treats the construct as supported, so this dump is how new
+/// rules get found: sort the null rows by count and probe the top ones.
+fn write_keys_json(p: &Path, stats: &stats::Stats, feats: &features::FeatureTable) -> Result<(), String> {
+    let mut rows: Vec<serde_json::Value> = stats
+        .map
+        .iter()
+        .map(|(key, e)| {
+            let feat = feats.classify(key);
+            let files: std::collections::HashSet<u32> = e.files.iter().flatten().copied().collect();
+            serde_json::json!({
+                "key": key,
+                "count": e.count.iter().sum::<u64>(),
+                "prod_count": e.count[walk::Cat::Prod as usize] + e.count[walk::Cat::Gen as usize],
+                "files": files.len(),
+                "feature": feat.map(|f| f.id.clone()),
+                "status": feat.map(|f| f.status.clone()),
+                "samples": e.samples,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()).then(a["key"].as_str().cmp(&b["key"].as_str())));
+    let text = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
+    std::fs::write(p, text + "\n").map_err(|e| format!("cannot write {}: {e}", p.display()))?;
+    eprintln!("lust-port: wrote {} keys to {}", rows.len(), p.display());
+    Ok(())
 }
 
 fn run(args: Args) -> Result<String, String> {
@@ -177,6 +210,9 @@ fn run(args: Args) -> Result<String, String> {
             .then(a.byte_start.cmp(&b.byte_start))
             .then(a.feature.cmp(&b.feature))
     });
+    if let Some(p) = &args.keys_json {
+        write_keys_json(p, &stats, &feats)?;
+    }
 
     let deps = report::dep_reports(&packages, &dep_table, &target);
     let rep = report::build(

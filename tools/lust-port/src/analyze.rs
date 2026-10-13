@@ -764,6 +764,40 @@ fn snippet_of(text: &str, start: usize, end: usize) -> String {
     }
 }
 
+/// True when a type mentions a lifetime: a ref lifetime or a lifetime
+/// generic argument, at any depth.
+fn type_has_lifetime(t: &syn::Type) -> bool {
+    match t {
+        syn::Type::Reference(r) => r.lifetime.is_some() || type_has_lifetime(&r.elem),
+        syn::Type::Path(p) => p.path.segments.iter().any(|s| match &s.arguments {
+            syn::PathArguments::AngleBracketed(a) => a.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Lifetime(_) => true,
+                syn::GenericArgument::Type(inner) => type_has_lifetime(inner),
+                syn::GenericArgument::AssocType(b) => type_has_lifetime(&b.ty),
+                _ => false,
+            }),
+            syn::PathArguments::Parenthesized(par) => {
+                par.inputs.iter().any(type_has_lifetime)
+                    || matches!(&par.output, syn::ReturnType::Type(_, o) if type_has_lifetime(o))
+            }
+            syn::PathArguments::None => false,
+        }),
+        syn::Type::Tuple(tt) => tt.elems.iter().any(type_has_lifetime),
+        syn::Type::Slice(s) => type_has_lifetime(&s.elem),
+        syn::Type::Array(a) => type_has_lifetime(&a.elem),
+        syn::Type::Ptr(p) => type_has_lifetime(&p.elem),
+        syn::Type::Paren(p) => type_has_lifetime(&p.elem),
+        syn::Type::Group(g) => type_has_lifetime(&g.elem),
+        syn::Type::BareFn(f) => {
+            f.inputs.iter().any(|a| type_has_lifetime(&a.ty))
+                || matches!(&f.output, syn::ReturnType::Type(_, o) if type_has_lifetime(o))
+        }
+        syn::Type::TraitObject(o) => o.bounds.iter().any(|b| matches!(b, syn::TypeParamBound::Lifetime(_))),
+        syn::Type::ImplTrait(it) => it.bounds.iter().any(|b| matches!(b, syn::TypeParamBound::Lifetime(_))),
+        _ => false,
+    }
+}
+
 fn short_type(t: &syn::Type) -> String {
     match t {
         syn::Type::Path(p) => last_ident(&p.path),
@@ -1256,6 +1290,15 @@ impl<'ast> Visit<'ast> for V<'_> {
                 if f.lifetimes.is_some() {
                     self.hit("lt.hrtb.fn_ptr", sp);
                 }
+                // A lifetime in the signature without a binder, as in
+                // `fn(&'a str) -> &'a str` in a struct field. Lust
+                // rejects this form (L0203) while plain fn pointers
+                // work, so it needs its own key.
+                let has_lt = f.inputs.iter().any(|a| type_has_lifetime(&a.ty))
+                    || matches!(&f.output, syn::ReturnType::Type(_, t) if type_has_lifetime(t));
+                if has_lt {
+                    self.hit("type.fn_ptr.lifetime", sp);
+                }
             }
             syn::Type::ImplTrait(it) => {
                 let pos = match self.pos {
@@ -1337,6 +1380,18 @@ impl<'ast> Visit<'ast> for V<'_> {
             Some(r) => {
                 let kind = if r.starts_with("std") { "std" } else { "ext" };
                 self.hit(format!("{kind}.type.{r}"), sp);
+                // HashMap<K, V, S> with an explicit hasher type arg.
+                // The plain type key cannot tell this form apart, and
+                // a custom-hasher map stays blocked after a plain
+                // HashMap lands, so record the arg count here.
+                if (name == "HashMap" || name == "HashSet") && r.contains("::collections::") {
+                    if let Some(syn::PathArguments::AngleBracketed(a)) = t.path.segments.last().map(|s| &s.arguments) {
+                        let types = a.args.iter().filter(|x| matches!(x, syn::GenericArgument::Type(_))).count();
+                        if types > if name == "HashMap" { 2 } else { 1 } {
+                            self.hit("map.hasher_arg", sp);
+                        }
+                    }
+                }
                 if WRAPPERS.contains(&name.as_str()) {
                     if let Some(syn::PathArguments::AngleBracketed(a)) = t.path.segments.last().map(|s| &s.arguments) {
                         for arg in &a.args {

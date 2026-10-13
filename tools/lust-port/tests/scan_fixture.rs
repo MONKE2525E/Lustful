@@ -25,13 +25,13 @@ fn fixture(name: &str) -> PathBuf {
     write(
         &root,
         "src/lib.rs",
-        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f(xs: &[i32]) -> i32 { xs.iter().map(|x| x + 1).sum() }\npub struct S<'a> { pub t: &'a str }\npub fn g() { let _c = |x: i32| x; }\n",
+        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f() -> usize { let m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); m.len() }\npub fn h(cb: for<'a> fn(&'a i32) -> i32) -> i32 { cb(&1) }\n",
     );
     write(&root, "src/sub/mod.rs", "pub fn h() -> Box<dyn Fn(i32) -> i32> { Box::new(|x| x) }\n");
     write(&root, "src/elsewhere.rs", "pub const N: usize = 1;\n");
-    write(&root, "src/win_only.rs", "pub fn w() { let _ = || 1; }\n");
+    write(&root, "src/win_only.rs", "pub fn w() { let _m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); }\n");
     write(&root, "src/feat.rs", "pub fn q() {}\n");
-    write(&root, "src/tests_only.rs", "pub fn t() { let _ = || 2; }\n");
+    write(&root, "src/tests_only.rs", "pub fn t() { let _m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); }\n");
     write(&root, "src/broken.rs", "pub fn broken( {\n");
     root
 }
@@ -69,13 +69,12 @@ fn scan_reports_gaps_and_survives_bad_files() {
     let has = |feature: &str, file: &str, scope: &str| {
         findings.iter().any(|f| f["feature"] == feature && f["file"] == file && f["scope"] == scope)
     };
-    assert!(has("closures.general", "src/lib.rs", "active"));
-    assert!(has("closures.general", "src/win_only.rs", "target-specific"));
-    assert!(has("closures.general", "src/tests_only.rs", "test-only"));
-    assert!(has("dyn.trait", "src/sub/mod.rs", "active"));
-    assert!(has("lifetimes.named", "src/lib.rs", "active"));
-    assert!(has("modules.path_attr", "src/lib.rs", "active"));
-    assert!(has("iterators.chains", "src/lib.rs", "active"));
+    assert!(has("std.hashmap", "src/lib.rs", "active"));
+    assert!(has("std.hashmap", "src/win_only.rs", "target-specific"));
+    assert!(has("std.hashmap", "src/tests_only.rs", "test-only"));
+    assert!(has("dyn.fn", "src/sub/mod.rs", "active"));
+    assert!(has("dyn.boxed", "src/sub/mod.rs", "active"));
+    assert!(has("lifetimes.hrtb", "src/lib.rs", "active"));
 
     // Every finding carries a byte range inside its file and a snippet.
     for f in findings {
@@ -88,13 +87,14 @@ fn scan_reports_gaps_and_survives_bad_files() {
 
     // Findings are grouped by root cause.
     let causes: Vec<&str> = v["root_causes"].as_array().unwrap().iter().map(|g| g["root_cause"].as_str().unwrap()).collect();
-    assert!(causes.contains(&"closures"), "causes: {causes:?}");
+    assert!(causes.contains(&"std-runtime"), "causes: {causes:?}");
     assert!(causes.contains(&"lifetimes"));
 
-    // feat.rs has no gaps and compiles today; lib.rs needs milestone 6.
+    // feat.rs (empty fn) and elsewhere.rs (a const, supported today)
+    // compile now; lib.rs needs milestone 6 for its for<'a> fn.
     let feat = v["files"].as_array().unwrap().iter().find(|f| f["file"] == "src/feat.rs").unwrap();
     assert!(feat["missing_features"].as_array().unwrap().is_empty(), "{feat}");
-    assert_eq!(v["coverage"]["supported_today_files"], 1);
+    assert_eq!(v["coverage"]["supported_today_files"], 2);
     let today = &v["coverage"]["by_plan_milestone"][0];
     let m6 = &v["coverage"]["by_plan_milestone"][3];
     assert_eq!(today["id"], "0");
@@ -121,10 +121,10 @@ fn human_output_groups_findings() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Gaps by root cause"), "{text}");
-    assert!(text.contains("closures.general"));
+    assert!(text.contains("std.hashmap"));
     // Grouped, not one line per finding: only 2 samples per feature.
-    let closure_samples = text.matches("closures.general").count();
-    assert!(closure_samples <= 3, "too many closure lines: {closure_samples}");
+    let map_samples = text.matches("std.hashmap").count();
+    assert!(map_samples <= 3, "too many hashmap lines: {map_samples}");
 }
 
 #[test]
