@@ -2519,7 +2519,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 // Body items and statement macros are rejected by the parser today.
                 Stmt::Item(_) | Stmt::Macro { .. } => {}
-                Stmt::Expr { expr, semi } => {
+                Stmt::Expr { expr, semi, .. } => {
                     let t = self.expr(*expr, if *semi { None } else { Some(UNIT) });
                     if self.kind(t) == TyKind::Never {
                         diverges = true;
@@ -8523,7 +8523,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Pushes statement-level `#[allow(..)]` counters for `attrs`;
+    /// returns which counters rose, for `k_allow_pop`.
+    fn k_allow_push(&self, attrs: &[ast::Attr], lint: &mut KLint) -> (bool, bool) {
+        let arith = attrs.iter().any(|a| crate::check::allow_attr(a, self.p.interner, "arithmetic_overflow"));
+        let panic_ = attrs.iter().any(|a| crate::check::allow_attr(a, self.p.interner, "unconditional_panic"));
+        lint.stmt_allow_arith += u32::from(arith);
+        lint.stmt_allow_panic += u32::from(panic_);
+        (arith, panic_)
+    }
+
+    fn k_allow_pop(&self, pushed: (bool, bool), lint: &mut KLint) {
+        lint.stmt_allow_arith -= u32::from(pushed.0);
+        lint.stmt_allow_panic -= u32::from(pushed.1);
+    }
+
     fn k_block(&mut self, b: ast::BlockId, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        // A block-level `#![allow(..)]` covers the whole block.
+        let pushed = self.k_allow_push(&self.p.ast.block(b).inner_attrs.clone(), lint);
+        let v = self.k_block_body(b, env, lint);
+        self.k_allow_pop(pushed, lint);
+        v
+    }
+
+    fn k_block_body(&mut self, b: ast::BlockId, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
         let p = self.p;
         if lint.dead {
             return None;
@@ -8536,28 +8559,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let diverges = match stmt {
                 Stmt::Let { pat, init, els, attrs, .. } => {
                     // A statement-level `#[allow(..)]` covers this let.
-                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
-                        lint.stmt_allow_arith += 1;
-                    }
-                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic")) {
-                        lint.stmt_allow_panic += 1;
-                    }
+                    let pushed = self.k_allow_push(attrs, lint);
                     let v = init.map(|i| self.k_expr(i, env, lint)).unwrap_or(None);
                     self.k_bind_pat(*pat, &v, env, lint);
                     if let Some(els) = els {
                         let mut eenv = env.clone();
                         self.k_block(*els, &mut eenv, lint);
                     }
-                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow")) {
-                        lint.stmt_allow_arith -= 1;
-                    }
-                    if attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic")) {
-                        lint.stmt_allow_panic -= 1;
-                    }
+                    self.k_allow_pop(pushed, lint);
                     init.is_some_and(|i| self.tys.kind(self.out.expr_ty[self.ei(i)]) == TyKind::Never)
                 }
-                Stmt::Expr { expr, .. } => {
+                Stmt::Expr { expr, attrs, .. } => {
+                    // A statement-level `#[allow(..)]` covers this expr.
+                    let pushed = self.k_allow_push(attrs, lint);
                     self.k_expr(*expr, env, lint);
+                    self.k_allow_pop(pushed, lint);
                     self.tys.kind(self.out.expr_ty[self.ei(*expr)]) == TyKind::Never
                 }
                 Stmt::Item(_) | Stmt::Macro { .. } => false,
@@ -8570,7 +8586,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         match block.tail {
-            Some(tail) => self.k_expr(tail, env, lint),
+            Some(tail) => {
+                // An outer `#[allow(..)]` on the tail covers it.
+                let pushed = self.k_allow_push(&block.tail_attrs.clone(), lint);
+                let v = self.k_expr(tail, env, lint);
+                self.k_allow_pop(pushed, lint);
+                v
+            }
             None => None,
         }
     }
@@ -8745,8 +8767,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // and its value are still lost at the join; a single
                     // arm is straight-line code.
                     lint.dead = false;
+                    let pushed = self.k_allow_push(&arm.attrs.clone(), lint);
                     self.k_bind_pat(arm.pat, &sv, env, lint);
                     let v = self.k_expr(arm.body, env, lint);
+                    self.k_allow_pop(pushed, lint);
                     let body_dead = lint.dead || self.tys.kind(self.out.expr_ty[self.ei(arm.body)]) == TyKind::Never;
                     lint.dead = saved || body_dead;
                     if arms.len() == 1 {
@@ -8760,11 +8784,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 for arm in arms {
                     lint.dead = false;
                     let mut aenv = env.clone();
+                    let pushed = self.k_allow_push(&arm.attrs.clone(), lint);
                     self.k_bind_pat(arm.pat, &sv, &mut aenv, lint);
                     if let Some(g) = arm.guard {
                         self.k_expr(g, &mut aenv, lint);
                     }
                     let v = self.k_expr(arm.body, &mut aenv, lint);
+                    self.k_allow_pop(pushed, lint);
                     regions.push(self.span(arm.body));
                     single = Some((aenv, v));
                 }

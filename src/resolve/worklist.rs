@@ -3148,10 +3148,11 @@ fn strip_file(
     tables: &mut ResolvedTables,
     diags: &mut Vec<Diag>,
 ) {
-    // Inner attributes ride on the first item (parser behavior).
     let strings = w.ast.strings.clone();
-    let inner: Vec<Attr> =
-        w.ast.items.first().map(|i| i.attrs.iter().filter(|a| a.style == AttrStyle::Inner).cloned().collect()).unwrap_or_default();
+    let mut inner: Vec<Attr> = w.ast.inner_attrs.clone();
+    if let Err(d) = cfg::expand_cfg_attr(&input.env, &mut inner, &strings, interner) {
+        diags.push(d);
+    }
     let module = w.module;
     if has_attr(&inner, "no_implicit_prelude", interner) {
         tables.modules[module.0 as usize].no_prelude = true;
@@ -3196,6 +3197,27 @@ fn strip_items(
                 continue;
             }
         }
+        // A `cfg` in the inner attributes of an inline `mod`, `impl`, or
+        // `trait` body turns the whole item off, like a file-level cfg.
+        let item_inner: Option<&mut Vec<Attr>> = match &mut item.kind {
+            ItemKind::Mod(m) => Some(&mut m.inner_attrs),
+            ItemKind::Impl(i) => Some(&mut i.inner_attrs),
+            ItemKind::Trait(t) => Some(&mut t.inner_attrs),
+            _ => None,
+        };
+        if let Some(inner) = item_inner {
+            if let Err(d) = cfg::expand_cfg_attr(&input.env, inner, strings, interner) {
+                diags.push(d);
+            }
+            match cfg::attrs_enabled(&input.env, inner, strings, interner) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(d) => {
+                    diags.push(d);
+                    continue;
+                }
+            }
+        }
         match &mut item.kind {
             ItemKind::Struct(s) => {
                 if let VariantFields::Struct(fs) | VariantFields::Tuple(fs) = &mut s.fields {
@@ -3237,7 +3259,7 @@ fn strip_items(
                 if let Some(&child) = list_module.get(&(fi, key.clone())) {
                     let vis = vis_from_ast(&item.vis, interner);
                     tables.modules[child.0 as usize].vis = vis;
-                    if has_attr(&item.attrs, "no_implicit_prelude", interner) {
+                    if has_attr(&item.attrs, "no_implicit_prelude", interner) || has_attr(&m.inner_attrs, "no_implicit_prelude", interner) {
                         tables.modules[child.0 as usize].no_prelude = true;
                     }
                     if let Some(body) = &mut m.body {
@@ -4120,9 +4142,9 @@ impl Rewrite<'_> {
                     }
                     out.push(Stmt::Let { pat, ty, init, els, attrs, span });
                 }
-                Stmt::Expr { expr, semi } => {
+                Stmt::Expr { expr, semi, attrs } => {
                     self.expr(ast, expr, module, scopes);
-                    out.push(Stmt::Expr { expr, semi });
+                    out.push(Stmt::Expr { expr, semi, attrs });
                 }
                 Stmt::Item(idx) => {
                     self.stmt_item(ast, idx, module, scopes);

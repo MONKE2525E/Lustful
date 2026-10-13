@@ -430,6 +430,21 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
     let err = |start: usize, end: usize, msg: &str| {
         Diag::new("L0001", Span::new(file, base + start as u32, base + end as u32), msg, "Fix the syntax.")
     };
+    // A shebang line (`#!/usr/bin/env ...`) at the very start of a file is
+    // skipped, as in rustc. `#!` followed (after spaces) by `[` is an inner
+    // attribute, not a shebang. Only a file's first bytes qualify: `base`
+    // is zero exactly for a whole file, not for a chunk of one.
+    if base == 0 && b.get(..2) == Some(b"#!") {
+        let mut j = 2;
+        while matches!(b.get(j), Some(b' ' | b'\t')) {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'[') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        }
+    }
     while i < b.len() {
         let c = b[i];
         let start = i;

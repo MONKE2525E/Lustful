@@ -53,6 +53,17 @@ pub struct Parser<'a> {
     /// True while parsing an `if` or `while` condition, where `let` may
     /// appear as a chain element.
     let_ok: bool,
+    /// `#[allow(..)]` attributes of enclosing scopes (crate and module
+    /// inner attrs, outer attrs on enclosing `mod`/`impl`/`trait` items,
+    /// impl and trait inner attrs). Every `FnDef` parsed inherits a copy,
+    /// which is how the overflow lint sees a scope-level allow. Frames
+    /// are length marks: push by extending, pop by truncating.
+    scope_allows: Vec<Attr>,
+    /// Set by an expression context where Rust permits inner attributes
+    /// at the start of a block (a statement or block tail, a call, array,
+    /// or tuple element). Taken by the next prefix or block parse, so a
+    /// nested subexpression does not inherit it.
+    block_inner_ok: bool,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -91,8 +102,17 @@ pub fn parse_items(lexed: &Lexed, range: std::ops::Range<usize>, interner: &Inte
 
 /// The item loop of `parse` over one token list (ending in `Eof`) and its string table.
 fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known) -> PResult<Ast> {
-    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
+    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
     p.ast.strings = strings;
+    // Inner attributes are permitted only here, before the first item
+    // (and before any outer attribute): they scope over the whole file.
+    match p.inner_attributes() {
+        Ok(inner) => {
+            p.scope_allows = inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect();
+            p.ast.inner_attrs = inner.attrs;
+        }
+        Err(hard) => return Err(hard),
+    }
     while p.peek() != Tok::Eof {
         let before = p.pos;
         let item = match p.item() {
@@ -171,8 +191,10 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
     let mut p =
-        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false };
+        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
+    // A fn body block permits inner attributes at its start.
+    p.block_inner_ok = true;
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
     let deferred = p.deferred.take();
@@ -195,7 +217,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
     f(&mut p)
 }
 
@@ -214,7 +236,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
     p.expr().ok().map(|_| p.pos)
 }
 
@@ -230,7 +252,11 @@ pub fn probe_pat(toks: &[Token], strings: &[String], interner: &Interner, known:
 
 /// True when `toks` (braces included) is exactly one block.
 pub fn probe_block(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> bool {
-    probe_with(toks, strings, interner, known, |p| p.block().is_ok() && p.peek() == Tok::Eof)
+    probe_with(toks, strings, interner, known, |p| {
+        // A `block` fragment may start with inner attributes, as in rustc.
+        p.block_inner_ok = true;
+        p.block().is_ok() && p.peek() == Tok::Eof
+    })
 }
 
 /// True when `toks` is exactly one statement: wrapped in a block it parses
@@ -401,6 +427,12 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
 
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
+}
+
+/// True when `attr` is a plain `#[allow(..)]` (the only attribute the
+/// parser propagates from an enclosing scope onto each `FnDef` in it).
+fn is_allow(attr: &Attr, known: &Known) -> bool {
+    attr.path.len() == 1 && attr.path[0].name == known.allow
 }
 
 /// One byte escape at `b[i]` (the byte after the backslash): the byte
@@ -786,26 +818,48 @@ impl<'a> Parser<'a> {
 
     // ---------- Items ----------
 
-    /// Parses attributes (outer, or inner at the start of a file or block).
+    /// Parses outer attributes (`#[..]`, `///` docs) in front of an item.
     /// Returns the derive list, whether `#[test]` was present, and the recorded
     /// attributes. Lint attributes and known tool attributes (`rustfmt::`,
     /// `clippy::`) are accepted and ignored, as before. A known Rust attribute
     /// lust does not handle yet (cfg, repr, path, inline, and kin) rejects with
-    /// L0522; a name lust does not know at all rejects with L0402.
+    /// L0522; a name lust does not know at all rejects with L0402. An inner
+    /// attribute (`#![..]`, `//!` docs) here is a syntax error, as in rustc:
+    /// inner attributes are permitted only at the very start of a file, a
+    /// module, impl, trait, or match body, or a permitted block, and those
+    /// sites call `inner_attributes` before anything else in the body.
     fn attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(true)
+        self.attributes_at(true, false)
     }
 
     /// Attributes on a part of an item (a field, parameter, variant, arm, or
     /// statement). `derive` and `test` are not valid there (rustc rejects
     /// them), so they get the unsupported-attribute error, not a free pass.
     fn part_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(false)
+        self.attributes_at(false, false)
     }
 
-    fn attributes_at(&mut self, item_level: bool) -> PResult<ParsedAttrs> {
+    /// Parses a run of inner attributes (`#![..]`, `//!` docs) at a site
+    /// that permits them. Stops at the first outer attribute, which belongs
+    /// to the next item or statement in the body.
+    fn inner_attributes(&mut self) -> PResult<ParsedAttrs> {
+        self.attributes_at(true, true)
+    }
+
+    /// True when the next tokens start an inner attribute (`#!`).
+    fn at_inner_attr(&self) -> bool {
+        self.peek() == Tok::Pound && self.peek_at(1) == Tok::Bang
+    }
+
+    fn attributes_at(&mut self, item_level: bool, inner_only: bool) -> PResult<ParsedAttrs> {
         let mut out = ParsedAttrs::default();
         while self.peek() == Tok::Pound {
+            if inner_only && !self.at_inner_attr() {
+                break;
+            }
+            if !inner_only && self.at_inner_attr() && self.peek_at(2) == Tok::LBracket {
+                return Err(syntax(self.span(), "an inner attribute is not permitted in this context"));
+            }
             let start = self.bump().span;
             let inner = self.eat(Tok::Bang);
             self.expect(Tok::LBracket, "`[`")?;
@@ -949,15 +1003,50 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// `derive` and `test` placement, as in rustc: `#[derive(..)]` applies
+    /// only to a struct or enum, and `#[test]` only to a free function.
+    /// Anywhere else the attribute was parsed and would be silently
+    /// dropped, which is a false accept.
+    fn check_derive_test(&self, parsed: &ParsedAttrs, is_adt: bool, is_fn: bool) -> PResult<()> {
+        // Presence of the attribute is what counts: `#[derive()]` on a
+        // function is an error in rustc even with an empty list.
+        let derive_attr = parsed.attrs.iter().find(|a| a.path.len() == 1 && a.path[0].name == self.known.derive);
+        if !is_adt && let Some(attr) = derive_attr {
+            let span = attr.span;
+            return Err(Diag::new(
+                "L0402",
+                span,
+                "`derive` may only be applied to structs and enums",
+                "Move the `#[derive(..)]` attribute to a struct or enum definition.",
+            ));
+        }
+        if !is_fn && parsed.is_test {
+            let span = parsed.attrs.iter().find(|a| a.path.len() == 1 && a.path[0].name == self.known.test).map_or(Span::default(), |a| a.span);
+            return Err(Diag::new(
+                "L0402",
+                span,
+                "the `test` attribute may only be used on a free function",
+                "Move the `#[test]` attribute to a free function.",
+            ));
+        }
+        Ok(())
+    }
+
     fn item(&mut self) -> PResult<Option<Item>> {
         let start = self.span();
         let parsed = self.attributes()?;
         let derives = parsed.derives.clone();
+        // An outer `#[allow(..)]` on a `mod`, `impl`, or `trait` item scopes
+        // over the functions inside it (see `scope_allows`).
+        let scope_mark = self.scope_allows.len();
+        self.scope_allows.extend(parsed.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let vis = self.vis()?;
         // A `const` item (`const NAME: Ty = ...;`), told apart from a
         // `const fn` qualifier by the name and colon after it.
         if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
             let kind = ItemKind::Const(self.const_def()?);
+            self.check_derive_test(&parsed, false, false)?;
+            self.scope_allows.truncate(scope_mark);
             return Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }));
         }
         // Function and impl qualifiers, in any written order: `const`,
@@ -1008,7 +1097,10 @@ impl<'a> Parser<'a> {
                 let mut def = self.fn_def()?;
                 def.is_test = parsed.is_test;
                 def.vis = vis.clone();
-                def.attrs = parsed.attrs.clone();
+                // `fn_def` seeded `attrs` with the enclosing scopes' allows.
+                let mut attrs = parsed.attrs.clone();
+                attrs.extend(def.attrs);
+                def.attrs = attrs;
                 def.qual = qual;
                 ItemKind::Fn(def)
             }
@@ -1017,7 +1109,11 @@ impl<'a> Parser<'a> {
             Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => ItemKind::Impl(self.impl_def(true)?),
             Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def(false)?),
             Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
-            Tok::Eof if derives.is_empty() && !has_qual => return Ok(None),
+            Tok::Eof if derives.is_empty() && parsed.attrs.is_empty() && !has_qual => {
+                self.scope_allows.truncate(scope_mark);
+                return Ok(None);
+            }
+            Tok::Eof if !has_qual => return Err(syntax(start, "expected an item after attributes")),
             Tok::Trait if !qual.is_const && !qual.is_async && qual.abi.is_none() => {
                 let mut def = self.trait_def()?;
                 def.is_unsafe = qual.is_unsafe;
@@ -1041,6 +1137,12 @@ impl<'a> Parser<'a> {
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
+        self.check_derive_test(
+            &parsed,
+            matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_)),
+            matches!(kind, ItemKind::Fn(_)),
+        )?;
+        self.scope_allows.truncate(scope_mark);
         Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }))
     }
 
@@ -1118,9 +1220,13 @@ impl<'a> Parser<'a> {
         let start = self.expect(Tok::Mod, "`mod`")?;
         let (name, name_span) = self.ident()?;
         if self.eat(Tok::Semi) {
-            return Ok(ModDef { name, name_span, body: None, span: start.to(self.prev_span()) });
+            return Ok(ModDef { name, name_span, inner_attrs: Vec::new(), body: None, span: start.to(self.prev_span()) });
         }
         self.expect(Tok::LBrace, "`{` or `;`")?;
+        // Inner attributes are permitted only here, before the first item.
+        let inner = self.inner_attributes()?;
+        let scope_mark = self.scope_allows.len();
+        self.scope_allows.extend(inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let mut items = Vec::new();
         while self.peek() != Tok::RBrace {
             if self.peek() == Tok::Eof {
@@ -1135,7 +1241,8 @@ impl<'a> Parser<'a> {
             }
         }
         self.bump();
-        Ok(ModDef { name, name_span, body: Some(items), span: start.to(self.prev_span()) })
+        self.scope_allows.truncate(scope_mark);
+        Ok(ModDef { name, name_span, inner_attrs: inner.attrs, body: Some(items), span: start.to(self.prev_span()) })
     }
 
     /// A `const` item: `const NAME: Ty = value;` (`_` for an unnamed const).
@@ -1487,7 +1594,14 @@ impl<'a> Parser<'a> {
         let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
         let where_clause = self.where_clause()?;
         let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
-        let body = if sig_only && self.eat(Tok::Semi) { None } else { Some(self.block()?) };
+        // A fn body block permits inner attributes at its start.
+        self.block_inner_ok = true;
+        let body = if sig_only && self.eat(Tok::Semi) {
+            self.block_inner_ok = false;
+            None
+        } else {
+            Some(self.block()?)
+        };
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
         Ok(FnDef {
@@ -1495,7 +1609,9 @@ impl<'a> Parser<'a> {
             name_span,
             is_test: false,
             vis: Vis::Private,
-            attrs: Vec::new(),
+            // Seeded with the enclosing scopes' allows; the caller prepends
+            // this function's own outer attributes.
+            attrs: self.scope_allows.clone(),
             qual: FnQual::default(),
             generics,
             self_param,
@@ -1646,17 +1762,25 @@ impl<'a> Parser<'a> {
         let bounds = if self.eat(Tok::Colon) { self.bounds()? } else { Vec::new() };
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
+        // Inner attributes are permitted only here, before the first item.
+        let inner = self.inner_attributes()?;
+        let scope_mark = self.scope_allows.len();
+        self.scope_allows.extend(inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let mut fns = Vec::new();
         let mut consts = Vec::new();
         let mut types = Vec::new();
         while self.peek() != Tok::RBrace {
             let parsed = self.attributes()?;
+            // A trait item is neither an ADT nor a free function.
+            self.check_derive_test(&parsed, false, false)?;
             let vis = self.vis()?;
             match self.peek() {
                 Tok::Fn => {
                     let mut def = self.fn_def_inner(true)?;
                     def.vis = vis;
-                    def.attrs = parsed.attrs;
+                    let mut attrs = parsed.attrs;
+                    attrs.extend(def.attrs);
+                    def.attrs = attrs;
                     fns.push(def);
                 }
                 Tok::Type => types.push(self.assoc_type()?),
@@ -1672,7 +1796,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
+        self.scope_allows.truncate(scope_mark);
         Ok(TraitDef {
+            inner_attrs: inner.attrs,
             name,
             name_span,
             is_unsafe: false,
@@ -1716,19 +1842,25 @@ impl<'a> Parser<'a> {
         if trait_ref.is_some() || is_negative {}
         let where_clause = self.where_clause()?;
         self.expect(Tok::LBrace, "`{`")?;
+        // Inner attributes are permitted only here, before the first item.
+        let inner = self.inner_attributes()?;
+        let scope_mark = self.scope_allows.len();
+        self.scope_allows.extend(inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let mut fns = Vec::new();
         let mut consts = Vec::new();
         let mut types = Vec::new();
         while self.peek() != Tok::RBrace {
             let parsed = self.attributes()?;
+            // An impl item is neither an ADT nor a free function.
+            self.check_derive_test(&parsed, false, false)?;
             let vis = self.vis()?;
-            let is_test = parsed.is_test;
             match self.peek() {
                 Tok::Fn => {
                     let mut def = self.fn_def()?;
-                    def.is_test = is_test;
                     def.vis = vis;
-                    def.attrs = parsed.attrs;
+                    let mut attrs = parsed.attrs;
+                    attrs.extend(def.attrs);
+                    def.attrs = attrs;
                     fns.push(def);
                 }
                 Tok::Type if trait_ref.is_some() => types.push(self.assoc_type()?),
@@ -1741,9 +1873,10 @@ impl<'a> Parser<'a> {
                 Tok::Const if self.peek_at(1) == Tok::Fn => {
                     self.bump();
                     let mut def = self.fn_def()?;
-                    def.is_test = is_test;
                     def.vis = vis;
-                    def.attrs = parsed.attrs;
+                    let mut attrs = parsed.attrs;
+                    attrs.extend(def.attrs);
+                    def.attrs = attrs;
                     def.qual.is_const = true;
                     fns.push(def);
                 }
@@ -1755,7 +1888,20 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(ImplDef { generics, is_unsafe, is_negative, trait_ref, self_ty, where_clause, fns, consts, types, span: start })
+        self.scope_allows.truncate(scope_mark);
+        Ok(ImplDef {
+            inner_attrs: inner.attrs,
+            generics,
+            is_unsafe,
+            is_negative,
+            trait_ref,
+            self_ty,
+            where_clause,
+            fns,
+            consts,
+            types,
+            span: start,
+        })
     }
 
     // ---------- Types ----------
@@ -1938,8 +2084,8 @@ impl<'a> Parser<'a> {
     fn const_arg_expr(&mut self) -> PResult<ExprId> {
         match self.peek() {
             Tok::Minus => self.prefix(false),
-            Tok::LBrace => self.block_like_expr(),
-            Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false),
+            Tok::LBrace => self.block_like_expr(false),
+            Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false, false),
             _ => Err(self.reject(C_CONST, "const generic arguments in this form")),
         }
     }
@@ -2104,11 +2250,27 @@ impl<'a> Parser<'a> {
 
     fn block_inner(&mut self) -> PResult<BlockId> {
         let start = self.expect(Tok::LBrace, "`{`")?;
+        // Inner attributes at a block's start are permitted only in the
+        // contexts that set `block_inner_ok` (a fn body, a loop body, a
+        // statement or tail block, a call/array/tuple element block), and
+        // only before the first statement. Everywhere else rustc rejects
+        // them, so lust does too.
+        let inner_attrs = if std::mem::take(&mut self.block_inner_ok) {
+            self.inner_attributes()?.attrs
+        } else if self.at_inner_attr() {
+            return Err(syntax(self.span(), "an inner attribute is not permitted in this context"));
+        } else {
+            Vec::new()
+        };
         let mut stmts = Vec::new();
         let mut tail = None;
+        let mut tail_attrs = Vec::new();
         while self.peek() != Tok::RBrace {
             if self.peek() == Tok::Eof {
                 return Err(syntax(self.span(), "expected `}`, found end of file"));
+            }
+            if self.at_inner_attr() {
+                return Err(syntax(self.span(), "an inner attribute is not permitted in this context"));
             }
             if self.eat(Tok::Semi) {
                 continue;
@@ -2128,8 +2290,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Statement attributes: parsed here so a `#[cfg]` on a statement
-            // gets the attribute code; lint attributes are kept on `let`s.
-            let stmt_attrs = self.part_attributes()?;
+            // gets the attribute code; lint attributes are kept on the
+            // statement (`let`, expression, or the block's tail).
+            let mut stmt_attrs = self.part_attributes()?;
             // A function-local `use` is an item statement; the resolver
             // binds it for the rest of the block (docs/ARCH.md 1.3).
             if self.peek() == Tok::Use {
@@ -2192,8 +2355,10 @@ impl<'a> Parser<'a> {
             }
             let labeled = matches!(self.peek(), Tok::Lifetime(_)) && self.peek_at(1) == Tok::Colon;
             let block_like = labeled || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
+            // A statement (or block tail) block may carry inner attributes.
+            self.block_inner_ok = true;
             let expr = if block_like {
-                let e = if labeled { self.expr()? } else { self.block_like_expr()? };
+                let e = if labeled { self.expr()? } else { self.block_like_expr(true)? };
                 // Allow method calls on a block-like expression, as rustc does.
                 if self.peek() == Tok::Dot || self.peek() == Tok::Question {
                     let e = self.postfix(e)?;
@@ -2204,18 +2369,37 @@ impl<'a> Parser<'a> {
             } else {
                 self.expr()?
             };
+            // An `#[allow(..)]` directly on a macro invocation is unused
+            // in rustc (it does not reach the macro's arguments), while
+            // the same allow on an enclosing `let`, block, or arm does.
+            // Drop it here so the lint still fires inside the invocation.
+            if matches!(self.ast.expr(expr), Expr::Macro { .. } | Expr::MacroCall(_)) {
+                stmt_attrs.attrs.retain(|a| !is_allow(a, self.known));
+            }
+            // Attributes on an expression statement are stable only for
+            // expression kinds with no trailing operator: rustc rejects
+            // them on assignments, binary operations, casts, and ranges.
+            if !stmt_attrs.attrs.is_empty()
+                && matches!(
+                    self.ast.expr(expr),
+                    Expr::Binary { .. } | Expr::Cast { .. } | Expr::Assign { .. } | Expr::AssignOp { .. } | Expr::Range { .. }
+                )
+            {
+                return Err(syntax(stmt_attrs.attrs[0].span, "attributes on expressions are not permitted in this context"));
+            }
             if self.eat(Tok::Semi) {
-                stmts.push(Stmt::Expr { expr, semi: true });
+                stmts.push(Stmt::Expr { expr, semi: true, attrs: stmt_attrs.attrs });
             } else if self.peek() == Tok::RBrace {
                 tail = Some(expr);
+                tail_attrs = stmt_attrs.attrs;
             } else if block_like {
-                stmts.push(Stmt::Expr { expr, semi: false });
+                stmts.push(Stmt::Expr { expr, semi: false, attrs: stmt_attrs.attrs });
             } else {
                 return Err(syntax(self.span(), format!("expected `;` or `}}`, found {}", tok_name(self.peek()))));
             }
         }
         let end = self.expect(Tok::RBrace, "`}`")?;
-        Ok(self.push_block(Block { stmts, tail, span: start.to(end) }))
+        Ok(self.push_block(Block { inner_attrs, stmts, tail, tail_attrs, span: start.to(end) }))
     }
 
     // ---------- Patterns ----------
@@ -2558,6 +2742,9 @@ impl<'a> Parser<'a> {
             if no_struct {
                 return Err(not_yet(C_CORE, start, "closures"));
             }
+            // A closure body block may not carry inner attributes, and
+            // this dispatch bypasses the prefix take of `block_inner_ok`.
+            self.block_inner_ok = false;
             return self.closure_expr(start);
         }
         // Assignment is right-associative and lowest.
@@ -2683,10 +2870,13 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self, no_struct: bool) -> PResult<ExprId> {
-        self.nest(|p| p.prefix_inner(no_struct))
+        // Spend the caller's block-inner permission here: only a block
+        // that starts this prefix expression may use it.
+        let inner_ok = std::mem::take(&mut self.block_inner_ok);
+        self.nest(|p| p.prefix_inner(no_struct, inner_ok))
     }
 
-    fn prefix_inner(&mut self, no_struct: bool) -> PResult<ExprId> {
+    fn prefix_inner(&mut self, no_struct: bool, inner_ok: bool) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
             Tok::Minus => {
@@ -2718,7 +2908,7 @@ impl<'a> Parser<'a> {
                 return Ok(id);
             }
             _ => {
-                let e = self.primary(no_struct)?;
+                let e = self.primary(no_struct, inner_ok)?;
                 return self.postfix(e);
             }
         };
@@ -2837,6 +3027,8 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LParen, "`(`")?;
         let mut args = Vec::new();
         while self.peek() != Tok::RParen {
+            // A call argument block may carry inner attributes.
+            self.block_inner_ok = true;
             args.push(self.expr()?);
             if !self.eat(Tok::Comma) {
                 break;
@@ -2846,26 +3038,40 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    fn block_like_expr(&mut self) -> PResult<ExprId> {
-        self.block_like_labeled(None)
+    /// A block-like expression. `inner_ok` says whether a plain or
+    /// labeled block here may carry inner attributes (see `block_inner`).
+    /// Loop bodies always may; `if`/`else` bodies and match arm bodies
+    /// never may, whatever the caller passes.
+    fn block_like_expr(&mut self, inner_ok: bool) -> PResult<ExprId> {
+        self.block_like_labeled(None, inner_ok)
     }
 
-    fn block_like_labeled(&mut self, label: Option<Label>) -> PResult<ExprId> {
+    fn block_like_labeled(&mut self, label: Option<Label>, inner_ok: bool) -> PResult<ExprId> {
+        // The caller's flag is spent: only the arms below re-arm it.
+        self.block_inner_ok = false;
         let start = self.span();
         let e = match self.peek() {
             Tok::LBrace => match label {
-                Some(label) => Expr::LabeledBlock { label, body: self.block()? },
-                None => Expr::Block(self.block()?),
+                Some(label) => {
+                    self.block_inner_ok = inner_ok;
+                    Expr::LabeledBlock { label, body: self.block()? }
+                }
+                None => {
+                    self.block_inner_ok = inner_ok;
+                    Expr::Block(self.block()?)
+                }
             },
             Tok::If => return self.if_expr(),
             Tok::While => {
                 self.bump();
                 let cond = self.condition()?;
+                self.block_inner_ok = true;
                 let body = self.block()?;
                 Expr::While { label, cond, body }
             }
             Tok::Loop => {
                 self.bump();
+                self.block_inner_ok = true;
                 Expr::Loop { label, body: self.block()? }
             }
             Tok::For => {
@@ -2873,6 +3079,7 @@ impl<'a> Parser<'a> {
                 let pat = self.pattern()?;
                 self.expect(Tok::In, "`in`")?;
                 let iter = self.expr_ctx(true)?;
+                self.block_inner_ok = true;
                 let body = self.block()?;
                 Expr::For { label, pat, iter, body }
             }
@@ -2880,14 +3087,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let scrut = self.expr_ctx(true)?;
                 self.expect(Tok::LBrace, "`{`")?;
+                // Inner attributes are permitted only here, before the
+                // first arm. An inner `#[allow(..)]` scopes over every
+                // arm, so it is cloned onto each arm's attributes.
+                let inner = self.inner_attributes()?;
+                let inner_allows: Vec<Attr> = inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned().collect();
                 let mut arms = Vec::new();
                 while self.peek() != Tok::RBrace {
-                    let aattrs = self.part_attributes()?;
+                    let mut aattrs = self.part_attributes()?;
+                    aattrs.attrs.splice(0..0, inner_allows.iter().cloned());
                     let pat = self.pattern()?;
                     let guard = if self.eat(Tok::If) { Some(self.expr()?) } else { None };
                     self.expect(Tok::FatArrow, "`=>`")?;
                     let block_body = self.peek() == Tok::LBrace;
-                    let body = if block_body { self.block_like_expr()? } else { self.expr()? };
+                    let body = if block_body { self.block_like_expr(false)? } else { self.expr()? };
                     arms.push(Arm { attrs: aattrs.attrs, pat, guard, body });
                     if !self.eat(Tok::Comma) && !block_body && self.peek() != Tok::RBrace {
                         return Err(syntax(self.span(), "expected `,` after match arm"));
@@ -2929,7 +3142,7 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(Expr::If { cond, then, els }, start.to(self.prev_span())))
     }
 
-    fn primary(&mut self, no_struct: bool) -> PResult<ExprId> {
+    fn primary(&mut self, no_struct: bool, inner_ok: bool) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
             Tok::Int(v, s) => {
@@ -3023,6 +3236,11 @@ impl<'a> Parser<'a> {
                         if self.peek() == Tok::RParen {
                             break;
                         }
+                        // A tuple element block may carry inner attrs. The
+                        // first element is not armed: until a comma is seen
+                        // it may still be a parenthesized expression, where
+                        // rustc rejects inner attrs.
+                        self.block_inner_ok = true;
                         match self.expr() {
                             Ok(e) => elems.push(e),
                             Err(d) => {
@@ -3046,6 +3264,9 @@ impl<'a> Parser<'a> {
                 if self.eat(Tok::RBracket) {
                     Expr::Array(Vec::new())
                 } else {
+                    // An array element (or repeat value) block may carry
+                    // inner attributes; the repeat length may not.
+                    self.block_inner_ok = true;
                     let first = self.expr()?;
                     if self.eat(Tok::Semi) {
                         let len = self.expr()?;
@@ -3057,6 +3278,7 @@ impl<'a> Parser<'a> {
                             if self.peek() == Tok::RBracket {
                                 break;
                             }
+                            self.block_inner_ok = true;
                             elems.push(self.expr()?);
                         }
                         self.expect(Tok::RBracket, "`]`")?;
@@ -3064,7 +3286,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace => return self.block_like_expr(),
+            Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace => return self.block_like_expr(inner_ok),
             Tok::Break => {
                 self.bump();
                 let label = self.break_label();
@@ -3090,7 +3312,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.expect(Tok::Colon, "`:` after a label")?;
                 let label = Label { name, span };
-                return self.block_like_labeled(Some(label));
+                return self.block_like_labeled(Some(label), inner_ok);
             }
             Tok::Pipe | Tok::OrOr | Tok::Move => return Err(not_yet(C_CORE, start, "closures")),
             Tok::Unsafe => return Err(unsafe_error(start)),

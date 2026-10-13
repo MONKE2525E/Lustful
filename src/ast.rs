@@ -21,6 +21,9 @@ ids!(ExprId, PatId, TyId, BlockId);
 
 #[derive(Clone, Default)]
 pub struct Ast {
+    /// Inner attributes at the start of the file (`#![..]`, `//!` docs).
+    /// They scope over the whole file's module, never over one item.
+    pub inner_attrs: Vec<Attr>,
     pub items: Vec<Item>,
     /// Items written inside function bodies, in order of appearance. A body item
     /// statement (`Stmt::Item`) holds an index into this list. These are never
@@ -314,6 +317,8 @@ pub struct EnumDef {
 
 #[derive(Clone)]
 pub struct ImplDef {
+    /// Inner attributes at the start of the impl body (`#![..]`).
+    pub inner_attrs: Vec<Attr>,
     pub generics: Generics,
     pub is_unsafe: bool,
     /// True for a negative impl (`impl !Send for T`).
@@ -366,6 +371,8 @@ pub enum UseKind {
 pub struct ModDef {
     pub name: Sym,
     pub name_span: Span,
+    /// Inner attributes at the start of an inline body (`#![..]`).
+    pub inner_attrs: Vec<Attr>,
     pub body: Option<Vec<Item>>,
     pub span: Span,
 }
@@ -374,6 +381,8 @@ pub struct ModDef {
 /// a method with a default body has one.
 #[derive(Clone)]
 pub struct TraitDef {
+    /// Inner attributes at the start of the trait body (`#![..]`).
+    pub inner_attrs: Vec<Attr>,
     pub name: Sym,
     pub name_span: Span,
     pub is_unsafe: bool,
@@ -656,8 +665,13 @@ pub struct FtyParam {
 
 #[derive(Clone)]
 pub struct Block {
+    /// Inner attributes at the start of the block (`#![..]`), where Rust
+    /// permits them (a fn body, a statement block, a loop body, and kin).
+    pub inner_attrs: Vec<Attr>,
     pub stmts: Vec<Stmt>,
     pub tail: Option<ExprId>,
+    /// Outer attributes on the tail expression (`#[allow(..)] expr`).
+    pub tail_attrs: Vec<Attr>,
     pub span: Span,
 }
 
@@ -675,6 +689,8 @@ pub enum Stmt {
     Expr {
         expr: ExprId,
         semi: bool,
+        /// Outer attributes on the statement (`#[allow(..)] expr;`).
+        attrs: Vec<Attr>,
     },
     /// An item inside a function body: an index into `Ast::stmt_items`.
     Item(u32),
@@ -1277,6 +1293,7 @@ impl Shift {
                 }
             }
             ItemKind::Impl(imp) => {
+                self.attrs(&mut imp.inner_attrs);
                 self.generics(&mut imp.generics);
                 if let Some(tr) = &mut imp.trait_ref {
                     self.path(&mut tr.path);
@@ -1289,11 +1306,13 @@ impl Shift {
             }
             ItemKind::Use(u) => self.use_tree(&mut u.tree),
             ItemKind::Mod(m) => {
+                self.attrs(&mut m.inner_attrs);
                 if let Some(items) = &mut m.body {
                     items.iter_mut().for_each(|i| self.item(i));
                 }
             }
             ItemKind::Trait(tr) => {
+                self.attrs(&mut tr.inner_attrs);
                 self.generics(&mut tr.generics);
                 self.bounds(&mut tr.bounds);
                 self.where_clause(&mut tr.where_clause);
@@ -1369,6 +1388,7 @@ impl Ast {
             chunks.iter_mut().zip(&shifts).skip(1).map(|(c, &s)| (std::sync::Mutex::new(c), s)).collect();
         crate::pool::par_map(&cells, |(c, s)| c.lock().unwrap().shift(*s));
         let mut out = Ast {
+            inner_attrs: Vec::new(),
             items: Vec::with_capacity(chunks.iter().map(|c| c.items.len()).sum()),
             stmt_items: Vec::with_capacity(sh.si as usize),
             exprs: Vec::with_capacity(sh.e as usize),
@@ -1381,6 +1401,7 @@ impl Ast {
             strings: Vec::with_capacity(sh.s as usize),
         };
         for mut c in chunks {
+            out.inner_attrs.append(&mut c.inner_attrs);
             out.items.append(&mut c.items);
             out.stmt_items.append(&mut c.stmt_items);
             out.exprs.append(&mut c.exprs);
@@ -1407,6 +1428,7 @@ impl Ast {
             si: self.stmt_items.len() as u32,
         };
         o.shift(sh);
+        self.inner_attrs.append(&mut o.inner_attrs);
         self.stmt_items.append(&mut o.stmt_items);
         self.exprs.append(&mut o.exprs);
         self.expr_spans.append(&mut o.expr_spans);
@@ -1422,6 +1444,7 @@ impl Ast {
     /// Adds `sh` to every index stored in this chunk's nodes.
     fn shift(&mut self, sh: Shift) {
         let o = self;
+        sh.attrs(&mut o.inner_attrs);
         for item in o.items.iter_mut().chain(o.stmt_items.iter_mut()) {
             sh.item(item);
         }
@@ -1589,6 +1612,8 @@ impl Ast {
             }
         }
         for b in &mut o.blocks {
+            sh.attrs(&mut b.inner_attrs);
+            sh.attrs(&mut b.tail_attrs);
             b.tail = b.tail.map(|x| sh.e(x));
             for st in &mut b.stmts {
                 match st {
@@ -1599,7 +1624,10 @@ impl Ast {
                         *els = els.map(|x| sh.b(x));
                         sh.attrs(attrs);
                     }
-                    Stmt::Expr { expr, .. } => *expr = sh.e(*expr),
+                    Stmt::Expr { expr, attrs, .. } => {
+                        *expr = sh.e(*expr);
+                        sh.attrs(attrs);
+                    }
                     Stmt::Item(i) => *i += sh.si,
                     Stmt::Macro { call, .. } => sh.macro_call(call),
                 }

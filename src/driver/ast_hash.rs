@@ -441,10 +441,12 @@ impl Walker<'_> {
 
     fn block(&mut self, h: &mut FxHasher, b: BlockId) {
         let block = self.ast.block(b);
+        self.attrs(h, &block.inner_attrs);
         (block.stmts.len() as u64).hash(h);
         for s in &block.stmts {
             self.stmt(h, s);
         }
+        self.attrs(h, &block.tail_attrs);
         match block.tail {
             Some(e) => self.expr(h, e),
             None => 0u8.hash(h),
@@ -470,9 +472,10 @@ impl Walker<'_> {
                 }
                 self.attrs(h, attrs);
             }
-            Stmt::Expr { expr, semi } => {
+            Stmt::Expr { expr, semi, attrs } => {
                 (1u8, semi).hash(h);
                 self.expr(h, *expr);
+                self.attrs(h, attrs);
             }
             Stmt::Item(i) => {
                 2u8.hash(h);
@@ -1064,6 +1067,7 @@ impl Walker<'_> {
             }
             ItemKind::Impl(imp) => {
                 3u8.hash(h);
+                self.attrs(h, &imp.inner_attrs);
                 self.generics(h, &imp.generics);
                 (imp.is_unsafe, imp.is_negative).hash(h);
                 match &imp.trait_ref {
@@ -1085,6 +1089,7 @@ impl Walker<'_> {
             }
             ItemKind::Mod(m) => {
                 5u8.hash(h);
+                self.attrs(h, &m.inner_attrs);
                 self.sym(h, m.name);
                 match &m.body {
                     Some(items) => {
@@ -1098,6 +1103,7 @@ impl Walker<'_> {
             }
             ItemKind::Trait(t) => {
                 6u8.hash(h);
+                self.attrs(h, &t.inner_attrs);
                 self.sym(h, t.name);
                 (t.is_unsafe, t.is_auto).hash(h);
                 self.generics(h, &t.generics);
