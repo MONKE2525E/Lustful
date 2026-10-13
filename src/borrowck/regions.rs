@@ -864,43 +864,63 @@ impl OwnSig {
         }
     }
 
-    /// A closure body's universals: the env reference's region, one class
-    /// for every captured region and the output (the creator equates them),
-    /// and one distinct universal per input slot (inputs may be any region).
+    /// A closure body's universals: one per slot of its env (the env
+    /// reference's region, then each captured region), of its output, and
+    /// of its inputs (inputs may be any region: higher-ranked). The facts
+    /// are the closure contract (`closure_roles`): every captured source
+    /// outlives every captured sink and every output slot; the creator
+    /// adds the same source-to-sink edges, and a call's result holds the
+    /// sources. Nothing relates an input to anything else.
     fn closure_sig<T: TyIntern>(&mut self, p: &Program, body: &Body, sc: &mut SlotCx<'_, '_, '_, T>) {
-        let class: Univ = 1;
-        self.n_univ = 1;
-        self.names.push("the closure's captured lifetimes".into());
-        let mut env_ref: Option<Univ> = None;
+        let _ = p;
+        let fresh = |own: &mut OwnSig, name: &str| -> Univ {
+            own.n_univ += 1;
+            own.names.push(name.into());
+            own.n_univ
+        };
+        let mut env_caps: Vec<Univ> = Vec::new();
+        let mut roles: Vec<(bool, bool)> = Vec::new();
         for l in 0..=body.arg_count {
             let t = body.locals[l].ty;
             let n = sc.slots(t) as usize;
             let mut out = Vec::with_capacity(n);
             if l == 0 {
-                out.resize(n, class);
+                for _ in 0..n {
+                    out.push(fresh(self, "the closure's return lifetime"));
+                }
             } else if l == 1 {
-                if let TyKind::Ref(..) = sc.tys.kind(t) {
-                    self.n_univ += 1;
-                    self.names.push("the closure environment's lifetime".into());
-                    env_ref = Some(self.n_univ);
-                    out.push(self.n_univ);
-                    out.resize(n, class);
-                } else {
-                    out.resize(n, class);
+                let cl = match sc.tys.kind(t) {
+                    TyKind::Ref(_, _, inner) => {
+                        out.push(fresh(self, "the closure environment's lifetime"));
+                        inner
+                    }
+                    _ => t,
+                };
+                if let TyKind::Closure(_, args) = sc.tys.kind(cl) {
+                    closure_roles(sc, args, &mut roles);
+                }
+                while out.len() < n {
+                    let u = fresh(self, "a lifetime the closure captures");
+                    env_caps.push(u);
+                    out.push(u);
                 }
             } else {
                 for _ in 0..n {
-                    self.n_univ += 1;
-                    self.names.push("a closure argument's lifetime".into());
-                    out.push(self.n_univ);
+                    out.push(fresh(self, "a closure argument's lifetime"));
                 }
             }
             self.slots.push(out);
         }
-        if let Some(e) = env_ref {
-            self.facts.push((class, e));
+        // The contract (the env param's implied walk adds the capture
+        // part); every source may also flow into the output.
+        let outs: Vec<Univ> = self.slots.first().cloned().unwrap_or_default();
+        for (i, &(src, _)) in roles.iter().enumerate() {
+            if src && let Some(&a) = env_caps.get(i) {
+                for &o in &outs {
+                    self.facts.push((a, o));
+                }
+            }
         }
-        let _ = p;
         self.implied(sc, body);
     }
 
@@ -948,6 +968,36 @@ impl OwnSig {
 
 /// Walks erased type `t` with slot universals `us` from `*at`, pushing a
 /// fact `inner: outer` for every slot inside each enclosing reference.
+/// The region contract of a closure (W-BORROW, ARCH 5.2 closures): per
+/// slot of its env field types, in slot order, whether the body may read
+/// the region into other places (a source) and whether it may write a
+/// region there (a sink). A shared capture `&'c T`: `'c` and `T`'s slots
+/// are sources; a mutable one `&'c mut T`: `T`'s slots are sources and
+/// sinks, `'c` neither (a captured `&mut` cannot escape); a by-value
+/// field: its slots are sources and sinks. The body may make any source
+/// outlive any sink and its output; the creator adds exactly the
+/// source-to-sink edges, and a call's result holds the sources.
+pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, args: ArgsId, out: &mut Vec<(bool, bool)>) {
+    for f in closure_fields(sc.tys, args) {
+        match sc.tys.kind(f) {
+            TyKind::Ref(_, m, inner) => {
+                let n = sc.slots(inner) as usize;
+                if m.is_mut() {
+                    out.push((false, false));
+                    out.extend(std::iter::repeat_n((true, true), n));
+                } else {
+                    out.push((true, false));
+                    out.extend(std::iter::repeat_n((true, false), n));
+                }
+            }
+            _ => {
+                let n = sc.slots(f) as usize;
+                out.extend(std::iter::repeat_n((true, true), n));
+            }
+        }
+    }
+}
+
 fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ], at: &mut usize, outer: &mut Vec<Univ>, facts: &mut Vec<(Univ, Univ)>) {
     let each = |u: Univ, facts: &mut Vec<(Univ, Univ)>, outer: &Vec<Univ>| {
         for &o in outer {
@@ -983,14 +1033,18 @@ fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ],
         }
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => implied_walk(sc, e, us, at, outer, facts),
         TyKind::Closure(_, args) => {
-            // A closure's captured regions are one class (see `closure_sig`).
+            // The closure contract: every source outlives every sink.
             let start = *at;
             for e in closure_fields(sc.tys, args) {
                 implied_walk(sc, e, us, at, outer, facts);
             }
-            for i in start..*at {
-                for j in start..*at {
-                    if let (Some(&a), Some(&b)) = (us.get(i), us.get(j)) {
+            let mut roles = Vec::new();
+            closure_roles(sc, args, &mut roles);
+            for (i, &(src, _)) in roles.iter().enumerate() {
+                for (j, &(_, snk)) in roles.iter().enumerate() {
+                    if src && snk && i != j
+                        && let (Some(&a), Some(&b)) = (us.get(start + i), us.get(start + j))
+                    {
                         facts.push((a, b));
                     }
                 }
@@ -1641,11 +1695,13 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 for (i, o) in ops.iter().enumerate() {
                     self.into_place(o, dest, &[Proj::Field(i as u32)]);
                 }
-                if let TyKind::Closure(..) = self.body.tys.kind(*ty) {
-                    // A closure's captured regions form one class: its body
-                    // may move data between captures and into its output.
+                if let TyKind::Closure(_, args) = self.body.tys.kind(*ty) {
+                    // The closure contract (`closure_roles`): its body may
+                    // make any captured source outlive any captured sink.
                     self.place(dest, &mut dv, &mut d);
-                    self.equate_all(&dv, &[]);
+                    let mut roles = Vec::new();
+                    closure_roles(&mut self.sc, args, &mut roles);
+                    self.contract_edges(&roles, &dv);
                 }
             }
             Rvalue::ArrayAgg(_, ops) | Rvalue::VecLit(_, ops) => {
@@ -1750,6 +1806,13 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
         let dt = self.place(dest, &mut dv, &mut d);
+        // A closure argument that returns borrows: whatever the callee
+        // returns may hold the closure's captured sources (its output).
+        let mut srcs: Vec<u32> = Vec::new();
+        for (t, v) in &avs {
+            self.closure_sources(*t, v, &mut 0, &mut srcs);
+        }
+        self.flow_all(&srcs, &dv);
         // A vtable call takes the trait method's signature, which every
         // impl satisfies (`impl_contract`). The object's hidden regions
         // stay alive through the pointer's region (`MakeDyn`), so a
@@ -1777,17 +1840,26 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.trait_view(f, &avs, dt, &dv);
             }
             Some((_, Callee::Closure)) => {
-                // The env's captured regions and the result are one class.
-                let class = self.fresh();
+                // The result holds what the body may return: the env's
+                // captured sources (the closure contract). Inputs are
+                // higher-ranked: nothing relates them to the result.
                 if let Some((et, ev)) = avs.first() {
-                    let skip = usize::from(matches!(self.body.tys.kind(*et), TyKind::Ref(..)));
-                    for &x in ev.iter().skip(skip) {
-                        self.edge(x, class);
-                        self.edge(class, x);
+                    let (ct, skip) = match self.body.tys.kind(*et) {
+                        TyKind::Ref(_, _, inner) => (inner, 1),
+                        _ => (*et, 0),
+                    };
+                    if let TyKind::Closure(_, args) = self.body.tys.kind(ct) {
+                        let mut roles = Vec::new();
+                        closure_roles(&mut self.sc, args, &mut roles);
+                        let caps: Vec<u32> = ev.iter().skip(skip).copied().collect();
+                        for (i, &(src, _)) in roles.iter().enumerate() {
+                            if src && let Some(&x) = caps.get(i) {
+                                for &y in &dv {
+                                    self.edge(x, y);
+                                }
+                            }
+                        }
                     }
-                }
-                for &y in &dv {
-                    self.edge(class, y);
                 }
             }
             _ if matches!(target, CallTarget::Builtin(b) if fmt_builder_builtin(b)) => {
@@ -1961,11 +2033,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     }
 
     /// The vars of the slots of `t` (laid out from `*at` in `vars`) that do
-    /// not sit inside a closure type.
+    /// not sit inside a closure type, plus the captured sources of the
+    /// closures that return borrows.
     fn non_closure_slots(&mut self, t: Ty, vars: &[u32], at: &mut usize, out: &mut Vec<u32>) {
         let n = self.sc.slots(t) as usize;
         if let TyKind::Closure(..) = self.body.tys.kind(t) {
-            *at += n;
+            // A closure that returns borrows: the items may hold its
+            // captured sources (`map(|i| &v[i])`).
+            self.closure_sources(t, vars, at, out);
             return;
         }
         match self.body.tys.kind(t) {
@@ -2005,6 +2080,68 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// The conservative call rule: the result may hold any argument's
     /// regions (equal to them when it holds a `&mut`), and each `&mut`
     /// argument's target may receive every other argument's regions.
+    /// The closure contract over a closure value's slot vars: every
+    /// source outlives every other sink.
+    fn contract_edges(&mut self, roles: &[(bool, bool)], vars: &[u32]) {
+        for (i, &(src, _)) in roles.iter().enumerate() {
+            for (j, &(_, snk)) in roles.iter().enumerate() {
+                if src && snk && i != j
+                    && let (Some(&a), Some(&b)) = (vars.get(i), vars.get(j))
+                {
+                    self.edge(a, b);
+                }
+            }
+        }
+    }
+
+    /// Whether closure `def` returns a value with regions (W-BORROW: its
+    /// body's output may hold its captured sources).
+    fn closure_returns_regions(&mut self, def: DefId) -> bool {
+        match self.p.gx.closures.get(&def) {
+            Some(c) => self.sc.slots(c.output) > 0,
+            None => true,
+        }
+    }
+
+    /// Adds the captured sources of each closure inside `t` (laid out from
+    /// `*at` in `vars`) whose output has regions to `out`.
+    fn closure_sources(&mut self, t: Ty, vars: &[u32], at: &mut usize, out: &mut Vec<u32>) {
+        let n = self.sc.slots(t) as usize;
+        match self.body.tys.kind(t) {
+            TyKind::Closure(def, args) => {
+                if self.closure_returns_regions(def) {
+                    let mut roles = Vec::new();
+                    closure_roles(&mut self.sc, args, &mut roles);
+                    for (i, &(src, _)) in roles.iter().enumerate() {
+                        if src && let Some(&v) = vars.get(*at + i) {
+                            out.push(v);
+                        }
+                    }
+                }
+                *at += n;
+            }
+            TyKind::Ref(_, _, inner) => {
+                *at += 1;
+                self.closure_sources(inner, vars, at, out);
+            }
+            TyKind::Adt(_, args) => {
+                *at += adt_regions(self.p, &self.body.tys, t) as usize;
+                for g in self.body.tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.closure_sources(e, vars, at, out);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in self.body.tys.tys_of(ts).to_vec() {
+                    self.closure_sources(e, vars, at, out);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.closure_sources(e, vars, at, out),
+            _ => *at += n,
+        }
+    }
+
     fn call_opaque(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) {
         let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         if has_mut_ref(&self.body.tys, dt) {

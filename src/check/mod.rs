@@ -11661,8 +11661,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// Zonks the closure records into `Checked` and rejects the closure
-    /// forms outside this slice (ARCH 2.9): a return type holding a
-    /// reference, and closure types stored inside an Adt.
+    /// forms outside this slice (ARCH 2.9): closure types stored inside
+    /// an Adt. A closure that returns a reference is borrowck's (W-BORROW
+    /// closure contract).
     fn finish_closures(&mut self) {
         for mut c in std::mem::take(&mut self.closures) {
             // A signature nothing fixed is an annotation error (rustc
@@ -11684,10 +11685,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 cap.place_ty = self.zonk(cap.place_ty);
             }
             c.ty = self.zonk(c.ty);
-            if contains_ref(&self.tys, c.output) {
-                let span = self.span(c.expr);
-                self.err("L0820", span, "closures that return references are not supported yet", "Return an owned value from the closure.");
-            }
             self.out.closures.push(c);
         }
         if self.out.closures.is_empty() {

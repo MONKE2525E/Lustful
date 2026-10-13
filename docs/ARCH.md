@@ -2860,15 +2860,31 @@ The engine is rustc's NLL (`src/borrowck/regions.rs`):
    a declared or implied relation is L0733.
 
 Calls lust cannot read precisely (builtins, intrinsics,
-fn pointers, dyn calls, a signature it cannot pair) use the
+fn pointers, a signature it cannot pair) use the
 conservative rule: the result may hold every argument's
 regions (equal to them when it holds a `&mut`), and each
 `&mut` argument's target may receive every other
-argument's regions. Closures: at creation all capture
-slots form one class; the output joins the class; each
-argument slot is its own universal in the closure body
-(as if higher-ranked), so a closure that stores its
-argument is L0733.
+argument's regions. A dyn call instantiates the trait
+method's signature; a call of a trait impl method also
+instantiates the trait's (rustc checks calls against the
+trait item, and an impl may refine it). A callee's `T:
+'static` bound (and a struct's, for each local) makes the
+regions bound to `T` outlive `'static`.
+
+Closures follow a contract computed from their capture
+types (`closure_roles`): a shared capture `&'c T` makes
+`'c` and `T`'s regions sources; a mutable one `&'c mut T`
+makes `T`'s regions sources and sinks (`'c` neither: a
+captured `&mut` cannot escape); a by-value capture's
+regions are sources and sinks. In the closure body every
+capture slot, output slot, and argument slot is its own
+universal, and the facts are: each source outlives each
+other sink and each output slot. The creator adds the same
+source-to-sink edges, and every call's result (a direct
+call, or any call taking a closure that returns borrows,
+and iterator items through it) may hold the sources. Each
+argument slot is higher-ranked, so a closure that stores
+or returns its argument is L0733.
 
 Templates are checked with abstract type params. Instance
 bodies are borrow-checked too, without the universal
@@ -2932,8 +2948,9 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
 - L0731: any explicit lifetime turbofish arg (rustc also
   rejects it whenever the fn has a late-bound lifetime,
   E0794).
-- L0820: closures that return references (closure.rs), and
-  closure to fn pointer coercion.
+- L0820: closure to fn pointer coercion and closures stored
+  in Adts (closure.rs). A closure that returns a borrow of
+  its argument is L0733 (arguments are higher-ranked).
 - GATs (L0620), higher-ranked binders on bounds (L0203 at
   the parser), async (milestone 8b), as before.
 
@@ -2949,8 +2966,10 @@ Each case runs against rustc 1.99 in difftest.
 
 Known gaps: regions of body types other than `let`
 annotations (casts, turbofish, closure params); fn pointer and
-dyn regions; closure capture precision (one class) and
-expected closure signatures; `T: 'a`; Adt inferred outlives
+dyn regions; closure arguments are always higher-ranked
+(rustc takes free ones from an expected signature: an
+iterator's items); the closure contract's coarser
+source-to-sink edges; `T: 'a`; Adt inferred outlives
 facts (missing facts reject, never accept); precise
 builtin region signatures.
 
