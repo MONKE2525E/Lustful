@@ -227,13 +227,14 @@ mod tests {
         });
     }
 
-    /// `lust check` makes closure instances (they check closure bodies)
+    /// `lust check` makes closure body fns (they check closure bodies)
     /// but no generic fn instances; a build makes both (ARCH 4.1).
     #[test]
     fn check_mode_makes_no_generic_fn_instances() {
+        use crate::check::generics::FnClass;
         let src = "fn id<T>(t: T) -> T { t }\nfn main() { let f = |x: u8| x + 1; println!(\"{} {}\", id(5u8), f(1)); }\n";
-        let count = |p: &Program| p.gx.fn_class.iter().filter(|&&c| c == crate::check::generics::FnClass::Instance).count();
-        with_mode(src, true, |_, p| assert_eq!(count(p), 2));
-        with_mode(src, false, |_, p| assert_eq!(count(p), 1));
+        let count = |p: &Program, k: FnClass| p.gx.fn_class.iter().filter(|&&c| c == k).count();
+        with_mode(src, true, |_, p| assert_eq!((count(p, FnClass::Instance), count(p, FnClass::Closure)), (1, 1)));
+        with_mode(src, false, |_, p| assert_eq!((count(p, FnClass::Instance), count(p, FnClass::Closure)), (0, 1)));
     }
 }

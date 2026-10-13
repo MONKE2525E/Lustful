@@ -1553,9 +1553,9 @@ pub struct GenTables<'a> {
     /// The signature stub of each trait method (`add_trait_method_stubs`),
     /// by method def: the callee of calls a template's env proves.
     pub trait_method_stubs: FxMap<DefId, LocalDefId>,
-    /// False for `lust check`: materialize makes closure instances
-    /// only (a closure body's errors come from its instance check),
-    /// not instances of generic fns (see `materialize`).
+    /// False for `lust check`: materialize makes no instances of
+    /// generic fns (closure body fns are made either way; see
+    /// `materialize`).
     pub walk_instances: bool,
 }
 
@@ -3763,8 +3763,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // a generic fn instance only replays its template's
                 // checked resolutions, and its post-mono errors (the
                 // recursion limit) are a build's, as in rustc. Closure
-                // instances stay: they check the closure bodies.
-                if !p.gx.walk_instances && !p.gx.closure_fns.contains_key(&template) {
+                // body fns are not requests: `register_closures` makes
+                // them in both modes, so every closure body is checked.
+                if !p.gx.walk_instances {
                     continue;
                 }
                 if depth + 1 > crate::mono::MAX_INSTANCE_DEPTH {
