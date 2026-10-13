@@ -98,6 +98,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0731](L0731.md) | explicit lifetime arguments on a fn |
 | [L0733](L0733.md) | lifetime may not live long enough |
 | [L0734](L0734.md) | lifetime mismatch with the trait method |
+| [L0735](L0735.md) | closure is not general enough |
 | [L0801](L0801.md) | macro expansion hit a limit |
 | [L0802](L0802.md) | no macro with this name is in scope |
 | [L0803](L0803.md) | include file not found |

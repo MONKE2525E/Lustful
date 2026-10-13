@@ -1192,8 +1192,10 @@ pub(super) fn closure_arg_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, inp
 /// The argument slots of a closure, in slot order: its role (`None`:
 /// higher-ranked; see `closure_arg_roles`) and, for a slot its annotation
 /// names (`|x: &'a T|`), the enclosing fn's region it is: such a slot is
-/// free, and the creator ties it to that region. `Err` when an annotated
-/// type does not pair with the argument's erased type.
+/// free, and the creator ties it to that region. A `Region::Bound` slot
+/// (an elided lifetime written on a closure with no expected signature)
+/// is higher-ranked. `Err` when an annotated type does not pair with the
+/// argument's erased type.
 pub(super) fn closure_arg_slots<T: TyIntern>(
     sc: &mut SlotCx<'_, '_, '_, T>,
     c: &crate::check::generics::ClosureEntry,
@@ -1209,7 +1211,13 @@ pub(super) fn closure_arg_slots<T: TyIntern>(
             Some(r) => {
                 let start = named.len();
                 if !regioned_slots(sc, r, e, &mut named) || named.len() - start != n {
-                    return Err(());
+                    // An annotation that names no lifetime only marks
+                    // its elided ones: unpaired, it counts as unwritten.
+                    if names_region(sc.tys, r) {
+                        return Err(());
+                    }
+                    named.truncate(start);
+                    named.extend(std::iter::repeat_n(Region::Erased, n));
                 }
             }
             None => named.extend(std::iter::repeat_n(Region::Erased, n)),
@@ -1221,9 +1229,29 @@ pub(super) fn closure_arg_slots<T: TyIntern>(
         .zip(named)
         .map(|((r, fr), nr)| match nr {
             Region::Param(_) | Region::Static => (fr, Some(nr)),
+            // An elided lifetime in an annotation of a closure with no
+            // expected signature: the closure's own, higher-ranked.
+            Region::Bound(_) => (None, None),
             _ => (r, None),
         })
         .collect())
+}
+
+/// True when regioned type `r` names a lifetime (`'static` or a param).
+fn names_region(tys: &impl TyIntern, r: Ty) -> bool {
+    let named = |x: Region| matches!(x, Region::Static | Region::Param(_));
+    match tys.kind(r) {
+        TyKind::Ref(x, _, inner) => named(x) || names_region(tys, inner),
+        TyKind::Adt(_, args) => tys.args(args).iter().any(|g| match g {
+            GenericArg::Ty(t) => names_region(tys, *t),
+            GenericArg::Lifetime(x) => named(*x),
+            _ => false,
+        }),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&t| names_region(tys, t)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => names_region(tys, e),
+        TyKind::Dyn(_, x) => named(x),
+        _ => false,
+    }
 }
 
 /// The region a regioned type `r` gives each slot of erased type `e`, in
@@ -2730,6 +2758,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 let n = self.sc.slots(pt) as usize;
                 let range = at..(at + n).min(vars.len());
                 at += n;
+                // `filter(|x| ..)` takes `&Self::Item`: the method's own
+                // borrow, higher-ranked in its bound.
+                if k > 0 && by_ref_item(b) && n > 0 && arg_roles.get(range.start).is_some_and(|r| r.is_some()) {
+                    self.not_general_enough();
+                    continue;
+                }
                 let item_param = k > 0 && !cands.is_empty() && !(b == Some(crate::check::Builtin::IterFold) && pi == 0);
                 if item_param {
                     let want = cands[0].len();
@@ -3146,6 +3180,20 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let Some(c) = p.gx.closures.get(&def) else { return };
         let Ok(slots) = closure_arg_slots(&mut self.sc, c) else { return };
         let inputs = c.inputs.clone();
+        // A reference the bound writes is higher-ranked there: the callee
+        // may pass a borrow of its own data, so the closure must take any
+        // region in that slot (rustc: "not general enough").
+        let mut hr: Vec<bool> = Vec::with_capacity(slots.len());
+        for (i, &it) in inputs.iter().enumerate() {
+            match inputs_tmpl.get(i) {
+                Some(&t) => self.hr_slots(t, it, &mut hr),
+                None => hr.extend(std::iter::repeat_n(false, self.sc.slots(it) as usize)),
+            }
+        }
+        if hr.iter().zip(&slots).any(|(&h, (r, link))| h && (r.is_some() || link.is_some())) {
+            self.not_general_enough();
+            return;
+        }
         let mut paired = vec![false; vars.len()];
         let mut at_slot = 0usize;
         for (i, &it) in inputs.iter().enumerate() {
@@ -3179,6 +3227,52 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if slots.iter().enumerate().all(|(i, (r, _))| r.is_none() || paired.get(i) == Some(&true)) {
             self.bound_linked.push(def);
         }
+    }
+
+    /// Per slot of a closure input's erased type `t`: whether the bound's
+    /// input type `tmpl` (over the callee's params) makes it higher-ranked.
+    /// A type param or projection there is the call's instantiation (free);
+    /// any other region the bound writes is its own (elided in `Fn(&T)`
+    /// sugar, so higher-ranked; a named one is taken as higher-ranked too,
+    /// which only rejects more).
+    fn hr_slots(&mut self, tmpl: Ty, t: Ty, out: &mut Vec<bool>) {
+        let p = self.p;
+        let n = self.sc.slots(t) as usize;
+        match (p.tys.kind(tmpl), self.body.tys.kind(t)) {
+            (TyKind::Param(_) | TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(false, n)),
+            (TyKind::Ref(_, _, ti), TyKind::Ref(_, _, ei)) => {
+                out.push(true);
+                self.hr_slots(ti, ei, out);
+            }
+            (TyKind::Adt(_, ta), TyKind::Adt(_, ea)) if p.tys.args(ta).len() == self.body.tys.args(ea).len() => {
+                out.extend(std::iter::repeat_n(true, adt_regions(p, &self.body.tys, t) as usize));
+                let pairs: Vec<(GenericArg, GenericArg)> = p.tys.args(ta).iter().copied().zip(self.body.tys.args(ea).iter().copied()).collect();
+                for (a, b) in pairs {
+                    if let (Some(a), Some(b)) = (a.as_ty(), b.as_ty()) {
+                        self.hr_slots(a, b, out);
+                    }
+                }
+            }
+            (TyKind::Tuple(ta), TyKind::Tuple(ea)) if p.tys.tys_of(ta).len() == self.body.tys.tys_of(ea).len() => {
+                let pairs: Vec<(Ty, Ty)> = p.tys.tys_of(ta).iter().copied().zip(self.body.tys.tys_of(ea).iter().copied()).collect();
+                for (a, b) in pairs {
+                    self.hr_slots(a, b, out);
+                }
+            }
+            (TyKind::Array(a, _) | TyKind::Slice(a), TyKind::Array(b, _) | TyKind::Slice(b)) => self.hr_slots(a, b, out),
+            _ => out.extend(std::iter::repeat_n(true, n)),
+        }
+    }
+
+    /// L0735: a closure whose argument lifetime is free (inferred, or named
+    /// by an annotation) where the callee's bound is higher-ranked.
+    fn not_general_enough(&mut self) {
+        self.errs.push(Diag::new(
+            "L0735",
+            self.span,
+            "this closure is not general enough for the bound it is passed to: its argument lifetime is fixed, but the callee may pass a borrow of its own data",
+            "Annotate the parameter with an elided lifetime (`|x: &T|`), or pass the closure where it is written.",
+        ));
     }
 
     /// The `X: 'static` where-clauses of the impls of `trait_def` whose Self
@@ -3474,6 +3568,13 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecSplitOff
             | B::SliceToVec
     )
+}
+
+/// The iterator methods whose closure takes `&Self::Item` (check/iter.rs
+/// `fn_mut_param_ref`): its outer reference is higher-ranked.
+fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
+    use crate::check::Builtin as B;
+    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey))
 }
 
 /// The builtin iterator calls whose result is an item (or a collection

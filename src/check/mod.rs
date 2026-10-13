@@ -3549,7 +3549,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// a reject (L0203).
     fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId) {
         let p = self.p;
-        let Some(r) = self.regioned_annotation(t) else { return };
+        let Some(r) = self.regioned_annotation(t, Region::Erased, true) else { return };
         if !self.annotate_pat(pat, r) {
             let s = p.ast.pat_span(pat);
             self.err(
@@ -3565,15 +3565,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `'static` and the fn's named lifetimes keep their regions, elided
     /// ones are free (`Region::Erased`). None after reporting `_` inside
     /// the annotation (no region form without inference, L0203).
-    fn regioned_annotation(&mut self, t: ast::TyId) -> Option<Ty> {
+    fn regioned_annotation(&mut self, t: ast::TyId, elided: Region, report: bool) -> Option<Ty> {
         let p = self.p;
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let mut sc = self.body_scope.clone();
         sc.annotation = true;
         sc.infer_cell = None;
-        sc.regions = generics::RegionMode::Keep { next: None, elided: Some(Region::Erased) };
+        sc.regions = generics::RegionMode::Keep { next: None, elided: Some(elided) };
         match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &sc) {
             Ok(r) => Some(r),
+            Err(_) if !report => None,
             Err(_) => {
                 let s = p.ast.ty_span(t);
                 self.err("L0203", s, "an explicit lifetime in a type annotation with `_` is not supported yet", "Write the full type, or drop the lifetime.");

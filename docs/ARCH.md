@@ -2923,7 +2923,13 @@ input that is a type param (`&T`: past its outer
 reference) is equated with that param's instantiation at
 the call (found through the type `F` binds, so a mono
 instance pairs like its template); a closure no bound
-pairs links like an iterator method's. A
+pairs links like an iterator method's. Unannotated
+parameters of a closure with no expected signature (a `let`
+closure) are free too, as rustc infers them: a direct call's
+arguments flow into them. A free or named argument slot
+where a bound or an iterator method is higher-ranked (`F:
+Fn(&T)`, `filter`'s `&Self::Item`) is L0735 (rustc: "not
+general enough"). A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
 fn: free in the body, tied to it by the creator, and a
@@ -2986,7 +2992,7 @@ reserved or duplicate names; L0110 lifetime arity (E0107),
 unused lifetime param (E0392), unconstrained impl lifetime
 in an associated type (E0207), early-bound fn item to fn
 pointer (E0308); L0306/L0307/L0303/L0312 loan conflicts;
-L0733; L0734.
+L0733; L0734; L0735.
 
 Stated subset cuts (valid Rust lust rejects, tests/reject):
 

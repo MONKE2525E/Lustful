@@ -62,14 +62,18 @@ pub struct ClosureInfo {
     pub captures: Vec<Capture>,
     /// The closure's own type, `Closure(def, env field types)`.
     pub ty: Ty,
-    /// W-BORROW: `Some` when an iterator method takes this closure, so
-    /// its argument regions are the items' (free, not higher-ranked);
-    /// per argument, true when it is `&item` (that outer reference is
-    /// higher-ranked). `None`: every argument region is higher-ranked.
+    /// W-BORROW: `Some` when an iterator method or a bound over a type
+    /// param takes this closure, or it has no expected signature, so its
+    /// argument regions are free (the items', the param's, inferred), not
+    /// higher-ranked; per argument, true when it is `&item` (that outer
+    /// reference is higher-ranked). `None`: every argument region is
+    /// higher-ranked.
     pub free_args: Option<Vec<bool>>,
     /// W-BORROW: per argument, its annotation's regioned type when it
     /// names a lifetime (`|x: &'a T|`: the enclosing fn's `'a`, a free
-    /// region the creator ties to that universal).
+    /// region the creator ties to that universal), or for any annotation
+    /// of a closure with no expected signature (its elided lifetimes are
+    /// `Region::Bound`: higher-ranked).
     pub input_regions: Vec<Option<Ty>>,
     /// W-BORROW: the return annotation's regioned type when it names a
     /// lifetime (only `'static` is supported there).
@@ -218,6 +222,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => None,
         });
         let sig = self.expected_closure_sig(expected);
+        // W-BORROW: with no expected signature (a `let` closure), rustc
+        // infers unannotated parameters' regions as free regions of the
+        // enclosing fn, one per slot for every call, while an elided
+        // lifetime in an annotation is the closure's own (higher-ranked:
+        // `Region::Bound` in `input_regions`).
+        let no_sig = sig.is_none();
+        let free_args = free_args.or_else(|| (no_sig && !params.is_empty()).then(|| vec![false; params.len()]));
         let expected_inputs: Option<Vec<Ty>> = sig.and_then(|(tup, _)| {
             let tup = self.deep(tup);
             match self.kind(tup) {
@@ -255,7 +266,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "Drop the lifetime from the annotation: the bound decides it.",
                 );
             }
-            input_regions.push(if named { prm.ty.and_then(|w| self.regioned_annotation(w)) } else { None });
+            // An unnamed annotation that does not resolve here (`Vec<_>`)
+            // counts as unannotated: free, as rustc infers `_`.
+            let elided = if no_sig { Region::Bound(0) } else { Region::Erased };
+            input_regions.push(if named || no_sig { prm.ty.and_then(|w| self.regioned_annotation(w, elided, named)) } else { None });
             let t = match (prm.ty, exp) {
                 (Some(w), exp) => {
                     let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
@@ -282,7 +296,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (Some(w), exp) => {
                 let named = generics::names_lifetime(self.p.ast, self.p.interner, w);
                 if named {
-                    output_region = self.regioned_annotation(w);
+                    output_region = self.regioned_annotation(w, Region::Erased, true);
                     let mut rs = Vec::new();
                     if let Some(r) = output_region {
                         crate::borrowck::regions_of(&self.tys, r, &mut rs);
