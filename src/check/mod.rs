@@ -225,6 +225,12 @@ pub enum Res {
     Static(u32),
     /// A compile-time usize constant: `size_of`, `align_of`, `offset_of!`.
     ConstUsize(u64),
+    /// `size_of_val` of an unsized value (`[T]` or `str`): the length
+    /// builtin for the argument times the element size (1 for `str`).
+    SizeOfVal {
+        len: Builtin,
+        elem: u64,
+    },
     /// A binary operator through an operator trait: the trait
     /// method to call (a template until mono rewrites it through
     /// `Checked::generic_args`), with operand deref counts.
@@ -3439,11 +3445,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     },
                     _ => false,
                 };
+                // A reference-to-reference cast is a coercion cast in
+                // rustc (`&[T; N] as &[T]`, `&mut T as &T`, `&Vec<T> as
+                // &[T]`): it holds exactly when the coercion does. The
+                // probe rolls back on failure so the cast error below
+                // is the only diagnostic.
+                let ref_cast = matches!((self.kind(t), self.kind(target)), (TyKind::Ref(..), TyKind::Ref(..))) && {
+                    let snap = self.snapshot_vars();
+                    let obl_len = self.obl_len();
+                    let err_len = self.errs.len();
+                    if self.coerce_at(t, target, span, Some(*expr)) {
+                        true
+                    } else {
+                        self.rollback_vars(snap);
+                        self.obl_truncate(obl_len);
+                        self.errs.truncate(err_len);
+                        false
+                    }
+                };
                 // The `as` table rustc enforces (E0054, E0604, E0606): bool
                 // and char never cast to a float, only `u8` casts to char,
                 // nothing casts to bool, a fieldless enum casts only to an
                 // integer. A same-kind cast (`bool as bool`) is fine.
-                let ok = fn_cast || match (self.kind(t), self.kind(target)) {
+                let ok = fn_cast || ref_cast || match (self.kind(t), self.kind(target)) {
                     // An integer of unknown type stays open: later uses decide it (default i32).
                     (k, TyKind::Int(_)) if k.is_int_infer() => true,
                     (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
@@ -4649,7 +4673,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // each instance answers with its own (the template body is
         // never generated). A const context still needs the number,
         // and its evaluator rejects the param (`ConstCx::layout`).
+        // The placeholder still needs rustc's `T: Sized` requirement:
+        // `size_of::<T>()` with only `T: ?Sized` in the env rejects.
         if self.is_template_check() && self.tys.flags(t).contains_param() {
+            if !self.sized_ok(t) {
+                let tn = self.tn(t);
+                self.err(
+                    "L0110",
+                    span,
+                    format!("the size for values of type `{tn}` cannot be known"),
+                    "Add a `Sized` bound, or use `size_of_val` on a reference.",
+                );
+            }
             return Res::ConstUsize(0);
         }
         match crate::ty::layout::layout_of_ty(&self.tys, p, t) {
@@ -5115,19 +5150,47 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 let inner = self.deep(inner);
                 p.record_layout_reads(&mut self.out.reads, &self.tys, inner);
+                // A template check has no layout for a type over its
+                // params (`size_of_val(t)` with `T: ?Sized` included);
+                // each instance answers with its own, as in
+                // `layout_query`. No Sized proof is needed here.
+                if self.is_template_check() && self.tys.flags(inner).contains_param() {
+                    self.set_res(e, Res::ConstUsize(0));
+                    return USIZE;
+                }
                 return match crate::ty::layout::layout_of_ty(&self.tys, p, inner) {
                     Ok(l) => {
                         self.set_res(e, Res::ConstUsize(l.size));
                         USIZE
                     }
                     Err(()) => {
-                        self.err(
-                            "L0652",
-                            span,
-                            format!("unsupported layout form: `{}`", self.tn(inner)),
-                            "Use a type inside the supported layout grammar.",
-                        );
-                        ERROR
+                        // Unsized tails with a runtime length: a slice
+                        // is `len * size_of::<elem>()`, a `str` is its
+                        // byte length. Other unsized forms (a generic
+                        // Adt with an unsized last field, `dyn`) stay
+                        // the layout reject.
+                        let tail = match self.kind(inner) {
+                            TyKind::Slice(elem) => {
+                                crate::ty::layout::layout_of_ty(&self.tys, p, elem).ok().map(|l| (Builtin::SliceLen, l.size))
+                            }
+                            TyKind::Str => Some((Builtin::StrLen, 1)),
+                            _ => None,
+                        };
+                        match tail {
+                            Some((len, elem)) => {
+                                self.set_res(e, Res::SizeOfVal { len, elem });
+                                USIZE
+                            }
+                            None => {
+                                self.err(
+                                    "L0652",
+                                    span,
+                                    format!("unsupported layout form: `{}`", self.tn(inner)),
+                                    "Use a type inside the supported layout grammar.",
+                                );
+                                ERROR
+                            }
+                        }
                     }
                 };
             }

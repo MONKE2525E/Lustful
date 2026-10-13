@@ -2384,15 +2384,19 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             if ok_path {
                 let args = segs[segs.len() - 1].type_args();
                 if args.len() == 1 {
-                    let t = resolve_ty(
+                    // Scoped resolution, not the plain one: the queried
+                    // type can apply a generic Adt (`size_of::<W<u32>>()`),
+                    // whose arguments the plain resolver rejects. A const
+                    // context has no params in scope here.
+                    let cx = self.p.gx.resolve_cx(&self.p.type_names, &self.p.aliases);
+                    let t = crate::check::generics::resolve_scoped(
                         self.p.ast,
                         self.p.interner,
                         self.p.known,
-                        &self.p.type_names,
-                        &self.p.aliases,
+                        &cx,
                         &mut self.p.tys,
                         args[0],
-                        None,
+                        &crate::check::generics::Scope::default(),
                     )
                     .unwrap_or(ERROR);
                     return if ltext == "size_of" { CallTarget::SizeOf(t) } else { CallTarget::AlignOf(t) };

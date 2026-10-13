@@ -665,31 +665,70 @@ pub trait AdtShapes {
 }
 
 /// The layout of a semantic type. `Err(())` means the type is outside the
-/// supported-shape grammar of 4.4 (unsized, a generic parameter, an unknown
-/// Adt such as `Box` before its wave, a user union, and so on).
+/// supported-shape grammar of 4.4 (unsized, a generic parameter with no
+/// argument in scope, an unknown Adt such as `Box` before its wave, a user
+/// union, and so on). A generic Adt is laid out from its shape with the
+/// application's arguments bound to the Adt's params (a frame below), so
+/// `W<u64>` gets its own layout with no substituted type built.
 pub fn layout_of_ty(tys: &impl TyIntern, shapes: &impl AdtShapes, t: Ty) -> Result<Layout, ()> {
-    let mut memo: Vec<(Ty, Option<Layout>)> = Vec::new();
-    let mut active: Vec<Ty> = Vec::new();
-    go(tys, shapes, t, &mut memo, &mut active)
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut memo: Vec<((Ty, Option<usize>), Option<Layout>)> = Vec::new();
+    let mut active: Vec<(Ty, Option<usize>)> = Vec::new();
+    go(tys, shapes, t, None, &mut frames, &mut memo, &mut active)
+}
+
+/// One generic application's arguments, each paired with the frame its
+/// params read in (the frame of the type that wrote the application).
+type Frame = Vec<(super::GenericArg, Option<usize>)>;
+
+/// Follows `Param` links through frames to the first non-param type,
+/// with the frame that type reads in.
+fn peel_param(tys: &impl TyIntern, mut t: Ty, mut env: Option<usize>, frames: &[Frame]) -> (Ty, Option<usize>) {
+    while let TyKind::Param(p) = tys.kind(t) {
+        let Some(f) = env.and_then(|f| frames.get(f)) else { break };
+        let Some(&(arg, aenv)) = f.get(p.0 as usize) else { break };
+        let Some(u) = arg.as_ty() else { break };
+        t = u;
+        env = aenv;
+    }
+    (t, env)
+}
+
+/// An array length through frames: a const param reads its argument.
+fn const_len(tys: &impl TyIntern, mut c: super::ConstId, mut env: Option<usize>, frames: &[Frame]) -> Option<u64> {
+    loop {
+        match tys.const_kind(c) {
+            super::ConstKind::Int(n) => return u64::try_from(n).ok(),
+            super::ConstKind::Param(i) => {
+                let &(arg, aenv) = frames.get(env?)?.get(i as usize)?;
+                let super::GenericArg::Const(c2) = arg else { return None };
+                c = c2;
+                env = aenv;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn go(
     tys: &impl TyIntern,
     shapes: &impl AdtShapes,
     t: Ty,
-    memo: &mut Vec<(Ty, Option<Layout>)>,
-    active: &mut Vec<Ty>,
+    env: Option<usize>,
+    frames: &mut Vec<Frame>,
+    memo: &mut Vec<((Ty, Option<usize>), Option<Layout>)>,
+    active: &mut Vec<(Ty, Option<usize>)>,
 ) -> Result<Layout, ()> {
-    if let Some((_, l)) = memo.iter().find(|(m, _)| *m == t) {
+    if let Some((_, l)) = memo.iter().find(|(m, _)| *m == (t, env)) {
         return l.clone().ok_or(());
     }
-    if active.contains(&t) {
+    if active.contains(&(t, env)) {
         return Err(()); // Recursive type without indirection: collect rejects it first.
     }
-    active.push(t);
-    let r = compute(tys, shapes, t, memo, active);
+    active.push((t, env));
+    let r = compute(tys, shapes, t, env, frames, memo, active);
     active.pop();
-    memo.push((t, r.as_ref().ok().cloned()));
+    memo.push(((t, env), r.as_ref().ok().cloned()));
     r
 }
 
@@ -697,16 +736,25 @@ fn compute(
     tys: &impl TyIntern,
     shapes: &impl AdtShapes,
     t: Ty,
-    memo: &mut Vec<(Ty, Option<Layout>)>,
-    active: &mut Vec<Ty>,
+    env: Option<usize>,
+    frames: &mut Vec<Frame>,
+    memo: &mut Vec<((Ty, Option<usize>), Option<Layout>)>,
+    active: &mut Vec<(Ty, Option<usize>)>,
 ) -> Result<Layout, ()> {
     match tys.kind(t) {
+        TyKind::Param(_) => {
+            let (u, uenv) = peel_param(tys, t, env, frames);
+            if u == t {
+                return Err(()); // No argument in scope: the caller (a template check) owns the placeholder.
+            }
+            go(tys, shapes, u, uenv, frames, memo, active)
+        }
         TyKind::Unit | TyKind::Never => Ok(zst_layout(1)),
         TyKind::Bool => Ok(bool_layout()),
         TyKind::Char => Ok(char_layout()),
         TyKind::Int(i) => Ok(int_layout(i)),
         TyKind::Float(f) => Ok(float_layout(f)),
-        TyKind::Ref(_, _, e) => match tys.kind(e) {
+        TyKind::Ref(_, _, e) => match tys.kind(peel_param(tys, e, env, frames).0) {
             TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => Ok(fat_ptr_layout()),
             _ => Ok(ptr_layout()),
         },
@@ -714,18 +762,15 @@ fn compute(
         TyKind::FnPtr(_) => Ok(ptr_layout()),
         TyKind::FnDef(..) | TyKind::Closure(..) => Ok(zst_layout(1)),
         TyKind::Array(e, c) => {
-            let len = match tys.const_kind(c) {
-                super::ConstKind::Int(n) => u64::try_from(n).map_err(|_| ())?,
-                _ => return Err(()),
-            };
-            let el = go(tys, shapes, e, memo, active)?;
+            let len = const_len(tys, c, env, frames).ok_or(())?;
+            let el = go(tys, shapes, e, env, frames, memo, active)?;
             array_layout(&el, len)
         }
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = tys.tys_of(ts).to_vec();
             let mut fields = Vec::with_capacity(elems.len());
             for e in elems {
-                fields.push(go(tys, shapes, e, memo, active)?);
+                fields.push(go(tys, shapes, e, env, frames, memo, active)?);
             }
             tuple_layout(&fields)
         }
@@ -736,29 +781,33 @@ fn compute(
             }
             Some(BuiltinTy::Option) => {
                 let e = tys.adt_first_ty_arg(t).ok_or(())?;
-                let el = go(tys, shapes, e, memo, active)?;
+                let el = go(tys, shapes, e, env, frames, memo, active)?;
                 enum_layout(&[vec![], vec![el]], &[0, 1], Repr::default())
             }
             Some(BuiltinTy::Result) => {
                 let (ok_t, err_t) = tys.result_args(t).ok_or(())?;
-                let ok_l = go(tys, shapes, ok_t, memo, active)?;
-                let err_l = go(tys, shapes, err_t, memo, active)?;
+                let ok_l = go(tys, shapes, ok_t, env, frames, memo, active)?;
+                let err_l = go(tys, shapes, err_t, env, frames, memo, active)?;
                 enum_layout(&[vec![ok_l], vec![err_l]], &[0, 1], Repr::default())
             }
             Some(_) => Err(()),
             None => {
                 let id = tys.local_adt(t).ok_or(())?;
                 let shape = shapes.adt_shape(id).ok_or(())?;
-                // Generic Adts reach layout only after substitution; an Adt
-                // with type arguments has no shape entry yet in this wave.
-                if !tys.args(tys.adt_parts(t).map(|p| p.1).ok_or(())?).is_empty() {
-                    return Err(());
-                }
+                // The shape's field types read in a new frame that binds
+                // the Adt's params to this application's arguments.
+                let args: Vec<super::GenericArg> = tys.adt_parts(t).map(|p| tys.args(p.1).to_vec()).ok_or(())?;
+                let frame = if args.is_empty() {
+                    None
+                } else {
+                    frames.push(args.into_iter().map(|g| (g, env)).collect());
+                    Some(frames.len() - 1)
+                };
                 let mut variants = Vec::with_capacity(shape.variants.len());
                 for v in &shape.variants {
                     let mut fields = Vec::with_capacity(v.len());
                     for &f in v {
-                        fields.push(go(tys, shapes, f, memo, active)?);
+                        fields.push(go(tys, shapes, f, frame, frames, memo, active)?);
                     }
                     variants.push(fields);
                 }

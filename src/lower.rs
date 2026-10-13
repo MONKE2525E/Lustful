@@ -683,6 +683,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                     Res::ConstUsize(v) => {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
+                    Res::SizeOfVal { len, elem } => {
+                        if elem == 1 {
+                            let d = self.call_dest(dest, ty);
+                            self.call_into(CallTarget::Builtin(len), ops, d, span);
+                        } else {
+                            let t = self.temp(ty);
+                            self.call_into(CallTarget::Builtin(len), ops, Place::local(t), span);
+                            self.set_or_temp(
+                                dest,
+                                Rvalue::Bin(BinOp::Mul, Operand::Copy(Place::local(t)), Operand::Const(Const::Int(elem as u128, IntTy::Usize))),
+                                ty,
+                                span,
+                            );
+                        }
+                    }
                     Res::FromCast => self.set_or_temp(dest, Rvalue::Cast(ops.into_iter().next().unwrap(), ty), ty, span),
                     Res::DefaultVal => {
                         let zero = match self.kind(ty) {
@@ -743,7 +758,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                     // A cast to a fn pointer already holds the pointer
                     // value (the coercion on the inner expression made
                     // the trampoline, or it was a fn pointer already).
-                    if matches!(self.kind(ty), TyKind::FnPtr(_)) {
+                    // A reference cast is the same: the coercion on the
+                    // inner expression already built the target value.
+                    if matches!(self.kind(ty), TyKind::FnPtr(_) | TyKind::Ref(..)) {
                         self.assign(d.clone(), Rvalue::Use(o), span);
                     } else {
                         self.assign(d.clone(), Rvalue::Cast(o, ty), span);
