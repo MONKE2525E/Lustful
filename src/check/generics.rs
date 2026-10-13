@@ -1972,11 +1972,14 @@ pub fn body_env(tys: &mut impl TyIntern, index: &ImplIndex, written: &[Predicate
     env
 }
 
-/// True for rustc's global predicate: not higher-ranked, and no type
-/// or const parameter anywhere in it (args and bindings). Regions do
-/// not count: selection erases them, and the subset has no named
-/// lifetime parameters. Outlives predicates are never global here:
-/// they pick no callee, and region checks read them.
+/// True for a predicate lust treats as global: not higher-ranked, and
+/// no type or const parameter anywhere in it (args and bindings). That
+/// is rustc's global predicate, plus predicates over lifetime
+/// parameters only (`where &'a A: Tr`): selection erases regions, so
+/// the impl is the callee either way. The impl's region bounds then
+/// apply in the body, where rustc leaves them to callers: stricter,
+/// so a reject, never a wrong accept. Outlives predicates are never
+/// global here: they pick no callee, and region checks read them.
 pub fn is_global_pred(tys: &impl TyIntern, pred: &Predicate) -> bool {
     let ty_free = |t: Ty| !tys.flags(t).contains_param();
     let args_free = |a: ArgsId| {
