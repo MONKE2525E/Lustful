@@ -157,8 +157,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
             let _ = writeln!(body, "  {}", builder_list("p->len", &format!("&(({et}*)p->ptr)[i]"), e, need));
         }
         // std's cell types (W-STD-A): `Weak` prints `(Weak)`, `Cell<T:
-        // Copy>` and `RefCell` a struct of their value, and a mutably
-        // borrowed RefCell `<borrowed>` (its try_borrow fails).
+        // Copy>` and `RefCell` a struct of their value.
         CTy::Weak(_) => {
             let _ = writeln!(body, "  return lust_f_write_str(f, {});", lit("(Weak)"));
         }
@@ -174,17 +173,29 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
             );
         }
         CTy::Cell(e) => {
-            let _ = writeln!(body, "  {}", builder_fields("Cell", true, &[("value".to_string(), "p".to_string(), (**e).clone())], need));
+            // Rust formats a copy (`self.get()`), so a Debug impl that
+            // sets the cell does not change what it prints.
+            let _ = writeln!(body, "  {} v = *p;", ctype(e));
+            let _ = writeln!(body, "  {}", builder_fields("Cell", true, &[("value".to_string(), "(&v)".to_string(), (**e).clone())], need));
         }
+        // RefCell: Rust's try_borrow. A failed one prints `<borrowed>`;
+        // else the shared borrow is held while the value formats, so a
+        // Debug impl that borrows the cell mutably panics.
         CTy::RefCell(e) => {
             let _ = writeln!(
                 body,
-                "  if (p->f0 < 0) {{ lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_write_str(w, {})); return lust_dstruct_finish(&b); }}",
+                "  if (p->f0 < 0 || p->f0 == 0x7fffffffffffffffLL) {{ lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_write_str(w, {})); return lust_dstruct_finish(&b); }}",
                 lit("RefCell"),
                 lit("value"),
                 lit("<borrowed>")
             );
-            let _ = writeln!(body, "  {}", builder_fields("RefCell", true, &[("value".to_string(), "&p->f1".to_string(), (**e).clone())], need));
+            let v = fmt_expr(e, FmtKind::Debug, "w", "(&p->f1)", need);
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; int r; p->f0++; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {v}); r = lust_dstruct_finish(&b); p->f0--; return r; }}",
+                lit("RefCell"),
+                lit("value")
+            );
         }
         CTy::Adt(a) => {
             if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots) {
