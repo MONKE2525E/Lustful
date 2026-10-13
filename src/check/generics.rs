@@ -1267,6 +1267,16 @@ pub fn build_generics_shifted(
         match p {
             ast::GenericParam::Lifetime { lt, .. } => errs.push(lifetime_diag(lt.span)),
             ast::GenericParam::Type { name, span, default, .. } => {
+                // One name, one parameter in a list (rustc E0403). Type and
+                // const parameters share the list's namespace; lifetimes do not.
+                if params.iter().any(|q| q.name == *name) {
+                    errs.push(Diag::new(
+                        "L0106",
+                        *span,
+                        format!("the parameter `{}` is already used for a parameter of an enclosing item", interner.get(*name)),
+                        "Rename one of the parameters.",
+                    ));
+                }
                 if default.is_some() {
                     errs.push(not_yet("L0614", *span, "generic parameter defaults"));
                 }
@@ -1275,6 +1285,14 @@ pub fn build_generics_shifted(
                 params.push(ParamDef { name: *name, kind: ParamKind::Type, span: *span });
             }
             ast::GenericParam::Const { name, span, ty, default, .. } => {
+                if params.iter().any(|q| q.name == *name) {
+                    errs.push(Diag::new(
+                        "L0106",
+                        *span,
+                        format!("the parameter `{}` is already used for a parameter of an enclosing item", interner.get(*name)),
+                        "Rename one of the parameters.",
+                    ));
+                }
                 if default.is_some() {
                     errs.push(not_yet("L0614", *span, "generic parameter defaults"));
                 }
@@ -1671,23 +1689,58 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
         let ordinal = ordinals.get(&tdef.name).copied().unwrap_or(0);
         ordinals.insert(tdef.name, ordinal + 1);
         let def = trait_def_id(p, p.interner, tdef.name, ordinal);
-        if p.gx.trait_names.insert(tdef.name, def).is_some() {
+        // The first trait of a name owns it. A duplicate gets no record and
+        // no name entry, so later passes never look its items up in the
+        // first trait's record (that lookup used to panic).
+        if p.gx.trait_names.contains_key(&tdef.name) {
             errs.push(Diag::new(
                 "L0106",
                 tdef.name_span,
                 format!("`{}` is defined more than once", p.display_name(tdef.name)),
                 "Rename one of the definitions.",
             ));
+            continue;
         }
+        p.gx.trait_names.insert(tdef.name, def);
+        // Associated items: types live in the type namespace, consts and
+        // methods in the value namespace. A second item of one name in one
+        // namespace is a duplicate (rustc E0428) and joins no record.
         let mut assoc_items: Vec<(DefId, Sym, bool)> = Vec::new();
         for at in &tdef.types {
+            if assoc_items.iter().any(|&(_, n, is_ty)| is_ty && n == at.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    at.name_span,
+                    format!("`{}` is defined more than once", p.display_name(at.name)),
+                    "Rename one of the definitions.",
+                ));
+                continue;
+            }
             assoc_items.push((child_def_id(p.krate, def, p.interner, at.name, crate::def::DefKind::Assoc), at.name, true));
         }
         for ac in &tdef.consts {
+            if assoc_items.iter().any(|&(_, n, is_ty)| !is_ty && n == ac.name) || tdef.fns.iter().any(|f| f.name == ac.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    ac.name_span,
+                    format!("`{}` is defined more than once", p.display_name(ac.name)),
+                    "Rename one of the definitions.",
+                ));
+                continue;
+            }
             assoc_items.push((child_def_id(p.krate, def, p.interner, ac.name, crate::def::DefKind::Assoc), ac.name, false));
         }
         let mut methods: Vec<(DefId, Sym)> = Vec::new();
         for f in &tdef.fns {
+            if methods.iter().any(|&(_, n)| n == f.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    f.name_span,
+                    format!("`{}` is defined more than once", p.display_name(f.name)),
+                    "Rename one of the definitions.",
+                ));
+                continue;
+            }
             methods.push((child_def_id(p.krate, def, p.interner, f.name, crate::def::DefKind::Method), f.name));
         }
         // Placeholder generics with the right parameter count, so
@@ -1697,8 +1750,8 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
         for _ in 0..=ast_param_count(&tdef.generics) {
             placeholder.params.push(ParamDef { name: tdef.name, kind: ParamKind::Type, span: tdef.name_span });
         }
-        for f in &tdef.fns {
-            p.gx.traits_by_method.entry(f.name).or_default().push(def);
+        for &(_, mname) in &methods {
+            p.gx.traits_by_method.entry(mname).or_default().push(def);
         }
         p.gx.index.insert_trait(TraitRecord {
             def,
@@ -1868,13 +1921,24 @@ pub fn ref_field_ok(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
 /// Runs after Adt names exist (signatures name Adts) and before
 /// fields and fns resolve (bounds name traits).
 pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
+    // Only the first trait of a name is built: a duplicate was reported in
+    // pass 0 and owns no record, so building it would look its methods up in
+    // the first trait's record.
+    let mut seen_traits: Vec<Sym> = Vec::new();
     let trait_items: Vec<(usize, DefId)> = p
         .ast
         .items
         .iter()
         .enumerate()
         .filter_map(|(i, item)| match &item.kind {
-            ast::ItemKind::Trait(tdef) => p.gx.trait_names.get(&tdef.name).map(|&d| (i, d)),
+            ast::ItemKind::Trait(tdef) => {
+                if seen_traits.contains(&tdef.name) {
+                    None
+                } else {
+                    seen_traits.push(tdef.name);
+                    p.gx.trait_names.get(&tdef.name).map(|&d| (i, d))
+                }
+            }
             _ => None,
         })
         .collect();
@@ -1914,12 +1978,10 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
         // Associated types: bounds become predicates on the
         // projection; defaults resolve under the trait scope.
         let assoc_defs: Vec<(usize, DefId)> = {
-            let rec = p.gx.index.trait_record(trait_def).unwrap();
-            tdef.types
-                .iter()
-                .enumerate()
-                .map(|(i, at)| (i, rec.assoc_by_name(at.name).expect("assoc defs were recorded in pass 0")))
-                .collect()
+            // A name with no record entry is a duplicate dropped in pass 0;
+            // it was already reported there, so skip it here.
+            let Some(rec) = p.gx.index.trait_record(trait_def) else { continue };
+            tdef.types.iter().enumerate().filter_map(|(i, at)| rec.assoc_by_name(at.name).map(|d| (i, d))).collect()
         };
         for (at_i, assoc_def) in assoc_defs {
             let ast::ItemKind::Trait(tdef) = &p.ast.items[item_i].kind else { unreachable!() };
@@ -1987,11 +2049,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
         };
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
         for fn_i in 0..fn_count {
-            let (fdef, method_def) = {
+            let Some((fdef, method_def)) = ({
                 let ast::ItemKind::Trait(tdef) = &p.ast.items[item_i].kind else { unreachable!() };
                 let f = &tdef.fns[fn_i];
-                let rec = p.gx.index.trait_record(trait_def).unwrap();
-                (f, rec.method_by_name(f.name).expect("method defs were recorded in pass 0"))
+                // No record entry means a duplicate dropped in pass 0.
+                p.gx.index.trait_record(trait_def).and_then(|rec| rec.method_by_name(f.name)).map(|d| (f, d))
+            }) else {
+                continue;
             };
             let shift = generics.params.len() as u32;
             let (own_generics, own_scope) = {
@@ -2001,9 +2065,10 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let mut combined = generics.clone();
             combined.params.extend(own_generics.params.iter().cloned());
             combined.predicates.extend(own_generics.predicates.iter().copied());
-            // No shadowing of the trait's parameters (E0403).
-            for (i, param) in combined.params.iter().enumerate() {
-                if combined.params[..i].iter().any(|q| q.name == param.name) {
+            // No shadowing of the trait's parameters (E0403). Duplicates
+            // inside one list are reported by `build_generics_shifted`.
+            for param in &own_generics.params {
+                if generics.params.iter().any(|q| q.name == param.name) {
                     errs.push(Diag::new(
                         "L0106",
                         param.span,
@@ -2038,7 +2103,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
         }
         // Replace the placeholder record with the full one.
         {
-            let old = p.gx.index.trait_record(trait_def).unwrap().clone();
+            let Some(old) = p.gx.index.trait_record(trait_def).cloned() else { continue };
             p.gx.index.insert_trait(TraitRecord { generics: generics.clone(), ..old });
             let mut data =
                 crate::ty::defs::DefData::skeleton(crate::ty::defs::DefKind::Trait, None, old.name, crate::ty::defs::Vis::Priv, old.span);
@@ -2114,6 +2179,36 @@ pub fn finish_trait_impl(
 ) {
     use crate::traits::index::{ImplRecord, Synthetic, pattern_head};
     let Some(rec) = p.gx.index.trait_record(tr.def).cloned() else { return };
+    // One impl may define each associated name once (rustc E0201): types
+    // in the type namespace, consts and methods in the value namespace.
+    {
+        let mut seen: Vec<Sym> = Vec::new();
+        for at in &imp.types {
+            if seen.contains(&at.name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    at.name_span,
+                    format!("`{}` is defined more than once", p.display_name(at.name)),
+                    "Rename one of the definitions.",
+                ));
+            } else {
+                seen.push(at.name);
+            }
+        }
+        let mut seen: Vec<Sym> = Vec::new();
+        for (name, span) in imp.consts.iter().map(|c| (c.name, c.name_span)).chain(imp.fns.iter().map(|f| (f.name, f.name_span))) {
+            if seen.contains(&name) {
+                errs.push(Diag::new(
+                    "L0106",
+                    span,
+                    format!("`{}` is defined more than once", p.display_name(name)),
+                    "Rename one of the definitions.",
+                ));
+            } else {
+                seen.push(name);
+            }
+        }
+    }
     // Associated types: resolve the written bindings, fill the
     // rest from trait defaults, and require every assoc type.
     let mut assoc_tys: Vec<(DefId, Ty)> = Vec::new();
