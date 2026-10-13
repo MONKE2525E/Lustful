@@ -2270,6 +2270,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::Ref(..), TyKind::Ref(_, em, y))
                 if ed == 1
                     && box_ref_mut(self).is_some_and(|bm| !em.is_mut() || bm)
+                    && {
+                        // An exact match wins over a deref
+                        // coercion (as in the `Deref` arm below):
+                        // `&Rc<T>` against `&Rc<T>` must not
+                        // become `&T` by binding through the box.
+                        let snap_vars = self.snapshot_vars();
+                        let obl_len = self.obl_len();
+                        let exact = self.unify(found, expected);
+                        self.rollback_vars(snap_vars);
+                        self.obl_truncate(obl_len);
+                        !exact
+                    }
                     && self.tys.smart_elem(self.resolve(fbase)).is_some_and(|e| self.unify(e, y)) =>
             {
                 Coerce::BoxToRef(fd + 1, em.is_mut())
@@ -3952,6 +3964,31 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// count is in the same units as `autoderef` (one `Deref`
     /// projection per step), so recorded resolutions lower
     /// uniformly.
+    /// The (derefs, autoref) adjustment that takes a receiver
+    /// of type `rt` to a typed receiver type `want` (`Box<Self>`,
+    /// `&Rc<Self>`, kin), if one exists: peel references and
+    /// smart pointers until the type is `want` itself (by
+    /// value) or the pointee of the reference `want` asks for.
+    fn typed_receiver_adjust(&self, rt: Ty, want: Ty) -> Option<(u8, Autoref)> {
+        let want = self.resolve(want);
+        let mut t = self.resolve(rt);
+        for d in 0..8u8 {
+            if t == want {
+                return Some((d, Autoref::None));
+            }
+            if let TyKind::Ref(_, m, inner) = self.kind(want)
+                && self.resolve(inner) == t
+            {
+                return Some((d, if m.is_mut() { Autoref::RefMut } else { Autoref::Ref }));
+            }
+            t = match self.kind(t) {
+                TyKind::Ref(_, _, inner) => self.resolve(inner),
+                _ => self.resolve(self.tys.smart_elem(t)?),
+            };
+        }
+        None
+    }
+
     fn autoderef_smart(&self, t: Ty) -> (u8, Ty) {
         let (mut n, mut base) = self.autoderef(t);
         while let Some(inner) = self.tys.smart_elem(base) {
@@ -4358,6 +4395,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Builtin::StringFrom
             } else if item == k.with_capacity {
                 Builtin::StringWithCapacity
+            } else if item == k.clone {
+                Builtin::Clone
             } else {
                 self.err(
                     "L0104",
@@ -4376,6 +4415,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Builtin::VecWithCapacity
             } else if item == k.from {
                 Builtin::VecFrom
+            } else if item == k.clone {
+                Builtin::Clone
             } else {
                 self.err(
                     "L0104",
@@ -4391,6 +4432,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if item == k.new {
                 return Some(Res::Builtin(Builtin::BoxNew));
             }
+            if item == k.clone {
+                return Some(Res::Builtin(Builtin::Clone));
+            }
             if item == k.leak {
                 return Some(Res::Builtin(Builtin::BoxLeak));
             }
@@ -4405,6 +4449,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if ty_name == k.Rc {
             let b = if item == k.new {
                 Builtin::RcNew
+            } else if item == k.clone {
+                Builtin::Clone
             } else if item == k.strong_count {
                 Builtin::RcStrongCount
             } else if item == k.weak_count {
@@ -5061,6 +5107,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // template check resolved through a trait keeps that
                 // trait (`Self::mk()` in a trait default body).
                 if segs.len() == 2
+                    && !(segs[1].name == p.known.clone
+                        && [p.known.String, p.known.Vec, p.known.Box, p.known.Rc].contains(&segs[0].name))
                     && let Some(base) = self.trait_assoc_base(segs, self.replay_pick(e).is_some())
                     && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
                 {
@@ -5181,6 +5229,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Res::Builtin(b) => {
                 let (params, ret): (Vec<Ty>, Ty) = match b {
+                    Builtin::Clone => {
+                        // The associated form `Type::clone(&x)`:
+                        // the argument fixes the type.
+                        let base = self.new_var(false);
+                        self.deferred_clone.push((base, span));
+                        let r = self.tys.mk_ref(false, base);
+                        (vec![r], base)
+                    }
                     Builtin::StringNew => (vec![], STRING),
                     Builtin::StringFrom => {
                         // The forms lust takes: `&str` (and `&String`
@@ -5698,6 +5754,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if params.first().is_none_or(|&want| !self.unify(want, probe.recv_ty)) {
                     self.rollback_vars(snap_vars);
                     self.obl_truncate(obl_len);
+                    // A typed receiver (`self: Box<Self>`, `self:
+                    // &Rc<Self>`): it buckets as Value, so match
+                    // it by its written receiver type against the
+                    // unpeeled receiver (ARCH 2.10 step 3).
+                    if p.fn_info(f).self_kind == Some(ast::SelfKind::Typed)
+                        && let Some(&want) = params.first()
+                        && let Some((td, ta)) = self.typed_receiver_adjust(rt, want)
+                    {
+                        if ta != Autoref::None {
+                            self.check_packed_borrow(recv, name_span);
+                        }
+                        self.set_res(e, Res::Method { f, derefs: td, autoref: ta });
+                        self.check_args(&params[1.min(params.len())..], args, name_span);
+                        return ret;
+                    }
                     continue;
                 }
                 if probe.autoref != Autoref::None {

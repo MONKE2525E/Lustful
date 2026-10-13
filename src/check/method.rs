@@ -919,6 +919,29 @@ pub(super) fn generic_method_search(
         // `&mut step`. Inherent probes run for every variant of
         // the group before the group's trait probe.
         let mut by_value = vec![RcvProbe::at(cx, step, ReceiverForm::Value)];
+        if let Some(elem) = cx.tys.smart_elem(step) {
+            // Typed receivers on the pointee's impls (`self:
+            // Box<Self>`, `self: &Rc<Self>`, kin) match by
+            // receiver type at this step (ARCH 2.10 step 3).
+            // They bucket as Value, so the filter stays Value
+            // while the receiver type carries the real form.
+            let elem = cx.resolve(elem);
+            by_value.push(RcvProbe { self_ty: elem, recv_ty: step, autoref: Autoref::None, extra_derefs: 0, filter: ReceiverForm::Value });
+            by_value.push(RcvProbe {
+                self_ty: elem,
+                recv_ty: cx.tys.mk_ref(false, step),
+                autoref: Autoref::Ref,
+                extra_derefs: 0,
+                filter: ReceiverForm::Value,
+            });
+            by_value.push(RcvProbe {
+                self_ty: elem,
+                recv_ty: cx.tys.mk_ref(true, step),
+                autoref: Autoref::RefMut,
+                extra_derefs: 0,
+                filter: ReceiverForm::Value,
+            });
+        }
         if let TyKind::Ref(_, m, inner) = cx.tys.kind(step) {
             by_value.push(RcvProbe {
                 self_ty: cx.resolve(inner),
