@@ -795,7 +795,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("the `Cell` type", "L0641"),
     ("items from other crates", "L0505"),
     ("typed `self` parameters on smart-pointer types (Box, Rc, Arc)", "L0641"),
-    ("generic parameter defaults", "L0614"),
+    ("generic parameter defaults that name a lifetime", "L0614"),
     ("negative impls", "L0614"),
     ("associated consts", "L0621"),
     ("dependency crates with no lust adapter or shim yet (named in the message)", "L0508"),

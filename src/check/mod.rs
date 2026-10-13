@@ -6,6 +6,7 @@ pub mod collect;
 pub mod constfn;
 pub mod convert;
 pub mod fmt;
+pub mod defaults;
 pub mod generics;
 pub mod iter;
 pub mod method;
@@ -1761,6 +1762,113 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ParamKind::Type => GenericArg::Ty(self.new_var(false)),
                 ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
                 ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+            })
+            .collect()
+    }
+
+    /// The generic args of a value path that names user Adt `a` (a
+    /// struct, or an enum through one of its variants): args written on
+    /// the type segment or the variant segment, with the defaults of
+    /// omitted trailing params. With no args written every param gets a
+    /// fresh variable, as rustc infers them there (defaults never apply).
+    fn value_path_args(&mut self, a: AdtId, segs: &[ast::PathSeg], span: Span) -> Vec<GenericArg> {
+        let p = self.p;
+        let generics = p.gx.adt_generics[a.0 as usize].clone();
+        let n = segs.len();
+        let written_on: Vec<&ast::PathSeg> = segs[n.saturating_sub(2)..].iter().filter(|s| s.has_args()).collect();
+        let seg = match written_on.as_slice() {
+            [] => return self.fresh_args(&generics),
+            [one] => *one,
+            _ => {
+                self.err(
+                    "L0110",
+                    span,
+                    "type arguments are not allowed on both the type and the variant",
+                    "Write the arguments on one segment only.",
+                );
+                return self.error_args(&generics);
+            }
+        };
+        let ast::GenericArgs::Angle(written) = &seg.args else {
+            self.err("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments.");
+            return self.error_args(&generics);
+        };
+        let mut args: Vec<GenericArg> = Vec::new();
+        for (i, w) in written.iter().filter(|w| !matches!(w, ast::GenericArg::Lifetime(_))).enumerate() {
+            let is_const = matches!(generics.params.get(i).map(|g| g.kind), Some(ParamKind::Const(_)));
+            let arg = match w {
+                ast::GenericArg::Type(t) if !is_const => Some(GenericArg::Ty(self.resolve_written(*t))),
+                ast::GenericArg::Const(e) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e)
+                    .map(|v| GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))),
+                ast::GenericArg::Type(t) => match p.ast.ty(*t) {
+                    ast::TyExpr::Path(ps) if ps.len() == 1 => {
+                        crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name)
+                            .map(|k| GenericArg::Const(self.tys.intern_const(k)))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match arg {
+                Some(g) => args.push(g),
+                None => {
+                    self.err(
+                        "L0110",
+                        span,
+                        "this generic argument form is not supported here",
+                        "Write a type, or a literal const argument.",
+                    );
+                    return self.error_args(&generics);
+                }
+            }
+        }
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let g_ast = crate::check::defaults::type_generics(p.ast, &cx, p.adt(a).name);
+        let min = g_ast.map_or(generics.params.len(), crate::check::defaults::required);
+        if args.len() < min || args.len() > generics.params.len() {
+            self.err(
+                "L0105",
+                span,
+                format!(
+                    "`{}` takes {} generic argument(s) but {} were given",
+                    p.display_path(p.adt(a).name),
+                    generics.params.len(),
+                    args.len()
+                ),
+                "Write one argument per parameter, or leave them all out to infer them.",
+            );
+            return self.error_args(&generics);
+        }
+        if let Some(g) = g_ast
+            && let Err(d) = crate::check::defaults::fill(
+                p.ast,
+                p.interner,
+                p.known,
+                &cx,
+                &mut self.tys,
+                &generics::Scope::default(),
+                g,
+                None,
+                &mut args,
+                span,
+            )
+        {
+            self.errs.push(d);
+            return self.error_args(&generics);
+        }
+        args
+    }
+
+    /// Args for a generics list after a reported error: the error type
+    /// for every type param, so no second error follows from them.
+    fn error_args(&mut self, generics: &Generics) -> Vec<GenericArg> {
+        generics
+            .params
+            .iter()
+            .map(|param| match param.kind {
+                ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+                ParamKind::Type => GenericArg::Ty(ERROR),
             })
             .collect()
     }
@@ -5879,7 +5987,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The value is baked into this body, so the const's
         // `Sig` read (its fingerprint folds the value) is
         // recorded, as `const_item_pat` does.
-        let assoc_base = if segs.len() == 2 { self.assoc_const_base(segs) } else { None };
+        let assoc_base = if segs.len() == 2 { self.assoc_const_base(segs, Some(span)) } else { None };
         if let Some((adt, item)) = self.assoc_const_key(segs)
             && let Some(picked) = assoc_base.and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
@@ -5923,7 +6031,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Res::Variant(a, v) = r {
                 let variant = &p.adt(a).variants[v as usize];
                 if variant.shape == VariantShape::Unit {
-                    return self.tys.adt_ty(a);
+                    if p.gx.adt_generics[a.0 as usize].params.is_empty() {
+                        return self.tys.adt_ty(a);
+                    }
+                    // A unit variant of a generic enum: its params come
+                    // from any turbofish, else from later uses.
+                    let gen_args = self.value_path_args(a, segs, span);
+                    let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
+                    if !preds.is_empty() {
+                        self.push_predicates(&preds, &gen_args, span);
+                    }
+                    return self.tys.mk_adt(p.def_of_adt(a), &gen_args);
                 }
                 if variant.shape == VariantShape::Tuple {
                     return self.ctor_value_ty(a, v, span);
@@ -6494,18 +6612,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let Some(owner) = p.fn_info(f).owner else { return };
         let Some(self_tmpl) = p.gx.fn_scopes.get(f.0 as usize).and_then(|s| s.scope.self_ty) else { return };
-        let generics = p.gx.adt_generics.get(owner.0 as usize).cloned().unwrap_or_default();
-        let written: Vec<ast::TyId> = segs[0].type_args();
-        if written.len() != generics.params.len() || generics.params.iter().any(|g| g.kind != ParamKind::Type) {
-            self.err(
-                "L0105",
-                span,
-                format!("`{}` takes {} type argument(s) but {} were given", self.name(segs[0].name), generics.params.len(), written.len()),
-                "Write one type argument per type parameter.",
-            );
-            return;
-        }
-        let gargs: Vec<GenericArg> = written.iter().map(|&t| GenericArg::Ty(self.resolve_written(t))).collect();
+        let gargs = self.value_path_args(owner, &segs[..1], span);
         let written_ty = self.tys.mk_adt(p.def_of_adt(owner), &gargs);
         let self_ty = subst(&mut self.tys, self_tmpl, inst_args);
         if !self.unify(self_ty, written_ty) {
@@ -7392,7 +7499,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.check_args(&params, args, span);
                     self.tys.adt_ty(a)
                 } else {
-                    let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
+                    let gen_args: Vec<GenericArg> = match p.ast.expr(callee) {
+                        Expr::Path(segs) => self.value_path_args(a, segs, span),
+                        _ => self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone()),
+                    };
                     let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
                     self.check_args(&params, args, span);
                     // Forming the type owes its parameter bounds.
@@ -9649,10 +9759,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return ERROR;
         };
         self.set_res(e, Res::Variant(a, v));
-        // A generic Adt literal instantiates its parameters from
-        // the written fields (and any turbofish): field types are
-        // the template's, substituted with fresh variables.
-        let gen_args: Vec<GenericArg> = self.fresh_args(&p.gx.adt_generics[a.0 as usize].clone());
+        // A generic Adt literal instantiates its parameters from any
+        // turbofish (with defaults) and the written fields: field types
+        // are the template's, substituted with those args.
+        let gen_args: Vec<GenericArg> = self.value_path_args(a, path, span);
         // An expectation that names dyn types (`W<&dyn Tr>`) fixes the
         // params first, so the fields become coercion sites for them,
         // as rustc's expected inputs make them (ARCH 2.8).
@@ -10318,7 +10428,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         if let Some((adt, item)) = self.assoc_const_key(segs)
-            && let Some(picked) = self.assoc_const_base(segs).and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
+            && let Some(picked) = self.assoc_const_base(segs, Some(span)).and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
             if let Some(idx) = picked {
                 self.check_assoc_vis(adt, item, "associated constant", span);
@@ -10331,7 +10441,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // pattern needs.
         if segs.len() == 2
             && !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item))
-            && let Some(base) = self.assoc_const_base(segs)
+            && let Some(base) = self.assoc_const_base(segs, Some(span))
             && let Some((Some(idx), _)) = self.trait_assoc_const(None, base, None, segs[1].name, span)
         {
             self.const_item_pat(pi, idx, t, span, in_match);
@@ -10578,8 +10688,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// The self type a two-segment associated const path names:
     /// a type parameter or `Self` from the body scope, else a
     /// local Adt (written type arguments fix its parameters,
-    /// fresh variables otherwise, as in `trait_assoc_base`).
-    fn assoc_const_base(&mut self, segs: &[ast::PathSeg]) -> Option<Ty> {
+    /// fresh variables otherwise, as in `trait_assoc_base`). A
+    /// `None` span (body const evaluation) reports no argument
+    /// errors: the path's own check reports them.
+    fn assoc_const_base(&mut self, segs: &[ast::PathSeg], span: Option<Span>) -> Option<Ty> {
         let p = self.p;
         let head = segs[0].name;
         if let Some(&(_, t)) = self.body_scope.param_tys.iter().find(|(n, _)| *n == head) {
@@ -10598,23 +10710,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if generics.params.is_empty() {
             return Some(self.tys.adt_ty(a));
         }
-        let written: Vec<Option<GenericArg>> = match &segs[0].args {
-            ast::GenericArgs::Angle(args) => args
-                .iter()
-                .map(|arg| match arg {
-                    ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
-                    ast::GenericArg::Const(e) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e)
-                        .map(|v| GenericArg::Const(self.tys.intern_const(crate::ty::ConstKind::Int(v)))),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        if written.len() == generics.params.len() && written.iter().all(|w| w.is_some()) {
-            let args: Vec<GenericArg> = written.into_iter().map(|w| w.unwrap()).collect();
-            return Some(self.tys.mk_adt(p.def_of_adt(a), &args));
+        let mark = self.errs.len();
+        let args = self.value_path_args(a, &segs[..1], span.unwrap_or_default());
+        if span.is_none() {
+            self.errs.truncate(mark);
         }
-        let args = self.fresh_args(&generics);
         Some(self.tys.mk_adt(p.def_of_adt(a), &args))
     }
 
@@ -11150,6 +11250,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0102", span, "unknown struct or variant in pattern", "Check the name.");
                     return;
                 };
+                // Written args on the pattern's path (`E::<u8>::A(x)`) must
+                // name the scrutinee's own type.
+                if segs[segs.len().saturating_sub(2)..].iter().any(|s| s.has_args()) && !p.gx.adt_generics[a.0 as usize].params.is_empty() {
+                    let written = self.value_path_args(a, segs, span);
+                    let wt = self.tys.mk_adt(p.def_of_adt(a), &written);
+                    if !self.unify(wt, t) {
+                        self.mismatch(span, t, wt);
+                        return;
+                    }
+                }
                 // A generic Adt pattern matches the scrutinee's
                 // own instance when mono has made it; before that
                 // (and in templates) it matches the template with
@@ -13843,7 +13953,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         // evaluation, through the same pick as `path_expr`.
         let p = self.cx.p;
         let (adt, item) = self.cx.assoc_const_key(segs)?;
-        let idx = self.cx.assoc_const_base(segs).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None))??;
+        let idx = self.cx.assoc_const_base(segs, None).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None))??;
         let out = {
             let c = &p.consts[idx as usize];
             (c.value.clone(), c.ty)

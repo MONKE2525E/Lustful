@@ -1125,6 +1125,17 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     if let Some(rs) = p.regions.trait_methods.get(&def) {
         hash_region_sig(&mut h, p, Some(rs));
     }
+    // Param defaults (W-CHECK-G): `S<u8>` means `S<u8, D>`, so a default
+    // edit changes what every path that omits the arg names.
+    if let Some(ds) = p.gx.param_defaults.get(&def) {
+        for d in ds {
+            match d {
+                Some(GenericArg::Ty(t)) => hash_ty_deep(&mut h, p, &p.tys, *t, &mut seen),
+                Some(GenericArg::Const(c)) => p.tys.const_kind(*c).hash(&mut h),
+                _ => 0u8.hash(&mut h),
+            }
+        }
+    }
     Fingerprint(h.finish())
 }
 

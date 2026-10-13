@@ -768,6 +768,10 @@ pub struct Scope {
     pub alias_lifetimes: Vec<(Sym, Region)>,
     /// Nesting of alias bodies being resolved (a cycle guard).
     pub alias_depth: u32,
+    /// How many generic parameter defaults this resolution is nested in
+    /// (`check::defaults`): a default that leads back to itself stops at
+    /// a limit instead of looping.
+    pub default_depth: u32,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -828,12 +832,15 @@ pub struct ResolveCx<'x> {
     pub adt_lifetimes: &'x FxMap<DefId, Vec<Sym>>,
     /// User trait name to its def. Lang traits answer after it.
     pub trait_names: &'x FxMap<Sym, DefId>,
-    /// Non-generic type aliases by name (collect pass 1.5).
+    /// Type aliases by name (collect pass 1.5). A generic alias's target
+    /// is over its own params (`Param(i)`).
     pub aliases: &'x FxMap<Sym, Ty>,
     /// Generic type aliases (W-BORROW).
     pub generic_aliases: &'x FxMap<Sym, GenericAlias>,
     pub index: &'x ImplIndex,
     pub lang: &'x LangTraits,
+    /// `GenTables::item_index`.
+    pub item_index: &'x FxMap<Sym, u32>,
 }
 
 impl ResolveCx<'_> {
@@ -1100,6 +1107,7 @@ fn resolve_generic_args(
     scope: &Scope,
     args: &[AstArg],
     param_is_const: &[bool],
+    min_params: usize,
     span: Span,
     what: &str,
 ) -> Result<Vec<GenericArg>, Diag> {
@@ -1141,8 +1149,10 @@ fn resolve_generic_args(
     // Erased lifetime arguments do not count against the declared
     // type/const parameters (declared lifetimes are rejected when
     // the item's generics are built).
+    // Trailing params with defaults (`min_params` and up) may be left
+    // out; the caller fills them (`check::defaults`).
     let n_value_args = out.iter().filter(|g| !matches!(g, GenericArg::Lifetime(_))).count();
-    if n_value_args != n_params {
+    if n_value_args > n_params || n_value_args < min_params {
         return Err(Diag::new(
             "L0110",
             span,
@@ -1203,7 +1213,7 @@ fn resolve_const_path_arg(
 
 /// A const generic argument or array length in signature form:
 /// a literal value, or a const parameter reference.
-fn resolve_const_arg(
+pub(crate) fn resolve_const_arg(
     ast: &Ast,
     interner: &Interner,
     known: &Known,
@@ -1358,6 +1368,23 @@ fn resolve_trait_path_args(
     let mut input_args = input_args;
     if input_args.len() + 1 == n_inputs && cx.lang.input_defaults_to_self(trait_def) {
         input_args.push(GenericArg::Ty(self_ty));
+    }
+    // A user trait's omitted trailing inputs take their defaults, with
+    // `Self` as this ref's Self type. A trait object has no Self to put
+    // there (rustc E0393).
+    if input_args.len() < n_inputs
+        && !matches!(seg.args, GenericArgs::Parenthesized { .. })
+        && let Some(g) = rec.and_then(|r| crate::check::defaults::trait_generics(ast, cx, r.name))
+    {
+        if self_ty == DYN_SELF && crate::check::defaults::defaults_name_self(ast, known, g, input_args.len()) {
+            return Err(Diag::new(
+                "L0110",
+                span,
+                "a trait object cannot use a parameter default that names `Self`",
+                "Write the trait's parameters out in the `dyn` type.",
+            ));
+        }
+        crate::check::defaults::fill(ast, interner, known, cx, tys, scope, g, Some(self_ty), &mut input_args, span)?;
     }
     if input_args.len() != n_inputs {
         return Err(Diag::new(
@@ -1811,7 +1838,7 @@ fn resolve_path_ty(
     }
     if name == known.Vec || name == known.Option || name == known.Box || name == known.Rc {
         let args = match &seg.args {
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], span, interner.get(name))?,
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, interner.get(name))?,
             _ => {
                 return Err(Diag::new(
                     "L0110",
@@ -1840,7 +1867,9 @@ fn resolve_path_ty(
     }
     if name == known.Result {
         let args = match &seg.args {
-            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false, false], span, interner.get(name))?,
+            GenericArgs::Angle(a) => {
+                resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false, false], 2, span, interner.get(name))?
+            }
             _ => {
                 return Err(Diag::new("L0110", span, "`Result` takes two type arguments".to_string(), "Write `Result<T, E>`."));
             }
@@ -1857,42 +1886,72 @@ fn resolve_path_ty(
     if segs.len() == 1
         && let Some(&alias_ty) = cx.aliases.get(&name)
     {
-        return if seg.has_args() {
-            Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
-        } else if matches!(scope.regions, RegionMode::Keep { .. }) {
-            Ok(staticize(tys, alias_ty))
-        } else {
-            Ok(alias_ty)
+        let g_ast = crate::check::defaults::type_generics(ast, cx, name);
+        let kinds: Vec<bool> = g_ast.map_or_else(Vec::new, |g| {
+            g.params
+                .iter()
+                .filter_map(|p| match p {
+                    ast::GenericParam::Type { .. } => Some(false),
+                    ast::GenericParam::Const { .. } => Some(true),
+                    ast::GenericParam::Lifetime { .. } => None,
+                })
+                .collect()
+        });
+        let alias_ty = if matches!(scope.regions, RegionMode::Keep { .. }) { staticize(tys, alias_ty) } else { alias_ty };
+        if kinds.is_empty() {
+            return if seg.has_args() {
+                Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
+            } else {
+                Ok(alias_ty)
+            };
+        }
+        // A generic alias: its args (defaults for omitted trailing ones)
+        // substitute into the target.
+        let what = crate::intern::source_name(interner.get(name));
+        let mut args: Vec<GenericArg> = match &seg.args {
+            GenericArgs::None => Vec::new(),
+            GenericArgs::Angle(a) => {
+                let min = g_ast.map_or(kinds.len(), crate::check::defaults::required);
+                resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, min, span, what)?
+            }
+            GenericArgs::Parenthesized { .. } => {
+                return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
+            }
         };
+        if args.iter().any(|g| matches!(g, GenericArg::Lifetime(_))) {
+            return Err(Diag::new("L0110", span, "this alias takes no lifetime arguments", "Remove the lifetime arguments."));
+        }
+        if let Some(g) = g_ast {
+            crate::check::defaults::fill(ast, interner, known, cx, tys, scope, g, None, &mut args, span)?;
+        }
+        if args.len() != kinds.len() {
+            return Err(Diag::new(
+                "L0110",
+                span,
+                format!("`{what}` takes {} generic argument(s)", kinds.len()),
+                "Write the arguments, for example with `_` where inference should fill them in a body.",
+            ));
+        }
+        return Ok(subst(tys, alias_ty, &args));
     }
     if let Some(&adt) = cx.type_names.get(&name) {
         let (def, n_params) = cx.adt_info_of(adt);
-        let gargs: Vec<GenericArg> = match &seg.args {
-            GenericArgs::None => {
-                if n_params == 0 {
-                    Vec::new()
-                } else {
-                    return Err(Diag::new(
-                        "L0110",
-                        span,
-                        format!("`{}` takes {n_params} generic argument(s)", crate::intern::source_name(interner.get(name))),
-                        "Write the arguments, for example with `_` where inference should fill them in a body.",
-                    ));
-                }
-            }
+        // Declared parameter kinds and defaults from the Adt's own item:
+        // its built generics may not exist yet when an earlier item's
+        // fields name it.
+        let g_ast = crate::check::defaults::type_generics(ast, cx, name);
+        let arity = || {
+            Diag::new(
+                "L0110",
+                span,
+                format!("`{}` takes {n_params} generic argument(s)", crate::intern::source_name(interner.get(name))),
+                "Write the arguments, for example with `_` where inference should fill them in a body.",
+            )
+        };
+        let mut gargs: Vec<GenericArg> = match &seg.args {
+            GenericArgs::None => Vec::new(),
             GenericArgs::Angle(a) => {
-                // Declared parameter kinds from the Adt's own item:
-                // its built generics may not exist yet when an
-                // earlier item's fields name it.
-                let kinds: Vec<bool> = ast
-                    .items
-                    .iter()
-                    .filter_map(|it| match &it.kind {
-                        ast::ItemKind::Struct(s) if s.name == name => Some(&s.generics),
-                        ast::ItemKind::Enum(e) if e.name == name => Some(&e.generics),
-                        _ => None,
-                    })
-                    .next()
+                let kinds: Vec<bool> = g_ast
                     .map(|g| {
                         g.params
                             .iter()
@@ -1904,12 +1963,37 @@ fn resolve_path_ty(
                             .collect()
                     })
                     .unwrap_or_else(|| vec![false; n_params]);
-                resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, crate::intern::source_name(interner.get(name)))?
+                let min = g_ast.map_or(n_params, crate::check::defaults::required);
+                resolve_generic_args(
+                    ast,
+                    interner,
+                    known,
+                    cx,
+                    tys,
+                    scope,
+                    a,
+                    &kinds,
+                    min,
+                    span,
+                    crate::intern::source_name(interner.get(name)),
+                )?
             }
             GenericArgs::Parenthesized { .. } => {
                 return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
             }
         };
+        // Omitted trailing params take their defaults.
+        let n_written = gargs.iter().filter(|g| !matches!(g, GenericArg::Lifetime(_))).count();
+        if n_written < n_params {
+            let mut values: Vec<GenericArg> = gargs.iter().copied().filter(|g| !matches!(g, GenericArg::Lifetime(_))).collect();
+            if let Some(g) = g_ast {
+                crate::check::defaults::fill(ast, interner, known, cx, tys, scope, g, None, &mut values, span)?;
+            }
+            if values.len() != n_params {
+                return Err(arity());
+            }
+            gargs.extend_from_slice(&values[n_written..]);
+        }
         // Lifetime args (W-BORROW): none written (each elided), or one
         // per declared lifetime param (rustc E0107 otherwise). The erased
         // type drops them; a region signature keeps them first, in
@@ -2235,6 +2319,42 @@ pub fn build_generics_shifted(
     seed: &Scope,
     errs: &mut Vec<Diag>,
 ) -> (Generics, Scope) {
+    build_generics_owned(ast, interner, known, cx, tys, g, w, shift, seed, crate::check::defaults::Owner::Other, errs)
+}
+
+/// The generics of a struct or enum: like `build_generics`, but its
+/// params may have defaults (`check::defaults`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_adt_generics(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    g: &ast::Generics,
+    w: &ast::WhereClause,
+    errs: &mut Vec<Diag>,
+) -> (Generics, Scope) {
+    build_generics_owned(ast, interner, known, cx, tys, g, w, 0, &Scope::default(), crate::check::defaults::Owner::Type, errs)
+}
+
+/// `build_generics_shifted` for an item of the given kind: only structs,
+/// enums, traits, and aliases may write param defaults.
+#[allow(clippy::too_many_arguments)]
+fn build_generics_owned(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    g: &ast::Generics,
+    w: &ast::WhereClause,
+    shift: u32,
+    seed: &Scope,
+    owner: crate::check::defaults::Owner,
+    errs: &mut Vec<Diag>,
+) -> (Generics, Scope) {
+    crate::check::defaults::check_written(ast, known, g, owner, errs);
     let mut params: Vec<ParamDef> = Vec::new();
     let mut scope = Scope::default();
     // Pass 0 (W-BORROW): lifetime params. They do not enter `params`
@@ -2319,9 +2439,7 @@ pub fn build_generics_shifted(
                         "Rename one of the parameters.",
                     ));
                 }
-                if default.is_some() {
-                    errs.push(not_yet("L0614", *span, "generic parameter defaults"));
-                }
+                let _ = default;
                 let idx = shift + params.len() as u32;
                 scope.type_params.push((*name, idx));
                 params.push(ParamDef { name: *name, kind: ParamKind::Type, span: *span });
@@ -2335,9 +2453,7 @@ pub fn build_generics_shifted(
                         "Rename one of the parameters.",
                     ));
                 }
-                if default.is_some() {
-                    errs.push(not_yet("L0614", *span, "generic parameter defaults"));
-                }
+                let _ = default;
                 let idx = shift + params.len() as u32;
                 let cty = resolve_scoped(ast, interner, known, cx, tys, *ty, &scope).unwrap_or_else(|d| {
                     errs.push(d);
@@ -2446,7 +2562,8 @@ pub fn build_trait_generics(
             ));
         }
     }
-    let (mut generics, mut scope) = build_generics_shifted(ast, interner, known, cx, tys, g, w, 1, &seed, errs);
+    let (mut generics, mut scope) =
+        build_generics_owned(ast, interner, known, cx, tys, g, w, 1, &seed, crate::check::defaults::Owner::Trait, errs);
     generics.params.insert(0, ParamDef { name: known.self_type, kind: ParamKind::Type, span: Span::default() });
     scope.self_ty = Some(self_ty);
     // Supertrait bounds are predicates on Self, in source order,
@@ -2706,6 +2823,15 @@ pub struct GenTables<'a> {
     pub template_rows: Option<u32>,
     /// Adt instances in creation order (ids are not: see `InstOrder`).
     pub adt_created: Vec<AdtId>,
+    /// The `Ast::items` index of each struct, enum, type alias, and trait
+    /// by flat name (the first one when a name repeats). Param defaults
+    /// and generic aliases read their written generics through it.
+    pub item_index: FxMap<Sym, u32>,
+    /// The resolved param defaults of each struct, enum, trait, and
+    /// generic alias that has one (`check::defaults::resolve_all`), by
+    /// def: the finish-side WF check proves them, and the driver folds
+    /// them into the def's `Sig` fingerprint.
+    pub param_defaults: FxMap<DefId, Vec<Option<GenericArg>>>,
 }
 
 impl Default for GenTables<'_> {
@@ -2764,6 +2890,8 @@ impl Default for GenTables<'_> {
             inst_order: Default::default(),
             template_rows: None,
             adt_created: Vec::new(),
+            item_index: FxMap::default(),
+            param_defaults: FxMap::default(),
         }
     }
 }
@@ -2780,6 +2908,7 @@ impl GenTables<'_> {
             generic_aliases: &self.generic_aliases,
             index: &self.index,
             lang: &self.lang,
+            item_index: &self.item_index,
         }
     }
 }
@@ -3257,6 +3386,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
             build_trait_generics(p.ast, p.interner, p.known, &cx, &mut p.tys, &tdef_generics, &tdef_where, &tdef_bounds, errs)
         };
+        let defaults = {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            crate::check::defaults::resolve_all(p.ast, p.interner, p.known, &cx, &mut p.tys, &tdef_generics, true, errs)
+        };
+        if defaults.iter().any(Option::is_some) {
+            p.gx.param_defaults.insert(trait_def, defaults);
+        }
         // The trait's own associated items are sources on its Self.
         {
             let rec = p.gx.index.trait_record(trait_def).cloned();
@@ -5760,7 +5896,17 @@ fn prove_trait_ref(
         return false;
     }
     if tr.def == lang.sized {
-        return true;
+        // Sized by structure: `str`, slices, and dyn types are not; a
+        // parameter is when the env says so (an implicit `T: Sized` is
+        // in every env that has one); every other type lust has is.
+        let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
+        return match cx.tys.kind(t) {
+            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
+            TyKind::Param(_) => env.iter().any(|pr| {
+                matches!(pr, Predicate::Trait(b) if b.value.def == lang.sized && cx.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(t))
+            }),
+            _ => true,
+        };
     }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
@@ -6338,6 +6484,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         items.push((Vec::new(), rec.generics.clone(), rec.span));
     }
     let adt_idx = adt_first_index(p);
+    check_default_wf(p, &adt_idx, errs);
     for (tys, generics, span) in items {
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let mut goals: Vec<TraitRef> = Vec::new();
@@ -6379,6 +6526,102 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
                     format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
                 ));
                 break;
+            }
+        }
+    }
+}
+
+/// Param defaults (rustc's wfcheck): a default that names no param
+/// must be well-formed and sized when its param is, and each predicate
+/// over exactly one param whose default names no param must hold for
+/// that default (`struct S<T: Copy = String>` is E0277). Defaults that
+/// name other params are checked at each use instead, as in rustc.
+fn check_default_wf(p: &mut Program, adt_idx: &FxMap<DefId, usize>, errs: &mut Vec<Diag>) {
+    use crate::traits::index::subst_predicate;
+    let mut entries: Vec<(DefId, Vec<Option<GenericArg>>)> = p.gx.param_defaults.iter().map(|(d, v)| (*d, v.clone())).collect();
+    entries.sort_by_key(|(d, _)| (d.krate.0, d.hash.0));
+    for (def, defaults) in entries {
+        let (generics, span, shift) = if let Some(a) = p.adt_by_def(def) {
+            (p.gx.adt_generics[a.0 as usize].clone(), p.adt(a).span, 0usize)
+        } else if let Some(rec) = p.gx.index.trait_record(def) {
+            (rec.generics.clone(), rec.span, 1usize)
+        } else {
+            continue;
+        };
+        let n = generics.params.len() as u32;
+        let names_param = |p: &Program, g: GenericArg| match g {
+            GenericArg::Ty(t) => (0..n).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)),
+            GenericArg::Const(c) => matches!(p.tys.const_kind(c), ConstKind::Param(_)),
+            GenericArg::Lifetime(_) => false,
+        };
+        // Identity args, with each non-dependent default in its slot.
+        let mut inst: Vec<GenericArg> = generics
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, prm)| match prm.kind {
+                ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+                _ => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+            })
+            .collect();
+        let mut concrete: Vec<bool> = vec![false; inst.len()];
+        for (k, d) in defaults.iter().enumerate() {
+            if let Some(d) = *d
+                && !names_param(p, d)
+                && shift + k < inst.len()
+            {
+                inst[shift + k] = d;
+                concrete[shift + k] = true;
+            }
+        }
+        let mut bad = false;
+        for (i, &is_concrete) in concrete.iter().enumerate() {
+            let Some(t) = inst[i].as_ty().filter(|_| is_concrete) else { continue };
+            let mut goals: Vec<TraitRef> = Vec::new();
+            wf_goals(p, adt_idx, t, &mut Vec::new(), &mut goals);
+            let bad_inner = !crate::check::collect::is_sized_ty(&p.tys, t)
+                && !matches!(p.tys.kind(t), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..));
+            if bad_inner || goals.into_iter().any(|g| !prove_goal(p, &[], g)) {
+                errs.push(Diag::new(
+                    "L0612",
+                    span,
+                    format!("the default `{}` of a parameter is not a well-formed type", crate::check::collect::ty_name(p, &p.tys, t)),
+                    "Change the default so every bound its types need holds.",
+                ));
+                bad = true;
+            }
+        }
+        if bad {
+            continue;
+        }
+        for &pred in &generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            if b.count != 0 {
+                continue;
+            }
+            let mentioned: Vec<u32> = (0..n)
+                .filter(|&i| {
+                    p.tys.args(b.value.args).iter().chain(p.tys.bindings(b.value.bindings).iter().map(|(_, g)| g)).any(|g| match *g {
+                        GenericArg::Ty(t) => ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i),
+                        GenericArg::Const(c) => p.tys.const_kind(c) == ConstKind::Param(i),
+                        GenericArg::Lifetime(_) => false,
+                    })
+                })
+                .collect();
+            let [only] = mentioned.as_slice() else { continue };
+            if !concrete[*only as usize] {
+                continue;
+            }
+            let Predicate::Trait(inst_b) = subst_predicate(&mut p.tys, pred, &inst) else { continue };
+            if !prove_goal(p, &[], inst_b.value) {
+                let shown = inst[*only as usize].as_ty().map_or_else(|| "?".to_string(), |t| crate::check::collect::ty_name(p, &p.tys, t));
+                let gname = p.gx.index.trait_record(b.value.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+                errs.push(Diag::new(
+                    "L0612",
+                    span,
+                    format!("the default `{shown}` does not satisfy the `{gname}` bound on its parameter"),
+                    "Change the default, or relax the bound.",
+                ));
             }
         }
     }

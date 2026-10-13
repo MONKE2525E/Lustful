@@ -464,6 +464,71 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, scope: &mut generics::Scope
     }
 }
 
+/// The target of a generic type alias, over its own params (`Param(i)`
+/// in declared order, lifetimes left out).
+fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, Diag> {
+    let mut scope = generics::Scope::default();
+    let mut idx = 0u32;
+    for g in &a.generics.params {
+        match g {
+            ast::GenericParam::Type { name, .. } => {
+                scope.type_params.push((*name, idx));
+                idx += 1;
+            }
+            ast::GenericParam::Const { name, .. } => {
+                scope.const_params.push((*name, idx));
+                idx += 1;
+            }
+            ast::GenericParam::Lifetime { lt, .. } => scope.lifetimes.push((lt.name, 0)),
+        }
+    }
+    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+    generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, a.ty, &scope)
+}
+
+/// The rules on generic aliases once their targets resolve: the param
+/// default rules (`check::defaults`), and every type param must appear
+/// in the target (rustc E0091). Their resolved defaults join
+/// `param_defaults` under the alias def.
+fn check_generic_aliases(p: &mut Program, errs: &mut Vec<Diag>) {
+    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    for item in &ast.items {
+        let ItemKind::Type(a) = &item.kind else { continue };
+        if !a.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. })) {
+            continue;
+        }
+        crate::check::defaults::check_written(ast, known, &a.generics, crate::check::defaults::Owner::Type, errs);
+        let Some(&target) = p.aliases.get(&a.name) else { continue };
+        let used = crate::check::variance::params_in(p, target);
+        let mut idx = 0u32;
+        for g in &a.generics.params {
+            match g {
+                ast::GenericParam::Type { name, span, .. } => {
+                    if !used.contains(&idx) {
+                        errs.push(Diag::new(
+                            "L0110",
+                            *span,
+                            format!("type parameter `{}` is never used", interner.get(*name)),
+                            "Use the parameter in the alias's type, or remove it.",
+                        ));
+                    }
+                    idx += 1;
+                }
+                ast::GenericParam::Const { .. } => idx += 1,
+                ast::GenericParam::Lifetime { .. } => {}
+            }
+        }
+        let defaults = {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            crate::check::defaults::resolve_all(ast, interner, known, &cx, &mut p.tys, &a.generics, false, errs)
+        };
+        if defaults.iter().any(Option::is_some) {
+            let hash = crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::TypeAlias, interner.get(a.name), 0);
+            p.gx.param_defaults.insert(DefId { krate: p.krate, hash }, defaults);
+        }
+    }
+}
+
 /// The span of a path to a user Adt with lifetime params that writes none
 /// (a hidden lifetime), anywhere in a written type.
 fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
@@ -1575,6 +1640,7 @@ pub fn collect_reuse<'a>(
 
     // Generic pass 0: lang traits and user trait defs, so bounds in
     // every later signature can name them.
+    p.gx.item_index = crate::check::defaults::item_index(ast);
     generics::init_lang(&mut p);
     generics::collect_trait_defs(&mut p, &mut errs);
 
@@ -1749,10 +1815,12 @@ pub fn collect_reuse<'a>(
         p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
     }
 
-    // Pass 1.5: non-generic type aliases. Resolved by a small fixpoint:
-    // an alias whose target still names an unresolved alias defers to
-    // the next sweep; a sweep with no progress means a cycle (L0601) or
-    // a genuine unknown type (the first error is kept).
+    // Pass 1.5: type aliases. Resolved by a small fixpoint: an alias
+    // whose target still names an unresolved alias defers to the next
+    // sweep; a sweep with no progress means a cycle (L0601) or a genuine
+    // unknown type (the first error is kept). A generic alias's target is
+    // over its own params (`Param(i)`); each use substitutes its args
+    // (`generics::resolve_path_ty`).
     {
         let mut pending: Vec<&ast::TypeAliasDef> = Vec::new();
         // `aliases` fills only in the fixpoint below, so registration needs
@@ -1824,17 +1892,30 @@ pub fn collect_reuse<'a>(
             }
             let mut progress = false;
             let mut first_err: Option<Diag> = None;
-            pending.retain(|a| match resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, a.ty, None) {
-                Ok(t) => {
-                    p.aliases.insert(a.name, t);
-                    progress = true;
-                    false
-                }
-                Err(d) => {
-                    if first_err.is_none() {
-                        first_err = Some(d);
+            pending.retain(|a| {
+                let generic = a.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. }));
+                let resolved = if generic {
+                    resolve_generic_alias(&mut p, a)
+                } else {
+                    // The scoped resolver covers what the plain one cannot
+                    // (a generic Adt applied to arguments, `W<i32>`).
+                    resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, a.ty, None).or_else(|d| {
+                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, a.ty, &generics::Scope::default()).map_err(|_| d)
+                    })
+                };
+                match resolved {
+                    Ok(t) => {
+                        p.aliases.insert(a.name, t);
+                        progress = true;
+                        false
                     }
-                    true
+                    Err(d) => {
+                        if first_err.is_none() {
+                            first_err = Some(d);
+                        }
+                        true
+                    }
                 }
             });
             if !progress && !pending.is_empty() {
@@ -1875,6 +1956,7 @@ pub fn collect_reuse<'a>(
                 break;
             }
         }
+        check_generic_aliases(&mut p, &mut errs);
     }
 
     // Generic pass 1.5: trait generics, method templates. Fields
@@ -1914,8 +1996,16 @@ pub fn collect_reuse<'a>(
             };
             let (adt_generics, adt_scope) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                generics::build_generics(ast, interner, known, &cx, &mut p.tys, &g_ast, &w_ast, &mut errs)
+                generics::build_adt_generics(ast, interner, known, &cx, &mut p.tys, &g_ast, &w_ast, &mut errs)
             };
+            let defaults = {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                crate::check::defaults::resolve_all(ast, interner, known, &cx, &mut p.tys, &g_ast, false, &mut errs)
+            };
+            if defaults.iter().any(Option::is_some) {
+                let def = p.defs.def_of_adt(id).expect("ADT defs are recorded in pass 1");
+                p.gx.param_defaults.insert(def, defaults);
+            }
             let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &adt_generics.predicates);
             p.gx.adt_generics[id.0 as usize] = adt_generics;
             p.gx.adt_envs[id.0 as usize] = env;

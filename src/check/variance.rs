@@ -119,6 +119,14 @@ pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<
     }
 }
 
+/// Every type param index that occurs in `t` (through any type form).
+pub fn params_in(p: &Program, t: Ty) -> Vec<u32> {
+    let slot = crate::intern::FxMap::default();
+    let mut all = Mark { p, slot: &slot, used: &[], tys: Vec::new(), lts: Vec::new() };
+    all.walk(t);
+    all.tys
+}
+
 /// The field types of one Adt template, regioned where the borrow
 /// tables have them (lifetime args first in user Adt args), else erased.
 fn field_tys(p: &Program, id: AdtId) -> Vec<Ty> {
