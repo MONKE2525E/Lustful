@@ -7,7 +7,7 @@
 // inline when it fits). Drop orders follow upstream too: truncate,
 // clear, retain, and dedup drop from the back, after all calls. The
 // layout differs from upstream's (no inline buffer), so layout queries
-// on SmallVec reject (L0652). Not here (they reject at the use): drain,
+// on SmallVec reject (L0652). Not here (they reject at the use):
 // insert_many, raw pointers and parts, from_buf, the const forms,
 // write, serde, arbitrary, and drain_filter.
 
@@ -220,6 +220,28 @@ impl<A: Array> SmallVec<A> {
 
     pub fn clear(&mut self) {
         self.truncate(0);
+    }
+
+    /// Removes `range` and yields its items. The bounds checks and their
+    /// panics are upstream's. When the Drain drops, the items it did not
+    /// yield drop front to back and the tail moves down, as upstream's
+    /// Drain does; std's `vec::Drain` does both the same way.
+    pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, A> {
+        use core::ops::Bound::*;
+        let len = self.len();
+        let start = match range.start_bound() {
+            Included(&n) => n,
+            Excluded(&n) => n.checked_add(1).expect("Range start out of bounds"),
+            Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Included(&n) => n.checked_add(1).expect("Range end out of bounds"),
+            Excluded(&n) => n,
+            Unbounded => len,
+        };
+        assert!(start <= end);
+        assert!(end <= len);
+        Drain { inner: self.items.drain(start..end) }
     }
 
     pub fn remove(&mut self, index: usize) -> A::Item {
@@ -599,6 +621,42 @@ impl<A: Array> DoubleEndedIterator for IntoIter<A> {
 }
 
 impl<A: Array> ExactSizeIterator for IntoIter<A> {}
+
+/// The items `SmallVec::drain` removes, by value.
+pub struct Drain<'a, T: 'a + Array> {
+    inner: std::vec::Drain<'a, T::Item>,
+}
+
+impl<'a, T: 'a + Array> core::fmt::Debug for Drain<'a, T>
+where
+    T::Item: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Drain").field(&self.inner.as_slice()).finish()
+    }
+}
+
+impl<'a, T: 'a + Array> Iterator for Drain<'a, T> {
+    type Item = T::Item;
+
+    fn next(&mut self) -> Option<T::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, T: 'a + Array> DoubleEndedIterator for Drain<'a, T> {
+    fn next_back(&mut self) -> Option<T::Item> {
+        self.inner.next_back()
+    }
+}
+
+impl<'a, T: Array> ExactSizeIterator for Drain<'a, T> {}
+
+impl<'a, T: Array> core::iter::FusedIterator for Drain<'a, T> {}
 
 /// `smallvec![]`, `smallvec![x; n]`, and `smallvec![a, b, ...]`, as
 /// upstream expands them.

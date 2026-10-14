@@ -9,3 +9,9 @@ c0 c2 c9 | clone
 d9 d2 d0 | clear
 d0 d2 d9 | drop clone
 d4 d4 d5 d5 d5 | drop rest
+| push five
+| drain next
+d2 d3 | drain drop
+d1 | drop first
+2 8
+d0 d4 | drop drained

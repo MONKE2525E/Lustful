@@ -53,4 +53,20 @@ fn main() {
     drop(w);
     drop(x);
     flush("drop rest");
+    // drain: items not yielded drop front to back when the Drain drops.
+    let mut y: SmallVec<[D; 2]> = SmallVec::new();
+    for i in 0..5u8 {
+        y.push(D(i));
+    }
+    flush("push five");
+    let mut d = y.drain(1..4);
+    let first = d.next();
+    flush("drain next");
+    drop(d);
+    flush("drain drop");
+    drop(first);
+    flush("drop first");
+    println!("{} {}", y.len(), y.capacity());
+    drop(y);
+    flush("drop drained");
 }

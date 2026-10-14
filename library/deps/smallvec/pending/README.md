@@ -13,8 +13,9 @@ Gate: `scripts/test-adapters.sh smallvec`.
   `pop`, `grow`, `reserve`, `reserve_exact`, `shrink_to_fit`,
   `truncate`, `clear`, `swap_remove`, `remove`, `insert`,
   `insert_from_slice`, `extend_from_slice`, `resize`, `retain`,
-  `retain_mut`, `dedup`, `dedup_by`, `dedup_by_key`, `into_vec`,
-  `as_slice`, `as_mut_slice`; `Deref`/`DerefMut` to the slice; `Extend`,
+  `retain_mut`, `dedup`, `dedup_by`, `dedup_by_key`, `drain` (and its
+  `Drain` iterator), `into_vec`, `as_slice`, `as_mut_slice`;
+  `Deref`/`DerefMut` to the slice; `Extend`,
   `FromIterator`, `IntoIterator` (by value, `&`, `&mut`), `Clone`,
   `Default`, `Debug`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
   `From<Vec>`, `From<&[T]>`.
@@ -29,7 +30,7 @@ Gate: `scripts/test-adapters.sh smallvec`.
 
 ## Rejected (lust error, never a different answer)
 
-- `drain`, `drain_filter`, `insert_many`, `append`, `into_inner`,
+- `drain_filter`, `insert_many`, `append`, `into_inner`,
   `into_boxed_slice`, `from_buf`, `from_buf_and_len`, raw pointers and
   parts, `set_len`, the const forms, and the `union`, `const_generics`,
   `write`, `serde`, and `arbitrary` features.
