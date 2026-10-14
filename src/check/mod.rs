@@ -593,9 +593,12 @@ pub enum PrimOpKind {
 /// `Res` derefs then apply to the `&Target` (`target_ref`) it returns.
 /// A place step also carries the impl's `deref_mut` (`f_mut`), which
 /// lowering calls when it needs the place mutably. `args` and
-/// `args_mut` instantiate generic fns (empty for plain ones).
+/// `args_mut` instantiate generic fns (empty for plain ones). `depth`
+/// orders a chain of steps (`W -> N -> M`): 0 is the outermost, which
+/// applies first.
 #[derive(Clone, Debug)]
 pub struct DerefRecv {
+    pub depth: u8,
     pub before: u8,
     pub f: LocalDefId,
     pub args: Vec<GenericArg>,
@@ -722,12 +725,13 @@ pub struct Checked<'g> {
     /// Vtable requests from unsizing coercions: (concrete pointee
     /// type, target dyn type), zonked. Mono builds the vtables.
     pub vtable_requests: Vec<(Ty, Ty)>,
-    /// Method calls whose receiver goes through a user `Deref` impl
-    /// (`method_via_user_deref`), by call expression; a chain of impls
-    /// records one entry per step, innermost first.
+    /// Expressions that go through user `Deref` impls (method call
+    /// receivers, field access bases, explicit `*x`, index bases), by
+    /// expression; a chain of impls records one entry per step (see
+    /// `DerefRecv::depth`).
     pub deref_recv: Vec<(ExprId, DerefRecv)>,
     /// The steps of each `Coerce::UserDeref`, by coerced expression,
-    /// innermost first (as `deref_recv`).
+    /// outermost first.
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
@@ -782,10 +786,12 @@ impl Checked<'_> {
     pub fn pat_derefs(&self, p: PatId) -> u8 {
         self.pat_derefs[(p.0 - self.pat_base) as usize]
     }
-    /// The user `Deref` steps of a method call's receiver, outermost
-    /// first (a chain `W -> N -> M` records the inner steps first).
+    /// The user `Deref` steps of a method call's receiver, a field
+    /// access base, or an explicit `*x`, outermost first.
     pub fn deref_recv(&self, e: ExprId) -> Vec<&DerefRecv> {
-        self.deref_recv.iter().rev().filter(|(x, _)| *x == e).map(|(_, d)| d).collect()
+        let mut steps: Vec<&DerefRecv> = self.deref_recv.iter().filter(|(x, _)| *x == e).map(|(_, d)| d).collect();
+        steps.sort_by_key(|d| d.depth);
+        steps
     }
     /// The steps of a `Coerce::UserDeref` on `e`, outermost first.
     pub fn deref_coerce(&self, e: ExprId) -> Vec<&DerefRecv> {
@@ -3903,6 +3909,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let (f, target, impl_args) = self.user_deref_fn(lang.deref, base, "deref", name_span)?;
+        let depth = self.deref_depth;
         let tref = self.tys.mk_ref(false, target);
         self.deref_depth += 1;
         let ret = self.method_call_with_rt(e, recv, tref, name, name_span, args, turbofish, expected);
@@ -3935,7 +3942,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let target_ref = self.tys.mk_ref(mutable, target);
         let idx = self.out.deref_recv.len();
-        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref }));
+        self.out.deref_recv.push((e, DerefRecv { depth, before, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref }));
         if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
             self.deref_sites.push((DerefTable::Recv, idx, false, f, impl_args));
         }
@@ -3959,7 +3966,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let target_ref = self.tys.mk_ref(false, target);
         let idx = self.out.deref_recv.len();
-        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), f_mut, args_mut: Vec::new(), mutable: false, target_ref }));
+        // Place steps record outermost first.
+        let depth = self.out.deref_recv.iter().filter(|(x, _)| *x == e).count() as u8;
+        self.out.deref_recv.push((e, DerefRecv { depth, before, f, args: Vec::new(), f_mut, args_mut: Vec::new(), mutable: false, target_ref }));
         let is_template = |cx: &Self, f: LocalDefId| cx.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
         if is_template(self, f) {
             self.deref_sites.push((DerefTable::Recv, idx, false, f, args));
@@ -4011,7 +4020,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let template = self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
                     self.out.deref_coerce.push((
                         e,
-                        DerefRecv { before: b, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref },
+                        DerefRecv { depth: i as u8, before: b, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref },
                     ));
                     if template {
                         self.deref_sites.push((DerefTable::Coerce, idx0 + i, false, f, args));

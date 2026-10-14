@@ -1085,7 +1085,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // for the `deref` call (its `Res` applies to the target).
                     Res::Method { .. } | Res::BuiltinMethod { .. } | Res::DynMethod { .. }
                         if let Some((before, mutable)) =
-                            self.out.deref_recv.iter().rev().find(|(x, _)| *x == e).map(|(_, d)| (d.before, d.mutable)) =>
+                            self.out.deref_recv.iter().filter(|(x, _)| *x == e).min_by_key(|(_, d)| d.depth).map(|(_, d)| (d.before, d.mutable)) =>
                     {
                         self.cap_receiver(*recv, before, if mutable { Autoref::RefMut } else { Autoref::Ref }, w);
                     }
@@ -1107,7 +1107,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // reads its index as a value).
             Expr::Field { base: inner, .. } | Expr::Deref(inner) | Expr::Index { base: inner, .. }
                 if let Some((before, has_mut)) =
-                    self.out.deref_recv.iter().rev().find(|(x, _)| *x == e).map(|(_, d)| (d.before, d.f_mut.is_some())) =>
+                    self.out.deref_recv.iter().filter(|(x, _)| *x == e).min_by_key(|(_, d)| d.depth).map(|(_, d)| (d.before, d.f_mut.is_some())) =>
             {
                 let mutable = mut_ctx && has_mut;
                 let span = self.span(*inner);
