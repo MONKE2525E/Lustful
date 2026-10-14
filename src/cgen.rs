@@ -363,7 +363,7 @@ fn is128(i: IntTy) -> bool {
 /// core/src/cell.rs, 10 std/src/thread/local.rs), plus 0x40 for `pow`. Lowering names
 /// one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
-    format!("{}ull", ((0xFFFF_FF00u64 + file) << 32) | (line << 12) | col)
+    format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
 }
 
 /// The std location of an integer method that panics inside core
@@ -1550,7 +1550,7 @@ impl FnGen<'_, '_, '_> {
         let (l, c) = self.map.line_display_col(self.map.call_site(span));
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
         let slot = self.slots[self.body.fn_id.0 as usize] as u64;
-        format!("{}u", (slot << 32) | (rel << 12) | c.min(0xFFF) as u64)
+        format!("{}u", (slot << 40) | (rel << 20) | c.min(0xFFFFF) as u64)
     }
     fn tmp(&mut self) -> String {
         self.tmp += 1;
@@ -3572,7 +3572,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.prelude, "static struct {node} {{ lust_loc k; struct {node} *next; {ct} v; }} *{node}_head;");
                 let _ = writeln!(
                     self.out,
-                    "    lust_loc {l} = (lust_loc)({loc}); struct {node} *{n} = {node}_head; while ({n} && {n}->k != {l}) {n} = {n}->next;\n    if (!{n}) {{ {n} = (struct {node}*)lust_alloc(sizeof(struct {node}), _Alignof(struct {node})); {n}->k = {l}; {n}->next = {node}_head; {node}_head = {n}; uint64_t fl = 0; while (lust_file[fl]) fl++; {n}->v.f0 = (lust_str){{(uint8_t*)lust_file, fl}}; {n}->v.f1 = (uint32_t)(lust_fn_line[{l} >> 32] + (({l} >> 12) & 0xFFFFF)); {n}->v.f2 = (uint32_t)({l} & 0xFFF); }}\n    {ct} *{t} = &{n}->v;"
+                    "    lust_loc {l} = (lust_loc)({loc}); struct {node} *{n} = {node}_head; while ({n} && {n}->k != {l}) {n} = {n}->next;\n    if (!{n}) {{ {n} = (struct {node}*)lust_alloc(sizeof(struct {node}), _Alignof(struct {node})); {n}->k = {l}; {n}->next = {node}_head; {node}_head = {n}; uint64_t fl = 0; while (lust_file[fl]) fl++; {n}->v.f0 = (lust_str){{(uint8_t*)lust_file, fl}}; {n}->v.f1 = (uint32_t)(lust_fn_line[{l} >> 40] + (({l} >> 20) & 0xFFFFF)); {n}->v.f2 = (uint32_t)({l} & 0xFFFFF); }}\n    {ct} *{t} = &{n}->v;"
                 );
                 t
             }

@@ -39,10 +39,11 @@ void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t 
 })
 
 /* A std source location in a lust_loc (cgen's `std_loc`): the slot
-   field is LUST_STD_SLOT plus an index into lust_std_files, the line and
-   col fields are absolute. Index bit LUST_STD_POW marks `pow`, whose
-   overflow says "exponentiate" where its multiply says "multiply". */
-#define LUST_STD_SLOT 0xFFFFFF00u
+   field (the top 24 bits) is LUST_STD_SLOT plus an index into
+   lust_std_files, the line and col fields are absolute. Index bit
+   LUST_STD_POW marks `pow`, whose overflow says "exponentiate" where
+   its multiply says "multiply". */
+#define LUST_STD_SLOT 0xFFFF00u
 #define LUST_STD_POW 0x40u
 #ifdef LUST_IMPL
 static const char *const lust_std_files[] = {
@@ -71,12 +72,12 @@ const uint32_t *lust_slot_file;
 #endif
 
 void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
-    uint32_t slot = (uint32_t)(loc >> 32);
+    uint32_t slot = (uint32_t)(loc >> 40);
     if (slot >= LUST_STD_SLOT) {
-        lust_panic_at(msg->ptr, msg->len, lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW], (loc >> 12) & 0xFFFFF, loc & 0xFFF);
+        lust_panic_at(msg->ptr, msg->len, lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW], (loc >> 20) & 0xFFFFF, loc & 0xFFFFF);
     }
     const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
-    lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 12) & 0xFFFFF), loc & 0xFFF);
+    lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF), loc & 0xFFFFF);
 })
 
 void lust_panic_str(lust_str msg, lust_loc loc) LUST_BODY({
@@ -92,7 +93,7 @@ void lust_panic_cstr(const char *msg, lust_loc loc) LUST_BODY({
 
 /* "attempt to <op> with overflow" (checked integer math). */
 void lust_ovf(const char *op, lust_loc loc) LUST_BODY({
-    uint32_t slot = (uint32_t)(loc >> 32);
+    uint32_t slot = (uint32_t)(loc >> 40);
     if (slot >= LUST_STD_SLOT && ((slot - LUST_STD_SLOT) & LUST_STD_POW)) op = "exponentiate";
     lust_String s = lust_string_new();
     lust_string_push_cstr(&s, "attempt to ");

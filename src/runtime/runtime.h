@@ -57,9 +57,11 @@ extern lust_fnptr lust_tramps[];
 extern int (*lust_main_entry_p)(void);
 void lust_base_init(void);
 
-/* A source location: (function id << 32) | (line within the function << 12) | column. Lines are
-   relative to each function's first line (lust_fn_line), so the code for an unchanged function
-   stays valid when code above it moves. */
+/* A source location: (function id << 40) | (line within the function << 20) | column, with
+   20 bits each for the relative line and the column. Lines are relative to each function's
+   first line (lust_fn_line), so the code for an unchanged function stays valid when code
+   above it moves. A function id at or above 0xFFFF00 instead names a std source line
+   (panic.c LUST_STD_SLOT), with absolute line and column. */
 typedef uint64_t lust_loc;
 extern const uint32_t *lust_fn_line;
 #ifdef LUST_IMPL
