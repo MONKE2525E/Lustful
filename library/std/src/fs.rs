@@ -128,7 +128,10 @@ impl OpenOptions {
                 Err(e) => Err(e),
             };
         }
-        if (self.truncate && (self.append || !self.write)) || ((self.create || self.create_new) && !self.write && !self.append) {
+        // std's checks: truncate needs plain write access, except
+        // that create_new drops the truncate flag entirely; creating
+        // needs write or append access.
+        if (self.truncate && !self.create_new && (self.append || !self.write)) || ((self.create || self.create_new) && !self.write && !self.append) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "creating or truncating a file requires write or append access"));
         }
         if !self.read && !self.write && !self.append {
