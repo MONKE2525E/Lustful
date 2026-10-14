@@ -1590,7 +1590,9 @@ fn resolved_setup(
     // in-memory run, and no other thread may live at the fork (tcc.rs).
     let old_ast = std::mem::replace(&mut front.ast, ast);
     if old_ast.exprs.len() > 20_000 && caches.persistent {
-        std::thread::spawn(move || drop(old_ast));
+        // Nested token trees in the Ast drop recursively; use the
+        // compiler stack size like every other compiler thread.
+        let _ = crate::pool::thread("lust-drop").spawn(move || drop(old_ast));
     }
     front.map = map.clone();
     front.src.clone_from(&root_text);

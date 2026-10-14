@@ -32,6 +32,22 @@ type Job = dyn Fn() + Sync + 'static;
 /// The name of every pool thread (also what /proc shows for it).
 const THREAD_NAME: &str = "lust-pool";
 
+/// The stack size of every compiler thread (pool workers, scoped phase
+/// threads, the daemon guard, and the thread `lust-core` runs on). The
+/// default 2 MB overflows on deep expressions the parser accepts (a
+/// 2000-term chain checks about 1500 deep in 2 MB); the parser bounds
+/// AST depth (see `MAX_AST_DEPTH` in src/parser.rs), and this stack
+/// holds several times that depth in every pass. The space is virtual:
+/// pages are committed only as a thread's stack grows into them.
+pub const STACK_SIZE: usize = 256 << 20;
+
+/// A thread builder with the compiler stack size, for threads that run
+/// compiler work outside the pool (such as the daemon guard). The main
+/// thread gets the same room by a raised stack limit (src/main.rs).
+pub fn thread(name: &str) -> std::thread::Builder {
+    std::thread::Builder::new().name(name.into()).stack_size(STACK_SIZE)
+}
+
 struct State {
     /// The job of the current phase. Its real lifetime is the `run` call
     /// that set it: `run` returns only after every worker that took it is
@@ -112,12 +128,10 @@ fn start_threads(p: &'static Pool) {
         return;
     }
     let workers = p.workers;
-    *helper = std::thread::Builder::new()
-        .name(THREAD_NAME.into())
+    *helper = thread(THREAD_NAME)
         .spawn(move || {
-            let others: Vec<JoinHandle<()>> = (1..workers)
-                .filter_map(|_| std::thread::Builder::new().name(THREAD_NAME.into()).spawn(move || worker(p)).ok())
-                .collect();
+            let others: Vec<JoinHandle<()>> =
+                (1..workers).filter_map(|_| thread(THREAD_NAME).spawn(move || worker(p)).ok()).collect();
             worker(p);
             for h in others {
                 let _ = h.join();
@@ -323,7 +337,9 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
         parts.into_inner().unwrap_or_else(|e| e.into_inner())
     } else {
         std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n).map(|_| s.spawn(take)).collect();
+            let handles: Vec<_> = (0..n)
+                .map(|_| thread(THREAD_NAME).spawn_scoped(s, || take()).unwrap_or_else(|_| s.spawn(|| take())))
+                .collect();
             handles.into_iter().map(|h| h.join().unwrap_or_else(|payload| resume_unwind(payload))).collect()
         })
     };

@@ -908,8 +908,9 @@ pub struct Expander<'a> {
 const RECURSION_CAP: u32 = 2048;
 /// rustc's default recursion limit.
 const DEFAULT_RECURSION_LIMIT: u32 = 128;
-/// Stack bytes expansion may use on its caller's thread (a pool thread
-/// has 2 MB) before it continues on a thread of its own.
+/// Stack bytes expansion may use on its caller's thread before it
+/// continues on a thread of its own. Kept small on purpose: expansion
+/// also runs on threads lust does not size (unit tests, probes).
 const STACK_FIRST: usize = 256 << 10;
 /// The stack size of each thread expansion continues on, and the bytes
 /// one such segment uses before the next; the rest is headroom for

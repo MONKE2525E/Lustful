@@ -60,7 +60,41 @@ fn remove_obj_dir(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Raises the main thread's stack limit toward `pool::STACK_SIZE` (best
+/// effort, capped by the hard limit), so the thread the compiler runs
+/// on holds deep expressions the parser accepts. The main thread keeps
+/// running the compile because an in-memory `lust run` forks, and a
+/// fork is only sound from a lone thread (see src/tcc.rs). On Linux the
+/// main stack grows on demand up to the soft limit at fault time, so
+/// raising it here, before any deep work, is enough.
+#[cfg(unix)]
+fn raise_stack_limit() {
+    #[repr(C)]
+    struct Rlimit {
+        cur: u64,
+        max: u64,
+    }
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+    }
+    const RLIMIT_STACK: i32 = 3;
+    let mut rl = Rlimit { cur: 0, max: 0 };
+    // SAFETY: `rl` is a valid out pointer for the call.
+    if unsafe { getrlimit(RLIMIT_STACK, &mut rl) } != 0 {
+        return;
+    }
+    let want = (pool::STACK_SIZE as u64).min(rl.max).max(rl.cur);
+    if want > rl.cur {
+        rl.cur = want;
+        // SAFETY: `rl` names a limit no higher than the hard limit read above.
+        unsafe { setrlimit(RLIMIT_STACK, &rl) };
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    raise_stack_limit();
     tcc::use_mimalloc();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Agent-kit commands run in this process; they never go through the daemon.

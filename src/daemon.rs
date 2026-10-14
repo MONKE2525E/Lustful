@@ -411,7 +411,9 @@ impl GuardJobs {
         eprintln!("guard-check: start {seq} for {}", req.file.display());
         let tx = self.tx.clone();
         let key = req.session.clone();
-        std::thread::spawn(move || {
+        // The guard compiles like the serve loop, so it gets the
+        // compiler stack size (see `pool::STACK_SIZE`).
+        let _ = crate::pool::thread("lust-guard").spawn(move || {
             let work_dir = dir.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let same = |req: &Request| std::fs::read(&req.file).ok().as_deref() == Some(&src[..]);
