@@ -23,10 +23,8 @@
 //   `collection_iter_inner`), with std's item types. They stay
 //   distinct from the inner types, as std's own iterator structs
 //   are. They have no `Debug` (std's prints the remaining items).
-// Not here yet: `Extend` impls (the `Extend` trait is not on next yet),
-// `VecDeque`'s `FromIterator` (its capacity
-// follows `Vec`'s collect rules, which generic source cannot call yet), `range`, `Index` (`map[&k]` needs user `Index`), `Hash`,
-// `From<[_; N]>`, the cursor and `extract_if` APIs, `DoubleEndedIterator`
+// Not here yet: `range`, `Index` (`map[&k]` needs user `Index`),
+// `Hash`, the cursor and `extract_if` APIs, `DoubleEndedIterator`
 // for the `Map` aliases beyond what the builtin adapters provide.
 
 // The three types are defined here, not only re-exported, so a user
@@ -612,6 +610,24 @@ pub mod btree_map {
         }
     }
 
+    /// Std's `Extend` is an insert loop: a repeated key keeps the
+    /// key already in the map and takes the new value, dropping
+    /// the replaced values as it goes.
+    impl<K: Ord, V> Extend<(K, V)> for BTreeMap<K, V> {
+        fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+            for (k, v) in iter {
+                self.insert(k, v);
+            }
+        }
+    }
+
+    impl<K: Ord, V, const N: usize> From<[(K, V); N]> for BTreeMap<K, V> {
+        /// As std's: the bulk build, so the last of equal keys stays.
+        fn from(arr: [(K, V); N]) -> BTreeMap<K, V> {
+            BTreeMap { entries: sorted_dedup_last(Vec::from(arr)) }
+        }
+    }
+
     impl<K, V> IntoIterator for BTreeMap<K, V> {
         type Item = (K, V);
         type IntoIter = IntoIter<K, V>;
@@ -921,33 +937,54 @@ pub mod btree_set {
     }
 
     impl<T: Ord> FromIterator<T> for BTreeSet<T> {
-        /// Std's bulk build: stable sort, the last of equal values stays.
         fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> BTreeSet<T> {
             let mut items: Vec<T> = Vec::new();
             for v in iter {
                 items.push(v);
             }
-            let mut i = 1;
-            while i < items.len() {
-                let mut j = i;
-                while j > 0 && super::cmp_of(&items[j - 1], &items[j]) == core::cmp::Ordering::Greater {
-                    items.swap(j - 1, j);
-                    j -= 1;
-                }
-                i += 1;
+            BTreeSet { items: sorted_dedup_last_set(items) }
+        }
+    }
+
+    /// Std's `Extend` is an insert loop: an equal value already in
+    /// the set stays, the new one drops.
+    impl<T: Ord> Extend<T> for BTreeSet<T> {
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            for v in iter {
+                self.insert(v);
             }
-            let mut out: Vec<T> = Vec::new();
-            for item in items {
-                let dup = match out.last() {
-                    Some(last) => super::cmp_of(last, &item) == core::cmp::Ordering::Equal,
-                    None => false,
-                };
-                if dup {
-                    out.pop();
-                }
-                out.push(item);
+        }
+    }
+
+    /// Std's bulk build for the set: stable sort, the last of
+    /// equal values stays.
+    fn sorted_dedup_last_set<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+        let mut i = 1;
+        while i < items.len() {
+            let mut j = i;
+            while j > 0 && super::cmp_of(&items[j - 1], &items[j]) == core::cmp::Ordering::Greater {
+                items.swap(j - 1, j);
+                j -= 1;
             }
-            BTreeSet { items: out }
+            i += 1;
+        }
+        let mut out: Vec<T> = Vec::new();
+        for item in items {
+            let dup = match out.last() {
+                Some(last) => super::cmp_of(last, &item) == core::cmp::Ordering::Equal,
+                None => false,
+            };
+            if dup {
+                out.pop();
+            }
+            out.push(item);
+        }
+        out
+    }
+
+    impl<T: Ord, const N: usize> From<[T; N]> for BTreeSet<T> {
+        fn from(arr: [T; N]) -> BTreeSet<T> {
+            BTreeSet { items: sorted_dedup_last_set(Vec::from(arr)) }
         }
     }
 
@@ -1192,6 +1229,38 @@ pub mod vec_deque {
     impl<T> From<Vec<T>> for VecDeque<T> {
         fn from(buf: Vec<T>) -> VecDeque<T> {
             VecDeque { buf }
+        }
+    }
+
+    // No `FromIterator` impl here: `collect` into a `VecDeque`
+    // takes the compiler's `Vec` collect (check/iter.rs), whose
+    // capacity is std's for a deque too; a source `from_iter`
+    // body could not state that capacity (the trusted-length
+    // exact reservation). A direct `VecDeque::from_iter(..)`
+    // call rejects for now, as `Vec::from_iter(..)` does.
+
+    /// Std's extend: reserve the size hint's lower bound once,
+    /// then push at the back.
+    impl<T> Extend<T> for VecDeque<T> {
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            let iter = iter.into_iter();
+            let (lower, _) = iter.size_hint();
+            self.buf.reserve(lower);
+            for x in iter {
+                self.buf.push(x);
+            }
+        }
+    }
+
+    // The reference-item `Extend` impls of std (`Extend<&T>`,
+    // `Extend<(&K, &V)>`) are not written here: with two `Extend`
+    // impls for one type, method selection cannot pick between
+    // them yet (the input type is what the argument decides), so
+    // every `extend` call would miss. They land with that fix.
+
+    impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
+        fn from(arr: [T; N]) -> VecDeque<T> {
+            VecDeque { buf: Vec::from(arr) }
         }
     }
 
