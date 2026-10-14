@@ -66,6 +66,11 @@ struct Lower<'p, 'a> {
     /// The current binary-spine run number; each run cleans up its
     /// own unconsumed `prelowered` entries.
     spine_gen: u32,
+    /// Temporary lifetime extension (rustc `record_rvalue_scope`):
+    /// while a `let` initializer lowers, the expressions whose
+    /// temporaries live to the end of the enclosing block, with the
+    /// index of that block's scope (see `let_stmt`, `materialize`).
+    extended: Vec<(ExprId, usize)>,
 }
 
 /// Lowers one checked function body to IR.
@@ -108,6 +113,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         bind_depth: 0,
         prelowered: Vec::new(),
         spine_gen: 0,
+        extended: Vec::new(),
     };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
@@ -166,6 +172,33 @@ impl<'p, 'a> Lower<'p, 'a> {
         let l = self.new_local(ty, true, None);
         self.scopes.last_mut().unwrap().push(l);
         l
+    }
+    /// Evaluates `e` (through its coercion unless `raw`) into a new
+    /// temporary of type `ty`. As rustc's `as_temp` schedules a
+    /// temporary's drop after evaluating its expression, the temporary
+    /// joins its scope only then, so it drops before the temporaries
+    /// of its own expression (`wrap(&mk()).0`: the wrapper, then the
+    /// argument). Its scope is the innermost one, or the enclosing
+    /// block's when a `let` extends it (`extended`).
+    fn materialize(&mut self, e: ExprId, ty: Ty, raw: bool) -> Local {
+        let t = self.new_local(ty, true, None);
+        if raw {
+            self.expr_into_raw(e, Some(&Place::local(t)));
+        } else {
+            self.expr_into(e, Some(&Place::local(t)));
+        }
+        let depth = self.extended.iter().rev().find(|&&(x, _)| x == e).map_or(self.scopes.len() - 1, |&(_, d)| d);
+        self.scopes[depth].push(t);
+        t
+    }
+    /// Whether a value of type `ty` needs a drop (cached per body type).
+    fn needs_drop_ty(&mut self, ty: Ty) -> bool {
+        if let Some(&d) = self.drop_ty.get(&ty) {
+            return d;
+        }
+        let d = needs_drop(self.p, &self.body.tys, ty);
+        self.drop_ty.insert(ty, d);
+        d
     }
     fn new_block(&mut self) -> Bb {
         self.body.blocks.push(BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() });
@@ -258,15 +291,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn emit_drops(&mut self, locals: &[Local], span: Span) {
         for &l in locals.iter().rev() {
             let ty = self.body.locals[l as usize].ty;
-            let drops = match self.drop_ty.get(&ty) {
-                Some(&d) => d,
-                None => {
-                    let d = needs_drop(self.p, &self.body.tys, ty);
-                    self.drop_ty.insert(ty, d);
-                    d
-                }
-            };
-            if drops {
+            if self.needs_drop_ty(ty) {
                 self.push(StmtKind::Drop(l), span);
             }
             self.push(StmtKind::StorageDead(l), span);
@@ -482,8 +507,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Place::local(t)
             }
             _ => {
-                let t = self.temp(self.ty(e));
-                self.expr_into(e, Some(&Place::local(t)));
+                let t = self.materialize(e, self.ty(e), false);
                 Place::local(t)
             }
         }
@@ -699,8 +723,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.operand_from(p, ty)
             }
             _ => {
-                let t = self.temp(ty);
-                self.expr_into_raw(e, Some(&Place::local(t)));
+                let t = self.materialize(e, ty, true);
                 Operand::Move(Place::local(t))
             }
         }
@@ -883,7 +906,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.goto(end, span);
                 self.cur = eb;
                 if let Some(els) = els {
-                    self.expr_into(*els, dest);
+                    let reborrow = self.reborrows_arms(ty) && !self.block_diverges(*then);
+                    self.arm_into(*els, reborrow, dest);
                 } else if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
                 }
@@ -901,7 +925,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.goto(end, span);
                 self.cur = eb;
                 if let Some(els) = els {
-                    self.expr_into(*els, dest);
+                    let reborrow = self.reborrows_arms(ty) && !self.block_diverges(*then);
+                    self.arm_into(*els, reborrow, dest);
                 } else if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
                 }
@@ -1666,7 +1691,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Stmt::Expr { expr, .. } => {
                     let span = self.span(*expr);
                     self.scopes.push(Vec::new());
-                    self.expr_into(*expr, None);
+                    self.stmt_expr(*expr);
                     self.pop_scope(span);
                 }
             }
@@ -1684,146 +1709,276 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.pop_scope(block.span);
     }
 
-    fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>, span: Span) {
+    /// An expression statement, as rustc's `stmt_expr`: the value goes
+    /// into a statement temporary that drops at the end of the
+    /// statement. A place moves (or copies) into it (`s;` drops `s`
+    /// here), and a block, `if`, `match`, or `loop` value drops after
+    /// the locals of the block that made it. Other values already go to
+    /// a temporary of this scope where the expression needs one.
+    fn stmt_expr(&mut self, e: ExprId) {
+        let value = matches!(
+            self.p.ast.expr(e),
+            Expr::Block(_) | Expr::LabeledBlock { .. } | Expr::If { .. } | Expr::Match { .. } | Expr::Loop { .. }
+        );
+        let ty = self.ty(e);
+        if self.ck.coerce(e) == Coerce::None && (self.is_place_expr(e) || value && self.needs_drop_ty(ty)) {
+            self.materialize(e, ty, false);
+        } else {
+            self.expr_into(e, None);
+        }
+    }
+
+    /// An `if` or `match` arm. rustc's LUB coercion reborrows (`&*arm`)
+    /// each reference-typed arm after the first one that does not
+    /// diverge (`reborrow`): the reborrow reads the arm's value after the
+    /// arm's block has dropped its locals and tail temporaries, so a
+    /// borrow of those is an error even when the result is unused (`if c
+    /// { .. } else { &temp() };`). Such an arm goes into a temporary
+    /// first; a coerced arm is already read through its coercion.
+    fn arm_into(&mut self, e: ExprId, reborrow: bool, dest: Option<&Place>) {
+        if !reborrow || self.ck.coerce(e) != Coerce::None {
+            self.expr_into(e, dest);
+            return;
+        }
+        let (ty, span) = (self.ty(e), self.span(e));
+        let t = self.materialize(e, ty, false);
+        match dest {
+            Some(d) => {
+                let op = self.operand_from(Place::local(t), ty);
+                self.assign(d.clone(), Rvalue::Use(op), span);
+            }
+            None => self.push(StmtKind::FakeRead(t), span),
+        }
+    }
+
+    /// True when an `if` or `match` result of type `ty` is a reference,
+    /// whose later arms rustc reborrows (`arm_into`).
+    fn reborrows_arms(&self, ty: Ty) -> bool {
+        matches!(self.kind(ty), TyKind::Ref(..))
+    }
+
+    fn diverges(&self, e: ExprId) -> bool {
+        matches!(self.kind(self.ty(e)), TyKind::Never)
+    }
+
+    /// True when block `b` has type `!`: its tail diverges, or it has no
+    /// tail where a value is expected.
+    fn block_diverges(&self, b: ast::BlockId) -> bool {
+        self.p.ast.block(b).tail.is_none_or(|t| self.diverges(t))
+    }
+
+    /// Marks the temporaries a `let` initializer extends to the end of
+    /// the enclosing block (scope `depth`), as rustc's
+    /// `record_rvalue_scope_if_borrow_expr`: the operand of each
+    /// extending borrow, found through the initializer itself and the
+    /// operands of extending struct, tuple, array, and cast expressions,
+    /// the arguments of tuple struct and variant constructors, block
+    /// tails, and the arms of `if` and `match`.
+    fn mark_extending(&mut self, e: ExprId, depth: usize) {
         let p = self.p;
-        match (p.ast.pat(pat), self.ck.pat_res(pat)) {
-            (Pat::Binding { .. }, PatRes::Binding { local, mode }) => {
-                let info = &self.ck.locals[local as usize];
-                let (ty, m, name) = (info.ty, info.mutable, p.name(info.name).to_string());
-                let l = self.new_local(ty, m, Some(name));
-                self.local_map[local as usize] = l;
-                if let Some(init) = init {
-                    self.scopes.push(Vec::new());
-                    match mode {
-                        BindMode::Move => {
-                            // `let x = &temp();` extends the temporary to the enclosing block.
-                            if let Expr::Ref { mutable, expr, .. } = p.ast.expr(init)
-                                && matches!(
-                                    self.ck.coerce(init),
-                                    Coerce::None | Coerce::SliceFromArray(_) | Coerce::SliceFromVec(_) | Coerce::Unsize(_)
-                                )
-                                && !self.is_place_expr(*expr)
-                            {
-                                let t = self.ty(*expr);
-                                let tmp = self.new_local(t, true, None);
-                                let n = self.scopes.len();
-                                self.scopes[n - 2].push(tmp);
-                                self.expr_into(*expr, Some(&Place::local(tmp)));
-                                if self.ck.coerce(init) == Coerce::None {
-                                    self.assign(Place::local(l), Rvalue::Ref(*mutable, Place::local(tmp)), span);
-                                } else if let Coerce::Unsize(target) = self.ck.coerce(init) {
-                                    // `let d: &dyn Tr = &S::new();` extends the
-                                    // temporary too, then unsizes the borrow.
-                                    let rt = self.ref_ty(*mutable, t);
-                                    let r = self.temp(rt);
-                                    self.assign(Place::local(r), Rvalue::Ref(*mutable, Place::local(tmp)), span);
-                                    let op = if *mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
-                                    let o = self.unsize(op, rt, target, span);
-                                    self.assign(Place::local(l), Rvalue::Use(o), span);
-                                } else {
-                                    self.assign(Place::local(l), Rvalue::SliceOf(Place::local(tmp)), span);
-                                }
-                                self.pop_scope(span);
-                                self.scopes.last_mut().unwrap().push(l);
-                                return;
-                            }
-                            self.expr_into(init, Some(&Place::local(l)));
-                        }
-                        BindMode::Ref(m) => {
-                            let pl = if m { self.place_for_mut(init) } else { self.place(init) };
-                            self.assign(Place::local(l), Rvalue::Ref(m, pl), span);
-                        }
-                    }
-                    self.pop_scope(span);
-                }
-                self.scopes.last_mut().unwrap().push(l);
+        match p.ast.expr(e) {
+            Expr::Ref { expr, .. } => {
+                self.mark_extending(*expr, depth);
+                self.mark_extended(*expr, depth);
             }
-            (Pat::Wild, _) => {
-                if let Some(init) = init {
-                    // `let _ = place;` does not move the place. A `Copy` place is still
-                    // read, so a borrow stored in it stays live until this point: emit
-                    // the read into a throwaway temporary.
-                    self.scopes.push(Vec::new());
-                    if self.is_place_expr(init) {
-                        let pl = self.place(init);
-                        let ty = self.ty(init);
-                        if is_copy(self.p, &self.body.tys, ty) {
-                            let t = self.temp(ty);
-                            self.assign(Place::local(t), Rvalue::Use(Operand::Copy(pl)), span);
-                        }
-                    } else {
-                        self.expr_into(init, None);
-                    }
-                    self.pop_scope(span);
+            Expr::StructLit { fields, .. } => {
+                for &(_, _, f) in fields {
+                    self.mark_extending(f, depth);
                 }
             }
-            _ => {
-                // A destructuring `let` binds directly out of a place
-                // initializer, as in rustc: a binding that moves a part
-                // is a partial move of that place, and the parts the
-                // pattern does not move stay in it and drop with it
-                // (codegen elaborates the drop, `cgen::FnGen::elab_drop`).
-                // Any other initializer goes through a temporary: it
-                // moves there once, stays in scope before the bindings,
-                // and parts the pattern does not move drop at scope exit.
-                if let Some(init) = init {
-                    if self.is_place_expr(init) {
-                        self.scopes.push(Vec::new());
-                        let pl = self.place(init);
-                        // Move the place's own temporaries (index values
-                        // and the like) into the block scope without
-                        // dropping them: the projections name them.
-                        let temps = self.scopes.pop().unwrap();
-                        self.scopes.last_mut().unwrap().extend(temps);
-                        let pl = self.pattern_place(pl, self.ty(init), &[pat], span);
-                        self.bind_pat(pat, pl);
-                    } else {
-                        let tty = self.ty(init);
-                        let t = self.new_local(tty, true, None);
-                        self.scopes.push(Vec::new());
-                        self.expr_into(init, Some(&Place::local(t)));
-                        self.pop_scope(span);
-                        self.scopes.last_mut().unwrap().push(t);
-                        self.bind_pat(pat, Place::local(t));
-                    }
+            Expr::Tuple(es) | Expr::Array(es) => {
+                for &x in es {
+                    self.mark_extending(x, depth);
                 }
+            }
+            Expr::Cast { expr, .. } => self.mark_extending(*expr, depth),
+            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::LabeledBlock { body: b, .. } => {
+                if let Some(t) = p.ast.block(*b).tail {
+                    self.mark_extending(t, depth);
+                }
+            }
+            Expr::If { then, els, .. } => {
+                if let Some(t) = p.ast.block(*then).tail {
+                    self.mark_extending(t, depth);
+                }
+                if let Some(x) = els {
+                    self.mark_extending(*x, depth);
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for arm in arms {
+                    self.mark_extending(arm.body, depth);
+                }
+            }
+            Expr::Call { callee, args } if self.is_ctor_callee(e, *callee) => {
+                for &a in args {
+                    self.mark_extending(a, depth);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// rustc's `record_rvalue_scope`: `e`, and the expressions it
+    /// borrows, derefs, or projects a field or an index from, get the
+    /// extended temporary scope (`&temp().field` extends `temp()`).
+    fn mark_extended(&mut self, mut e: ExprId, depth: usize) {
+        loop {
+            self.extended.push((e, depth));
+            match self.p.ast.expr(e) {
+                Expr::Ref { expr, .. } | Expr::Deref(expr) => e = *expr,
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => e = *base,
+                _ => return,
             }
         }
     }
 
+    /// True for the callee of a tuple struct or tuple variant
+    /// constructor call written as a resolved path (`W(..)`, `Some(..)`,
+    /// `m::E::V(..)`, `Self(..)`), whose arguments extend like a
+    /// struct literal's fields. A type-relative path (`Self::V(..)`, a
+    /// variant through a type alias) does not extend, as in rustc.
+    fn is_ctor_callee(&self, call: ExprId, callee: ExprId) -> bool {
+        let p = self.p;
+        let Expr::Path(segs) = p.ast.expr(callee) else { return false };
+        if !matches!(self.ck.res(call), Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr) {
+            return false;
+        }
+        match segs.len() {
+            0 | 1 => true,
+            n => {
+                let head = segs[n - 2].name;
+                head != p.known.self_type && !p.aliases.contains_key(&head)
+            }
+        }
+    }
+
+    /// rustc's `is_binding_pat`: a pattern with an explicit `ref` or
+    /// `ref mut` binding (not one match ergonomics makes) extends its
+    /// whole initializer to the end of the block.
+    fn is_binding_pat(&self, pat: PatId) -> bool {
+        match self.p.ast.pat(pat) {
+            Pat::Binding { by_ref, .. } | Pat::At { by_ref, .. } => *by_ref,
+            Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.is_binding_pat(s)),
+            Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&s| self.is_binding_pat(s)),
+            Pat::Slice { prefix, middle, suffix } => {
+                middle.is_some_and(|m| self.is_binding_pat(m)) || prefix.iter().chain(suffix.iter()).any(|&s| self.is_binding_pat(s))
+            }
+            Pat::Paren(i) => self.is_binding_pat(*i),
+            _ => false,
+        }
+    }
+
+    /// `let PAT = init;`, as rustc builds it: the initializer's
+    /// temporaries drop at the end of the statement, except those a
+    /// borrow extends to the end of the block (`mark_extending`). A
+    /// plain binding takes the value directly and is used once it is
+    /// set (rustc's `FakeRead(ForLet)`), so a borrow of something the
+    /// initializer already dropped is an error. Any other pattern binds
+    /// out of the initializer's place (see `pattern_init`).
+    fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>, span: Span) {
+        let p = self.p;
+        let Some(init) = init else {
+            if let (Pat::Binding { .. }, PatRes::Binding { local, .. }) = (p.ast.pat(pat), self.ck.pat_res(pat)) {
+                let l = self.binding_local(local);
+                self.scopes.last_mut().unwrap().push(l);
+            }
+            return;
+        };
+        let block = self.scopes.len() - 1;
+        let mark = self.extended.len();
+        self.mark_extending(init, block);
+        self.scopes.push(Vec::new());
+        match (p.ast.pat(pat), self.ck.pat_res(pat)) {
+            (Pat::Binding { by_ref: false, .. }, PatRes::Binding { local, mode: BindMode::Move }) => {
+                let l = self.binding_local(local);
+                self.expr_into(init, Some(&Place::local(l)));
+                self.push(StmtKind::FakeRead(l), span);
+                self.scopes[block].push(l);
+            }
+            (Pat::Wild, _) => {
+                // `let _ = init;` binds nothing. A place initializer is
+                // only mentioned (rustc `PlaceMention`): not read or
+                // moved, but its root is live here; an index in it still
+                // runs, through a shared borrow. A value goes into a
+                // statement temporary that is mentioned the same way.
+                if self.ck.coerce(init) == Coerce::None && self.is_place_expr(init) {
+                    let pl = self.place(init);
+                    if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+                        let rt = self.ref_ty(false, self.ty(init));
+                        let t = self.temp(rt);
+                        self.assign(Place::local(t), Rvalue::Ref(false, pl), span);
+                    } else {
+                        self.push(StmtKind::FakeRead(pl.local), span);
+                    }
+                } else if let Operand::Copy(pl) | Operand::Move(pl) = self.operand(init) {
+                    self.push(StmtKind::FakeRead(pl.local), span);
+                }
+            }
+            _ => {
+                let src = self.pattern_init(pat, init, block, span);
+                let stmt = self.scopes.pop().unwrap();
+                self.bind_pat(pat, src);
+                self.scopes.push(stmt);
+            }
+        }
+        self.pop_scope(span);
+        self.extended.truncate(mark);
+    }
+
+    /// The IR local for a `let` binding's checker local.
+    fn binding_local(&mut self, local: u32) -> Local {
+        let info = &self.ck.locals[local as usize];
+        let (ty, m, name) = (info.ty, info.mutable, self.p.name(info.name).to_string());
+        let l = self.new_local(ty, m, Some(name));
+        self.local_map[local as usize] = l;
+        l
+    }
+
+    /// The place a destructuring `let` (or `let`-`else`) binds out of,
+    /// evaluated in the statement scope (the innermost one): a place
+    /// initializer itself, as in rustc (a binding that moves a part is
+    /// a partial move of it; the rest stays and drops with its owner,
+    /// `cgen::FnGen::elab_drop`); any other value moves into a
+    /// temporary whose leftover parts drop at the end of the statement,
+    /// or at the end of the block (scope `block`) when the pattern has
+    /// an explicit `ref` binding, which extends the whole initializer.
+    fn pattern_init(&mut self, pat: PatId, init: ExprId, block: usize, span: Span) -> Place {
+        if self.is_binding_pat(pat) {
+            self.mark_extended(init, block);
+        }
+        if self.ck.coerce(init) == Coerce::None && self.is_place_expr(init) {
+            let pl = self.place(init);
+            return self.pattern_place(pl, self.ty(init), &[pat], span);
+        }
+        let t = self.materialize(init, self.coerced_ty(init), false);
+        Place::local(t)
+    }
+
     /// `let PAT = init else { ... };`: test the pattern against the
-    /// scrutinee place (a place initializer directly, any other
-    /// initializer through a block-scope temporary, as in `let_stmt`),
-    /// bind on success, and run the diverging else block on failure.
-    /// The scrutinee temporary stays in the block scope before the
-    /// bindings, so parts the pattern does not move drop at scope
-    /// exit on both paths (the else block's own exits drop it through
-    /// the usual scope cleanup).
+    /// initializer's place (`pattern_init`), bind on success, and run
+    /// the diverging else block on failure. The statement's
+    /// temporaries drop at its end on success and before the else
+    /// block on failure, as in rustc.
     fn let_else_stmt(&mut self, pat: PatId, init: Option<ExprId>, els: ast::BlockId, span: Span) {
         let Some(init) = init else { return };
-        let sp = if self.is_place_expr(init) {
-            self.scopes.push(Vec::new());
-            let pl = self.place(init);
-            let temps = self.scopes.pop().unwrap();
-            self.scopes.last_mut().unwrap().extend(temps);
-            pl
-        } else {
-            let tty = self.ty(init);
-            let t = self.new_local(tty, true, None);
-            self.scopes.push(Vec::new());
-            self.expr_into(init, Some(&Place::local(t)));
-            self.pop_scope(span);
-            self.scopes.last_mut().unwrap().push(t);
-            Place::local(t)
-        };
+        let block = self.scopes.len() - 1;
+        let mark = self.extended.len();
+        self.mark_extending(init, block);
+        self.scopes.push(Vec::new());
+        let sp = self.pattern_init(pat, init, block, span);
         let fail = self.new_block();
         self.test_pat(pat, sp.clone(), fail);
+        let stmt = self.scopes.pop().unwrap();
+        self.bind_pat(pat, sp);
+        self.emit_drops(&stmt, span);
+        self.extended.truncate(mark);
         let cont = self.cur;
         self.cur = fail;
+        self.emit_drops(&stmt, span);
         self.block_into(els, None);
         self.terminate(Terminator::Unreachable, span);
         self.cur = cont;
-        self.bind_pat(pat, sp);
     }
 
     // ---------- Calls ----------
@@ -2439,8 +2594,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             // Short circuit. Both sides write a mutable temporary, and the destination is
             // written once at the end. Writing the destination twice would make the borrow
             // checker see `let hot = a && b;` as two assignments to an immutable binding.
+            // Each side is a terminating scope, as in rustc: its temporaries drop right
+            // after it.
             let tmp = Place::local(self.temp(ty));
+            self.scopes.push(Vec::new());
             self.expr_into(lhs, Some(&tmp));
+            self.pop_scope(span);
             let (rhs_bb, end) = (self.new_block(), self.new_block());
             let b = &mut self.body.blocks[self.cur.0 as usize];
             b.term = if op == BinOp::And {
@@ -3069,8 +3228,9 @@ impl<'p, 'a> Lower<'p, 'a> {
     // ---------- Match ----------
 
     fn match_into(&mut self, scrut: ExprId, arms: &[ast::Arm], dest: Option<&Place>, span: Span) {
-        // Temporaries in the scrutinee live until the end of the match.
-        self.scopes.push(Vec::new());
+        // Temporaries in the scrutinee belong to the enclosing scope, as
+        // in rustc (the scrutinee is not a terminating scope): in a `let`
+        // or a call argument they live to the end of the statement.
         // Arms bind out of the scrutinee place itself, as in rustc: an
         // arm that moves a part is a partial move of that place, and
         // the rest drops with it (codegen elaborates the drop).
@@ -3078,7 +3238,11 @@ impl<'p, 'a> Lower<'p, 'a> {
         let arm_pats: Vec<PatId> = arms.iter().map(|a| a.pat).collect();
         let sp = self.pattern_place(sp, self.ty(scrut), &arm_pats, span);
         let end = self.new_block();
-        for arm in arms {
+        // Reference-typed arms after the first that does not diverge are
+        // reborrowed (`arm_into`).
+        let first = arms.iter().position(|a| !self.diverges(a.body));
+        let reborrow = first.is_some_and(|i| self.reborrows_arms(self.ty(arms[i].body)));
+        for (ai, arm) in arms.iter().enumerate() {
             // A guard reads the arm's bindings by shared reference
             // (rustc binds pattern variables by reference for the
             // guard, then by their declared mode in the arm body):
@@ -3170,14 +3334,14 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             self.or_forced = saved_forced;
             self.cur = body_bb;
-            self.expr_into(arm.body, dest);
+            let rb = reborrow && first.is_some_and(|i| ai > i) && !self.diverges(arm.body);
+            self.arm_into(arm.body, rb, dest);
             self.pop_scope(span);
             self.goto(end, span);
             self.cur = next;
         }
         self.terminate(Terminator::Unreachable, span);
         self.cur = end;
-        self.pop_scope(span);
     }
 
     /// True when a slice pattern in `pat` binds its middle by
