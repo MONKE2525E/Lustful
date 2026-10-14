@@ -11,6 +11,10 @@
 
 extern char **environ;
 
+/* glibc exposes pipe2 only under a feature macro this unit does not
+   set; declare it (the symbol is always in libc). */
+int pipe2(int pipefd[2], int flags);
+
 /* Appends `n` bytes to a Vec<u8>. */
 static void lust_sysio_push(lust_Vec *out, const void *p, uint64_t n) {
     if (n == 0) return;
@@ -180,3 +184,197 @@ int64_t lust_sys_proc_wait(uint32_t pid, uint8_t block) {
 }
 
 int32_t lust_sys_proc_kill(uint32_t pid) { return kill((pid_t)pid, SIGKILL) == 0 ? 0 : errno; }
+
+/* glibc's PATH-searching exec with an explicit environment; declared
+   here because no feature macro exposes it in this unit. */
+int execvpe(const char *file, char *const argv[], char *const envp[]);
+
+/* Splits NUL-terminated packed strings (the argv and env formats of
+   sysio.h) into a malloc'd, NULL-terminated array. The strings
+   themselves are copied, so the packed bytes may be freed. */
+static char **lust_sysio_split(const uint8_t *p, uint64_t len) {
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < len; i++)
+        if (p[i] == 0) count++;
+    char **arr = malloc((count + 1) * sizeof *arr);
+    if (!arr) lust_oom();
+    uint64_t at = 0, start = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        if (p[i] != 0) continue;
+        arr[at] = malloc(i - start + 1);
+        if (!arr[at]) lust_oom();
+        memcpy(arr[at], p + start, i - start);
+        arr[at][i - start] = 0;
+        at++;
+        start = i + 1;
+    }
+    arr[at] = NULL;
+    return arr;
+}
+
+static void lust_sysio_free_split(char **arr) {
+    if (!arr) return;
+    for (uint64_t i = 0; arr[i]; i++) free(arr[i]);
+    free(arr);
+}
+
+/* Appends one 8-byte little-endian value to the Vec. */
+static void lust_sysio_push_u64(lust_Vec *out, uint64_t v) {
+    uint8_t b[8];
+    for (int k = 0; k < 8; k++) b[k] = (uint8_t)(v >> (8 * k));
+    lust_sysio_push(out, b, 8);
+}
+
+/* Spawns `prog` with fork and execvpe, as std's Command::spawn does
+   on Linux: the child's stdio is set up from the specs, then the
+   working directory, then exec (with PATH search through the
+   child's environment when the program has no slash). An error in
+   the child before exec (chdir, dup, exec itself) travels back
+   through a close-on-exec pipe and becomes the spawn error, the
+   errno std reports. `stdio` packs three 2-bit specs (stdin,
+   stdout, stderr) and bit 6 for a working directory; spec 0 inherit,
+   1 /dev/null, 2 pipe, 3 the fd in that stream's slot of the packed
+   `fds` (three 8-byte little-endian values). */
+int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t *args, uint64_t argslen,
+                            const uint8_t *env, uint64_t envlen, const uint8_t *cwd, uint64_t cwdlen, uint32_t stdio,
+                            const uint8_t *fds, uint64_t fdslen, lust_Vec *out) {
+    if (argslen == 0 || envlen == 0) return EINVAL;
+    char *prog_s = malloc(proglen + 1);
+    if (!prog_s) lust_oom();
+    memcpy(prog_s, prog, proglen);
+    prog_s[proglen] = 0;
+    char **argv = lust_sysio_split(args, argslen);
+    char **envp = env[0] == 0 ? environ : lust_sysio_split(env + 1, envlen - 1);
+    int have_cwd = (stdio >> 6) & 1;
+    char *cwd_s = NULL;
+    if (have_cwd) {
+        cwd_s = malloc(cwdlen + 1);
+        if (!cwd_s) lust_oom();
+        memcpy(cwd_s, cwd, cwdlen);
+        cwd_s[cwdlen] = 0;
+    }
+    int spec[3] = {(int)(stdio & 3), (int)((stdio >> 2) & 3), (int)((stdio >> 4) & 3)};
+    int srcfd[3] = {-1, -1, -1};
+    for (int i = 0; i < 3; i++) {
+        if (spec[i] != 3) continue;
+        if (fdslen < (uint64_t)(i + 1) * 8) return EINVAL;
+        uint64_t v = 0;
+        for (int k = 0; k < 8; k++) v |= (uint64_t)fds[i * 8 + k] << (8 * k);
+        srcfd[i] = (int)(int64_t)v;
+    }
+    int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
+    int err = 0;
+    for (int i = 0; i < 3 && !err; i++) {
+        if (spec[i] == 2 && pipe2(pipes[i], O_CLOEXEC) != 0) err = errno;
+    }
+    int errpipe[2] = {-1, -1};
+    if (!err && pipe2(errpipe, O_CLOEXEC) != 0) err = errno;
+    if (err) {
+        for (int i = 0; i < 3; i++) {
+            if (pipes[i][0] >= 0) close(pipes[i][0]);
+            if (pipes[i][1] >= 0) close(pipes[i][1]);
+        }
+        if (errpipe[0] >= 0) close(errpipe[0]);
+        if (errpipe[1] >= 0) close(errpipe[1]);
+        if (envp != environ) lust_sysio_free_split(envp);
+        lust_sysio_free_split(argv);
+        free(prog_s);
+        free(cwd_s);
+        return err;
+    }
+    /* Order parent and child output as rustc's line-buffered stdout
+       does: text printed before the spawn is out before an
+       inheriting child writes. (A partial line with no newline also
+       goes out; rustc would hold it.) */
+    if (spec[1] == 0 || spec[2] == 0) fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* The child: set up, report any error through errpipe, exec. */
+        close(errpipe[0]);
+        int target_of[3] = {0, 1, 2};
+        for (int i = 0; i < 3; i++) {
+            int dest = target_of[i];
+            if (spec[i] == 0) continue;
+            int src = srcfd[i];
+            if (spec[i] == 1) {
+                src = open("/dev/null", i == 0 ? O_RDONLY : O_WRONLY);
+                if (src < 0) goto child_err;
+            } else if (spec[i] == 2) {
+                src = pipes[i][i == 0 ? 0 : 1];
+            }
+            if (src != dest) {
+                if (dup2(src, dest) < 0) goto child_err;
+            } else {
+                /* The fd already is the target but is close-on-exec. */
+                int fl = fcntl(src, F_GETFD);
+                if (fl >= 0) fcntl(src, F_SETFD, fl & ~FD_CLOEXEC);
+            }
+        }
+        for (int i = 0; i < 3; i++) {
+            if (pipes[i][0] > 2) close(pipes[i][0]);
+            if (pipes[i][1] > 2) close(pipes[i][1]);
+        }
+        if (have_cwd && chdir(cwd_s) != 0) goto child_err;
+        signal(SIGPIPE, SIG_DFL);
+        execvpe(prog_s, argv, envp);
+    child_err: {
+            int e = errno;
+            const uint8_t *p = (const uint8_t *)&e;
+            uint64_t left = sizeof e;
+            while (left > 0) {
+                ssize_t n = write(errpipe[1], p, left);
+                if (n <= 0) break;
+                p += n;
+                left -= (uint64_t)n;
+            }
+            _exit(127);
+        }
+    }
+    int fork_err = pid < 0 ? errno : 0;
+    close(errpipe[1]);
+    for (int i = 0; i < 3; i++) {
+        if (pipes[i][i == 0 ? 0 : 1] >= 0) close(pipes[i][i == 0 ? 0 : 1]);
+    }
+    if (pid < 0) {
+        close(errpipe[0]);
+        for (int i = 0; i < 3; i++) {
+            if (pipes[i][i == 0 ? 1 : 0] >= 0) close(pipes[i][i == 0 ? 1 : 0]);
+        }
+        if (envp != environ) lust_sysio_free_split(envp);
+        lust_sysio_free_split(argv);
+        free(prog_s);
+        free(cwd_s);
+        return fork_err;
+    }
+    /* Read the error pipe: EOF means exec succeeded. */
+    int child_err = 0;
+    {
+        uint8_t buf[sizeof(int)];
+        uint64_t got = 0;
+        for (;;) {
+            ssize_t n = read(errpipe[0], buf + got, sizeof buf - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (uint64_t)n;
+            if (got == sizeof buf) break;
+        }
+        close(errpipe[0]);
+        if (got == sizeof buf) memcpy(&child_err, buf, sizeof buf);
+    }
+    if (envp != environ) lust_sysio_free_split(envp);
+    lust_sysio_free_split(argv);
+    free(prog_s);
+    free(cwd_s);
+    if (child_err) {
+        int st;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+        }
+        for (int i = 0; i < 3; i++) {
+            if (pipes[i][i == 0 ? 1 : 0] >= 0) close(pipes[i][i == 0 ? 1 : 0]);
+        }
+        return child_err;
+    }
+    lust_sysio_push_u64(out, (uint64_t)pid);
+    for (int i = 0; i < 3; i++) lust_sysio_push_u64(out, (uint64_t)(int64_t)(spec[i] == 2 ? pipes[i][i == 0 ? 1 : 0] : -1));
+    return 0;
+}

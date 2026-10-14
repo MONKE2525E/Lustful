@@ -1059,6 +1059,40 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // Spawns a process with the packed argv, env, cwd, stdio specs
+    // and fds process_os.rs builds (sysio.c has the formats). On
+    // success the Vec gains the pid and the three pipe parent fds as
+    // 8-byte fields. 0, or errno.
+    IntrinsicDef {
+        name: "sys_proc_spawn",
+        c_symbol: "lust_sys_proc_spawn",
+        params: &[S::Bytes, S::Bytes, S::Bytes, S::Bytes, S::U32, S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // waitpid: the raw wait status, -2 when a non-blocking wait
+    // finds the child still running, or -errno.
+    IntrinsicDef {
+        name: "sys_proc_wait",
+        c_symbol: "lust_sys_proc_wait",
+        params: &[S::U32, S::Bool],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // kill with SIGKILL: 0, or errno.
+    IntrinsicDef { name: "sys_proc_kill", c_symbol: "lust_sys_proc_kill", params: &[S::U32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // Reads two fds to EOF at once (poll), for Command::output:
+    // 0, or errno of the first failed read.
+    IntrinsicDef {
+        name: "sys_fd_read_both",
+        c_symbol: "lust_sys_fd_read_both",
+        params: &[S::I32, S::VecU8Mut, S::I32, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).
