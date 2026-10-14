@@ -320,7 +320,15 @@ impl<T, S: Default> Default for IndexSet<T, S> {
 
 impl<T: core::fmt::Debug, S> core::fmt::Debug for IndexSet<T, S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_set().entries(self.iter()).finish()
+        // Upstream's `entries(self.iter())`, one entry at a time.
+        let mut set = f.debug_set();
+        let entries = &self.map.core.entries;
+        let mut i = 0;
+        while i < entries.len() {
+            set.entry(&entries[i].key);
+            i += 1;
+        }
+        set.finish()
     }
 }
 

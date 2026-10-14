@@ -793,7 +793,16 @@ impl<K, V, S: Default> Default for IndexMap<K, V, S> {
 
 impl<K: core::fmt::Debug, V: core::fmt::Debug, S> core::fmt::Debug for IndexMap<K, V, S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
+        // Upstream's `entries(self.iter())`, one entry at a time (lust's
+        // DebugMap has no `entries` yet; the output is the same).
+        let mut map = f.debug_map();
+        let entries = &self.core.entries;
+        let mut i = 0;
+        while i < entries.len() {
+            map.entry(&entries[i].key, &entries[i].value);
+            i += 1;
+        }
+        map.finish()
     }
 }
 
