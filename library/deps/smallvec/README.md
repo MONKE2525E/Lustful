@@ -5,11 +5,12 @@ The adapter is written and checked against the real crate with rustc
 in `pending/`, and a dependency on smallvec is L0508 ("no lust adapter
 yet"). The corpus is tests/adapters/crates/smallvec (UNSUPPORTED today).
 
-Blocked on: method calls that autoderef from a user type to builtin
-slice methods (`Deref<Target = [T]>`, W-CHECK-G); `Iterator::size_hint` overrides,
+Blocked on: a user `Deref<Target = [T]>` as an operator and for method
+calls, so `v[i]`, `*v`, and slice methods (rejects on next; W-CHECK-G
+or W-TRAITS); `Iterator::size_hint` overrides,
 `DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, and the `Hasher`
 trait (W-STD-B, in its queue); `into_iter()` on a generic
-`I: IntoIterator` parameter (W-STD-B or W-TRAITS). `drain` (ts-rust
+`I: IntoIterator` parameter (in W-TRAITS2's next landing). `drain` (ts-rust
 calls `drain(..)`) also needs `Vec::drain`, `RangeBounds`, and `..` as
 a value (L9001 today), which no package has queued yet (W-STD-A owns
 Vec).

@@ -9,7 +9,8 @@ Blocked on: `Iterator::size_hint` overrides, `DoubleEndedIterator`,
 `ExactSizeIterator`, `Extend`, `BuildHasher::hash_one` in generic
 code, and `RandomState` (W-STD-B, in its queue); `into_iter()` on a
 generic `I: IntoIterator` parameter, which `Extend` and `FromIterator`
-need (W-STD-B or W-TRAITS).
+need (in W-TRAITS2's next landing); a user `Index` impl as the
+`map[&key]` operator (rejects on next).
 
 On next plus W-STD-B's queue (a scratch merge) with `extend` and
 `from_iter` cut, the adapter compiles. The corpus cases then also need
