@@ -5112,7 +5112,8 @@ pub fn finish_trait_impl(
                     let want = subst(&mut p.tys, want, &args);
                     // `Self::A` in the declared type is this impl's
                     // binding for `A` (as for method signatures).
-                    let want = rewrite_impl_projections(p, want, &assoc_tys);
+                    let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+                    let want = rewrite_impl_projections(p, want, self_ty, &assoc_tys);
                     if got != want {
                         errs.push(Diag::new(
                             "L0110",
@@ -5189,8 +5190,15 @@ pub fn finish_trait_impl(
     // Method validation against the trait's templates.
     let impl_parent_n = impl_generics.params.len();
     for (method_def, mname) in &rec.methods {
-        let Some(tmpl) = p.gx.trait_methods.get(method_def).cloned() else { continue };
         let found = method_ids.iter().copied().find(|&id| p.fn_info(id).name == *mname);
+        let Some(tmpl) = p.gx.trait_methods.get(method_def).cloned() else {
+            // A lang trait's method has no template (`fmt` is checked
+            // by check_fmt_impl).
+            if tr.def != p.gx.lang.debug && tr.def != p.gx.lang.display {
+                check_lang_method(p, tr, *method_def, *mname, found, impl_parent_n, &assoc_tys, imp.span, errs);
+            }
+            continue;
+        };
         let Some(local) = found else {
             if tmpl.def.body.is_none() {
                 errs.push(Diag::new(
@@ -5376,18 +5384,30 @@ fn check_drop_impl(p: &Program, imp: &ast::ImplDef, generics: &Generics, self_pa
     }
 }
 
-/// Rewrites projections of this impl's associated types to the
-/// impl's bindings (in impl parameter space). Used when the
-/// solver cannot normalize them because the Self type is still
-/// a parameter.
-fn rewrite_impl_projections(p: &mut Program, t: Ty, assoc_tys: &[(DefId, Ty)]) -> Ty {
+/// Rewrites projections of this impl's associated types on its Self
+/// type `self_ty` to the impl's bindings (in impl parameter space).
+/// Used when the solver cannot normalize them because the Self type
+/// is still a parameter.
+fn rewrite_impl_projections(p: &mut Program, t: Ty, self_ty: Ty, assoc_tys: &[(DefId, Ty)]) -> Ty {
+    rewrite_projections_at(p, t, self_ty, assoc_tys, 0)
+}
+
+/// `rewrite_impl_projections` at nesting `depth`: a projection on
+/// another type (`I::Item` in `type Item = I::Item`) stays, and a
+/// binding that names itself stops at a fixed depth instead of looping.
+fn rewrite_projections_at(p: &mut Program, t: Ty, self_ty: Ty, assoc_tys: &[(DefId, Ty)], depth: u32) -> Ty {
+    if depth > 16 {
+        return t;
+    }
+    let assoc_tys_ref = assoc_tys;
+    let rw = |p: &mut Program, e: Ty| rewrite_projections_at(p, e, self_ty, assoc_tys_ref, depth + 1);
     match p.tys.kind(t) {
-        TyKind::Projection(assoc, _) => match assoc_tys.iter().find(|(d, _)| *d == assoc.0) {
-            Some((_, bound)) => rewrite_impl_projections(p, *bound, assoc_tys),
-            None => t,
+        TyKind::Projection(assoc, args) => match assoc_tys.iter().find(|(d, _)| *d == assoc.0) {
+            Some((_, bound)) if p.tys.args(args).first().and_then(|g| g.as_ty()) == Some(self_ty) => rw(p, *bound),
+            _ => t,
         },
         TyKind::Ref(r, m, e) => {
-            let e = rewrite_impl_projections(p, e, assoc_tys);
+            let e = rw(p, e);
             p.tys.intern(TyKind::Ref(r, m, e))
         }
         TyKind::Adt(d, a) => {
@@ -5395,7 +5415,7 @@ fn rewrite_impl_projections(p: &mut Program, t: Ty, assoc_tys: &[(DefId, Ty)]) -
             let out: Vec<GenericArg> = raw
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(e) => GenericArg::Ty(rewrite_impl_projections(p, e, assoc_tys)),
+                    GenericArg::Ty(e) => GenericArg::Ty(rw(p, e)),
                     other => other,
                 })
                 .collect();
@@ -5404,16 +5424,16 @@ fn rewrite_impl_projections(p: &mut Program, t: Ty, assoc_tys: &[(DefId, Ty)]) -
         }
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
-            let out: Vec<Ty> = elems.iter().map(|&e| rewrite_impl_projections(p, e, assoc_tys)).collect();
+            let out: Vec<Ty> = elems.iter().map(|&e| rw(p, e)).collect();
             let ts = p.tys.intern_tys(&out);
             p.tys.intern(TyKind::Tuple(ts))
         }
         TyKind::Slice(e) => {
-            let e = rewrite_impl_projections(p, e, assoc_tys);
+            let e = rw(p, e);
             p.tys.intern(TyKind::Slice(e))
         }
         TyKind::Array(e, n) => {
-            let e = rewrite_impl_projections(p, e, assoc_tys);
+            let e = rw(p, e);
             p.tys.intern(TyKind::Array(e, n))
         }
         _ => t,
@@ -5475,6 +5495,158 @@ fn rewrite_own_projections(p: &mut Program, t: Ty, trait_args: ArgsId, assoc_tys
             p.tys.intern(TyKind::FnPtr(sig))
         }
         _ => t,
+    }
+}
+
+/// The provided methods of the lang traits: an impl may leave them
+/// out. Every other method in a lang trait record is required.
+fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
+    match name {
+        "ne" => tr == lang.partial_eq,
+        "lt" | "le" | "gt" | "ge" => tr == lang.partial_ord,
+        "max" | "min" | "clamp" => tr == lang.ord,
+        "len" => tr == lang.exact_size_iterator,
+        "size_hint" => tr == lang.iterator,
+        "clone_into" => tr == lang.to_owned,
+        "hash_one" => tr == lang.build_hasher,
+        n => tr == lang.hasher && n != "finish" && n != "write",
+    }
+}
+
+/// An impl's method of a lang trait, which has no AST template: a
+/// required method must be written (rustc E0046), and a written one
+/// must have the trait's signature (E0053, E0050, E0049, E0185,
+/// E0186): the lang signature table's, with the trait ref's args and
+/// the impl's associated types put in. `hash<H: Hasher>` takes one
+/// type parameter, which may have no bound but `Hasher`.
+#[allow(clippy::too_many_arguments)]
+fn check_lang_method(
+    p: &mut Program,
+    tr: TraitRef,
+    method_def: DefId,
+    name: Sym,
+    found: Option<LocalDefId>,
+    impl_parent_n: usize,
+    assoc_tys: &[(DefId, Ty)],
+    span: Span,
+    errs: &mut Vec<Diag>,
+) {
+    use crate::traits::solve::{PureCx, Solver, normalize};
+    use ast::SelfKind::{Ref, RefMut};
+    let lang = p.gx.lang;
+    let n = p.name(name).to_string();
+    let Some(local) = found else {
+        if !lang_provided(&lang, tr.def, &n) {
+            errs.push(Diag::new("L0110", span, format!("the impl is missing the trait method `{n}`"), "Add the method to the impl."));
+        }
+        return;
+    };
+    let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
+    let own: Vec<ParamDef> = p
+        .gx
+        .fn_templates
+        .get(local.0 as usize)
+        .cloned()
+        .flatten()
+        .map_or(Vec::new(), |t| t.generics.params.into_iter().skip(impl_parent_n).collect());
+    let own_tys: Vec<&ParamDef> = own.iter().filter(|g| !matches!(g.kind, ParamKind::Lifetime)).collect();
+    let is_hash = tr.def == lang.hash && n == "hash";
+    // `hash`'s H: in the signature, the parameter after the trait's
+    // (Self); in the impl method, its first own type parameter.
+    let trait_n = p.tys.args(tr.args).len() as u32;
+    let h_impl = own.iter().position(|g| !matches!(g.kind, ParamKind::Lifetime)).map(|i| p.tys.intern(TyKind::Param(ParamId(impl_parent_n as u32 + i as u32))));
+    let sig = match p.gx.lang_method_sigs.get(&method_def) {
+        Some(s) => s.clone(),
+        None if tr.def == lang.drop && n == "drop" => {
+            let m0 = p.tys.mk_ref(true, p0);
+            LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: UNIT, ret_borrows_from: None }
+        }
+        None if tr.def == lang.iterator && n == "size_hint" => {
+            let r0 = p.tys.mk_ref(false, p0);
+            let hi = p.tys.mk_option(USIZE);
+            let ts = p.tys.intern_tys(&[USIZE, hi]);
+            let ret = p.tys.intern(TyKind::Tuple(ts));
+            LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret, ret_borrows_from: None }
+        }
+        // `fn hash<H: Hasher>(&self, state: &mut H)`: H is the method's
+        // first own parameter, after the impl's.
+        None if is_hash && own_tys.len() == 1 && matches!(own_tys[0].kind, ParamKind::Type) => {
+            let r0 = p.tys.mk_ref(false, p0);
+            let h = p.tys.intern(TyKind::Param(ParamId(trait_n)));
+            let mh = p.tys.mk_ref(true, h);
+            LangMethodSig { self_kind: Some(Ref), params: vec![r0, mh], ret: UNIT, ret_borrows_from: None }
+        }
+        None if is_hash => {
+            let f_name_span = p.fn_info(local).def.name_span;
+            errs.push(Diag::new(
+                "L0110",
+                f_name_span,
+                "method has a different number of generic parameters than the trait method",
+                "Write `fn hash<H: Hasher>(&self, state: &mut H)`.",
+            ));
+            return;
+        }
+        // No signature known for this method (`from_iter`, `call`): not
+        // checked here.
+        None => return,
+    };
+    let (f_self_kind, f_name_span, got_params, got_ret) = {
+        let f = p.fn_info(local);
+        (f.self_kind, f.def.name_span, f.params.clone(), f.ret)
+    };
+    let fix = "Match the signature of the std trait method.";
+    // `self` forms must match; a typed `self: T` compares by type below.
+    let typed = matches!(f_self_kind, Some(ast::SelfKind::Typed));
+    if f_self_kind.is_some() != sig.self_kind.is_some() || (!typed && f_self_kind != sig.self_kind) {
+        errs.push(Diag::new("L0110", f_name_span, "method receiver does not match the trait method", fix));
+        return;
+    }
+    if got_params.len() != sig.params.len() {
+        errs.push(Diag::new("L0110", f_name_span, "method takes a different number of parameters than the trait method", fix));
+        return;
+    }
+    if own_tys.len() != usize::from(is_hash) {
+        errs.push(Diag::new("L0110", f_name_span, "method has a different number of generic parameters than the trait method", fix));
+        return;
+    }
+    if is_hash && let Some(h) = h_impl {
+        // A stricter bound on H than the trait's `H: Hasher` (E0276).
+        let preds = p.gx.fn_templates.get(local.0 as usize).cloned().flatten().map_or(Vec::new(), |t| t.generics.predicates);
+        let extra = preds.iter().any(|pred| match pred {
+            Predicate::Trait(b) => {
+                let on_h = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(h);
+                on_h && b.count == 0 && b.value.def != lang.hasher && b.value.def != lang.sized
+            }
+            _ => false,
+        });
+        if extra {
+            errs.push(Diag::new("L0110", f_name_span, "this method requires more of its generic parameters than the trait method does", fix));
+            return;
+        }
+    }
+    let mut args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+    let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+    if is_hash && let Some(h) = h_impl {
+        args.push(GenericArg::Ty(h));
+    }
+    let want_params: Vec<Ty> = sig
+        .params
+        .iter()
+        .map(|&t| {
+            let t = subst(&mut p.tys, t, &args);
+            rewrite_impl_projections(p, t, self_ty, assoc_tys)
+        })
+        .collect();
+    let want_ret = {
+        let t = subst(&mut p.tys, sig.ret, &args);
+        rewrite_impl_projections(p, t, self_ty, assoc_tys)
+    };
+    let mut cx = PureCx::new(&p.tys);
+    let mut solver = Solver::new();
+    let mut norm = |t: Ty| normalize(&mut solver, &mut cx, &p.gx.index, &[], t);
+    let same = want_params.iter().zip(&got_params).all(|(&w, &g)| norm(w) == norm(g)) && norm(want_ret) == norm(got_ret);
+    if !same {
+        errs.push(Diag::new("L0110", f_name_span, format!("method `{n}` has an incompatible type for the trait"), fix));
     }
 }
 
@@ -5596,17 +5768,18 @@ fn validate_method_sig(
             }
         }
     }
+    let self_ty = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
     let want_params: Vec<Ty> = tmpl
         .params
         .iter()
         .map(|&t| {
             let t = subst(&mut p.tys, t, &subst_args);
-            rewrite_impl_projections(p, t, assoc_tys)
+            rewrite_impl_projections(p, t, self_ty, assoc_tys)
         })
         .collect();
     let want_ret = {
         let t = subst(&mut p.tys, tmpl.ret, &subst_args);
-        rewrite_impl_projections(p, t, assoc_tys)
+        rewrite_impl_projections(p, t, self_ty, assoc_tys)
     };
     let got_params = p.fn_info(local).params.clone();
     let got_ret = p.fn_info(local).ret;
@@ -7996,6 +8169,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
             continue;
         }
         let subst_args: Vec<GenericArg> = p.tys.args(rec.trait_ref.args).to_vec();
+        let self_ty = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
         let mut goals: Vec<TraitRef> = Vec::new();
         let mut statics: Vec<Ty> = Vec::new();
         for &pred in &trec.generics.predicates {
@@ -8013,7 +8187,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
             let new_args: Vec<GenericArg> = old_args
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, &rec.assoc_tys)),
+                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys)),
                     other => other,
                 })
                 .collect();
