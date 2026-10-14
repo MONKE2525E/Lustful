@@ -4052,7 +4052,12 @@ impl Rewrite<'_> {
             }
             PathRes::Done(Target::Variant(def, variant)) => {
                 if let Some(info) = self.tables.def_info.get(&def) {
-                    *segs = vec![PathSeg::plain(info.flat), PathSeg::plain(variant)];
+                    // Written generic args stay on their segment
+                    // (`E::<u8>::V`, `V::<u8>`): the checker reads them.
+                    let n = segs.len();
+                    let variant_args = segs.last().map(|s| s.args.clone()).unwrap_or_default();
+                    let enum_args = if n >= 2 { segs[n - 2].args.clone() } else { Default::default() };
+                    *segs = vec![PathSeg { name: info.flat, args: enum_args }, PathSeg { name: variant, args: variant_args }];
                 }
             }
             PathRes::Done(Target::Module(_)) => {
