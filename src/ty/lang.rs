@@ -226,7 +226,12 @@ impl LangItems {
 /// static table, so it cannot hold a `Ty`; check resolves these through
 /// the body's type store. `Ptr` is an erased raw pointer (`*mut ()`):
 /// sized intrinsics take explicit size and align (section 3.2), and the
-/// typed pointer API is source in std wrappers.
+/// typed pointer API is source in std wrappers. `Bytes` is `&[u8]`,
+/// passed to C as two arguments (`const uint8_t *ptr, uint64_t len`), so
+/// adapter cores can take a slice before source std has raw pointers.
+/// `U128` is `u128` (C `lust_u128`). `StringMut` is `&mut String` (C
+/// `lust_String *`), for a core that appends text. New variants go at
+/// the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigTy {
     Unit,
@@ -239,6 +244,9 @@ pub enum SigTy {
     F32,
     F64,
     Ptr,
+    Bytes,
+    U128,
+    StringMut,
 }
 
 impl SigTy {
@@ -255,6 +263,12 @@ impl SigTy {
             SigTy::F32 => tys.intern(TyKind::Float(FloatTy::F32)),
             SigTy::F64 => tys.intern(TyKind::Float(FloatTy::F64)),
             SigTy::Ptr => tys.intern(TyKind::RawPtr(Mut::Mut, UNIT)),
+            SigTy::Bytes => {
+                let bytes = tys.intern(TyKind::Slice(super::int(super::IntTy::U8)));
+                tys.intern(TyKind::Ref(super::Region::Erased, Mut::Shared, bytes))
+            }
+            SigTy::U128 => super::int(super::IntTy::U128),
+            SigTy::StringMut => tys.intern(TyKind::Ref(super::Region::Erased, Mut::Mut, super::STRING)),
         }
     }
 }
@@ -658,34 +672,38 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: &[C::Bumpalo],
         implemented: false,
     },
+    // Byte and substring search: the index of the first (memchr, memmem)
+    // or last (memrchr) match, or usize::MAX for none (no slice is that
+    // long).
     IntrinsicDef {
         name: "memchr",
         c_symbol: "lust_memchr",
-        params: &[S::U32, S::Ptr, S::Usize],
-        ret: S::Ptr,
+        params: &[S::U32, S::Bytes],
+        ret: S::Usize,
         allowed: &[C::Memchr],
         implemented: false,
     },
     IntrinsicDef {
         name: "memrchr",
         c_symbol: "lust_memrchr",
-        params: &[S::U32, S::Ptr, S::Usize],
-        ret: S::Ptr,
+        params: &[S::U32, S::Bytes],
+        ret: S::Usize,
         allowed: &[C::Memchr],
         implemented: false,
     },
     IntrinsicDef {
         name: "memmem",
         c_symbol: "lust_memmem",
-        params: &[S::Ptr, S::Usize, S::Ptr, S::Usize],
-        ret: S::Ptr,
+        params: &[S::Bytes, S::Bytes],
+        ret: S::Usize,
         allowed: &[C::Memchr],
         implemented: false,
     },
+    // XXH3 of the bytes with a seed (0 is the unseeded hash).
     IntrinsicDef {
         name: "xxh3_64",
         c_symbol: "lust_xxh3_64",
-        params: &[S::Ptr, S::Usize],
+        params: &[S::Bytes, S::U64],
         ret: S::U64,
         allowed: &[C::XxhashRust],
         implemented: false,
@@ -693,15 +711,17 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     IntrinsicDef {
         name: "xxh3_128",
         c_symbol: "lust_xxh3_128",
-        params: &[S::Ptr, S::Usize, S::Ptr],
-        ret: S::Unit,
+        params: &[S::Bytes, S::U64],
+        ret: S::U128,
         allowed: &[C::XxhashRust],
         implemented: false,
     },
+    // Appends the ECMAScript Number::toString text of the f64 (ryu-js
+    // 1.0.2 Buffer::format) to the String; the core is in float.c.
     IntrinsicDef {
         name: "ryu_js_fmt_f64",
-        c_symbol: "lust_ryu_js_fmt_f64",
-        params: &[S::F64, S::Ptr],
+        c_symbol: "lust_fmt_js_f64",
+        params: &[S::StringMut, S::F64],
         ret: S::Unit,
         allowed: &[C::RyuJs],
         implemented: false,
