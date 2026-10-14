@@ -23,8 +23,8 @@
 //   `collection_iter_inner`), with std's item types. They stay
 //   distinct from the inner types, as std's own iterator structs
 //   are. They have no `Debug` (std's prints the remaining items).
-// Not here yet: `range`, `Index` (`map[&k]` needs user `Index`),
-// `Hash`, the cursor and `extract_if` APIs, `DoubleEndedIterator`
+// Not here yet: `range`, `Hash`, the cursor and `extract_if`
+// APIs, `DoubleEndedIterator`
 // for the `Map` aliases beyond what the builtin adapters provide.
 
 // The three types are defined here, not only re-exported, so a user
@@ -620,6 +620,23 @@ pub mod btree_map {
             }
         }
     }
+
+    impl<K: Ord, V, Q: ?Sized + Ord> core::ops::Index<&Q> for BTreeMap<K, V>
+    where
+        K: Borrow<Q>,
+    {
+        type Output = V;
+        /// As std's: a missing key panics with `no entry found for key`.
+        fn index(&self, key: &Q) -> &V {
+            match self.get(key) {
+                Some(v) => v,
+                None => panic!("no entry found for key"),
+            }
+        }
+    }
+
+    // No `IndexMut` for the map: std has none (assigning through
+    // `map[&k]` is rustc E0594; `get_mut` and `entry` are the way).
 
     impl<K: Ord, V, const N: usize> From<[(K, V); N]> for BTreeMap<K, V> {
         /// As std's: the bulk build, so the last of equal keys stays.
@@ -1257,6 +1274,19 @@ pub mod vec_deque {
     // impls for one type, method selection cannot pick between
     // them yet (the input type is what the argument decides), so
     // every `extend` call would miss. They land with that fix.
+
+    impl<T> core::ops::Index<usize> for VecDeque<T> {
+        type Output = T;
+        fn index(&self, index: usize) -> &T {
+            &self.buf[index]
+        }
+    }
+
+    impl<T> core::ops::IndexMut<usize> for VecDeque<T> {
+        fn index_mut(&mut self, index: usize) -> &mut T {
+            &mut self.buf[index]
+        }
+    }
 
     impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
         fn from(arr: [T; N]) -> VecDeque<T> {
