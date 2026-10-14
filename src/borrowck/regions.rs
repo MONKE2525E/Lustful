@@ -3318,6 +3318,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && self.p.gx.lang.is_fn_family(b.value.def)
             {
                 self.link_bound_closure(b.value.args, &binds, sig, &univ);
+                self.tie_bound_output(b.value.args, &binds, sig, &univ);
             }
         }
         ok
@@ -3662,6 +3663,66 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         if slots.iter().enumerate().all(|(i, (r, _))| r.is_none() || paired.get(i) == Some(&true)) {
             self.bound_linked.push(def);
+        }
+    }
+
+    /// A closure passed for `F: Fn*(..) -> R` whose regioned output names
+    /// a lifetime (`-> &'static str`, the callee's `'a`) or is
+    /// higher-ranked (`Fn(&u8) -> &u8`): rustc gives the closure that
+    /// return type, so what the body returns from its captured or free
+    /// argument slots (`closure_reqs`, else every captured source) must
+    /// outlive that region, `'static` for a higher-ranked one (the callee
+    /// picks it). Higher-ranked arguments take no part: the body itself
+    /// checks those.
+    fn tie_bound_output(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>, sig: &RegionSig, univ: &[u32]) {
+        let p = self.p;
+        let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
+        let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
+        let (TyKind::Param(jf), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
+        let n_in = p.tys.tys_of(ts).len();
+        let Some(out_t) = sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).and_then(|b| b.output) else { return };
+        let Some(&ft) = self.bind_tys.get(&jf.0) else { return };
+        let TyKind::Closure(def, args) = self.body.tys.kind(ft) else { return };
+        let Some(c_out) = p.gx.closures.get(&def).map(|c| c.output) else { return };
+        let mut outs: Vec<BoundSlot> = Vec::new();
+        self.bound_slots(out_t, c_out, univ, &mut outs);
+        let target = |k: BoundSlot| match k {
+            BoundSlot::Tie(u) => Some(u),
+            BoundSlot::Hr => Some(0),
+            BoundSlot::Free => None,
+        };
+        if outs.iter().all(|&k| target(k).is_none()) {
+            return;
+        }
+        let caps = binds.get(&jf.0).cloned().unwrap_or_default();
+        let mut roles = Vec::new();
+        closure_roles(&mut self.sc, args, &mut roles);
+        match self.closure_reqs(def, &roles) {
+            Some(reqs) => {
+                let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
+                for &(x, y) in reqs.iter() {
+                    let End::Out(k) = y else { continue };
+                    let Some(u) = outs.get(k as usize).and_then(|&k| target(k)) else { continue };
+                    let from = match x {
+                        End::Cap(i) => caps.get(i as usize),
+                        End::Arg(j) => vars.get(j as usize),
+                        End::Static | End::Out(_) => None,
+                    };
+                    if let Some(&v) = from {
+                        self.edge(v, u);
+                    }
+                }
+            }
+            None => {
+                let us: Vec<u32> = outs.iter().filter_map(|&k| target(k)).collect();
+                for (i, &(src, _)) in roles.iter().enumerate() {
+                    if src && let Some(&v) = caps.get(i) {
+                        for &u in &us {
+                            self.edge(v, u);
+                        }
+                    }
+                }
+            }
         }
     }
 

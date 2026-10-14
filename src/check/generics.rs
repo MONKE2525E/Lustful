@@ -3607,13 +3607,19 @@ fn region_sig(
     let early: Vec<bool> = (0..n_named)
         .map(|i| scope.region_facts.iter().any(|&(a, b)| a == i || b == i) || !in_inputs.contains(&Region::Param(i)))
         .collect();
-    let fn_bounds = fn_bounds_of(ast, interner, known, tys, cx, scope, &def.generics, &def.where_clause);
-    let mut trait_bounds = trait_lts_of(ast, interner, known, cx, scope, &def.generics, &def.where_clause);
-    for (i, param) in def.params.iter().enumerate() {
-        if let Some(&erased) = params.get(skip + i) {
-            impl_trait_lts(ast, interner, known, tys, cx, scope, param.ty, erased, &mut trait_bounds);
+    // `impl Trait` args (`f: impl Fn(&'a u8)`, `w: &mut impl Tr<'d>`)
+    // bound their synthetic type params like declared ones.
+    let mut bounded = param_bounds(ast, scope, &def.generics, &def.where_clause);
+    let top = def.params.iter().zip(params.get(skip..).unwrap_or_default()).map(|(p, &t)| (p.ty, t));
+    for (n, t) in top.chain(scope.apit.iter().copied()) {
+        if let TyExpr::ImplTrait { bounds } = ast.ty(n)
+            && let TyKind::Param(j) = tys.kind(t)
+        {
+            bounded.push((j.0, bounds));
         }
     }
+    let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded, Some(errs));
+    let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
     Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds })
 }
 
@@ -3652,29 +3658,13 @@ pub fn trait_lts_of(
     generics: &ast::Generics,
     where_clause: &ast::WhereClause,
 ) -> Vec<crate::borrowck::TraitLts> {
-    let type_param = |t: ast::TyId| match ast.ty(t) {
-        TyExpr::Path(segs) if segs.len() == 1 && matches!(segs[0].args, ast::GenericArgs::None) => {
-            scope.type_params.iter().find(|&&(n, _)| n == segs[0].name).map(|&(_, j)| j)
-        }
-        _ => None,
-    };
-    let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
-    for gp in &generics.params {
-        if let ast::GenericParam::Type { name, bounds, .. } = gp
-            && let Some(&(_, j)) = scope.type_params.iter().find(|&&(n, _)| n == *name)
-        {
-            bounded.push((j, bounds));
-        }
-    }
-    for pred in &where_clause.preds {
-        if let ast::WherePred::Type { ty, bounds, .. } = pred
-            && let Some(j) = type_param(*ty)
-        {
-            bounded.push((j, bounds));
-        }
-    }
+    trait_lts_in(interner, known, cx, scope, &param_bounds(ast, scope, generics, where_clause))
+}
+
+/// `trait_lts_of` over bounds already found, by type param index.
+fn trait_lts_in(interner: &Interner, known: &Known, cx: &ResolveCx, scope: &Scope, bounded: &[(u32, &[TraitBound])]) -> Vec<crate::borrowck::TraitLts> {
     let mut out = Vec::new();
-    for (j, bounds) in bounded {
+    for &(j, bounds) in bounded {
         for b in bounds {
             if let TraitBound::Trait { trait_ref, .. } = b
                 && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
@@ -3686,34 +3676,29 @@ pub fn trait_lts_of(
     out
 }
 
-/// The `impl Tr<'a>` argument types in a written param type (`w: &mut impl
-/// Tr<'d>`), each with the synthetic type param its erased form names.
-#[allow(clippy::too_many_arguments)]
-fn impl_trait_lts(
-    ast: &Ast,
-    interner: &Interner,
-    known: &Known,
-    tys: &impl TyIntern,
-    cx: &ResolveCx,
-    scope: &Scope,
-    t: ast::TyId,
-    erased: Ty,
-    out: &mut Vec<crate::borrowck::TraitLts>,
-) {
-    match (ast.ty(t), tys.kind(erased)) {
-        (TyExpr::ImplTrait { bounds }, TyKind::Param(j)) => {
-            for b in bounds {
-                if let TraitBound::Trait { trait_ref, .. } = b
-                    && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
-                {
-                    out.push(crate::borrowck::TraitLts { param: j.0, trait_def, lifetimes });
-                }
-            }
+/// The bounds that a generics list and its where clause put on the type
+/// params of `scope`, by param index.
+fn param_bounds<'a>(ast: &'a Ast, scope: &Scope, generics: &'a ast::Generics, where_clause: &'a ast::WhereClause) -> Vec<(u32, &'a [TraitBound])> {
+    let param = |name| scope.type_params.iter().find(|&&(n, _)| n == name).map(|&(_, j)| j);
+    let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
+    for gp in &generics.params {
+        if let ast::GenericParam::Type { name, bounds, .. } = gp
+            && let Some(j) = param(*name)
+        {
+            bounded.push((j, bounds));
         }
-        (TyExpr::Ref { inner, .. }, TyKind::Ref(_, _, ei)) => impl_trait_lts(ast, interner, known, tys, cx, scope, *inner, ei, out),
-        (TyExpr::Paren(inner), _) => impl_trait_lts(ast, interner, known, tys, cx, scope, *inner, erased, out),
-        _ => {}
     }
+    for pred in &where_clause.preds {
+        if let ast::WherePred::Type { ty, bounds, .. } = pred
+            && let TyExpr::Path(segs) = ast.ty(*ty)
+            && let [seg] = &segs[..]
+            && matches!(seg.args, ast::GenericArgs::None)
+            && let Some(j) = param(seg.name)
+        {
+            bounded.push((j, bounds));
+        }
+    }
+    bounded
 }
 
 /// The `F: Fn*(A..) -> R` bounds that a generics list and its where
@@ -3733,45 +3718,55 @@ pub fn fn_bounds_of(
     generics: &ast::Generics,
     where_clause: &ast::WhereClause,
 ) -> Vec<crate::borrowck::FnBound> {
+    fn_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause), None)
+}
+
+/// `fn_bounds_of` over bounds already found, by type param index. An
+/// elided output lifetime is the only input lifetime, as in a fn
+/// signature; with none or several it is L0202 (rustc E0106), reported
+/// into `errs` when given.
+#[allow(clippy::too_many_arguments)]
+fn fn_bounds_in(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &mut impl TyIntern,
+    cx: &ResolveCx,
+    scope: &Scope,
+    bounded: &[(u32, &[TraitBound])],
+    mut errs: Option<&mut Vec<Diag>>,
+) -> Vec<crate::borrowck::FnBound> {
     let mut bs = scope.clone();
     bs.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
-    let type_param = |t: ast::TyId| match ast.ty(t) {
-        TyExpr::Path(segs) if segs.len() == 1 && matches!(segs[0].args, ast::GenericArgs::None) => {
-            scope.type_params.iter().find(|&&(n, _)| n == segs[0].name).map(|&(_, j)| j)
-        }
-        _ => None,
-    };
-    let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
-    for gp in &generics.params {
-        if let ast::GenericParam::Type { name, bounds, .. } = gp
-            && let Some(&(_, j)) = scope.type_params.iter().find(|&&(n, _)| n == *name)
-        {
-            bounded.push((j, bounds));
-        }
-    }
-    for pred in &where_clause.preds {
-        if let ast::WherePred::Type { ty, bounds, .. } = pred
-            && let Some(j) = type_param(*ty)
-        {
-            bounded.push((j, bounds));
-        }
-    }
     let mut out = Vec::new();
-    for (j, bounds) in bounded {
+    for &(j, bounds) in bounded {
         for b in bounds {
             let TraitBound::Trait { trait_ref, .. } = b else { continue };
             let Some(ast::GenericArgs::Parenthesized { inputs, output }) = trait_ref.path.last().map(|s| &s.args) else { continue };
-            let tys_in: Option<Vec<Ty>> = inputs.iter().map(|&t| resolve_scoped(ast, interner, known, cx, tys, t, &bs).ok()).collect();
+            let Some(inputs) = inputs.iter().map(|&t| resolve_scoped(ast, interner, known, cx, tys, t, &bs).ok()).collect::<Option<Vec<Ty>>>() else { continue };
             let out_ty = match output {
-                Some(t) => match resolve_scoped(ast, interner, known, cx, tys, *t, &bs) {
-                    Ok(t) => Some(t),
-                    Err(_) => continue,
-                },
+                Some(t) => {
+                    let mut lts: Vec<Region> = Vec::new();
+                    for &it in &inputs {
+                        crate::borrowck::regions_of(tys, it, &mut lts);
+                    }
+                    let mut os = scope.clone();
+                    os.regions = RegionMode::Keep { next: None, elided: if let [r] = lts[..] { Some(r) } else { None } };
+                    match resolve_scoped(ast, interner, known, cx, tys, *t, &os) {
+                        Ok(t) => Some(t),
+                        Err(d) => {
+                            if d.code == "L0202"
+                                && let Some(errs) = errs.as_deref_mut()
+                            {
+                                errs.push(d);
+                            }
+                            continue;
+                        }
+                    }
+                }
                 None => None,
             };
-            if let Some(inputs) = tys_in {
-                out.push(crate::borrowck::FnBound { param: j, inputs, output: out_ty });
-            }
+            out.push(crate::borrowck::FnBound { param: j, inputs, output: out_ty });
         }
     }
     out

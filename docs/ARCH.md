@@ -2954,7 +2954,15 @@ Fn(&T)`, `filter`'s `&Self::Item`) is L0735 (rustc: "not
 general enough"); a lifetime the bound writes (`F:
 Fn(&'static Message)`, the callee's `'a`; the region
 signature keeps bound inputs with regions) ties the slot to
-that region. A
+that region. The bound's output is the closure's return type
+(rustc deduces it from the bound): what the body returns
+from captured or free argument slots outlives a written
+output lifetime, and `'static` where the output is
+higher-ranked (`F: Fn(&u8) -> &u8`: the callee picks it).
+In `Fn` sugar an elided output lifetime is the only input
+lifetime (`Fn(&'a u8) -> &u8` returns `'a`), else L0202
+(rustc E0106). `impl Fn*` arguments are type params with
+those bounds (also nested ones). A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
 fn: free in the body, tied to it by the creator, and a
