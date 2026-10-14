@@ -4416,6 +4416,7 @@ impl FnGen<'_, '_, '_> {
             | B::IterFind
             | B::IterFindMap
             | B::IterPosition
+            | B::IterRposition
             | B::IterFold
             | B::IterForEach
             | B::IterMin

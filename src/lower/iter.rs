@@ -57,6 +57,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterFind
             | B::IterFindMap
             | B::IterPosition
+            | B::IterRposition
             | B::IterFold
             | B::IterForEach
             | B::IterMin
@@ -486,13 +487,17 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(nl), Rvalue::Use(n));
                 self.nth(itp, ty, nl, dest)?;
             }
-            B::IterAny | B::IterAll | B::IterFind | B::IterFindMap | B::IterPosition => {
+            B::IterAny | B::IterAll | B::IterFind | B::IterFindMap | B::IterPosition | B::IterRposition => {
                 let (r, f) = (arg()?, arg()?);
                 let (itp, ty) = self.deref_arg(r)?;
                 let fty = self.op_ty(&f)?;
                 let fl = self.local(fty);
                 self.assign(Place::local(fl), Rvalue::Use(f));
-                self.search(b, itp, ty, Place::local(fl), fty, dest, dest_ty)?;
+                if b == B::IterRposition {
+                    self.rposition(itp, ty, Place::local(fl), fty, dest, dest_ty)?;
+                } else {
+                    self.search(b, itp, ty, Place::local(fl), fty, dest, dest_ty)?;
+                }
                 self.drop_local(fl);
             }
             B::IterCount | B::IterLast | B::IterMin | B::IterMax | B::IterCollect | B::IterSum | B::IterProduct => {
@@ -3453,6 +3458,43 @@ impl Ex<'_, '_, '_> {
                 self.none(&dest, dest_ty);
             }
         }
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// `rposition` (W-STD-B): the index counts down from the exact
+    /// length while `next_back` pulls, as Rust's slice iterator does.
+    fn rposition(&mut self, itp: Place, ty: Ty, fpl: Place, fty: Ty, dest: Place, dest_ty: Ty) -> R {
+        use crate::ast::BinOp::Sub;
+        let join = self.block();
+        let n = self.size(itp.clone(), ty)?;
+        let pos = self.local(USIZE);
+        self.assign(Place::local(pos), Rvalue::Use(n));
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let item = self.item(ty)?;
+        let opt = self.body.tys.mk_option(item);
+        let t = self.local(opt);
+        self.next(itp.clone(), ty, Place::local(t), true)?;
+        let (s, none) = self.switch_opt(&Place::local(t));
+        self.cur = s;
+        let x = self.local(item);
+        let px = self.take(Self::payload(&Place::local(t)), item);
+        self.assign(Place::local(x), Rvalue::Use(px));
+        self.assign(Place::local(pos), Rvalue::Bin(Sub, Operand::Copy(Place::local(pos)), Self::usize_c(1)));
+        let ax = self.take(Place::local(x), item);
+        let r = self.local(BOOL);
+        self.call_fn(fty, fpl, vec![ax], Place::local(r))?;
+        let (yes, no) = self.branch(Operand::Copy(Place::local(r)));
+        self.cur = yes;
+        self.some(&dest, dest_ty, Operand::Copy(Place::local(pos)));
+        self.goto(join);
+        self.cur = no;
+        self.goto(lp);
+        self.cur = none;
+        self.none(&dest, dest_ty);
         self.goto(join);
         self.cur = join;
         Ok(())

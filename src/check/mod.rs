@@ -324,6 +324,9 @@ pub enum Builtin {
     IterFind,
     IterFindMap,
     IterPosition,
+    /// `rposition` (W-STD-B): from the back, over an iterator with an
+    /// exact size and `next_back`.
+    IterRposition,
     IterFold,
     IterForEach,
     IterMin,
@@ -12056,7 +12059,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let k = self.p.known;
         let chars = CHARS;
         let opt_str = self.tys.mk_option(REF_STR);
+        let bytes = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+        let ref_bytes = self.tys.mk_ref(false, bytes);
         let table = [
+            // The `&[u8]` view, as `AsRef<[u8]>` gives it (W-STD-B).
+            (k.as_bytes, B::ConvStrBytes, vec![], ref_bytes),
             (k.contains, B::StrContains, vec![REF_STR], BOOL),
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),
             (k.ends_with, B::StrEndsWith, vec![REF_STR], BOOL),

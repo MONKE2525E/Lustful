@@ -268,7 +268,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use Builtin as B;
         use IterKind as K;
         let item = self.iter_item(base);
-        let by_value = !matches!(n, "next" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "peek");
+        let by_value = !matches!(n, "next" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek");
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
         if by_value && derefs > 0 && self.iter_method_known(n) {
@@ -422,6 +422,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let p = self.fn_mut_param(&[item], BOOL, span);
                 let o = self.tys.mk_option(USIZE);
                 (B::IterPosition, vec![p], o)
+            }
+            // ExactSizeIterator + DoubleEndedIterator: the slice and
+            // array iterators lust has, and Map, Copied, Cloned of them.
+            "rposition" => {
+                if !self.rposition_ok(base) {
+                    let tn = self.tn(base);
+                    self.err("L0640", span, format!("`rposition` on `{tn}` is not implemented yet"), "Use `rposition` on a slice iterator (`v.iter()`).");
+                    return self.iter_bail(args);
+                }
+                let p = self.fn_mut_param(&[item], BOOL, span);
+                let o = self.tys.mk_option(USIZE);
+                (B::IterRposition, vec![p], o)
             }
             "fold" => {
                 let Some(&init) = args.first() else {
@@ -584,7 +596,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn iter_method_known(&self, n: &str) -> bool {
         matches!(
             n,
-            "map"
+            "rposition"
+                | "map"
                 | "filter"
                 | "filter_map"
                 | "enumerate"
@@ -760,6 +773,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let k = if m.is_mut() { IterKind::SliceIterMut } else { IterKind::SliceIter };
         Some(it::mk_iter(&mut self.tys, k, &[el]))
+    }
+
+    /// True when `rposition` runs on `t` here: an ExactSizeIterator and
+    /// DoubleEndedIterator whose length the expansion knows (`size`).
+    fn rposition_ok(&self, t: Ty) -> bool {
+        use IterKind as K;
+        match it::iter_parts(&self.tys, t) {
+            Some((K::SliceIter | K::SliceIterMut | K::ArrayIntoIter, _)) => true,
+            Some((K::Map | K::Copied | K::Cloned, a)) => self.rposition_ok(a[0]),
+            _ => false,
+        }
     }
 
     /// True when an iterator type is double-ended in Rust 1.99, for
