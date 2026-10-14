@@ -870,6 +870,10 @@ struct Ctx<'p, 'a> {
     /// True once an unsizing coercion made a dyn value from one that
     /// may hold a borrow (see `dyn_static_clean`).
     dyn_borrow_src: bool,
+    /// The expected result type of the method call being checked, by
+    /// call expression: a generic method's closure arguments read it
+    /// (`expected_output_first`).
+    pub(super) call_expected: Option<(ExprId, Ty)>,
     /// Or-pattern alternatives being checked against the first
     /// alternative's bindings, innermost last (see the `Pat::Or`
     /// arm of `pattern_mode`).
@@ -1043,6 +1047,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         dyn_borrow_src: false,
+        call_expected: None,
         or_frames: Vec::new(),
         or_log: None,
         pat_marks: Vec::new(),
@@ -3788,6 +3793,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// rustc's expected inputs for a closure argument: a generic call
+    /// that returns its own type variable (`fn with<R>(f: impl FnOnce()
+    /// -> R) -> R`) under an expected type fixes that variable first, so
+    /// a closure body that needs its output type sees it (`let s: u32 =
+    /// with(|| v.iter().sum())`). Only for a bare variable with a closure
+    /// argument and no dyn in the expectation, where the result could
+    /// still coerce (rustc's own expectation is not binding there).
+    pub(super) fn expected_output_first(&mut self, ret: Ty, expected: Option<Ty>, args: &[ExprId]) {
+        let Some(want) = expected else { return };
+        if !matches!(self.kind(ret), TyKind::Infer(v) if !v.is_int() && !v.is_float())
+            || !args.iter().any(|&a| matches!(self.p.ast.expr(a), Expr::Closure { .. }))
+        {
+            return;
+        }
+        let want = self.deep(want);
+        if object::mentions_dyn(&self.tys, want) || matches!(self.kind(want), TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
+            return;
+        }
+        let snap = self.snapshot_vars();
+        let obl_len = self.obl_len();
+        if !self.unify(ret, want) {
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+        }
+    }
+
     /// The pointees of an owning unsizing (`Box<T>` to `Box<dyn Tr>`,
     /// `Rc<T>` to `Rc<dyn Tr>`, ARCH 2.8): the same smart pointer on
     /// both sides, a dyn target, and a known source.
@@ -8198,6 +8229,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let (mut params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
                     self.unify_written_self(callee, f, &inst_args, span);
                     self.normalize_params(&mut params, span);
+                    self.expected_output_first(ret, expected, args);
                     self.check_args(&params, args, span);
                     return self.normalize_use(ret, span);
                 }
@@ -8918,6 +8950,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let k = p.known;
         let rt = self.deep(rt);
+        self.call_expected = expected.map(|t| (e, t));
         // ARCH 2.12 run point: a method call must know the receiver type. The
         // obligation queue runs just before that head is required (ARCH 2.4).
         self.run_obligations(false);

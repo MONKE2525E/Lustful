@@ -218,6 +218,11 @@ fn confirm_method(
     // the impl's params (check/project.rs).
     cx.normalize_params(&mut params, name_span);
     cx.set_res(e, Res::Method { f: template, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
+    if let Some((ce, want)) = cx.call_expected
+        && ce == e
+    {
+        cx.expected_output_first(ret, Some(want), args);
+    }
     cx.check_args(&params[1.min(params.len())..], args, name_span);
     Some(cx.normalize_use(ret, name_span))
 }

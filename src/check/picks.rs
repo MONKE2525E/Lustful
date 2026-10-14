@@ -248,6 +248,15 @@ pub(super) fn replay_method(
             },
         }
     }
+    // An instance's `into()` takes its target from the template's bound
+    // when the context gives none (`R: Into<Range>` at `R = (u32,
+    // u32)`): core's blanket impl alone leaves the target open.
+    let expected = match expected {
+        None if ok && pick.trait_def == cx.p.gx.lang.into => {
+            cx.instance_bound_ref(name, step).and_then(|tr| cx.tys.args(tr.args).get(1).and_then(|g| g.as_ty()))
+        }
+        e => e,
+    };
     if ok {
         let probe = RcvProbe::at(cx, step, pick.form);
         // A `?Sized` param instantiated at a dyn type whose principal (or

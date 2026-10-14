@@ -4240,6 +4240,10 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
     };
     match tys.kind(t) {
         TyKind::Error => Some(true),
+        // Every integer and float type has every auto trait, so a
+        // literal not yet fixed does too (`vec![1, 2]` moved into a
+        // `Send` closure).
+        TyKind::Infer(v) if v.is_int() || v.is_float() => Some(true),
         TyKind::Infer(_) | TyKind::Projection(..) => None,
         TyKind::Param(_) => Some(env.iter().any(|pred| {
             matches!(pred, Predicate::Trait(b) if b.value.def == trait_def && tys.args(b.value.args)[0].as_ty() == Some(t))
