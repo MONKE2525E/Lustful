@@ -1,5 +1,4 @@
-// expect: L0113
-// `map[&k]` needs user `Index` impls, which lust lacks yet.
+// map[&k] through BTreeMap's Index impl (W-STD-C phase 2).
 use std::collections::BTreeMap;
 fn main() {
     let mut m = BTreeMap::new();

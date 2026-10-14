@@ -5011,7 +5011,7 @@ impl Ex<'_, '_, '_> {
                 self.goto(fresh);
                 self.cur = fresh;
                 self.assign(Place::local(v), Rvalue::VecLit(elem, Vec::new()));
-                let rvm = self.ref_to(true, Place::local(v), dest_ty);
+                let rvm = self.ref_to(true, Place::local(v), vec_ty);
                 let u = self.local(UNIT);
                 self.call_builtin(Builtin::VecReserve, vec![Operand::Move(Place::local(rvm)), Operand::Copy(Place::local(len))], Place::local(u));
                 self.goto(fill);
@@ -5029,7 +5029,10 @@ impl Ex<'_, '_, '_> {
             })?;
             self.goto(join);
             self.cur = join;
-            self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v))));
+            match deque {
+                Some(a) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
+                None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
+            }
             return Ok(());
         }
         if self.trusted_len(ty) {

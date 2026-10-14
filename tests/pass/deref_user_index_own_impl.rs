@@ -1,7 +1,6 @@
-// expect: L0113
-// Valid Rust: `w[0]` uses W's own `Index` impl (prints 3 3), not its
-// `Deref` to the Vec. `[]` through a user `Index` impl is not supported
-// yet, so a type with one must not index through its Deref instead.
+// Method calls autoderef through user Deref impls, but indexing
+// uses the type's own Index impl first (W-STD-C phase 2): w[0] is
+// the reversed index, w.len() goes through the Deref.
 use std::ops::{Deref, Index};
 struct W(Vec<u32>);
 impl Deref for W {
