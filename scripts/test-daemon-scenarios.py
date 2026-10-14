@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # Daemon edit scenarios: every tests/daemon/<name>/ version sequence runs
 # against one warm daemon, a cold lust, and rustc. The warm answer must
-# match the cold answer and, when lust accepts the program, the rustc
-# answer. This is the regression net for the dependency edges of
+# match the cold answer (a check that rejects must give the same first
+# error code) and, when lust accepts the program, the rustc answer. This is the regression net for the dependency edges of
 # docs/ARCH.md 8.1-8.3 (const/static values from const fns, consts in
 # patterns, derived impls under type edits, layout answers in bodies).
 #
 # Usage: python3 scripts/test-daemon-scenarios.py [scenario ...]
 # Env: LUST_BIN (default target/release/lust), DAEMON_SCENARIO_JOBS.
 # Exit 0 = pass, 1 = a mismatch, 2 = setup error.
-import os, shutil, signal, subprocess, sys, tempfile, time
+import os, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +20,12 @@ SCEN = os.path.join(ROOT, "tests/daemon")
 def run(cmd, cwd, env, timeout=60):
     r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
     return r.returncode, r.stdout, r.stderr
+
+
+def first_code(stderr):
+    """The first `error[L####]` code in a diagnostic text, or None."""
+    m = re.search(r"error\[(L\d+)\]", stderr)
+    return m.group(1) if m else None
 
 
 def scenario(srcdir):
@@ -65,9 +71,11 @@ def scenario(srcdir):
             # current (this ordering caught a real statics bug).
             wkc, _, wkerr = run([LUST, "check", main], work, env)
             cold_env = dict(env, LUST_NO_DAEMON="1")
-            ckc, _, _ = run([LUST, "check", main], work, cold_env)
-            if (wkc == 0) != (ckc == 0):
-                problems.append(f"{name} {v}: warm check != cold check: warm rc={wkc} {wkerr[:160]!r}, cold rc={ckc}")
+            ckc, _, ckerr = run([LUST, "check", main], work, cold_env)
+            # Same rule as the edit fuzzer: both accept, or both reject with the same first code.
+            if (wkc == 0) != (ckc == 0) or first_code(wkerr) != first_code(ckerr):
+                problems.append(f"{name} {v}: warm check != cold check: warm rc={wkc} {wkerr[:160]!r}, "
+                                f"cold rc={ckc} {ckerr[:160]!r}")
             wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, env)
             crc, cout, cerr = run([LUST, "run", main, "-o", os.path.join(work, "c.bin")], work, cold_env)
             rrc, rout, _ = run(["rustc", "--edition", "2024", "-C", "panic=abort",

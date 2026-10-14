@@ -1981,7 +1981,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     let split_inner_attr = ranges.len() > 1
         && (reused.iter().flatten().any(|c| c.inner_attr) || fresh.iter().flatten().any(|&(_, _, _, inner_attr)| inner_attr));
-    if split_inner_attr || fresh.iter().any(|l| l.is_err()) {
+    // An unbalanced chunk parsed alone fails at its own first bad token; the whole file
+    // (as a cold compile sees it) reports the delimiter first, before macro errors elsewhere.
+    let unbalanced = ranges.len() > 1 && fresh.iter().flatten().any(|(l, ..)| expand::delimiter_error(&l.tokens).is_some());
+    if split_inner_attr || unbalanced || fresh.iter().any(|l| l.is_err()) {
         // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
         // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
         // answer; if it lexes, compile as one chunk. Never panic.

@@ -1228,6 +1228,31 @@ pub fn expand_lexed_with_deps(lexed: Lexed, ctx: &ExpandCtx) -> Result<(Lexed, V
     expand_lexed_seeded_with_deps(lexed, ctx, &[])
 }
 
+/// The first delimiter error in `tokens`: a closer that does not match
+/// the open group, or else the innermost group still open at the end.
+/// None when every delimiter is balanced (as `build_trees` judges).
+pub fn delimiter_error(tokens: &[Token]) -> Option<Diag> {
+    let mut open: Vec<(Tok, Span)> = Vec::new();
+    for t in tokens {
+        let want = match t.tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                open.push((t.tok, t.span));
+                continue;
+            }
+            Tok::RParen => Tok::LParen,
+            Tok::RBracket => Tok::LBracket,
+            Tok::RBrace => Tok::LBrace,
+            _ => continue,
+        };
+        if open.last().map(|o| o.0) != Some(want) {
+            return Some(err("L0001", t.span, "unexpected closing delimiter", "Remove it, or close the groups opened before it first."));
+        }
+        open.pop();
+    }
+    let (_, span) = open.pop()?;
+    Some(err("L0001", span, "this file contains an unclosed delimiter", "Close the group this delimiter opens."))
+}
+
 /// The seeded, dependency-returning expansion both wrappers use.
 /// A file that cannot contain macros comes back unchanged (the
 /// same `Lexed`, no deps).
@@ -1237,7 +1262,11 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
     }
     let (trees, balanced) = build_trees(&lexed.tokens);
     if !balanced {
-        // The parser gives the real syntax error on the flat tokens.
+        // rustc reports this while lexing, before any macro or parse
+        // error; the parser would stop at the first unexpanded call.
+        if let Some(d) = delimiter_error(&lexed.tokens) {
+            return Err(d);
+        }
         return Ok((lexed, Vec::new()));
     }
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
