@@ -427,9 +427,14 @@ impl SourceMap {
         self.lines(span.file).line_col(span.lo)
     }
     /// 1-based line and display column of a span's first byte (panic
-    /// locations; see `LineIndex::line_display_col`).
+    /// locations; see `LineIndex::line_display_col`). No token starts on
+    /// a newline, so a span that does is lowering's gap from an index
+    /// base to its index (`bracket_span`, `v` then `[i]` on the next
+    /// line): its `[` is the byte before `hi`.
     pub fn line_display_col(&self, span: Span) -> (u32, u32) {
-        self.lines(span.file).line_display_col(span.lo)
+        let li = self.lines(span.file);
+        let on_newline = span.hi > span.lo + 1 && li.line_col(span.lo).0 != li.line_col(span.lo + 1).0;
+        li.line_display_col(if on_newline { span.hi - 1 } else { span.lo })
     }
     /// 1-based line and column of byte `offset` in `file`.
     pub fn line_col_at(&self, file: FileId, offset: u32) -> (u32, u32) {

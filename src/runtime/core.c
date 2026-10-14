@@ -7,9 +7,10 @@ int posix_memalign(void **memptr, size_t alignment, size_t size);
 
 void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abort(); })
 
-/* Rust's `capacity overflow` abort: a requested byte size above
+/* Rust's `capacity overflow` panic (RawVec, raw_vec/mod.rs:28:5): a requested byte size above
    isize::MAX, or a length sum that wraps usize. Defined before the
    String and Vec cores that call it. */
+void lust_panic_std(const char *msg, const char *where); /* panic.c, included below */
 void lust_vec_capacity_overflow(void) LUST_BODY({ lust_panic_std("capacity overflow", "alloc/src/raw_vec/mod.rs:28:5"); })
 
 void lust_oom_size(uint64_t n) LUST_BODY({

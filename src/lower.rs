@@ -395,11 +395,14 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// (`v[ i ]` too); right before the index after a parenthesized base,
     /// as rustfmt writes `(v)[i]`; the macro call when the brackets come
     /// from a macro body (`e`'s span then covers the call, `Span::to`).
-    /// Known gap: `v` and `[i]` on separate lines (rustfmt never does it).
+    /// For a plain base the span runs from the base's end to the index,
+    /// so `v` and `[i]` on separate lines resolve to the `[`
+    /// (`SourceMap::line_display_col`).
     fn bracket_span(&self, e: ExprId, base: ExprId, index: ExprId) -> Span {
         let (whole, b, s) = (self.span(e), self.span(base), self.span(index));
         if whole.lo == b.lo && whole.ctxt == b.ctxt {
-            return Span { lo: b.hi, hi: b.hi + 1, ..b };
+            let hi = if s.ctxt == b.ctxt && s.file == b.file && s.lo > b.hi { s.lo } else { b.hi + 1 };
+            return Span { lo: b.hi, hi, ..b };
         }
         let before = s.lo.saturating_sub(1);
         if before >= b.hi && s.ctxt == b.ctxt && s.file == b.file {
