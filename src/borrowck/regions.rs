@@ -4216,18 +4216,35 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             TyKind::Ref(_, _, inner) if !v0.is_empty() => (inner, v0[1..].to_vec()),
             _ => (*t0, v0.clone()),
         };
-        if !matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Option | BuiltinTy::Vec)) || adt_regions(self.p, &self.body.tys, dt) != 0 {
+        use crate::ty::hash::HashTy;
+        // The result's parts that hold the item: `Option<T>` and `Vec<T>`
+        // hold `T`; a map or set from `collect` (W-STD-B) holds `(K, V)` or
+        // `T`, and its hasher's slots (after them) are its own.
+        if adt_regions(self.p, &self.body.tys, dt) != 0 {
             return false;
         }
         let Some((_, args)) = self.body.tys.adt_parts(dt) else { return false };
         let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
-        let [elem] = comps[..] else { return false };
+        let collect = b == crate::check::Builtin::IterCollect;
+        let parts = match (self.body.tys.builtin_of(dt), &comps[..]) {
+            (Some(BuiltinTy::Option | BuiltinTy::Vec), &[t]) => vec![t],
+            (Some(BuiltinTy::Hash(HashTy::HashMap)), &[k, v, _]) if collect => vec![k, v],
+            (Some(BuiltinTy::Hash(HashTy::HashSet)), &[t, _]) if collect => vec![t],
+            _ => return false,
+        };
+        let n: usize = parts.iter().map(|&t| self.sc.slots(t) as usize).sum();
+        let Some(dv) = dv.get(..n) else { return false };
         let mut cands = Vec::new();
-        if !self.iter_items(it, &iv, &mut cands) || cands.is_empty() || cands.iter().any(|c| c.len() != dv.len()) {
+        if !self.iter_items(it, &iv, &mut cands) || cands.is_empty() || cands.iter().any(|c| c.len() != n) {
             return false;
         }
         for c in cands {
-            self.relate(elem, &c, elem, dv, Variance::Co);
+            let mut at = 0;
+            for &t in &parts {
+                let k = self.sc.slots(t) as usize;
+                self.relate(t, &c[at..at + k], t, &dv[at..at + k], Variance::Co);
+                at += k;
+            }
         }
         true
     }
