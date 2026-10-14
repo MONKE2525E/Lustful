@@ -41,6 +41,14 @@ pub trait SolveCx {
     fn unify(&mut self, a: Ty, b: Ty) -> bool;
     /// A fresh type inference variable.
     fn fresh_var(&mut self) -> Ty;
+    /// A fresh const inference variable, for an impl's const params
+    /// in a probe (`impl<T, const N: usize> Tr for [T; N]`).
+    fn fresh_const_var(&mut self) -> ConstId;
+    /// Unifies two consts, binding a const variable; the binding is
+    /// undone by rollback like a type binding.
+    fn unify_const(&mut self, a: ConstId, b: ConstId) -> bool;
+    /// The const a const variable is bound to, or the const itself.
+    fn resolve_const(&self, c: ConstId) -> ConstId;
     fn snapshot(&mut self) -> Self::Snapshot;
     fn rollback(&mut self, snap: Self::Snapshot);
     /// Records one `ImplSet` read (section 8.2): the bucket for this
@@ -138,6 +146,7 @@ fn deep_trait_ref<C: SolveCx>(cx: &mut C, tr: TraitRef) -> TraitRef {
     for g in old_args {
         new_args.push(match g {
             GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)),
+            GenericArg::Const(c) => GenericArg::Const(cx.resolve_const(c)),
             other => other,
         });
     }
@@ -197,6 +206,7 @@ fn unify_trait_refs<C: SolveCx>(cx: &mut C, a: TraitRef, b: TraitRef) -> bool {
     for (x, y) in aa.iter().zip(&ba) {
         let ok = match (x, y) {
             (GenericArg::Ty(u), GenericArg::Ty(v)) => cx.unify(*u, *v),
+            (GenericArg::Const(u), GenericArg::Const(v)) => cx.unify_const(*u, *v),
             (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => true,
             _ => x == y,
         };
@@ -272,26 +282,15 @@ fn split_projections<C: SolveCx>(cx: &mut C, t: Ty, out: &mut Vec<(Ty, Ty)>) -> 
 /// variable per type parameter, an erased region per lifetime, and
 /// a fresh const variable per const parameter.
 fn fresh_inst_args<C: SolveCx>(cx: &mut C, generics: &Generics) -> Vec<GenericArg> {
-    let mut out = Vec::with_capacity(generics.params.len());
-    let mut next_const = 0u32;
-    for p in &generics.params {
-        out.push(match p.kind {
+    generics
+        .params
+        .iter()
+        .map(|p| match p.kind {
             ParamKind::Type => GenericArg::Ty(cx.fresh_var()),
             ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
-            ParamKind::Const(_) => {
-                // Const inference variables are numbered in their
-                // own space per instantiation. Unification of const
-                // arguments is by equality outside the solver, so a
-                // const param of an impl binds only where a header
-                // argument already names it; that subset limit is
-                // recorded in the W-TRAITS-CORE report.
-                let id = cx.tys().intern_const(ConstKind::Infer(next_const));
-                next_const += 1;
-                GenericArg::Const(id)
-            }
-        });
-    }
-    out
+            ParamKind::Const(_) => GenericArg::Const(cx.fresh_const_var()),
+        })
+        .collect()
 }
 
 impl Solver {
@@ -443,6 +442,13 @@ impl Solver {
                         unbound.push(ParamId(i as u32));
                     }
                     args.push(GenericArg::Ty(r));
+                }
+                GenericArg::Const(c) => {
+                    let r = cx.resolve_const(*c);
+                    if matches!(cx.tys().const_kind(r), ConstKind::Infer(_)) {
+                        unbound.push(ParamId(i as u32));
+                    }
+                    args.push(GenericArg::Const(r));
                 }
                 other => args.push(*other),
             }
@@ -938,14 +944,22 @@ impl Solver {
 pub struct PureCx<'g> {
     pub tys: Tys<'g>,
     vars: Vec<Option<Ty>>,
+    /// Const variable bindings; a const variable is `ConstKind::Infer`
+    /// of its index here.
+    consts: Vec<Option<ConstId>>,
+    /// Bound variables in binding order: type variable indexes, and
+    /// const variable indexes tagged with `CONST_TRAIL`.
     trail: Vec<u32>,
     pub reads: Vec<(DefId, Ty, bool)>,
 }
 
+/// Marks a const variable on `PureCx::trail`.
+const CONST_TRAIL: u32 = 1 << 31;
+
 impl<'g> PureCx<'g> {
     /// A pure context over the given global store.
     pub fn new(global: &'g GlobalTys) -> PureCx<'g> {
-        PureCx { tys: Tys::new(global), vars: Vec::new(), trail: Vec::new(), reads: Vec::new() }
+        PureCx { tys: Tys::new(global), vars: Vec::new(), consts: Vec::new(), trail: Vec::new(), reads: Vec::new() }
     }
 
     fn resolve_shallow(&self, mut t: Ty) -> Ty {
@@ -984,6 +998,7 @@ impl<'g> PureCx<'g> {
         for i in 0..n {
             let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {
                 (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                (GenericArg::Const(x), GenericArg::Const(y)) => self.unify_const(x, y),
                 (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => true,
                 (x, y) => x == y,
             };
@@ -1026,6 +1041,7 @@ impl<'g> SolveCx for PureCx<'g> {
             }
             TyKind::Array(e, n) => {
                 let e = self.deep_resolve(e);
+                let n = self.resolve_const(n);
                 self.tys.intern(TyKind::Array(e, n))
             }
             TyKind::Tuple(ts) => {
@@ -1040,6 +1056,7 @@ impl<'g> SolveCx for PureCx<'g> {
                     .iter()
                     .map(|&g| match g {
                         GenericArg::Ty(e) => GenericArg::Ty(self.deep_resolve(e)),
+                        GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
                         other => other,
                     })
                     .collect();
@@ -1091,7 +1108,7 @@ impl<'g> SolveCx for PureCx<'g> {
             (TyKind::Ref(_, m, x), TyKind::Ref(_, n, y)) => m == n && self.unify(x, y),
             (TyKind::RawPtr(m, x), TyKind::RawPtr(n, y)) => m == n && self.unify(x, y),
             (TyKind::Slice(x), TyKind::Slice(y)) => self.unify(x, y),
-            (TyKind::Array(x, cx), TyKind::Array(y, cy)) => cx == cy && self.unify(x, y),
+            (TyKind::Array(x, cx), TyKind::Array(y, cy)) => self.unify_const(cx, cy) && self.unify(x, y),
             (TyKind::Tuple(x), TyKind::Tuple(y)) => {
                 let (xs, ys): (Vec<Ty>, Vec<Ty>) = (self.tys.tys_of(x).to_vec(), self.tys.tys_of(y).to_vec());
                 xs.len() == ys.len() && xs.iter().zip(&ys).all(|(&u, &v)| self.unify(u, v))
@@ -1109,6 +1126,46 @@ impl<'g> SolveCx for PureCx<'g> {
         self.tys.intern(TyKind::Infer(InferId(id, InferKind::General)))
     }
 
+    fn fresh_const_var(&mut self) -> ConstId {
+        self.consts.push(None);
+        let id = self.consts.len() as u32 - 1;
+        self.tys.intern_const(ConstKind::Infer(id))
+    }
+
+    fn unify_const(&mut self, a: ConstId, b: ConstId) -> bool {
+        let (a, b) = (self.resolve_const(a), self.resolve_const(b));
+        if a == b {
+            return true;
+        }
+        let var = |cx: &Self, c: ConstId| match cx.tys.const_kind(c) {
+            ConstKind::Infer(i) if (i as usize) < cx.consts.len() => Some(i),
+            _ => None,
+        };
+        match (var(self, a), var(self, b)) {
+            (Some(i), _) => {
+                self.consts[i as usize] = Some(b);
+                self.trail.push(i | CONST_TRAIL);
+                true
+            }
+            (None, Some(j)) => {
+                self.consts[j as usize] = Some(a);
+                self.trail.push(j | CONST_TRAIL);
+                true
+            }
+            (None, None) => false,
+        }
+    }
+
+    fn resolve_const(&self, mut c: ConstId) -> ConstId {
+        while let ConstKind::Infer(i) = self.tys.const_kind(c) {
+            match self.consts.get(i as usize).copied().flatten() {
+                Some(b) => c = b,
+                None => break,
+            }
+        }
+        c
+    }
+
     fn snapshot(&mut self) -> usize {
         self.trail.len()
     }
@@ -1116,7 +1173,11 @@ impl<'g> SolveCx for PureCx<'g> {
     fn rollback(&mut self, snap: usize) {
         while self.trail.len() > snap {
             let var = self.trail.pop().unwrap();
-            self.vars[var as usize] = None;
+            if var & CONST_TRAIL != 0 {
+                self.consts[(var & !CONST_TRAIL) as usize] = None;
+            } else {
+                self.vars[var as usize] = None;
+            }
         }
     }
 

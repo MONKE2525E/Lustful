@@ -2020,7 +2020,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// Unifies two consts, binding a const inference variable.
+    /// Unifies two consts, binding a const inference variable. The
+    /// binding goes on the probe trail (its id is at or above
+    /// `INFER_MARKER_BASE`, never a type variable index), so a rolled
+    /// back probe drops it like a type binding.
     fn unify_const(&mut self, a: ConstId, b: ConstId) -> bool {
         let (a, b) = (self.resolve_const(a), self.resolve_const(b));
         if a == b {
@@ -2029,10 +2032,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match (self.tys.const_kind(a), self.tys.const_kind(b)) {
             (ConstKind::Infer(x), _) if x >= generics::INFER_MARKER_BASE => {
                 self.const_bindings.insert(x, b);
+                self.trail.push(x);
                 true
             }
             (_, ConstKind::Infer(x)) if x >= generics::INFER_MARKER_BASE => {
                 self.const_bindings.insert(x, a);
+                self.trail.push(x);
                 true
             }
             _ => false,
@@ -2620,7 +2625,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let mut progress = false;
             for ob in work {
                 // What a selection queues and binds, to tell a repeat (below).
-                let (queued, trail, vars) = (self.obl.len(), self.trail.len(), self.vars.len());
+                let (queued, trail, vars, consts) = (self.obl.len(), self.trail.len(), self.vars.len(), self.next_const_id);
                 match ob {
                     obligations::Obligation::AssocEq { eq, span } => {
                         if self.prove_assoc_eq(eq, span) {
@@ -2638,7 +2643,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 // queues copies of the nested predicates its last selection
                                 // queued: no progress. Counting it ran every run point to the
                                 // round cap and grew the queue each round.
-                                let bound_old = self.trail.get(trail..).unwrap_or(&[]).iter().any(|&v| (v as usize) < vars);
+                                let bound_old = self.trail.get(trail..).unwrap_or(&[]).iter().any(|&v| {
+                                    if v >= generics::INFER_MARKER_BASE { v < consts } else { (v as usize) < vars }
+                                });
                                 if self.obl.note_requeued(trait_ref, span, depth, id, &args) || bound_old {
                                     progress = true;
                                 } else {
@@ -15360,13 +15367,28 @@ impl<'p> SolveCx for Ctx<'p, '_> {
     fn fresh_var(&mut self) -> Ty {
         self.new_var(false)
     }
+    fn fresh_const_var(&mut self) -> ConstId {
+        Ctx::fresh_const_var(self)
+    }
+    fn unify_const(&mut self, a: ConstId, b: ConstId) -> bool {
+        Ctx::unify_const(self, a, b)
+    }
+    fn resolve_const(&self, c: ConstId) -> ConstId {
+        Ctx::resolve_const(self, c)
+    }
     fn snapshot(&mut self) -> usize {
         self.trail.len()
     }
+    /// Pops the trail: type variables, and const variables (ids at or
+    /// above `INFER_MARKER_BASE`, see `unify_const`).
     fn rollback(&mut self, snap: usize) {
         while self.trail.len() > snap {
             let var = self.trail.pop().unwrap();
-            self.vars[var as usize].bound = None;
+            if var >= generics::INFER_MARKER_BASE {
+                self.const_bindings.remove(&var);
+            } else {
+                self.vars[var as usize].bound = None;
+            }
         }
     }
     fn closure_select(&mut self, obl: TraitRef) -> Option<bool> {
