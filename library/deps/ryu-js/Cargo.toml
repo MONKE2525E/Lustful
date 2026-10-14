@@ -1,0 +1,14 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package ryu-js 1.0.2; release builds use
+# the real crate through Cargo. The driver checks `version` against the
+# resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "ryu-js"
+version = "1.0.2"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# `small` only swaps upstream's tables; the digits are the same.
+features = ["small"]

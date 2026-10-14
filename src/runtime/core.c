@@ -1423,3 +1423,6 @@ uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY
 /* Erased hash table core (src/runtime/hash.h): declarations in every
    unit, bodies only in the runtime unit (LUST_IMPL). */
 #include "hash.h"
+
+/* Adapter crate cores, such as xxh3 (src/runtime/deps.h, W-DEPS). */
+#include "deps.h"

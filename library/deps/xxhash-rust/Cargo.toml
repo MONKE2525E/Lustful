@@ -1,0 +1,14 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package xxhash-rust 0.8.15; release
+# builds use the real crate through Cargo. The driver checks `version`
+# against the resolved package and the metadata against
+# src/resolve/adapters.rs.
+[package]
+name = "xxhash-rust"
+version = "0.8.15"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = ["xxh3"]

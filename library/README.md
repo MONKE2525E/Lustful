@@ -44,7 +44,9 @@ the upstream features it implements, and its exact-layout types.
 | deps/indexmap | README only. Upstream 2.14.0. | W-DEPS |
 | deps/smallvec | README only. Upstream 1.15.1. | W-DEPS |
 | deps/memchr | Adapter for 2.8.2: byte and substring search in source (deps/memchr/README.md). | W-DEPS |
-| deps/bumpalo, deps/xxhash-rust, deps/ryu-js, deps/num-bigint, deps/num-traits | No crate yet (section 3.6). | W-DEPS |
+| deps/xxhash-rust | Adapter for 0.8.15: `xxh3` over the C core (deps/xxhash-rust/README.md). | W-DEPS |
+| deps/ryu-js | Adapter for 1.0.2: `Buffer::format` for f64 over the runtime JS printer (deps/ryu-js/README.md). | W-DEPS |
+| deps/bumpalo, deps/num-bigint, deps/num-traits | No crate yet (section 3.6). | W-DEPS |
 
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 
@@ -55,15 +57,19 @@ the upstream features it implements, and its exact-layout types.
 
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)
 
-Implemented (codegen emits them): `exit` only.
+Implemented (codegen emits them): `exit`; the adapter cores
+`xxh3_64`/`xxh3_128` (xxhash-rust, C in src/runtime/deps.c) and
+`ryu_js_fmt_f64` (ryu-js, the JS printer in src/runtime/float.c).
+Adapter crates get their privilege from the resolver's record of their
+files (`Program::shipped_crate_at`).
 
 Registered with signature and privilege list, no body yet (a
 privileged call rejects with L0640): the memory, bytes, ptr, float
 text, panic, thread, sync, atomic, time, fd IO, and process groups of
 section 3.2; the three specialization predicates of section 3.4; the
-adapter cores `arena_alloc` (bumpalo), `memchr`/`memrchr`/`memmem`
-(memchr), `xxh3_64`/`xxh3_128` (xxhash-rust), `ryu_js_fmt_f64`
-(ryu-js). A user call to any intrinsic rejects with L0642.
+adapter cores `arena_alloc` (bumpalo) and `memchr`/`memrchr`/`memmem`
+(memchr, whose adapter searches in source for now). A user call to any
+intrinsic rejects with L0642.
 
 Specialization that changes output (section 3.4 gate): none in source
 yet, so no unfused difftest rows yet. Add one row here per predicate

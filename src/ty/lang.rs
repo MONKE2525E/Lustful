@@ -706,7 +706,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::Bytes, S::U64],
         ret: S::U64,
         allowed: &[C::XxhashRust],
-        implemented: false,
+        implemented: true,
     },
     IntrinsicDef {
         name: "xxh3_128",
@@ -714,7 +714,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::Bytes, S::U64],
         ret: S::U128,
         allowed: &[C::XxhashRust],
-        implemented: false,
+        implemented: true,
     },
     // Appends the ECMAScript Number::toString text of the f64 (ryu-js
     // 1.0.2 Buffer::format) to the String; the core is in float.c.
@@ -724,7 +724,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::StringMut, S::F64],
         ret: S::Unit,
         allowed: &[C::RyuJs],
-        implemented: false,
+        implemented: true,
     },
 ];
 

@@ -2412,11 +2412,16 @@ impl FnGen<'_, '_, '_> {
             def.name
         );
         assert!(def.implemented, "internal: intrinsic `core::intrinsics::{}` reached codegen with no body", def.name);
-        let args: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-        if def.ret == SigTy::Never {
-            // The C callee never returns (its C type is void). The comma
-            // form still gives the assignment a value of the right shape
-            // for the dead continuation.
+        let mut args: Vec<String> = Vec::new();
+        for (o, sig) in ops.iter().zip(def.params) {
+            let v = self.operand(o, loc, post).0;
+            // A `&[u8]` reaches C as its pointer and its length.
+            args.push(if *sig == SigTy::Bytes { format!("({v}).ptr, ({v}).len") } else { v });
+        }
+        if matches!(def.ret, SigTy::Never | SigTy::Unit) {
+            // The C callee returns void (and for `!`, never returns). The
+            // comma form still gives the assignment a value of the right
+            // shape: `()`, or the dead continuation's.
             format!("({}({}), ((lust_Unit){{}}))", def.c_symbol, args.join(", "))
         } else {
             format!("{}({})", def.c_symbol, args.join(", "))
@@ -4014,6 +4019,7 @@ fn runtime_source(with_impls: bool) -> String {
     // the symbols link; a unit whose code calls the core adds
     // `hash_decls()` to its header.
     let hash = if with_impls { hash_source(true) } else { String::new() };
+    let deps = include_str!("runtime/deps.h").replacen("#include \"deps.c\"", if with_impls { include_str!("runtime/deps.c") } else { "" }, 1);
     let core = include_str!("runtime/core.c")
         .replacen("#include \"escape_table.h\"", include_str!("runtime/escape_table.h"), 1)
         .replacen("#include \"unicode_table.h\"", include_str!("runtime/unicode_table.h"), 1);
@@ -4024,7 +4030,8 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
     let src = src.replacen("#include \"float.h\"", &header, 1);
     let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
-    src.replacen("#include \"hash.h\"", &hash, 1)
+    let src = src.replacen("#include \"hash.h\"", &hash, 1);
+    src.replacen("#include \"deps.h\"", &deps, 1)
 }
 
 /// Removes C comments, replacing each with one space (the C meaning of a
