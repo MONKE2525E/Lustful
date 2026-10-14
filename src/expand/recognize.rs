@@ -347,21 +347,23 @@ fn parse_qualified(c: &mut Cur, ty: bool) -> bool {
     if !c.eat(Tok::Gt) {
         return false;
     }
-    if c.at(Tok::PathSep) {
-        if ty {
-            // The rest reads as one more segment chain.
-            while c.eat(Tok::PathSep) {
-                if !matches!(c.tok(), Some(t) if is_seg(t)) {
-                    return false;
-                }
-                c.bump();
-                if c.at(Tok::Lt) && !generic_args(c) {
-                    return false;
-                }
+    // rustc expects `::` and a segment after the closing `>`.
+    if !c.at(Tok::PathSep) {
+        return false;
+    }
+    if ty {
+        // The rest reads as one more segment chain.
+        while c.eat(Tok::PathSep) {
+            if !matches!(c.tok(), Some(t) if is_seg(t)) {
+                return false;
+            }
+            c.bump();
+            if c.at(Tok::Lt) && !generic_args(c) {
+                return false;
             }
         }
-        // In expression position the caller consumes `::seg` chains.
     }
+    // In expression position the caller consumes `::seg` chains.
     true
 }
 
@@ -416,7 +418,12 @@ fn parse_ty(c: &mut Cur) -> bool {
         }
     }
     match c.tree() {
-        Some(Tt::Frag(_, _, _)) => {
+        // A forwarded fragment is one type only when it is a type or a
+        // path (rustc's `can_begin_type`).
+        Some(Tt::Frag(kind, _, _)) => {
+            if !matches!(kind, FragKind::Ty | FragKind::Path) {
+                return false;
+            }
             c.i += 1;
             return true;
         }
@@ -657,7 +664,13 @@ fn parse_pat_one(c: &mut Cur) -> bool {
         }
     }
     match c.tree() {
-        Some(Tt::Frag(_, _, _)) => {
+        // A forwarded fragment is one pattern when it is a pattern, a
+        // path, or a literal (an `expr` only when it holds one).
+        Some(Tt::Frag(kind, inner, _)) => {
+            let literal_expr = matches!(kind, FragKind::Expr | FragKind::Expr2021) && super::match_::trees_read_literal(inner);
+            if !(matches!(kind, FragKind::Pat | FragKind::PatParam | FragKind::Path | FragKind::Literal) || literal_expr) {
+                return false;
+            }
             c.i += 1;
             return true;
         }
@@ -758,16 +771,28 @@ fn parse_pat_path_pat(c: &mut Cur) -> bool {
     if !parse_pat_path(c) {
         return false;
     }
-    // A struct pattern: `Path { field: pat, .. }`.
+    // A struct pattern: `Path { field: pat, .. }`. A field is a name
+    // (or tuple index) and `: pat`, or the shorthand `[ref] [mut] name`.
     if let Some(inner) = c.group(Delim::Brace) {
         return pieces_all(inner, |p| {
             if is_rest(p) {
                 return true;
             }
-            match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
-                Some(k) if k >= 1 => is_pat(&p[k + 1..], c.interner, true),
-                _ => is_pat(p, c.interner, false),
+            let tok = |i: usize| match p.get(i) {
+                Some(Tt::Tok(t)) => Some(t.tok),
+                _ => None,
+            };
+            if tok(1) == Some(Tok::Colon) {
+                return matches!(tok(0), Some(Tok::Ident(_) | Tok::Int(_, None))) && is_pat(&p[2..], c.interner, true);
             }
+            let mut i = 0;
+            if tok(i) == Some(Tok::Ref) {
+                i += 1;
+            }
+            if tok(i) == Some(Tok::Mut) {
+                i += 1;
+            }
+            i + 1 == p.len() && matches!(tok(i), Some(Tok::Ident(_)))
         });
     }
     // A tuple struct pattern: `Path(pat, ..)`.
@@ -816,10 +841,17 @@ fn bin_bp(t: Tok) -> Option<u8> {
     })
 }
 
+/// True when a forwarded fragment of `kind` is one expression operand
+/// (rustc's `can_begin_expr` for a metavariable).
+fn expr_frag(kind: FragKind) -> bool {
+    matches!(kind, FragKind::Expr | FragKind::Expr2021 | FragKind::Literal | FragKind::Path | FragKind::Block)
+}
+
 /// True when the next tree can start an expression operand.
 fn operand_start(c: &Cur) -> bool {
     match c.tree() {
-        Some(Tt::Delim(_, _, _)) | Some(Tt::Frag(_, _, _)) => return true,
+        Some(Tt::Delim(_, _, _)) => return true,
+        Some(Tt::Frag(kind, _, _)) => return expr_frag(*kind),
         _ => {}
     }
     matches!(
@@ -876,12 +908,19 @@ fn parse_expr_bp(c: &mut Cur, min_bp: u8) -> bool {
     if !parse_unary(c) {
         return false;
     }
+    // Comparisons do not chain: `a < b < c` is a parse error in rustc.
+    let mut after_cmp = false;
     loop {
         let Some(t) = c.tok() else { return true };
         let Some(bp) = bin_bp(t) else { return true };
         if bp <= min_bp {
             return true;
         }
+        let cmp = matches!(t, Tok::EqEq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge);
+        if cmp && after_cmp {
+            return false;
+        }
+        after_cmp = cmp;
         c.bump();
         c.block_like = false;
         match t {
@@ -1145,7 +1184,10 @@ fn parse_primary(c: &mut Cur) -> bool {
         }
     }
     match c.tree() {
-        Some(Tt::Frag(_, _, _)) => {
+        Some(Tt::Frag(kind, _, _)) => {
+            if !expr_frag(*kind) {
+                return false;
+            }
             c.i += 1;
             return parse_postfix(c);
         }
@@ -1396,13 +1438,15 @@ fn struct_fields(inner: &[Tt], interner: &Interner, ed2024: bool) -> bool {
         if matches!(p.first(), Some(Tt::Tok(t)) if t.tok == Tok::DotDot) {
             return p.len() > 1 && is_expr(&p[1..], interner, ed2024);
         }
+        // `name: expr` (a name or a tuple index), or the shorthand
+        // `name`; rustc rejects keywords and numbers as a shorthand.
         match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
             Some(1) => {
-                matches!(p.first(), Some(Tt::Tok(t)) if is_seg(t.tok) || matches!(t.tok, Tok::Int(..)))
+                matches!(p.first(), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Ident(_) | Tok::Int(_, None)))
                     && is_expr(&p[2..], interner, ed2024)
             }
             Some(_) => false,
-            None => matches!(p, [Tt::Tok(t)] if is_seg(t.tok) || matches!(t.tok, Tok::Int(..))),
+            None => matches!(p, [Tt::Tok(t)] if matches!(t.tok, Tok::Ident(_))),
         }
     })
 }

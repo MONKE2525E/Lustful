@@ -145,7 +145,8 @@ pub fn tt_from_tree(tree: &TokenTree) -> Tt {
 }
 
 /// Turns expander trees back into lexer token trees. A fragment becomes
-/// its inner trees: the lexer form has no fragment case.
+/// its inner trees (a statement also its `;`, see `match_::stmt_semi`):
+/// the lexer form has no fragment case.
 pub fn trees_from_tts(trees: &[Tt], out: &mut Vec<TokenTree>) {
     for tree in trees {
         match tree {
@@ -159,7 +160,14 @@ pub fn trees_from_tts(trees: &[Tt], out: &mut Vec<TokenTree>) {
                 trees_from_tts(inner, &mut converted);
                 out.push(TokenTree::Delim(*d, converted, *span));
             }
-            Tt::Frag(_, inner, _) => trees_from_tts(inner, out),
+            Tt::Frag(kind, inner, _) => {
+                trees_from_tts(inner, out);
+                if *kind == FragKind::Stmt
+                    && let Some(semi) = match_::stmt_semi(inner)
+                {
+                    out.push(TokenTree::Token(semi));
+                }
+            }
         }
     }
 }
@@ -517,7 +525,7 @@ pub struct VarInfo {
 
 /// One arm of a compiled macro definition.
 pub struct Arm {
-    pub nodes: Vec<match_::MNode>,
+    pub matcher: match_::ArmMatcher,
     pub template: Vec<Tt>,
 }
 
@@ -603,9 +611,9 @@ pub fn compile_macro(
             return Err(err(C_DEF, mspan, "expected a macro expansion group", "Write each rule as `( matcher ) => { expansion };`."));
         };
         let template = template.clone();
-        let (nodes, vars) = match_::compile_arm(&matcher, mspan, interner)?;
+        let (matcher, vars) = match_::compile_arm(&matcher, mspan, interner)?;
         transcribe::check_template_vars(&template, &vars, interner)?;
-        arms.push(Arm { nodes, template });
+        arms.push(Arm { matcher, template });
         i += 3;
         if tok_at(body, i).map(|t| t.tok) == Some(Tok::Semi) {
             i += 1;
@@ -1333,7 +1341,8 @@ fn atomic_shaped(trees: &[Tt]) -> bool {
 
 /// Flattens expanded trees for the parser. An expression fragment with
 /// more than one token gets parens, so forwarding one into a larger
-/// expression keeps its rustc atomic shape in the flat token stream.
+/// expression keeps its rustc atomic shape in the flat token stream,
+/// and a statement fragment gets its `;` (see `match_::stmt_semi`).
 fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
     for tree in trees {
         match tree {
@@ -1362,7 +1371,14 @@ fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
                 flatten_final(inner, out);
                 out.push(Token { tok: close, span: *span });
             }
-            Tt::Frag(_, inner, _) => flatten_final(inner, out),
+            Tt::Frag(kind, inner, _) => {
+                flatten_final(inner, out);
+                if *kind == FragKind::Stmt
+                    && let Some(semi) = match_::stmt_semi(inner)
+                {
+                    out.push(semi);
+                }
+            }
         }
     }
 }
@@ -1729,26 +1745,29 @@ impl<'a> Expander<'a> {
         }
         CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         let mut chosen: Option<(usize, BindMap)> = None;
+        let mut matcher = match_::Matcher::new(self.ctx.interner, self.ctx.known, &self.strings, call.span);
         for (arm_i, arm) in def.arms.iter().enumerate() {
-            let mut matcher = match_::Matcher::new(self.ctx.interner, self.ctx.known, &self.strings, call.span);
-            let matches = match_::match_arm(&mut matcher, &arm.nodes, &call.inner)?;
-            // Local ambiguity is fatal even when this arm goes on to
-            // fail: rustc stops at the first ambiguous token, it does
-            // not fall through to a later arm.
-            if matcher.ambiguous() || matches.len() > 1 {
-                return Err(err(
-                    C_AMBIG,
-                    call.span,
-                    format!("local ambiguity when calling macro `{}!`", def.name_text),
-                    "Make the matcher decide each token's role without guessing between fragments.",
-                )
-                .with_label(def.def_span, "the macro is defined here"));
-            }
-            if matches.is_empty() {
+            match match_::match_arm(&mut matcher, &arm.matcher, &call.inner)? {
+                match_::ArmMatch::Match(binds) => {
+                    chosen = Some((arm_i, binds));
+                    break;
+                }
+                match_::ArmMatch::NoMatch => {}
+                // Local ambiguity is fatal: rustc stops at the first
+                // ambiguous token, it does not fall through to a later arm.
+                match_::ArmMatch::Ambiguous => {
+                    return Err(err(
+                        C_AMBIG,
+                        call.span,
+                        format!("local ambiguity when calling macro `{}!`", def.name_text),
+                        "Make the matcher decide each token's role without guessing between fragments.",
+                    )
+                    .with_label(def.def_span, "the macro is defined here"));
+                }
                 // A fragment parser that began and failed is rustc's
                 // hard error: the call fails here instead of falling
                 // through to a later arm that token-matches the input.
-                if matcher.hard_fail {
+                match_::ArmMatch::BadFragment => {
                     return Err(err(
                         C_CALL,
                         call.span,
@@ -1757,10 +1776,7 @@ impl<'a> Expander<'a> {
                     )
                     .with_label(def.def_span, "the macro is defined here"));
                 }
-                continue;
             }
-            chosen = Some((arm_i, matches.into_iter().next().unwrap()));
-            break;
         }
         let Some((arm_i, binds)) = chosen else {
             return Err(err(
