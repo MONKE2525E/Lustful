@@ -977,11 +977,12 @@ impl OwnSig {
 
     /// A closure body's universals: one per slot of its env (the env
     /// reference's region, then each captured region), of its output, and
-    /// of its inputs (inputs may be any region: higher-ranked). The facts
-    /// are the closure contract (`closure_roles`): every captured source
-    /// outlives every captured sink and every output slot; the creator
-    /// adds the same source-to-sink edges, and a call's result holds the
-    /// sources. Nothing relates an input to anything else.
+    /// of its inputs. The facts are the closure contract (`closure_roles`):
+    /// every source (captured, or a free argument slot) outlives every
+    /// other sink and every output slot. Relations among the captured
+    /// slots, the free argument slots, and `'static` are not errors here:
+    /// the creator adds what the body needs of them (`ends`,
+    /// `closure_requirements`). Higher-ranked argument slots take no part.
     fn closure_sig<T: TyIntern>(&mut self, p: &Program, body: &Body, sc: &mut SlotCx<'_, '_, '_, T>) {
         let free = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d)).and_then(|c| c.free_args.clone());
         let fresh = |own: &mut OwnSig, name: &str| -> Univ {
@@ -1150,8 +1151,6 @@ impl OwnSig {
     }
 }
 
-/// Walks erased type `t` with slot universals `us` from `*at`, pushing a
-/// fact `inner: outer` for every slot inside each enclosing reference.
 /// The region contract of a closure (W-BORROW, ARCH 5.2 closures): per
 /// slot of its env field types, in slot order, whether the body may read
 /// the region into other places (a source) and whether it may write a
@@ -1159,8 +1158,9 @@ impl OwnSig {
 /// are sources; a mutable one `&'c mut T`: `T`'s slots are sources and
 /// sinks, `'c` neither (a captured `&mut` cannot escape); a by-value
 /// field: its slots are sources and sinks. The body may make any source
-/// outlive any sink and its output; the creator adds exactly the
-/// source-to-sink edges, and a call's result holds the sources.
+/// outlive any sink and its output; the creator adds what the body needs
+/// of that (`closure_reqs`), or every source-to-sink edge when the body
+/// does not solve, and a call's result holds what the body returns.
 pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, args: ArgsId, out: &mut Vec<(bool, bool)>) {
     for f in closure_fields(sc.tys, args) {
         match sc.tys.kind(f) {
@@ -1336,6 +1336,8 @@ fn arg_slot_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, under_mut:
     }
 }
 
+/// Walks erased type `t` with slot universals `us` from `*at`, pushing a
+/// fact `inner: outer` for every slot inside each enclosing reference.
 fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ], at: &mut usize, outer: &mut Vec<Univ>, facts: &mut Vec<(Univ, Univ)>) {
     let each = |u: Univ, facts: &mut Vec<(Univ, Univ)>, outer: &Vec<Univ>| {
         for &o in outer {
