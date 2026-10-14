@@ -643,9 +643,27 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             let after = next.map(|ch| i + 1 + ch.len_utf8());
             if next.is_some_and(|ch| ch.is_alphabetic() || ch == '_') && after.and_then(|a| b.get(a)) != Some(&b'\'') {
                 i += 1;
-                let name_start = i;
+                let mut name_start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
+                }
+                // A raw lifetime: `'r#name`. The token keeps the name; its
+                // span still covers the `r#`, which macro matching reads.
+                if &src[name_start..i] == "r" && b.get(i) == Some(&b'#') && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_') {
+                    i += 1;
+                    name_start = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    let name = &src[name_start..i];
+                    if raw_ident_invalid(name) {
+                        return Err(Diag::new(
+                            "L0001",
+                            Span::new(file, base + start as u32, base + i as u32),
+                            format!("`{name}` cannot be a raw lifetime"),
+                            "Use a different name. `self`, `Self`, `super`, `crate`, and `_` cannot be raw lifetimes.",
+                        ));
+                    }
                 }
                 let name = &src[name_start..i];
                 Tok::Lifetime(*cache.entry(name).or_insert_with(|| interner.intern(name)))
