@@ -346,43 +346,58 @@ fn fmt_ctype(k: crate::ty::fmt::FmtTy) -> &'static str {
     }
 }
 
+/// The C name fragment of `t`, used in type names (`O_<m>`, `Tup_<m>`) and glue names
+/// (`drop_<m>`, `clone_<m>`). It must be injective: two different types with one fragment
+/// give two C definitions with one name. Every type constructor gets its own token, every
+/// token ends in `_` and has no other `_`, and each token fixes how many child tokens follow
+/// (tuples and fn pointers encode their arity, arrays their length). So the fragment is a
+/// prefix (Polish) code: splitting on `_` gives one token list, which parses one way only.
 fn mangle(t: &CTy) -> String {
+    let mut s = String::new();
+    mangle_into(t, &mut s);
+    s
+}
+
+/// Appends the tokens of `t` to `s` (see `mangle`).
+fn mangle_into(t: &CTy, s: &mut String) {
+    let tok = |s: &mut String, code: &str, kids: &[&CTy]| {
+        s.push_str(code);
+        s.push('_');
+        kids.iter().for_each(|k| mangle_into(k, s));
+    };
     match t {
-        CTy::Unit => "u".into(),
-        CTy::Bool => "b".into(),
-        CTy::Char => "c".into(),
-        CTy::Int(i) => i.name().into(),
-        CTy::Str => "str".into(),
-        CTy::String => "S".into(),
-        CTy::Vec(e) => format!("V_{}_", mangle(e)),
-        CTy::Boxed(e) => format!("Bx_{}_", mangle(e)),
-        CTy::Rc(e) => format!("Rc_{}_", mangle(e)),
-        CTy::VecIter(e) => format!("VI_{}_", mangle(e)),
-        CTy::Weak(e) => format!("Wk_{}_", mangle(e)),
-        CTy::RefCell(e) => format!("RCL_{}_", mangle(e)),
-        CTy::Cell(e) => format!("Cl_{}_", mangle(e)),
-        CTy::Guard(e, m) => format!("Gd{}_{}_", if *m { "M" } else { "" }, mangle(e)),
-        CTy::ExitCode => "XC".into(),
-        CTy::BoxSlice(e) => format!("BS_{}_", mangle(e)),
-        CTy::Sync(k, e) => format!("Sy{}_{}_", *k as u32, mangle(e)),
-        CTy::Ref(e) => format!("R_{}_", mangle(e)),
-        CTy::Adt(a) => format!("A{}", a.0),
-        CTy::Option(e) => format!("O_{}_", mangle(e)),
-        CTy::Result(a, b) => format!("R_{}{}_", mangle(a), mangle(b)),
-        CTy::Args => "Args".into(),
-        CTy::Chars => "Chars".into(),
-        CTy::Tuple(es) => es.iter().map(|e| format!("{}_", mangle(e))).collect(),
-        CTy::Array(e, n) => format!("{n}_{}_", mangle(e)),
-        CTy::Slice(e) => format!("sl{}_", mangle(e)),
-        CTy::Float(f) => f.name().into(),
-        CTy::FnPtr(ps, r) => {
-            let ps: String = ps.iter().map(|e| format!("{}_", mangle(e))).collect();
-            format!("fp{ps}r{}_", mangle(r))
-        }
-        CTy::Dyn => "dyn".into(),
-        CTy::BoxDyn => "Bxdyn".into(),
-        CTy::RcDyn => "Rcdyn".into(),
-        CTy::Fmt(k) => format!("Fmt{}", *k as u8),
+        CTy::Unit => tok(s, "u", &[]),
+        CTy::Bool => tok(s, "b", &[]),
+        CTy::Char => tok(s, "c", &[]),
+        CTy::Int(i) => tok(s, i.name(), &[]),
+        CTy::Float(f) => tok(s, f.name(), &[]),
+        CTy::Str => tok(s, "str", &[]),
+        CTy::String => tok(s, "S", &[]),
+        CTy::Args => tok(s, "Args", &[]),
+        CTy::Chars => tok(s, "Chars", &[]),
+        CTy::Dyn => tok(s, "dyn", &[]),
+        CTy::BoxDyn => tok(s, "Bxdyn", &[]),
+        CTy::RcDyn => tok(s, "Rcdyn", &[]),
+        CTy::ExitCode => tok(s, "XC", &[]),
+        CTy::Fmt(k) => tok(s, &format!("Fmt{}", *k as u8), &[]),
+        CTy::Adt(a) => tok(s, &format!("A{}", a.0), &[]),
+        CTy::Vec(e) => tok(s, "V", &[e]),
+        CTy::Boxed(e) => tok(s, "Bx", &[e]),
+        CTy::Rc(e) => tok(s, "Rc", &[e]),
+        CTy::VecIter(e) => tok(s, "VI", &[e]),
+        CTy::Weak(e) => tok(s, "Wk", &[e]),
+        CTy::RefCell(e) => tok(s, "RCL", &[e]),
+        CTy::Cell(e) => tok(s, "Cl", &[e]),
+        CTy::Guard(e, m) => tok(s, if *m { "GdM" } else { "Gd" }, &[e]),
+        CTy::BoxSlice(e) => tok(s, "BS", &[e]),
+        CTy::Sync(k, e) => tok(s, &format!("Sy{}", *k as u32), &[e]),
+        CTy::Ref(e) => tok(s, "R", &[e]),
+        CTy::Option(e) => tok(s, "O", &[e]),
+        CTy::Result(a, b) => tok(s, "Re", &[a, b]),
+        CTy::Slice(e) => tok(s, "sl", &[e]),
+        CTy::Array(e, n) => tok(s, &format!("Y{n}"), &[e]),
+        CTy::Tuple(es) => tok(s, &format!("T{}", es.len()), &es.iter().collect::<Vec<_>>()),
+        CTy::FnPtr(ps, r) => tok(s, &format!("fp{}", ps.len()), &ps.iter().chain([&**r]).collect::<Vec<_>>()),
     }
 }
 
