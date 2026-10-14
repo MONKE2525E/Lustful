@@ -559,6 +559,18 @@ pub fn atomic_ordering_def() -> DefId {
     lang_def(&["core", "sync", "atomic"], crate::def::DefKind::Adt, "Ordering")
 }
 
+/// The def of `std::sync::mpsc::RecvError`, a synthetic unit struct
+/// (W-THREADS).
+pub fn recv_error_def() -> DefId {
+    lang_def(&["std", "sync", "mpsc"], crate::def::DefKind::Adt, "RecvError")
+}
+
+/// The def of `std::sync::mpsc::TryRecvError`, a synthetic enum
+/// (`Empty`, `Disconnected`; W-THREADS).
+pub fn try_recv_error_def() -> DefId {
+    lang_def(&["std", "sync", "mpsc"], crate::def::DefKind::Adt, "TryRecvError")
+}
+
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
@@ -569,13 +581,15 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// only the flat name (check/collect.rs); `fmt::Error` and
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`).
 /// The driver predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 5] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 7] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
         (2, "Utf8Error", utf8_error_def(), false),
         (3, "FromUtf8Error", from_utf8_error_def(), false),
         (4, "Ordering", atomic_ordering_def(), true),
+        (5, "RecvError", recv_error_def(), false),
+        (6, "TryRecvError", try_recv_error_def(), true),
     ]
 }
 
@@ -583,7 +597,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 5] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4)
+    !matches!(index, 1 | 4 | 5 | 6)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -613,6 +627,8 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("str", "Utf8Error", utf8_error_def()),
         ("string", "FromUtf8Error", from_utf8_error_def()),
         ("atomic", "Ordering", atomic_ordering_def()),
+        ("mpsc", "RecvError", recv_error_def()),
+        ("mpsc", "TryRecvError", try_recv_error_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)

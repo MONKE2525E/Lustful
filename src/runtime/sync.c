@@ -492,3 +492,230 @@ void lust_scope_wait(lust_Scope *sc) LUST_BODY({
         lust_futex_wait(&sc->live, n);
     }
 })
+
+/* ---------- mpsc channels ----------
+
+   One lust_Chan per channel, shared by every Sender/SyncSender and the
+   Receiver (each of those is a lust_Chan*). A futex mutex guards it; `seq`
+   is a condition word (waiters sleep on its value, every change bumps it
+   and wakes all). Values move in and out by memcpy of `esize` bytes.
+   `cap` is -1 for `channel()` and the bound for `sync_channel(n)`; a
+   bound of 0 is a rendezvous: a sender places its value only while a
+   receiver waits, then waits until that value is taken. The channel is
+   freed when the last sender and the receiver are gone; values still
+   queued then drop through `drop_elem`. */
+typedef struct lust_Chan {
+    uint32_t lock;
+    uint32_t seq;
+    uint64_t senders;
+    uint32_t rx_alive;
+    uint32_t rx_waiting;
+    int64_t cap;
+    uint64_t esize;
+    uint64_t ealign;
+    uint8_t *buf;
+    uint64_t head, len, bufcap;
+    uint64_t taken;
+    void (*drop_elem)(void *);
+} lust_Chan;
+
+#ifdef LUST_IMPL
+static void lust_chan_changed(lust_Chan *c) {
+    __atomic_add_fetch(&c->seq, 1, 5);
+    lust_futex_wake(&c->seq, 0x7fffffff);
+}
+/* Sleeps until the channel changes; the lock is dropped meanwhile. */
+static void lust_chan_wait(lust_Chan *c) {
+    uint32_t s;
+    __atomic_load(&c->seq, &s, 5);
+    lust_mutex_unlock(&c->lock);
+    lust_futex_wait(&c->seq, s);
+    lust_mutex_lock(&c->lock);
+}
+static void lust_chan_push(lust_Chan *c, const void *v) {
+    if (c->esize == 0) { c->len++; return; }
+    if (c->len == c->bufcap) {
+        uint64_t nc = c->bufcap ? c->bufcap * 2 : 4;
+        uint8_t *nb = (uint8_t *)lust_alloc(nc * c->esize, c->ealign);
+        for (uint64_t i = 0; i < c->len; i++) memcpy(nb + i * c->esize, c->buf + ((c->head + i) % c->bufcap) * c->esize, c->esize);
+        if (c->bufcap && c->esize) free(c->buf);
+        c->buf = nb;
+        c->bufcap = nc;
+        c->head = 0;
+    }
+    memcpy(c->buf + ((c->head + c->len) % c->bufcap) * c->esize, v, c->esize);
+    c->len++;
+}
+static void lust_chan_pop(lust_Chan *c, void *out) {
+    if (c->esize == 0) { c->len--; c->taken++; return; }
+    memcpy(out, c->buf + c->head * c->esize, c->esize);
+    c->head = (c->head + 1) % c->bufcap;
+    c->len--;
+    c->taken++;
+}
+/* Drops the queued values and frees the channel (lock held, last user). */
+static void lust_chan_drain(lust_Chan *c) {
+    if (c->drop_elem)
+        for (uint64_t i = 0; i < c->len; i++) c->drop_elem(c->esize ? c->buf + ((c->head + i) % c->bufcap) * c->esize : (uint8_t *)(uintptr_t)c->ealign);
+    c->len = 0;
+}
+static void lust_chan_free(lust_Chan *c) {
+    lust_chan_drain(c);
+    if (c->bufcap && c->esize) free(c->buf);
+    free(c);
+}
+#endif
+
+lust_Chan *lust_chan_new(uint64_t esize, uint64_t ealign, int64_t cap, void (*drop_elem)(void *)) LUST_BODY({
+    lust_Chan *c = (lust_Chan *)calloc(1, sizeof(lust_Chan));
+    if (!c) lust_oom();
+    c->senders = 1;
+    c->rx_alive = 1;
+    c->cap = cap;
+    c->esize = esize;
+    c->ealign = ealign;
+    c->drop_elem = drop_elem;
+    return c;
+})
+
+/* 0 sent; 1 the receiver is gone (the value stays with the caller). */
+int lust_chan_send(lust_Chan *c, const void *v) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    if (c->cap == 0) {
+        while (c->rx_alive && (c->rx_waiting == 0 || c->len > 0)) lust_chan_wait(c);
+        if (!c->rx_alive) { lust_mutex_unlock(&c->lock); return 1; }
+        uint64_t ticket = c->taken;
+        lust_chan_push(c, v);
+        lust_chan_changed(c);
+        while (c->taken == ticket && c->rx_alive) lust_chan_wait(c);
+        lust_mutex_unlock(&c->lock);
+        return 0;
+    }
+    while (c->rx_alive && c->cap > 0 && c->len >= (uint64_t)c->cap) lust_chan_wait(c);
+    if (!c->rx_alive) { lust_mutex_unlock(&c->lock); return 1; }
+    lust_chan_push(c, v);
+    lust_chan_changed(c);
+    lust_mutex_unlock(&c->lock);
+    return 0;
+})
+
+/* 0 received into out; 1 every sender is gone and nothing is queued.
+   `block` 0 is try_recv: 1 means empty, 2 disconnected. */
+int lust_chan_recv(lust_Chan *c, void *out, int block) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    c->rx_waiting++;
+    lust_chan_changed(c);
+    for (;;) {
+        if (c->len > 0) {
+            lust_chan_pop(c, out);
+            c->rx_waiting--;
+            lust_chan_changed(c);
+            lust_mutex_unlock(&c->lock);
+            return 0;
+        }
+        if (c->senders == 0) { c->rx_waiting--; lust_mutex_unlock(&c->lock); return block ? 1 : 2; }
+        if (!block) { c->rx_waiting--; lust_mutex_unlock(&c->lock); return 1; }
+        lust_chan_wait(c);
+    }
+})
+
+lust_Chan *lust_chan_clone_sender(lust_Chan *c) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    c->senders++;
+    lust_mutex_unlock(&c->lock);
+    return c;
+})
+
+void lust_chan_drop_sender(lust_Chan *c) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    if (--c->senders == 0) {
+        if (!c->rx_alive) { lust_chan_free(c); return; }
+        lust_chan_changed(c);
+    }
+    lust_mutex_unlock(&c->lock);
+})
+
+void lust_chan_drop_receiver(lust_Chan *c) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    c->rx_alive = 0;
+    if (c->senders == 0) { lust_chan_free(c); return; }
+    /* Queued values drop now, as std's receiver drop does. */
+    lust_chan_drain(c);
+    lust_chan_changed(c);
+    lust_mutex_unlock(&c->lock);
+})
+
+/* ---------- Condvar, Barrier, OnceLock ----------
+
+   A Condvar is a sequence word: a waiter reads it, unlocks the mutex,
+   sleeps while it is unchanged, and locks again; a notify bumps it and
+   wakes one or all (spurious wakeups are allowed, as std documents).
+   A Barrier is { lock, seq, count, generation, n }: the n-th arrival
+   starts a new generation, wakes the others, and is the leader. A
+   OnceLock<T> is { state, T }: 0 empty, 1 being set, 2 set. */
+void lust_cv_wait(uint32_t *cv, uint32_t *m) LUST_BODY({
+    uint32_t s;
+    __atomic_load(cv, &s, 5);
+    lust_mutex_unlock(m);
+    lust_futex_wait(cv, s);
+    lust_mutex_lock(m);
+})
+
+void lust_cv_notify(uint32_t *cv, int all) LUST_BODY({
+    __atomic_add_fetch(cv, 1, 5);
+    lust_futex_wake(cv, all ? 0x7fffffff : 1);
+})
+
+typedef struct lust_Barrier {
+    uint32_t lock;
+    uint32_t seq;
+    uint64_t count;
+    uint64_t gen;
+    uint64_t n;
+} lust_Barrier;
+
+/* 1 for the leader (the arrival that releases the others). */
+int lust_barrier_wait(lust_Barrier *b) LUST_BODY({
+    lust_mutex_lock(&b->lock);
+    uint64_t g = b->gen;
+    if (++b->count < b->n) {
+        while (b->gen == g) {
+            uint32_t s;
+            __atomic_load(&b->seq, &s, 5);
+            lust_mutex_unlock(&b->lock);
+            lust_futex_wait(&b->seq, s);
+            lust_mutex_lock(&b->lock);
+        }
+        lust_mutex_unlock(&b->lock);
+        return 0;
+    }
+    b->count = 0;
+    b->gen++;
+    lust_cv_notify(&b->seq, 1);
+    lust_mutex_unlock(&b->lock);
+    return 1;
+})
+
+/* 1 when the caller must set the value (state is now 1); 0 when it is
+   set (after waiting out another thread's set). */
+int lust_once_begin(uint32_t *st) LUST_BODY({
+    for (;;) {
+        uint32_t zero = 0, one = 1, s;
+        if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 2)) return 1;
+        __atomic_load(st, &s, 2);
+        if (s == 2) return 0;
+        if (s == 1) lust_futex_wait(st, 1);
+    }
+})
+
+void lust_once_finish(uint32_t *st) LUST_BODY({
+    uint32_t two = 2;
+    __atomic_store(st, &two, 3);
+    lust_futex_wake(st, 0x7fffffff);
+})
+
+int lust_once_is_done(uint32_t *st) LUST_BODY({
+    uint32_t s;
+    __atomic_load(st, &s, 2);
+    return s == 2;
+})

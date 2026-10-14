@@ -7712,6 +7712,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
         {
             return Some(Res::Variant(a, 0));
         }
+        // `mpsc::RecvError`, the unit struct value (W-THREADS).
+        if names.len() == 4
+            && names[0] == k.std
+            && self.name(names[1]) == "sync"
+            && self.name(names[2]) == "mpsc"
+            && self.name(names[3]) == "RecvError"
+            && let Some(a) = p.tys.local_adt_of(generics::recv_error_def())
+        {
+            return Some(Res::Variant(a, 0));
+        }
         // `std::cmp::Ordering::Less`, `std::sync::atomic::Ordering::SeqCst`,
         // and kin: a variant of a synthetic std enum by its full path.
         if names.len() >= 4 && (names[0] == k.std || names[0] == k.core) {

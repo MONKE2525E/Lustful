@@ -2001,6 +2001,19 @@ pub fn collect_reuse<'a>(
                     vec![unit("Relaxed", 0), unit("Release", 1), unit("Acquire", 2), unit("AcqRel", 3), unit("SeqCst", 4)],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
                 ),
+                // std: `#[derive(PartialEq, Eq, Clone, Copy, Debug)] pub
+                // struct RecvError;` and `pub enum TryRecvError { Empty,
+                // Disconnected }` with the same derives (W-THREADS).
+                5 => (
+                    generics::recv_error_def(),
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                6 => (
+                    generics::try_recv_error_def(),
+                    vec![unit("Empty", 0), unit("Disconnected", 1)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
                 _ => {
                     let bytes = p.tys.mk_vec(int(IntTy::U8));
                     let error = p.tys.intern(TyKind::Adt(generics::utf8_error_def(), EMPTY_ARGS));
@@ -4723,8 +4736,13 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
                 || tys.poison_elem(t).is_some()
+                || crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::SendError)
                 || tys.adt_parts(t).is_some_and(|(d, _)| {
-                    d == crate::check::generics::fmt_error_def() || d == generics::utf8_error_def() || d == generics::from_utf8_error_def()
+                    d == crate::check::generics::fmt_error_def()
+                        || d == generics::utf8_error_def()
+                        || d == generics::from_utf8_error_def()
+                        || d == generics::recv_error_def()
+                        || d == generics::try_recv_error_def()
                 })
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))
         }
@@ -4747,11 +4765,20 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     // A join handle detaches (or frees) its thread; a `Thread` is counted.
     if matches!(
         crate::ty::sync::sync_kind(tys, t),
-        Some(crate::ty::sync::SyncTy::JoinHandle | crate::ty::sync::SyncTy::ScopedJoinHandle | crate::ty::sync::SyncTy::Thread)
+        Some(
+            crate::ty::sync::SyncTy::JoinHandle
+                | crate::ty::sync::SyncTy::ScopedJoinHandle
+                | crate::ty::sync::SyncTy::Thread
+                | crate::ty::sync::SyncTy::Sender
+                | crate::ty::sync::SyncTy::SyncSender
+                | crate::ty::sync::SyncTy::Receiver
+        )
     ) {
         return true;
     }
-    if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)).or_else(|| tys.lock_elem(t).map(|l| l.1)).or_else(|| tys.poison_elem(t)) {
+    if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)).or_else(|| tys.lock_elem(t).map(|l| l.1)).or_else(|| tys.poison_elem(t)).or_else(|| {
+        (crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::SendError)).then(|| tys.adt_first_ty_arg(t)).flatten()
+    }) {
         return needs_drop(p, tys, e);
     }
     if let Some(e) = tys.option_elem(t) {

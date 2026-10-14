@@ -789,6 +789,10 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std", "alloc"], "string", "FromUtf8Error"),
 ];
 
+/// The std types under `std::sync::mpsc` lust knows by name besides the
+/// sync types (ty/sync.rs): the synthetic error Adts (W-THREADS).
+pub const STD_MPSC_ADTS: &[&str] = &["RecvError", "TryRecvError"];
+
 /// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
 /// brings the std type `name` into scope. The sync types and
 /// `atomic::Ordering` live in deeper modules (W-THREADS).
@@ -800,6 +804,7 @@ pub fn std_glob_imports(path: &[&str], name: &str) -> bool {
         .any(|&(crates, module, n)| n == name && path.len() == 2 && crates.contains(&path[0]) && path[1] == module)
         || crate::ty::sync::SyncTy::by_path(&full).is_some()
         || (name == "Ordering" && matches!(full.as_slice(), ["std" | "core", "sync", "atomic", "Ordering"]))
+        || (STD_MPSC_ADTS.contains(&name) && path == ["std", "sync", "mpsc"])
 }
 
 /// True when a glob of the std module `path` imports `name` and the
@@ -824,7 +829,7 @@ pub fn std_glob_fns(path: &[&str]) -> Vec<&'static str> {
 
 /// Every std type name a glob `use` can bring (`std_glob_imports`).
 pub fn std_glob_names() -> impl Iterator<Item = &'static str> {
-    STD_IMPORTED_TYPES.iter().map(|t| t.2).chain(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name()))
+    STD_IMPORTED_TYPES.iter().map(|t| t.2).chain(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name())).chain(STD_MPSC_ADTS.iter().copied())
 }
 
 /// The `use` path to suggest for a non-prelude std type lust knows by
@@ -832,6 +837,9 @@ pub fn std_glob_names() -> impl Iterator<Item = &'static str> {
 pub fn std_use_hint(name: &str) -> String {
     if let Some(t) = STD_IMPORTED_TYPES.iter().find(|t| t.2 == name) {
         return format!("std::{}::{name}", t.1);
+    }
+    if STD_MPSC_ADTS.contains(&name) {
+        return format!("std::sync::mpsc::{name}");
     }
     match crate::ty::sync::SyncTy::ALL.iter().find(|k| k.name() == name) {
         Some(k) => format!("std::{}::{name}", k.module().join("::")),
@@ -853,7 +861,7 @@ pub fn std_enum_variants(path: &[&str]) -> Vec<&'static str> {
 
 /// True when `name` is one of `STD_IMPORTED_TYPES`.
 pub fn needs_std_use(name: &str) -> bool {
-    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name) || crate::ty::sync::SyncTy::ALL.iter().any(|k| k.name() == name)
+    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name) || crate::ty::sync::SyncTy::ALL.iter().any(|k| k.name() == name) || STD_MPSC_ADTS.contains(&name)
 }
 
 /// True if `src` can mention an implemented source std fn, so the driver
@@ -908,6 +916,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/process/ExitCode",
     "core/str/Utf8Error",
     "std/str/Utf8Error",
+    "std/sync/mpsc/RecvError",
+    "std/sync/mpsc/TryRecvError",
     "alloc/string/FromUtf8Error",
     "std/string/FromUtf8Error",
     "std/collections/HashMap",
@@ -1088,6 +1098,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/thread/yield_now",
     "std/thread/panicking",
     "std/thread/scope",
+    "std/sync/mpsc/channel",
+    "std/sync/mpsc/sync_channel",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[
@@ -1144,6 +1156,8 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/sync/atomic/Ordering/AcqRel",
     "core/sync/atomic/Ordering/SeqCst",
     "std/sync/atomic/Ordering/SeqCst",
+    "std/sync/mpsc/TryRecvError/Empty",
+    "std/sync/mpsc/TryRecvError/Disconnected",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's

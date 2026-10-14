@@ -53,10 +53,26 @@ pub enum SyncTy {
     Scope,
     /// `std::thread::ScopedJoinHandle<'scope, T>`.
     ScopedJoinHandle,
+    /// `std::sync::mpsc::Sender<T>`.
+    Sender,
+    /// `std::sync::mpsc::SyncSender<T>`.
+    SyncSender,
+    /// `std::sync::mpsc::Receiver<T>`.
+    Receiver,
+    /// `std::sync::mpsc::SendError<T>`: the value a send gives back.
+    SendError,
+    /// `std::sync::Condvar`.
+    Condvar,
+    /// `std::sync::Barrier`.
+    Barrier,
+    /// `std::sync::BarrierWaitResult`.
+    BarrierWaitResult,
+    /// `std::sync::OnceLock<T>`.
+    OnceLock,
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 25] = [
+    pub const ALL: [SyncTy; 33] = [
         SyncTy::Arc,
         SyncTy::ArcWeak,
         SyncTy::AtomicBool,
@@ -82,6 +98,14 @@ impl SyncTy {
         SyncTy::JoinError,
         SyncTy::Scope,
         SyncTy::ScopedJoinHandle,
+        SyncTy::Sender,
+        SyncTy::SyncSender,
+        SyncTy::Receiver,
+        SyncTy::SendError,
+        SyncTy::Condvar,
+        SyncTy::Barrier,
+        SyncTy::BarrierWaitResult,
+        SyncTy::OnceLock,
     ];
 
     /// The struct name (the def hash input and the printed name).
@@ -112,6 +136,14 @@ impl SyncTy {
             SyncTy::JoinError => "Box<dyn Any + Send>",
             SyncTy::Scope => "Scope",
             SyncTy::ScopedJoinHandle => "ScopedJoinHandle",
+            SyncTy::Sender => "Sender",
+            SyncTy::SyncSender => "SyncSender",
+            SyncTy::Receiver => "Receiver",
+            SyncTy::SendError => "SendError",
+            SyncTy::Condvar => "Condvar",
+            SyncTy::Barrier => "Barrier",
+            SyncTy::BarrierWaitResult => "BarrierWaitResult",
+            SyncTy::OnceLock => "OnceLock",
         }
     }
 
@@ -121,6 +153,7 @@ impl SyncTy {
         match self {
             _ if k_is_atomic(self) => &["sync", "atomic"],
             SyncTy::JoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::ScopedJoinHandle => &["thread"],
+            SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError => &["sync", "mpsc"],
             _ => &["sync"],
         }
     }
@@ -139,7 +172,7 @@ impl SyncTy {
     pub fn arity(self) -> usize {
         match self {
             _ if k_is_atomic(self) => 0,
-            SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope => 0,
+            SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult => 0,
             _ => 1,
         }
     }
@@ -170,7 +203,15 @@ impl SyncTy {
             | SyncTy::ThreadId
             | SyncTy::JoinError
             | SyncTy::Scope
-            | SyncTy::ScopedJoinHandle => return None,
+            | SyncTy::ScopedJoinHandle
+            | SyncTy::Sender
+            | SyncTy::SyncSender
+            | SyncTy::Receiver
+            | SyncTy::SendError
+            | SyncTy::Condvar
+            | SyncTy::Barrier
+            | SyncTy::BarrierWaitResult
+            | SyncTy::OnceLock => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),
             SyncTy::AtomicU8 => AtomicVal::Int(IntTy::U8),
@@ -205,6 +246,12 @@ impl SyncTy {
             SyncTy::ScopedJoinHandle => 1,
             _ => u32::from(self.guard().is_some()),
         }
+    }
+
+    /// True for the types whose C form is a struct of state words and
+    /// the value: `Mutex`, `RwLock`, and `OnceLock`.
+    pub fn is_cell_struct(self) -> bool {
+        matches!(self, SyncTy::Mutex | SyncTy::RwLock | SyncTy::OnceLock)
     }
 
     /// True for `Mutex` and `RwLock`.

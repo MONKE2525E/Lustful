@@ -19,9 +19,15 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
         (SyncTy::Arc | SyncTy::ArcWeak, _) => format!("RcI_{}*", mangle(e)),
         // A lock is its struct (`LkM_T`/`LkR_T`); a guard points at its
         // lock; a `PoisonError<G>` is `G` itself.
-        (SyncTy::Mutex | SyncTy::RwLock, _) => format!("Lk{}_{}", if k == SyncTy::Mutex { "M" } else { "R" }, mangle(e)),
+        (SyncTy::Mutex | SyncTy::RwLock | SyncTy::OnceLock, _) => {
+            format!("Lk{}_{}", if k == SyncTy::Mutex { "M" } else if k == SyncTy::RwLock { "R" } else { "O" }, mangle(e))
+        }
+        (SyncTy::Condvar, _) => "uint32_t".into(),
+        (SyncTy::Barrier, _) => "lust_Barrier".into(),
+        (SyncTy::BarrierWaitResult, _) => "uint8_t".into(),
         (SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard, _) => format!("{}*", sync_ctype(k.guard().expect("a guard").0, e)),
-        (SyncTy::PoisonError, _) => ctype(e),
+        (SyncTy::PoisonError | SyncTy::SendError, _) => ctype(e),
+        (SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver, _) => "lust_Chan*".into(),
         (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, _) => "lust_JoinHdr*".into(),
         (SyncTy::Scope, _) => "lust_Scope".into(),
         (SyncTy::Thread, _) => "lust_ThreadInfo*".into(),
@@ -34,15 +40,32 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
     }
 }
 
+/// The state words ahead of the value in a lock or `OnceLock` struct:
+/// `st` (the futex word), then `wn` (an RwLock's sleepers) and `poison`.
+pub(super) fn cell_words(k: SyncTy) -> &'static [IntTy] {
+    match k {
+        SyncTy::Mutex => &[IntTy::U32, IntTy::U8],
+        SyncTy::RwLock => &[IntTy::U32, IntTy::U32, IntTy::U8],
+        _ => &[IntTy::U32],
+    }
+}
+
 /// The exact Rust layout of a sync type. An atomic is its value's
 /// size and alignment with no niche (`UnsafeCell`); `Arc` and
 /// `sync::Weak` are a non-null pointer.
 pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
-    if matches!(k, SyncTy::Arc | SyncTy::ArcWeak | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread) || k.guard().is_some() {
+    if matches!(
+        k,
+        SyncTy::Arc | SyncTy::ArcWeak | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver
+    ) || k.guard().is_some()
+    {
         return Some(layout::ptr_layout());
     }
-    if k == SyncTy::Scope {
-        return Some(plain_layout(4, 4));
+    match k {
+        SyncTy::Scope | SyncTy::Condvar => return Some(plain_layout(4, 4)),
+        SyncTy::Barrier => return Some(plain_layout(32, 8)),
+        SyncTy::BarrierWaitResult => return Some(plain_layout(1, 1)),
+        _ => {}
     }
     if k == SyncTy::ThreadId {
         return Some(plain_layout(8, 8));
@@ -58,8 +81,20 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
 /// True when a value of the sync type needs drop glue.
 pub(super) fn sync_needs_drop(p: &Program, k: SyncTy, e: &CTy) -> bool {
     match k {
-        SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError => needs_drop_c(p, e),
-        _ => matches!(k, SyncTy::Arc | SyncTy::ArcWeak | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread) || k.guard().is_some(),
+        SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError | SyncTy::SendError | SyncTy::OnceLock => needs_drop_c(p, e),
+        _ => {
+            matches!(
+                k,
+                SyncTy::Arc
+                    | SyncTy::ArcWeak
+                    | SyncTy::JoinHandle
+                    | SyncTy::ScopedJoinHandle
+                    | SyncTy::Thread
+                    | SyncTy::Sender
+                    | SyncTy::SyncSender
+                    | SyncTy::Receiver
+            ) || k.guard().is_some()
+        }
     }
 }
 
@@ -70,11 +105,11 @@ pub(super) fn sync_collect_types(k: SyncTy, e: &CTy, out: &mut HashSet<CTy>) {
         out.insert(CTy::Rc(Box::new(e.clone())));
         collect_types(e, out);
     }
-    if let Some(l) = if k.is_lock() { Some(k) } else { k.guard().map(|g| g.0) } {
+    if let Some(l) = if k.is_cell_struct() { Some(k) } else { k.guard().map(|g| g.0) } {
         out.insert(CTy::Sync(l, Box::new(e.clone())));
         collect_types(e, out);
     }
-    if k == SyncTy::PoisonError {
+    if matches!(k, SyncTy::PoisonError | SyncTy::SendError | SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle) {
         collect_types(e, out);
     }
 }
@@ -144,6 +179,8 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         (_, SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError) => {
             thread_glue_def(g, k, &m, &ct, protos, defs)
         }
+        (_, SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError) => chan_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
+        (_, SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::OnceLock) => once_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
         (Glue::Default, _) if k.atomic_value().is_some() => {
             let _ = writeln!(protos, "{ct} default_{m}(void);");
             let _ = writeln!(defs, "{ct} default_{m}(void) {{\n  return 0;\n}}\n");
@@ -154,6 +191,85 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         }
         _ => unreachable!("internal: no {g:?} glue for `{}`", k.name()),
     }
+}
+
+/// Glue of `Condvar`, `Barrier`, `BarrierWaitResult`, and `OnceLock`.
+#[allow(clippy::too_many_arguments)]
+fn once_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+    let lit = |s: &str| format!("(lust_str){{(uint8_t*)\"{s}\", {}}}", s.len());
+    let dbg = format!("int dbg_{m}(lust_Formatter *f, {ct} *p)");
+    let (proto, body) = match (g, k) {
+        (Glue::Drop, SyncTy::OnceLock) => {
+            let body = if needs_drop_c(p, e) {
+                need(Glue::Drop, e);
+                format!("if (p->st == 2) drop_{}(&p->v);", mangle(e))
+            } else {
+                "(void)p;".into()
+            };
+            (format!("void drop_{m}({ct} *p)"), body)
+        }
+        (Glue::Drop, _) => (format!("void drop_{m}({ct} *p)"), "(void)p;".into()),
+        (Glue::Default, _) => (format!("{ct} default_{m}(void)"), format!("{ct} r; memset(&r, 0, sizeof r); return r;")),
+        // `OnceLock(5)` or `OnceLock(<uninit>)` (a `format_args!`).
+        (Glue::Debug, SyncTy::OnceLock) => {
+            let v = super::fmt::fmt_expr(e, FmtKind::Debug, "w", "(&p->v)", need);
+            (
+                dbg,
+                format!(
+                    "lust_DebugTuple b; lust_fmt_slot s; lust_Formatter *w; lust_dtuple_new(&b, f, {}); if ((w = lust_dtuple_field(&b, &s))) lust_dtuple_field_end(&b, &s, lust_once_is_done(&p->st) ? {v} : lust_f_write_str(w, {})); return lust_dtuple_finish(&b);",
+                    lit("OnceLock"),
+                    lit("<uninit>")
+                ),
+            )
+        }
+        (Glue::Debug, SyncTy::BarrierWaitResult) => (
+            dbg,
+            format!(
+                "lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_bool(w, *p)); return lust_dstruct_finish(&b);",
+                lit("BarrierWaitResult"),
+                lit("is_leader")
+            ),
+        ),
+        (Glue::Debug, _) => (
+            dbg,
+            format!("(void)p; lust_DebugStruct b; lust_dstruct_new(&b, f, {}); return lust_dstruct_finish_ne(&b);", lit(k.name())),
+        ),
+        _ => unreachable!("internal: no {g:?} glue for `{}`", k.name()),
+    };
+    let _ = writeln!(protos, "{proto};");
+    let _ = writeln!(defs, "{proto} {{\n  {body}\n}}\n");
+}
+
+/// Glue of the channel ends and `SendError` (std's impls).
+#[allow(clippy::too_many_arguments)]
+fn chan_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+    let lit = |s: &str| format!("(lust_str){{(uint8_t*)\"{s}\", {}}}", s.len());
+    let (proto, body) = match (g, k) {
+        (Glue::Drop, SyncTy::Sender | SyncTy::SyncSender) => (format!("void drop_{m}({ct} *p)"), "lust_chan_drop_sender(*p);".to_string()),
+        (Glue::Drop, SyncTy::Receiver) => (format!("void drop_{m}({ct} *p)"), "lust_chan_drop_receiver(*p);".to_string()),
+        (Glue::Drop, _) => {
+            let body = if needs_drop_c(p, e) {
+                need(Glue::Drop, e);
+                format!("drop_{}(p);", mangle(e))
+            } else {
+                "(void)p;".into()
+            };
+            (format!("void drop_{m}({ct} *p)"), body)
+        }
+        (Glue::Clone, SyncTy::Sender | SyncTy::SyncSender) => (format!("{ct} clone_{m}({ct} *p)"), "return lust_chan_clone_sender(*p);".to_string()),
+        // `Sender { .. }`, `SyncSender { .. }`, `Receiver { .. }`, and
+        // `SendError { .. }`.
+        (Glue::Debug, _) => (
+            format!("int dbg_{m}(lust_Formatter *f, {ct} *p)"),
+            format!("(void)p; lust_DebugStruct b; lust_dstruct_new(&b, f, {}); return lust_dstruct_finish_ne(&b);", lit(k.name())),
+        ),
+        (Glue::Display, SyncTy::SendError) => {
+            (format!("int disp_{m}(lust_Formatter *f, {ct} *p)"), format!("(void)p; return lust_f_pad(f, {});", lit("sending on a closed channel")))
+        }
+        _ => unreachable!("internal: no {g:?} glue for `{}`", k.name()),
+    };
+    let _ = writeln!(protos, "{proto};");
+    let _ = writeln!(defs, "{proto} {{\n  {body}\n}}\n");
 }
 
 /// Glue of the thread types (std's impls): a `JoinHandle` drop detaches
@@ -430,8 +546,126 @@ impl FnGen<'_, '_, '_> {
                 );
                 t
             }
+            S::Channel | S::SyncChannel => unreachable!("channel calls go through channel_new"),
+            S::ChanSend => {
+                let el = match deref_cty(&tys[0]) {
+                    CTy::Sync(_, e) => *e,
+                    other => unreachable!("a Sender operand, found {other:?}"),
+                };
+                let res = CTy::Result(Box::new(CTy::Unit), Box::new(CTy::Sync(SyncTy::SendError, Box::new(el.clone()))));
+                collect_types(&res, &mut self.sig_types);
+                let (t, v) = (self.tmp(), self.tmp());
+                let err = variant_field(self.p, &res, &t, 1, 0);
+                let _ = writeln!(
+                    self.out,
+                    "    {} {v} = {}; {} {t}; if (lust_chan_send(*{}, &{v})) {{ {} {err} = {v}; }} else {{ {} }}",
+                    ctype(&el),
+                    vals[1],
+                    ctype(&res),
+                    vals[0],
+                    disc_set(self.p, &res, &t, 1),
+                    disc_set(self.p, &res, &t, 0)
+                );
+                t
+            }
+            S::ChanRecv | S::ChanTryRecv => {
+                let el = match deref_cty(&tys[0]) {
+                    CTy::Sync(_, e) => *e,
+                    other => unreachable!("a Receiver operand, found {other:?}"),
+                };
+                let def = if op == S::ChanRecv { crate::check::generics::recv_error_def() } else { crate::check::generics::try_recv_error_def() };
+                let et = self.p.tys.local_adt_of(def).map_or(CTy::Unit, CTy::Adt);
+                let res = CTy::Result(Box::new(el.clone()), Box::new(et.clone()));
+                collect_types(&res, &mut self.sig_types);
+                let (t, r) = (self.tmp(), self.tmp());
+                let ok = variant_field(self.p, &res, &t, 0, 0);
+                let err = variant_field(self.p, &res, &t, 1, 0);
+                // try_recv: 1 is `Empty` (variant 0), 2 `Disconnected`.
+                let err_val = if op == S::ChanRecv {
+                    format!("memset(&{err}, 0, sizeof({err}));")
+                } else {
+                    format!("memset(&{err}, 0, sizeof({err})); if ({r} == 2) {{ {} }} else {{ {} }}", disc_set(self.p, &et, &err, 1), disc_set(self.p, &et, &err, 0))
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; int {r} = lust_chan_recv(*{}, &{ok}, {}); if ({r} == 0) {{ {} }} else {{ {} {err_val} }}",
+                    ctype(&res),
+                    vals[0],
+                    u8::from(op == S::ChanRecv),
+                    disc_set(self.p, &res, &t, 0),
+                    disc_set(self.p, &res, &t, 1)
+                );
+                t
+            }
             _ => self.lock_builtin(op, vals, tys),
         }
+    }
+
+    /// `mpsc::channel()` or `sync_channel(cap)` into the C pair type
+    /// `pair` (`(Sender<T>, Receiver<T>)`): one runtime channel that both
+    /// ends point at, with `T`'s drop glue for values left queued.
+    pub(super) fn channel_new(&mut self, pair: &CTy, cap: &str) -> String {
+        let el = match pair {
+            CTy::Tuple(es) => match es.first() {
+                Some(CTy::Sync(_, e)) => (**e).clone(),
+                _ => CTy::Unit,
+            },
+            _ => CTy::Unit,
+        };
+        collect_types(pair, &mut self.sig_types);
+        let drop = if needs_drop_c(self.p, &el) {
+            self.want(Glue::Drop, &el);
+            format!("(void (*)(void *))drop_{}", mangle(&el))
+        } else {
+            "0".into()
+        };
+        let (t, c) = (self.tmp(), self.tmp());
+        let _ = writeln!(
+            self.out,
+            "    lust_Chan *{c} = lust_chan_new(sizeof({0}), _Alignof({0}), {cap}, {drop}); {1} {t}; {t}.f0 = {c}; {t}.f1 = {c};",
+            ctype(&el),
+            ctype(pair)
+        );
+        t
+    }
+
+    /// `cv.wait_while(guard, f)`: waits while `f(&mut *guard)` holds; and
+    /// `once.get_or_init(f)`: runs `f` only in the call that sets the
+    /// value (a closure that never runs still drops its env).
+    fn closure_wait_or_init(&mut self, op: SyncOp, ops: &[Operand], ci: usize, loc: &str, post: &mut Vec<String>) -> String {
+        let (body_fn, once) = self.closure_of(&ops[ci]);
+        let target = self.operand(&ops[0], loc, post).0;
+        let guard = (op == SyncOp::CondvarWaitWhile).then(|| self.operand(&ops[1], loc, post));
+        let (env, env_ty) = self.operand(&ops[ci], loc, post);
+        collect_types(&env_ty, &mut self.sig_types);
+        let ev = self.tmp();
+        let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
+        let arg = if once { ev.clone() } else { format!("&{ev}") };
+        let drop_env = if needs_drop_c(self.p, &env_ty) {
+            self.want(Glue::Drop, &env_ty);
+            format!("drop_{}(&{ev});", mangle(&env_ty))
+        } else {
+            String::new()
+        };
+        let mut body = String::new();
+        if let Some((g, gt)) = guard {
+            let (r, _) = self.closure_call_c(&mut body, body_fn, &arg, &[format!("&({g})->v")]);
+            let _ = writeln!(body, "  if (!{r}) break; lust_cv_wait({target}, &({g})->st);");
+            let _ = writeln!(self.out, "    for (;;) {{\n{body}    }}\n    {drop_env}");
+            let res = CTy::Result(Box::new(gt.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(gt))));
+            collect_types(&res, &mut self.sig_types);
+            let t = self.tmp();
+            let f = variant_field(self.p, &res, &t, 0, 0);
+            let _ = writeln!(self.out, "    {} {t}; {} {f} = {g};", ctype(&res), disc_set(self.p, &res, &t, 0));
+            return t;
+        }
+        let (v, _) = self.closure_call_c(&mut body, body_fn, &arg, &[]);
+        let after = if once { String::new() } else { drop_env.clone() };
+        let _ = writeln!(
+            self.out,
+            "    if (lust_once_begin(&({target})->st)) {{\n{body}  ({target})->v = {v}; lust_once_finish(&({target})->st); {after}\n    }} else {{ {drop_env} }}"
+        );
+        format!("(&({target})->v)")
     }
 
     /// The closure body fn and FnOnce-ness of a closure operand.
@@ -456,7 +690,14 @@ impl FnGen<'_, '_, '_> {
     /// `thread::scope(f)` calls the closure on a fresh scope here, then
     /// waits for every packet of the scope.
     pub(super) fn thread_closure_call(&mut self, op: SyncOp, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
-        let ci = if op == SyncOp::ScopeSpawn { 1 } else { 0 };
+        let ci = match op {
+            SyncOp::ScopeSpawn | SyncOp::OnceGetOrInit => 1,
+            SyncOp::CondvarWaitWhile => 2,
+            _ => 0,
+        };
+        if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::OnceGetOrInit) {
+            return self.closure_wait_or_init(op, ops, ci, loc, post);
+        }
         let (body_fn, once) = self.closure_of(&ops[ci]);
         let scope = if op == SyncOp::ScopeSpawn { self.operand(&ops[0], loc, post).0 } else { "0".into() };
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
@@ -513,7 +754,7 @@ impl FnGen<'_, '_, '_> {
         use SyncOp as S;
         let (k, elem) = match op {
             S::LockNew(k) | S::LockFrom(k) => (k, tys[0].clone()),
-            S::LockDefault(_) | S::PoisonNew => (SyncTy::PoisonError, CTy::Unit),
+            S::LockDefault(_) | S::PoisonNew | S::SyncNew(_) => (SyncTy::PoisonError, CTy::Unit),
             _ => match deref_cty(&tys[0]) {
                 CTy::Sync(k, e) => (k, *e),
                 other => unreachable!("a lock operand, found {other:?}"),
@@ -533,7 +774,8 @@ impl FnGen<'_, '_, '_> {
                 let lock = CTy::Sync(k, Box::new(elem));
                 collect_types(&lock, &mut self.sig_types);
                 let t = self.tmp();
-                let _ = writeln!(self.out, "    {} {t}; memset(&{t}, 0, sizeof {t}); {t}.v = {};", ctype(&lock), vals[0]);
+                let set = if k == SyncTy::OnceLock { format!(" {t}.st = 2;") } else { String::new() };
+                let _ = writeln!(self.out, "    {} {t}; memset(&{t}, 0, sizeof {t}); {t}.v = {};{set}", ctype(&lock), vals[0]);
                 t
             }
             S::LockDefault(_) => unreachable!("LockDefault calls the Default glue"),
@@ -556,6 +798,67 @@ impl FnGen<'_, '_, '_> {
             S::LockIsPoisoned => format!("((void){}, (uint8_t)0)", vals[0]),
             S::LockClearPoison => format!("((void){}, ((lust_Unit){{}}))", vals[0]),
             S::PoisonNew => vals[0].clone(),
+            S::SyncNew(SyncTy::Barrier) => format!("((lust_Barrier){{0, 0, 0, 0, {}}})", vals[0]),
+            S::SyncNew(_) => "((uint32_t)0)".into(),
+            S::CondvarWait => {
+                let guard = tys[1].clone();
+                let _ = writeln!(self.out, "    lust_cv_wait({}, &({})->st);", vals[0], vals[1]);
+                ok(self, guard, vals[1].clone())
+            }
+            S::CondvarNotifyOne | S::CondvarNotifyAll => format!("(lust_cv_notify({}, {}), ((lust_Unit){{}}))", vals[0], u8::from(op == S::CondvarNotifyAll)),
+            S::BarrierWait => format!("((uint8_t)lust_barrier_wait({}))", vals[0]),
+            S::BarrierIsLeader => format!("(*{})", vals[0]),
+            S::OnceGet | S::OnceGetMut => {
+                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem.clone()))));
+                collect_types(&opt, &mut self.sig_types);
+                let t = self.tmp();
+                let f = variant_field(self.p, &opt, &t, 1, 0);
+                let o = &vals[0];
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; if (lust_once_is_done(&({o})->st)) {{ {} {f} = &({o})->v; }} else {{ {} }}",
+                    ctype(&opt),
+                    disc_set(self.p, &opt, &t, 1),
+                    disc_set(self.p, &opt, &t, 0),
+                );
+                t
+            }
+            S::OnceSet => {
+                let res = CTy::Result(Box::new(CTy::Unit), Box::new(elem.clone()));
+                collect_types(&res, &mut self.sig_types);
+                let (t, v) = (self.tmp(), self.tmp());
+                let err = variant_field(self.p, &res, &t, 1, 0);
+                let o = &vals[0];
+                let _ = writeln!(
+                    self.out,
+                    "    {} {v} = {}; {} {t}; if (lust_once_begin(&({o})->st)) {{ ({o})->v = {v}; lust_once_finish(&({o})->st); {} }} else {{ {} {err} = {v}; }}",
+                    ctype(&elem),
+                    vals[1],
+                    ctype(&res),
+                    disc_set(self.p, &res, &t, 0),
+                    disc_set(self.p, &res, &t, 1),
+                );
+                t
+            }
+            S::OnceIntoInner | S::OnceTake => {
+                let opt = CTy::Option(Box::new(elem.clone()));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, o) = (self.tmp(), self.tmp());
+                let f = variant_field(self.p, &opt, &t, 1, 0);
+                let (decl, reset) = if op == S::OnceTake {
+                    (format!("{} *{o} = {};", ctype(&tys[0]).trim_end_matches('*'), vals[0]), format!(" {o}->st = 0;"))
+                } else {
+                    (format!("{0} {o}_v = {1}; {0} *{o} = &{o}_v;", ctype(&tys[0]), vals[0]), String::new())
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {decl} {} {t}; if ({o}->st == 2) {{ {} {f} = {o}->v;{reset} }} else {{ {} }}",
+                    ctype(&opt),
+                    disc_set(self.p, &opt, &t, 1),
+                    disc_set(self.p, &opt, &t, 0),
+                );
+                t
+            }
             S::PoisonIntoInner => vals[0].clone(),
             S::PoisonGetRef | S::PoisonGetMut => vals[0].clone(),
             _ => unreachable!("lock_builtin takes the lock ops"),

@@ -1303,12 +1303,13 @@ impl Evaluator {
         // (W-THREADS): the value is the atomic's (its C form is the value).
         if let Expr::Path(segs) = cx.ast().expr(callee)
             && segs.len() > 2
-            && args.len() == 1
+            && args.len() <= 1
         {
             let names: Vec<&str> = segs.iter().map(|s| cx.sym_text(s.name)).collect();
             if let Some((&"new", ty_path)) = names.split_last()
                 && let Some(k) = super::sync::SyncTy::by_path(ty_path)
                 && let Some(av) = k.atomic_value()
+                && args.len() == 1
             {
                 let (v, vt) = self.value(cx, env, args[0], Some(av.ty()))?;
                 if !const_ty_compatible(cx.tys_ref(), vt, av.ty()) {
@@ -1317,11 +1318,33 @@ impl Evaluator {
                 let t = super::sync::sync_ty(cx.tys(), k, &[]);
                 return Ok((v, t));
             }
+            // `Condvar::new()`, `OnceLock::new()`, and `Barrier::new(n)`:
+            // a zeroed state (and a Barrier's count).
+            if let Some((&"new", ty_path)) = names.split_last()
+                && let Some(k @ (super::sync::SyncTy::Condvar | super::sync::SyncTy::OnceLock | super::sync::SyncTy::Barrier)) = super::sync::SyncTy::by_path(ty_path)
+            {
+                if k == super::sync::SyncTy::Barrier {
+                    let [a] = args else { return Err(outside(span, "this Barrier initializer")) };
+                    let (v, _) = self.value(cx, env, *a, Some(super::int(super::IntTy::Usize)))?;
+                    return Ok((ConstValue::Aggregate(vec![v]), super::sync::sync_ty(cx.tys(), k, &[])));
+                }
+                if !args.is_empty() || !segs[segs.len() - 2].type_args().is_empty() {
+                    return Err(outside(span, "this initializer"));
+                }
+                let elem = match expected.and_then(|t| cx.tys_ref().adt_first_ty_arg(t)) {
+                    Some(e) => e,
+                    None if k == super::sync::SyncTy::Condvar => super::ERROR,
+                    None => return Err(outside(span, "a `OnceLock::new()` with no known element type")),
+                };
+                let targs: &[Ty] = if k == super::sync::SyncTy::Condvar { &[] } else { &[elem] };
+                return Ok((ConstValue::Aggregate(Vec::new()), super::sync::sync_ty(cx.tys(), k, targs)));
+            }
             // `Mutex::new(v)` and `RwLock::new(v)` are const fns too: an
             // unlocked, unpoisoned lock around the value.
             if let Some((&"new", ty_path)) = names.split_last()
                 && let Some(k) = super::sync::SyncTy::by_path(ty_path)
                 && k.is_lock()
+                && args.len() == 1
             {
                 let written = segs[segs.len() - 2].type_args();
                 let want = match written.first() {

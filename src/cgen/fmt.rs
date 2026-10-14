@@ -249,6 +249,16 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
             format!("  return lust_f_pad(f, {});\n", lit("an error occurred when formatting an argument"))
         }
+        // mpsc's errors (W-THREADS): str Display of std's text.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::recv_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("receiving on a closed channel"))
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_recv_error_def()) == Some(*a) => format!(
+            "  return {} ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
+            disc_call(p, t, "p"),
+            lit("receiving on an empty and disconnected channel"),
+            lit("receiving on an empty channel")
+        ),
         // std's UTF-8 errors (W-STD-A): their Display writes with
         // `write!`, a fresh default Formatter over the same sink, so the
         // caller's width and fill do not apply.
@@ -297,7 +307,7 @@ fn may_fail(t: &CTy) -> bool {
         CTy::Vec(e) | CTy::Option(e) | CTy::Ref(e) | CTy::Array(e, _) | CTy::Slice(e) | CTy::Boxed(e) | CTy::Rc(e) => may_fail(e),
         CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => may_fail(e),
         // The locks and their guards format their value (W-THREADS).
-        CTy::Sync(k, e) if k.is_lock() || k.guard().is_some() => may_fail(e),
+        CTy::Sync(k, e) if k.is_cell_struct() || k.guard().is_some() => may_fail(e),
         // std's cells and boxed slices (W-STD-A) format their contents.
         CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
         CTy::Result(a, b) => may_fail(a) || may_fail(b),

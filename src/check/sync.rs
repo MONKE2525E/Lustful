@@ -108,11 +108,36 @@ pub enum SyncOp {
     ThreadScope,
     /// `Scope::spawn(&self, f)`.
     ScopeSpawn,
+    /// `mpsc::channel()`.
+    Channel,
+    /// `mpsc::sync_channel(bound)`.
+    SyncChannel,
+    /// `Sender::send` and `SyncSender::send`.
+    ChanSend,
+    /// `Receiver::recv`.
+    ChanRecv,
+    /// `Receiver::try_recv`.
+    ChanTryRecv,
+    /// `Condvar::new()`, `Barrier::new(n)`, `OnceLock::new()` (const fns).
+    SyncNew(SyncTy),
+    CondvarWait,
+    /// `Condvar::wait_while(guard, condition)`.
+    CondvarWaitWhile,
+    CondvarNotifyOne,
+    CondvarNotifyAll,
+    BarrierWait,
+    BarrierIsLeader,
+    OnceGet,
+    OnceGetMut,
+    OnceSet,
+    OnceGetOrInit,
+    OnceIntoInner,
+    OnceTake,
 }
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 62] = [
+    pub const ALL: [SyncOp; 80] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -175,6 +200,24 @@ impl SyncOp {
         SyncOp::ThreadGetName,
         SyncOp::ThreadScope,
         SyncOp::ScopeSpawn,
+        SyncOp::Channel,
+        SyncOp::SyncChannel,
+        SyncOp::ChanSend,
+        SyncOp::ChanRecv,
+        SyncOp::ChanTryRecv,
+        SyncOp::SyncNew(SyncTy::Condvar),
+        SyncOp::CondvarWait,
+        SyncOp::CondvarWaitWhile,
+        SyncOp::CondvarNotifyOne,
+        SyncOp::CondvarNotifyAll,
+        SyncOp::BarrierWait,
+        SyncOp::BarrierIsLeader,
+        SyncOp::OnceGet,
+        SyncOp::OnceGetMut,
+        SyncOp::OnceSet,
+        SyncOp::OnceGetOrInit,
+        SyncOp::OnceIntoInner,
+        SyncOp::OnceTake,
     ];
 
     /// (types, names, how it is called) for `lust capabilities`.
@@ -246,6 +289,24 @@ impl SyncOp {
             SyncOp::ThreadGetName => (&["std::thread::Thread"], &["name"], m),
             SyncOp::ThreadScope => (&["std::thread"], &["scope"], f),
             SyncOp::ScopeSpawn => (&["std::thread::Scope"], &["spawn"], m),
+            SyncOp::Channel => (&["std::sync::mpsc"], &["channel"], f),
+            SyncOp::SyncChannel => (&["std::sync::mpsc"], &["sync_channel"], f),
+            SyncOp::ChanSend => (&["std::sync::mpsc::Sender<T>", "std::sync::mpsc::SyncSender<T>"], &["send"], m),
+            SyncOp::ChanRecv => (&["std::sync::mpsc::Receiver<T>"], &["recv"], m),
+            SyncOp::ChanTryRecv => (&["std::sync::mpsc::Receiver<T>"], &["try_recv"], m),
+            SyncOp::SyncNew(_) => (&["std::sync::Condvar", "std::sync::Barrier", "std::sync::OnceLock<T>"], &["new"], a),
+            SyncOp::CondvarWait => (&["std::sync::Condvar"], &["wait"], m),
+            SyncOp::CondvarWaitWhile => (&["std::sync::Condvar"], &["wait_while"], m),
+            SyncOp::CondvarNotifyOne => (&["std::sync::Condvar"], &["notify_one"], m),
+            SyncOp::CondvarNotifyAll => (&["std::sync::Condvar"], &["notify_all"], m),
+            SyncOp::BarrierWait => (&["std::sync::Barrier"], &["wait"], m),
+            SyncOp::BarrierIsLeader => (&["std::sync::BarrierWaitResult"], &["is_leader"], m),
+            SyncOp::OnceGet => (&["std::sync::OnceLock<T>"], &["get"], m),
+            SyncOp::OnceGetMut => (&["std::sync::OnceLock<T>"], &["get_mut"], m),
+            SyncOp::OnceSet => (&["std::sync::OnceLock<T>"], &["set"], m),
+            SyncOp::OnceGetOrInit => (&["std::sync::OnceLock<T>"], &["get_or_init"], m),
+            SyncOp::OnceIntoInner => (&["std::sync::OnceLock<T>"], &["into_inner"], m),
+            SyncOp::OnceTake => (&["std::sync::OnceLock<T>"], &["take"], m),
         }
     }
 }
@@ -280,6 +341,16 @@ pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool,
         // `PoisonError`, `JoinHandle`, `Thread`, `ThreadId`, and the join
         // error are `Debug` for every `T`.
         (SyncTy::PoisonError | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError, G::Debug) => Ok(true),
+        // The channel ends and `SendError` are Debug for every `T`;
+        // the senders are Clone.
+        (SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError, G::Debug) => Ok(true),
+        (SyncTy::Sender | SyncTy::SyncSender, G::Clone) => Ok(true),
+        // `Condvar`, `Barrier`, and `BarrierWaitResult` are Debug;
+        // `Condvar` and `OnceLock<T>` are Default; `OnceLock<T>` is Debug
+        // for `T: Debug`.
+        (SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult, G::Debug) => Ok(true),
+        (SyncTy::Condvar | SyncTy::OnceLock, G::Default) => Ok(true),
+        (SyncTy::OnceLock, G::Debug) => Err(elem?),
         // `Thread` is `Clone`; `ThreadId` is `Copy` and `Eq`.
         (SyncTy::Thread, G::Clone) => Ok(true),
         (SyncTy::ThreadId, G::Clone | G::Copy | G::PartialEq) => Ok(true),
@@ -320,6 +391,8 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
         ["std", "thread", "yield_now"] => Some(SyncOp::ThreadYieldNow),
         ["std", "thread", "panicking"] => Some(SyncOp::ThreadPanicking),
         ["std", "thread", "scope"] => Some(SyncOp::ThreadScope),
+        ["std", "sync", "mpsc", "channel"] => Some(SyncOp::Channel),
+        ["std", "sync", "mpsc", "sync_channel"] => Some(SyncOp::SyncChannel),
         _ => None,
     }
 }
@@ -360,7 +433,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (SyncTy::ArcWeak, _, "ptr_eq") => SyncOp::ArcWeakPtrEq,
             (SyncTy::Mutex | SyncTy::RwLock, _, "new") => SyncOp::LockNew(k),
             (SyncTy::Mutex | SyncTy::RwLock, _, "from") => SyncOp::LockFrom(k),
-            (SyncTy::Mutex | SyncTy::RwLock, _, "default") => SyncOp::LockDefault(k),
+            (SyncTy::Mutex | SyncTy::RwLock | SyncTy::Condvar | SyncTy::OnceLock, _, "default") => SyncOp::LockDefault(k),
+            (SyncTy::Condvar | SyncTy::Barrier | SyncTy::OnceLock, _, "new") => SyncOp::SyncNew(k),
+            (SyncTy::OnceLock, _, "from") => SyncOp::LockFrom(k),
             (SyncTy::PoisonError, _, "new") => SyncOp::PoisonNew,
             _ => {
                 self.err(
@@ -424,8 +499,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             SyncOp::AtomicDefault(k) => (vec![], sync_ty(&mut self.tys, k, &[])),
             SyncOp::LockNew(k) | SyncOp::LockFrom(k) => (vec![elem], sync_ty(&mut self.tys, k, &[elem])),
             SyncOp::LockDefault(k) => {
-                self.deferred_default.push((elem, span));
-                (vec![], sync_ty(&mut self.tys, k, &[elem]))
+                if k.is_lock() {
+                    self.deferred_default.push((elem, span));
+                }
+                let args: &[Ty] = if k.arity() == 0 { &[] } else { &[elem] };
+                (vec![], sync_ty(&mut self.tys, k, args))
+            }
+            SyncOp::SyncNew(SyncTy::Barrier) => (vec![USIZE], sync_ty(&mut self.tys, SyncTy::Barrier, &[])),
+            SyncOp::SyncNew(k) => {
+                let args: &[Ty] = if k.arity() == 0 { &[] } else { &[elem] };
+                (vec![], sync_ty(&mut self.tys, k, args))
             }
             SyncOp::PoisonNew => (vec![elem], sync_ty(&mut self.tys, SyncTy::PoisonError, &[elem])),
             // `spawn<F, T>(f: F) -> JoinHandle<T>` where `F: FnOnce() -> T
@@ -453,6 +536,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (vec![f], ret)
             }
             SyncOp::ThreadYieldNow => (vec![], UNIT),
+            // `channel<T>() -> (Sender<T>, Receiver<T>)`; the turbofish
+            // is on the fn (`channel::<u8>()`).
+            SyncOp::Channel | SyncOp::SyncChannel => {
+                let t = match self.p.ast.expr(callee) {
+                    Expr::Path(segs) => match segs.last().map(|s| s.type_args()).unwrap_or_default().first() {
+                        Some(&g) => self.resolve_written(g),
+                        None => self.new_var(false),
+                    },
+                    _ => self.new_var(false),
+                };
+                let tx = sync_ty(&mut self.tys, if op == SyncOp::Channel { SyncTy::Sender } else { SyncTy::SyncSender }, &[t]);
+                let rx = sync_ty(&mut self.tys, SyncTy::Receiver, &[t]);
+                let ts = self.tys.intern_tys(&[tx, rx]);
+                let pair = self.tys.intern(TyKind::Tuple(ts));
+                (if op == SyncOp::Channel { vec![] } else { vec![USIZE] }, pair)
+            }
             SyncOp::ThreadPanicking => (vec![], BOOL),
             SyncOp::Fence | SyncOp::CompilerFence => (vec![ord], UNIT),
             SyncOp::SpinLoop => (vec![], UNIT),
@@ -549,6 +648,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
         f
     }
 
+    /// A fresh closure-argument type with the pending obligations of
+    /// `F: FnMut(inputs..) -> output`; each input's outer reference is
+    /// higher-ranked (`wait_while`'s `&mut T`).
+    fn sync_fn_mut_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+        let f = self.new_var(false);
+        if let TyKind::Infer(v) = self.kind(f) {
+            self.iter_closure_args.insert(v.0, vec![true; inputs.len()]);
+        }
+        let lang = self.p.gx.lang;
+        let ts = self.tys.intern_tys(inputs);
+        let tuple = self.tys.intern(TyKind::Tuple(ts));
+        let args = self.tys.intern_args(&[GenericArg::Ty(f), GenericArg::Ty(tuple)]);
+        self.obl.push(obligations::Obligation::Trait { trait_ref: TraitRef { def: lang.fn_mut, args, bindings: EMPTY_BINDINGS }, span, depth: 0 });
+        if let Some(out) = lang.output_of(lang.fn_once) {
+            self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc: out, trait_args: args, ty: output }, span });
+        }
+        f
+    }
+
     /// The pending obligation `t: Send`.
     fn require_send(&mut self, t: Ty, span: Span) {
         let send = self.p.gx.lang.send;
@@ -627,6 +745,79 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 _ => return None,
             }
+        } else if let Some(k @ (SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver)) = crate::ty::sync::sync_kind(&self.tys, base) {
+            let el = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
+            match (k, n.as_str()) {
+                (SyncTy::Sender | SyncTy::SyncSender, "send") => {
+                    let se = sync_ty(&mut self.tys, SyncTy::SendError, &[el]);
+                    let r = self.tys.mk_result(UNIT, se);
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::ChanSend), derefs, autoref: Autoref::Ref });
+                    self.check_args(&[el], args, span);
+                    return Some(r);
+                }
+                (SyncTy::Receiver, "recv") => {
+                    let er = self.tys.intern(TyKind::Adt(crate::check::generics::recv_error_def(), EMPTY_ARGS));
+                    (SyncOp::ChanRecv, Autoref::Ref, self.tys.mk_result(el, er))
+                }
+                (SyncTy::Receiver, "try_recv") => {
+                    let er = self.tys.intern(TyKind::Adt(crate::check::generics::try_recv_error_def(), EMPTY_ARGS));
+                    (SyncOp::ChanTryRecv, Autoref::Ref, self.tys.mk_result(el, er))
+                }
+                (_, "try_send" | "send_timeout" | "recv_timeout" | "recv_deadline" | "iter" | "try_iter" | "into_iter") => {
+                    self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `send`, `recv`, or `try_recv`.");
+                    return Some(self.iter_bail(args));
+                }
+                _ => return None,
+            }
+        } else if let Some(k @ (SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::OnceLock)) = crate::ty::sync::sync_kind(&self.tys, base) {
+            let el = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
+            let (op, autoref, params, ret) = match (k, n.as_str()) {
+                // `wait<'a, T>(&self, guard: MutexGuard<'a, T>) ->
+                // LockResult<MutexGuard<'a, T>>`.
+                (SyncTy::Condvar, "wait" | "wait_while") => {
+                    let t = self.new_var(false);
+                    let g = sync_ty(&mut self.tys, SyncTy::MutexGuard, &[t]);
+                    let ret = self.lock_result(g);
+                    if n == "wait" {
+                        (SyncOp::CondvarWait, Autoref::Ref, vec![g], ret)
+                    } else {
+                        let tm = self.tys.mk_ref(true, t);
+                        let f = self.sync_fn_mut_param(&[tm], BOOL, span);
+                        (SyncOp::CondvarWaitWhile, Autoref::Ref, vec![g, f], ret)
+                    }
+                }
+                (SyncTy::Condvar, "notify_one") => (SyncOp::CondvarNotifyOne, Autoref::Ref, vec![], UNIT),
+                (SyncTy::Condvar, "notify_all") => (SyncOp::CondvarNotifyAll, Autoref::Ref, vec![], UNIT),
+                (SyncTy::Barrier, "wait") => (SyncOp::BarrierWait, Autoref::Ref, vec![], sync_ty(&mut self.tys, SyncTy::BarrierWaitResult, &[])),
+                (SyncTy::BarrierWaitResult, "is_leader") => (SyncOp::BarrierIsLeader, Autoref::Ref, vec![], BOOL),
+                (SyncTy::OnceLock, "get") => {
+                    let r = self.tys.mk_ref(false, el);
+                    (SyncOp::OnceGet, Autoref::Ref, vec![], self.tys.mk_option(r))
+                }
+                (SyncTy::OnceLock, "get_mut") => {
+                    let r = self.tys.mk_ref(true, el);
+                    (SyncOp::OnceGetMut, Autoref::RefMut, vec![], self.tys.mk_option(r))
+                }
+                (SyncTy::OnceLock, "set") => (SyncOp::OnceSet, Autoref::Ref, vec![el], self.tys.mk_result(UNIT, el)),
+                (SyncTy::OnceLock, "get_or_init") => {
+                    let f = self.fn_once_param(&[], el, span);
+                    (SyncOp::OnceGetOrInit, Autoref::Ref, vec![f], self.tys.mk_ref(false, el))
+                }
+                (SyncTy::OnceLock, "into_inner") => (SyncOp::OnceIntoInner, Autoref::None, vec![], self.tys.mk_option(el)),
+                (SyncTy::OnceLock, "take") => (SyncOp::OnceTake, Autoref::RefMut, vec![], self.tys.mk_option(el)),
+                (_, "wait_timeout" | "wait_timeout_while" | "wait_timeout_ms" | "get_mut_or_init" | "get_or_try_init" | "try_insert" | "wait_with" | "get_or_init_with") => {
+                    self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use the methods without timeouts.");
+                    return Some(self.iter_bail(args));
+                }
+                _ => return None,
+            };
+            if autoref != Autoref::None {
+                self.check_packed_borrow(recv, span);
+            }
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref });
+            self.check_args(&params, args, span);
+            return Some(ret);
         } else if let Some(el) = self.tys.poison_elem(base) {
             match n.as_str() {
                 "into_inner" => (SyncOp::PoisonIntoInner, Autoref::None, el),
@@ -753,6 +944,28 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
     // `Thread` is Clone and Debug; `ThreadId` Copy, Eq, and Debug.
     let jh = sync_ty(&mut p.tys, SyncTy::JoinHandle, &[p0]);
     insert_synthetic(p, ordinal, lang.debug, jh, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    for k in [SyncTy::Sender, SyncTy::SyncSender, SyncTy::Receiver, SyncTy::SendError] {
+        let t = sync_ty(&mut p.tys, k, &[p0]);
+        insert_synthetic(p, ordinal, lang.debug, t, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        if k != SyncTy::Receiver && k != SyncTy::SendError {
+            insert_synthetic(p, ordinal, lang.clone, t, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        if k == SyncTy::SendError {
+            insert_synthetic(p, ordinal, lang.display, t, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
+    for k in [SyncTy::Condvar, SyncTy::Barrier, SyncTy::BarrierWaitResult] {
+        let t = sync_ty(&mut p.tys, k, &[]);
+        insert_synthetic(p, ordinal, lang.debug, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        if k == SyncTy::Condvar {
+            insert_synthetic(p, ordinal, lang.default, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
+    let ol = sync_ty(&mut p.tys, SyncTy::OnceLock, &[p0]);
+    insert_synthetic(p, ordinal, lang.default, ol, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    insert_synthetic(p, ordinal, lang.from, ol, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let g = bounded(p, lang.debug);
+    insert_synthetic(p, ordinal, lang.debug, ol, &[], g, Vec::new(), Synthetic::Lang, false, span);
     let sjh = sync_ty(&mut p.tys, SyncTy::ScopedJoinHandle, &[p0]);
     insert_synthetic(p, ordinal, lang.debug, sjh, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     let je = sync_ty(&mut p.tys, SyncTy::JoinError, &[]);
@@ -875,6 +1088,35 @@ pub fn builtin_auto(
         // and Sync for every `T`; `Box<dyn Any + Send>` is Send only.
         B::Sync(SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId) => Some(true),
         B::Sync(SyncTy::JoinError) => Some(send),
+        B::Sync(SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult) => Some(true),
+        // `OnceLock<T>` is Send for `T: Send`, Sync for `T: Send + Sync`.
+        B::Sync(SyncTy::OnceLock) => {
+            let Some(e) = elem else { return Some(None) };
+            seen.push((trait_def, t));
+            let mut unknown = false;
+            let needs: &[DefId] = if send { &[lang.send] } else { &[lang.send, lang.sync] };
+            for &tr in needs {
+                match auto_structural(p, tys, env, tr, e, seen) {
+                    Some(false) => return Some(Some(false)),
+                    None => unknown = true,
+                    Some(true) => {}
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        // `Sender<T>` and `SyncSender<T>` are Send and Sync for `T:
+        // Send`; `Receiver<T>` is Send for `T: Send`, never Sync;
+        // `SendError<T>` follows `T`.
+        B::Sync(SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError) => {
+            let k = crate::ty::sync::sync_kind(tys, t).expect("a sync type");
+            if k == SyncTy::Receiver && !send {
+                return Some(Some(false));
+            }
+            let Some(e) = elem else { return Some(None) };
+            let tr = if k == SyncTy::SendError { trait_def } else { lang.send };
+            seen.push((trait_def, t));
+            auto_structural(p, tys, env, tr, e, seen)
+        }
         B::Sync(k) => match k.atomic_value() {
             Some(_) => Some(true),
             None => None,

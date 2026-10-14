@@ -459,8 +459,8 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         CTy::Cell(e) => by_value_deps(e, out),
         CTy::BoxSlice(e) => out.push(CTy::Slice(e.clone())),
         // A lock holds its value; a `PoisonError` is its value's C type.
-        CTy::Sync(k, _) if k.is_lock() => out.push(t.clone()),
-        CTy::Sync(crate::ty::sync::SyncTy::PoisonError, e) => by_value_deps(e, out),
+        CTy::Sync(k, _) if k.is_cell_struct() => out.push(t.clone()),
+        CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => by_value_deps(e, out),
         // A pointer to a fn pointer still names its typedef, which has
         // no forward form (a closure capturing a fn pointer by ref).
         CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
@@ -695,18 +695,14 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::ExitCode => Some(plain_layout(1, 1)),
             // A lock: its words, the poison flag, then the value (no
             // niche: `UnsafeCell`). `PoisonError<T>` is laid out as `T`.
-            CTy::Sync(k, e) if k.is_lock() => {
+            CTy::Sync(k, e) if k.is_cell_struct() => {
                 let mut v = go(p, e, seen)?;
                 v.niche = None;
-                let mut fields = vec![layout::int_layout(IntTy::U32)];
-                if *k == crate::ty::sync::SyncTy::RwLock {
-                    fields.push(layout::int_layout(IntTy::U32));
-                }
-                fields.push(layout::int_layout(IntTy::U8));
+                let mut fields: Vec<Layout> = sync::cell_words(*k).iter().map(|&i| layout::int_layout(i)).collect();
                 fields.push(v);
                 layout::struct_layout(&fields, layout::Repr { kind: ReprKind::C, ..layout::Repr::default() }).ok()
             }
-            CTy::Sync(crate::ty::sync::SyncTy::PoisonError, e) => go(p, e, seen),
+            CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),
             CTy::Sync(k, _) => sync::sync_layout(*k),
             CTy::Weak(_) | CTy::Guard(..) => Some(layout::ptr_layout()),
             // `UnsafeCell` hides the value's niche, as in Rust.
@@ -931,13 +927,13 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
             CTy::ExitCode => (1, 1),
-            CTy::Sync(k, e) if k.is_lock() => {
+            CTy::Sync(k, e) if k.is_cell_struct() => {
                 let (es, ea) = go(p, e, seen);
-                let at = if *k == crate::ty::sync::SyncTy::RwLock { 9 } else { 5 };
+                let at = sync::cell_words(*k).iter().map(|i| i.bits() as u64 / 8).sum::<u64>();
                 let align = ea.max(4);
                 (align_up(align_up(at, ea) + es, align), align)
             }
-            CTy::Sync(crate::ty::sync::SyncTy::PoisonError, e) => go(p, e, seen),
+            CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),
             CTy::Sync(k, _) => sync::sync_layout(*k).map_or((8, 8), |l| (l.size, l.align)),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
@@ -1945,8 +1941,13 @@ impl FnGen<'_, '_, '_> {
                     format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
                 }
             }
+            // `mpsc::channel()`: the element type comes from the pair.
+            CallTarget::Builtin(Builtin::Sync(op @ (crate::check::sync::SyncOp::Channel | crate::check::sync::SyncOp::SyncChannel))) => {
+                let cap = if op == crate::check::sync::SyncOp::SyncChannel { format!("(int64_t){}", self.operand(&args[0], loc, post).0) } else { "-1".into() };
+                self.channel_new(dest_cty, &cap)
+            }
             // `Mutex::default()`: the lock's Default glue (W-THREADS).
-            CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::LockDefault(_))) => {
+            CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::LockDefault(_) | crate::check::sync::SyncOp::SyncNew(crate::ty::sync::SyncTy::OnceLock))) => {
                 self.want(Glue::Default, dest_cty);
                 format!("default_{}()", mangle(dest_cty))
             }
@@ -2864,7 +2865,14 @@ impl FnGen<'_, '_, '_> {
     fn builtin(&mut self, b: Builtin, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
         use Builtin as B;
         // `thread::spawn` reads its closure's body fn (cgen/sync.rs).
-        if let B::Sync(op @ (crate::check::sync::SyncOp::ThreadSpawn | crate::check::sync::SyncOp::ScopeSpawn | crate::check::sync::SyncOp::ThreadScope)) = b {
+        if let B::Sync(
+            op @ (crate::check::sync::SyncOp::ThreadSpawn
+            | crate::check::sync::SyncOp::ScopeSpawn
+            | crate::check::sync::SyncOp::ThreadScope
+            | crate::check::sync::SyncOp::CondvarWaitWhile
+            | crate::check::sync::SyncOp::OnceGetOrInit),
+        ) = b
+        {
             return self.thread_closure_call(op, ops, loc, post);
         }
         let mut vals = Vec::new();
@@ -5259,9 +5267,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Bool(b), _) => (*b as u8).to_string(),
         // An atomic's constant is its value (cgen/sync.rs).
         // A const lock: unlocked and unpoisoned around its value.
-        (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_lock() && vals.len() == 1 => {
-            let words = if *k == crate::ty::sync::SyncTy::RwLock { "0, 0, 0" } else { "0, 0" };
+        (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_cell_struct() && vals.len() == 1 => {
+            let words = vec!["0"; sync::cell_words(*k).len()].join(", ");
             format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter))
+        }
+        // An empty `OnceLock`, a `Condvar`, a `Barrier::new(n)` (W-THREADS).
+        (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::OnceLock, _)) if vals.is_empty() => "{0}".into(),
+        (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Condvar, _)) if vals.is_empty() => "0".into(),
+        (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Barrier, _)) if vals.len() == 1 => {
+            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter))
         }
         (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
@@ -5780,7 +5794,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::RefCell(e) => {
                 let _ = writeln!(out, "typedef struct RCL_{0} RCL_{0};", mangle(e));
             }
-            CTy::Sync(k, _) if k.is_lock() => {
+            CTy::Sync(k, _) if k.is_cell_struct() => {
                 let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
             }
             _ => {}
@@ -5803,7 +5817,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
             CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
-            CTy::Sync(k, e) if k.is_lock() => by_value_deps(e, &mut deps),
+            CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| by_value_deps(e, &mut deps));
                 by_value_deps(r, &mut deps);
@@ -5879,9 +5893,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             // `Mutex<T>`: the futex word, the poison flag, the value;
             // `RwLock<T>` adds the waiter count (runtime/sync.c).
-            CTy::Sync(k, e) if k.is_lock() => {
-                let words = if *k == crate::ty::sync::SyncTy::RwLock { "uint32_t st; uint32_t wn;" } else { "uint32_t st;" };
-                let _ = writeln!(out, "struct {0} {{ {words} uint8_t poison; {1} v; }};", ctype(t), ctype(e));
+            CTy::Sync(k, e) if k.is_cell_struct() => {
+                let words: String = ["st", "wn", "poison"].iter().zip(sync::cell_words(*k)).map(|(n, i)| format!("{} {n}; ", int_c(*i))).collect();
+                let _ = writeln!(out, "struct {0} {{ {words}{1} v; }};", ctype(t), ctype(e));
             }
             CTy::FnPtr(ps, r) => {
                 let ct = ctype(t);

@@ -511,6 +511,15 @@ impl AdtTables {
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::MutexGuard | crate::ty::sync::SyncTy::RwLockWriteGuard)) => return (Variance::Inv, DropMode::None),
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::RwLockReadGuard)) => return (Variance::Co, DropMode::None),
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::PoisonError)) => return (Variance::Co, DropMode::Owned),
+            // The channel ends and join handles have std `Drop` impls with
+            // no `#[may_dangle]`: their drop may read every `T` region.
+            Some(BuiltinTy::Sync(
+                crate::ty::sync::SyncTy::Sender
+                | crate::ty::sync::SyncTy::SyncSender
+                | crate::ty::sync::SyncTy::Receiver
+                | crate::ty::sync::SyncTy::JoinHandle
+                | crate::ty::sync::SyncTy::ScopedJoinHandle,
+            )) => return (Variance::Inv, DropMode::All),
             // `ScopedJoinHandle<'scope, T>` owns its `T` (an `Arc` of a
             // packet with an `UnsafeCell`: invariant).
             Some(BuiltinTy::Sync(_)) => return (Variance::Inv, DropMode::Owned),
@@ -553,12 +562,16 @@ fn builtin_region_variance(tys: &impl TyIntern, t: Ty) -> Variance {
     if crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::Scope) { Variance::Inv } else { Variance::Co }
 }
 
-/// True when a drop of a value of type `t` drops a `RefCell` guard,
-/// whose own drop uses its borrow (Rust's `BorrowRef` is `Drop`).
+/// True when a drop of a value of type `t` drops a `RefCell` or lock
+/// guard, whose own drop uses its borrow (Rust's `BorrowRef` is `Drop`),
+/// or a std type whose `Drop` reads its `T` (a channel end, a join
+/// handle: no `#[may_dangle]`; W-THREADS).
 fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::sync::SyncTy as S;
     match tys.kind(t) {
         TyKind::Adt(_, args) => {
             tys.guard_elem(t).is_some()
+                || matches!(crate::ty::sync::sync_kind(tys, t), Some(S::Sender | S::SyncSender | S::Receiver | S::JoinHandle | S::ScopedJoinHandle))
                 || (!matches!(tys.builtin_of(t), Some(BuiltinTy::Weak | BuiltinTy::Sync(crate::ty::sync::SyncTy::ArcWeak)))
                     && tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| drops_guard(tys, e))))
         }
@@ -2782,6 +2795,53 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
             return;
         }
+        // `mpsc::channel()`: both ends carry one `T` (W-THREADS).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::Channel | crate::check::sync::SyncOp::SyncChannel)) = target {
+            let n = dv.len() / 2;
+            for i in 0..n {
+                self.edge(dv[i], dv[n + i]);
+                self.edge(dv[n + i], dv[i]);
+            }
+            return;
+        }
+        // `send(&self, t: T)`: the value flows into the channel's `T`; a
+        // failed send's `SendError<T>` gives that `T` back.
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::ChanSend | crate::check::sync::SyncOp::OnceSet)) = target
+            && let [(st, sv), (vt, vv)] = avs.as_slice()
+            && let TyKind::Ref(_, _, s) = self.body.tys.kind(*st)
+            && let Some(el) = self.body.tys.adt_first_ty_arg(s)
+            && let Some(tv) = sv.get(1..)
+        {
+            let tv = tv.to_vec();
+            if !self.relate(*vt, vv, el, &tv, Variance::Co) {
+                self.flow_all(vv, &tv);
+            }
+            self.equate_all(&tv, &dv);
+            return;
+        }
+        // `once.get_or_init(f)`: what `f` returns is the cell's `T`; the
+        // result `&T` borrows the cell.
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::OnceGetOrInit)) = target
+            && let Some((_, sv)) = avs.first()
+            && let Some((&r, tv)) = sv.split_first()
+            && dv.len() == sv.len()
+        {
+            let tv = tv.to_vec();
+            self.flow_all(&srcs, &tv);
+            self.edge(r, dv[0]);
+            self.equate_all(&tv, &dv[1..]);
+            return;
+        }
+        // `cv.wait(guard)` and `wait_while`: the guard comes back as is.
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CondvarWait | crate::check::sync::SyncOp::CondvarWaitWhile)) = target
+            && let Some((_, gv)) = avs.get(1)
+            && dv.len() == 2 * gv.len()
+        {
+            let gv = gv.clone();
+            self.equate_all(&gv, &dv[..gv.len()]);
+            self.equate_all(&gv, &dv[gv.len()..]);
+            return;
+        }
         // `thread::spawn(f)`: `F: 'static` and `T: 'static` (W-THREADS).
         // Every region of the closure (its captured borrows) and of the
         // handle must be `'static`.
@@ -3065,7 +3125,15 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let tys = &self.body.tys;
         let comp: Option<Ty> = match tys.kind(x) {
             TyKind::Slice(e) | TyKind::Array(e, _) => Some(e),
-            _ => tys.vec_elem(x).or_else(|| tys.lock_elem(x).map(|l| l.1)).or_else(|| tys.poison_elem(x)),
+            _ => tys
+                .vec_elem(x)
+                .or_else(|| tys.lock_elem(x).map(|l| l.1))
+                .or_else(|| tys.poison_elem(x))
+                .or_else(|| {
+                    matches!(crate::ty::sync::sync_kind(tys, x), Some(crate::ty::sync::SyncTy::Receiver | crate::ty::sync::SyncTy::OnceLock))
+                        .then(|| tys.adt_first_ty_arg(x))
+                        .flatten()
+                }),
         };
         // The element type sits at the end of the receiver's slots (after
         // any region params of the container, which these builtins lack).
@@ -5121,6 +5189,11 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
                     | crate::check::sync::SyncOp::LockGetMut
                     | crate::check::sync::SyncOp::PoisonGetRef
                     | crate::check::sync::SyncOp::PoisonGetMut
+                    | crate::check::sync::SyncOp::ChanRecv
+                    | crate::check::sync::SyncOp::ChanTryRecv
+                    | crate::check::sync::SyncOp::OnceGet
+                    | crate::check::sync::SyncOp::OnceGetMut
+                    | crate::check::sync::SyncOp::OnceTake
             )
     )
 }
