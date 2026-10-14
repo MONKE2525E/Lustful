@@ -84,7 +84,6 @@ pub struct LangTraits {
     /// (`rev` over a user iterator calls its `next_back`).
     pub double_ended_iterator: DefId,
     pub extend: DefId,
-    pub double_ended_iterator: DefId,
     /// `core::ops::RangeBounds` (fx-vec-drain).
     pub range_bounds: DefId,
     /// The conversion traits of `core::convert` and `core::borrow`
@@ -842,6 +841,7 @@ pub fn lang_method_sigs(
                 (d, "next_back") if d == lang.double_ended_iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                }
                 (d, "size_hint") if d == lang.iterator => {
                     let ou = tys.mk_option(USIZE);
                     let pair = tys.intern_tys(&[USIZE, ou]);
@@ -8216,6 +8216,8 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
             p.gx.hash_impls.entry(a).or_default().push((h, inst));
         }
     }
+}
+
 /// True when the program mentions `Bound`, its variants, or the
 /// `RangeBounds` bound methods by name. `Bound<T>` is a generic
 /// synthetic Adt registered for every program; its instances need

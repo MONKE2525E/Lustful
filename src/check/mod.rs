@@ -596,10 +596,8 @@ pub enum Builtin {
     StrDrainNext,
     StrDrainNextBack,
     StrDrainAsStr,
-    /// `next_back`, `size_hint`, and `len` called directly on a
-    /// builtin iterator: expanded in lower/iter.rs like `next`.
-    IterNextBack,
-    IterSizeHint,
+    /// `len` called directly on a builtin iterator: expanded in
+    /// lower/iter.rs like `next`.
     IterLen,
     /// `RangeBounds::start_bound` and `end_bound` on a builtin
     /// range kind or a `(Bound, Bound)` pair: expanded in
@@ -11696,6 +11694,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // `into()` through std's other `From` impls between builtin
         // types (check/convert.rs, W-STD-B).
         if let Some(ret) = self.std_into_method(e, rt, name, args, turbofish, expected) {
+            return ret;
+        }
         // `Vec::drain` and `String::drain` (check/iter.rs).
         if let Some(ret) = self.drain_method(e, recv, base, derefs, name, name_span, args, turbofish) {
             return ret;

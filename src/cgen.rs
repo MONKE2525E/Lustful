@@ -281,6 +281,7 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
     // The hash iterators' state is the core's (cgen/hash.rs).
     if k.is_hash() {
         return CTy::Hash(crate::ty::hash::HashTy::of_iter(k), args.iter().map(|&a| cty(tys, a)).collect());
+    }
     if k == IterKind::VecDrain {
         return CTy::VecDrain(Box::new(cty(tys, arg(0))));
     }

@@ -130,6 +130,21 @@ pub enum IterKind {
     /// front and back search positions, flags, count left), then the
     /// pattern (runtime/core.c `lust_split_step`).
     StrSplit,
+    /// `alloc::vec::Drain<T>`: args `[T]`, item `T`. Holds the
+    /// drained Vec mutably; its drop removes what it did not yield.
+    VecDrain,
+    /// `alloc::string::Drain`: no args, item `char`. Holds the
+    /// drained String mutably.
+    StringDrain,
+    /// `core::ops::RangeFrom<T>`: args `[T]`. Not an iterator here
+    /// (std's Step iterator is not modeled); a `RangeBounds` value.
+    RangeFrom,
+    /// `core::ops::RangeTo<T>`: args `[T]`. A `RangeBounds` value.
+    RangeTo,
+    /// `core::ops::RangeFull`: no args. A `RangeBounds` value.
+    RangeFull,
+    /// `core::ops::RangeToInclusive<T>`: args `[T]`. A `RangeBounds` value.
+    RangeToInclusive,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -175,21 +190,6 @@ pub fn split_mode(tys: &impl TyIntern, marker: Ty) -> Option<SplitMode> {
     let TyKind::Array(_, c) = tys.kind(marker) else { return None };
     let ConstKind::Int(n) = tys.const_kind(c) else { return None };
     SplitMode::ALL.get(n as usize).copied()
-    /// `alloc::vec::Drain<T>`: args `[T]`, item `T`. Holds the
-    /// drained Vec mutably; its drop removes what it did not yield.
-    VecDrain,
-    /// `alloc::string::Drain`: no args, item `char`. Holds the
-    /// drained String mutably.
-    StringDrain,
-    /// `core::ops::RangeFrom<T>`: args `[T]`. Not an iterator here
-    /// (std's Step iterator is not modeled); a `RangeBounds` value.
-    RangeFrom,
-    /// `core::ops::RangeTo<T>`: args `[T]`. A `RangeBounds` value.
-    RangeTo,
-    /// `core::ops::RangeFull`: no args. A `RangeBounds` value.
-    RangeFull,
-    /// `core::ops::RangeToInclusive<T>`: args `[T]`. A `RangeBounds` value.
-    RangeToInclusive,
 }
 
 /// One stored field of a builtin iterator, over the type's args.

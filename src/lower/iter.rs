@@ -789,6 +789,7 @@ impl Ex<'_, '_, '_> {
                 let si = self.local(inner[0]);
                 self.assign(Place::local(si), Rvalue::TupleAgg(inner[0], vec![Operand::Move(Place::local(v))]));
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(si))]));
+            }
             B::BoundAsRef | B::BoundCloned => {
                 let r = arg()?;
                 let (itp, ty) = if b == B::BoundAsRef {
@@ -1534,6 +1535,7 @@ impl Ex<'_, '_, '_> {
                 let r = self.ref_to(true, itp, ty);
                 self.call_builtin(Builtin::HashIterNext, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
+            }
             K::VecDrain | K::StringDrain => {
                 let r = self.ref_to(true, itp, ty);
                 let b = match (k, back) {

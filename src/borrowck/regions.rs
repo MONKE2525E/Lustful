@@ -3915,7 +3915,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let cat = |parts: &[&[u32]]| parts.concat();
         Some(match k {
             K::SliceIter | K::SliceIterMut | K::Windows => cat(&[&own, &args[0]]),
-            K::VecIntoIter | K::Range | K::RangeInclusive => args[0].clone(),
+            K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
             K::Map | K::FilterMap => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
@@ -3934,7 +3934,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
             K::MapIntoValues | K::ByNext => args[1].clone(),
             // (usize, char): no regions.
-            K::CharIndices => Vec::new(),
+            K::CharIndices | K::StringDrain => Vec::new(),
+            // Range kinds that are `RangeBounds` values here, not iterators.
+            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
             K::Flatten => self.item_slots(a[1], &args[1])?,
             K::OptionIntoIter => args[0].clone(),
             // `&'a str` of the haystack (W-STD-B).
