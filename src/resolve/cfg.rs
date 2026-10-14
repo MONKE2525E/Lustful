@@ -314,8 +314,13 @@ fn unknown_cfg(name: &str, span: Span) -> Diag {
 
 /// True when an attribute list stays in the program: every `#[cfg(...)]`
 /// holds. `#[cfg_attr(...)]` does not gate the item; see `expand_cfg_attr`.
+/// A `#[test]` item stays only in a test build, as in rustc: outside one
+/// it is removed before name resolution, so a call to it does not resolve.
 pub fn attrs_enabled(env: &CfgEnv, attrs: &[Attr], strings: &[String], interner: &Interner) -> Result<bool, Diag> {
     for a in attrs {
+        if a.path.len() == 1 && interner.get(a.path[0].name) == "test" && !env.flags.contains("test") {
+            return Ok(false);
+        }
         if a.path.len() == 1
             && interner.get(a.path[0].name) == "cfg"
             && let AttrInput::List(_, trees) = &a.input

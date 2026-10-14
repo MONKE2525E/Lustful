@@ -890,7 +890,7 @@ pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
                 }
                 if tokens.get(j).map(|t| t.tok) == Some(Tok::LBracket)
                     && let Some(name) = tokens.get(j + 1).and_then(|t| seg_text(t.tok, interner))
-                    && (name == "cfg" || name == "cfg_attr" || name == "macro_use" || name == "macro_export" || name == "recursion_limit")
+                    && (name == "cfg" || name == "cfg_attr" || name == "macro_use" || name == "macro_export" || name == "recursion_limit" || name == "test")
                 {
                     return true;
                 }
@@ -2688,10 +2688,13 @@ impl<'a> Expander<'a> {
         // so a disabled compile_error! or include! never runs (6.1).
         // The dropped node is still grammar-checked (rustc parses
         // before it strips), except a macro invocation or definition,
-        // whose group rustc does not parse.
+        // whose group rustc does not parse. A `#[test]` item outside a
+        // test build drops the same way, as in rustc: it never reaches
+        // name resolution.
         let mut exported = false;
         let mut macro_use_attr = false;
         for (attr, attr_start) in &kept {
+            let mut off = false;
             match attr.path.as_str() {
                 "cfg" => {
                     let on = builtin::eval_cfg(&attr.inner, &self.ctx.cfg, self, attr.span)?;
@@ -2736,9 +2739,47 @@ impl<'a> Expander<'a> {
                         ));
                     }
                 }
+                "test" => off = !self.ctx.cfg.test,
                 "macro_export" => exported = true,
                 "macro_use" => macro_use_attr = true,
                 _ => {}
+            }
+            if off {
+                if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
+                    check_def_form(trees, &def)?;
+                    return Ok(def.end);
+                }
+                // A macro call is boundable even though it is
+                // not a keyword item: path, `!`, its group,
+                // and an optional `;`. Dropping it here keeps
+                // a disabled `include!` or `compile_error!`
+                // from ever expanding (found in ts-rust's
+                // wasm-only bundled embed).
+                if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner) {
+                    let mut end = group_idx + 1;
+                    if tok_at(trees, end).map(|t| t.tok) == Some(Tok::Semi) {
+                        end += 1;
+                    }
+                    return Ok(end);
+                }
+                if let Some(end) = item_end(trees, after, self.ctx.interner) {
+                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item)?;
+                    return Ok(end);
+                }
+                // A statement, match arm, or comma-ended part:
+                // bounded at token level, dropped whole so
+                // nothing inside it expands.
+                if let Some(end) = node_end(trees, after) {
+                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node)?;
+                    return Ok(end);
+                }
+                let _ = attr_start;
+                return Err(err(
+                    C_UNSUPPORTED,
+                    attr.span,
+                    "`#[cfg]` on this statement form is not supported yet",
+                    "Move the cfg to an item, or rewrite the statement with cfg!.",
+                ));
             }
         }
         if exported || macro_rules_at(trees, after, self.ctx.interner).is_some() {
