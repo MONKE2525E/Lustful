@@ -309,7 +309,8 @@ fn is128(i: IntTy) -> bool {
 /// alloc/src/vec/mod.rs, 4 core/src/cmp.rs, 5
 /// core/src/iter/adapters/step_by.rs, 6
 /// alloc/src/vec/spec_from_iter_nested.rs, 7
-/// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs), plus 0x40 for `pow`. Lowering names
+/// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
+/// core/src/cell.rs), plus 0x40 for `pow`. Lowering names
 /// one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFFFF_FF00u64 + file) << 32) | (line << 12) | col)
@@ -4108,11 +4109,14 @@ impl FnGen<'_, '_, '_> {
                 let CTy::RefCell(e) = &rc else { unreachable!("RefCell::swap on a RefCell") };
                 let _ = writeln!(
                     self.out,
-                    "    {rt}* {a} = {}; {rt}* {bb} = {}; if ({a}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {a}->f0 = -1; if ({bb}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {et} {tmp} = {a}->f1; {a}->f1 = {bb}->f1; {bb}->f1 = {tmp}; {a}->f0 = 0;",
+                    "    {rt}* {a} = {}; {rt}* {bb} = {}; if ({a}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {la}); {a}->f0 = -1; if ({bb}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {lb}); {et} {tmp} = {a}->f1; {a}->f1 = {bb}->f1; {bb}->f1 = {tmp}; {a}->f0 = 0;",
                     vals[0],
                     vals[1],
                     rt = ctype(&rc),
-                    et = ctype(e)
+                    et = ctype(e),
+                    // `swap` is not track_caller: its two `borrow_mut`s panic in cell.rs.
+                    la = std_loc(9, 1083, 30),
+                    lb = std_loc(9, 1083, 56)
                 );
                 "((lust_Unit){})".into()
             }
@@ -4139,9 +4143,11 @@ impl FnGen<'_, '_, '_> {
                 if b == B::RefCellTake {
                     let _ = writeln!(
                         self.out,
-                        "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {et} {old} = {c}->f1; {c}->f1 = {def};",
+                        "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {}); {et} {old} = {c}->f1; {c}->f1 = {def};",
                         ctype(cell),
-                        vals[0]
+                        vals[0],
+                        // `take` is not track_caller: its `replace` panics in cell.rs.
+                        std_loc(9, 1434, 14)
                     );
                 } else {
                     let _ = writeln!(self.out, "    {et}* {c} = {}; {et} {old} = *{c}; *{c} = {def};", vals[0]);

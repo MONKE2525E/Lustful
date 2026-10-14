@@ -4311,6 +4311,9 @@ impl<'a> Parser<'a> {
             }
             Tok::LParen => {
                 self.bump();
+                // The first token inside: its context tells a macro-written body
+                // from source (see the paren span below).
+                let first_inner = self.span();
                 if self.eat(Tok::RParen) {
                     Expr::Unit
                 } else {
@@ -4355,6 +4358,16 @@ impl<'a> Parser<'a> {
                         Expr::Tuple(elems)
                     } else {
                         self.paren_lo.insert(elems[0].0, start);
+                        // rustc's HIR lowering gives a parenthesized expression the
+                        // parens' span when it contains the inner one: a panic in
+                        // `(t + t)` reports at the `(`.
+                        let inner = self.ast.expr_span(elems[0]);
+                        let close = self.prev_span();
+                        let last_inner = self.toks[self.pos.saturating_sub(2)].span;
+                        let one_ctxt = [inner.ctxt, close.ctxt, first_inner.ctxt, last_inner.ctxt].iter().all(|&c| c == start.ctxt);
+                        if one_ctxt && start.file == inner.file {
+                            self.ast.expr_spans[elems[0].0 as usize] = Span { lo: start.lo, hi: close.hi, ..inner };
+                        }
                         return Ok(elems[0]);
                     }
                 }
