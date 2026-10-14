@@ -5556,7 +5556,10 @@ fn runtime_source(with_impls: bool) -> String {
         include_str!("runtime/stdc.h").replacen("#include \"stdc.c\"", if with_impls { include_str!("runtime/stdc.c") } else { "" }, 1);
     let src = src.replacen("#include \"stdc.h\"", &stdc, 1);
     let sys = include_str!("runtime/sys.h").replacen("#include \"sys.c\"", if with_impls { include_str!("runtime/sys.c") } else { "" }, 1);
-    src.replacen("#include \"sys.h\"", &sys, 1)
+    let src = src.replacen("#include \"sys.h\"", &sys, 1);
+    let sysio =
+        include_str!("runtime/sysio.h").replacen("#include \"sysio.c\"", if with_impls { include_str!("runtime/sysio.c") } else { "" }, 1);
+    src.replacen("#include \"sysio.h\"", &sysio, 1)
 }
 
 /// Removes C comments, replacing each with one space (the C meaning of a

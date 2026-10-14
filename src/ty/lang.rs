@@ -968,6 +968,97 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // The std platform crate's fd and process calls (W-SHIM phase 2,
+    // src/runtime/sysio.c). Counts come back with -errno for errors;
+    // the rest return 0 or errno (sysio.h has each contract).
+    // One read of up to `max` bytes from the fd into the Vec.
+    IntrinsicDef {
+        name: "sys_fd_read",
+        c_symbol: "lust_sys_fd_read",
+        params: &[S::I32, S::U64, S::VecU8Mut],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // One write of the bytes to the fd.
+    IntrinsicDef {
+        name: "sys_fd_write",
+        c_symbol: "lust_sys_fd_write",
+        params: &[S::I32, S::Bytes],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // close.
+    IntrinsicDef { name: "sys_fd_close", c_symbol: "lust_sys_fd_close", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // dup with FD_CLOEXEC: the new fd, or -errno.
+    IntrinsicDef { name: "sys_fd_dup", c_symbol: "lust_sys_fd_dup", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // fsync.
+    IntrinsicDef { name: "sys_fd_sync", c_symbol: "lust_sys_fd_sync", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // ftruncate to the length.
+    IntrinsicDef {
+        name: "sys_fd_truncate",
+        c_symbol: "lust_sys_fd_truncate",
+        params: &[S::I32, S::U64],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // lseek: the new position, or -errno.
+    IntrinsicDef {
+        name: "sys_fd_seek",
+        c_symbol: "lust_sys_fd_seek",
+        params: &[S::I32, S::I64, S::I32],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // fstat as 8-byte fields, like sys_stat.
+    IntrinsicDef {
+        name: "sys_fd_stat",
+        c_symbol: "lust_sys_fd_stat",
+        params: &[S::I32, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // open with the abstract flag bits of sysio.c: the fd, or -errno.
+    IntrinsicDef {
+        name: "sys_fd_open",
+        c_symbol: "lust_sys_fd_open",
+        params: &[S::Bytes, S::I32],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Stdin through the process-wide buffer: up to `max` bytes into
+    // the Vec, the count or -errno.
+    IntrinsicDef {
+        name: "sys_stdin_read",
+        c_symbol: "lust_sys_stdin_read",
+        params: &[S::U64, S::VecU8Mut],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // The buffered stdin bytes into the Vec, not consumed.
+    IntrinsicDef {
+        name: "sys_stdin_fill",
+        c_symbol: "lust_sys_stdin_fill",
+        params: &[S::VecU8Mut],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Drops up to `n` buffered stdin bytes.
+    IntrinsicDef {
+        name: "sys_stdin_consume",
+        c_symbol: "lust_sys_stdin_consume",
+        params: &[S::U64],
+        ret: S::Unit,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).
