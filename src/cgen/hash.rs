@@ -946,7 +946,7 @@ impl FnGen<'_, '_, '_> {
                 let map = a.len() == 2;
                 // The part of an owned element an item leaves behind drops
                 // when the item is taken (`map(|(k, _)| k)` and kin).
-                let mut drop_part = |this: &mut Self, part: usize| {
+                let drop_part = |this: &mut Self, part: usize| {
                     let pc = a[part].clone();
                     if needs_drop_c(this.p, &pc) {
                         this.want(Glue::Drop, &pc);

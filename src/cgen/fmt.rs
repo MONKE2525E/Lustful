@@ -714,7 +714,7 @@ impl FnGen<'_, '_, '_> {
                 let o = self.tmp();
                 // `<B as ToOwned>::to_owned` of the borrowed view: str to
                 // an exact String, `[T]` to an exact Vec of clones.
-                let mut want_clone = |this: &mut Self, t: &CTy, x: &str| -> String {
+                let want_clone = |this: &mut Self, t: &CTy, x: &str| -> String {
                     if is_copy_c(this.p, t) {
                         x.to_string()
                     } else {

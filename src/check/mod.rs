@@ -11269,7 +11269,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `into()` through std's other `From` impls between builtin
         // types (check/convert.rs, W-STD-B).
-        if let Some(ret) = self.std_into_method(e, rt, name, name_span, args, turbofish, expected) {
+        if let Some(ret) = self.std_into_method(e, rt, name, args, turbofish, expected) {
             return ret;
         }
         // Iterator sources on sequences and every method on a builtin

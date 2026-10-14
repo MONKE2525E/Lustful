@@ -3139,7 +3139,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashIterNew)) && self.call_hash_iter(&avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(b) = target
                 && entry_builtin(b)
-                && self.call_hash_entry(b, &avs, dt, &dv) => {}
+                && self.call_hash_entry(b, &avs, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowToMut)) && self.call_cow_to_mut(&avs, &dv) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
@@ -3643,7 +3643,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// same Entry back. A stored value (`or_insert`'s argument) and a
     /// closure form's closure (all its regions) flow into V. The keys'
     /// regions never reach the loan.
-    fn call_hash_entry(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    fn call_hash_entry(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dv: &[u32]) -> bool {
         use crate::check::Builtin as B;
         use crate::ty::hash::hash_parts;
         let Some((t0, v0)) = avs.first() else { return false };

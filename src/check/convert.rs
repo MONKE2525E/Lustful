@@ -430,7 +430,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         e: ExprId,
         rt: Ty,
         name: Sym,
-        name_span: Span,
         args: &[ExprId],
         turbofish: &[ast::GenericArg],
         expected: Option<Ty>,

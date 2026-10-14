@@ -741,9 +741,3 @@ pub fn hash_ctor_builtin(k: HashTy, item: &str) -> Option<Builtin> {
     })
 }
 
-/// Builds the type of one hash struct at fresh args (a constructor
-/// path without written args).
-pub fn fresh_hash_ty(cx: &mut Ctx, k: HashTy) -> Ty {
-    let args: Vec<Ty> = (0..k.n_args()).map(|_| cx.new_var(false)).collect();
-    mk_hash(&mut cx.tys, k, &args)
-}
