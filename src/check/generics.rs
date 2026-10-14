@@ -80,6 +80,10 @@ pub struct LangTraits {
     pub fn_mut: DefId,
     pub fn_once: DefId,
     pub exact_size_iterator: DefId,
+    /// `DoubleEndedIterator` and `Extend<A>` (W-STD-B): for user impls
+    /// (`rev` over a user iterator calls its `next_back`).
+    pub double_ended_iterator: DefId,
+    pub extend: DefId,
     /// The conversion traits of `core::convert` and `core::borrow`
     /// (W-STD-B, check/convert.rs), and `ToOwned` with its `Owned`.
     pub as_ref: DefId,
@@ -178,6 +182,8 @@ impl LangTraits {
         let into_iterator = lang_trait(&["core", "iter"], "IntoIterator");
         let from_iterator = lang_trait(&["core", "iter"], "FromIterator");
         let exact_size_iterator = lang_trait(&["core", "iter"], "ExactSizeIterator");
+        let double_ended_iterator = lang_trait(&["core", "iter"], "DoubleEndedIterator");
+        let extend = lang_trait(&["core", "iter"], "Extend");
         let as_ref = lang_trait(&["core", "convert"], "AsRef");
         let as_mut = lang_trait(&["core", "convert"], "AsMut");
         let borrow = lang_trait(&["core", "borrow"], "Borrow");
@@ -240,6 +246,8 @@ impl LangTraits {
             fn_mut,
             fn_once,
             exact_size_iterator,
+            double_ended_iterator,
+            extend,
             as_ref,
             as_mut,
             borrow,
@@ -342,6 +350,8 @@ impl LangTraits {
             "IntoIterator" => self.into_iterator,
             "FromIterator" => self.from_iterator,
             "ExactSizeIterator" => self.exact_size_iterator,
+            "DoubleEndedIterator" => self.double_ended_iterator,
+            "Extend" => self.extend,
             "AsRef" => self.as_ref,
             "AsMut" => self.as_mut,
             "Borrow" => self.borrow,
@@ -499,6 +509,8 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         ),
         rec(lang.from_iterator, "FromIterator", 1, vec![], vec![], &["from_iter"]),
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
+        rec(lang.double_ended_iterator, "DoubleEndedIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["next_back"]),
+        rec(lang.extend, "Extend", 1, vec![], vec![], &["extend"]),
         rec(lang.as_ref, "AsRef", 1, vec![], vec![], &["as_ref"]),
         rec(lang.as_mut, "AsMut", 1, vec![], vec![], &["as_mut"]),
         rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
@@ -771,6 +783,10 @@ pub fn lang_method_sigs(
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: p0, ret_borrows_from: None }
                 }
                 (d, "next") if d == lang.iterator => {
+                    let item = proj(tys, lang.assoc_item, &[p0]);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                }
+                (d, "next_back") if d == lang.double_ended_iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
                 }
@@ -5551,6 +5567,9 @@ fn check_lang_method(
         .map_or(Vec::new(), |t| t.generics.params.into_iter().skip(impl_parent_n).collect());
     let own_tys: Vec<&ParamDef> = own.iter().filter(|g| !matches!(g.kind, ParamKind::Lifetime)).collect();
     let is_hash = tr.def == lang.hash && n == "hash";
+    // `fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T)` takes
+    // one type parameter like `hash`.
+    let is_extend = tr.def == lang.extend && n == "extend";
     // `hash`'s H: in the signature, the parameter after the trait's
     // (Self); in the impl method, its first own type parameter.
     let trait_n = p.tys.args(tr.args).len() as u32;
@@ -5576,13 +5595,18 @@ fn check_lang_method(
             let mh = p.tys.mk_ref(true, h);
             LangMethodSig { self_kind: Some(Ref), params: vec![r0, mh], ret: UNIT, ret_borrows_from: None }
         }
-        None if is_hash => {
+        None if is_extend && own_tys.len() == 1 && matches!(own_tys[0].kind, ParamKind::Type) => {
+            let m0 = p.tys.mk_ref(true, p0);
+            let t = p.tys.intern(TyKind::Param(ParamId(trait_n)));
+            LangMethodSig { self_kind: Some(RefMut), params: vec![m0, t], ret: UNIT, ret_borrows_from: None }
+        }
+        None if is_hash || is_extend => {
             let f_name_span = p.fn_info(local).def.name_span;
             errs.push(Diag::new(
                 "L0110",
                 f_name_span,
                 "method has a different number of generic parameters than the trait method",
-                "Write `fn hash<H: Hasher>(&self, state: &mut H)`.",
+                if is_hash { "Write `fn hash<H: Hasher>(&self, state: &mut H)`." } else { "Write `fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T)`." },
             ));
             return;
         }
@@ -5605,17 +5629,26 @@ fn check_lang_method(
         errs.push(Diag::new("L0110", f_name_span, "method takes a different number of parameters than the trait method", fix));
         return;
     }
-    if own_tys.len() != usize::from(is_hash) {
+    if own_tys.len() != usize::from(is_hash || is_extend) {
         errs.push(Diag::new("L0110", f_name_span, "method has a different number of generic parameters than the trait method", fix));
         return;
     }
-    if is_hash && let Some(h) = h_impl {
-        // A stricter bound on H than the trait's `H: Hasher` (E0276).
+    if (is_hash || is_extend) && let Some(h) = h_impl {
+        // A stricter bound on the parameter than the trait's (E0276):
+        // `H: Hasher`, or `T: IntoIterator<Item = A>`.
         let preds = p.gx.fn_templates.get(local.0 as usize).cloned().flatten().map_or(Vec::new(), |t| t.generics.predicates);
+        let a = p.tys.args(tr.args).get(1).and_then(|g| g.as_ty());
+        let allowed = if is_hash { lang.hasher } else { lang.into_iterator };
         let extra = preds.iter().any(|pred| match pred {
             Predicate::Trait(b) => {
                 let on_h = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(h);
-                on_h && b.count == 0 && b.value.def != lang.hasher && b.value.def != lang.sized
+                // `T: IntoIterator<Item = X>` with X not the trait's A.
+                let other_item = p.tys.bindings(b.value.bindings).iter().any(|&(d, g)| d != lang.assoc_into_item || g.as_ty() != a);
+                on_h && (b.count != 0 || (b.value.def != allowed && b.value.def != lang.sized) || other_item)
+            }
+            Predicate::AssocEq(b) => {
+                let on_h = p.tys.args(b.value.trait_args).first().and_then(|g| g.as_ty()) == Some(h);
+                on_h && (b.value.assoc != lang.assoc_into_item || Some(b.value.ty) != a)
             }
             _ => false,
         });
@@ -5626,7 +5659,7 @@ fn check_lang_method(
     }
     let mut args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
     let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
-    if is_hash && let Some(h) = h_impl {
+    if (is_hash || is_extend) && let Some(h) = h_impl {
         args.push(GenericArg::Ty(h));
     }
     let want_params: Vec<Ty> = sig

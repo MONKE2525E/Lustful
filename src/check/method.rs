@@ -121,6 +121,9 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.iterator,
         lang.into_iterator,
         lang.from_iterator,
+        // Prelude traits of user iterators and collections (W-STD-B).
+        lang.double_ended_iterator,
+        lang.extend,
         lang.from,
         lang.into,
         // Prelude conversion traits (W-STD-B).

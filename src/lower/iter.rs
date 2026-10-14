@@ -1296,8 +1296,9 @@ impl Ex<'_, '_, '_> {
             K::ByNext => {
                 let (inner, at) = self.by_next_held(a[0], f(0));
                 let fns = crate::check::iter::by_next_fns(self.p, inner)?;
+                let step = if back { fns.next_back.ok_or("iterator expansion: no `next_back`")? } else { fns.next };
                 let r = self.ref_to(true, at, inner);
-                self.call(CallTarget::Fn(fns.next), vec![Operand::Move(Place::local(r))], dest);
+                self.call(CallTarget::Fn(step), vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
             // The hash iterators step in the core (cgen/hash.rs, W-STD-B);

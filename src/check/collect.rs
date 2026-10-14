@@ -3220,6 +3220,37 @@ pub fn collect_reuse<'a>(
                         args: tr.args,
                         assocs: rec.assoc_items.iter().map(|&(d, n, _)| (n, d)).collect(),
                     });
+                    // Its supertraits' too: `Self::Item` in a
+                    // `DoubleEndedIterator` impl is `Iterator`'s (W-STD-B).
+                    let targs: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+                    let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
+                    for pred in &rec.generics.predicates {
+                        let Predicate::Trait(b) = pred else { continue };
+                        if b.count != 0 || p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) != Some(p0) {
+                            continue;
+                        }
+                        let Some(srec) = p.gx.index.trait_record(b.value.def).cloned() else { continue };
+                        if srec.assoc_items.is_empty() {
+                            continue;
+                        }
+                        let sargs: Vec<GenericArg> = p
+                            .tys
+                            .args(b.value.args)
+                            .to_vec()
+                            .into_iter()
+                            .map(|g| match g {
+                                GenericArg::Ty(t) => GenericArg::Ty(crate::ty::subst(&mut p.tys, t, &targs)),
+                                other => other,
+                            })
+                            .collect();
+                        let sargs = p.tys.intern_args(&sargs);
+                        impl_scope.assoc_srcs.push(generics::AssocSrc {
+                            self_ty: self_pat,
+                            trait_def: b.value.def,
+                            args: sargs,
+                            assocs: srec.assoc_items.iter().map(|&(d, n, _)| (n, d)).collect(),
+                        });
+                    }
                 }
                 let parent_gen =
                     ParentGen { generics: impl_generics.clone(), scope: impl_scope, ast_generics: Some((&imp.generics, &imp.where_clause)) };

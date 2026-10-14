@@ -923,8 +923,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | K::SetIter
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
-            // Only `next`: no `next_back` reaches the user's impl yet.
-            K::ByNext => false,
+            // A user iterator with a `DoubleEndedIterator` impl.
+            K::ByNext => by_next_fns(self.p, a[0]).is_ok_and(|f| f.next_back.is_some()),
             // Forward only in lust so far.
             K::Flatten => false,
             K::OptionIntoIter => true,
@@ -1086,6 +1086,8 @@ const ITER_METHODS: &[&str] = &[
 pub struct ByNextFns {
     pub next: LocalDefId,
     pub size_hint: Option<LocalDefId>,
+    /// `next_back` from the type's `DoubleEndedIterator` impl, if any.
+    pub next_back: Option<LocalDefId>,
     /// The impl's `type Item`.
     pub item: Option<Ty>,
 }
@@ -1115,5 +1117,14 @@ pub fn by_next_fns(p: &Program, t: Ty) -> Result<ByNextFns, &'static str> {
         }
     }
     let item = rec.assoc_tys.iter().find(|(d, _)| *d == lang.assoc_item).map(|&(_, t)| t);
-    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint, item })
+    // A non-generic `DoubleEndedIterator` impl gives `next_back`.
+    let next_back = p
+        .gx
+        .index
+        .impls_of_trait(lang.double_ended_iterator)
+        .iter()
+        .map(|&id| p.gx.index.get(id))
+        .find(|r| r.local && r.self_ty(&p.tys) == t && r.generics.params.is_empty())
+        .and_then(|r| r.items.iter().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "next_back")));
+    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint, next_back, item })
 }
