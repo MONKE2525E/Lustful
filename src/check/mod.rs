@@ -1795,6 +1795,42 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.tys.intern(TyKind::FnDef(p.def_of_adt(a), args))
     }
 
+    /// The item type of a builtin constructor used as a value
+    /// (`.map(Some)`, `Result::Err`): an `FnDef` over the builtin Adt
+    /// def with the variant as its first (const) arg (Some 1, Ok 0,
+    /// Err 1), then the Adt's args from the turbofish or fresh
+    /// variables. `builtin_ctor_res` decodes it.
+    fn builtin_ctor_value(&mut self, e: ExprId, r: Res, segs: &[ast::PathSeg], span: Span) -> Ty {
+        let b = self.tys.builtins();
+        let (def, v, n) = match r {
+            Res::OptSome => (b.option, 1, 1),
+            Res::ResOk => (b.result, 0, 2),
+            _ => (b.result, 1, 2),
+        };
+        let tys = match self.builtin_ctor_args(segs, n, span) {
+            Some(a) => a,
+            None => (0..n).map(|_| self.new_var(false)).collect(),
+        };
+        self.set_res(e, r);
+        let mut args = vec![GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))];
+        args.extend(tys.into_iter().map(GenericArg::Ty));
+        let args = self.tys.intern_args(&args);
+        self.tys.intern(TyKind::FnDef(def, args))
+    }
+
+    /// The builtin constructor call a constructor item over the builtin
+    /// Option or Result def makes (see `builtin_ctor_value`).
+    fn builtin_ctor_res(&self, def: DefId, args: ArgsId) -> Option<Res> {
+        let b = self.tys.builtins();
+        if def == b.option {
+            Some(Res::OptSome)
+        } else if def == b.result {
+            Some(if self.ctor_variant(args) == 0 { Res::ResOk } else { Res::ResErr })
+        } else {
+            None
+        }
+    }
+
     /// The variant a constructor `FnDef` type names, from its const arg.
     fn ctor_variant(&self, args: ArgsId) -> u32 {
         match self.tys.args(args).first() {
@@ -1816,6 +1852,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some((self.tys.tys_of(s.inputs).to_vec(), s.output))
             }
             TyKind::FnDef(def, args) => {
+                if let Some(r) = self.builtin_ctor_res(def, args) {
+                    let a: Vec<Ty> = self.tys.args(args).iter().skip(1).filter_map(|g| g.as_ty()).collect();
+                    return match (r, a.as_slice()) {
+                        (Res::OptSome, &[t]) => Some((vec![t], self.tys.mk_option(t))),
+                        (Res::ResOk, &[t, e]) => Some((vec![t], self.tys.mk_result(t, e))),
+                        (Res::ResErr, &[t, e]) => Some((vec![e], self.tys.mk_result(t, e))),
+                        _ => None,
+                    };
+                }
                 if let Some(a) = p.adt_by_def(def) {
                     let v = self.ctor_variant(args);
                     let variant = &p.adt(a).variants[v as usize];
@@ -1869,7 +1914,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// coerces to a function pointer backed by a slot trampoline.
     fn is_fn_item(&self, t: Ty) -> bool {
         match self.kind(t) {
-            TyKind::FnDef(def, _) => self.p.adt_by_def(def).is_none(),
+            TyKind::FnDef(def, _) => !self.p.is_ctor_def(def),
             _ => false,
         }
     }
@@ -3856,7 +3901,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // A tuple constructor there is not supported yet.
         if lang.is_fn_family(to.def) {
             let fn_value = match self.kind(x) {
-                TyKind::FnDef(def, _) => p.adt_by_def(def).is_none(),
+                TyKind::FnDef(def, _) => !p.is_ctor_def(def),
                 TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
                 _ => false,
             };
@@ -6840,6 +6885,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => {}
                 }
             }
+            // The prelude's `Some`, `Ok`, and `Err` as values
+            // (`.map(Some)`), when no binding takes the name.
+            if matches!(bound, BindingRes::Absent) {
+                let k = p.known;
+                let r = [(k.Some, Res::OptSome), (k.Ok, Res::ResOk), (k.Err, Res::ResErr)].into_iter().find(|&(n, _)| n == name);
+                if let Some((_, r)) = r {
+                    return self.builtin_ctor_value(e, r, segs, span);
+                }
+            }
             self.err(
                 "L0101",
                 span,
@@ -7014,9 +7068,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Res::Fn(f) = r {
                 return self.fn_value_ty(e, f, span);
             }
-            // Std fns (`String::from`, `Box::new`, `Option::Some`)
-            // have no value form yet. An error type without a
-            // diagnostic would reach codegen, so report every one.
+            if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr) {
+                return self.builtin_ctor_value(e, r, segs, span);
+            }
+            // Std fns (`String::from`, `Box::new`) have no value form
+            // yet. An error type without a diagnostic would reach
+            // codegen, so report every one.
             self.errs.push(unsupported(span, "this std function used as a value"));
             return ERROR;
         }
@@ -8001,7 +8058,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::FnPtr(_) => Some(Res::Indirect),
             TyKind::FnDef(def, cargs) => match self.p.adt_by_def(def) {
                 Some(a) => Some(Res::Variant(a, self.ctor_variant(cargs))),
-                None => self.p.local_def(def.hash).map(Res::Fn),
+                None => self.builtin_ctor_res(def, cargs).or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
             },
             _ => None,
         }

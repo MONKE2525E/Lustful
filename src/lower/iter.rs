@@ -288,6 +288,17 @@ impl Ex<'_, '_, '_> {
                 return Ok(());
             }
             TyKind::FnDef(def, fargs) => {
+                // `Some`, `Ok`, or `Err` as the callable (`.map(Some)`):
+                // the variant comes from the const arg, as below.
+                let b = self.body.tys.builtins();
+                if def == b.option || def == b.result {
+                    let ty = self.place_ty(&dest)?;
+                    let ok = matches!(self.body.tys.args(fargs).first(), Some(GenericArg::Const(c)) if matches!(self.body.tys.const_kind(*c), ConstKind::Int(0)));
+                    let op = args.into_iter().next().ok_or("iterator expansion: a constructor call takes one argument")?;
+                    let rv = if def == b.option { Rvalue::Opt(ty, Some(op)) } else { Rvalue::Res(ty, ok, op) };
+                    self.assign(dest, rv);
+                    return Ok(());
+                }
                 if let Some(a) = self.p.adt_by_def(def) {
                     let v = match self.body.tys.args(fargs).first() {
                         Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {

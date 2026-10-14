@@ -1017,6 +1017,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 Res::Static(idx) => self.set_or_temp(dest, Rvalue::StaticLoad(idx), ty, span),
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
+                // `Some`, `Ok`, or `Err` used as a value (W-CHECK-G): a
+                // zero-sized constructor item, as for a user one above.
+                Res::OptSome | Res::ResOk | Res::ResErr => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
                 _ => {}
             },
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
