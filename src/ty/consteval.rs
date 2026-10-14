@@ -301,6 +301,37 @@ pub fn is_unsuffixed_lit(ast: &Ast, e: ExprId) -> bool {
     }
 }
 
+/// True when an expression's integer type is not pinned by anything
+/// in it: only unsuffixed literals, `!`/`-`, and arithmetic over such
+/// operands. Rust infers the type from the surroundings and falls
+/// back to `i32`; the evaluator runs such an expression wide (i128)
+/// and re-runs it at the pinning type where one appears (a binary
+/// operation against a typed operand, a cast, an inline const with
+/// no expected type). A name, a call, or a suffixed literal pins it.
+pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
+    match ast.expr(e) {
+        Expr::Int(_, suffix) => suffix.is_none(),
+        Expr::Unary { op: UnOp::Neg | UnOp::Not, expr } => flex_int_expr(ast, *expr),
+        Expr::Binary { op, lhs, rhs } => {
+            !op.is_cmp()
+                && !matches!(op, BinOp::And | BinOp::Or)
+                && flex_int_expr(ast, *lhs)
+                && (matches!(op, BinOp::Shl | BinOp::Shr) || flex_int_expr(ast, *rhs))
+        }
+        Expr::Block(b) | Expr::ConstBlock(b) => {
+            let b = ast.block(*b);
+            b.stmts.is_empty() && b.tail.is_some_and(|t| flex_int_expr(ast, t))
+        }
+        Expr::If { then, els, .. } => {
+            let then = ast.block(*then);
+            then.stmts.is_empty()
+                && then.tail.is_some_and(|t| flex_int_expr(ast, t))
+                && els.is_some_and(|e| flex_int_expr(ast, e))
+        }
+        _ => false,
+    }
+}
+
 /// Evaluates one const expression. `expected` is the type the context wants,
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
@@ -416,7 +447,14 @@ impl Evaluator {
             Expr::Unit => (ConstValue::Unit, UNIT),
             Expr::Path(segs) => return Ok(Flow::Val(self.path_value(cx, env, segs, span, expected)?)),
             Expr::Block(b) => return self.block(cx, env, *b, expected),
-            Expr::ConstBlock(b) => return self.block(cx, env, *b, expected),
+            Expr::ConstBlock(b) => {
+                // An inline const with no expected type pins its own
+                // literals: Rust falls back to i32 there, not i128.
+                if expected.is_none() && flex_int_expr(cx.ast(), e) {
+                    return self.block(cx, env, *b, Some(super::I32));
+                }
+                return self.block(cx, env, *b, expected);
+            }
             Expr::Tuple(elems) => {
                 let exp: Vec<Option<Ty>> = match expected.map(|t| cx.tys_ref().kind(t)) {
                     Some(TyKind::Tuple(ts)) => cx.tys_ref().tys_of(ts).iter().map(|&t| Some(t)).collect(),
@@ -525,8 +563,16 @@ impl Evaluator {
             Expr::Cast { expr, ty } => {
                 let target = cx.resolve_ty(*ty);
                 // An unsuffixed literal takes its type from the cast
-                // target, so `300 as u8` is out of range, not 44.
-                let exp = if is_unsuffixed_lit(cx.ast(), *expr) { Some(target) } else { None };
+                // target, so `300 as u8` is out of range, not 44. A
+                // wider unpinned expression keeps the i32 fallback,
+                // so `(2147483648 >> 7) as i64` is out of range too.
+                let exp = if is_unsuffixed_lit(cx.ast(), *expr) {
+                    Some(target)
+                } else if flex_int_expr(cx.ast(), *expr) {
+                    Some(super::I32)
+                } else {
+                    None
+                };
                 let v = self.value(cx, env, *expr, exp)?;
                 return Ok(Flow::Val(self.cast(cx, v, target, span)?));
             }
@@ -1064,8 +1110,28 @@ impl Evaluator {
             }
             _ => {}
         }
-        let (lv, lt) = self.value(cx, env, lhs, expected)?;
-        let (rv, _) = self.value(cx, env, rhs, Some(lt))?;
+        // A comparison's expected type is bool: it does not pin the
+        // operands. An unpinned (flex) operand takes the other
+        // operand's type, as inference does (`!0 > T` with `T: u8`
+        // computes `!0` in u8); two unpinned operands of a comparison
+        // fall back to i32. Re-running a flex operand at its pinning
+        // type is sound: it has no name, call, or suffix to disagree.
+        let lhs_exp = if op.is_cmp() { None } else { expected };
+        let (mut lv, mut lt) = self.value(cx, env, lhs, lhs_exp)?;
+        let (mut rv, mut rt) = self.value(cx, env, rhs, Some(lt))?;
+        let both_int = matches!(lv, ConstValue::Int(_)) && matches!(rv, ConstValue::Int(_));
+        if both_int && lt != rt && self.int_ty_of(cx, lt).is_some() && self.int_ty_of(cx, rt).is_some() {
+            if flex_int_expr(cx.ast(), lhs) && !flex_int_expr(cx.ast(), rhs) {
+                (lv, lt) = self.value(cx, env, lhs, Some(rt))?;
+            } else if flex_int_expr(cx.ast(), rhs) && !flex_int_expr(cx.ast(), lhs) {
+                (rv, rt) = self.value(cx, env, rhs, Some(lt))?;
+            }
+        }
+        if both_int && op.is_cmp() && flex_int_expr(cx.ast(), lhs) && flex_int_expr(cx.ast(), rhs) {
+            (lv, lt) = self.value(cx, env, lhs, Some(super::I32))?;
+            (rv, rt) = self.value(cx, env, rhs, Some(super::I32))?;
+        }
+        let _ = rt;
         if op.is_cmp() {
             let eq = values_eq(&lv, &rv);
             let ord = match (&lv, &rv) {
@@ -1651,6 +1717,22 @@ impl Evaluator {
         let outside_err = || outside(span, "method calls");
         let name = cx.sym_text(name).to_string();
         let (rv, rt) = self.value(cx, env, recv_e, None)?;
+        // An inherent integer method on an unpinned receiver is
+        // ambiguous (rustc E0689), even where the surroundings
+        // would pin the type later: the body checker reports the
+        // same shape as L0111. The `Ord` methods `min`, `max`, and
+        // `clamp` hold for every integer type, so they stay.
+        if matches!(rv, ConstValue::Int(_))
+            && flex_int_expr(cx.ast(), recv_e)
+            && !matches!(name.as_str(), "min" | "max" | "clamp")
+        {
+            return Err(Diag::new(
+                "L0111",
+                span,
+                format!("cannot call method `{name}` on an integer whose type is not known yet"),
+                "Add a type suffix such as `5i64`, or a type annotation on the variable.",
+            ));
+        }
         let no_args = |args: &[ExprId]| args.is_empty();
         match &rv {
             ConstValue::Str(i) => {
