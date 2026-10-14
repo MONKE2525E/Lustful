@@ -11263,8 +11263,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.pat_derefs[pi] = derefs;
         }
         self.out.pat_ty[pi] = t;
+        // Turbofish on the pattern's path (`Some::<u8>(x)`, `None::<u8>`)
+        // fixes the scrutinee's args, as in expressions.
+        let pat_path: Option<&[ast::PathSeg]> = match p.ast.pat(pat) {
+            Pat::TupleStruct { path, .. } | Pat::Path(path) => Some(path.as_slice()),
+            _ => None,
+        };
         if let Some(is_some) = opt {
-            let inner = self.new_var(false);
+            let inner = match pat_path.and_then(|segs| self.builtin_ctor_args(segs, 1, span)) {
+                Some(a) => a[0],
+                None => self.new_var(false),
+            };
             let ot = self.tys.mk_option(inner);
             if std::env::var_os("LUST_DEBUG_PAT").is_some() {
                 eprintln!(
@@ -11288,7 +11297,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if opt.is_none()
             && let Some(is_ok) = self.result_pattern(pat)
         {
-            let (a, b) = (self.new_var(false), self.new_var(false));
+            let (a, b) = match pat_path.and_then(|segs| self.builtin_ctor_args(segs, 2, span)) {
+                Some(w) => (w[0], w[1]),
+                None => (self.new_var(false), self.new_var(false)),
+            };
             let rt = self.tys.mk_result(a, b);
             if !self.unify(rt, t) {
                 self.mismatch(span, t, rt);
