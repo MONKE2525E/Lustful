@@ -5158,10 +5158,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                             .collect();
                         self.assign(dest.clone(), Rvalue::Aggregate(a, 0, ops), span);
                     }
-                    None => {
-                        let op = self.const_operand(v, ty, span);
-                        self.assign(dest.clone(), Rvalue::Use(op), span);
-                    }
+                    None => self.const_builtin_aggregate(vals, ty, dest, span),
                 },
             },
             CV::Variant(variant, vals) => {
@@ -5212,6 +5209,50 @@ impl<'p, 'a> Lower<'p, 'a> {
             _ => {
                 let op = self.const_operand(v, ty, span);
                 self.assign(dest.clone(), Rvalue::Use(op), span);
+            }
+        }
+    }
+
+    /// A const aggregate of a builtin type, built by the same call
+    /// its `::new` lowers to: the const evaluator gives
+    /// `Mutex::new(v)`, `RwLock::new(v)`, `OnceLock::new()`,
+    /// `Condvar::new()`, `Barrier::new(n)`, `Vec::new()`, and
+    /// `String::new()` this shape (ty/consteval.rs). Any other
+    /// builtin aggregate is a clean reject, never a recursion back
+    /// into `const_operand`.
+    fn const_builtin_aggregate(&mut self, vals: &[crate::ty::consteval::ConstValue], ty: Ty, dest: &Place, span: Span) {
+        use crate::check::sync::SyncOp;
+        use crate::ty::sync::SyncTy;
+        let sync = |this: &mut Self, op: SyncOp, args: Vec<Operand>| {
+            this.call_into(CallTarget::Builtin(Builtin::Sync(op)), args, dest.clone(), span);
+        };
+        match self.body.tys.builtin_of(ty) {
+            Some(BuiltinTy::Sync(k)) if k.is_lock() && vals.len() == 1 => {
+                let elem = self.body.tys.adt_first_ty_arg(ty).unwrap_or(ERROR);
+                let op = self.const_operand(&vals[0], elem, span);
+                sync(self, SyncOp::LockNew(k), vec![op]);
+            }
+            Some(BuiltinTy::Sync(k @ (SyncTy::OnceLock | SyncTy::Condvar))) if vals.is_empty() => {
+                sync(self, SyncOp::SyncNew(k), Vec::new());
+            }
+            Some(BuiltinTy::Sync(k @ SyncTy::Barrier)) if vals.len() == 1 => {
+                let op = self.const_operand(&vals[0], USIZE, span);
+                sync(self, SyncOp::SyncNew(k), vec![op]);
+            }
+            Some(BuiltinTy::Vec) if vals.is_empty() => {
+                self.assign(dest.clone(), Rvalue::VecLit(self.peel_vec(ty), Vec::new()), span);
+            }
+            Some(BuiltinTy::String) if vals.is_empty() => {
+                self.call_into(CallTarget::Builtin(Builtin::StringNew), Vec::new(), dest.clone(), span);
+            }
+            _ => {
+                self.body.lower_errs.push(crate::diag::Diag::new(
+                    "L0630",
+                    span,
+                    "this const value is outside the bounded const evaluator",
+                    "Use literals, const items, and const fn calls only.",
+                ));
+                self.assign(dest.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
             }
         }
     }
