@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 mod fmt;
+mod sync;
 
 /// A body-independent type, so glue can be shared across functions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -82,6 +83,9 @@ pub enum CTy {
     /// A `Box<[T]>`: the slice's fat `{ptr, len}` struct, owning its
     /// elements and buffer; a deref is the slice place itself.
     BoxSlice(Box<CTy>),
+    /// A `std::sync` or `std::thread` type and its type argument (`Unit`
+    /// for the atomics), emitted by cgen/sync.rs (W-THREADS).
+    Sync(crate::ty::sync::SyncTy, Box<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -175,6 +179,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::Cell) => CTy::Cell(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::RefGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), false),
             Some(BuiltinTy::RefMutGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), true),
+            Some(BuiltinTy::Sync(k)) => CTy::Sync(k, Box::new(tys.adt_first_ty_arg(t).map_or(CTy::Unit, |e| cty(tys, e)))),
             None => match tys.local_adt(t) {
                 Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
@@ -303,6 +308,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Args => "lust_Args".into(),
         CTy::ExitCode => "uint8_t".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
+        CTy::Sync(k, e) => sync::sync_ctype(*k, e),
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
         CTy::Array(..) => format!("Arr_{}", mangle(t)),
@@ -354,6 +360,7 @@ fn mangle(t: &CTy) -> String {
         CTy::Guard(e, m) => format!("Gd{}_{}_", if *m { "M" } else { "" }, mangle(e)),
         CTy::ExitCode => "XC".into(),
         CTy::BoxSlice(e) => format!("BS_{}_", mangle(e)),
+        CTy::Sync(k, e) => format!("Sy{}_{}_", *k as u32, mangle(e)),
         CTy::Ref(e) => format!("R_{}_", mangle(e)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(e) => format!("O_{}_", mangle(e)),
@@ -485,6 +492,8 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
 fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
     match t {
         CTy::Cell(_) | CTy::RefCell(_) => false,
+        // Every sync type holds an `UnsafeCell` inline.
+        CTy::Sync(..) => false,
         CTy::Tuple(es) => es.iter().all(|e| is_freeze_c(p, e, seen)),
         CTy::Array(e, _) | CTy::Option(e) => is_freeze_c(p, e, seen),
         CTy::Result(a, b) => is_freeze_c(p, a, seen) && is_freeze_c(p, b, seen),
@@ -502,6 +511,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
         CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
+        CTy::Sync(k, e) => sync::sync_needs_drop(*k, e),
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -679,6 +689,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             }
             CTy::Args => Some(plain_layout(8, 8)),
             CTy::ExitCode => Some(plain_layout(1, 1)),
+            CTy::Sync(k, _) => sync::sync_layout(*k),
             CTy::Weak(_) | CTy::Guard(..) => Some(layout::ptr_layout()),
             // `UnsafeCell` hides the value's niche, as in Rust.
             CTy::Cell(e) => go(p, e, seen).map(|mut l| {
@@ -902,6 +913,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
             CTy::ExitCode => (1, 1),
+            CTy::Sync(k, _) => sync::sync_layout(*k).map_or((8, 8), |l| (l.size, l.align)),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
@@ -2835,6 +2847,9 @@ impl FnGen<'_, '_, '_> {
         if let Some(v) = self.fmt_builtin(b, &vals, &tys, loc) {
             return v;
         }
+        if let B::Sync(op) = b {
+            return self.sync_builtin(op, &vals, &tys, loc);
+        }
         let slice_like = |t: &CTy, val: &str| -> (CTy, String, String) {
             match t {
                 CTy::Ref(inner) => match &**inner {
@@ -2849,6 +2864,7 @@ impl FnGen<'_, '_, '_> {
             }
         };
         match b {
+            B::Sync(_) => unreachable!("sync builtins emit in cgen/sync.rs"),
             // Emitted by `fmt_builtin` above (cgen/fmt.rs).
             B::FmtWriteStr
             | B::FmtWriteChar
@@ -4911,7 +4927,8 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
     let src = src.replacen("#include \"sort.h\"", include_str!("runtime/sort.h"), 1);
     let src = src.replacen("#include \"hash.h\"", &hash, 1);
-    src.replacen("#include \"deps.h\"", &deps, 1)
+    let src = src.replacen("#include \"deps.h\"", &deps, 1);
+    src.replacen("#include \"sync.c\"\n", include_str!("runtime/sync.c"), 1)
 }
 
 /// Removes C comments, replacing each with one space (the C meaning of a
@@ -5201,6 +5218,8 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::Bool(b), _) => (*b as u8).to_string(),
+        // An atomic's constant is its value (cgen/sync.rs).
+        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
         (CV::Unit, _) => "((lust_Unit){})".into(),
         (CV::Str(i), _) => {
@@ -5933,6 +5952,11 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
     // shaped glue arms below (unused strings for other shapes).
     let disc_p = disc_call(p, t, "p");
     let pf = variant_field(p, t, "(*p)", 1, 0);
+    // The sync types' glue (cgen/sync.rs).
+    if let CTy::Sync(k, e) = t {
+        sync::sync_glue_def(p, *g, *k, e, protos, defs, &mut need);
+        return;
+    }
     match g {
         Glue::Drop => {
             let _ = writeln!(protos, "void drop_{m}({ct} *p);");

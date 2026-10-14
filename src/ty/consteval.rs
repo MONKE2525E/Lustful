@@ -1298,6 +1298,25 @@ impl Evaluator {
         args: &[ExprId],
         span: Span,
     ) -> Result<TypedValue, Diag> {
+        // `AtomicUsize::new(v)` and the other atomics' `new` are const fns
+        // (W-THREADS): the value is the atomic's (its C form is the value).
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && segs.len() > 2
+            && args.len() == 1
+        {
+            let names: Vec<&str> = segs.iter().map(|s| cx.sym_text(s.name)).collect();
+            if let Some((&"new", ty_path)) = names.split_last()
+                && let Some(k) = super::sync::SyncTy::by_path(ty_path)
+                && let Some(av) = k.atomic_value()
+            {
+                let (v, vt) = self.value(cx, env, args[0], Some(av.ty()))?;
+                if !const_ty_compatible(cx.tys_ref(), vt, av.ty()) {
+                    return Err(outside(span, "this atomic initializer"));
+                }
+                let t = super::sync::sync_ty(cx.tys(), k, &[]);
+                return Ok((v, t));
+            }
+        }
         // `f64::from_bits(n)` and `f32::from_bits(n)` are const fns.
         if let Expr::Path(segs) = cx.ast().expr(callee)
             && segs.len() == 2

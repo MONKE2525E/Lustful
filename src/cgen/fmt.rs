@@ -38,6 +38,14 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::Rc(inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // A `RefCell` guard formats its value (W-STD-A).
         CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
+        // An atomic's Debug formats a relaxed load of its value (W-THREADS).
+        CTy::Sync(k, _) if let Some(a) = k.atomic_value() => {
+            let load = format!("(({})lust_at_load_{}((uint{}_t*){v}, 0, 0))", ctype(&super::sync::vt_of(a)), a.bytes(), a.bytes() * 8);
+            match a {
+                crate::ty::sync::AtomicVal::Bool => format!("lust_f_bool({f}, {load})"),
+                crate::ty::sync::AtomicVal::Int(i) => int_expr(i, kind, f, &load),
+            }
+        }
         _ if debug => {
             need(Glue::Debug, t);
             format!("dbg_{}({f}, {v})", mangle(t))

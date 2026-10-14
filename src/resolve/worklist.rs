@@ -4319,6 +4319,18 @@ impl Rewrite<'_> {
             if self.expand_std_alias(segs, &names, ns, module, scopes) {
                 return;
             }
+            // A bare name a module-level glob of a sync or thread module
+            // imports: rewrite it to the full std path (W-THREADS).
+            if res == PathRes::Absent
+                && let Some(&first) = names.first()
+                && !self.local_names.contains_key(&first)
+                && let Some(path) = self.tables.std_sync_glob_path(module, self.interner.get(first), self.interner)
+            {
+                let mut out: Vec<PathSeg> = path.iter().map(|s| PathSeg::plain(*s)).collect();
+                out.extend(segs.iter().cloned());
+                *segs = out;
+                return;
+            }
             // Lexical scope (section 1.3): an unqualified name that only
             // another module defines is not found here, even though the
             // merged flat tables could answer it. Names no module
@@ -4333,12 +4345,12 @@ impl Rewrite<'_> {
                 && !self.tables.std_glob_imports(module, self.interner.get(first), self.interner)
             {
                 let n = self.interner.get(first).to_string();
-                let (m, _, _) = crate::ty::lang::STD_IMPORTED_TYPES.iter().find(|t| t.2 == n).map(|t| (t.1, 0, 0)).unwrap_or(("rc", 0, 0));
+                let hint = crate::ty::lang::std_use_hint(&n);
                 self.diags.push(Diag::new(
                     "L0102",
                     span,
                     format!("cannot find type `{n}` in this scope"),
-                    format!("Import it: `use std::{m}::{n};`."),
+                    format!("Import it: `use {hint};`."),
                 ));
                 return;
             }
@@ -4736,13 +4748,20 @@ impl Rewrite<'_> {
                                 && let Some(frame) = scopes.last_mut()
                             {
                                 let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
-                                for &(_, _, n) in crate::ty::lang::STD_IMPORTED_TYPES {
+                                for n in crate::ty::lang::std_glob_names() {
                                     if crate::ty::lang::std_glob_imports(&p, n) {
                                         let name = self.interner.intern(n);
                                         let mut full = path.clone();
                                         full.push(name);
                                         frame.std_imports.entry((name, ns_index(Namespace::Type))).or_insert(full);
                                     }
+                                }
+                                // The std free fns of the module (`fence`).
+                                for f in crate::ty::lang::std_glob_fns(&p) {
+                                    let name = self.interner.intern(f);
+                                    let mut full = path.clone();
+                                    full.push(name);
+                                    frame.std_imports.entry((name, ns_index(Namespace::Value))).or_insert(full);
                                 }
                                 // A glob of a std enum's variants (`Ordering::*`).
                                 for v in crate::ty::lang::std_enum_variants(&p) {

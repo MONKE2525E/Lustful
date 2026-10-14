@@ -1493,3 +1493,5 @@ uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY
 
 /* Adapter crate cores, such as xxh3 (src/runtime/deps.h, W-DEPS). */
 #include "deps.h"
+
+#include "sync.c"

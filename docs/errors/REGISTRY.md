@@ -55,7 +55,8 @@ prints "reserved, not yet emitted".
 | L0532-L0539 | Crate session | W-DRIVER | reserved | |
 | L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
 | L0541 | Known-value checks | check | in use | Operation will panic at runtime (rustc `unconditional_panic`) |
-| L0542-L0549 | Known-value checks | check | reserved | |
+| L0542 | Known-value checks | W-THREADS | in use | Invalid atomic memory ordering (rustc `invalid_atomic_ordering`) |
+| L0543-L0549 | Known-value checks | check | reserved | |
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603-L0609 | Types and aliases | W-CORELANG | reserved | |

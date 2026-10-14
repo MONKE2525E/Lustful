@@ -501,6 +501,8 @@ impl AdtTables {
             Some(BuiltinTy::RefGuard) => return (Variance::Co, DropMode::None),
             // Interior mutability: `Cell<T>` and `RefCell<T>` are invariant.
             Some(BuiltinTy::Cell | BuiltinTy::RefCell) => return (Variance::Inv, DropMode::Owned),
+            // The atomics take no type args (W-THREADS).
+            Some(BuiltinTy::Sync(_)) => return (Variance::Inv, DropMode::Owned),
             None => {}
         }
         let v = self.variance.get(&def).and_then(|v| v.get(j)).copied().unwrap_or(Variance::Inv);

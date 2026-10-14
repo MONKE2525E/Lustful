@@ -368,6 +368,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::FromUtf8ErrorIntoBytes,
     Builtin::Utf8ErrorValidUpTo,
     Builtin::Utf8ErrorErrorLen,
+    Builtin::Sync(crate::check::sync::SyncOp::SpinLoop),
 ];
 
 /// How a builtin is called.
@@ -383,6 +384,10 @@ enum Call {
 fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str], Vec<Sym>, Call) {
     use Builtin as B;
     match b {
+        B::Sync(op) => {
+            let (types, names, call) = op.info();
+            (types, names.iter().map(|n| i.intern(n)).collect(), [Call::Method, Call::Associated, Call::Function][call as usize])
+        }
         B::StringNew => (&["String"], vec![k.new], Call::Associated),
         B::StringFrom => (&["String"], vec![k.from], Call::Associated),
         B::StringWithCapacity => (&["String"], vec![k.with_capacity], Call::Associated),
@@ -1031,7 +1036,9 @@ fn grouped(want: Call) -> Vec<(String, Vec<String>)> {
     let interner = Interner::default();
     let known = Known::new(&interner);
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for &b in ALL_BUILTINS {
+    // The sync ops stand behind one `Builtin::Sync` row (check/sync.rs).
+    let all = ALL_BUILTINS.iter().copied().filter(|b| !matches!(b, Builtin::Sync(_)));
+    for b in all.chain(crate::check::sync::SyncOp::ALL.map(Builtin::Sync)) {
         let (types, names, call) = builtin_info(b, &known, &interner);
         if call != want {
             continue;

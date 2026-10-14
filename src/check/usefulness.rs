@@ -188,6 +188,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if self.tys.result_args(t).is_some() {
                     Col::Ctors(vec![1, 1])
                 } else if let Some(a) = self.tys.local_adt(t) {
+                    // A `#[non_exhaustive]` std enum (`atomic::Ordering`)
+                    // needs a wildcard outside its crate (rustc E0004;
+                    // W-THREADS).
+                    if self.p.tys.local_adt_of(crate::check::generics::atomic_ordering_def()) == Some(a) {
+                        return Col::Open;
+                    }
                     Col::Ctors(self.p.adt(a).variants.iter().map(|v| v.fields.len()).collect())
                 } else {
                     Col::Open

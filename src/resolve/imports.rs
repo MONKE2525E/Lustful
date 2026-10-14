@@ -245,6 +245,18 @@ impl ResolvedTables {
         })
     }
 
+    /// The std module path of a module-level glob in `module` that
+    /// imports `name` from a sync or thread module (W-THREADS): a type
+    /// (`AtomicUsize`, `atomic::Ordering`) or a free fn (`fence`). The
+    /// resolver rewrites the bare name to that full std path, as it does
+    /// for a fn-body glob, so check never reads it by its bare name.
+    pub fn std_sync_glob_path(&self, module: ModuleId, name: &str, interner: &Interner) -> Option<Vec<Sym>> {
+        self.std_globs.iter().find_map(|(m, path)| {
+            let p: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+            (*m == module && crate::ty::lang::std_sync_glob_imports(&p, name)).then(|| path.clone())
+        })
+    }
+
     /// An empty table set with only the first crate's root module (id
     /// 0, the selected crate; dependency crates join with
     /// `add_crate_root`).

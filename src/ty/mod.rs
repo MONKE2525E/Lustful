@@ -17,6 +17,7 @@ pub mod fmt;
 pub mod iter;
 pub mod lang;
 pub mod layout;
+pub mod sync;
 pub use defs::{DefData, Defs, SigData};
 
 use crate::def::{CrateId, DefId, StableCrateHash};
@@ -601,6 +602,9 @@ pub struct BuiltinDefs {
     pub ref_mut_guard: DefId,
     /// `std::process::ExitCode`, a `main` result (W-STD-A phase 3).
     pub exit_code: DefId,
+    /// The `std::sync` and `std::thread` types, by `SyncTy` index
+    /// (ty/sync.rs, W-THREADS).
+    pub sync_tys: [DefId; sync::SyncTy::ALL.len()],
 }
 
 impl BuiltinDefs {
@@ -638,6 +642,8 @@ impl BuiltinDefs {
             Some(BuiltinTy::RefMutGuard)
         } else if def == self.exit_code {
             Some(BuiltinTy::ExitCode)
+        } else if let Some(i) = self.sync_tys.iter().position(|&d| d == def) {
+            Some(BuiltinTy::Sync(sync::SyncTy::ALL[i]))
         } else if def.krate != BUILTIN_CRATE {
             None
         } else {
@@ -671,6 +677,8 @@ pub enum BuiltinTy {
     RefMutGuard,
     /// `process::ExitCode`.
     ExitCode,
+    /// A `std::sync` or `std::thread` type (ty/sync.rs).
+    Sync(sync::SyncTy),
 }
 
 /// What a type contains, computed once at intern time and cached per `Ty`. Substitution,
@@ -1078,6 +1086,7 @@ impl GlobalTys {
             ref_guard: builtin_def(&["core", "cell"], "Ref"),
             ref_mut_guard: builtin_def(&["core", "cell"], "RefMut"),
             exit_code: builtin_def(&["std", "process"], "ExitCode"),
+            sync_tys: sync::SyncTy::ALL.map(sync::sync_def),
         };
         let mut g = GlobalTys {
             kinds: Arena::default(),

@@ -3243,6 +3243,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     27u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Sync(k, x) => {
+                    (28u8, *k).hash(h);
+                    inner(h, p, x);
+                }
             }
         }
         let mut h = crate::intern::FxHasher::default();

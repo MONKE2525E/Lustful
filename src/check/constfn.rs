@@ -99,6 +99,8 @@ fn builtin_is_const(b: Builtin) -> bool {
         // still a drop type, so destroying it here rejects elsewhere.
         StringNew
             | VecNew
+            // `AtomicX::new` and `into_inner` are `const fn` (W-THREADS).
+            | Sync(crate::check::sync::SyncOp::AtomicNew(_) | crate::check::sync::SyncOp::AtomicIntoInner)
             // Length and view queries on str, String, Vec, and slices.
             | StrLen
             | StrIsEmpty

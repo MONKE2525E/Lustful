@@ -21,6 +21,7 @@ pub mod project;
 pub mod sized;
 pub mod stdtypes;
 pub mod usefulness;
+pub mod sync;
 pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
@@ -424,6 +425,8 @@ pub enum Builtin {
     FromUtf8ErrorIntoBytes,
     Utf8ErrorValidUpTo,
     Utf8ErrorErrorLen,
+    /// A `std::sync` or `std::thread` call (check/sync.rs, W-THREADS).
+    Sync(sync::SyncOp),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7705,27 +7708,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
         {
             return Some(Res::Variant(a, 0));
         }
-        // `std::cmp::Ordering::Less` and kin: the one four-segment
-        // value path in the subset today (the enum is the synthetic
-        // Adt collect registers under its builtin def).
-        if names.len() == 4
-            && (names[0] == k.std || names[0] == k.core)
-            && self.name(names[1]) == "cmp"
-            && self.name(names[2]) == "Ordering"
-            && let Some(a) = p.tys.local_adt_of(generics::ordering_def())
-        {
-            return match p.adt(a).variants.iter().position(|v| v.name == names[3]) {
-                Some(v) => Some(Res::Variant(a, v as u32)),
-                None => {
-                    self.err(
-                        "L0104",
-                        span,
-                        format!("no variant `{}` on `Ordering`", self.name(names[3])),
-                        "Check the name: `Less`, `Equal`, or `Greater`.",
-                    );
-                    None
-                }
-            };
+        // `std::cmp::Ordering::Less`, `std::sync::atomic::Ordering::SeqCst`,
+        // and kin: a variant of a synthetic std enum by its full path.
+        if names.len() >= 4 && (names[0] == k.std || names[0] == k.core) {
+            let path: Vec<&str> = names.iter().map(|n| self.name(*n)).collect();
+            if let Some((a, v)) = generics::std_variant_of(p, &path) {
+                return Some(Res::Variant(a, v));
+            }
+            if let Some(a) = generics::std_adt_of_path(&path[..path.len() - 1]).and_then(|d| p.tys.local_adt_of(d))
+                && p.adt(a).is_enum
+                && crate::ty::lang::std_path_kind(&path[..path.len() - 1]) == Some(crate::ty::lang::StdPathKind::Type)
+            {
+                let all: Vec<String> = p.adt(a).variants.iter().map(|v| format!("`{}`", self.name(v.name))).collect();
+                self.err(
+                    "L0104",
+                    span,
+                    format!("no variant `{}` on `Ordering`", path[path.len() - 1]),
+                    format!("Check the name: {}.", all.join(", ")),
+                );
+                return None;
+            }
+        }
+        // `std::sync::atomic::fence` and the other sync free fns.
+        if names.len() >= 3 && (names[0] == k.std || names[0] == k.core) {
+            let path: Vec<&str> = names.iter().map(|n| self.name(*n)).collect();
+            if let Some(op) = sync::sync_free_fn(&path) {
+                return Some(Res::Builtin(Builtin::Sync(op)));
+            }
         }
         // The `core::mem` and `core::cmp` free fns by module path.
         if names.len() == 3 && (names[0] == k.std || names[0] == k.core) {
@@ -7826,6 +7835,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
         if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
+            return r;
+        }
+        // `AtomicUsize::new` and the other sync types (check/sync.rs).
+        if let Some(r) = self.sync_assoc(&names, std_ty, span) {
             return r;
         }
         if let Some(r) = self.exit_code_assoc(ty_name, item, std_ty, span) {
@@ -9331,6 +9344,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return if b == Builtin::BoxNew { self.tys.mk_boxed(at) } else { self.tys.mk_rc(at) };
                 }
                 let (params, ret): (Vec<Ty>, Ty) = match b {
+                    Builtin::Sync(op) => self.sync_call_sig(op),
                     Builtin::Clone => {
                         // The associated form `Type::clone(&x)`:
                         // the argument fixes the type.
@@ -9531,6 +9545,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.errs.push(generics::dyn_not_yet(span, "this `Rc` function on an `Rc<dyn Tr>`"));
                     }
                     return ERROR;
+                }
+                if let Builtin::Sync(op) = b {
+                    self.lint_atomic_ordering(op, args);
                 }
                 // The byte-move and scalar-cmp builtins have type
                 // limits rustc states as `Sized`, `Default`, and
@@ -10309,6 +10326,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `Weak`, `RefCell`, and `Cell` methods (check/cells.rs).
         if let Some(ret) = self.cell_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // Atomic and other sync methods (check/sync.rs).
+        if let Some(ret) = self.sync_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         if let Some(ret) = self.utf8_method(e, recv, base, derefs, name, name_span, args) {
@@ -15964,16 +15985,11 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
 
 /// The (Adt, variant) a path denotes in the compat tables.
 fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
-    // `std::cmp::Ordering::Less`: the same four-segment path
+    // `std::cmp::Ordering::Less`: the same std variant paths
     // `resolve_assoc` answers, for const contexts.
-    if segs.len() == 4
-        && matches!(p.interner.get(segs[0].name), "std" | "core")
-        && p.interner.get(segs[1].name) == "cmp"
-        && p.interner.get(segs[2].name) == "Ordering"
-        && let Some(a) = p.tys.local_adt_of(generics::ordering_def())
-    {
-        let v = p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
-        return Some((a, v as u32));
+    if segs.len() >= 4 {
+        let path: Vec<&str> = segs.iter().map(|s| p.interner.get(s.name)).collect();
+        return generics::std_variant_of(p, &path);
     }
     if segs.len() == 1 {
         let &a = p.type_names.get(&segs[0].name)?;

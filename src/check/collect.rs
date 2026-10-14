@@ -371,6 +371,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
             Some(BuiltinTy::ExitCode) => "ExitCode".into(),
+            Some(BuiltinTy::Sync(k)) => k.name().into(),
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -733,8 +734,8 @@ fn std_names_without_use(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
     let mut report = |first: Sym, span: Span| {
         let n = interner.get(first);
         if crate::ty::lang::needs_std_use(n) && !defined(first) {
-            let m = crate::ty::lang::STD_IMPORTED_TYPES.iter().find(|t| t.2 == n).map_or("rc", |t| t.1);
-            errs.push(Diag::new("L0102", span, format!("cannot find type `{n}` in this scope"), format!("Import it: `use std::{m}::{n};`.")));
+            let hint = crate::ty::lang::std_use_hint(n);
+            errs.push(Diag::new("L0102", span, format!("cannot find type `{n}` in this scope"), format!("Import it: `use {hint};`.")));
         }
     };
     for (i, t) in ast.tys.iter().enumerate() {
@@ -887,6 +888,13 @@ pub fn resolve_ty(
                     return Err(not_yet("L0641", span, "an Rc of an unsized type"));
                 }
                 return Ok(tys.mk_rc(e));
+            }
+            // The sync and thread types (W-THREADS): by their std path,
+            // or by a bare name a module glob of their std module imports.
+            if let Some(k) = crate::check::sync::sync_type_named(interner, segs, std_prefixed || !type_names.contains_key(&name))
+                && k.arity() == 0
+            {
+                return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
             }
             // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A; the import
             // itself is checked where paths resolve).
@@ -1827,6 +1835,11 @@ pub fn collect_reuse<'a>(
             insert_builtin(&mut p, b.fmt_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), Generics::default());
         }
         insert_builtin(&mut p, b.exit_code, DefsKind::Struct, interner.intern("ExitCode"), Generics::default());
+        for k in crate::ty::sync::SyncTy::ALL {
+            let params = (0..k.arity()).map(|i| ParamDef { name: interner.intern(["T", "U"][i]), kind: ParamKind::Type, span: dummy }).collect();
+            let g = Generics { parent: None, params, predicates: Vec::new() };
+            insert_builtin(&mut p, b.sync_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), g);
+        }
         for (def, n) in [(b.weak, "Weak"), (b.refcell, "RefCell"), (b.cell, "Cell"), (b.ref_guard, "Ref"), (b.ref_mut_guard, "RefMut")] {
             insert_builtin(&mut p, def, DefsKind::Struct, interner.intern(n), one_ty_param());
         }
@@ -1922,7 +1935,7 @@ pub fn collect_reuse<'a>(
     }
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
-        if item_idx > usize::MAX - 4 {
+        if item_idx > usize::MAX - generics::std_adts().len() {
             // A synthetic std Adt (see above): variants, fields, and
             // derives are std's, written here directly (no AST item).
             let id = AdtId(adt_base as u32 + rank);
@@ -1961,6 +1974,13 @@ pub fn collect_reuse<'a>(
                         Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                     )
                 }
+                // core: `#[derive(Copy, Clone, Debug, Eq, PartialEq,
+                // Hash)] #[non_exhaustive] pub enum Ordering` (W-THREADS).
+                4 => (
+                    generics::atomic_ordering_def(),
+                    vec![unit("Relaxed", 0), unit("Release", 1), unit("Acquire", 2), unit("AcqRel", 3), unit("SeqCst", 4)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
+                ),
                 _ => {
                     let bytes = p.tys.mk_vec(int(IntTy::U8));
                     let error = p.tys.intern(TyKind::Adt(generics::utf8_error_def(), EMPTY_ARGS));
@@ -1973,7 +1993,7 @@ pub fn collect_reuse<'a>(
             };
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx != 1 && !std_taken.contains(&name) {
+            if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
                 p.type_names.insert(name, id);
             }
             p.tys.register_adt(def, id);
@@ -3160,6 +3180,22 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             ));
             continue;
         }
+        // A static is shared by every thread: its type must be `Sync`
+        // (rustc E0277), proven by the auto trait walk (ARCH 2.7).
+        if is_static.is_some() {
+            let sync = p.gx.lang.sync;
+            let mut tys = crate::ty::Tys::new(&p.tys);
+            if crate::check::collect::auto_structural(p, &mut tys, &[], sync, ty, &mut Vec::new()) != Some(true) {
+                let tn = ty_name(p, &p.tys, ty);
+                errs.push(Diag::new(
+                    "L0612",
+                    span,
+                    format!("`{tn}` cannot be shared between threads safely: a static's type must be `Sync`"),
+                    "Use a `Sync` type, such as an atomic or a `Mutex`, or a `thread_local!` for per-thread state.",
+                ));
+                continue;
+            }
+        }
         // Static indices are assigned after registration below,
         // once every surviving static is known (stable ranks).
         let static_idx = 0;
@@ -4052,16 +4088,11 @@ impl CollectCx<'_, '_> {
         // `Self` in an inherent associated const's initializer names the
         // owning Adt (`Self(1)`, `Self::A`, `Self { .. }`).
         let head = |n: Sym| if n == self.p.known.self_type { self.self_name.unwrap_or(n) } else { n };
-        // `std::cmp::Ordering::Less`: the same four-segment path
+        // `std::cmp::Ordering::Less`: the same std variant paths
         // `resolve_assoc` answers, for const contexts.
-        if segs.len() == 4
-            && matches!(self.p.interner.get(segs[0].name), "std" | "core")
-            && self.p.interner.get(segs[1].name) == "cmp"
-            && self.p.interner.get(segs[2].name) == "Ordering"
-            && let Some(a) = self.p.tys.local_adt_of(generics::ordering_def())
-        {
-            let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[3].name)?;
-            return Some((a, v as u32));
+        if segs.len() >= 4 {
+            let path: Vec<&str> = segs.iter().map(|s| self.p.interner.get(s.name)).collect();
+            return generics::std_variant_of(self.p, &path);
         }
         if segs.len() == 1 {
             let &a = self.p.type_names.get(&head(segs[0].name))?;
@@ -4446,11 +4477,9 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
         | TyKind::FnDef(..)
         | TyKind::FnPtr(_) => Some(true),
         _ => {
-            match tys.builtin_of(t) {
-                Some(BuiltinTy::String) | Some(BuiltinTy::Chars) => return Some(true),
-                Some(BuiltinTy::Args) | Some(BuiltinTy::Rc) => return Some(trait_def == lang.unpin),
-                Some(BuiltinTy::Vec) | Some(BuiltinTy::Boxed) if trait_def == lang.unpin => return Some(true),
-                _ => {}
+            // The std types' own facts (check/sync.rs keeps the table).
+            if let Some(r) = crate::check::sync::builtin_auto(p, tys, env, trait_def, t, seen) {
+                return r;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
                 seen.push(t);
@@ -4532,6 +4561,9 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
             if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() {
                 return true;
             }
+            if let Some(b) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Default) {
+                return b;
+            }
             if let Some(e) = tys.smart_elem(t) {
                 return glue_default(p, tys, e, seen);
             }
@@ -4612,6 +4644,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             // no such rendering, so it is not Debug here (a reject).
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() {
                 return true;
+            }
+            if let Some(b) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
+                return b;
             }
             if let Some(e) = tys.cell_elem(t) {
                 return is_copy(p, tys, e) && glue_debug(p, tys, e, seen);

@@ -373,6 +373,10 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                     CallTarget::Builtin(b) => {
                         1u8.hash(&mut h);
                         std::mem::discriminant(b).hash(&mut h);
+                        // The sync ops share one variant (check/sync.rs).
+                        if let Builtin::Sync(op) = b {
+                            op.hash(&mut h);
+                        }
                     }
                     CallTarget::Intrinsic(i) => (2u8, i).hash(&mut h),
                     CallTarget::Indirect(l) => (3u8, l).hash(&mut h),

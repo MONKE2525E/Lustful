@@ -66,6 +66,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0522](L0522.md) | this attribute is not supported yet |
 | [L0540](L0540.md) | arithmetic operation will overflow |
 | [L0541](L0541.md) | operation will panic at runtime |
+| [L0542](L0542.md) | invalid atomic memory ordering |
 | [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
 | [L0610](L0610.md) | type annotations needed |

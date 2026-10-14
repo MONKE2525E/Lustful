@@ -552,24 +552,68 @@ pub fn from_utf8_error_def() -> DefId {
     lang_def(&["alloc", "string"], crate::def::DefKind::Adt, "FromUtf8Error")
 }
 
+/// The def of `core::sync::atomic::Ordering`, the memory ordering
+/// enum of the atomics (W-THREADS): a synthetic Adt like `cmp::Ordering`,
+/// with Rust's variant order (Relaxed, Release, Acquire, AcqRel, SeqCst).
+pub fn atomic_ordering_def() -> DefId {
+    lang_def(&["core", "sync", "atomic"], crate::def::DefKind::Adt, "Ordering")
+}
+
+/// The `core::sync::atomic::Ordering` type.
+pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
+}
+
 /// The synthetic std Adts collect always registers, as (index, name,
 /// def, is_enum). A user type, alias, or trait of the same name shadows
-/// only the flat name (check/collect.rs); `fmt::Error` never has one.
+/// only the flat name (check/collect.rs); `fmt::Error` and
+/// `atomic::Ordering` never have one (see `std_adt_has_flat_name`).
 /// The driver predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 4] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 5] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
         (2, "Utf8Error", utf8_error_def(), false),
         (3, "FromUtf8Error", from_utf8_error_def(), false),
+        (4, "Ordering", atomic_ordering_def(), true),
     ]
+}
+
+/// True when the synthetic std Adt at `index` (see `std_adts`) enters
+/// the flat type name table. `fmt::Error` and `atomic::Ordering` do
+/// not: only their std paths (after a `use`, rewritten) reach them.
+pub fn std_adt_has_flat_name(index: usize) -> bool {
+    !matches!(index, 1 | 4)
+}
+
+/// The (Adt, variant) of a std enum variant path such as
+/// `std::cmp::Ordering::Less` or `core::sync::atomic::Ordering::SeqCst`.
+/// None when the path is not a canonical std variant path, or names
+/// no variant of its enum.
+pub fn std_variant_of(p: &crate::check::collect::Program<'_>, names: &[&str]) -> Option<(AdtId, u32)> {
+    let (&variant, ty_path) = names.split_last()?;
+    if names.len() < 4 || !matches!(names[0], "std" | "core") || crate::ty::lang::std_path_kind(ty_path) != Some(crate::ty::lang::StdPathKind::Type) {
+        return None;
+    }
+    let a = p.tys.local_adt_of(std_adt_of_path(ty_path)?)?;
+    if !p.adt(a).is_enum {
+        return None;
+    }
+    let v = p.adt(a).variants.iter().position(|v| p.interner.get(v.name) == variant)?;
+    Some((a, v as u32))
 }
 
 /// The synthetic std Adt a canonical std type path (`std::cmp::Ordering`,
 /// `std::fmt::Error`) names, by its module and name.
 pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
     let [.., module, name] = path else { return None };
-    [("cmp", "Ordering", ordering_def()), ("fmt", "Error", fmt_error_def()), ("str", "Utf8Error", utf8_error_def()), ("string", "FromUtf8Error", from_utf8_error_def())]
+    [
+        ("cmp", "Ordering", ordering_def()),
+        ("fmt", "Error", fmt_error_def()),
+        ("str", "Utf8Error", utf8_error_def()),
+        ("string", "FromUtf8Error", from_utf8_error_def()),
+        ("atomic", "Ordering", atomic_ordering_def()),
+    ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
         .map(|(_, _, d)| d)
@@ -2490,6 +2534,13 @@ fn resolve_path_ty(
         } else {
             tys.mk_option(elem)
         });
+    }
+    // The sync and thread types (W-THREADS): by their std path, or by a
+    // bare name a module glob of their std module imports.
+    if let Some(k) = crate::check::sync::sync_type_named(interner, segs, std_path || !cx.type_names.contains_key(&name)) {
+        if k.arity() == 0 {
+            return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
+        }
     }
     // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A).
     if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)
@@ -4592,7 +4643,7 @@ fn synthetic_impl_def(p: &Program, ordinal: u32) -> DefId {
 
 /// Builds the next synthetic impl record in the index. Returns
 /// its id, or None when the Self pattern has no indexed head.
-fn insert_synthetic(
+pub(crate) fn insert_synthetic(
     p: &mut Program,
     ordinal: &mut u32,
     trait_def: DefId,
@@ -5726,6 +5777,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
             span,
         );
     }
+    // The std::sync and std::thread types (W-THREADS, check/sync.rs).
+    crate::check::sync::add_sync_impls(p, &mut ordinal, span);
 }
 
 /// An owned snapshot of a type from any store (see `lift_ty`).

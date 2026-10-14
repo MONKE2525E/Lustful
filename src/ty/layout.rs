@@ -812,6 +812,9 @@ fn compute(
                 let err_l = go(tys, shapes, err_t, env, frames, memo, active)?;
                 enum_layout(&[vec![ok_l], vec![err_l]], &[0, 1], Repr::default())
             }
+            // An atomic: its value's size and alignment, with no niche
+            // (`UnsafeCell`), as std lays out `Atomic<T>` (W-THREADS).
+            Some(BuiltinTy::Sync(k)) if let Some(v) = k.atomic_value() => Ok(Layout::simple(v.bytes() as u64, v.bytes() as u64, None)),
             Some(_) => Err(()),
             None => {
                 let id = tys.local_adt(t).ok_or(())?;

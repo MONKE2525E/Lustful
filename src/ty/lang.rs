@@ -790,11 +790,51 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
 ];
 
 /// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
-/// brings the std type `name` into scope.
+/// brings the std type `name` into scope. The sync types and
+/// `atomic::Ordering` live in deeper modules (W-THREADS).
 pub fn std_glob_imports(path: &[&str], name: &str) -> bool {
+    let mut full = path.to_vec();
+    full.push(name);
     STD_IMPORTED_TYPES
         .iter()
         .any(|&(crates, module, n)| n == name && path.len() == 2 && crates.contains(&path[0]) && path[1] == module)
+        || crate::ty::sync::SyncTy::by_path(&full).is_some()
+        || (name == "Ordering" && matches!(full.as_slice(), ["std" | "core", "sync", "atomic", "Ordering"]))
+}
+
+/// True when a glob of the std module `path` imports `name` and the
+/// module is one of the sync or thread modules (W-THREADS): a sync
+/// type, `atomic::Ordering`, or a std free fn of that module.
+pub fn std_sync_glob_imports(path: &[&str], name: &str) -> bool {
+    let sync_module = matches!(path, ["std" | "core", "sync", ..] | ["std" | "core", "hint"]);
+    sync_module && (std_glob_imports(path, name) || std_glob_fns(path).contains(&name))
+}
+
+/// The std free fns a glob `use` of `path` brings (`use std::sync::
+/// atomic::*;` brings `fence`).
+pub fn std_glob_fns(path: &[&str]) -> Vec<&'static str> {
+    STD_FN_PATHS
+        .iter()
+        .filter_map(|row| {
+            let parts: Vec<&str> = row.split('/').collect();
+            (parts.len() == path.len() + 1 && parts.iter().zip(path).all(|(a, b)| a == b)).then(|| *parts.last().unwrap())
+        })
+        .collect()
+}
+
+/// Every std type name a glob `use` can bring (`std_glob_imports`).
+pub fn std_glob_names() -> impl Iterator<Item = &'static str> {
+    STD_IMPORTED_TYPES.iter().map(|t| t.2).chain(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name()))
+}
+
+/// The `use` path to suggest for a non-prelude std type lust knows by
+/// name (`needs_std_use`), as `std::module::Name`.
+pub fn std_use_hint(name: &str) -> String {
+    if let Some(k) = crate::ty::sync::SyncTy::ALL.iter().find(|k| k.name() == name) {
+        return format!("std::{}::{name}", k.module().join("::"));
+    }
+    let m = STD_IMPORTED_TYPES.iter().find(|t| t.2 == name).map_or("rc", |t| t.1);
+    format!("std::{m}::{name}")
 }
 
 /// The variant names of the std enum at `path` (`std::cmp::Ordering`
@@ -811,7 +851,7 @@ pub fn std_enum_variants(path: &[&str]) -> Vec<&'static str> {
 
 /// True when `name` is one of `STD_IMPORTED_TYPES`.
 pub fn needs_std_use(name: &str) -> bool {
-    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name)
+    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name) || crate::ty::sync::SyncTy::ALL.iter().any(|k| k.name() == name)
 }
 
 /// True if `src` can mention an implemented source std fn, so the driver
@@ -890,6 +930,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/fmt/DebugSet",
     "core/fmt/DebugMap",
     "std/fmt/DebugMap",
+    "core/sync/atomic/Ordering",
+    "std/sync/atomic/Ordering",
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[
@@ -1033,6 +1075,12 @@ const STD_FN_PATHS: &[&str] = &[
     "std/env/args",
     "std/process/exit",
     "std/process/abort",
+    "core/sync/atomic/fence",
+    "std/sync/atomic/fence",
+    "core/sync/atomic/compiler_fence",
+    "std/sync/atomic/compiler_fence",
+    "core/hint/spin_loop",
+    "std/hint/spin_loop",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[
@@ -1079,6 +1127,16 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/cmp/Ordering/Equal",
     "core/cmp/Ordering/Greater",
     "std/cmp/Ordering/Greater",
+    "core/sync/atomic/Ordering/Relaxed",
+    "std/sync/atomic/Ordering/Relaxed",
+    "core/sync/atomic/Ordering/Release",
+    "std/sync/atomic/Ordering/Release",
+    "core/sync/atomic/Ordering/Acquire",
+    "std/sync/atomic/Ordering/Acquire",
+    "core/sync/atomic/Ordering/AcqRel",
+    "std/sync/atomic/Ordering/AcqRel",
+    "core/sync/atomic/Ordering/SeqCst",
+    "std/sync/atomic/Ordering/SeqCst",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's
@@ -1139,6 +1197,7 @@ fn std_row_eq(row: &str, path: &[&str]) -> bool {
 pub fn std_path_kind(path: &[&str]) -> Option<StdPathKind> {
     let mut find = |rows: &[&str], kind| rows.iter().any(|r| std_row_eq(r, path)).then_some(kind);
     find(STD_TYPE_PATHS, StdPathKind::Type)
+        .or_else(|| crate::ty::sync::SyncTy::by_path(path).map(|_| StdPathKind::Type))
         .or_else(|| find(STD_TRAIT_PATHS, StdPathKind::Trait))
         .or_else(|| find(STD_FN_PATHS, StdPathKind::Fn))
         .or_else(|| find(STD_MACRO_PATHS, StdPathKind::Macro))
@@ -1160,6 +1219,7 @@ pub fn std_is_module_path(path: &[&str]) -> bool {
         path.iter().all(|p| parts.next() == Some(p)) && parts.next().is_some()
     };
     [STD_TYPE_PATHS, STD_TRAIT_PATHS, STD_FN_PATHS, STD_MACRO_PATHS, STD_VARIANT_PATHS].iter().any(|rows| rows.iter().any(|r| prefix_of(r)))
+        || crate::ty::sync::type_rows().iter().any(|r| prefix_of(r))
 }
 
 /// True for `std::primitive::u8` style paths: a primitive type
