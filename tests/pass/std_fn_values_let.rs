@@ -1,6 +1,5 @@
-// expect: L9001
-// Std fns and Option/Result constructors as values have no value
-// form yet. Each must report, not compile with an error type.
+// Std fns and the Option constructor as values, bound by `let` and
+// called (`builtin_item_value`).
 fn main() {
     let f = String::from;
     let s: String = f("x");
