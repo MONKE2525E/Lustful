@@ -451,6 +451,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let saved_loops = std::mem::take(&mut self.loops);
         self.closure_rets.push(output);
         let bt = self.expr(body, Some(output));
+        // Edition 2024 never-type fallback: a body that only diverges
+        // (`|| { ..; panic!(); }`) leaves the return type open, and rustc
+        // makes it `!`. Without this the closure's signature zonks to
+        // the error type and no body is built for it.
+        if matches!(self.kind(self.resolve(bt)), TyKind::Never) && matches!(self.kind(self.resolve(output)), TyKind::Infer(v) if !v.is_int() && !v.is_float()) {
+            self.unify(output, NEVER);
+        }
         self.coerce_expr(body, bt, output);
         self.closure_rets.pop();
         self.loops = saved_loops;
