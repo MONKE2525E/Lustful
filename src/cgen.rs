@@ -1269,7 +1269,28 @@ fn c_size_align(p: &Program, t: &CTy) -> (u64, u64) {
 /// Returns over 32 bytes go through a hidden out-pointer (ARCH 4.5);
 /// parameters stay by value, which keeps the slot cast simple.
 fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
-    c_size_align(p, &cty(&p.tys, p.fn_info(f).ret)).0 > 32
+    ret_by_out(p, &cty(&p.tys, p.fn_info(f).ret))
+}
+
+/// True when a C function returns `t` through a hidden out-pointer:
+/// over 32 bytes, or a zero-sized type that holds a zero-length array
+/// (`[T; 0]`, also in a tuple or struct). tcc 0.9.28 crashes in a
+/// function that returns such a struct by value (see `param_dropped`
+/// for the same bug on parameters, and `zst_out_glue` for glue).
+fn ret_by_out(p: &Program, t: &CTy) -> bool {
+    let size = c_size_align(p, t).0;
+    size > 32 || (size == 0 && has_zero_len_array(p, t))
+}
+
+/// True when a zero-sized type holds a zero-length array.
+fn has_zero_len_array(p: &Program, t: &CTy) -> bool {
+    match t {
+        CTy::Array(_, 0) => true,
+        CTy::Array(e, _) => has_zero_len_array(p, e),
+        CTy::Tuple(es) => es.iter().any(|e| has_zero_len_array(p, e)),
+        CTy::Adt(a) => p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| has_zero_len_array(p, &cty(&p.tys, f.ty)))),
+        _ => false,
+    }
 }
 
 /// True when a by-value parameter of C type `t` is dropped from the C
@@ -2351,7 +2372,7 @@ impl FnGen<'_, '_, '_> {
                 collect_types(&ret, &mut self.sig_types);
                 let rc = ctype(&ret);
                 let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
-                if c_size_align(self.p, &ret).0 > 32 {
+                if ret_by_out(self.p, &ret) {
                     let t = self.tmp();
                     let _ =
                         writeln!(self.out, "    {rc} {t}; ((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
@@ -2372,7 +2393,7 @@ impl FnGen<'_, '_, '_> {
                     i += 1;
                     keep
                 });
-                if c_size_align(self.p, ret).0 > 32 {
+                if ret_by_out(self.p, ret) {
                     let t = self.tmp();
                     let rt = ctype(ret);
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
@@ -2903,7 +2924,7 @@ impl FnGen<'_, '_, '_> {
         let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", ctype(t))).collect();
         let names: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
         let free = if consume { format!(" lust_dealloc(self, sizeof({cts}), _Alignof({cts}));") } else { String::new() };
-        if c_size_align(p, &ret).0 > 32 {
+        if ret_by_out(p, &ret) {
             let args: String = std::iter::once("out".to_string()).chain(names).collect::<Vec<_>>().join(", ");
             let _ = writeln!(self.prelude, "static void {name}({rt} *out, void *self{decls}) {{ {call}({args});{free} }}");
         } else {
@@ -6433,7 +6454,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             CTy::FnPtr(ps, r) => {
                 let ct = ctype(t);
-                let large = c_size_align(p, r).0 > 32;
+                let large = ret_by_out(p, r);
                 let mut params: Vec<String> = Vec::new();
                 if large {
                     params.push(format!("{}*", ctype(r)));
@@ -6559,6 +6580,49 @@ fn glue_callee(p: &Program, slots: &[u32], f: LocalDefId, types: &mut Vec<CTy>) 
 /// definition calls to `more` and the extra C types it names to `types`.
 #[allow(clippy::too_many_arguments)]
 fn glue_def(
+    p: &Program,
+    slots: &[u32],
+    g: &Glue,
+    t: &CTy,
+    protos: &mut String,
+    defs: &mut String,
+    more: &mut Vec<(Glue, CTy)>,
+    types: &mut Vec<CTy>,
+) {
+    if matches!(g, Glue::Default | Glue::Clone) && c_size_align(p, t).0 == 0 && ret_by_out(p, t) {
+        let (mut proto, mut def) = (String::new(), String::new());
+        glue_def_value(p, slots, g, t, &mut proto, &mut def, more, types);
+        zst_out_glue(g, t, &def, protos, defs);
+        return;
+    }
+    glue_def_value(p, slots, g, t, protos, defs, more, types);
+}
+
+/// The `default` or `clone` glue of a zero-sized type that tcc cannot
+/// return by value (`ret_by_out`), from its by-value definition `def`:
+/// a function that writes through an out-pointer (each `return X;`
+/// becomes `*o = X;`), and a macro of the glue's name, so every call
+/// stays an expression.
+fn zst_out_glue(g: &Glue, t: &CTy, def: &str, protos: &mut String, defs: &mut String) {
+    let (m, ct) = (mangle(t), ctype(t));
+    let (name, head, params, call) = match g {
+        Glue::Default => (format!("default_{m}"), format!("{ct} default_{m}(void) {{"), format!("{ct} *o"), "&r_".to_string()),
+        _ => (format!("clone_{m}"), format!("{ct} clone_{m}({ct} *p) {{"), format!("{ct} *o, {ct} *p"), "&r_, (p)".to_string()),
+    };
+    let arg = if matches!(g, Glue::Default) { "" } else { "p" };
+    let _ = writeln!(protos, "void {name}_o({params});\n#define {name}({arg}) ({{ {ct} r_; {name}_o({call}); r_; }})");
+    let mut body = def.replacen(&head, &format!("void {name}_o({params}) {{"), 1);
+    while let Some(i) = body.find("return ") {
+        let end = i + body[i..].find(';').unwrap_or(body.len() - i);
+        let e = body[i + "return ".len()..end].to_string();
+        body.replace_range(i..=end, &format!("{{ *o = {e}; return; }}"));
+    }
+    defs.push_str(&body);
+}
+
+/// `glue_def` for every glue whose value C returns directly.
+#[allow(clippy::too_many_arguments)]
+fn glue_def_value(
     p: &Program,
     slots: &[u32],
     g: &Glue,
@@ -7696,7 +7760,7 @@ fn tls_glue(p: &Program, g: &Glue, c: &CTy, protos: &mut String, defs: &mut Stri
         return;
     }
     let _ = writeln!(protos, "{ct} *tlsinit_{m}({ct} *c, void *init);");
-    let make = if c_size_align(p, t).0 > 32 { format!("((void (*)({vt} *))init)(&v);") } else { format!("v = (({vt} (*)(void))init)();") };
+    let make = if ret_by_out(p, t) { format!("((void (*)({vt} *))init)(&v);") } else { format!("v = (({vt} (*)(void))init)();") };
     let (replace, register) = if drops {
         need(Glue::TlsDtor, c);
         (format!(" {vt} old = c->f1; c->f1 = v; drop_{}(&old); ", mangle(t)), format!(" lust_tls_register(c, tlsdtor_{m});"))

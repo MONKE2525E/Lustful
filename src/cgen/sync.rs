@@ -886,7 +886,7 @@ impl FnGen<'_, '_, '_> {
             Callee::Ptr(ft) => {
                 let CTy::FnPtr(_, r) = ft else { unreachable!("a fn pointer type") };
                 let v = self.tmp();
-                if c_size_align(self.p, r).0 > 32 {
+                if ret_by_out(self.p, r) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();
                     let _ = writeln!(out, "  {} {v}; {env}(&{v}{pre});", ctype(r));
                 } else {
