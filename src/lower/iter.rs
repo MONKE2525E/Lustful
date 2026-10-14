@@ -415,6 +415,8 @@ impl Ex<'_, '_, '_> {
                 let (good, bad) = self.branch(ok);
                 self.cur = bad;
                 self.term(Terminator::Panic(vec![FmtPart::Lit("assertion failed: step != 0".into())]));
+                // `StepBy::new` asserts in core, not at the caller.
+                self.body.blocks[self.cur.0 as usize].term_span = crate::diag::Span::std_site(5, 36, 9);
                 self.cur = good;
                 let m = self.local(USIZE);
                 self.assign(Place::local(m), Rvalue::Bin(crate::ast::BinOp::Sub, n, Self::usize_c(1)));
@@ -3087,7 +3089,10 @@ impl Ex<'_, '_, '_> {
         let op = if product { crate::ast::BinOp::Mul } else { crate::ast::BinOp::Add };
         self.each(&itp, ty, &mut |this, x, item| {
             let v = if matches!(this.body.tys.kind(item), TyKind::Ref(..)) { Place::local(x).deref() } else { Place::local(x) };
+            // Overflow reports at core's `integer_sum_product!` line.
+            let at = std::mem::replace(&mut this.span, crate::diag::Span::std_site(7, 206, 1));
             this.assign(Place::local(acc), Rvalue::Bin(op, Operand::Copy(Place::local(acc)), Operand::Copy(v)));
+            this.span = at;
             Ok(())
         })?;
         self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(acc))));
@@ -3321,6 +3326,8 @@ impl Ex<'_, '_, '_> {
             let (s, n) = self.switch_opt(&Place::local(hi));
             self.cur = n;
             self.term(Terminator::Panic(vec![FmtPart::Lit("capacity overflow".into())]));
+            // TrustedLen `SpecFromIterNested` panics in alloc.
+            self.body.blocks[self.cur.0 as usize].term_span = crate::diag::Span::std_site(6, 57, 18);
             self.cur = s;
             with_capacity(self, Operand::Copy(Self::payload(&Place::local(hi))));
             // `extend_trusted` writes through `for_each`, so a fold.

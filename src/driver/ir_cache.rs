@@ -41,9 +41,13 @@ fn hash_def(h: &mut FxHasher, p: &Program, def: DefId) {
 /// line, as cgen embeds it: (file path, relative line, column). The
 /// path rides in because a multi-file crate's spans name many files.
 fn hash_span(h: &mut FxHasher, map: &SourceMap, base_line: u32, span: Span) {
+    if span.file == crate::diag::FileId::STD_SITE {
+        span.hash(h);
+        return;
+    }
     let at = map.call_site(span);
     map.path(at.file).hash(h);
-    let (line, col) = map.line_col(at);
+    let (line, col) = map.line_display_col(at);
     (line.saturating_sub(base_line), col).hash(h);
 }
 

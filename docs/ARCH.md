@@ -2030,7 +2030,17 @@ where output can observe it:
   And `Location::file()` is the path Cargo gives rustc:
   workspace-relative for members, never an absolute lust
   path. The line numbers in cached code follow the
-  remapping rule in 4.2.
+  remapping rule in 4.2. Measured location rules (W-PANIC):
+  the column is rustc's display column (a tab counts 4, a
+  wide char 2, per-char widths measured from rustc 1.99 in
+  `src/colwidth.rs`); a panic in tokens a `macro_rules!`
+  body wrote reports at the outermost macro call; a std
+  panic without `track_caller` (`step_by(0)`, `Ord::clamp`,
+  `sum` overflow, capacity overflow) reports std's own
+  `library/` line. A stack overflow prints Rust's guard-page
+  text and aborts. rustc wraps an `assert!` condition text
+  of more than 78 bytes over lines; lust rejects that form
+  (L0809).
 - **Drop order.** Already a rule-zero requirement and
   tested today with printing `Drop` impls. Std source
   must not reorder drops: `Vec` drops elements front

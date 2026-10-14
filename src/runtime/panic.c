@@ -50,6 +50,10 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/char/methods.rs",
     LUST_STD_SRC "core/src/char/convert.rs",
     LUST_STD_SRC "alloc/src/vec/mod.rs",
+    LUST_STD_SRC "core/src/cmp.rs",
+    LUST_STD_SRC "core/src/iter/adapters/step_by.rs",
+    LUST_STD_SRC "alloc/src/vec/spec_from_iter_nested.rs",
+    LUST_STD_SRC "core/src/iter/traits/accum.rs",
 };
 #endif
 
@@ -146,34 +150,96 @@ static void lust_out_flush_buf(void) {
 }
 #endif
 
+/* LineWriterShim::write_all: the complete lines (through the last
+   newline) go out after any held bytes; the tail then takes the
+   BufWriter::write_all path. */
 void lust_print_out(const uint8_t *p, uint64_t n) LUST_BODY({
-    while (n) {
-        uint64_t k = n;
-        while (k && p[k - 1] != '\n') k--;
-        if (!k) {
-            if (lust_out_len && lust_out_buf[lust_out_len - 1] == '\n') lust_out_flush_buf();
-            if (lust_out_len + n > sizeof lust_out_buf) lust_out_flush_buf();
-            if (n >= sizeof lust_out_buf) lust_out_raw(p, n);
-            else { memcpy(lust_out_buf + lust_out_len, p, n); lust_out_len += n; }
-            return;
-        }
+    uint64_t k = n;
+    while (k && p[k - 1] != '\n') k--;
+    if (k) {
         lust_out_flush_buf();
         lust_out_raw(p, k);
         p += k;
         n -= k;
-        k = n < sizeof lust_out_buf ? n : sizeof lust_out_buf;
-        memcpy(lust_out_buf, p, k);
-        lust_out_len = k;
-        p += k;
-        n -= k;
+    } else if (lust_out_len && lust_out_buf[lust_out_len - 1] == '\n') {
+        lust_out_flush_buf();
     }
+    if (lust_out_len + n > sizeof lust_out_buf) lust_out_flush_buf();
+    if (n >= sizeof lust_out_buf) lust_out_raw(p, n);
+    else { memcpy(lust_out_buf + lust_out_len, p, n); lust_out_len += n; }
 })
 
 /* Flushes stdout: at exit and `process::exit` (Rust's rt::cleanup). */
 void lust_print_flush(void) LUST_BODY({ lust_out_flush_buf(); })
 
-/* Runtime setup before main: Rust ignores SIGPIPE. */
-void lust_rt_init(void) LUST_BODY({ signal(SIGPIPE, SIG_IGN); })
+/* ---------- Stack overflow ----------
+   Rust puts a SIGSEGV/SIGBUS handler on an alternate stack: a fault in
+   the guard region below the thread's stack prints
+       \nthread 'main' (<os tid>) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n
+   and aborts (134); any other fault gets the default action. Linux only
+   (the stack bounds come from pthread_getattr_np). The region counts 16
+   MiB below the stack, as a tcc frame can step past one guard page. */
+#if defined(LUST_IMPL) && defined(__linux__)
+#include <pthread.h>
+int pthread_getattr_np(pthread_t, pthread_attr_t *);
+static uintptr_t lust_guard_lo, lust_guard_hi;
+static char lust_alt_stack[65536];
+
+static void lust_segv(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    uintptr_t a = (uintptr_t)info->si_addr;
+    if (a >= lust_guard_lo && a < lust_guard_hi) {
+        char tid[24];
+        int n = 0;
+        unsigned long long t = lust_os_tid();
+        do { tid[n++] = (char)('0' + t % 10); t /= 10; } while (t);
+        char msg[160];
+        int m = 0;
+        const char *head = "\nthread 'main' (", *tail = ") has overflowed its stack\nfatal runtime error: stack overflow, aborting\n";
+        while (*head) msg[m++] = *head++;
+        while (n) msg[m++] = tid[--n];
+        while (*tail) msg[m++] = *tail++;
+        if (write(2, msg, (size_t)m) < 0) {}
+        abort();
+    }
+    /* Not a stack overflow: the default action on return re-runs the fault. */
+    signal(sig, SIG_DFL);
+}
+
+static void lust_stack_guard_init(void) {
+    pthread_attr_t at;
+    void *addr;
+    size_t size;
+    if (pthread_getattr_np(pthread_self(), &at) != 0) return;
+    int ok = pthread_attr_getstack(&at, &addr, &size) == 0;
+    pthread_attr_destroy(&at);
+    if (!ok) return;
+    long page = sysconf(_SC_PAGESIZE);
+    lust_guard_hi = (uintptr_t)addr + (uintptr_t)(page > 0 ? page : 4096);
+    lust_guard_lo = (uintptr_t)addr > (16u << 20) ? (uintptr_t)addr - (16u << 20) : 0;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = lust_alt_stack;
+    ss.ss_size = sizeof lust_alt_stack;
+    if (sigaltstack(&ss, NULL) != 0) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = lust_segv;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#elif defined(LUST_IMPL)
+static void lust_stack_guard_init(void) {}
+#endif
+
+/* Runtime setup before main: Rust ignores SIGPIPE and reports a stack
+   overflow (above). */
+void lust_rt_init(void) LUST_BODY({
+    signal(SIGPIPE, SIG_IGN);
+    lust_stack_guard_init();
+})
 
 /* A print to stdout (`to_stderr` 0) or stderr whose fmt impl returned
    Err: Rust has already written the pieces before the failing one. */

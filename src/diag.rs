@@ -22,6 +22,14 @@ pub const DEFAULT_MAX_ERRORS: usize = 20;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(pub u32);
 
+impl FileId {
+    /// Not a source file: a span in it names a line of Rust 1.99's own std
+    /// source, for a panic rustc reports inside std (no `#[track_caller]`).
+    /// Only literal-text `Panic` terminators carry one (`Span::std_site`);
+    /// cgen's `loc` and the IR cache read it before any source map lookup.
+    pub const STD_SITE: FileId = FileId(u32::MAX);
+}
+
 /// The expansion context of a span: which macro expansion (if any) produced its tokens.
 /// `CtxtId(0)` is the root context (ordinary source). `CtxtId(n)` for n > 0 names entry
 /// n - 1 of the source map's expansion table. Session-local, like `FileId`.
@@ -53,9 +61,26 @@ impl Span {
     /// The smallest span that covers both spans. Both spans must be in the same file. The
     /// result keeps the left span's context: name resolution reads the contexts of the
     /// spans that were combined, never of this cover span (docs/ARCH.md section 6.3).
+    ///
+    /// Spans from different expansion contexts (a macro argument and the
+    /// macro's own tokens) are not ranges of one text: the cover is taken
+    /// over their call sites instead, in the root context, which is where
+    /// rustc reports a panic in such an expression.
     pub fn to(self, other: Span) -> Span {
+        if self.ctxt != other.ctxt {
+            let (a, b) = (call_site_span(self), call_site_span(other));
+            if a.file == b.file && a.ctxt == b.ctxt {
+                return Span { file: a.file, lo: a.lo.min(b.lo), hi: a.hi.max(b.hi), ctxt: a.ctxt };
+            }
+            return self;
+        }
         debug_assert_eq!(self.file, other.file, "Span::to across files");
         Span { file: self.file, lo: self.lo.min(other.lo), hi: self.hi.max(other.hi), ctxt: self.ctxt }
+    }
+    /// A `FileId::STD_SITE` span: `file` indexes `lust_std_files` in
+    /// runtime/panic.c, at 1-based `line` and `col` of that std file.
+    pub fn std_site(file: u32, line: u32, col: u32) -> Span {
+        Span { file: FileId::STD_SITE, lo: file, hi: (line << 12) | col.min(0xFFF), ctxt: CtxtId::ROOT }
     }
     /// This span moved by `delta` bytes within the same file. The driver uses it when an
     /// edit shifts the kept suffix of a file; file and context do not change.
@@ -139,6 +164,26 @@ pub fn source_hash(src: &str) -> String {
 #[derive(Clone)]
 pub struct LineIndex {
     starts: Vec<u32>,
+    /// Each char whose display width differs from its byte length (a
+    /// tab, most non-ASCII chars): its byte offset and width minus bytes.
+    /// Empty for an ASCII file with no tab. Panic locations count columns
+    /// as rustc does, in display width (`display_col`).
+    wide: Vec<(u32, i32)>,
+}
+
+/// Appends the `LineIndex::wide` entries of `text`, which starts at byte `base`.
+fn wide_chars(text: &str, base: usize, out: &mut Vec<(u32, i32)>) {
+    if text.is_ascii() && !text.as_bytes().contains(&b'\t') {
+        return;
+    }
+    for (i, ch) in text.char_indices() {
+        if ch == '\t' || !ch.is_ascii() {
+            let d = crate::colwidth::char_width(ch) as i32 - ch.len_utf8() as i32;
+            if d != 0 {
+                out.push(((base + i) as u32, d));
+            }
+        }
+    }
 }
 
 impl LineIndex {
@@ -147,7 +192,9 @@ impl LineIndex {
         let mut starts = Vec::with_capacity(src.len() / 32);
         starts.push(0);
         starts.extend(src.match_indices('\n').map(|(i, _)| i as u32 + 1));
-        LineIndex { starts }
+        let mut wide = Vec::new();
+        wide_chars(src, 0, &mut wide);
+        LineIndex { starts, wide }
     }
     /// The index after an edit replaced `old[a..old_b]` with `new[a..new_b]`: line starts before
     /// the edit are kept, starts inside it are recomputed, and starts after it are shifted.
@@ -159,12 +206,27 @@ impl LineIndex {
         starts.extend(new[a..new_b].match_indices('\n').map(|(i, _)| (a + i) as u32 + 1));
         let after = self.starts.partition_point(|&s| s as usize <= old_b);
         starts.extend(self.starts[after..].iter().map(|&s| (s as i64 + delta) as u32));
-        LineIndex { starts }
+        let keep = self.wide.partition_point(|&(o, _)| (o as usize) < a);
+        let mut wide = self.wide[..keep].to_vec();
+        wide_chars(&new[a..new_b], a, &mut wide);
+        let after = self.wide.partition_point(|&(o, _)| (o as usize) < old_b);
+        wide.extend(self.wide[after..].iter().map(|&(o, d)| ((o as i64 + delta) as u32, d)));
+        LineIndex { starts, wide }
     }
 
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let line = self.starts.partition_point(|&s| s <= offset) - 1;
         (line as u32 + 1, offset - self.starts[line] + 1)
+    }
+    /// 1-based line and display column of byte `offset`: rustc's
+    /// `col_display + 1`, where a tab counts 4 and each char its width.
+    pub fn line_display_col(&self, offset: u32) -> (u32, u32) {
+        let (line, col) = self.line_col(offset);
+        let start = self.starts[line as usize - 1];
+        let lo = self.wide.partition_point(|&(o, _)| o < start);
+        let hi = self.wide.partition_point(|&(o, _)| o < offset);
+        let extra: i32 = self.wide[lo..hi].iter().map(|&(_, d)| d).sum();
+        (line, (col as i32 + extra).max(1) as u32)
     }
 }
 
@@ -363,6 +425,11 @@ impl SourceMap {
     /// 1-based line and column of a span's first byte.
     pub fn line_col(&self, span: Span) -> (u32, u32) {
         self.lines(span.file).line_col(span.lo)
+    }
+    /// 1-based line and display column of a span's first byte (panic
+    /// locations; see `LineIndex::line_display_col`).
+    pub fn line_display_col(&self, span: Span) -> (u32, u32) {
+        self.lines(span.file).line_display_col(span.lo)
     }
     /// 1-based line and column of byte `offset` in `file`.
     pub fn line_col_at(&self, file: FileId, offset: u32) -> (u32, u32) {

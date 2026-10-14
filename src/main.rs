@@ -14,6 +14,7 @@ mod borrowck;
 mod capabilities;
 mod cgen;
 mod check;
+mod colwidth;
 mod daemon;
 mod def;
 mod diag;

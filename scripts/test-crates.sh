@@ -60,7 +60,7 @@ fail=0
 seen=0
 
 # A panic line names the OS thread id, which differs per run: mask it.
-mask_tid() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) panicked/thread '\1' (TID) panicked/" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+mask_tid() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
 report() {
   if [ "$1" = ok ]; then pass=$((pass + 1)); echo "ok   $2"; else fail=$((fail + 1)); echo "FAIL $2: $3"; fi

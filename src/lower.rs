@@ -390,12 +390,17 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn span(&self, e: ExprId) -> Span {
         self.p.ast.expr_span(e)
     }
-    /// The `[` of an index expression, given its index operand: the byte
-    /// before the operand (rustfmt never puts space after `[`). rustc
-    /// reports `Index::index` panics there.
-    fn bracket_span(&self, index: ExprId) -> Span {
-        let s = self.span(index);
-        Span { lo: s.lo.saturating_sub(1), hi: s.lo, ..s }
+    /// The `[` of index expression `e`: the byte right after its base
+    /// (whatever spacing follows the `[`). rustc reports `Index::index`
+    /// panics there. When the brackets come from a macro and the base from
+    /// its argument, `e`'s span covers the call site (`Span::to`), where
+    /// rustc reports too.
+    fn bracket_span(&self, e: ExprId, base: ExprId) -> Span {
+        let (whole, b) = (self.span(e), self.span(base));
+        if whole.lo != b.lo || whole.ctxt != b.ctxt {
+            return whole;
+        }
+        Span { lo: b.hi, hi: b.hi + 1, ..b }
     }
     /// Gives the index local `i` its panic location `at` (see
     /// `Proj::Index`): re-spans its assignment when that is the last
@@ -576,7 +581,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 };
                 let t = self.temp(slice);
                 // Range indexing is `Index::index`: it panics at the brackets.
-                let span = self.bracket_span(*index);
+                let span = self.bracket_span(e, *base);
                 let mutable = self.mut_index > 0;
                 self.assign(Place::local(t), Rvalue::Subslice { base: b, lo, hi, inclusive, mutable }, span);
                 Place::local(t)
@@ -613,7 +618,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 // `a[i]` for a built-in array or slice index, at the
                 // brackets for `Index::index` (a Vec). See `Proj::Index`.
                 let builtin = matches!(self.kind(self.peel(self.ty(*base), derefs)), TyKind::Array(..) | TyKind::Slice(_));
-                let at = if builtin { self.span(e) } else { self.bracket_span(*index) };
+                let at = if builtin { self.span(e) } else { self.bracket_span(e, *base) };
                 self.mark_index_loc(i, at);
                 b.project(Proj::Index(i))
             }
@@ -2596,6 +2601,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 let rv = match self.kind(ty) {
                     TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => Rvalue::Bin(op, Operand::Copy(a), Operand::Copy(b)),
+                    // `ra`/`rb` are the `&str` views themselves.
+                    TyKind::Str => Rvalue::StrCmp(op, ra, rb),
                     _ => Rvalue::Cmp { op, a: ra, b: rb, ty },
                 };
                 self.assign(Place::local(c), rv, span);
@@ -2667,10 +2674,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let ok = self.pick_cmp(f, via, BinOp::Le, &pl(vals[1]), &pl(vals[2]), ty, span);
                 let (good, bad) = branch(self, ok);
                 self.cur = bad;
-                // Primitive `clamp` panics with the bounds in its text;
-                // `Ord::clamp` asserts (rustc reports that one in std's
-                // cmp.rs, which lust does not model yet).
-                let parts = if matches!(self.kind(ty), TyKind::Int(_) | TyKind::Char | TyKind::Bool) {
+                // Integer and char `clamp` panic at the caller with the
+                // bounds in the text; `Ord::clamp` and bool's own `clamp`
+                // assert inside core's cmp.rs.
+                let prim = matches!(self.kind(ty), TyKind::Int(_) | TyKind::Char);
+                let site = if prim { span } else if matches!(self.kind(ty), TyKind::Bool) { Span::std_site(4, 2303, 13) } else { Span::std_site(4, 1115, 9) };
+                let parts = if prim {
                     // A format argument is a reference to the value.
                     let dbg = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
                     let arg = |this: &mut Self, v: Local| {
@@ -2684,7 +2693,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 } else {
                     vec![FmtPart::Lit("assertion failed: min <= max".into())]
                 };
-                self.terminate(Terminator::Panic(parts), span);
+                self.terminate(Terminator::Panic(parts), site);
                 self.cur = good;
                 let below = self.pick_cmp(f, via, BinOp::Lt, &pl(vals[0]), &pl(vals[1]), ty, span);
                 let (t, el) = branch(self, below);

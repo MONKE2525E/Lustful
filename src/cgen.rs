@@ -306,7 +306,11 @@ fn is128(i: IntTy) -> bool {
 /// rustc reports there (no `#[track_caller]`): `file` indexes
 /// `lust_std_files` in panic.c (0 core/src/num/mod.rs, 1
 /// core/src/char/methods.rs, 2 core/src/char/convert.rs, 3
-/// alloc/src/vec/mod.rs), plus 0x40 for `pow`.
+/// alloc/src/vec/mod.rs, 4 core/src/cmp.rs, 5
+/// core/src/iter/adapters/step_by.rs, 6
+/// alloc/src/vec/spec_from_iter_nested.rs, 7
+/// core/src/iter/traits/accum.rs), plus 0x40 for `pow`. Lowering names
+/// one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFFFF_FF00u64 + file) << 32) | (line << 12) | col)
 }
@@ -1422,12 +1426,17 @@ impl FnGen<'_, '_, '_> {
     /// The runtime prints one file path for the whole program (`lust_file`), so the packed
     /// value carries line and column only; an expanded span reports at its call site.
     fn loc(&self, span: Span) -> String {
+        // A panic rustc reports inside std keeps std's line, also in a
+        // `#[track_caller]` fn.
+        if span.file == crate::diag::FileId::STD_SITE {
+            return std_loc(span.lo as u64, (span.hi >> 12) as u64, (span.hi & 0xFFF) as u64);
+        }
         // In a `#[track_caller]` fn every panic reports the caller's
         // location, as rustc does (check/caller.rs).
         if crate::check::caller::is_track_caller(self.p, self.body.fn_id) {
             return "ltc".to_string();
         }
-        let (l, c) = self.map.line_col(self.map.call_site(span));
+        let (l, c) = self.map.line_display_col(self.map.call_site(span));
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
         let slot = self.slots[self.body.fn_id.0 as usize] as u64;
         format!("{}u", (slot << 32) | (rel << 12) | c.min(0xFFF) as u64)

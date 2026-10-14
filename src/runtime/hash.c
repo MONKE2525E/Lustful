@@ -15,8 +15,8 @@ static void lust_hash_oom(void) {
     abort();
 }
 static void lust_hash_capacity_overflow(void) {
-    fputs("Hash table capacity overflow\n", stderr);
-    abort();
+    static const char msg[] = "Hash table capacity overflow";
+    lust_panic_at((const uint8_t *)msg, sizeof msg - 1, "/rust/deps/hashbrown-0.17.1/src/raw.rs", 36, 40);
 }
 
 /* Tag::is_full / special_is_empty for one control byte. */

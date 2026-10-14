@@ -10,7 +10,7 @@ void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abo
 /* Rust's `capacity overflow` abort: a requested byte size above
    isize::MAX, or a length sum that wraps usize. Defined before the
    String and Vec cores that call it. */
-void lust_vec_capacity_overflow(void) LUST_BODY({ fputs("capacity overflow\n", stderr); abort(); })
+void lust_vec_capacity_overflow(void) LUST_BODY({ lust_panic_std("capacity overflow", "alloc/src/raw_vec/mod.rs:28:5"); })
 
 void lust_oom_size(uint64_t n) LUST_BODY({
     fprintf(stderr, "memory allocation of %llu bytes failed\n", (unsigned long long)n);
@@ -1297,8 +1297,12 @@ lust_String lust_str_replace(lust_str s, lust_str from, lust_str to) LUST_BODY({
 })
 
 lust_String lust_str_repeat(lust_str s, uint64_t n, lust_loc loc) LUST_BODY({
-    if (s.len && n > (uint64_t)9223372036854775807ull / s.len) lust_panic_cstr("capacity overflow", loc);
+    /* `checked_mul(n).expect(..)` in alloc's slice.rs, then RawVec's
+       isize::MAX byte limit. */
+    (void)loc;
+    if (s.len && n > UINT64_MAX / s.len) lust_panic_std("capacity overflow", "alloc/src/slice.rs:524:50");
     uint64_t total = s.len * n;
+    if (total > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
     lust_String r = lust_string_with_capacity(total);
     for (uint64_t i = 0; i < n; i++) { memcpy(r.ptr + r.len, s.ptr, s.len); r.len += s.len; }
     return r;
