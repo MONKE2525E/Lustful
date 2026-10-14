@@ -1945,12 +1945,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     t = self.body.tys.tys_of(ts).get(*i as usize).copied().unwrap_or(ERROR);
                 }
                 (TyKind::Adt(..), Proj::Field(i)) if self.body.tys.local_adt(t).is_some() => {
-                    let a = self.body.tys.local_adt(t).unwrap();
-                    t = self.p.adt(a).variants[variant as usize].fields[*i as usize].ty;
+                    t = self.step_field_ty(t, variant, *i);
                     variant = 0;
                 }
                 (TyKind::Adt(..), Proj::Downcast(v)) => variant = *v,
-                (_, Proj::Field(_)) if self.body.tys.option_elem(t).is_some() => t = self.body.tys.option_elem(t).unwrap(),
+                (_, Proj::Field(_)) if self.body.tys.option_elem(t).is_some() => {
+                    t = self.body.tys.option_elem(t).unwrap();
+                    variant = 0;
+                }
                 (_, Proj::Field(_)) if self.body.tys.result_args(t).is_some() => {
                     let (a, b) = self.body.tys.result_args(t).unwrap();
                     t = if variant == 0 { a } else { b };
