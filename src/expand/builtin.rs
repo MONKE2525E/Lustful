@@ -342,7 +342,7 @@ pub fn compile_env(name: &str) -> Option<String> {
 /// token stream printer: a space where the source had a gap, except
 /// never before `,` `;` `)` `]`, never after `(` `[`, never around
 /// `.`, and never before a call or index group. Braces keep their
-/// source gaps (`{ a; b }` but `{b}`). A token a macro body produced
+/// source gaps (`{ a; b }` but `{b}`); an empty brace group is `{}`. A token a macro body produced
 /// (non-root context) prints alone, with a space on each side the
 /// rules above do not already close: its source gaps were in the
 /// definition, not at the call site (`$crate :: x`, `a - b - c`).
@@ -411,6 +411,8 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
             Kind::Tok(Tok::DocStr(_)) if matches!(prev.kind, Kind::Tok(Tok::Eq)) => return true,
             Kind::Tok(Tok::Comma | Tok::Semi | Tok::Dot) => return false,
             Kind::Close(Delim::Paren | Delim::Bracket) => return false,
+            // An empty brace group prints `{}`, whatever its source gap.
+            Kind::Close(Delim::Brace) if matches!(prev.kind, Kind::Open(Delim::Brace)) => return false,
             Kind::Open(Delim::Paren | Delim::Bracket) => {
                 // A call, index, or macro group hugs its head.
                 let hugs = matches!(
