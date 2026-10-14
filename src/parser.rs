@@ -3579,6 +3579,7 @@ impl<'a> Parser<'a> {
             }
             // A tuple struct literal names fields by index: `T { 0: 5, ..a }`.
             // Tuple field names are the index text (collect).
+            let index = matches!(self.peek(), Tok::Int(..));
             let (name, span) = if let Tok::Int(v, suffix) = self.peek() {
                 if suffix.is_some() || v > u32::MAX as u128 {
                     return Err(syntax(self.span(), "invalid tuple field index"));
@@ -3591,6 +3592,9 @@ impl<'a> Parser<'a> {
             };
             let value = if self.eat(Tok::Colon) {
                 self.expr()?
+            } else if index {
+                // An index needs its value: `T { 0 }` is not shorthand.
+                return Err(syntax(span, "expected `:` after a tuple field index"));
             } else {
                 let seg = PathSeg::plain(name);
                 self.push_expr(Expr::Path(vec![seg]), span)
