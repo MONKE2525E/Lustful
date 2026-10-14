@@ -3050,8 +3050,10 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   an elided (`'_` or missing) lifetime arg of a trait,
   lifetime args in a trait's own bounds (supertraits,
   `Self` where-clauses), and associated types in a trait
-  with lifetime params; `T: 'a` bounds on named lifetimes
-  and `'a: 'static`.
+  with lifetime params; `T: 'a` bounds on named lifetimes.
+  (`'a: 'static` and an Adt's own outlives facts, `struct
+  H<'a, 'b: 'a>`, are checked: every use of the type meets
+  them, and a signature naming it assumes them.)
 - L0731: any explicit lifetime turbofish arg (rustc also
   rejects it whenever the fn has a late-bound lifetime,
   E0794).

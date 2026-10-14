@@ -169,6 +169,12 @@ pub struct RegionTables {
     pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
     /// The headers of impls of traits with lifetime params, by impl def.
     pub impl_heads: FxMap<DefId, ImplHead>,
+    /// Declared outlives facts between an Adt's lifetime params
+    /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
+    /// index, `y == STATIC_FACT` is `'static`. Every use of the type must
+    /// meet them (well-formedness), and a signature that names the type
+    /// may assume them (implied bounds).
+    pub adt_facts: FxMap<DefId, Vec<(u32, u32)>>,
     adts: std::sync::OnceLock<AdtTables>,
     /// The trait method of each trait method stub (the reverse of
     /// `GenTables::trait_method_stubs`), built on first use.
@@ -1411,12 +1417,20 @@ fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ],
             implied_walk(sc, inner, us, at, outer, facts);
             outer.pop();
         }
-        TyKind::Adt(_, args) => {
+        TyKind::Adt(def, args) => {
+            let start = *at;
             for _ in 0..adt_regions(sc.p, sc.tys, t) {
                 if let Some(&u) = us.get(*at) {
                     each(u, facts, outer);
                 }
                 *at += 1;
+            }
+            // The Adt's own outlives facts are implied by its use.
+            for &(x, y) in sc.p.regions.adt_facts.get(&def).map_or(&[][..], |v| v.as_slice()) {
+                let to = if y == crate::check::generics::STATIC_FACT { Some(0) } else { us.get(start + y as usize).copied() };
+                if let (Some(&a), Some(b)) = (us.get(start + x as usize), to) {
+                    facts.push((a, b));
+                }
             }
             for g in sc.tys.args(args).to_vec() {
                 if let GenericArg::Ty(e) = g {
@@ -3930,7 +3944,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.implied_edges(inner, vars, at, refs);
                 refs.pop();
             }
-            TyKind::Adt(_, args) => {
+            TyKind::Adt(def, args) => {
+                let start = *at;
                 for _ in 0..adt_regions(self.p, tys, t) {
                     if let Some(&v) = vars.get(*at) {
                         for &o in refs.iter() {
@@ -3938,6 +3953,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                         }
                     }
                     *at += 1;
+                }
+                // The Adt's own outlives facts: every value of the type
+                // meets them (`struct H<'a, 'b: 'a>`).
+                for &(x, y) in self.p.regions.adt_facts.get(&def).map_or(&[][..], |v| v.as_slice()) {
+                    let to = if y == crate::check::generics::STATIC_FACT { Some(0) } else { vars.get(start + y as usize).copied() };
+                    if let (Some(&a), Some(b)) = (vars.get(start + x as usize), to) {
+                        self.edge(a, b);
+                    }
                 }
                 for g in tys.args(args).to_vec() {
                     if let GenericArg::Ty(e) = g {

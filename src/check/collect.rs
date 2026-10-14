@@ -2229,6 +2229,10 @@ pub fn collect_reuse<'a>(
                 }
             }
             p.regions.adt_fields.insert(def, by_variant);
+            let facts = p.gx.adt_scopes[id.0 as usize].region_facts.clone();
+            if !facts.is_empty() {
+                p.regions.adt_facts.insert(def, facts);
+            }
         }
         let adt = &mut p.adts[id.0 as usize];
         adt.variants = variants;

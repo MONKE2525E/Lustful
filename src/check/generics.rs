@@ -748,7 +748,8 @@ pub struct Scope {
     /// `Region::Param` index in the item's region signature). An impl's
     /// come first, then a method's own (W-BORROW).
     pub lifetimes: Vec<(Sym, u32)>,
-    /// Declared `'a: 'b` facts between those params, by universal index.
+    /// Declared `'a: 'b` facts between those params, by universal index
+    /// (`'a: 'static` has `STATIC_FACT` as its target).
     pub region_facts: Vec<(u32, u32)>,
     /// The regioned `Self` type of an impl, for signatures resolved in
     /// `RegionMode::Keep` (`self_ty` stays the erased one).
@@ -2498,12 +2499,8 @@ fn build_generics_owned(
         let mut fact = |a: &ast::Lifetime, b: &ast::Lifetime, errs: &mut Vec<Diag>| {
             let (an, bn) = (interner.get(a.name), interner.get(b.name));
             match (find(a.name), find(b.name), bn) {
-                (_, _, "static") if an != "static" => errs.push(Diag::new(
-                    "L0203",
-                    b.span,
-                    "a lifetime bound by `'static` is not supported yet",
-                    "Use `'static` itself instead of a bounded lifetime parameter.",
-                )),
+                // `'a: 'static`: `'a` is `'static` (`STATIC_FACT` stands for it).
+                (Some(x), _, "static") => facts.push((x, STATIC_FACT)),
                 (Some(x), Some(y), _) => facts.push((x, y)),
                 (None, _, _) if an != "static" => errs.push(lifetime_diag_undeclared(interner, *a)),
                 (_, None, _) if bn != "static" => errs.push(lifetime_diag_undeclared(interner, *b)),
@@ -2699,6 +2696,9 @@ pub fn build_trait_generics(
     scope.assoc_srcs = assoc_srcs_of(cx, tys, &generics.predicates);
     (generics, scope)
 }
+
+/// The target index a `'a: 'static` fact has in `Scope::region_facts`.
+pub const STATIC_FACT: u32 = u32::MAX;
 
 /// The checking scope of one fn: its elaborated param env and the
 /// naming scope its body annotations resolve under. For an
@@ -3592,7 +3592,11 @@ fn region_sig(
         },
     };
     let n_univ = counter.load(Ordering::Relaxed);
-    let facts: Vec<(Region, Region)> = scope.region_facts.iter().map(|&(a, b)| (Region::Param(a), Region::Param(b))).collect();
+    let facts: Vec<(Region, Region)> = scope
+        .region_facts
+        .iter()
+        .map(|&(a, b)| (Region::Param(a), if b == STATIC_FACT { Region::Static } else { Region::Param(b) }))
+        .collect();
     // A named lifetime is early-bound when a bound names it or no input
     // type does (rustc's split, ARCH 5.5): such a fn does not coerce to a
     // fn pointer that is generic over it.
