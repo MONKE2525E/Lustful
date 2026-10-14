@@ -7,6 +7,11 @@ int posix_memalign(void **memptr, size_t alignment, size_t size);
 
 void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abort(); })
 
+/* Rust's `capacity overflow` abort: a requested byte size above
+   isize::MAX, or a length sum that wraps usize. Defined before the
+   String and Vec cores that call it. */
+void lust_vec_capacity_overflow(void) LUST_BODY({ fputs("capacity overflow\n", stderr); abort(); })
+
 void lust_oom_size(uint64_t n) LUST_BODY({
     fprintf(stderr, "memory allocation of %llu bytes failed\n", (unsigned long long)n);
     abort();
@@ -75,12 +80,17 @@ lust_String lust_string_new(void) LUST_BODY({ lust_String s = {(uint8_t *)(uintp
 
 /* String capacity follows the Vec<u8> RawVec rules below: minimum
    capacity 8, then max(cap * 2, len + extra) on the amortized path and
-   exactly len + extra on the exact path. */
+   exactly len + extra on the exact path. A len + extra sum that wraps
+   usize, or a capacity above isize::MAX bytes, is a capacity overflow,
+   as in the Vec core. */
 void lust_string_reserve(lust_String *s, uint64_t extra) LUST_BODY({
     if (s->cap - s->len >= extra) return;
+    uint64_t needed = s->len + extra;
+    if (needed < s->len) lust_vec_capacity_overflow();
     uint64_t cap = s->cap * 2;
-    if (cap < s->len + extra) cap = s->len + extra;
+    if (cap < needed) cap = needed;
     if (cap < 8) cap = 8;
+    if (cap > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
     s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
     s->cap = cap;
 })
@@ -88,13 +98,19 @@ void lust_string_reserve(lust_String *s, uint64_t extra) LUST_BODY({
 void lust_string_reserve_exact(lust_String *s, uint64_t extra) LUST_BODY({
     if (s->cap - s->len >= extra) return;
     uint64_t cap = s->len + extra;
+    if (cap < s->len) lust_vec_capacity_overflow();
+    if (cap > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
     s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
     s->cap = cap;
 })
 
 lust_String lust_string_with_capacity(uint64_t n) LUST_BODY({
     lust_String s = {(uint8_t *)(uintptr_t)1, 0, 0};
-    if (n) { s.ptr = lust_alloc(n, 1); s.cap = n; }
+    if (n) {
+        if (n > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
+        s.ptr = lust_alloc(n, 1);
+        s.cap = n;
+    }
     return s;
 })
 
@@ -265,8 +281,6 @@ void lust_exit(int32_t code) LUST_BODY({ fflush(stdout); exit(code); })
    - A byte size above isize::MAX is a capacity overflow, as in Rust.
    The typed layer owns the shrink_to length assert; this core clamps
    the target at len, which is the same end state. */
-void lust_vec_capacity_overflow(void) LUST_BODY({ fputs("capacity overflow\n", stderr); abort(); })
-
 void lust_vec_grow_to(lust_Vec *v, uint64_t new_cap, uint64_t elem, uint64_t align) LUST_BODY({
     if (new_cap > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();
     v->ptr = lust_realloc(v->ptr, v->cap * elem, align, new_cap * elem);
@@ -1214,32 +1228,22 @@ lust_str lust_str_trim_end(lust_str s) LUST_BODY({
     return r;
 })
 
-/* The one-byte-pattern exact-capacity path of Rust's replace,
-   the general push-in-pieces path, and the empty-pattern
-   boundary inserts, with capacities as Rust leaves them. */
+/* Rust's `str::replace` for a `&str` pattern, capacities included:
+   a one-byte pattern and one-byte `to` collect into exactly `s.len`;
+   else the result starts at `s.len` when the pattern is no longer
+   than `to` (0 otherwise) and grows by push_str of each piece
+   (segment, `to`, ..., tail), with no exact or no-match fast path. */
 lust_String lust_str_replace(lust_str s, lust_str from, lust_str to) LUST_BODY({
-    if (from.len == 1) {
-        uint64_t count = 0;
-        for (uint64_t i = 0; i < s.len; i++) if (s.ptr[i] == from.ptr[0]) count++;
-        if (!count) return lust_string_from(s);
-        uint64_t final_len = s.len - count + count * to.len;
-        lust_String r = lust_string_with_capacity(final_len);
-        for (uint64_t i = 0; i < s.len; i++) {
-            if (s.ptr[i] == from.ptr[0]) { memcpy(r.ptr + r.len, to.ptr, to.len); r.len += to.len; }
-            else r.ptr[r.len++] = s.ptr[i];
-        }
+    if (from.len == 1 && to.len == 1) {
+        lust_String r = lust_string_with_capacity(s.len);
+        for (uint64_t i = 0; i < s.len; i++) r.ptr[i] = s.ptr[i] == from.ptr[0] ? to.ptr[0] : s.ptr[i];
+        r.len = s.len;
         return r;
     }
-    /* First match, or an exact copy when there is none. */
-    int64_t first = -1;
-    if (from.len == 0) first = 0;
-    else for (uint64_t i = 0; i + from.len <= s.len; i++)
-        if (s.ptr[i] == from.ptr[0] && memcmp(s.ptr + i, from.ptr, from.len) == 0) { first = (int64_t)i; break; }
-    if (first < 0) return lust_string_from(s);
-    lust_String r = lust_string_new();
-    uint64_t last = 0;
+    lust_String r = lust_string_with_capacity(from.len <= to.len ? s.len : 0);
     if (from.len == 0) {
-        /* Insert at every char boundary, both ends included. */
+        /* A match at every char boundary, both ends included: the
+           pieces are `to`, then one char and `to` per char. */
         lust_string_push_str(&r, to);
         uint64_t i = 0;
         while (i < s.len) {
@@ -1251,7 +1255,8 @@ lust_String lust_str_replace(lust_str s, lust_str from, lust_str to) LUST_BODY({
         }
         return r;
     }
-    for (uint64_t i = (uint64_t)first; i + from.len <= s.len;) {
+    uint64_t last = 0;
+    for (uint64_t i = 0; i + from.len <= s.len;) {
         if (s.ptr[i] == from.ptr[0] && memcmp(s.ptr + i, from.ptr, from.len) == 0) {
             lust_string_push_bytes(&r, s.ptr + last, i - last);
             lust_string_push_str(&r, to);
