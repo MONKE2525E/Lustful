@@ -32,6 +32,11 @@ type Job = dyn Fn() + Sync + 'static;
 /// The name of every pool thread (also what /proc shows for it).
 const THREAD_NAME: &str = "lust-pool";
 
+/// The name of a scoped phase thread (the `par_map` fallback when the
+/// pool is busy or stopped). Not `THREAD_NAME`: `stop`'s contract is
+/// about pool threads only, and the stop test counts them by name.
+const SCOPED_NAME: &str = "lust-par";
+
 /// The stack size of every compiler thread (pool workers, scoped phase
 /// threads, the daemon guard, and the thread `lust-core` runs on). The
 /// default 2 MB overflows on deep expressions the parser accepts (a
@@ -338,7 +343,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     } else {
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..n)
-                .map(|_| thread(THREAD_NAME).spawn_scoped(s, || take()).unwrap_or_else(|_| s.spawn(|| take())))
+                .map(|_| thread(SCOPED_NAME).spawn_scoped(s, || take()).unwrap_or_else(|_| s.spawn(|| take())))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap_or_else(|payload| resume_unwind(payload))).collect()
         })
