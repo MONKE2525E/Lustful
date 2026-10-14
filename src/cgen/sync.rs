@@ -393,15 +393,19 @@ fn lock_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, pr
             (format!("{ct} default_{m}(void)"), format!("{ct} r; {} r.v = default_{}(); return r;", zero_c("r"), mangle(e)))
         }
         // `Mutex { data: .., poisoned: false, .. }`: std's try_lock (or
-        // try_read); a held lock prints the str `"<locked>"` (Debug).
+        // try_read); a held Mutex prints the str `"<locked>"` (Debug,
+        // so quoted), a held RwLock prints a bare `<locked>`.
         (Glue::Debug, SyncTy::Mutex | SyncTy::RwLock) => {
-            let (name, try_, unlock) =
-                if k == SyncTy::Mutex { ("Mutex", "lust_mutex_trylock", "lust_mutex_unlock") } else { ("RwLock", "lust_rw_tryread", "lust_rw_read_unlock") };
+            let (name, try_, unlock, locked) = if k == SyncTy::Mutex {
+                ("Mutex", "lust_mutex_trylock", "lust_mutex_unlock", "lust_f_dbg_str")
+            } else {
+                ("RwLock", "lust_rw_tryread", "lust_rw_read_unlock", "lust_f_write_str")
+            };
             let v = super::fmt::fmt_expr(e, FmtKind::Debug, "w", "(&p->v)", need);
             let body = format!(
                 "lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); \
 if ({try_}(&p->st)) {{ if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {v}); {unlock}(&p->st); }} \
-else if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_dbg_str(w, {})); \
+else if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {locked}(w, {})); \
 if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_bool(w, 0)); return lust_dstruct_finish_ne(&b);",
                 lit(name),
                 lit("data"),
@@ -790,12 +794,52 @@ impl FnGen<'_, '_, '_> {
     /// takes its env by value), a fn item's instance, or a fn pointer.
     fn callee_of(&self, o: &Operand) -> Callee {
         let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a thread call takes a callable value") };
+        // The callable may sit in a field: a closure held in a local
+        // is a field of the enclosing closure's env, and a tuple or
+        // struct field holds it the same way. Walk the place at the
+        // type level, as `FnGen::place` walks it at the C level.
+        let tys = &self.body.tys;
         let mut t = self.body.locals[pl.local as usize].ty;
+        let mut variant = 0usize;
         for pr in &pl.proj {
-            t = match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                _ => panic!("internal: a thread callable place with projections"),
+            t = match pr {
+                Proj::Deref => match tys.kind(t) {
+                    TyKind::Ref(_, _, i) | TyKind::RawPtr(_, i) => i,
+                    _ => tys.smart_elem(t).unwrap_or(ERROR),
+                },
+                Proj::Downcast(v) => {
+                    variant = *v as usize;
+                    t
+                }
+                Proj::Field(i) => {
+                    let i = *i as usize;
+                    match tys.kind(t) {
+                        TyKind::Tuple(ts) => tys.tys_of(ts).get(i).copied().unwrap_or(ERROR),
+                        TyKind::Closure(_, a) => tys.args(a).get(i).and_then(|g| g.as_ty()).unwrap_or(ERROR),
+                        _ if let Some(e) = tys.option_elem(t) => e,
+                        _ if let Some((ok, err)) = tys.result_args(t) => {
+                            if variant == 0 {
+                                ok
+                            } else {
+                                err
+                            }
+                        }
+                        _ => match tys.local_adt(t) {
+                            Some(a) => self.p.adt(a).variants.get(variant).and_then(|v| v.fields.get(i)).map_or(ERROR, |f| f.ty),
+                            None => ERROR,
+                        },
+                    }
+                }
+                Proj::Index(_) => match tys.kind(t) {
+                    TyKind::Array(e, _) | TyKind::Slice(e) => e,
+                    _ => tys.vec_elem(t).unwrap_or(ERROR),
+                },
             };
+        }
+        // A callable behind one reference (a by-ref capture of a
+        // `Copy` closure) calls what it points at.
+        if let TyKind::Ref(_, _, i) = tys.kind(t) {
+            t = i;
         }
         match self.body.tys.kind(t) {
             TyKind::Closure(def, _) => {

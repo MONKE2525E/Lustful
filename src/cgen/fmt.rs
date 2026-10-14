@@ -303,7 +303,7 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_recv_error_def()) == Some(*a) => format!(
             "  return {} ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
             disc_call(p, t, "p"),
-            lit("receiving on an empty and disconnected channel"),
+            lit("receiving on a closed channel"),
             lit("receiving on an empty channel")
         ),
         // std's UTF-8 errors (W-STD-A): their Display writes with
