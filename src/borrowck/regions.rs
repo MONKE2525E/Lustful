@@ -2322,6 +2322,40 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
+    /// The closure arguments of a call to `f` (not a call through a
+    /// bound) whose param is a type param (`F`, `&F`, `&mut F`) with only
+    /// `Fn*` bounds whose output has no type param: what the closure
+    /// returns has the bound's regions (`tie_bound_output`), which the
+    /// signature relates to the result, as rustc checks a call by its
+    /// signature alone.
+    fn output_tied(&self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<usize> {
+        let p = self.p;
+        if p.gx.fn_class.get(f.0 as usize) == Some(&crate::check::generics::FnClass::Stub) {
+            return Vec::new();
+        }
+        let Callee::Sig(sig) = self.callee(f) else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, (t, _)) in avs.iter().enumerate() {
+            let mut t = *t;
+            while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+                t = inner;
+            }
+            if !matches!(self.body.tys.kind(t), TyKind::Closure(..)) {
+                continue;
+            }
+            let Some(mut pt) = sig.params.get(i).copied() else { continue };
+            while let TyKind::Ref(_, _, inner) = p.tys.kind(pt) {
+                pt = inner;
+            }
+            let TyKind::Param(j) = p.tys.kind(pt) else { continue };
+            let mut bounds = sig.fn_bounds.iter().filter(|b| b.param == j.0).peekable();
+            if bounds.peek().is_some() && bounds.all(|b| b.output.is_none_or(|o| !p.tys.flags(o).contains_param())) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
     /// The trait method behind a vtable call. Lowering upcasts the
     /// receiver to the method's own trait first, so the receiver's
     /// principal owns the slot.
@@ -2392,10 +2426,18 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         // A closure argument that returns borrows: whatever the callee
         // returns may hold the closure's captured sources and free
-        // argument regions (its output).
+        // argument regions (its output), unless the callee's bounds give
+        // its output every region (`output_tied`; then the signature
+        // says what reaches the result).
+        let tied = match target {
+            CallTarget::Fn(f) => self.output_tied(f, &avs),
+            _ => Vec::new(),
+        };
         let mut srcs: Vec<u32> = Vec::new();
-        for (t, v) in &avs {
-            self.closure_sources(*t, v, &mut 0, &mut srcs);
+        for (i, (t, v)) in avs.iter().enumerate() {
+            if !tied.contains(&i) {
+                self.closure_sources(*t, v, &mut 0, &mut srcs);
+            }
         }
         self.flow_all(&srcs, &dv);
         // A vtable call takes the trait method's signature, which every
@@ -2433,6 +2475,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     let linked = std::mem::take(&mut self.bound_linked);
                     self.link_closure_args(&avs, None, &linked);
                 } else {
+                    let mut srcs: Vec<u32> = Vec::new();
+                    for &i in &tied {
+                        let (t, v) = &avs[i];
+                        self.closure_sources(*t, v, &mut 0, &mut srcs);
+                    }
+                    self.flow_all(&srcs, &dv);
                     self.call_opaque(&avs, dt, &dv);
                     self.link_closure_args(&avs, None, &[]);
                 }

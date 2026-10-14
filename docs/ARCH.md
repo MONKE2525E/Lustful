@@ -2928,7 +2928,9 @@ no captures). A body that does not check or lower gets the
 whole contract (its own errors reject it). Every call's
 result (a direct call, or any call taking a closure that
 returns borrows, and iterator items through it) may hold
-the sources.
+the sources, except where the callee's `Fn*` bounds give
+the closure's output every region (no type param there:
+`output_tied`), so the signature relates it to the result.
 Argument slots are higher-ranked (L0733 when stored or
 returned), except for a closure an iterator method takes
 (check records `free_args` from `fn_mut_param`): its
