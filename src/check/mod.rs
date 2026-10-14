@@ -5294,7 +5294,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (UnOp::Neg, TyKind::Float(_)) => inner,
                     (UnOp::Neg, k) if k.is_float_infer() => inner,
                     (UnOp::Neg, TyKind::Int(i)) if i.signed() => inner,
-                    (UnOp::Neg, k) if k.is_int_infer() => inner,
+                    // The variable may still become unsigned (`let y: u64
+                    // = x`): queue `Neg` for body end, as `x.neg()` does.
+                    (UnOp::Neg, k) if k.is_int_infer() => {
+                        let args_id = self.tys.intern_args(&[GenericArg::Ty(inner)]);
+                        let tr = TraitRef { def: p.gx.lang.neg, args: args_id, bindings: EMPTY_BINDINGS };
+                        self.obl.push_trait_at(tr, span, 0);
+                        inner
+                    }
                     (UnOp::Not, TyKind::Bool | TyKind::Int(_)) => inner,
                     (UnOp::Not, k) if k.is_int_infer() => inner,
                     (_, TyKind::Error) => ERROR,
