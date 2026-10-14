@@ -2712,7 +2712,7 @@ pub fn collect_reuse<'a>(
                 // Eq)] enum Bound<T>`, in this order.
                 _ => {
                     let t = p.tys.intern(TyKind::Param(ParamId(0)));
-                    let tuple = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Tuple, fields: vec![field("0", t)], disc };
+                    let tuple = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Tuple, fields: vec![field("0", t)], disc, non_exhaustive: false };
                     (
                         generics::bound_def(),
                         vec![tuple("Included", 0), tuple("Excluded", 1), unit("Unbounded", 2)],
