@@ -1,6 +1,7 @@
 // Type checking for one function body. Inference is local to the body: unification plus
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
+pub mod alias_path;
 pub mod any;
 pub mod closure;
 pub mod cells;
@@ -2357,54 +2358,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// `alias_adt` for the type segment of a value path, generic
-    /// aliases too: a generic alias's body under the segment's type
-    /// args (`A::<u8>::make`), fresh variables when none are written
-    /// (`type A<T> = S<T>; A::make(5)`), and the defaults of the
-    /// missing ones otherwise. The bool is true for a generic alias,
-    /// whose written args are its own, not the Adt's.
+    /// aliases too (`alias_seg_ty`): the user Adt and args the alias's
+    /// type applies. The bool is true for a generic alias, whose written
+    /// args are its own, not the Adt's.
     fn alias_adt_seg(&mut self, seg: &ast::PathSeg, span: Span) -> Option<(AdtId, Vec<GenericArg>, bool)> {
-        if let Some((a, args)) = self.alias_adt(seg.name) {
-            return Some((a, args, false));
-        }
-        let p = self.p;
-        if p.gx.generic_aliases.is_empty() {
-            return None;
-        }
-        let flat = match self.binding(Namespace::Type, seg.name) {
-            BindingRes::Def(def) => p.resolved.as_ref().and_then(|t| t.def_info.get(&def)).map_or(seg.name, |i| i.flat),
-            _ => return None,
-        };
-        let la = p.gx.generic_aliases.get(&flat)?.clone();
-        let written = seg.type_args();
-        if written.len() > la.type_params.len() {
-            self.err("L0107", span, format!("this alias takes {} type argument(s)", la.type_params.len()), "Write one type per parameter.");
-            return None;
-        }
-        let mut body = generics::Scope {
-            alias_lifetimes: la.lifetimes.iter().map(|&n| (n, Region::Erased)).collect(),
-            alias_depth: 1,
-            ..Default::default()
-        };
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        for (i, &(name, default)) in la.type_params.iter().enumerate() {
-            // rustc infers every param when no args are written, and
-            // takes the missing ones' defaults otherwise (E0107 when one
-            // has none).
-            let t = match (written.get(i), default) {
-                (Some(&w), _) => self.resolve_written(w),
-                _ if written.is_empty() => self.new_var(false),
-                (None, Some(d)) => generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, d, &body).ok()?,
-                (None, None) => {
-                    self.err("L0107", span, format!("this alias takes {} type argument(s)", la.type_params.len()), "Write one type per parameter.");
-                    return None;
-                }
-            };
-            body.param_tys.push((name, t));
-        }
-        let t = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, la.ty, &body).ok()?;
+        let (t, generic) = self.alias_seg_ty(seg, span, true)?;
         let (d, args) = self.tys.adt_parts(t)?;
-        let a = p.adt_by_def(d)?;
-        Some((a, self.tys.args(args).to_vec(), true))
+        let a = self.p.adt_by_def(d)?;
+        Some((a, self.tys.args(args).to_vec(), generic))
     }
 
     /// The args of a value path through `Self` (`Self::V(..)`, `Self {
@@ -7411,6 +7372,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// a wrong count is rustc's E0107.
     fn builtin_ctor_args(&mut self, segs: &[ast::PathSeg], n: usize, span: Span) -> Option<Vec<Ty>> {
         let p = self.p;
+        // Through an alias (`type OP = Option<u8>; OP::Some(3)`) the
+        // alias's type gives them; `resolve_assoc` reported its errors.
+        if let Some(t) = self.builtin_alias_ty(segs, span, false) {
+            return Some(self.builtin_self_args(t, n));
+        }
         let written: Vec<ast::TyId> = segs.iter().flat_map(|s| s.type_args()).collect();
         if written.is_empty() {
             return None;
@@ -7456,6 +7422,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn path_expr(&mut self, e: ExprId, segs: &[ast::PathSeg], span: Span) -> Ty {
         let p = self.p;
+        // `U::MAX` through `type U = u8` is `u8::MAX` (check/alias_path.rs).
+        if let Some(canon) = self.primitive_alias_segs(segs, span) {
+            return self.path_expr(e, &canon, span);
+        }
         if segs.len() == 1 {
             let name = segs[0].name;
             if let Some(l) = self.lookup(name, span.ctxt) {
@@ -7861,6 +7831,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn resolve_assoc(&mut self, segs: &[ast::PathSeg], span: Span) -> Option<Res> {
         let p = self.p;
         let k = p.known;
+        // `Alias::item` through an alias of a builtin type is the item of
+        // the type the alias names, by its canonical std path
+        // (check/alias_path.rs); the alias's args are the written Self.
+        if let Some(t) = self.builtin_alias_ty(segs, span, true) {
+            if t == ERROR {
+                return None;
+            }
+            if segs[1].has_args() {
+                self.err("L0107", span, "this associated item takes no generic arguments", "Write the type's arguments on the alias.");
+                return None;
+            }
+            let canon = self.canonical_item_segs(t, &segs[1])?;
+            return self.resolve_assoc(&canon, span);
+        }
         let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
         if names.len() == 3 && names[0] == k.core && names[1] == k.intrinsics {
             return self.resolve_intrinsic(names[2], span);
@@ -9377,6 +9361,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(align) = self.layout_of_val_callee(callee) {
             return self.layout_of_val(e, args, align, span);
         }
+        // The Self type a type-relative builtin call writes (an alias's
+        // type, `<T>::`, or a turbofish on the type), which the builtin's
+        // signature must agree with (check/alias_path.rs).
+        let mut written_self: Option<Ty> = None;
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
@@ -9413,9 +9401,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     },
                 }
             }
-            Expr::QPath { self_ty, trait_path, segs } => {
+            Expr::QPath { self_ty, trait_path, segs } => 'qpath: {
                 if segs.len() == 1 {
                     let base = self.resolve_written(*self_ty);
+                    // `<Vec<u8>>::new()`: a builtin type's own items first,
+                    // then the traits, as for `Alias::new()`.
+                    if trait_path.is_empty()
+                        && let Some(r) = self.builtin_type_item(base, &segs[0], span)
+                    {
+                        written_self = Some(base);
+                        break 'qpath r;
+                    }
                     let hint = if trait_path.is_empty() {
                         None
                     } else {
@@ -9441,7 +9437,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0101", span, "cannot find the associated function", "Check the trait and the name.");
                 return ERROR;
             }
-            Expr::Path(segs) => {
+            Expr::Path(segs) => 'path: {
+                // `Rune::from(c)` through `type Rune = i32` is `i32::from(c)`.
+                let prim;
+                let segs = match self.primitive_alias_segs(segs, self.span(callee)) {
+                    Some(c) => {
+                        prim = c;
+                        &prim[..]
+                    }
+                    None => segs,
+                };
                 // `T::assoc_fn(..)` on a type parameter, or `Self::f(..)`
                 // in a trait default body (Self is the trait's param):
                 // the trait comes from the bounds in scope here.
@@ -9535,6 +9540,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                 }
+                // `V4::new()` through `type V4 = Vec<u8>`: the builtin's
+                // own item at the alias's type, else a trait's
+                // (`FxHashMap::default()`), as for `<Vec<u8>>::new()`.
+                if let Some(base) = self.alias_path_target(segs, self.span(callee), true) {
+                    if base != ERROR && !segs[1].has_args() {
+                        if let Some(r) = self.builtin_type_item(base, &segs[1], span) {
+                            written_self = Some(base);
+                            break 'path r;
+                        }
+                        if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[1].name, args, span) {
+                            return t;
+                        }
+                        let (item, tn) = (self.name(segs[1].name).to_string(), self.tn(base));
+                        self.err("L0104", span, format!("no function or associated item `{item}` for `{tn}`"), "Check the name.");
+                    } else if base != ERROR {
+                        self.err("L0107", span, "this associated item takes no generic arguments", "Write the type's arguments on the alias.");
+                    }
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
                 // `M::from(x)`: an Adt with no variant or inherent fn of
                 // that name finds it in the traits in scope (rustc
                 // probes inherent items first, then traits). A call the
@@ -9549,10 +9576,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return t;
                 }
                 let cs = self.span(callee);
+                let mark = self.errs.len();
                 let r = if self.is_type_id_of(segs) { self.type_id_of_path(e, segs.last().unwrap(), cs) } else { self.resolve_assoc(segs, cs) };
                 match r {
                     Some(r) => r,
                     None => {
+                        // `String::default()`: no builtin item of that
+                        // name, so a std trait's (as for aliases above).
+                        if self.errs[mark..].iter().all(|d| matches!(d.code, "L0101" | "L0104"))
+                            && let Some(base) = self.builtin_path_base(segs, cs)
+                        {
+                            let saved = self.errs.split_off(mark);
+                            if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[segs.len() - 1].name, args, span) {
+                                return t;
+                            }
+                            self.errs.extend(saved);
+                        }
                         for &a in args {
                             self.expr(a, None);
                         }
@@ -9575,9 +9614,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             // Turbofish (`Some::<u8>(..)`, `Option::<u8>::Some(..)`) fixes
             // the element type; the argument is a coercion site for it.
-            if let Expr::Path(segs) = p.ast.expr(callee)
-                && let Some(a) = self.builtin_ctor_args(segs, 1, span)
-            {
+            let turbo = match p.ast.expr(callee) {
+                Expr::Path(segs) => self.builtin_ctor_args(segs, 1, span),
+                _ => written_self.map(|t| self.builtin_self_args(t, 1)),
+            };
+            if let Some(a) = turbo {
                 self.expect_expr(args[0], a[0]);
                 return self.tys.mk_option(a[0]);
             }
@@ -9605,7 +9646,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // is a fresh var.
             let turbo: Vec<Ty> = match p.ast.expr(callee) {
                 Expr::Path(segs) => self.builtin_ctor_args(segs, 2, span).unwrap_or_default(),
-                _ => Vec::new(),
+                _ => written_self.map(|t| self.builtin_self_args(t, 2)).unwrap_or_default(),
             };
             // Under a `Result<&dyn Tr, _>` expectation the argument is a
             // coercion site, as for `Some`; a dyn deeper in gets the hint.
@@ -9616,11 +9657,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let other = self.new_var(false);
                 return if res == Res::ResOk { self.tys.mk_result(want, other) } else { self.tys.mk_result(other, want) };
             }
-            let (want, other) = if turbo.len() == 2 {
-                if res == Res::ResOk { (Some(turbo[0]), turbo[1]) } else { (Some(turbo[1]), turbo[0]) }
-            } else {
-                (side.filter(|&t| object::mentions_dyn(&self.tys, t)), self.new_var(false))
-            };
+            // Written args fix the side: the argument is a coercion site
+            // for it (rustc E0308 for `Result::<u16, u8>::Ok(1u8)`).
+            if turbo.len() == 2 {
+                self.expect_expr(args[0], if res == Res::ResOk { turbo[0] } else { turbo[1] });
+                return self.tys.mk_result(turbo[0], turbo[1]);
+            }
+            let (want, other) = (side.filter(|&t| object::mentions_dyn(&self.tys, t)), self.new_var(false));
             let t = self.expr(args[0], want);
             return if res == Res::ResOk { self.tys.mk_result(t, other) } else { self.tys.mk_result(other, t) };
         }
@@ -9717,6 +9760,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Res::Builtin(b) => {
+                if self.type_item_has_args(callee) {
+                    self.err("L0107", span, "this associated function takes no generic arguments", "Write the type's arguments on the type: `Vec::<u8>::new()`.");
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
+                if written_self.is_none()
+                    && let Expr::Path(segs) = p.ast.expr(callee)
+                {
+                    written_self = self.written_builtin_self(segs, span);
+                }
                 // rustc's expected inputs: `Box::new(|x| ..)` (or `Rc::new`)
                 // where `Box<dyn Fn(A) -> R>` is expected checks the
                 // argument against the dyn type, so a closure takes that
@@ -9724,8 +9779,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // caller's coercion.
                 if matches!(b, Builtin::BoxNew | Builtin::RcNew)
                     && args.len() == 1
-                    && let Expr::Path(segs) = p.ast.expr(callee)
-                    && segs[0].type_args().is_empty()
+                    && written_self.is_none()
                     && let Some(want) = expected.map(|t| self.resolve(t))
                     && let Some(inner) = if b == Builtin::BoxNew { self.tys.boxed_elem(want) } else { self.tys.rc_elem(want) }
                     && matches!(self.kind(inner), TyKind::Dyn(..))
@@ -9802,15 +9856,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             }
                         }
                     }
+                    // The element of these comes from the written Self
+                    // type (`unify_builtin_self` below), else inference.
                     Builtin::BoxNew => {
-                        let generics = match p.ast.expr(callee) {
-                            Expr::Path(segs) => segs[0].type_args(),
-                            _ => Vec::new(),
-                        };
-                        let elem = match generics.first() {
-                            Some(&g) => self.resolve_written(g),
-                            None => self.new_var(false),
-                        };
+                        let elem = self.new_var(false);
                         (vec![elem], self.tys.mk_boxed(elem))
                     }
                     Builtin::BoxLeak => {
@@ -9820,14 +9869,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (vec![bx], r)
                     }
                     Builtin::RcNew => {
-                        let generics = match p.ast.expr(callee) {
-                            Expr::Path(segs) => segs[0].type_args(),
-                            _ => Vec::new(),
-                        };
-                        let elem = match generics.first() {
-                            Some(&g) => self.resolve_written(g),
-                            None => self.new_var(false),
-                        };
+                        let elem = self.new_var(false);
                         (vec![elem], self.tys.mk_rc(elem))
                     }
                     Builtin::RcStrongCount | Builtin::RcWeakCount => {
@@ -9880,14 +9922,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (vec![rc], elem)
                     }
                     Builtin::VecNew | Builtin::VecWithCapacity => {
-                        let generics = match p.ast.expr(callee) {
-                            Expr::Path(segs) => segs.iter().find(|s| s.name == p.known.Vec).map(|s| s.type_args()).unwrap_or_default(),
-                            _ => Vec::new(),
-                        };
-                        let elem = match generics.first() {
-                            Some(&g) => self.resolve_written(g),
-                            None => self.new_var(false),
-                        };
+                        let elem = self.new_var(false);
                         let params = if b == Builtin::VecNew { vec![] } else { vec![USIZE] };
                         (params, self.tys.mk_vec(elem))
                     }
@@ -9922,6 +9957,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     _ => unreachable!(),
                 };
+                if let Some(want) = written_self {
+                    let item = match p.ast.expr(callee) {
+                        Expr::Path(segs) => segs[segs.len() - 1].name,
+                        Expr::QPath { segs, .. } => segs[0].name,
+                        _ => p.known.new,
+                    };
+                    if !self.unify_builtin_self(want, &params, ret, item, span) {
+                        for &a in args {
+                            self.expr(a, None);
+                        }
+                        return ERROR;
+                    }
+                }
                 self.check_args(&params, args, span);
                 // `Rc::try_unwrap` needs `T: Sized` (rustc E0277), and
                 // the other value-reaching Rc builtins are not built for
@@ -13336,7 +13384,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let scrut_t = self.resolve(t);
         let mut t = scrut_t;
         let mut mode = mode;
-        let opt = self.option_pattern(pat);
+        // `OP::Some(x)` and `RR::Ok(x)` through an alias of Option or
+        // Result are the std variants (check/alias_path.rs).
+        let alias_ctor = self.alias_ctor_pattern(pat, span);
+        let opt = self.option_pattern(pat).or(alias_ctor.and_then(|(o, v)| o.then_some(v)));
         let structural = opt.is_some()
             || matches!(
                 p.ast.pat(pat),
@@ -13403,7 +13454,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         if opt.is_none()
-            && let Some(is_ok) = self.result_pattern(pat)
+            && let Some(is_ok) = self.result_pattern(pat).or(alias_ctor.and_then(|(o, v)| (!o).then_some(v)))
         {
             let (a, b) = match pat_path.and_then(|segs| self.builtin_ctor_args(segs, 2, span)) {
                 Some(w) => (w[0], w[1]),

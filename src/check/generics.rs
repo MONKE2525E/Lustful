@@ -2405,7 +2405,7 @@ pub fn dyn_not_yet(span: Span, what: &str) -> Diag {
 
 /// A path type: parameters, primitives, builtin Adts, user Adts
 /// with generic arguments, and `Self`/parameter projections.
-fn resolve_path_ty(
+pub(crate) fn resolve_path_ty(
     ast: &Ast,
     interner: &Interner,
     known: &Known,

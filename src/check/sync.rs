@@ -516,15 +516,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     pub(super) fn sync_call_sig(&mut self, op: SyncOp, callee: ExprId, span: Span) -> (Vec<Ty>, Ty) {
         let ord = crate::check::generics::atomic_ordering_ty(&mut self.tys);
         // `Arc<T>` and `sync::Weak<T>` ops: the element type comes from
-        // turbofish on the type segment when written (`Arc::<u8>::new`).
-        let written = match self.p.ast.expr(callee) {
-            Expr::Path(segs) if segs.len() >= 2 => segs[segs.len() - 2].type_args(),
-            _ => Vec::new(),
-        };
-        let elem = match written.first() {
-            Some(&g) => self.resolve_written(g),
-            None => self.new_var(false),
-        };
+        // the written Self type (`Arc::<u8>::new`, an alias;
+        // `unify_builtin_self` in `call`), else inference.
+        let elem = self.new_var(false);
         let arc = sync_ty(&mut self.tys, SyncTy::Arc, &[elem]);
         let weak = sync_ty(&mut self.tys, SyncTy::ArcWeak, &[elem]);
         let arc_ref = self.tys.mk_ref(false, arc);

@@ -40,17 +40,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// Parameter and return types of a `cell_assoc` builtin call. The
-    /// element type comes from turbofish on the type segment
-    /// (`Weak::<u8>::new`, `std::rc::Weak::<u8>::new`) when written.
+    /// element type comes from the written Self type (`Weak::<u8>::new`,
+    /// an alias; `unify_builtin_self` in `call`), else inference.
     pub(super) fn cell_call_sig(&mut self, b: Builtin, callee: ExprId) -> (Vec<Ty>, Ty) {
-        let written = match self.p.ast.expr(callee) {
-            Expr::Path(segs) if segs.len() >= 2 => segs[segs.len() - 2].type_args(),
-            _ => Vec::new(),
-        };
-        let elem = match written.first() {
-            Some(&g) => self.resolve_written(g),
-            None => self.new_var(false),
-        };
+        let elem = self.new_var(false);
         let mk = |this: &mut Self, which: fn(&BuiltinDefs) -> DefId| this.tys.mk_builtin1(which, elem);
         match b {
             Builtin::RcDowngrade => {
