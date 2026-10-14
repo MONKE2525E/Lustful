@@ -34,6 +34,8 @@ fn async_error(span: Span) -> Diag {
 
 type PResult<T> = Result<T, Diag>;
 
+mod attrs;
+
 /// The depth of each arena node built so far (1 for a leaf, else one
 /// more than its deepest child), index-aligned with the `Ast` arenas.
 /// Nodes that were already in the `Ast` when this parser started (a
@@ -217,6 +219,7 @@ fn parse_tokens(
     // items carry the same allows as in a whole parse.
     match p.inner_attributes() {
         Ok(inner) => {
+            attrs::check_target(&inner.attrs, "crates", false, false, interner)?;
             if !inner.attrs.is_empty() {
                 p.scope_allows = inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect();
             }
@@ -290,7 +293,6 @@ const KNOWN_ATTRS: &[&str] = &[
     "recursion_limit",
     "type_length_limit",
     "feature",
-    "forbid",
 ];
 
 /// Parses one function body (`tokens` runs from its `{` to its `}`) and appends it to `ast`.
@@ -743,6 +745,26 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
 
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
     Diag::new("L0001", span, msg, "Fix the syntax. Lust uses Rust syntax.")
+}
+
+/// An item kind in the plural, as rustc names attribute targets.
+fn item_kind_plural(kind: &ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Fn(_) => "functions",
+        ItemKind::Struct(_) => "structs",
+        ItemKind::Enum(_) => "enums",
+        ItemKind::Union(_) => "unions",
+        ItemKind::Impl(_) => "impl blocks",
+        ItemKind::Use(_) => "use statements",
+        ItemKind::Mod(_) => "modules",
+        ItemKind::Trait(_) => "traits",
+        ItemKind::Type(_) => "type aliases",
+        ItemKind::Const(_) => "constants",
+        ItemKind::Static(_) => "statics",
+        ItemKind::MacroRules(_) | ItemKind::MacroCall(_) => "macro calls",
+        ItemKind::ExternCrate(_) => "extern crates",
+        ItemKind::ExternBlock(_) => "extern blocks",
+    }
 }
 
 /// A visibility written where Rust permits none (rustc E0449): on an
@@ -1591,6 +1613,14 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let k = self.known;
+            if path.len() == 1 {
+                attrs::check_input(&name_text, &attr, self.interner)?;
+                // Fields, params, variants, arms, and statements take
+                // neither `inline` nor `repr`.
+                if !item_level {
+                    attrs::check_target(std::slice::from_ref(&attr), "fields, parameters, variants, or statements", false, false, self.interner)?;
+                }
+            }
             if path.len() > 1 {
                 // Tool attributes under a known tool namespace are ignored.
                 if name_text == "rustfmt" || name_text == "clippy" {
@@ -1631,7 +1661,8 @@ impl<'a> Parser<'a> {
                 // Doc comments lex to this attribute; it carries no code.
                 _ if name_text == "doc" => {}
                 _ if name_text == "repr" => {}
-                _ if first == k.allow || first == k.warn || first == k.deny => {}
+                // `attrs::check_input` judged the lint list (L0531 for deny and forbid).
+                _ if first == k.allow || first == k.warn || first == k.deny || name_text == "forbid" => {}
                 // Advisory attributes are accepted and ignored, as
                 // ARCH 1.6 gives them: `inline` and `cold` are hints,
                 // `must_use` and `deprecated` are lints with no
@@ -1697,6 +1728,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `inline` and `repr` on a trait or impl item: rustc takes `inline`
+    /// on fns (and, with a warning, on consts), never on types, and
+    /// `repr` on none of them. The next token tells the item kind.
+    fn check_assoc_targets(&self, parsed: &ParsedAttrs) -> PResult<()> {
+        let is_type = self.peek() == Tok::Type || (self.peek() != Tok::Fn && self.peek_at(1) == Tok::Type);
+        attrs::check_target(&parsed.attrs, if is_type { "associated types" } else { "associated items" }, !is_type, false, self.interner)
+    }
+
     fn item(&mut self) -> PResult<Option<Item>> {
         let start = self.span();
         let parsed = self.attributes()?;
@@ -1714,6 +1753,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
             let kind = ItemKind::Const(self.const_def()?);
             self.check_derive_test(&parsed, false, false)?;
+            attrs::check_target(&parsed.attrs, "constants", false, false, self.interner)?;
             self.scope_allows.truncate(scope_mark);
             return Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }));
         }
@@ -1829,6 +1869,13 @@ impl<'a> Parser<'a> {
             t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
         self.check_derive_test(&parsed, matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_)), matches!(kind, ItemKind::Fn(_)))?;
+        attrs::check_target(
+            &parsed.attrs,
+            item_kind_plural(&kind),
+            matches!(kind, ItemKind::Fn(_)),
+            matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_)),
+            self.interner,
+        )?;
         self.scope_allows.truncate(scope_mark);
         Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }))
     }
@@ -1953,6 +2000,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{` or `;`")?;
         // Inner attributes are permitted only here, before the first item.
         let inner = self.inner_attributes()?;
+        attrs::check_target(&inner.attrs, "modules", false, false, self.interner)?;
         let scope_mark = self.scope_allows.len();
         self.scope_allows.extend(inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let mut items = Vec::new();
@@ -2552,6 +2600,7 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // A trait item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
+            self.check_assoc_targets(&parsed)?;
             // Trait items are as visible as their trait.
             let vis_start = self.span();
             let vis = self.vis()?;
@@ -2655,6 +2704,7 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // An impl item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
+            self.check_assoc_targets(&parsed)?;
             // Trait impl items take the trait's visibility.
             let vis_start = self.span();
             let vis = self.vis()?;

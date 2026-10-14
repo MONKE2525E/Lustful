@@ -64,6 +64,8 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0530](L0530.md) | unsupported edition |
 | [L0531](L0531.md) | unsupported deny-level lint |
 | [L0522](L0522.md) | this attribute is not supported yet |
+| [L0523](L0523.md) | unstable cfg predicate |
+| [L0524](L0524.md) | attribute used wrongly |
 | [L0540](L0540.md) | arithmetic operation will overflow |
 | [L0541](L0541.md) | operation will panic at runtime |
 | [L0542](L0542.md) | invalid atomic memory ordering |

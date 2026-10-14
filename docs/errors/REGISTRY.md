@@ -50,7 +50,9 @@ prints "reserved, not yet emitted".
 | L0520 | cfg and attributes | W-RESOLVE | in use | Unknown cfg name |
 | L0521 | cfg and attributes | W-MACRO | reserved | Unknown attribute |
 | L0522 | cfg and attributes | W-MACRO | in use | Known attribute (cfg, repr, path, inline, and kin) is not supported yet (S3b parser reject) |
-| L0523-L0529 | cfg and attributes | W-MACRO | reserved | |
+| L0523 | cfg and attributes | W-MACRO | in use | Unstable cfg predicate (rustc E0658) |
+| L0524 | cfg and attributes | W-MACRO | in use | Built-in attribute with a malformed input or on a target Rust does not permit |
+| L0525-L0529 | cfg and attributes | W-MACRO | reserved | |
 | L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
 | L0532-L0539 | Crate session | W-DRIVER | reserved | |
 | L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
