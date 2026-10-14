@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `19c7b716` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `36a93108` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
