@@ -2935,6 +2935,17 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.seed_univ = self.trait_lifetime_seeds(f, &avs);
                 let ok = self.call_sig(f, sig, &avs, dt, &dv);
                 self.seed_univ.clear();
+                // An `Item = T` bound (`I: Iterator<Item = T>`, `I:
+                // IntoIterator<Item = T>`) ties `T`'s regions to the
+                // iterator's, which the signature pairing does not see:
+                // `mk(v.iter())` returning `Vec<T>` borrows `v` (rustc
+                // E0505 on a later move; this was a false accept, also
+                // behind `collect` into a BTreeSet). Over-approximate:
+                // every argument region may reach the result.
+                if ok && self.item_bound(f) {
+                    let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+                    self.flow_all(&all, &dv);
+                }
                 if ok {
                     // Closures no bound paired: like the opaque rule.
                     let linked = std::mem::take(&mut self.bound_linked);
@@ -4314,6 +4325,24 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// fn's own, an elided one a fresh region of this call (higher-ranked).
     /// False when no regioned bound pairs: the caller then takes the
     /// conservative rule, which ties the result to the receiver too.
+    /// True when `f`'s template bounds an `Item` of `Iterator` or
+    /// `IntoIterator` to a type (`call`'s over-approximation, W-STD-C).
+    fn item_bound(&self, f: LocalDefId) -> bool {
+        let p = self.p;
+        let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+        let Some(Some(t)) = p.gx.fn_templates.get(src.0 as usize) else { return false };
+        let items: Vec<DefId> = [p.gx.lang.iterator, p.gx.lang.into_iterator]
+            .iter()
+            .filter_map(|&tr| p.gx.index.trait_record(tr))
+            .flat_map(|r| r.assoc_items.iter().filter(|a| p.interner.get(a.1) == "Item").map(|a| a.0).collect::<Vec<_>>())
+            .collect();
+        t.generics.predicates.iter().any(|pr| match pr {
+            Predicate::AssocEq(b) => items.contains(&b.value.assoc),
+            Predicate::Trait(b) => p.tys.bindings(b.value.bindings).iter().any(|(d, _)| items.contains(d)),
+            _ => false,
+        })
+    }
+
     fn call_fn_bound(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let p = self.p;
         if p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {

@@ -423,6 +423,41 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "collect" => {
                 let target = self.iter_target(turbofish, expected, span);
+                // A std source collection (`BTreeMap`, `BTreeSet`): the
+                // call is its `FromIterator::from_iter(self)`, as rustc's
+                // `collect` is (W-STD-C). The `Target: FromIterator<Item>`
+                // obligation proves the impl's bounds (`T: Ord`).
+                let tr = self.resolve(target);
+                if let Some(a) = self.tys.local_adt(tr).or_else(|| self.tys.adt_parts(tr).and_then(|(d, _)| self.tys.local_adt_of(d)))
+                    && self.p.is_std_adt(a)
+                    && args.is_empty()
+                {
+                    // Each has one `FromIterator` impl, whose item is the
+                    // entry type: unify it now, so `collect::<BTreeMap<_,
+                    // _>>()` infers `K` and `V` from the items.
+                    let path = self.p.display_path(self.p.adt(a).name);
+                    let targs: Vec<Ty> = self.tys.adt_parts(tr).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+                    let entry = match (path.rsplit("::").next(), targs.as_slice()) {
+                        (Some("BTreeMap"), [k, v]) => {
+                            let ts = self.tys.intern_tys(&[*k, *v]);
+                            Some(self.tys.intern(TyKind::Tuple(ts)))
+                        }
+                        (Some("BTreeSet"), [t]) => Some(*t),
+                        _ => None,
+                    };
+                    if let Some(entry) = entry
+                        && !self.unify(entry, item)
+                    {
+                        self.mismatch(span, entry, item);
+                        return self.iter_bail(args);
+                    }
+                    let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
+                    let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
+                    self.obl.push_trait_at(trait_ref, span, 0);
+                    let name = self.p.interner.intern("from_iter");
+                    super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(base)], derefs, Autoref::None);
+                    return tr;
+                }
                 if !self.collect_target_ok(target, item, span) {
                     return self.iter_bail(args);
                 }
@@ -612,7 +647,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// variable (which the target check then rejects).
     fn iter_target(&mut self, turbofish: &[ast::GenericArg], expected: Option<Ty>, span: Span) -> Ty {
         if let Some(ast::GenericArg::Type(t)) = turbofish.first() {
-            let t = self.resolve_written(*t);
+            let t = match self.turbofish_ty.take() {
+                Some(t) => t,
+                None => self.resolve_written(*t),
+            };
             if turbofish.len() > 1 {
                 self.err("L0105", span, "this method takes 1 type argument", "Write one target type.");
             }

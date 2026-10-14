@@ -974,6 +974,9 @@ struct Ctx<'p, 'a> {
     /// the format check ran: (type, spec, span). The format test
     /// re-runs at finish (W-TRAITS-CORE).
     deferred_fmt: Vec<(Ty, FmtSpec, Span)>,
+    /// The resolved first turbofish type of the method call being
+    /// checked, for the builtin iterator methods (`collect::<T>()`).
+    turbofish_ty: Option<Ty>,
     /// `size_of_val` / `align_of_val` calls whose pointee type held an
     /// inference variable (call, pointee, align, span): answered at the
     /// body end (W-STD-C).
@@ -1256,6 +1259,7 @@ fn check_fn_mode<'p, 'a>(
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
         deferred_layout: Vec::new(),
+        turbofish_ty: None,
         format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
@@ -10706,7 +10710,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // Iterator sources on sequences and every method on a builtin
         // iterator (check/iter.rs, W-STD-A).
-        if let Some(ret) = self.iter_method(e, recv, rt, base, derefs, name, name_span, args, turbofish, expected) {
+        // The turbofish type is resolved once, above: the iterator
+        // methods take it from here (a second resolution left the
+        // first one's `_: Sized` obligations unbound, W-STD-C).
+        self.turbofish_ty = explicit.first().copied().flatten().and_then(|g| g.as_ty());
+        let iter_ret = self.iter_method(e, recv, rt, base, derefs, name, name_span, args, turbofish, expected);
+        self.turbofish_ty = None;
+        if let Some(ret) = iter_ret {
             return ret;
         }
         // `write!` (`write_fmt(format_args!(..))`), Formatter and builder

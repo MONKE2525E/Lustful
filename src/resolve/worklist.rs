@@ -5280,6 +5280,14 @@ impl Rewrite<'_> {
             scopes.truncate(depth);
             return;
         }
+        // Method turbofish types (`collect::<BTreeMap<_, _>>()`) name
+        // types too: rewrite them like any written type (W-STD-C).
+        if let Expr::MethodCall { generic_args, .. } = &ast.exprs[id.0 as usize] {
+            let tys: Vec<TyId> = generic_args.iter().filter_map(|g| if let crate::ast::GenericArg::Type(t) = g { Some(*t) } else { None }).collect();
+            for t in tys {
+                self.ty(ast, t, module, scopes);
+            }
+        }
         match ast.exprs[id.0 as usize].kind_children() {
             ExprKids { blocks, exprs, pats_with_scope, ty } => {
                 if let Some(t) = ty {

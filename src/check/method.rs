@@ -800,6 +800,13 @@ pub(super) fn defer_path_call(cx: &mut Ctx, e: ExprId, tr: TraitRef, name: Sym, 
     cx.deferred_methods.push(DeferredMethod { e, tr, name, own, derefs: 0, autoref: Autoref::None, path: true });
 }
 
+/// Queues a call `e` of trait method `name` for `finish_deferred_methods`,
+/// which points it at the impl `tr` selects once the body's types are
+/// known (`collect` into a std source collection, W-STD-C).
+pub(super) fn defer_trait_method(cx: &mut Ctx, e: ExprId, tr: TraitRef, name: Sym, own: Vec<GenericArg>, derefs: u8, autoref: Autoref) {
+    cx.deferred_methods.push(DeferredMethod { e, tr, name, own, derefs, autoref });
+}
+
 /// Confirms a trait method whose impl is still ambiguous (an input
 /// type only an argument or the expected type fixes, or a literal Self
 /// with several numeric impls), as rustc does: the call is typed by the
