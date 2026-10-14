@@ -2469,10 +2469,20 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         self.call_late_bound(&ins, out, &avs[1..], dt, dv)
     }
 
-    /// A call of a signature whose regions are all elided, so late-bound
-    /// (a `dyn Fn*` value, a fn pointer: check rejects written lifetimes
-    /// there, L0203): each input slot is a fresh region of this call that
-    /// the argument outlives, and each output slot is the one input
+    /// The region of each slot of a type inside a fn pointer type or `dyn
+    /// Fn*` sugar: `'static` where written there (`Scope::static_refs`),
+    /// else elided (`Erased`), so late-bound.
+    fn sig_slot_regions(&mut self, t: Ty) -> Vec<Region> {
+        let mut rs = Vec::new();
+        regioned_slots(&mut self.sc, t, t, &mut rs);
+        rs
+    }
+
+    /// A call of a signature whose regions are all elided, so late-bound,
+    /// or written `'static` (a `dyn Fn*` value, a fn pointer: check rejects
+    /// other written lifetimes there, L0203): each elided input slot is a
+    /// fresh region of this call that the argument outlives, a `'static`
+    /// one is `'static`, and each elided output slot is the one input
     /// slot's (elision; L0202 otherwise). False when the shapes do not
     /// pair or the output is not the one input's (the caller's rule then).
     fn call_late_bound(&mut self, ins: &[Ty], out: Ty, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
@@ -2482,7 +2492,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let mut slots: Vec<u32> = Vec::new();
         for (i, &it) in ins.iter().enumerate() {
             let (at, av) = &avs[i];
-            let pv: Vec<u32> = (0..self.sc.slots(it)).map(|_| self.fresh()).collect();
+            let pv: Vec<u32> = self.sig_slot_regions(it).into_iter().map(|r| if r == Region::Static { 0 } else { self.fresh() }).collect();
             if !av.is_empty() && !self.relate(*at, av, it, &pv, Variance::Co) {
                 return false;
             }
@@ -2491,8 +2501,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if dv.is_empty() {
             return true;
         }
-        let [one] = slots[..] else { return false };
-        let rv = vec![one; self.sc.slots(out) as usize];
+        let outs = self.sig_slot_regions(out);
+        let one = if let [one] = slots[..] { Some(one) } else { None };
+        let Some(rv) = outs.iter().map(|&r| if r == Region::Static { Some(0) } else { one }).collect::<Option<Vec<u32>>>() else { return false };
         self.relate(out, &rv, dt, dv, Variance::Co)
     }
 
@@ -2511,9 +2522,31 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         match self.body.tys.kind(src) {
             TyKind::Closure(def, args) => {
                 let Some(c) = p.gx.closures.get(&def) else { return };
-                if closure_arg_slots(&mut self.sc, c).is_ok_and(|v| v.iter().any(|(r, _)| r.is_some())) {
-                    self.not_general_enough();
-                    return;
+                // A free argument slot (a `let` closure, a named or
+                // `'static` annotation, or the target's own `&'static`)
+                // takes one region: only where the target writes `'static`
+                // does it serve, and it is `'static` then.
+                let mut targets: Vec<Region> = Vec::new();
+                for &it in &ins {
+                    targets.extend(self.sig_slot_regions(it));
+                }
+                if let Ok(cs) = closure_arg_slots(&mut self.sc, c) {
+                    let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
+                    for (i, (r, link)) in cs.iter().enumerate() {
+                        if r.is_none() {
+                            continue;
+                        }
+                        if targets.get(i) != Some(&Region::Static) || cs.len() != targets.len() {
+                            self.not_general_enough();
+                            return;
+                        }
+                        if link.is_none()
+                            && let Some(&v) = vars.get(i)
+                        {
+                            self.edge(v, 0);
+                            self.edge(0, v);
+                        }
+                    }
                 }
                 if n_out == 0 {
                     return;
@@ -2664,6 +2697,15 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         // argument regions (its output), unless the callee's bounds give
         // its output every region (`output_tied`; then the signature
         // says what reaches the result).
+        // `Box::new(x)` and `Rc::new(x)` hold `x` itself: its slots are
+        // the result's, one to one (a closure's captures included).
+        if let CallTarget::Builtin(crate::check::Builtin::BoxNew | crate::check::Builtin::RcNew) = target
+            && let [(at, av)] = &avs[..]
+            && let Some(inner) = self.body.tys.smart_elem(dt)
+            && (av.is_empty() && dv.is_empty() || self.relate(*at, av, inner, &dv, Variance::Co))
+        {
+            return;
+        }
         let tied = match target {
             CallTarget::Fn(f) => self.output_tied(f, &avs),
             _ => Vec::new(),
@@ -4503,15 +4545,32 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if let Some(o) = f_out {
             regions_of(&p.tys, o, &mut f_out_regions);
         }
-        if f_out_regions.len() != n_out || (n_out > 0 && f_in_regions.len() != 1) {
+        // The target's slots: a written `'static` is `'static`, each
+        // elided input its own binder, an elided output the one input's.
+        let mut t_in: Vec<Region> = Vec::new();
+        for &it in ins {
+            t_in.extend(self.sig_slot_regions(it));
+        }
+        let t_out = self.sig_slot_regions(out);
+        let tside = |i: usize, r: Region| if r == Region::Static { Side::Tie(0) } else { Side::Binder(i as u32) };
+        let t_outs: Option<Vec<Side>> = t_out
+            .iter()
+            .map(|&r| match (r, &t_in[..]) {
+                (Region::Static, _) => Some(Side::Tie(0)),
+                (_, [one]) => Some(tside(0, *one)),
+                _ => None,
+            })
+            .collect();
+        let Some(t_outs) = t_outs else { return unproved(self) };
+        if f_out_regions.len() != n_out || t_in.len() != f_in_regions.len() {
             return unproved(self);
         }
         if item.is_none() && self.own.closure && f_in_regions.iter().chain(&f_out_regions).any(|r| matches!(r, Region::Param(_))) {
             return self.closure_param_bound_cut();
         }
         let mut sides = FnSides::new(item);
-        let ins: Vec<(Side, Side)> = f_in_regions.iter().enumerate().map(|(i, &r)| (Side::Binder(i as u32), sides.side(self, r, false))).collect();
-        let outs: Vec<(Side, Side)> = f_out_regions.iter().map(|&r| (Side::Binder(0), sides.side(self, r, true))).collect();
+        let ins: Vec<(Side, Side)> = t_in.iter().zip(&f_in_regions).enumerate().map(|(i, (&t, &r))| (tside(i, t), sides.side(self, r, false))).collect();
+        let outs: Vec<(Side, Side)> = t_outs.into_iter().zip(&f_out_regions).map(|(t, &r)| (t, sides.side(self, r, true))).collect();
         self.match_fn_sides(&ins, &outs);
     }
 
@@ -5524,16 +5583,31 @@ pub(super) fn fn_item_coercions(p: &Program, body: &Body) -> Vec<Diag> {
                 ));
                 continue;
             }
-            // A fn pointer type names no lifetime (each is its own,
-            // late-bound), so an input that must be `'static` is less
-            // general than the pointer (rustc E0308; W-CHECK-G).
-            if sig.is_some_and(|s| {
-                let mut rs: Vec<Region> = Vec::new();
-                for &t in &s.params {
-                    regions_of(&p.tys, t, &mut rs);
+            // A fn pointer type's regions are its own (late-bound) or a
+            // written `&'static` (`Scope::static_refs`): an input the fn
+            // needs `'static` where the pointer takes any is less general
+            // than the pointer, and so is an output the pointer promises
+            // `'static` where the fn returns a borrow (rustc E0308).
+            let TyKind::FnPtr(ps) = body.tys.kind(*ty) else { continue };
+            let ps = body.tys.sig(ps).value;
+            let (p_ins, p_out) = (body.tys.tys_of(ps.inputs).to_vec(), ps.output);
+            let (mut ins, mut outs) = (Vec::new(), Vec::new());
+            if let Some(s) = sig {
+                for (&it, &pt) in s.params.iter().zip(&p_ins) {
+                    ptr_region_pairs(&p.tys, &body.tys, it, pt, &mut ins);
                 }
-                rs.contains(&Region::Static)
-            }) {
+                ptr_region_pairs(&p.tys, &body.tys, s.ret, p_out, &mut outs);
+            }
+            if outs.iter().any(|&(f, t)| t == Region::Static && f != Region::Static) {
+                out.push(Diag::new(
+                    "L0110",
+                    s.span,
+                    format!("`{}` returns a borrow of its argument, so it cannot become a fn pointer that returns `'static`", p.display_name(p.fn_info(*f).name)),
+                    "Return `'static` data from the fn, or elide the pointer's output lifetime.",
+                ));
+                continue;
+            }
+            if ins.iter().any(|&(f, t)| f == Region::Static && t != Region::Static) {
                 out.push(Diag::new(
                     "L0110",
                     s.span,
@@ -5547,6 +5621,41 @@ pub(super) fn fn_item_coercions(p: &Program, body: &Body) -> Vec<Diag> {
         }
     }
     out
+}
+
+/// The pairs of regions at the same places of a fn's regioned param or
+/// return type `f` (in `ftys`) and a fn pointer's erased one `t` (in
+/// `ptys`, `'static` kept where written): an Adt's lifetime slots pair
+/// with `Erased` (a fn pointer type writes none there).
+fn ptr_region_pairs(ftys: &impl TyIntern, ptys: &impl TyIntern, f: Ty, t: Ty, out: &mut Vec<(Region, Region)>) {
+    match (ftys.kind(f), ptys.kind(t)) {
+        (TyKind::Ref(a, _, fi), TyKind::Ref(b, _, ti)) => {
+            out.push((a, b));
+            ptr_region_pairs(ftys, ptys, fi, ti, out);
+        }
+        (TyKind::Adt(_, fa), TyKind::Adt(_, ta)) => {
+            let ta: Vec<Ty> = ptys.args(ta).iter().filter_map(|g| g.as_ty()).collect();
+            let mut tj = ta.into_iter();
+            for g in ftys.args(fa).to_vec() {
+                match g {
+                    GenericArg::Lifetime(r) => out.push((r, Region::Erased)),
+                    GenericArg::Ty(e) => {
+                        if let Some(te) = tj.next() {
+                            ptr_region_pairs(ftys, ptys, e, te, out);
+                        }
+                    }
+                    GenericArg::Const(_) => {}
+                }
+            }
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            for (x, y) in ftys.tys_of(a).to_vec().into_iter().zip(ptys.tys_of(b).to_vec()) {
+                ptr_region_pairs(ftys, ptys, x, y, out);
+            }
+        }
+        (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => ptr_region_pairs(ftys, ptys, x, y, out),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

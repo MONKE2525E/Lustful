@@ -834,6 +834,11 @@ pub struct Scope {
     /// `&[impl Tr]`, `Option<impl Tr>`): each node's synthetic type
     /// param (rustc APIT), set by `resolve_fn_sig`.
     pub apit: Vec<(ast::TyId, Ty)>,
+    /// W-BORROW: inside a fn pointer type or `dyn Fn*` sugar, a written
+    /// `&'static` keeps `Region::Static` even when regions erase, so the
+    /// borrow checker sees which slots of the signature are `'static`;
+    /// every other region there is elided, so late-bound.
+    pub static_refs: bool,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -1038,9 +1043,12 @@ fn keep_object_lifetime(
         return Ok(ty);
     }
     let written = lifetime.or_else(|| bounds.iter().find_map(|tb| if let TraitBound::Lifetime(lt) = tb { Some(*lt) } else { None }));
+    // With no written bound: the enclosing reference's lifetime, else
+    // `'static` in a signature, and inferred in a body annotation (rustc
+    // infers the default object lifetime inside expressions).
     let region = match written {
         Some(lt) => scope_region(interner, scope, Some(lt), span)?,
-        None => scope.obj_default.unwrap_or(Region::Static),
+        None => scope.obj_default.unwrap_or(if scope.annotation { Region::Erased } else { Region::Static }),
     };
     Ok(tys.intern(TyKind::Dyn(b, region)))
 }
@@ -1075,36 +1083,50 @@ fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) 
             _ => false,
         }),
         GenericArgs::Parenthesized { inputs, output } => {
-            inputs.iter().any(|&t| names_lifetime(ast, interner, t)) || output.is_some_and(|t| names_lifetime(ast, interner, t))
+            inputs.iter().any(|&t| names_lifetime_beyond_static_refs(ast, interner, t))
+                || output.is_some_and(|t| names_lifetime_beyond_static_refs(ast, interner, t))
         }
         _ => false,
     })
 }
 
+/// `names_lifetime` that lets `'static` on a reference pass (`&'static
+/// Message`): fn pointer types and `dyn Fn*` sugar keep it
+/// (`Scope::static_refs`). A `'static` lifetime arg of an Adt there still
+/// names a lifetime: erased Adts carry no lifetime args to keep it in.
+fn names_lifetime_beyond_static_refs(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    names_lifetime_with(ast, interner, id, true)
+}
+
 /// True when a written type names a lifetime other than `'_` anywhere
 /// (fn pointer types cannot carry one yet, W-BORROW).
 pub fn names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    names_lifetime_with(ast, interner, id, false)
+}
+
+/// `names_lifetime`; with `static_refs`, a `'static` written on a
+/// reference does not count (`names_lifetime_beyond_static_refs`).
+fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_refs: bool) -> bool {
     let named = |lt: &ast::Lifetime| interner.get(lt.name) != "_";
+    let go = |t: ast::TyId| names_lifetime_with(ast, interner, t, static_refs);
     let in_args = |args: &GenericArgs| match args {
         GenericArgs::Angle(a) => a.iter().any(|g| match g {
             AstArg::Lifetime(lt) => named(lt),
-            AstArg::Type(t) => names_lifetime(ast, interner, *t),
+            AstArg::Type(t) => go(*t),
             _ => false,
         }),
-        GenericArgs::Parenthesized { inputs, output } => {
-            inputs.iter().any(|&t| names_lifetime(ast, interner, t)) || output.is_some_and(|t| names_lifetime(ast, interner, t))
-        }
+        GenericArgs::Parenthesized { inputs, output } => inputs.iter().any(|&t| go(t)) || output.is_some_and(go),
         _ => false,
     };
     match ast.ty(id) {
-        TyExpr::Ref { lifetime, inner, .. } => lifetime.as_ref().is_some_and(named) || names_lifetime(ast, interner, *inner),
-        TyExpr::Tuple(elems) => elems.iter().any(|&e| names_lifetime(ast, interner, e)),
-        TyExpr::Paren(i) | TyExpr::Slice(i) => names_lifetime(ast, interner, *i),
-        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => names_lifetime(ast, interner, *inner),
-        TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
-        TyExpr::FnPtr { inputs, ret, .. } => {
-            inputs.iter().any(|p| names_lifetime(ast, interner, p.ty)) || ret.is_some_and(|r| names_lifetime(ast, interner, r))
+        TyExpr::Ref { lifetime, inner, .. } => {
+            lifetime.as_ref().is_some_and(|lt| named(lt) && !(static_refs && interner.get(lt.name) == "static")) || go(*inner)
         }
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| go(e)),
+        TyExpr::Paren(i) | TyExpr::Slice(i) => go(*i),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
+        TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
+        TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|p| go(p.ty)) || ret.is_some_and(go),
         TyExpr::Dyn { bounds, lifetime, .. } => {
             lifetime.as_ref().is_some_and(named)
                 || bounds.iter().any(|b| match b {
@@ -2006,6 +2028,7 @@ pub fn resolve_scoped(
                 Some(r) => r,
                 None => scope_region(interner, scope, *lifetime, span)?,
             };
+            let region = if scope.static_refs && lifetime.is_some_and(|lt| interner.get(lt.name) == "static") { Region::Static } else { region };
             Ok(if region == Region::Erased { tys.mk_ref(*mutable, inner) } else { tys.intern(TyKind::Ref(region, Mut::from_bool(*mutable), inner)) })
         }
         TyExpr::Tuple(elems) => {
@@ -2053,17 +2076,18 @@ pub fn resolve_scoped(
             // A fn pointer's elided lifetimes are its own (late-bound); a
             // named or `'static` one would need regions in fn pointer types,
             // which lust does not track yet (W-BORROW increment 5).
-            if names_lifetime(ast, interner, id) {
+            if names_lifetime_beyond_static_refs(ast, interner, id) {
                 return Err(Diag::new(
                     "L0203",
                     span,
-                    "lifetimes in function pointer types are not supported yet",
+                    "lifetimes in function pointer types are not supported yet (only `&'static`)",
                     "Elide the lifetimes (`fn(&T) -> &U`), or use a generic `F: Fn(&T) -> &U` parameter.",
                 ));
             }
             let in_tys: Vec<ast::TyId> = inputs.iter().map(|p| p.ty).collect();
             sugar_elision(ast, interner, known, cx, tys, scope, &in_tys, *ret)?;
-            let erased = scope.erased();
+            let mut erased = scope.erased();
+            erased.static_refs = true;
             let scope = &erased;
             let mut ins = Vec::with_capacity(inputs.len());
             for p in inputs {
@@ -2252,7 +2276,9 @@ fn resolve_dyn(
                 if fn_family && !matches!(seg.args, GenericArgs::Parenthesized { .. }) {
                     return Err(dyn_not_yet(span, "a `dyn` Fn trait without the `Fn(..) -> R` form"));
                 }
-                let tr = resolve_trait_path_args(ast, interner, known, cx, tys, scope, trait_def, seg, DYN_SELF, span)?;
+                let mut fs = scope.clone();
+                fs.static_refs = fn_family;
+                let tr = resolve_trait_path_args(ast, interner, known, cx, tys, &fs, trait_def, seg, DYN_SELF, span)?;
                 // The `Fn(..) -> R` sugar binds `Output`; other bindings
                 // are not supported yet.
                 if !fn_family && !tys.bindings(tr.bindings).is_empty() {

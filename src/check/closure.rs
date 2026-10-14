@@ -195,6 +195,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         inputs.map(|i| (i, output))
     }
 
+    /// True when `t` has a `'static` reference region (kept only inside fn
+    /// pointer types and `dyn Fn*` sugar, `Scope::static_refs`).
+    fn has_static_region(&mut self, t: Ty) -> bool {
+        let t = self.deep(t);
+        let mut rs = Vec::new();
+        crate::borrowck::regions_of(&self.tys, t, &mut rs);
+        rs.contains(&Region::Static)
+    }
+
     /// `t` with every region `Region::Bound(0)`, Adt lifetime args
     /// included: the output of a `dyn Fn` signature, whose regions are all
     /// the one input region's (`ClosureInfo::bound_output`).
@@ -365,7 +374,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // An unnamed annotation that does not resolve here (`Vec<_>`)
             // counts as unannotated: free, as rustc infers `_`.
             let elided = if no_sig { Region::Bound(0) } else { Region::Erased };
-            input_regions.push(if named || no_sig { prm.ty.and_then(|w| self.regioned_annotation(w, elided, named)) } else { None });
+            // W-BORROW: a `&'static` the expected fn pointer or `dyn Fn` type
+            // writes (`Scope::static_refs`) is that argument's, as if
+            // annotated: free in the body, `'static` from the creator.
+            let from_sig = exp.filter(|&x| (dyn_out.is_some() || to_fn_ptr.is_some()) && prm.ty.is_none() && self.has_static_region(x));
+            input_regions.push(if named || no_sig { prm.ty.and_then(|w| self.regioned_annotation(w, elided, named)) } else { from_sig });
             let t = match (prm.ty, exp) {
                 (Some(w), exp) => {
                     let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
@@ -415,7 +428,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 t
             }
-            (None, Some(x)) => x,
+            (None, Some(x)) => {
+                // W-BORROW: a `&'static` the expected fn pointer or `dyn Fn`
+                // output writes pins that slot, as a `'static` return
+                // annotation does.
+                if (dyn_out.is_some() || to_fn_ptr.is_some()) && self.has_static_region(x) {
+                    output_region = Some(self.deep(x));
+                }
+                x
+            }
             (None, None) => self.new_var(false),
         };
         // The body: a new frame for `return`, and no outer loop labels.

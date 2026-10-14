@@ -3833,6 +3833,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// either, so both are L0705.
     fn dyn_regions(&mut self, found: Ty, expected: Ty, invariant: bool, span: Span) {
         let (f, e) = (self.deep(found), self.deep(expected));
+        // A dyn type's principal args do not reach the type flags, so the
+        // signature check runs first.
+        if let Some(why) = self.sig_static_mismatch(f, e, invariant, 0) {
+            self.err("L0110", span, why, "Write `&'static` in both types, or elide it in both.");
+            return;
+        }
         if !self.tys.flags(f).contains_static_region() && !self.tys.flags(e).contains_static_region() {
             return;
         }
@@ -3879,10 +3885,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             (TyKind::Ref(rf, _, xf), TyKind::Ref(re, me, xe)) => {
-                if re == Region::Static && rf != Region::Static {
+                // Only `&'static dyn Tr` is checked here; a `&'static` in a
+                // fn pointer type or `dyn Fn` sugar (`Scope::static_refs`)
+                // is the borrow checker's.
+                let to_dyn = matches!(self.tys.kind(xe), TyKind::Dyn(..));
+                if to_dyn && re == Region::Static && rf != Region::Static {
                     return Some(format!("lust cannot prove that this reference lives for `'static`, which `{}` requires", self.tn(e)));
                 }
-                if rf == Region::Static && re != Region::Static && invariant {
+                if to_dyn && rf == Region::Static && re != Region::Static && invariant {
                     return Some(format!("`{}` and `{}` must have the same lifetime here, and lust cannot prove that", self.tn(f), self.tn(e)));
                 }
                 self.region_walk(xf, xe, invariant || me.is_mut(), need_static, depth + 1)
@@ -3914,6 +3924,92 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if df == de =>
             {
                 self.args_walk(af, ae, true, need_static, depth)
+            }
+            _ => None,
+        }
+    }
+
+    /// W-BORROW: a fn pointer type or `dyn Fn*` sugar may write `&'static`
+    /// (`Scope::static_refs`); every other region there is late-bound.
+    /// `found` fits `expected` only when it is at least as general: no
+    /// `'static` input where `expected` takes any lifetime, and no
+    /// late-bound output where `expected` returns `'static` (rustc E0308;
+    /// under `invariant`, the two must agree). Walks two unified types in
+    /// parallel to the signatures in them.
+    fn sig_static_mismatch(&mut self, f: Ty, e: Ty, invariant: bool, depth: u32) -> Option<String> {
+        if f == e || depth > object::LIFETIME_WALK_LIMIT {
+            return None;
+        }
+        let sigs = |this: &mut Self, t: Ty| -> Option<(Vec<Ty>, Ty)> {
+            match this.tys.kind(t) {
+                TyKind::FnPtr(s) => {
+                    let s = this.tys.sig(s).value;
+                    Some((this.tys.tys_of(s.inputs).to_vec(), s.output))
+                }
+                TyKind::Dyn(..) => {
+                    let (_, tuple, out) = this.dyn_fn_parts(t)?;
+                    let ins = match this.tys.kind(tuple) {
+                        TyKind::Tuple(ts) => this.tys.tys_of(ts).to_vec(),
+                        _ => Vec::new(),
+                    };
+                    Some((ins, out))
+                }
+                _ => None,
+            }
+        };
+        if let (Some((fi, fo)), Some((ei, eo))) = (sigs(self, f), sigs(self, e)) {
+            for (x, y) in fi.into_iter().zip(ei) {
+                if let Some(why) = self.sig_pos_mismatch(x, y, true, invariant, f, e) {
+                    return Some(why);
+                }
+            }
+            return self.sig_pos_mismatch(fo, eo, false, invariant, f, e);
+        }
+        match (self.tys.kind(f), self.tys.kind(e)) {
+            (TyKind::Ref(_, _, x), TyKind::Ref(_, m, y)) | (TyKind::RawPtr(_, x), TyKind::RawPtr(m, y)) => {
+                self.sig_static_mismatch(x, y, invariant || m.is_mut(), depth + 1)
+            }
+            (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => self.sig_static_mismatch(x, y, invariant, depth + 1),
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (a, b) = (self.tys.tys_of(a).to_vec(), self.tys.tys_of(b).to_vec());
+                a.into_iter().zip(b).find_map(|(x, y)| self.sig_static_mismatch(x, y, invariant, depth + 1))
+            }
+            (TyKind::Adt(df, af), TyKind::Adt(de, ae)) if df == de => {
+                let covariant = matches!(self.tys.builtin_of(f), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc));
+                let (a, b) = (self.tys.args(af).to_vec(), self.tys.args(ae).to_vec());
+                a.into_iter().zip(b).find_map(|(x, y)| match (x.as_ty(), y.as_ty()) {
+                    (Some(x), Some(y)) => self.sig_static_mismatch(x, y, invariant || !covariant, depth + 1),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// One input (`input`) or the output of two signatures in parallel
+    /// (`sig_static_mismatch`): their `&'static` and late-bound
+    /// references, place by place.
+    fn sig_pos_mismatch(&mut self, x: Ty, y: Ty, input: bool, invariant: bool, f: Ty, e: Ty) -> Option<String> {
+        match (self.tys.kind(x), self.tys.kind(y)) {
+            (TyKind::Ref(rx, _, xi), TyKind::Ref(ry, _, yi)) => {
+                let (sx, sy) = (rx == Region::Static, ry == Region::Static);
+                let bad = if invariant { sx != sy } else if input { sx && !sy } else { sy && !sx };
+                if bad {
+                    return Some(format!("`{}` is not as general as `{}`: their `'static` references differ", self.tn(f), self.tn(e)));
+                }
+                self.sig_pos_mismatch(xi, yi, input, invariant, f, e)
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (a, b) = (self.tys.tys_of(a).to_vec(), self.tys.tys_of(b).to_vec());
+                a.into_iter().zip(b).find_map(|(p, q)| self.sig_pos_mismatch(p, q, input, invariant, f, e))
+            }
+            (TyKind::Slice(p), TyKind::Slice(q)) | (TyKind::Array(p, _), TyKind::Array(q, _)) => self.sig_pos_mismatch(p, q, input, invariant, f, e),
+            (TyKind::Adt(dx, ax), TyKind::Adt(dy, ay)) if dx == dy => {
+                let (a, b) = (self.tys.args(ax).to_vec(), self.tys.args(ay).to_vec());
+                a.into_iter().zip(b).find_map(|(p, q)| match (p.as_ty(), q.as_ty()) {
+                    (Some(p), Some(q)) => self.sig_pos_mismatch(p, q, input, true, f, e),
+                    _ => None,
+                })
             }
             _ => None,
         }
@@ -4108,6 +4204,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             };
             if !auto_ok || !path_ok {
                 self.mismatch(span, expected, found);
+                return None;
+            }
+            // W-BORROW: `dyn Fn(&'static T)` is not as general as `dyn
+            // Fn(&T)` (rustc E0308; `sig_static_mismatch`).
+            if from.def == to.def
+                && let Some(why) = self.sig_static_mismatch(x, y, false, 0)
+            {
+                self.err("L0110", span, why, "Write `&'static` in both types, or elide it in both.");
                 return None;
             }
             if to_static && !object::dyn_is_static(p, &self.tys, x) {

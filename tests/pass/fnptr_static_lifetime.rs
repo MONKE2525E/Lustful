@@ -1,5 +1,5 @@
-// expect: L0203
-// Valid Rust: lust does not track lifetimes in fn pointer types yet (W-BORROW).
+// A `&'static` written in a fn pointer type: the call passes a `'static`
+// borrow, and a fn that takes any lifetime coerces to the pointer.
 fn apply(f: fn(&'static str) -> usize) -> usize {
     f("abc")
 }
