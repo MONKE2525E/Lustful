@@ -1,4 +1,6 @@
-// `std::process`: process exit (docs/ARCH.md section 3.1).
+// The `process` module of std: process exit (docs/ARCH.md section 3.1). Its
+// text is spliced into user source, so it names no `std::` platform module
+// path: the platform crate scan (`mentions_std_platform`) would load for it.
 //
 // Lust std source. The std loader (src/stdload.rs) parses and checks this
 // file as part of the shipped `std` crate, then splices its fns into a
