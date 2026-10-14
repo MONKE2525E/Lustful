@@ -4286,7 +4286,10 @@ impl Rewrite<'_> {
             for p in &def.params {
                 match p.pat {
                     Some(pat) => self.pat_bindings(ast, pat, &mut frame.locals),
-                    None => frame.locals.push(p.name),
+                    None => {
+                        self.binding_over_block_import(p.name, !p.mutable, p.span, &scopes);
+                        frame.locals.push(p.name);
+                    }
                 }
             }
             scopes.push(frame);
@@ -5353,6 +5356,21 @@ impl Rewrite<'_> {
             && (scopes.iter().any(|f| f.std_mod_glob) || self.tables.has_std_glob(module, true, self.interner))
     }
 
+    /// rustc E0530 for a binding over a static or const that a block's
+    /// `use` brings in: no binding may shadow a static, and only a plain
+    /// binding may name a const (as its path pattern). The checker sees
+    /// module imports and block items, but not block imports.
+    fn binding_over_block_import(&mut self, name: Sym, plain: bool, span: Span, scopes: &[Frame]) {
+        let Some(FrameHit::Import(LocalBind::Target(Target::Def(def)))) = self.frame_hit(&[name], Namespace::Value, scopes) else { return };
+        let what = match self.tables.def_info.get(&def).map(|i| i.kind) {
+            Some(ResKind::Static) => "statics",
+            Some(ResKind::Const) if !plain => "constants",
+            _ => return,
+        };
+        let n = self.interner.get(name);
+        self.diags.push(Diag::new("L0110", span, format!("bindings cannot shadow {what}"), format!("Rename the binding: `{n}` names an item here.")));
+    }
+
     /// Rewrites one pattern's paths.
     fn pat(&mut self, ast: &mut Ast, id: PatId, module: ModuleId, scopes: &[Frame]) {
         let span = ast.pat_span(id);
@@ -5361,6 +5379,7 @@ impl Rewrite<'_> {
                 if self.binding_under_std_glob(name, module, scopes) {
                     self.diags.push(crate::resolve::imports::std_glob_name_diag(self.interner.get(name), span));
                 }
+                self.binding_over_block_import(name, !mutable && !by_ref, span, scopes);
                 let replacement = if !mutable && !by_ref { self.binding_pat(name, span, module, scopes) } else { None };
                 ast.pats[id.0 as usize] = replacement.unwrap_or(Pat::Binding { name, mutable, by_ref });
             }
@@ -5405,7 +5424,12 @@ impl Rewrite<'_> {
                             self.expr(ast, *e, module, &mut sc);
                         }
                     }
-                    Pat::At { inner, .. } | Pat::Ref { inner, .. } | Pat::Paren(inner) => {
+                    Pat::At { inner, name, .. } => {
+                        let (inner, name) = (*inner, *name);
+                        self.binding_over_block_import(name, false, span, scopes);
+                        self.pat(ast, inner, module, scopes);
+                    }
+                    Pat::Ref { inner, .. } | Pat::Paren(inner) => {
                         let inner = *inner;
                         self.pat(ast, inner, module, scopes);
                     }
