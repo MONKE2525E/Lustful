@@ -1609,6 +1609,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// The tuple struct a value binding names as a constructor, if it names one.
     fn tuple_struct_ctor(&mut self, name: Sym) -> Option<AdtId> {
+        // `Self(..)` in an impl of a tuple struct (its args are the
+        // impl's, see `self_path_args`).
+        if name == self.p.known.self_type {
+            return self.self_adt().filter(|&a| !self.p.adt(a).is_enum && self.p.adt(a).variants[0].shape == VariantShape::Tuple);
+        }
         match self.binding(Namespace::Value, name) {
             BindingRes::Def(def) => match self.p.adt_by_def(def) {
                 Some(a) if !self.p.adt(a).is_enum && self.p.adt(a).variants[0].shape == VariantShape::Tuple => Some(a),
@@ -1894,6 +1899,55 @@ impl<'p, 'a> Ctx<'p, 'a> {
             .collect()
     }
 
+    /// The user Adt and args a non-generic type alias names (`type EA =
+    /// E<u8>;`): value paths and patterns through the alias (`EA::A(3)`,
+    /// `SA { .. }`) build or match that Adt at those args. None when
+    /// `name` is not such an alias.
+    fn alias_adt(&mut self, name: Sym) -> Option<(AdtId, Vec<GenericArg>)> {
+        let p = self.p;
+        if p.aliases.is_empty() {
+            return None;
+        }
+        let flat = match self.binding(Namespace::Type, name) {
+            BindingRes::Def(def) => p.resolved.as_ref().and_then(|t| t.def_info.get(&def)).map_or(name, |i| i.flat),
+            _ => name,
+        };
+        let &t = p.aliases.get(&flat)?;
+        let (d, args) = p.tys.adt_parts(t)?;
+        let a = p.adt_by_def(d)?;
+        Some((a, p.tys.args(args).to_vec()))
+    }
+
+    /// The args of a value path through `Self` (`Self::V(..)`, `Self {
+    /// .. }`, `Self(..)`, `Self::N` in patterns too): `Self` names the
+    /// impl's Self type with its own args, never a fresh application of
+    /// the Adt (rustc E0308 for `Self::V(5u16)` in `impl<T> G<T>`).
+    /// None when the path's type segment is not `Self` or `Self` is not
+    /// an application of `a`.
+    fn self_path_args(&mut self, a: AdtId, segs: &[ast::PathSeg], span: Span) -> Option<Vec<GenericArg>> {
+        let p = self.p;
+        let ty_seg = &segs[segs.len().saturating_sub(2)];
+        if ty_seg.name != p.known.self_type {
+            return None;
+        }
+        let st = self.resolve(self.body_scope.self_ty?);
+        let (d, args) = self.tys.adt_parts(st)?;
+        if d != p.def_of_adt(a) {
+            return None;
+        }
+        let args = self.tys.args(args).to_vec();
+        if segs.iter().any(|s| s.has_args()) {
+            self.err(
+                "L0110",
+                span,
+                "type arguments are not allowed on a path through `Self`",
+                "Remove the `::<..>` part: `Self` already names the impl's type with its arguments.",
+            );
+            return Some(self.error_args(&p.gx.adt_generics[a.0 as usize].clone()));
+        }
+        Some(args)
+    }
+
     /// The generic args of a value path that names user Adt `a` (a
     /// struct, or an enum through one of its variants): args written on
     /// the type segment or the variant segment, with the defaults of
@@ -1901,6 +1955,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// fresh variable, as rustc infers them there (defaults never apply).
     fn value_path_args(&mut self, a: AdtId, segs: &[ast::PathSeg], span: Span) -> Vec<GenericArg> {
         let p = self.p;
+        if let Some(args) = self.self_path_args(a, segs, span) {
+            return args;
+        }
+        // A path through an alias of a generic Adt (`type EA = E<u8>;
+        // EA::A(3)`) builds the Adt at the alias's args.
+        if let Some((aa, args)) = self.alias_adt(segs[segs.len().saturating_sub(2)].name)
+            && p.def_of_adt(aa) == p.def_of_adt(a)
+            && !args.is_empty()
+        {
+            if segs.iter().any(|s| s.has_args()) {
+                self.err("L0105", span, "this type alias takes no generic arguments", "Remove the `::<..>` part.");
+                return self.error_args(&p.gx.adt_generics[a.0 as usize].clone());
+            }
+            return args;
+        }
         let generics = p.gx.adt_generics[a.0 as usize].clone();
         let n = segs.len();
         let written_on: Vec<&ast::PathSeg> = segs[n.saturating_sub(2)..].iter().filter(|s| s.has_args()).collect();
@@ -4331,6 +4400,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.coerce_expr(*els, t2, d);
                             return d;
                         }
+                        if expected.is_none()
+                            && let Some(tail) = p.ast.block(*then).tail
+                            && self.lub_flip(&[tail], t1, t2)
+                        {
+                            return t2;
+                        }
                         self.join(t1, t2, Some(*els), span)
                     }
                 }
@@ -4355,6 +4430,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
                             return d;
+                        }
+                        if expected.is_none()
+                            && let Some(tail) = p.ast.block(*then).tail
+                            && self.lub_flip(&[tail], t1, t2)
+                        {
+                            return t2;
                         }
                         self.join(t1, t2, Some(*els), span)
                     }
@@ -4410,6 +4491,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // ARCH 2.12 run point: a match must know the scrutinee enum.
                 self.run_obligations(false);
                 let mut result: Option<Ty> = None;
+                let mut sites: Vec<ExprId> = Vec::new();
                 for arm in arms {
                     let scope = self.scopes.len();
                     self.pattern(arm.pat, st, true);
@@ -4435,8 +4517,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     result = Some(match result {
                         None => bt,
+                        Some(r) if expected.is_none() && self.lub_flip(&sites, r, bt) => bt,
                         Some(r) => self.join(r, bt, Some(arm.body), self.span(arm.body)),
                     });
+                    sites.push(arm.body);
                     self.scopes.truncate(scope);
                 }
                 self.exhaustive(st, arms, span);
@@ -4979,8 +5063,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
                             return self.tys.intern(TyKind::Array(fp, c));
                         }
-                        for &el_e in &elems[1..] {
-                            self.expect_expr(el_e, el);
+                        let mut el = el;
+                        for (i, &el_e) in elems.iter().enumerate().skip(1) {
+                            let t = self.expr(el_e, Some(el));
+                            if self.lub_flip(&elems[..i], el, t) {
+                                el = t;
+                            } else {
+                                self.coerce_expr(el_e, t, el);
+                            }
                         }
                         el
                     }
@@ -5367,6 +5457,56 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// rustc's LUB fallback (CoerceMany): when the new site's type `new`
+    /// cannot coerce to `prev`, the type of the earlier sites, but `prev`
+    /// coerces to `new` (`[&&d, &d]`, or `match n { 0 => &[], _ => v }`
+    /// with `v: &[u8]`), and no earlier site carries a coercion yet, the
+    /// earlier sites coerce to `new`. True when it applied them; the
+    /// caller then takes `new` as the joined type. The tests are pure,
+    /// so a false answer leaves the usual coercion (and its error).
+    fn lub_flip(&mut self, prev: &[ExprId], prev_ty: Ty, new: Ty) -> bool {
+        if prev.is_empty() || self.kind(prev_ty) == TyKind::Never || self.kind(new) == TyKind::Never {
+            return false;
+        }
+        if self.pure_coercible(new, prev_ty) || !self.pure_coercible(prev_ty, new) {
+            return false;
+        }
+        if prev.iter().any(|&s| self.out.coerce[self.ei(s)] != Coerce::None) {
+            return false;
+        }
+        for &s in prev {
+            let t = self.out.expr_ty[self.ei(s)];
+            if self.kind(t) != TyKind::Never {
+                self.coerce_expr(s, t, new);
+            }
+        }
+        true
+    }
+
+    /// True when `coerce_at` may take `f` to `e`: the types match up to
+    /// inference variables, or a reference coercion applies (slice and
+    /// `str` unsizing, `&mut` to `&`, deref of extra reference layers),
+    /// or `e` is a dyn reference (an unsizing site). Pure.
+    fn pure_coercible(&self, f: Ty, e: Ty) -> bool {
+        if self.ty_matchish(f, e) || self.ref_coercible(f, e) {
+            return true;
+        }
+        let (TyKind::Ref(..), TyKind::Ref(_, em, y)) = (self.kind(f), self.kind(e)) else { return false };
+        if matches!(self.kind(y), TyKind::Dyn(..)) {
+            return true;
+        }
+        let mut t = f;
+        while let TyKind::Ref(_, _, inner) = self.kind(t)
+            && matches!(self.kind(inner), TyKind::Ref(..))
+        {
+            t = inner;
+            if !em.is_mut() && self.ty_matchish(t, e) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Joins the types of two branches. A diverging branch takes the other branch's type.
     fn join(&mut self, a: Ty, b: Ty, be: Option<ExprId>, span: Span) -> Ty {
         if self.kind(a) == TyKind::Never {
@@ -5575,6 +5715,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return None;
         };
+        // A path through `Self` names the impl's own type.
+        if let Some(args) = self.self_path_args(a, segs, span)
+            && !args.is_empty()
+        {
+            let st = self.tys.mk_adt(p.def_of_adt(a), &args);
+            if !self.unify(st, want) {
+                self.mismatch(span, want, st);
+                return None;
+            }
+        }
         let dt = self.deep(want);
         let scrut_args: Vec<GenericArg> = match self.tys.adt_parts(dt) {
             Some((d, aa)) if d == p.def_of_adt(a) => self.tys.args(aa).to_vec(),
@@ -6195,6 +6345,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // One value-namespace binding read covers the fn and constructor
             // cases below. The prelude `None` keeps its place between them,
             // as before: it is a prelude name, not a module binding.
+            // `Self` as a value in an impl of a unit or tuple struct: the
+            // unit value or the constructor, at the impl's own args.
+            if name == p.known.self_type
+                && let Some(a) = self.self_adt()
+                && !p.adt(a).is_enum
+            {
+                match p.adt(a).variants[0].shape {
+                    VariantShape::Unit => {
+                        self.set_res(e, Res::Variant(a, 0));
+                        return match self.self_path_args(a, segs, span) {
+                            Some(args) if !args.is_empty() => self.tys.mk_adt(p.def_of_adt(a), &args),
+                            _ => self.tys.adt_ty(a),
+                        };
+                    }
+                    VariantShape::Tuple => {
+                        // In an instance `Self` names a materialized Adt;
+                        // the constructor item is the template's, at the
+                        // instance's args.
+                        let a = match p.gx.adt_instance_of.get(a.0 as usize).copied().flatten() {
+                            Some((def, _)) => p.adt_by_def(def).unwrap_or(a),
+                            None => a,
+                        };
+                        self.set_res(e, Res::Variant(a, 0));
+                        return self.ctor_value_ty(e, a, 0, span);
+                    }
+                    VariantShape::Named => {}
+                }
+            }
             let bound = self.binding(Namespace::Value, name);
             if let BindingRes::Def(def) = bound
                 && p.binding_kind(def) == Some(DefsKind::Fn)
@@ -6723,6 +6901,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => None,
             }
         };
+        // A type alias of a user Adt (`EA::A(3)`, `SA::new()`).
+        let adt = adt.or_else(|| self.alias_adt(ty_name).map(|(a, _)| a));
         let Some(a) = adt else {
             self.err(
                 "L0101",
@@ -10233,6 +10413,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.binding(Namespace::Type, n);
             }
             let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+            let a = a.or_else(|| self.alias_adt(n).map(|(a, _)| a));
             match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32)) {
                 Some(v) => Some(v),
                 // An imported struct-like variant (`use E::*; C { .. }`).
@@ -11740,6 +11921,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.binding(Namespace::Type, n);
                     }
                     let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+                    // A struct pattern through a type alias (`SA { a }`);
+                    // tuple-struct and unit patterns need the value
+                    // namespace, which an alias does not fill (rustc E0532).
+                    let a = match p.ast.pat(pat) {
+                        Pat::Struct { .. } => a.or_else(|| self.alias_adt(n).map(|(a, _)| a)),
+                        _ => a,
+                    };
                     match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0)) {
                         Some(v) => Some(v),
                         // An imported variant in a tuple or struct pattern
@@ -11763,9 +11951,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0102", span, "unknown struct or variant in pattern", "Check the name.");
                     return;
                 };
-                // Written args on the pattern's path (`E::<u8>::A(x)`) must
-                // name the scrutinee's own type.
-                if segs[segs.len().saturating_sub(2)..].iter().any(|s| s.has_args()) && !p.gx.adt_generics[a.0 as usize].params.is_empty() {
+                // Written args on the pattern's path (`E::<u8>::A(x)`), and
+                // a path through `Self` (the impl's own args), must name
+                // the scrutinee's own type.
+                let ty_seg = segs[segs.len().saturating_sub(2)].name;
+                let via_self = ty_seg == p.known.self_type;
+                let via_alias = self.alias_adt(ty_seg).is_some_and(|(_, args)| !args.is_empty());
+                if (via_self || via_alias || segs[segs.len().saturating_sub(2)..].iter().any(|s| s.has_args()))
+                    && !p.gx.adt_generics[a.0 as usize].params.is_empty()
+                {
                     let written = self.value_path_args(a, segs, span);
                     let wt = self.tys.mk_adt(p.def_of_adt(a), &written);
                     if !self.unify(wt, t) {
@@ -11828,7 +12022,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                     Pat::Struct { fields, rest, .. } => {
-                        if variant.shape != VariantShape::Named {
+                        // Braces fit every shape, as in rustc: `U {}` for a
+                        // unit struct, `P { 0: x, .. }` for a tuple struct.
+                        if variant.shape == VariantShape::Unit && !fields.is_empty() {
                             self.err("L0110", span, "this variant does not have named fields", "Use the tuple form.");
                             return;
                         }
@@ -12615,6 +12811,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn irrefutable(&self, pat: PatId) -> bool {
         let p = self.p;
+        // A struct, or an enum with one variant (rustc: exhaustive).
+        let one_variant = |a: AdtId| !p.adt(a).is_enum || p.adt(a).variants.len() == 1;
         if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_) | PatRes::Res(_)) {
             return false;
         }
@@ -12624,23 +12822,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // that resolved to a unit struct cannot.
             Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
                 PatRes::ConstItem(_) => false,
-                PatRes::Variant(a, _) => !p.adt(a).is_enum,
+                PatRes::Variant(a, _) => one_variant(a),
                 _ if self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_some() => false,
                 _ => true,
             },
             Pat::Or(alts) => alts.iter().any(|&a| self.irrefutable(a)),
             Pat::Struct { fields, .. } => {
-                matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
+                matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
                     && fields.iter().all(|&(_, s)| self.irrefutable(s))
             }
             Pat::TupleStruct { elems, .. } => {
-                matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
+                matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
                     && elems.iter().all(|&s| self.irrefutable(s))
             }
             Pat::Path(_) => {
                 self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_none()
                     && !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_))
-                    && matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if !p.adt(a).is_enum)
+                    && matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
             }
             Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
             Pat::Ref { inner, .. } => self.irrefutable(*inner),
