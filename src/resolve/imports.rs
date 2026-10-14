@@ -1249,17 +1249,26 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
 /// duplicate rules as a local explicit import: a name already
 /// bound explicitly in the module (a local item, an earlier
 /// import, or an earlier std alias) reports `dup_diag` and the
-/// first binding keeps the name. `as _` binds no usable name and
-/// records nothing (a std trait's methods do not key on the name).
+/// first binding keeps the name. `as _` binds no usable name: it is
+/// stored under a synthetic name keyed by the path (never a
+/// duplicate), so a std trait imported that way is in scope for its
+/// methods (`use std::fmt::Write as _;` for `write!` into a String).
 fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], name: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> bool {
-    if interner.get(name) == "_" {
-        return false;
-    }
     let Some(namespaces) = std_import_namespaces(interner, path) else { return false };
+    let anon = interner.get(name) == "_";
+    let name = if anon {
+        let full: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        interner.intern(&format!("$lust$anon$std${}", full.join("::")))
+    } else {
+        name
+    };
     let mut dup = false;
     let mut inserted = false;
     for ns in namespaces {
         let key = (imp.module, ns_index(ns) as u8, name);
+        if anon && tables.std_aliases.contains_key(&key) {
+            continue;
+        }
         if explicit_exists(tables, imp, ns, name) || tables.std_aliases.contains_key(&key) {
             dup = true;
             continue;

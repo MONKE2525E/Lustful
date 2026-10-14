@@ -73,8 +73,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// True when this module imports the std trait `module::name` by a
-    /// `use` of its std path (`use std::fmt::Write;`, any rename). Globs
-    /// and `as _` imports do not count yet, which can only reject.
+    /// `use` of its std path at module level (`use std::fmt::Write;`,
+    /// any rename, `as _`). Globs and imports inside a fn body do not
+    /// count yet, which can only reject.
     pub(super) fn std_trait_imported(&self, module: &str, name: &str) -> bool {
         let p = self.p;
         let Some(res) = &p.resolved else { return false };
