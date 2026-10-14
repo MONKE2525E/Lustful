@@ -4785,6 +4785,28 @@ impl Rewrite<'_> {
     }
 
     /// Rewrites one expression subtree.
+    /// One `if`/`while` condition with `let`s: operands of `&&` in order,
+    /// each `let`'s scrutinee in the scopes so far, then a frame with its
+    /// bindings pushed for what follows (the caller pops them).
+    fn let_chain(&mut self, ast: &mut Ast, e: ExprId, module: ModuleId, scopes: &mut Vec<Frame>) {
+        match &ast.exprs[e.0 as usize] {
+            Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                let (lhs, rhs) = (*lhs, *rhs);
+                self.let_chain(ast, lhs, module, scopes);
+                self.let_chain(ast, rhs, module, scopes);
+            }
+            Expr::Let { pat, scrut } => {
+                let (pat, scrut) = (*pat, *scrut);
+                self.expr(ast, scrut, module, scopes);
+                self.pat(ast, pat, module, scopes);
+                let mut frame = Frame::default();
+                self.pat_bindings(ast, pat, &mut frame.locals);
+                scopes.push(frame);
+            }
+            _ => self.expr(ast, e, module, scopes),
+        }
+    }
+
     fn expr(&mut self, ast: &mut Ast, id: ExprId, module: ModuleId, scopes: &mut Vec<Frame>) {
         let span = ast.expr_span(id);
         // Nodes that carry a path are swapped out whole, rewritten, and
@@ -4808,6 +4830,51 @@ impl Rewrite<'_> {
                 self.expr(ast, u, module, scopes);
             }
             ast.exprs[id.0 as usize] = Expr::StructLit { path: segs, fields, update };
+            return;
+        }
+        // A closure's params scope over its body: all of them in one
+        // frame, pushed before the body (a param named like an item, such
+        // as an imported fn, resolved to the item before).
+        if let Expr::Closure { params, ret, body, .. } = &ast.exprs[id.0 as usize] {
+            let (pats, ret, body): (Vec<PatId>, Option<TyId>, ExprId) = (params.iter().map(|p| p.pat).collect(), *ret, *body);
+            if let Some(t) = ret {
+                self.ty(ast, t, module, scopes);
+            }
+            let mut frame = Frame::default();
+            for pat in pats {
+                self.pat(ast, pat, module, scopes);
+                self.pat_bindings(ast, pat, &mut frame.locals);
+            }
+            scopes.push(frame);
+            self.expr(ast, body, module, scopes);
+            scopes.pop();
+            return;
+        }
+        // `if let` and `while let` (let chains too): each `let` binds over
+        // the later conditions and the body, not the `else` branch (the
+        // bindings scoped over nothing before, so a body name like an
+        // imported fn resolved to the fn).
+        if let Expr::If { cond, then, els } = &ast.exprs[id.0 as usize]
+            && has_let(ast, *cond)
+        {
+            let (cond, then, els) = (*cond, *then, *els);
+            let depth = scopes.len();
+            self.let_chain(ast, cond, module, scopes);
+            self.block(ast, then, module, scopes);
+            scopes.truncate(depth);
+            if let Some(e) = els {
+                self.expr(ast, e, module, scopes);
+            }
+            return;
+        }
+        if let Expr::While { cond, body, .. } = &ast.exprs[id.0 as usize]
+            && has_let(ast, *cond)
+        {
+            let (cond, body) = (*cond, *body);
+            let depth = scopes.len();
+            self.let_chain(ast, cond, module, scopes);
+            self.block(ast, body, module, scopes);
+            scopes.truncate(depth);
             return;
         }
         match ast.exprs[id.0 as usize].kind_children() {
@@ -4835,6 +4902,16 @@ impl Rewrite<'_> {
                 }
             }
         }
+    }
+}
+
+/// True when an `if`/`while` condition holds a `let` (directly or in a
+/// `&&` chain).
+fn has_let(ast: &Ast, e: ExprId) -> bool {
+    match ast.expr(e) {
+        Expr::Let { .. } => true,
+        Expr::Binary { op: BinOp::And, lhs, rhs } => has_let(ast, *lhs) || has_let(ast, *rhs),
+        _ => false,
     }
 }
 
