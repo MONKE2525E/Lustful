@@ -7024,13 +7024,14 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
         };
         let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
         let record = p.gx.index.get(id).clone();
-        // The format site already proved the impl's where clauses (or
-        // reported L0612). `prove_goal` here is weaker than that proof
-        // for args with references (`W<&str>: Debug` fails it), and a
-        // skip made the glue print a structural Debug for a type with
-        // no derive: wrong output (W-STD-C). A selected written impl is
-        // the one to call.
-        if record.synthetic != Synthetic::None {
+        // An impl whose where clauses fail has no instance: a type that
+        // is never formatted (`VecDeque<D>` with `D: !Debug`) must not
+        // instantiate its `T: Debug` impl. `prove_goal` is weaker than
+        // the format site's proof for args holding references or
+        // closures (`W<&str>: Debug` fails it), and a skip there printed
+        // a structural Debug for a type with no derive (wrong output):
+        // for those, the selected written impl is called (W-STD-C).
+        if record.synthetic != Synthetic::None || !fmt_impl_bounds_hold(p, &record, &impl_args, tr, self_ty) {
             continue;
         }
         let Some(local) = record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "fmt"))
@@ -7048,6 +7049,49 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
             local
         };
         p.gx.fmt_methods.insert((adt, kind as u8), f);
+    }
+}
+
+/// True when a written fmt impl's where clauses hold for its selected
+/// args (`ensure_fmt_methods`). `Debug`/`Display` bounds ask the format
+/// site's own question (`has_debug`, `has_display`); `prove_goal` gives
+/// false negatives for tuples and references there. Other bounds take
+/// `prove_goal`, or hold when the args carry references or closures.
+fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplRecord, impl_args: &[GenericArg], tr: TraitRef, self_ty: Ty) -> bool {
+    let lang = p.gx.lang;
+    let mut other = false;
+    for pr in &record.generics.predicates {
+        let Predicate::Trait(b) = pr else {
+            other = true;
+            continue;
+        };
+        let d = b.value.def;
+        if d == lang.sized {
+            continue;
+        }
+        if d != lang.debug && d != lang.display {
+            other = true;
+            continue;
+        }
+        let Some(arg) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) else { return false };
+        let t = crate::ty::subst(&mut p.tys, arg, impl_args);
+        let ok = if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, t) } else { crate::check::collect::has_display(p, &p.tys, t) };
+        if !ok {
+            return false;
+        }
+    }
+    !other || prove_goal(p, &[], tr) || args_hold_refs(&p.tys, self_ty)
+}
+
+/// True when some type argument of `t` (at any depth) is a reference,
+/// raw pointer, or closure (`ensure_fmt_methods`).
+fn args_hold_refs(tys: &GlobalTys, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::Closure(..) => true,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| args_hold_refs(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => args_hold_refs(tys, e),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| args_hold_refs(tys, e))),
+        _ => false,
     }
 }
 
