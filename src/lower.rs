@@ -794,9 +794,20 @@ impl<'p, 'a> Lower<'p, 'a> {
             spine.push(cur);
             cur = *lhs;
         }
-        for &node in spine[1..].iter().rev() {
+        for i in (1..spine.len()).rev() {
+            let node = spine[i];
             let pl = Place::local(self.temp(self.ty(node)));
+            // The left side of `&&` or `||` is a terminating scope, as in
+            // rustc (and `binary_into`): its temporaries drop right after it.
+            let term = matches!(self.p.ast.expr(spine[i - 1]), Expr::Binary { op: BinOp::And | BinOp::Or, .. });
+            if term {
+                self.scopes.push(Vec::new());
+            }
             self.expr_into_here(node, Some(&pl));
+            if term {
+                let span = self.span(node);
+                self.pop_scope(span);
+            }
             self.prelowered.push((node, pl, run));
         }
         run
