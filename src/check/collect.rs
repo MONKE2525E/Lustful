@@ -3988,6 +3988,40 @@ fn coerce_const_value(
     ))
 }
 
+/// How a const fn's generics meet a call in const position
+/// (`ConstFnBody::generic`): from its template's predicates, with std's
+/// `LazyLock::new` and `LazyCell::new` named by their std paths.
+pub fn const_generic_kind(p: &Program, f: LocalDefId) -> crate::ty::consteval::ConstGeneric {
+    use crate::ty::consteval::ConstGeneric;
+    let Some(Some(t)) = p.gx.fn_templates.get(f.0 as usize) else { return ConstGeneric::No };
+    // Implied `Sized` bounds need nothing: every value here is sized.
+    let sized = p.gx.lang.sized;
+    if t.generics.predicates.iter().all(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == sized)) {
+        return ConstGeneric::Free;
+    }
+    let info = p.fn_info(f);
+    let lazy = p.std_source_span(info.def.name_span)
+        && p.interner.get(info.name) == "new"
+        && info.owner.is_some_and(|a| matches!(p.display_path(p.adt(a).name).as_str(), "std::sync::LazyLock" | "core::cell::LazyCell"));
+    if lazy { ConstGeneric::LazyCtor } else { ConstGeneric::Bounded }
+}
+
+/// True when a type holds no reference, raw pointer, fn pointer, trait
+/// object, or lifetime argument (`CollectCx::fn_item`).
+fn region_free(tys: &GlobalTys, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::Dyn(..) => false,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| region_free(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => region_free(tys, e),
+        TyKind::Adt(_, a) => tys.args(a).iter().all(|g| match g {
+            GenericArg::Ty(e) => region_free(tys, *e),
+            GenericArg::Lifetime(_) => false,
+            GenericArg::Const(_) => true,
+        }),
+        _ => true,
+    }
+}
+
 impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     type Tys = GlobalTys;
 
@@ -4059,6 +4093,34 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         }
         self.p.static_names.get(&name).map(|&i| (i, self.p.statics[i as usize].ty))
     }
+    fn fn_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
+        // A plain safe Rust-ABI free fn with no generics. With params,
+        // none of its types may hold a reference or lifetime: the
+        // pointer type here has no late-bound regions, so a region
+        // mismatch rustc reports could not show. With no params every
+        // lifetime in the return type is `'static` (W-STD-C).
+        let [seg] = segs else { return None };
+        if !seg.type_args().is_empty() {
+            return None;
+        }
+        let f = *self.p.fn_names.get(&seg.name)?;
+        let info = self.p.fn_info(f);
+        let q = &info.def.qual;
+        if info.owner.is_some() || info.self_kind.is_some() || q.is_async || q.is_unsafe || q.abi.is_some() || info.def.variadic {
+            return None;
+        }
+        if !info.def.generics.params.is_empty() || !info.def.where_clause.preds.is_empty() {
+            return None;
+        }
+        let (params, ret) = (info.params.clone(), info.ret);
+        if !params.is_empty() && params.iter().chain([&ret]).any(|&t| !region_free(&self.p.tys, t)) {
+            return None;
+        }
+        let inputs = self.p.tys.intern_tys(&params);
+        let sig = self.p.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: ret, is_unsafe: false, extern_c: false }));
+        let t = self.p.tys.intern(TyKind::FnPtr(sig));
+        Some((crate::ty::consteval::ConstValue::FnPtr(f.0), t))
+    }
     fn call_target(&mut self, callee: ast::ExprId) -> crate::ty::consteval::CallTarget {
         use crate::ty::consteval::{CallTarget, ConstFnBody};
         let ast::Expr::Path(segs) = self.p.ast.expr(callee) else { return CallTarget::Unknown };
@@ -4127,7 +4189,12 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             }
             let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
             let owner = info.owner.map(|a| self.p.adt(a).name);
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner });
+            let generic = const_generic_kind(self.p, f);
+            // Written type args on a generic call are not matched yet.
+            if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
+                return CallTarget::Unknown;
+            }
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
         }
         if let Some((adt, variant, ty)) = self.variant_ctor(segs) {
             return CallTarget::VariantCtor { adt, variant, ty };
@@ -4164,7 +4231,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         // instance of its own Adt.
         let def = self.p.def_of_adt(adt);
         let ty = match expected {
-            Some(t) if self.p.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
+            Some(t) if segs.iter().all(|s| s.type_args().is_empty()) && self.p.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
             _ => self.p.tys.adt_ty(adt),
         };
         Some((adt, variant, ty))

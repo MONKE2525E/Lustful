@@ -16260,7 +16260,11 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             }
             let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
             let owner = info.owner.map(|a| p.adt(a).name);
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner });
+            let generic = crate::check::collect::const_generic_kind(p, f);
+            if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
+                return CallTarget::Unknown;
+            }
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
         }
         if let Some(a) = self.cx.tuple_struct_ctor(last)
             && segs.len() == 1
@@ -16287,7 +16291,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         // instance of its own Adt.
         let def = p.def_of_adt(adt);
         let ty = match expected {
-            Some(t) if self.cx.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
+            Some(t) if segs.iter().all(|s| s.type_args().is_empty()) && self.cx.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
             _ => self.cx.tys.adt_ty(adt),
         };
         Some((adt, variant, ty))

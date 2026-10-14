@@ -49,6 +49,10 @@ pub enum ConstValue {
     Ref(Box<ConstValue>),
     /// A reference to a static item, by index into the program's statics.
     StaticRef(u32),
+    /// A fn item coerced to a fn pointer, by its `LocalDefId` index
+    /// (W-STD-C: `static LazyLock` init fns). It can be stored and moved,
+    /// never called or compared here, as in rustc.
+    FnPtr(u32),
 }
 
 /// A value with its type, as the evaluator produces it.
@@ -82,6 +86,25 @@ pub struct ConstFnBody {
     /// The flat type name `Self` means inside the body: the impl type of
     /// a method or associated fn, None for a free fn.
     pub owner: Option<Sym>,
+    /// Whether the fn is generic, and which bounds its type args need.
+    pub generic: ConstGeneric,
+}
+
+/// A const fn's generics, for a call in const position. The evaluator
+/// has no trait solver (const items evaluate before the impl index is
+/// built), so a bounded generic fn is outside the bound, except std's
+/// lazy constructors, whose one bound it checks itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConstGeneric {
+    /// Not generic.
+    No,
+    /// Generic, with no bounds and no where clauses.
+    Free,
+    /// `LazyLock::new` / `LazyCell::new` (std source, W-STD-C): params
+    /// `T` (0) and `F` (1), bound `F: FnOnce() -> T`.
+    LazyCtor,
+    /// Generic with bounds: outside the bound.
+    Bounded,
 }
 
 /// The questions the evaluator asks its caller.
@@ -103,6 +126,11 @@ pub trait ConstCx<'a> {
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)>;
     /// A static item by name: its index and type.
     fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)>;
+    /// A safe, non-generic free fn named by a path, as a fn pointer
+    /// value with its `fn(..) -> R` type.
+    fn fn_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
+        None
+    }
     /// The struct or variant a struct literal names.
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)>;
     /// Called around a const fn body the evaluator runs: `Self` inside
@@ -222,11 +250,6 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
             a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| const_ty_compatible(tys, x, y))
         }
         (TyKind::Array(e1, n1), TyKind::Array(e2, n2)) => n1 == n2 && const_ty_compatible(tys, e1, e2),
-        // A generic const fn's result keeps its template type
-        // (`W<T>` from `W::new()`); the call was type-checked as a fn
-        // call, so a parameter on the value side stands for the
-        // caller's type.
-        (TyKind::Param(_), _) => true,
         (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
             let (a, b) = (tys.args(a1), tys.args(a2));
             a.len() == b.len()
@@ -237,6 +260,105 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
         }
         _ => false,
     }
+}
+
+/// Matches a generic const fn's param or return type `pat` against a
+/// concrete `actual`, recording each `Param(i)` in `binds[i]`. A param
+/// bound twice must bind the same type; parts with no param must be
+/// `const_ty_compatible`. False on any mismatch.
+fn bind_params<T: TyIntern>(tys: &mut T, pat: Ty, actual: Ty, binds: &mut Vec<Option<Ty>>) -> bool {
+    if actual == ERROR {
+        return true;
+    }
+    if !tys.flags(pat).contains_param() {
+        return const_ty_compatible(tys, actual, pat);
+    }
+    match (tys.kind(pat), tys.kind(actual)) {
+        (TyKind::Param(p), _) => {
+            let i = p.0 as usize;
+            if binds.len() <= i {
+                binds.resize(i + 1, None);
+            }
+            match binds[i] {
+                Some(b) => b == actual,
+                None => {
+                    binds[i] = Some(actual);
+                    true
+                }
+            }
+        }
+        (TyKind::Ref(_, m1, a), TyKind::Ref(_, m2, b)) => m1 == m2 && bind_params(tys, a, b, binds),
+        (TyKind::Slice(a), TyKind::Slice(b)) => bind_params(tys, a, b, binds),
+        (TyKind::Array(a, n1), TyKind::Array(b, n2)) => n1 == n2 && bind_params(tys, a, b, binds),
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            let (a, b) = (tys.tys_of(a).to_vec(), tys.tys_of(b).to_vec());
+            a.len() == b.len() && a.iter().zip(&b).all(|(&x, &y)| bind_params(tys, x, y, binds))
+        }
+        (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
+            let (a, b) = (tys.args(a1).to_vec(), tys.args(a2).to_vec());
+            a.len() == b.len()
+                && a.iter().zip(&b).all(|(x, y)| match (x, y) {
+                    (super::GenericArg::Ty(x), super::GenericArg::Ty(y)) => bind_params(tys, *x, *y, binds),
+                    _ => x == y,
+                })
+        }
+        (TyKind::FnPtr(s1), TyKind::FnPtr(s2)) => {
+            let (b1, b2) = (tys.sig(s1), tys.sig(s2));
+            let (i1, i2) = (tys.tys_of(b1.value.inputs).to_vec(), tys.tys_of(b2.value.inputs).to_vec());
+            b1.count == b2.count
+                && b1.value.is_unsafe == b2.value.is_unsafe
+                && b1.value.extern_c == b2.value.extern_c
+                && i1.len() == i2.len()
+                && i1.iter().zip(&i2).all(|(&x, &y)| bind_params(tys, x, y, binds))
+                && bind_params(tys, b1.value.output, b2.value.output, binds)
+        }
+        _ => false,
+    }
+}
+
+/// The indices of the params `t` mentions.
+fn params_in<T: TyIntern>(tys: &T, t: Ty, out: &mut Vec<u32>) {
+    if !tys.flags(t).contains_param() {
+        return;
+    }
+    match tys.kind(t) {
+        TyKind::Param(p) => out.push(p.0),
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => params_in(tys, e, out),
+        TyKind::Tuple(ts) => {
+            for &e in tys.tys_of(ts) {
+                params_in(tys, e, out);
+            }
+        }
+        TyKind::Adt(_, a) => {
+            for g in tys.args(a) {
+                if let Some(e) = g.as_ty() {
+                    params_in(tys, e, out);
+                }
+            }
+        }
+        TyKind::FnPtr(sig) => {
+            let b = tys.sig(sig);
+            for &e in tys.tys_of(b.value.inputs) {
+                params_in(tys, e, out);
+            }
+            params_in(tys, b.value.output, out);
+        }
+        // Any other kind with a param: count it unbindable.
+        _ => out.push(u32::MAX),
+    }
+}
+
+/// `t` with each bound param replaced (unbound params stay as written).
+fn subst_binds<T: TyIntern>(tys: &mut T, t: Ty, binds: &[Option<Ty>]) -> Ty {
+    if !tys.flags(t).contains_param() || binds.iter().all(|b| b.is_none()) {
+        return t;
+    }
+    let args: Vec<super::GenericArg> = binds
+        .iter()
+        .enumerate()
+        .map(|(i, b)| super::GenericArg::Ty(b.unwrap_or_else(|| tys.intern(TyKind::Param(super::ParamId(i as u32))))))
+        .collect();
+    super::subst(tys, t, &args)
 }
 
 /// The L0110 a const item gets when its value type is not its declared type.
@@ -705,12 +827,24 @@ impl Evaluator {
                 };
                 // A generic struct literal is the expected instance of
                 // its Adt (`static S: K<u8> = K { .. }`); check typed it.
+                // Written type args (`K::<u16> { .. }`) are not matched
+                // against it: such a literal keeps the template type.
                 let def_of = |t: Ty| cx.tys_ref().adt_parts(t).map(|(d, _)| d);
-                let ty = match expected {
-                    Some(t) if def_of(t).is_some() && def_of(t) == def_of(ty) => t,
-                    _ => ty,
+                let written_args = path.iter().any(|s| !s.type_args().is_empty());
+                let (ty, inst) = match expected {
+                    Some(t) if !written_args && def_of(t).is_some() && def_of(t) == def_of(ty) => {
+                        let args = cx.tys_ref().adt_parts(t).map(|(_, a)| cx.tys_ref().args(a).to_vec()).unwrap_or_default();
+                        (t, Some(args))
+                    }
+                    _ => (ty, None),
                 };
-                let field_defs = cx.variant_fields(adt, variant);
+                // Field types of the instance: the template's, with its args.
+                let mut field_defs = cx.variant_fields(adt, variant);
+                if let Some(args) = &inst {
+                    for f in &mut field_defs {
+                        f.1 = super::subst(cx.tys(), f.1, args);
+                    }
+                }
                 // Privacy first: written fields, and every field when
                 // `..base` fills the rest (rustc E0451 for both).
                 for &(fname, fspan, _) in fields {
@@ -1006,6 +1140,9 @@ impl Evaluator {
             return Ok(v);
         }
         if let Some(v) = self.float_assoc_const(cx, segs) {
+            return Ok(v);
+        }
+        if let Some(v) = cx.fn_item(segs) {
             return Ok(v);
         }
         Err(outside(span, "this path"))
@@ -1450,6 +1587,15 @@ impl Evaluator {
                 return Ok((ConstValue::Aggregate(vec![v]), t));
             }
         }
+        // A call through a local (a fn pointer value): rustc rejects
+        // fn pointer calls in const contexts. Never resolve the name
+        // to an item of the same name instead.
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && segs.len() == 1
+            && env.iter().any(|(n, _, _)| *n == segs[0].name)
+        {
+            return Err(outside(span, "a call through a fn pointer"));
+        }
         // `f64::from_bits(n)` and `f32::from_bits(n)` are const fns.
         if let Expr::Path(segs) = cx.ast().expr(callee)
             && segs.len() == 2
@@ -1554,10 +1700,41 @@ impl Evaluator {
                 })?;
                 Ok((ConstValue::Int(l.align as i128), USIZE))
             }
+            CallTarget::VariantCtor { adt, variant, ty } if adt.0 >= u32::MAX - 1 => {
+                // The `Some` and `Ok`/`Err` shims (adt u32::MAX and
+                // u32::MAX - 1): the payload type comes from the expected
+                // `Option`/`Result` (`Some(5u16)` for an `Option<u8>` is a
+                // mismatch, never a silent narrowing), else from the
+                // argument (`Some` only).
+                let _ = ty;
+                let [a] = args else { return Err(outside(span, "this constructor call")) };
+                let want = if adt.0 == u32::MAX {
+                    expected.and_then(|t| cx.tys_ref().option_elem(t))
+                } else {
+                    let Some((ok, err)) = expected.and_then(|t| cx.tys_ref().result_args(t)) else {
+                        return Err(outside(span, "this `Ok`/`Err` value (type annotations needed)"));
+                    };
+                    Some(if variant == 0 { ok } else { err })
+                };
+                let (v, vt) = self.value(cx, env, *a, want)?;
+                if let Some(want) = want
+                    && !const_ty_compatible(cx.tys_ref(), vt, want)
+                {
+                    return Err(const_ty_mismatch(cx.ast().expr_span(*a), "this constructor argument"));
+                }
+                let ty = match (adt.0 == u32::MAX, expected) {
+                    (true, _) => {
+                        let e = want.unwrap_or(vt);
+                        cx.tys().mk_option(e)
+                    }
+                    (false, Some(t)) => t,
+                    (false, None) => ERROR,
+                };
+                Ok((ConstValue::Variant(variant, vec![v]), ty))
+            }
             CallTarget::VariantCtor { adt, variant, ty } => {
                 // A user variant knows its field types; check each argument
-                // against them. The `Some` and `Ok`/`Err` shims (adt
-                // u32::MAX and u32::MAX - 1) have none here.
+                // against them.
                 let fields: Vec<Ty> = if adt.0 >= u32::MAX - 1 { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
                 // A tuple struct constructor is private when any field
                 // is; enum variant fields take the enum's visibility.
@@ -1590,13 +1767,27 @@ impl Evaluator {
                 }
                 // Arguments evaluate in the caller's module, so they
                 // evaluate before the call depth moves.
+                // A generic fn's type args come from the expected type
+                // and the argument types (`binds`, by param index); its
+                // result has its return type with them substituted.
+                let generic = body.generic != ConstGeneric::No;
+                if body.generic == ConstGeneric::Bounded {
+                    return Err(outside(span, "a call to a generic const fn with bounds"));
+                }
+                let mut binds: Vec<Option<Ty>> = Vec::new();
+                if generic && let Some(e) = expected {
+                    let _ = bind_params(cx.tys(), body.ret, e, &mut binds);
+                }
                 let mut arg_vals: Vec<TypedValue> = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
-                    let (v0, vt) = self.value(cx, env, a, body.param_tys.get(i).copied())?;
-                    if let Some(&want) = body.param_tys.get(i)
-                        && !const_ty_compatible(cx.tys_ref(), vt, want)
-                    {
-                        return Err(const_ty_mismatch(cx.ast().expr_span(a), "this call argument"));
+                    let want = body.param_tys.get(i).copied();
+                    let want_now = if generic { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
+                    let (v0, vt) = self.value(cx, env, a, want_now)?;
+                    if let Some(want) = want {
+                        let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
+                        if !ok {
+                            return Err(const_ty_mismatch(cx.ast().expr_span(a), "this call argument"));
+                        }
                     }
                     // The parameter has its declared type inside the body,
                     // whatever width the argument literal was written at.
@@ -1628,6 +1819,38 @@ impl Evaluator {
                         None => fenv.push((name, v, mutable)),
                     }
                 }
+                // Every type arg must be known, and the lazy
+                // constructors' `F: FnOnce() -> T` must hold.
+                let call_ret = if generic {
+                    // (A bound type may hold the caller's own params, in a
+                    // generic const fn body: those are fine.)
+                    let r = subst_binds(cx.tys(), body.ret, &binds);
+                    let mut used = Vec::new();
+                    for &t in body.param_tys.iter().chain([&body.ret]) {
+                        params_in(cx.tys_ref(), t, &mut used);
+                    }
+                    if used.iter().any(|&i| binds.get(i as usize).copied().flatten().is_none()) {
+                        return Err(outside(span, "this generic const fn call (type annotations needed)"));
+                    }
+                    if body.generic == ConstGeneric::LazyCtor {
+                        let holds = match (binds.first().copied().flatten(), binds.get(1).copied().flatten()) {
+                            (Some(t), Some(f)) => match cx.tys_ref().kind(f) {
+                                TyKind::FnPtr(sig) => {
+                                    let b = cx.tys_ref().sig(sig);
+                                    cx.tys_ref().tys_of(b.value.inputs).is_empty() && b.value.output == t && !b.value.is_unsafe && !b.value.extern_c
+                                }
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if !holds {
+                            return Err(outside(span, "this lazy constructor's init fn"));
+                        }
+                    }
+                    r
+                } else {
+                    body.ret
+                };
                 cx.enter_const_fn(body.owner);
                 let flow = match bind_err {
                     Some(d) => Err(d),
@@ -1656,7 +1879,7 @@ impl Evaluator {
                             }
                             return Ok((ConstValue::Int(int_from_bits(int_bits(*i, it), it)), body.ret));
                         }
-                        Ok((v.0, body.ret))
+                        Ok((v.0, call_ret))
                     }
                     _ => Err(outside(span, "control flow out of a const fn")),
                 }

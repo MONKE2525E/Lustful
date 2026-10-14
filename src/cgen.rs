@@ -4973,6 +4973,9 @@ pub struct GlueSet {
     /// Keys the last `refresh` did not reach: their text may predate a type edit. `add`
     /// regenerates one when a body reaches it again.
     stale: HashSet<(Glue, CTy)>,
+    /// Fn slots as of the last `add` or `refresh`: fn pointers in static
+    /// data (`ConstValue::FnPtr`) name their slot's trampoline.
+    slots: Vec<u32>,
 }
 
 impl GlueSet {
@@ -4982,6 +4985,7 @@ impl GlueSet {
     /// that no unit shared at freeze time is not in `shared`, so it does not count as a shared
     /// change: the new glue is static in the function units that reach it.
     pub fn add<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
+        self.slots = slots.to_vec();
         let roots: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k) || self.stale.contains(k)).cloned().collect();
         self.regen(p, slots, roots, false).0
     }
@@ -5003,6 +5007,7 @@ impl GlueSet {
     /// reaches one regenerates it: a type edit in a version that does
     /// not use the glue must still reach the version that uses it again.
     pub fn refresh<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
+        self.slots = slots.to_vec();
         let (changed, seen) = self.regen(p, slots, keys.cloned().collect(), true);
         self.stale = self.protos.keys().filter(|k| !seen.contains(*k)).cloned().collect();
         changed
@@ -5358,7 +5363,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         for k in &keys {
             c.push_str(&g.def_map[*k]);
         }
-        c.push_str(&static_defs(p));
+        c.push_str(&static_defs(p, &g.slots));
         return c;
     }
     for k in g.protos.keys() {
@@ -5371,7 +5376,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         c.push_str(proto);
     }
     c.push_str(&g.defs);
-    c.push_str(&static_defs(p));
+    c.push_str(&static_defs(p, &g.slots));
     c
 }
 
@@ -5432,7 +5437,7 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
 
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
-fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32) -> String {
+fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32, slots: &[u32]) -> String {
     if let (CV::Float(bits, f), CTy::Float(_)) = (v, t) {
         return match f {
             FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
@@ -5459,15 +5464,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         // A const lock: unlocked and unpoisoned around its value.
         (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_cell_struct() && vals.len() == 1 => {
             let words = vec!["0"; sync::cell_words(*k).len()].join(", ");
-            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter))
+            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter, slots))
         }
         // An empty `OnceLock`, a `Condvar`, a `Barrier::new(n)` (W-THREADS).
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::OnceLock, _)) if vals.is_empty() => "{0}".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Condvar, _)) if vals.is_empty() => "0".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Barrier, _)) if vals.len() == 1 => {
-            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter))
+            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter, slots))
         }
-        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter),
+        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter, slots),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
         (CV::Unit, _) => "((lust_Unit){})".into(),
         (CV::Str(i), _) => {
@@ -5483,12 +5488,24 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::StaticRef(idx), _) => format!("(&{})", static_sym(p, *idx)),
+        (CV::FnPtr(f), CTy::FnPtr(..)) => {
+            // Runtime fn pointer values are `lust_tramps[slot]`, not a
+            // constant; this unit gets its own copy of the slot's
+            // trampoline (forwarding through `lust_fns`), whose address is.
+            let f = LocalDefId(*f);
+            let slot = *slots.get(f.0 as usize).expect("internal: a fn pointer in static data has no fn slot");
+            let name = format!("stramp{slot}");
+            if !pre.contains(&format!(" {name}(")) {
+                pre.push_str(&trampoline(p, f, slot).replacen(&format!(" tramp{slot}("), &format!(" {name}("), 1));
+            }
+            format!("(({})&{name})", ctype(t))
+        }
         (CV::Ref(inner), CTy::Slice(el)) => {
             // A slice over a promoted aggregate.
             match &**inner {
                 CV::Aggregate(vals) => {
                     let at = CTy::Array(el.clone(), vals.len() as u64);
-                    let init = const_init(p, inner, &at, pre, counter);
+                    let init = const_init(p, inner, &at, pre, counter, slots);
                     *counter += 1;
                     let name = format!("lust_promoted_{counter}");
                     let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
@@ -5498,7 +5515,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
-            let init = const_init(p, inner, inner_ct, pre, counter);
+            let init = const_init(p, inner, inner_ct, pre, counter, slots);
             *counter += 1;
             let name = format!("lust_promoted_{counter}");
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(inner_ct));
@@ -5509,7 +5526,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 zero_lit(p, t)
             } else {
                 let parts: Vec<String> =
-                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter))).collect();
+                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter, slots))).collect();
                 format!("(({}){{ {} }})", ctype(t), parts.join(", "))
             }
         }
@@ -5517,7 +5534,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             if vals.is_empty() {
                 zero_lit(p, t)
             } else {
-                let parts: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+                let parts: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
         }
@@ -5525,7 +5542,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             if *n == 0 {
                 zero_lit(p, t)
             } else {
-                let one = const_init(p, x, e, pre, counter);
+                let one = const_init(p, x, e, pre, counter, slots);
                 let parts: Vec<String> = (0..*n).map(|_| one.clone()).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
@@ -5538,7 +5555,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 let parts: Vec<String> = vals
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter)))
+                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter, slots)))
                     .collect();
                 format!("((A{}){{ {} }})", a.0, parts.join(", "))
             }
@@ -5548,22 +5565,22 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let inits: Vec<String> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter))
+                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter, slots))
                 .collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Option(e)) => {
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Result(a, b)) => {
             let e = if *variant == 0 { a } else { b };
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), vals.len() as u64);
-            let init = const_init(p, v, &at, pre, counter);
+            let init = const_init(p, v, &at, pre, counter, slots);
             *counter += 1;
             let name = format!("lust_promoted_{counter}");
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
@@ -5642,13 +5659,13 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
 /// The extern declarations come first: statics emit in stable def order,
 /// so one static's initializer can name a later static (`static S: &[u8] = &A;`
 /// before `A` in hash order), and C needs the name declared before use.
-fn static_defs(p: &Program) -> String {
+fn static_defs(p: &Program, slots: &[u32]) -> String {
     let mut pre = static_decls(p);
     let mut out = String::new();
     let mut counter = 0u32;
     for (i, st) in p.statics.iter().enumerate() {
         let ct = cty(&p.tys, st.ty);
-        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter);
+        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter, slots);
         let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
     }
     format!("{pre}{out}")

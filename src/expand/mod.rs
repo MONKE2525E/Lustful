@@ -11,6 +11,7 @@
 // `lookup_macro` is the one place macro names resolve; it swaps to the
 // frozen `Binding` query fns (S7) without touching callers.
 pub mod builtin;
+pub mod lazy;
 pub mod match_;
 pub mod recognize;
 pub mod transcribe;
@@ -1255,8 +1256,16 @@ pub fn delimiter_error(tokens: &[Token]) -> Option<Diag> {
 
 /// The seeded, dependency-returning expansion both wrappers use.
 /// A file that cannot contain macros comes back unchanged (the
-/// same `Lexed`, no deps).
+/// same `Lexed`, no deps). Static init closures then move into hidden
+/// fns (`lazy::hoist_static_closures`, W-STD-C), so every pipeline that
+/// expands sees the same items.
 pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
+    let (lexed, deps) = expand_macros(lexed, ctx, seeds)?;
+    Ok((lazy::hoist_static_closures(lexed, ctx.interner), deps))
+}
+
+/// Macro expansion proper, for `expand_lexed_seeded_with_deps`.
+fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
     if !needs_expansion(&lexed.tokens, ctx.interner) {
         return Ok((lexed, Vec::new()));
     }

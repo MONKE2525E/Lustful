@@ -1023,6 +1023,10 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
             8u8.hash(h);
             hash_const_value(h, p, inner, depth);
         }
+        ConstValue::FnPtr(f) => {
+            11u8.hash(h);
+            p.fn_defs.get(*f as usize).map(|d| d.hash.0).hash(h);
+        }
         ConstValue::StaticRef(i) => {
             9u8.hash(h);
             match p.statics.get(*i as usize) {

@@ -4900,6 +4900,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.assign(dest.clone(), Rvalue::Ref(mutable, Place::local(t)), span);
             }
             CV::StaticRef(idx) => self.assign(dest.clone(), Rvalue::StaticRef(*idx), span),
+            // A fn pointer in a const value (W-STD-C): the slot trampoline.
+            CV::FnPtr(f) => self.assign(dest.clone(), Rvalue::FnValue(LocalDefId(*f), ty), span),
             _ => {
                 let op = self.const_operand(v, ty, span);
                 self.assign(dest.clone(), Rvalue::Use(op), span);
