@@ -48,7 +48,7 @@ the upstream features it implements, and its exact-layout types.
 | deps/ryu-js | Adapter for 1.0.2: `Buffer::format` for f64 over the runtime JS printer (deps/ryu-js/README.md). | W-DEPS |
 | deps/num-traits | Adapter for 0.2.19: `ToPrimitive` with the f64 impl (deps/num-traits/README.md). | W-DEPS |
 | deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
-| deps/bumpalo | No crate yet (section 3.6). | W-DEPS |
+| deps/bumpalo | Pending for 3.20.3: written and checked with rustc, waits in `pending/` for `Cell` (deps/bumpalo/README.md). | W-DEPS |
 
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 
