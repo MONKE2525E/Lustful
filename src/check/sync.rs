@@ -586,6 +586,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // needs the bound here; the borrow checker proves concrete
             // borrows, borrowck/regions.rs).
             SyncOp::ThreadSpawn => {
+                // A thread that panics under panic=unwind ends alone and
+                // its join returns Err: not built yet (W-UNWIND threads).
+                if self.p.unwind {
+                    self.err("L0820", span, "`thread::spawn` under panic=unwind is not supported yet", "Build with panic=abort.");
+                }
                 let ret = self.new_var(false);
                 let f = self.fn_once_param(&[], ret, span);
                 self.require_send(f, span);
@@ -599,6 +604,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // FnOnce(&'scope Scope<'scope, 'env>) -> T`: the closure's
             // `&Scope` is higher-ranked.
             SyncOp::ThreadScope => {
+                if self.p.unwind {
+                    self.err("L0820", span, "`thread::scope` under panic=unwind is not supported yet", "Build with panic=abort.");
+                }
                 let ret = self.new_var(false);
                 let sc = sync_ty(&mut self.tys, SyncTy::Scope, &[]);
                 let sr = self.tys.mk_ref(false, sc);

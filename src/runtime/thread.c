@@ -70,6 +70,11 @@ static void lust_tls_run(lust_tls_block *b) {
     while (b->ndtors) {
         lust_tls_dtor d = b->dtors[--b->ndtors];
         d.dtor(d.cell);
+        /* Rust runs TLS destructors behind a no-unwind boundary. */
+        if (lust_unwind_mode && lust_unw_mine()) {
+            fputs("fatal runtime error: thread local panicked on drop, aborting\n", stderr);
+            abort();
+        }
     }
 }
 

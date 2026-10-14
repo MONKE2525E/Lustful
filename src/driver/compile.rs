@@ -50,9 +50,11 @@ fn expand_tokens(
     file: &std::path::Path,
     src: &str,
     test: bool,
+    unwind: bool,
 ) -> Result<(lexer::Lexed, Vec<expand::Dep>), Diag> {
     let mut ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
     ctx.client = &front.client;
+    ctx.cfg.panic_unwind = unwind;
     expand::expand_lexed_with_deps(lexed, &ctx)
 }
 
@@ -2029,7 +2031,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let test_mode = req.harness || req.session.krate.test;
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
-        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)).map(
+        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)).map(
             |(l, deps)| {
                 let mut sc = scan::scan(&l);
                 fold_fn_text(&mut sc, &l, &src);
@@ -2052,7 +2054,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
         // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
         // answer; if it lexes, compile as one chunk. Never panic.
-        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
+        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok((whole, deps)) => {
                 let mut sc = scan::scan(&whole);
@@ -2399,7 +2401,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else {
             // Re-parse serially for an exact error.
             let whole =
-                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode)) {
+                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)) {
                     Ok((w, _deps)) => w,
                     Err(mut d) => {
                         front.env_hash = None;
@@ -2534,6 +2536,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Read sets serve the next request's dirty walk; a one-shot process
     // has none, so its body checks skip recording and fingerprinting.
     program.record_reads = caches.persistent;
+    program.unwind = !session_key.profile.panic_abort;
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
@@ -3168,7 +3171,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered),
+        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered, program.unwind),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
@@ -3184,7 +3187,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[]) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[], program.unwind) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }

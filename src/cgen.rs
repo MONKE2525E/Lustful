@@ -16,6 +16,8 @@ mod fmt;
 mod sync;
 mod hash;
 mod split;
+mod unwind;
+use unwind::Unw;
 
 /// A body-independent type, so glue can be shared across functions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -818,6 +820,15 @@ struct FnGen<'b, 'p, 'a> {
     prelude: String,
     /// Comparator adapters emitted so far (`sort_adapter`), for names.
     adapters: u32,
+    /// panic=unwind state (cgen/unwind.rs); all empty under abort.
+    /// The cleanup blocks, the cleanup entry of each statement by
+    /// (block, index), and the action of the statement or call being
+    /// emitted now.
+    cleanup: Vec<bool>,
+    stmt_unw: HashMap<(u32, u32), u32>,
+    unw: Option<Unw>,
+    /// The value being assigned comes from a `Call` terminator.
+    unw_call: bool,
 }
 
 /// A layout with no field or niche detail, for runtime struct types whose
@@ -1483,6 +1494,10 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         vtables: HashMap::new(),
         prelude: String::new(),
         adapters: 0,
+        cleanup: if p.unwind { unwind::cleanup_blocks(body) } else { Vec::new() },
+        stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
+        unw: None,
+        unw_call: false,
     };
     g.collect_move_paths();
     if g.bad_move {
@@ -1630,6 +1645,13 @@ impl FnGen<'_, '_, '_> {
         if !flags.is_empty() {
             let _ = writeln!(self.out, "  uint8_t {};", flags.join(", "));
         }
+        if p.unwind {
+            // A call made while its thread has a pending exception comes
+            // from code that runs on after a panic (glue, a runtime
+            // callback): it returns at once, as if never called.
+            let _ = writeln!(self.out, "  lust_exc ex;
+  if (lust_unw_pending && lust_unw_mine()) {}", self.unwind_return());
+        }
         let n = self.body.blocks.len();
         let mut reachable = vec![false; n];
         let mut stack = vec![0usize];
@@ -1638,14 +1660,25 @@ impl FnGen<'_, '_, '_> {
                 continue;
             }
             stack.extend(succ(&self.body.blocks[b].term).into_iter().map(|s| s.0 as usize));
+            stack.extend(self.body.stmt_unwind.iter().filter(|e| e.0.0 as usize == b).map(|e| e.2.0 as usize));
         }
         let order: Vec<usize> = (0..n).filter(|&b| reachable[b]).collect();
         for (k, &bi) in order.iter().enumerate() {
             let _ = writeln!(self.out, "bb{bi}:;");
             let block = self.body.block(Bb(bi as u32));
-            for s in &block.stmts {
+            for (si, s) in block.stmts.iter().enumerate() {
+                self.unw = self.stmt_action(bi, si).filter(|_| !matches!(s.kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_)));
+                let mark = self.out.len();
                 self.stmt(&s.kind, s.span);
+                if let Some(u) = self.unw.take() {
+                    let check = u.check();
+                    let text = unwind::wrap_calls(&self.out[mark..], &check);
+                    self.out.truncate(mark);
+                    self.out.push_str(&text);
+                    let _ = writeln!(self.out, "  {check}");
+                }
             }
+            self.unw = self.stmt_action(bi, block.stmts.len());
             let next = order.get(k + 1).copied();
             if let Terminator::Goto(t) = &block.term
                 && Some(t.0 as usize) == next
@@ -1655,6 +1688,29 @@ impl FnGen<'_, '_, '_> {
             self.term(&block.term, block.term_span, next);
         }
         self.out.push_str("}\n\n");
+    }
+
+    /// The unwind action of statement `si` of block `bi` (`si` equal to
+    /// the statement count is the terminator): abort in a cleanup
+    /// block, else its cleanup entry, if lowering gave it one.
+    fn stmt_action(&self, bi: usize, si: usize) -> Option<Unw> {
+        if !self.p.unwind {
+            return None;
+        }
+        if self.cleanup[bi] {
+            return Some(Unw::Abort);
+        }
+        self.stmt_unw.get(&(bi as u32, si as u32)).map(|&u| Unw::Goto(u))
+    }
+
+    /// `return <placeholder>;` for a frame that leaves by unwinding: the
+    /// caller never reads the value.
+    fn unwind_return(&self) -> String {
+        if self.ret_large {
+            return "return;".into();
+        }
+        let rt = cty(&self.p.tys, self.p.fn_info(self.body.fn_id).ret);
+        format!("return {};", zero_lit(self.p, &rt))
     }
 
     /// For an assignment to `dest` of a type that needs drop: the C
@@ -2018,7 +2074,10 @@ impl FnGen<'_, '_, '_> {
                 (Proj::Downcast(v), _) => variant = Some(*v),
                 (Proj::Index(l), CTy::Vec(el)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = format!("(({}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]", ctype(&el));
+                    e = match self.unw {
+                        Some(Unw::Goto(b)) => self.index_unw(&format!("{e}.len"), &format!("(({}*){e}.ptr)", ctype(&el)), *l, &loc, b),
+                        _ => format!("(({}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]", ctype(&el)),
+                    };
                     t = *el;
                 }
                 (Proj::Field(i), CTy::Tuple(es)) => {
@@ -2027,7 +2086,10 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Index(l), CTy::Array(el, n)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]");
+                    e = match self.unw {
+                        Some(Unw::Goto(b)) => self.index_unw(&n.to_string(), &format!("{e}.v"), *l, &loc, b),
+                        _ => format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]"),
+                    };
                     t = *el;
                 }
                 (Proj::Deref, CTy::Slice(_)) | (Proj::Deref, CTy::Dyn) => {
@@ -2044,13 +2106,23 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Index(l), CTy::Slice(el)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]");
+                    e = match self.unw {
+                        Some(Unw::Goto(b)) => self.index_unw(&format!("{e}.len"), &format!("{e}.ptr"), *l, &loc, b),
+                        _ => format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]"),
+                    };
                     t = *el;
                 }
                 _ => panic!("bad projection in codegen"),
             }
         }
         (e, t)
+    }
+
+    /// An indexed element place under panic=unwind: a GNU statement
+    /// expression whose failed bounds check panics and leaves for the
+    /// cleanup at block `b` before any element is read.
+    fn index_unw(&self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
+        format!("(*({{ if (l{l} >= {len}) {{ lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
     }
 
     fn operand(&mut self, o: &Operand, loc: &str, post: &mut Vec<String>) -> (String, CTy) {
@@ -2127,6 +2199,40 @@ impl FnGen<'_, '_, '_> {
         let value = make_value(self, loc, &mut post);
         let (d, dt) = self.place(dest, loc);
         let drop = needs_drop_c(self.p, &dt);
+        // A statement whose destination is a whole local with nothing to
+        // drop writes it directly: a value left there by a panic is never
+        // read, and the statement's own check follows (`function`).
+        let unw = self.unw.filter(|_| self.unw_call || drop || !dest.proj.is_empty());
+        if let Some(u) = unw {
+            // panic=unwind: the value goes to a temporary first and the
+            // check runs before the old value drops or the place is
+            // written, so a panic leaves the destination as it was.
+            // A call owns its moved arguments from the start, so their
+            // flags clear before it runs: a panic inside it must not drop
+            // them again here. A statement moves only at its end.
+            if self.unw_call {
+                let flags: String = post.iter().map(|p| format!("    {p}\n")).collect();
+                self.out.insert_str(body_start, &flags);
+                post.clear();
+            }
+            let t = self.tmp();
+            let _ = writeln!(self.out, "    {} {t} = {value};", ctype(&dt));
+            for p in &post {
+                let _ = writeln!(self.out, "    {p}");
+            }
+            let _ = writeln!(self.out, "    {}", u.check());
+            if drop {
+                let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
+                // A drop that panics leaves the local unowned, so its
+                // cleanup does not drop it again.
+                let drop_old = if dest.proj.is_empty() { drop_old.replacen(" {", &format!(" {{ d{} = 0;", dest.local), 1) } else { drop_old };
+                let _ = writeln!(self.out, "   {drop_old}\n    {d} = {t};\n   {refill}");
+            } else {
+                let _ = writeln!(self.out, "    {d} = {t};");
+            }
+            self.out.push_str("  }\n");
+            return;
+        }
         if drop && dest.proj.is_empty() && !mentions {
             // The old value is dropped before the new one is written. Safe because the
             // rvalue does not read the destination.
@@ -2231,11 +2337,16 @@ impl FnGen<'_, '_, '_> {
             }
             Terminator::Call { target, args, dest, next, unwind } => {
                 // Calls carry a cleanup (unwind) successor since
-                // W-CORELANG. The C form has no edge to it: the cleanup
-                // blocks are emitted like any other block, and a panic
-                // in the callee aborts before they could run. Wave C
-                // gives the edge real work.
-                let _ = unwind;
+                // W-CORELANG. Under panic=abort the C form has no edge to
+                // it: a panic in the callee aborts first. Under
+                // panic=unwind the call is checked and the edge taken
+                // (cgen/unwind.rs); a call without one (a catch
+                // boundary) is not checked.
+                if self.unw != Some(Unw::Abort) {
+                    self.unw = unwind.filter(|_| self.p.unwind).map(|u| Unw::Goto(u.0));
+                }
+                let mark = self.out.len();
+                self.unw_call = true;
                 let mentions =
                     args.iter().any(|o| operand_mentions(o, dest.local)) || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
                 // A call to a never fn (unit C form) whose destination
@@ -2266,6 +2377,12 @@ impl FnGen<'_, '_, '_> {
                         if ret_unit && dest_cty != CTy::Unit { format!("({v}, {})", zero_lit(s.p, &dest_cty)) } else { v }
                     });
                 }
+                self.unw_call = false;
+                if let Some(u) = self.unw.take() {
+                    let text = unwind::wrap_calls(&self.out[mark..], &u.check());
+                    self.out.truncate(mark);
+                    self.out.push_str(&text);
+                }
                 if Some(next.0 as usize) != next_block {
                     let _ = writeln!(self.out, "  goto bb{};", next.0);
                 }
@@ -2277,11 +2394,19 @@ impl FnGen<'_, '_, '_> {
                     self.out.push_str("  return l0;\n")
                 }
             }
+            // The last block of a cleanup ladder: the frame gives its
+            // exception back and leaves (panic=unwind).
+            Terminator::Unreachable if self.unw == Some(Unw::Abort) => {
+                let _ = writeln!(self.out, "  lust_unw_resume(&ex);\n  {}", self.unwind_return());
+            }
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
             Terminator::Panic(parts) => {
                 self.out.push_str("  {\n");
                 let s = self.format(parts, &loc, &mut post, 0);
                 let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n  }}");
+                if let Some(Unw::Goto(b)) = self.unw {
+                    let _ = writeln!(self.out, "  lust_unw_take(&ex);\n  goto bb{b};");
+                }
             }
         }
     }
@@ -5559,8 +5684,9 @@ pub struct SlotFiles<'a> {
 }
 
 /// Unit 0: the line and file tables (by slot), globals, overlay registration, and `main`.
-/// Rebuilt on every build.
-pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize]) -> String {
+/// Rebuilt on every build. Under panic=unwind (`unwind`) it switches the
+/// runtime to unwinding, and a `main` that ends by a panic exits 101.
+pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize], unwind: bool) -> String {
     let mut c = unit_header();
     let lines: Vec<String> = slot_lines.iter().map(|l| l.to_string()).collect();
     let _ = writeln!(c, "static const uint32_t lines[{}] = {{{}}};", lines.len().max(1), lines.join(","));
@@ -5578,16 +5704,20 @@ pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;{}\n  lust_rt_init();\n  lust_base_init();",
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;{}{}\n  lust_rt_init();\n  lust_base_init();",
         c_string_lit(file.as_bytes()),
-        if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "" }
+        if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "" },
+        if unwind { "\n  lust_unwind_mode = 1;" } else { "" }
     );
     for u in overlays {
         let _ = writeln!(c, "  lust_overlay_u{u}();");
     }
     let _ = writeln!(
         c,
-        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); lust_tls_exit(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  lust_tls_exit();\n  lust_flush();\n  return 0;\n}}"
+        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); {} lust_tls_exit(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  {}lust_tls_exit();\n  lust_flush();\n  return {};\n}}",
+        if unwind { "if (lust_unw_main_exit()) rc = 101;" } else { "" },
+        if unwind { "int rc = lust_unw_main_exit();\n  " } else { "" },
+        if unwind { "rc" } else { "0" }
     );
     c
 }
@@ -6066,6 +6196,9 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
             let _ = writeln!(c, "  {rt} r; ({cast}lust_fns[{idx}])(&r);");
         } else {
             let _ = writeln!(c, "  {rt} r = ({cast}lust_fns[{idx}])();");
+        }
+        if p.unwind {
+            let _ = writeln!(c, "  if (lust_unw_pending && lust_unw_mine()) return 0;");
         }
         match p.tys.result_args(ret) {
             Some((ok_t, err_t)) => {
@@ -6579,6 +6712,10 @@ fn glue_callee(p: &Program, slots: &[u32], f: LocalDefId, types: &mut Vec<CTy>) 
 /// Generates the prototype and definition of glue `g` for `t`. Pushes the glue keys the
 /// definition calls to `more` and the extra C types it names to `types`.
 #[allow(clippy::too_many_arguments)]
+/// The drop glue step under panic=unwind (`lust_unw_dstep`): after a
+/// call that may panic, the first exception moves into the glue's `ex`.
+const UNW_DSTEP: &str = "  if (lust_unw_pending) lust_unw_dstep(&ex, &u);\n";
+
 fn glue_def(
     p: &Program,
     slots: &[u32],
@@ -6674,13 +6811,14 @@ fn glue_def_value(
                 // the allocation by the size and align words.
                 CTy::BoxDyn => {
                     body.push_str("  if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data);\n");
+                    body.push_str(UNW_DSTEP);
                     body.push_str("  lust_dealloc(p->data, (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]);\n");
                 }
                 CTy::RcDyn => {
                     // The two counts sit right before the value (`RcI_T`).
                     body.push_str("  uint64_t *h = (uint64_t *)p->data - 2;\n");
                     // The strong refs hold one implicit weak ref, as for `Rc<T>`.
-                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); if (--h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
+                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); UNW_DSTEP if (--h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
                 }
                 CTy::Boxed(e) => {
                     if needs_drop_c(p, e) {
@@ -6785,6 +6923,7 @@ fn glue_def_value(
                             let _ = writeln!(body, "#error \"internal: drop glue calls a fn with no generated body\"");
                         }
                         let _ = writeln!(body, "  {}(p);", glue_callee(p, slots, drop_fn, types));
+                        body.push_str(UNW_DSTEP);
                     }
                     let adt = p.adt(*a);
                     if adt.is_enum {
@@ -6812,6 +6951,15 @@ fn glue_def_value(
                     }
                 }
                 _ => {}
+            }
+            // panic=unwind: a panicking drop leaves the rest to drop as
+            // cleanup, and the glue passes the exception on at its end.
+            if p.unwind && body.contains('(') {
+                let dstep = UNW_DSTEP.trim();
+                body = unwind::wrap_calls(&body.replace("UNW_DSTEP ", UNW_DSTEP.trim_start()), dstep);
+                body = format!("  lust_exc ex; int32_t u = 0;\n{body}  if (u) lust_unw_resume(&ex);\n");
+            } else {
+                body = body.replace(UNW_DSTEP, "").replace("UNW_DSTEP ", "");
             }
             let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n{body}}}\n");
         }
@@ -7491,7 +7639,7 @@ mod tests {
         let mut glue = GlueSet::default();
         glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
         let units = [
-            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[]),
+            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[], false),
             glue_unit(&program, &glue),
             runtime_unit(),
             table_unit(n, &[4]),

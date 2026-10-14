@@ -480,10 +480,17 @@ impl FnGen<'_, '_, '_> {
         if newline {
             let _ = writeln!(self.out, "    {guard}lust_f_write(&{s}f, \"\\n\", 1);");
         }
+        // panic=unwind: unlock first, so a panic that leaves for cleanup
+        // does not keep the stream locked.
+        if self.p.unwind {
+            let _ = writeln!(self.out, "    lust_print_end({fd});");
+        }
         if fallible {
             let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed(2, {loc});");
         }
-        let _ = writeln!(self.out, "    lust_print_end({fd});");
+        if !self.p.unwind {
+            let _ = writeln!(self.out, "    lust_print_end({fd});");
+        }
     }
 
     /// Emits the writes of `parts` through the Formatter `{s}f` the
@@ -521,6 +528,12 @@ impl FnGen<'_, '_, '_> {
                     let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
                     let _ = writeln!(self.out, "    {guard}{{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
                     fallible |= may_fail(&t);
+                    // panic=unwind: a fmt impl that panicked stops the
+                    // formatting like an error, and a print still writes
+                    // the pieces before it (Rust writes as it formats).
+                    if self.p.unwind && may_fail(&t) {
+                        let _ = writeln!(self.out, "    if (lust_unw_pending && lust_unw_mine()) {s}e = 1;");
+                    }
                 }
             }
         }

@@ -56,6 +56,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        stmt_unwind: Vec::new(),
     };
     let info = ck.closures.iter().find(|c| c.def == def).cloned();
     let poisoned = ck.poisoned;
@@ -83,6 +84,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         unwind_steps: Default::default(),
         unwind_end: None,
         unwind_last: None,
+        in_cleanup: false,
     };
     let Some(info) = info.filter(|_| !poisoned) else {
         // The parent failed to check and reports why; keep the shape
@@ -146,8 +148,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         lw.bind_pat(prm.pat, Place::local(l));
     }
     lw.expr_into(*body_expr, Some(&Place::local(0)));
-    let root = lw.scopes.pop().unwrap();
-    lw.emit_drops(&root, span);
+    lw.pop_scope(span);
     lw.terminate(Terminator::Return, span);
     lw.rewrite_upvars();
     lw.map_annotations();

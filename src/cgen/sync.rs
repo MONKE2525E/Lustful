@@ -572,7 +572,7 @@ impl FnGen<'_, '_, '_> {
             S::ThreadSpawn | S::ScopeSpawn | S::ThreadScope => unreachable!("closure-taking thread calls go through thread_closure_call"),
             S::ThreadCurrent => "lust_thread_current()".into(),
             S::ThreadYieldNow => "(lust_thread_yield(), ((lust_Unit){}))".into(),
-            S::ThreadPanicking => "((uint8_t)0)".into(),
+            S::ThreadPanicking => if self.p.unwind { "lust_unw_panicking()".into() } else { "((uint8_t)0)".into() },
             S::JoinHandleJoin => {
                 // `Ok(value)`: the result sits right after the header.
                 let el = match &tys[0] {

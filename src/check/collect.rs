@@ -267,6 +267,11 @@ pub struct Program<'a> {
     /// process): body checks then use a sink that records nothing. Set by
     /// the driver after collection.
     pub record_reads: bool,
+    /// The panic strategy is unwind (`-C panic=unwind`, or a Cargo
+    /// profile that unwinds): lowering records cleanup entries for
+    /// statements and codegen propagates panics (docs/ARCH.md 7.2).
+    /// Set by the driver after collection from the session's profile.
+    pub unwind: bool,
     /// Region signatures for the borrow checker (W-BORROW, ARCH 5): the
     /// signatures with their lifetimes kept, beside the erased ones above.
     pub regions: crate::borrowck::RegionTables,
@@ -2378,6 +2383,7 @@ pub fn collect_reuse<'a>(
         resolved,
         gx: GenTables::default(),
         record_reads: true,
+        unwind: false,
         regions: Default::default(),
     };
     p.gx.walk_instances = walk_instances;

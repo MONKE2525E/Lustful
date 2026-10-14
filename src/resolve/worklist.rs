@@ -521,7 +521,7 @@ fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
     for f in &env.features {
         facts.push(("feature".to_string(), Some(f.clone())));
     }
-    crate::expand::builtin::CfgEnv { test: env.flags.contains("test"), debug_assertions: env.flags.contains("debug_assertions"), facts }
+    crate::expand::builtin::CfgEnv { test: env.flags.contains("test"), debug_assertions: env.flags.contains("debug_assertions"), facts, panic_unwind: false }
 }
 
 /// Evaluates every `#[cfg]`/`#[cfg_attr]` predicate and `cfg!` call in

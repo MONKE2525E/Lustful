@@ -95,6 +95,9 @@ struct Lower<'p, 'a> {
     /// sequence ends with it reuses it as the suffix, so only the
     /// locals added since then need new ladder steps.
     unwind_last: Option<(Vec<Local>, Bb)>,
+    /// Set while a cleanup ladder step lowers its drops: those drops
+    /// are cleanup themselves and get no cleanup entry.
+    in_cleanup: bool,
 }
 
 /// Lowers one checked function body to IR.
@@ -121,6 +124,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        stmt_unwind: Vec::new(),
     };
     let mut lw = Lower {
         p,
@@ -146,6 +150,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         unwind_steps: Default::default(),
         unwind_end: None,
         unwind_last: None,
+        in_cleanup: false,
     };
     // A template's own `impl Trait` return is its hidden type here, so the
     // borrow checker sees the returned value's regions (check/opaque.rs).
@@ -191,8 +196,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     if let Some(b) = body {
         lw.block_into(b, Some(&Place::local(0)));
     }
-    let root = lw.scopes.pop().unwrap();
-    lw.emit_drops(&root, span);
+    lw.pop_scope(span);
     lw.terminate(Terminator::Return, span);
     lw.map_annotations();
     lw.mark_opaque_locals();
@@ -244,7 +248,46 @@ impl<'p, 'a> Lower<'p, 'a> {
         Bb(self.body.blocks.len() as u32 - 1)
     }
     fn push(&mut self, kind: StmtKind, span: Span) {
+        let unwinds = self.p.unwind && !self.in_cleanup && self.may_unwind(&kind);
         self.body.blocks[self.cur.0 as usize].stmts.push(crate::ir::Stmt { kind, span });
+        if unwinds {
+            let n = self.body.blocks[self.cur.0 as usize].stmts.len() as u32 - 1;
+            self.record_unwind(n, span);
+        }
+    }
+    /// Records the cleanup entry at the current scopes for statement
+    /// `idx` of the current block (`Body::stmt_unwind`).
+    fn record_unwind(&mut self, idx: u32, span: Span) {
+        let at = self.cur;
+        let entry = self.unwind_block(span);
+        self.body.stmt_unwind.push((at, idx, entry));
+    }
+    /// Whether a statement can start or pass on a panic, so it needs a
+    /// cleanup entry under panic=unwind. Conservative: only moves,
+    /// borrows, and value building of plain operands with no indexed
+    /// place and no destination drop are known not to.
+    fn may_unwind(&mut self, kind: &StmtKind) -> bool {
+        match kind {
+            StmtKind::StorageDead(_) | StmtKind::FakeRead(_) => false,
+            StmtKind::Drop(_) | StmtKind::Print { .. } => true,
+            StmtKind::Assign(dest, rv) => {
+                let indexed = |pl: &Place| pl.proj.iter().any(|p| matches!(p, crate::ir::Proj::Index(_)));
+                let op_indexed = |o: &Operand| matches!(o, Operand::Copy(pl) | Operand::Move(pl) if indexed(pl));
+                if indexed(dest) || !dest.proj.is_empty() || self.needs_drop_ty(self.body.locals[dest.local as usize].ty) {
+                    return true;
+                }
+                match rv {
+                    Rvalue::Use(o) | Rvalue::Opt(_, Some(o)) | Rvalue::Res(_, _, o) => op_indexed(o),
+                    Rvalue::Ref(_, pl) | Rvalue::Discriminant(pl) | Rvalue::SliceOf(pl) | Rvalue::LenOf(pl) => indexed(pl),
+                    Rvalue::Aggregate(_, _, os) | Rvalue::TupleAgg(_, os) | Rvalue::ArrayAgg(_, os) => os.iter().any(op_indexed),
+                    Rvalue::Opt(_, None) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) => false,
+                    Rvalue::MakeDyn { ptr, .. } | Rvalue::DynUpcast { ptr, .. } | Rvalue::DynMeta { ptr, .. } | Rvalue::DynData { ptr, .. } => {
+                        op_indexed(ptr)
+                    }
+                    _ => true,
+                }
+            }
+        }
     }
     fn assign(&mut self, place: Place, rv: Rvalue, span: Span) {
         self.push(StmtKind::Assign(place, rv), span);
@@ -329,11 +372,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             return bb;
         }
         let bb = self.new_block();
-        let saved = self.cur;
+        let saved = (self.cur, self.in_cleanup);
         self.cur = bb;
+        self.in_cleanup = true;
         self.emit_drops(&[l], span);
         self.goto(next, span);
-        self.cur = saved;
+        (self.cur, self.in_cleanup) = saved;
         self.unwind_steps.insert((l, next), bb);
         bb
     }
@@ -347,6 +391,10 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
     /// Ends the current block. Later code goes into a fresh block (unreachable if nothing jumps there).
     fn terminate(&mut self, term: Terminator, span: Span) {
+        if self.p.unwind && matches!(term, Terminator::Panic(_)) {
+            let n = self.body.blocks[self.cur.0 as usize].stmts.len() as u32;
+            self.record_unwind(n, span);
+        }
         let b = &mut self.body.blocks[self.cur.0 as usize];
         b.term = term;
         b.term_span = span;
@@ -382,9 +430,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.push(StmtKind::StorageDead(l), span);
         }
     }
+    /// Drops the innermost scope's locals, then pops it. The scope stays
+    /// on the stack while its drops lower, so a drop that panics gets a
+    /// cleanup entry that still drops the scope's other locals.
     fn pop_scope(&mut self, span: Span) {
-        let s = self.scopes.pop().unwrap();
+        let s = self.scopes.last().unwrap().clone();
         self.emit_drops(&s, span);
+        self.scopes.pop();
     }
     /// Emits drops for every scope deeper than `depth`, without popping them (for break/return).
     fn exit_to(&mut self, depth: usize, span: Span) {

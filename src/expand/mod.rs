@@ -689,7 +689,7 @@ impl<'a> ExpandCtx<'a> {
             known,
             file_path: file_path.to_string_lossy().to_string(),
             src,
-            cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new() },
+            cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new(), panic_unwind: false },
             module_path: Vec::new(),
             crate_name: None,
             client: &ClientView::PROCESS,

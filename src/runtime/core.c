@@ -87,11 +87,11 @@ lust_String lust_string_new(void) LUST_BODY({ lust_String s = {(uint8_t *)(uintp
 void lust_string_reserve(lust_String *s, uint64_t extra) LUST_BODY({
     if (s->cap - s->len >= extra) return;
     uint64_t needed = s->len + extra;
-    if (needed < s->len) lust_vec_capacity_overflow();
+    if (needed < s->len) { lust_vec_capacity_overflow(); return; }
     uint64_t cap = s->cap * 2;
     if (cap < needed) cap = needed;
     if (cap < 8) cap = 8;
-    if (cap > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
+    if (cap > (uint64_t)9223372036854775807ull) { lust_vec_capacity_overflow(); return; }
     s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
     s->cap = cap;
 })
@@ -99,8 +99,8 @@ void lust_string_reserve(lust_String *s, uint64_t extra) LUST_BODY({
 void lust_string_reserve_exact(lust_String *s, uint64_t extra) LUST_BODY({
     if (s->cap - s->len >= extra) return;
     uint64_t cap = s->len + extra;
-    if (cap < s->len) lust_vec_capacity_overflow();
-    if (cap > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
+    if (cap < s->len) { lust_vec_capacity_overflow(); return; }
+    if (cap > (uint64_t)9223372036854775807ull) { lust_vec_capacity_overflow(); return; }
     s->ptr = lust_realloc(s->ptr, s->cap, 1, cap);
     s->cap = cap;
 })
@@ -108,7 +108,7 @@ void lust_string_reserve_exact(lust_String *s, uint64_t extra) LUST_BODY({
 lust_String lust_string_with_capacity(uint64_t n) LUST_BODY({
     lust_String s = {(uint8_t *)(uintptr_t)1, 0, 0};
     if (n) {
-        if (n > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
+        if (n > (uint64_t)9223372036854775807ull) { lust_vec_capacity_overflow(); return s; }
         s.ptr = lust_alloc(n, 1);
         s.cap = n;
     }
@@ -285,7 +285,7 @@ void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); lust_print_flush(); ex
    The typed layer owns the shrink_to length assert; this core clamps
    the target at len, which is the same end state. */
 void lust_vec_grow_to(lust_Vec *v, uint64_t new_cap, uint64_t elem, uint64_t align) LUST_BODY({
-    if (new_cap > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();
+    if (new_cap > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return; }
     v->ptr = lust_realloc(v->ptr, v->cap * elem, align, new_cap * elem);
     v->cap = new_cap;
 })
@@ -299,7 +299,7 @@ void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align
     if (!elem) { lust_vec_set_zst(v, align); return; }
     if (v->cap - v->len >= extra) return;
     uint64_t needed = v->len + extra;
-    if (needed < v->len) lust_vec_capacity_overflow();
+    if (needed < v->len) { lust_vec_capacity_overflow(); return; }
     uint64_t cap = v->cap * 2;
     if (cap < needed) cap = needed;
     uint64_t min_cap = elem == 1 ? 8 : elem <= 1024 ? 4 : 1;
@@ -311,7 +311,7 @@ void lust_vec_reserve_exact(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t
     if (!elem) { lust_vec_set_zst(v, align); return; }
     if (v->cap - v->len >= extra) return;
     uint64_t needed = v->len + extra;
-    if (needed < v->len) lust_vec_capacity_overflow();
+    if (needed < v->len) { lust_vec_capacity_overflow(); return; }
     lust_vec_grow_to(v, needed, elem, align);
 })
 
@@ -319,7 +319,7 @@ lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem, uint64_t align) LUST_
     lust_Vec v = {(void *)(uintptr_t)(align ? align : 1), 0, 0};
     if (!elem) { lust_vec_set_zst(&v, align); return v; }
     if (n) {
-        if (n > (uint64_t)9223372036854775807ull / elem) lust_vec_capacity_overflow();
+        if (n > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return v; }
         v.ptr = lust_alloc(n * elem, align);
         v.cap = n;
     }
@@ -361,10 +361,10 @@ void lust_panic_nn(const char *a, uint64_t n, const char *b, uint64_t m, const c
    against the length, the end against the length (an inclusive end
    prints as written; u64::MAX always fails), then start against end. */
 uint64_t lust_slice_range(uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
-    if (lo > len) lust_panic_nn("range start index ", lo, " out of range for slice of length ", len, "", loc);
-    if (inclusive ? hi >= len : hi > len) lust_panic_nn("range end index ", hi, " out of range for slice of length ", len, "", loc);
+    if (lo > len) { lust_panic_nn("range start index ", lo, " out of range for slice of length ", len, "", loc); return lo; }
+    if (inclusive ? hi >= len : hi > len) { lust_panic_nn("range end index ", hi, " out of range for slice of length ", len, "", loc); return lo; }
     uint64_t end = inclusive ? hi + 1 : hi;
-    if (lo > end) lust_panic_nn("slice index starts at ", lo, " but ends at ", end, "", loc);
+    if (lo > end) { lust_panic_nn("slice index starts at ", lo, " but ends at ", end, "", loc); return lo; }
     return end;
 })
 
@@ -395,12 +395,12 @@ static void lust_str_boundary_fail(const char *which, const uint8_t *ptr, uint64
    boundaries (the end of the string or a byte that is not a
    continuation byte). */
 uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
-    if (lo > len) lust_panic_nn("start byte index ", lo, " is out of bounds for string of length ", len, "", loc);
-    if (inclusive ? hi >= len : hi > len) lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc);
+    if (lo > len) { lust_panic_nn("start byte index ", lo, " is out of bounds for string of length ", len, "", loc); return lo; }
+    if (inclusive ? hi >= len : hi > len) { lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc); return lo; }
     uint64_t end = inclusive ? hi + 1 : hi;
-    if (lo > end) lust_panic_nn("byte range starts at ", lo, " but ends at ", end, "", loc);
-    if (lo < len && (ptr[lo] & 0xC0) == 0x80) lust_str_boundary_fail("start byte index ", ptr, lo, loc);
-    if (end < len && (ptr[end] & 0xC0) == 0x80) lust_str_boundary_fail("end byte index ", ptr, end, loc);
+    if (lo > end) { lust_panic_nn("byte range starts at ", lo, " but ends at ", end, "", loc); return lo; }
+    if (lo < len && (ptr[lo] & 0xC0) == 0x80) { lust_str_boundary_fail("start byte index ", ptr, lo, loc); return lo; }
+    if (end < len && (ptr[end] & 0xC0) == 0x80) { lust_str_boundary_fail("end byte index ", ptr, end, loc); return lo; }
     return end;
 })
 
@@ -507,15 +507,15 @@ T lust_add_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a + b; i
 T lust_sub_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a - b; if (r < MINV || r > MAXV) LUST_OVF("subtract"); return (T)r; }) \
 T lust_mul_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a * b; if (r < MINV || r > MAXV) LUST_OVF("multiply"); return (T)r; }) \
 T lust_neg_##N(T a, lust_loc loc) LUST_BODY({ if (a == MINV) LUST_OVF("negate"); return (T)-a; }) \
-T lust_div_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to divide by zero", loc); if (a == MINV && b == -1) LUST_OVF("divide"); return (T)(a / b); }) \
-T lust_rem_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); if (a == MINV && b == -1) LUST_OVF("calculate the remainder"); return (T)(a % b); })
+T lust_div_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; } if (a == MINV && b == -1) { LUST_OVF("divide"); return 0; } return (T)(a / b); }) \
+T lust_rem_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; } if (a == MINV && b == -1) { LUST_OVF("calculate the remainder"); return 0; } return (T)(a % b); })
 
 #define LUST_UNSIGNED_NARROW(T, N, MAXV) \
 T lust_add_##N(T a, T b, lust_loc loc) LUST_BODY({ uint64_t r = (uint64_t)a + b; if (r > MAXV) LUST_OVF("add"); return (T)r; }) \
 T lust_sub_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b > a) LUST_OVF("subtract"); return (T)(a - b); }) \
 T lust_mul_##N(T a, T b, lust_loc loc) LUST_BODY({ uint64_t r = (uint64_t)a * (uint64_t)b; if (r > MAXV) LUST_OVF("multiply"); return (T)r; }) \
-T lust_div_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to divide by zero", loc); return (T)(a / b); }) \
-T lust_rem_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return (T)(a % b); })
+T lust_div_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; } return (T)(a / b); }) \
+T lust_rem_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; } return (T)(a % b); })
 
 LUST_SIGNED_NARROW(int8_t, i8, -128, 127)
 LUST_SIGNED_NARROW(int16_t, i16, -32768, 32767)
@@ -543,20 +543,20 @@ int64_t lust_mul_i64(int64_t a, int64_t b, lust_loc loc) LUST_BODY({
 })
 int64_t lust_neg_i64(int64_t a, lust_loc loc) LUST_BODY({ if (a == INT64_MIN) LUST_OVF("negate"); return -a; })
 int64_t lust_div_i64(int64_t a, int64_t b, lust_loc loc) LUST_BODY({
-    if (b == 0) lust_panic_cstr("attempt to divide by zero", loc);
-    if (a == INT64_MIN && b == -1) LUST_OVF("divide");
+    if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; }
+    if (a == INT64_MIN && b == -1) { LUST_OVF("divide"); return 0; }
     return a / b;
 })
 int64_t lust_rem_i64(int64_t a, int64_t b, lust_loc loc) LUST_BODY({
-    if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
-    if (a == INT64_MIN && b == -1) LUST_OVF("calculate the remainder");
+    if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; }
+    if (a == INT64_MIN && b == -1) { LUST_OVF("calculate the remainder"); return 0; }
     return a % b;
 })
 uint64_t lust_add_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ uint64_t r = a + b; if (r < a) LUST_OVF("add"); return r; })
 uint64_t lust_sub_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ if (b > a) LUST_OVF("subtract"); return a - b; })
 uint64_t lust_mul_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ uint64_t r = a * b; if (a != 0 && r / a != b) LUST_OVF("multiply"); return r; })
-uint64_t lust_div_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to divide by zero", loc); return a / b; })
-uint64_t lust_rem_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return a % b; })
+uint64_t lust_div_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; } return a / b; })
+uint64_t lust_rem_u64(uint64_t a, uint64_t b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; } return a % b; })
 
 uint32_t lust_shift_amount(uint64_t b, uint32_t bits, const char *op, lust_loc loc) LUST_BODY({
     if (b >= bits) {
@@ -565,6 +565,7 @@ uint32_t lust_shift_amount(uint64_t b, uint32_t bits, const char *op, lust_loc l
         lust_string_push_cstr(&s, op);
         lust_string_push_cstr(&s, " with overflow");
         lust_panic(&s, loc);
+        return 0;
     }
     return (uint32_t)b;
 })
@@ -720,15 +721,15 @@ uint64_t lust_div_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, l
     a &= mask;
     b &= mask;
     if (!is_signed) {
-        if (b == 0) lust_panic_cstr("attempt to divide by zero", loc);
+        if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; }
         return a / b;
     }
     {
         int64_t sa = lust_sext64(a, bits), sb = lust_sext64(b, bits);
         int64_t minv = bits >= 64 ? INT64_MIN : -(1ll << (bits - 1));
         int64_t q;
-        if (sb == 0) lust_panic_cstr("attempt to divide by zero", loc);
-        if (sa == minv && sb == -1) LUST_OVF("divide");
+        if (sb == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; }
+        if (sa == minv && sb == -1) { LUST_OVF("divide"); return 0; }
         q = sa / sb;
         if (sa % sb < 0) q += sb > 0 ? -1 : 1;
         return (uint64_t)q & mask;
@@ -739,15 +740,15 @@ uint64_t lust_rem_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, l
     a &= mask;
     b &= mask;
     if (!is_signed) {
-        if (b == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+        if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; }
         return a % b;
     }
     {
         int64_t sa = lust_sext64(a, bits), sb = lust_sext64(b, bits);
         int64_t minv = bits >= 64 ? INT64_MIN : -(1ll << (bits - 1));
         int64_t r;
-        if (sb == 0) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
-        if (sa == minv && sb == -1) LUST_OVF("calculate the remainder");
+        if (sb == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; }
+        if (sa == minv && sb == -1) { LUST_OVF("calculate the remainder"); return 0; }
         r = sa % sb;
         if (r < 0) r += sb > 0 ? sb : -sb;
         return (uint64_t)r & mask;
@@ -979,11 +980,11 @@ lust_u128 lust_mul_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
     return r;
 })
 lust_u128 lust_div_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
-    if (!b.lo && !b.hi) lust_panic_cstr("attempt to divide by zero", loc);
+    if (!b.lo && !b.hi) { lust_panic_cstr("attempt to divide by zero", loc); return b; }
     return lust_u128_divmod(a, b, 0);
 })
 lust_u128 lust_rem_u128(lust_u128 a, lust_u128 b, lust_loc loc) LUST_BODY({
-    if (!b.lo && !b.hi) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+    if (!b.lo && !b.hi) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return b; }
     lust_u128 r;
     (void)lust_u128_divmod(a, b, &r);
     return r;
@@ -1026,7 +1027,7 @@ lust_i128 lust_mul_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
     return r;
 })
 lust_i128 lust_div_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
-    if (!b.lo && !b.hi) lust_panic_cstr("attempt to divide by zero", loc);
+    if (!b.lo && !b.hi) { lust_panic_cstr("attempt to divide by zero", loc); return b; }
     if (a.lo == 0 && a.hi == 0x8000000000000000ull && b.lo == 0xFFFFFFFFFFFFFFFFull && b.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("divide");
     lust_u128 q = lust_u128_divmod(lust_i128_mag(a), lust_i128_mag(b), 0);
     if (((a.hi ^ b.hi) >> 63) & 1) {
@@ -1036,7 +1037,7 @@ lust_i128 lust_div_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
     return lust_i128_from_u128(q);
 })
 lust_i128 lust_rem_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
-    if (!b.lo && !b.hi) lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc);
+    if (!b.lo && !b.hi) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return b; }
     if (a.lo == 0 && a.hi == 0x8000000000000000ull && b.lo == 0xFFFFFFFFFFFFFFFFull && b.hi == 0xFFFFFFFFFFFFFFFFull) LUST_OVF("calculate the remainder");
     lust_u128 r;
     (void)lust_u128_divmod(lust_i128_mag(a), lust_i128_mag(b), &r);
@@ -1189,6 +1190,7 @@ void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, 
         lust_fmt_u64(&s, v->len);
         lust_string_push_cstr(&s, ")");
         lust_panic(&s, loc);
+        return;
     }
     lust_vec_reserve(v, 1, elem, align);
     memmove((char *)v->ptr + (i + 1) * elem, (char *)v->ptr + i * elem, (v->len - i) * elem);
@@ -1303,9 +1305,9 @@ lust_String lust_str_repeat(lust_str s, uint64_t n, lust_loc loc) LUST_BODY({
     /* `checked_mul(n).expect(..)` in alloc's slice.rs, then RawVec's
        isize::MAX byte limit. */
     (void)loc;
-    if (s.len && n > UINT64_MAX / s.len) lust_panic_std("capacity overflow", "alloc/src/slice.rs:524:50");
+    if (s.len && n > UINT64_MAX / s.len) { lust_panic_std("capacity overflow", "alloc/src/slice.rs:524:50"); return lust_string_new(); }
     uint64_t total = s.len * n;
-    if (total > (uint64_t)9223372036854775807ull) lust_vec_capacity_overflow();
+    if (total > (uint64_t)9223372036854775807ull) { lust_vec_capacity_overflow(); return lust_string_new(); }
     lust_String r = lust_string_with_capacity(total);
     for (uint64_t i = 0; i < n; i++) { memcpy(r.ptr + r.len, s.ptr, s.len); r.len += s.len; }
     return r;
@@ -1354,7 +1356,8 @@ static void lust_string_check_boundary(lust_String *s, uint64_t idx, const char 
 /* String::remove slices `self[idx..]` first, so it panics as that slice does. */
 uint32_t lust_string_remove(lust_String *s, uint64_t idx, lust_loc loc) LUST_BODY({
     (void)lust_str_range(s->ptr, idx, s->len, 0, s->len, loc);
-    if (idx == s->len) lust_panic_cstr("cannot remove a char from the end of a string", loc);
+    if (lust_unwind_mode && lust_unw_mine()) return 0;
+    if (idx == s->len) { lust_panic_cstr("cannot remove a char from the end of a string", loc); return 0; }
     uint64_t j = idx;
     uint32_t c = lust_utf8_next(s->ptr, &j);
     memmove(s->ptr + idx, s->ptr + j, s->len - j);
@@ -1364,6 +1367,7 @@ uint32_t lust_string_remove(lust_String *s, uint64_t idx, lust_loc loc) LUST_BOD
 
 void lust_string_insert_bytes(lust_String *s, uint64_t idx, const uint8_t *p, uint64_t n, lust_loc loc) LUST_BODY({
     lust_string_check_boundary(s, idx, "idx", loc);
+    if (lust_unwind_mode && lust_unw_mine()) return;
     /* Copy the inserted bytes first: they may view this String. */
     uint8_t small[4];
     uint8_t *tmp = small;
@@ -1389,12 +1393,14 @@ void lust_string_insert_char(lust_String *s, uint64_t idx, uint32_t c, lust_loc 
 void lust_string_truncate(lust_String *s, uint64_t n, lust_loc loc) LUST_BODY({
     if (n < s->len) {
         lust_string_check_boundary(s, n, "new_len", loc);
+        if (lust_unwind_mode && lust_unw_mine()) return;
         s->len = n;
     }
 })
 
 lust_String lust_string_split_off(lust_String *s, uint64_t at, lust_loc loc) LUST_BODY({
     lust_string_check_boundary(s, at, "at", loc);
+    if (lust_unwind_mode && lust_unw_mine()) return lust_string_new();
     lust_String r = lust_string_with_capacity(s->len - at);
     memcpy(r.ptr, s->ptr + at, s->len - at);
     r.len = s->len - at;

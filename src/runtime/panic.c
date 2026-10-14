@@ -30,8 +30,198 @@ static unsigned long long lust_os_tid(void) {
 #define LUST_STD_SRC "/rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/"
 #endif
 
-/* Prints the default hook text for `msg` at `file:line:col` and aborts. */
+/* ---------- Unwinding (panic=unwind, ARCH 7.2) ----------
+   Explicit propagation: a panic runs the hook, then marks an exception
+   pending on its thread and returns. Generated code checks after each
+   call and each statement that can panic: when its thread has a pending
+   exception, the frame takes it (`lust_unw_take`) into its own `ex`,
+   runs its cleanup blocks (the drops of its live locals, as normal
+   code), and gives it back (`lust_unw_resume`) as it returns. So while
+   a frame cleans up, nothing is pending and the destructors it calls
+   run normally. A destructor that ends with a new pending exception
+   during cleanup aborts (`lust_unw_cleanup_abort`).
+   `lust_unw_pending` counts threads with a pending exception: 0 in
+   almost every run, so the fast path of every check is one load. No C
+   TLS (tcc breaks it in shared objects): thread state is under a
+   pthread key. A panic while its thread already has a pending exception
+   comes from code that runs on after the first panic in the same C
+   statement (it uses only safe placeholder values); it does nothing.
+   `lust_unwind_mode` is 0 (panic=abort: every panic aborts, as before)
+   unless main sets it. The runtime object is the same in both modes. */
+typedef struct {
+    uint32_t kind; /* LUST_EXC_STR, LUST_EXC_STRING, or LUST_EXC_BOX */
+    lust_str s;    /* the message bytes; LUST_EXC_STRING owns them */
+    lust_dyn box;  /* LUST_EXC_BOX: a Box<dyn Any + Send> */
+} lust_exc;
+#define LUST_EXC_STR 0u
+#define LUST_EXC_STRING 1u
+#define LUST_EXC_BOX 2u
+extern int32_t lust_unwind_mode;
+extern int32_t lust_unw_pending;
+/* The checks codegen emits (cgen/unwind.rs): take a new exception and
+   run the cleanup from block b, or abort inside cleanup. */
+#define LUST_UNW(b) if (lust_unw_pending && lust_unw_take(&ex)) goto bb##b
+#define LUST_UNW_ABORT() if (lust_unw_pending && lust_unw_mine()) lust_unw_cleanup_abort()
+#ifdef LUST_IMPL
+int32_t lust_unwind_mode;
+int32_t lust_unw_pending;
+int pthread_key_create(unsigned int *key, void (*dtor)(void *));
+void *pthread_getspecific(unsigned int key);
+int pthread_setspecific(unsigned int key, const void *v);
+int pthread_once(int *once, void (*init)(void));
+
+/* One thread's panic state. `count` is Rust's local panic count: it
+   rises when a panic starts and falls when a catch takes it, so
+   `thread::panicking()` is `count > 0`. */
+typedef struct {
+    int32_t count;
+    int32_t in_hook;
+    int32_t pending;
+    lust_exc exc;
+} lust_unw_state;
+static unsigned int lust_unw_key;
+static int lust_unw_once;
+/* Rust's FIRST_PANIC: the backtrace note prints for the first panic only. */
+static int32_t lust_first_panic = 1;
+
+/* Set once the key exists (as thread.c's lust_tls_ready). */
+static int lust_unw_ready;
+static void lust_unw_make_key(void) {
+    if (pthread_key_create(&lust_unw_key, free) != 0) abort();
+    int one = 1;
+    __atomic_store(&lust_unw_ready, &one, 3);
+}
+static lust_unw_state *lust_unw_get(void) {
+    pthread_once(&lust_unw_once, lust_unw_make_key);
+    lust_unw_state *s = (lust_unw_state *)pthread_getspecific(lust_unw_key);
+    if (!s) {
+        s = (lust_unw_state *)calloc(1, sizeof *s);
+        if (!s) abort();
+        pthread_setspecific(lust_unw_key, s);
+    }
+    return s;
+}
+/* The calling thread's state, or NULL when it never panicked. */
+static lust_unw_state *lust_unw_peek(void) {
+    int ready;
+    __atomic_load(&lust_unw_ready, &ready, 2);
+    if (!ready) return 0;
+    return (lust_unw_state *)pthread_getspecific(lust_unw_key);
+}
+static void lust_unw_set_pending(lust_unw_state *s, lust_exc *ex) {
+    s->exc = *ex;
+    s->pending = 1;
+    __atomic_add_fetch(&lust_unw_pending, 1, 5);
+}
+
+/* Rust's FIRST_PANIC swap: 1 for the process's first panic only. */
+static int32_t lust_first_panic_take(void) {
+    int32_t zero = 0, old;
+    __atomic_exchange(&lust_first_panic, &zero, &old, 0);
+    return old;
+}
+
+/* The default hook's text (std's default_hook) on the current thread. */
+static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col, int32_t count) {
+    fprintf(stderr, "\nthread 'main' (%llu) panicked at %s:%u:%u:\n%.*s\n", lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len,
+            (const char *)msg);
+    /* A panic while panicking prints a full backtrace in Rust; lust has no
+       frames to print, only the header. */
+    if (count >= 2) fputs("stack backtrace:\n", stderr);
+    else if (lust_first_panic_take()) fputs("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n", stderr);
+    fflush(stderr);
+}
+
+/* Starts a panic in unwind mode: the hook, then the exception pending. */
+static void lust_unw_raise(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
+    lust_unw_state *s = lust_unw_get();
+    if (s->pending) return;
+    s->count++;
+    s->in_hook = 1;
+    lust_default_hook(msg, len, file, line, col, s->count);
+    s->in_hook = 0;
+    lust_exc ex;
+    ex.kind = LUST_EXC_STRING;
+    ex.s.ptr = (uint8_t *)lust_alloc(len, 1);
+    if (len) memcpy(ex.s.ptr, msg, len);
+    ex.s.len = len;
+    ex.box.data = 0;
+    ex.box.vt = 0;
+    lust_unw_set_pending(s, &ex);
+}
+
+/* Frees an exception's payload (an uncaught one at a thread root). */
+static void lust_exc_drop(lust_exc *ex) {
+    if (ex->kind == LUST_EXC_STRING) lust_dealloc(ex->s.ptr, ex->s.len, 1);
+    if (ex->kind == LUST_EXC_BOX) {
+        if (ex->box.vt[0]) ((void (*)(void *))ex->box.vt[0])(ex->box.data);
+        lust_dealloc(ex->box.data, (uint64_t)(uintptr_t)ex->box.vt[1], (uint64_t)(uintptr_t)ex->box.vt[2]);
+    }
+}
+#endif
+
+/* Takes the calling thread's pending exception into `ex` (a frame starts
+   its cleanup): 1, or 0 when this thread has none. */
+int32_t lust_unw_take(lust_exc *ex) LUST_BODY({
+    lust_unw_state *s = lust_unw_peek();
+    if (!s || !s->pending) return 0;
+    *ex = s->exc;
+    s->pending = 0;
+    __atomic_sub_fetch(&lust_unw_pending, 1, 5);
+    return 1;
+})
+
+/* Makes `ex` pending again: the frame's cleanup is done and it returns. */
+void lust_unw_resume(lust_exc *ex) LUST_BODY({ lust_unw_set_pending(lust_unw_get(), ex); })
+
+/* `thread::panicking()`: a panic started on this thread and no catch
+   has taken it yet. */
+uint8_t lust_unw_panicking(void) LUST_BODY({
+    lust_unw_state *s = lust_unw_peek();
+    return s && s->count > 0;
+})
+
+/* 1 when the calling thread has a pending exception. */
+int32_t lust_unw_mine(void) LUST_BODY({
+    lust_unw_state *s = lust_unw_peek();
+    return s && s->pending;
+})
+
+/* A destructor that cleanup called ended with a new exception: Rust's
+   nounwind "panic in a destructor during cleanup", then abort. */
+void lust_unw_cleanup_abort(void) LUST_BODY({
+    fprintf(stderr, "\nthread 'main' (%llu) panicked at " LUST_STD_SRC "core/src/panicking.rs:233:5:\npanic in a destructor during cleanup\nthread caused non-unwinding panic. aborting.\n",
+            lust_os_tid());
+    fflush(stderr);
+    abort();
+})
+
+/* One step of drop glue that keeps dropping after a panic (Rust drops the
+   other fields and elements as cleanup): the first exception moves into
+   `ex` and sets `*u`; one more aborts. The glue resumes `ex` at its end. */
+void lust_unw_dstep(lust_exc *ex, int32_t *u) LUST_BODY({
+    if (!lust_unw_mine()) return;
+    if (*u) lust_unw_cleanup_abort();
+    lust_unw_take(ex);
+    *u = 1;
+})
+
+/* After `main` returns: 101 when it ended by a panic (std's lang_start
+   catches it and drops the payload), else 0. */
+int32_t lust_unw_main_exit(void) LUST_BODY({
+    lust_exc ex;
+    if (!lust_unw_pending || !lust_unw_take(&ex)) return 0;
+    lust_exc_drop(&ex);
+    return 101;
+})
+
+/* Prints the default hook text for `msg` at `file:line:col` and aborts;
+   in unwind mode it raises the panic and returns. */
 void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) LUST_BODY({
+    if (lust_unwind_mode) {
+        lust_unw_raise(msg, len, file, line, col);
+        return;
+    }
     fprintf(stderr, "\nthread 'main' (%llu) panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
             lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len, (const char *)msg);
     fflush(stderr);
@@ -75,6 +265,7 @@ void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
     uint32_t slot = (uint32_t)(loc >> 40);
     if (slot >= LUST_STD_SLOT) {
         lust_panic_at(msg->ptr, msg->len, lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW], (loc >> 20) & 0xFFFFF, loc & 0xFFFFF);
+        return;
     }
     const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
     lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF), loc & 0xFFFFF);
@@ -105,6 +296,16 @@ void lust_ovf(const char *op, lust_loc loc) LUST_BODY({
 /* A panic Rust raises at a fixed line of its own std source: `where` is
    "path:line:col" under library/. */
 void lust_panic_std(const char *msg, const char *where) LUST_BODY({
+    if (lust_unwind_mode) {
+        /* `where` is "path:line:col"; split it for the hook. */
+        const char *c2 = strrchr(where, ':'), *c1 = c2;
+        while (c1 > where && c1[-1] != ':') c1--;
+        char file[256];
+        int n = snprintf(file, sizeof file, LUST_STD_SRC "%.*s", (int)(c1 - 1 - where), where);
+        (void)n;
+        lust_unw_raise((const uint8_t *)msg, strlen(msg), file, (uint32_t)strtoul(c1, 0, 10), (uint32_t)strtoul(c2 + 1, 0, 10));
+        return;
+    }
     fprintf(stderr, "\nthread 'main' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
             lust_os_tid(), where, msg);
     fflush(stderr);
@@ -150,6 +351,7 @@ static void lust_out_raw(const uint8_t *p, uint64_t n) {
             else { char b[32]; snprintf(b, sizeof b, " (os error %d)", e); lust_string_push_cstr(&s, strerror(e)); lust_string_push_cstr(&s, b); }
             lust_out_len = 0;
             lust_panic_at(s.ptr, s.len, LUST_STD_SRC "std/src/io/stdio.rs", 1168, 9);
+            return;
         }
         p += w;
         n -= (uint64_t)w;

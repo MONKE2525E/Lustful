@@ -120,8 +120,9 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        stmt_unwind: body.stmt_unwind.clone(),
     };
-    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false, unw: None };
     let n = ex.body.blocks.len();
     for b in 0..n {
         let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
@@ -129,9 +130,10 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
             continue;
         }
         let term = std::mem::replace(&mut ex.body.blocks[b].term, Terminator::Unreachable);
-        let Terminator::Call { args, dest, next, .. } = term else { unreachable!() };
+        let Terminator::Call { args, dest, next, unwind, .. } = term else { unreachable!() };
         ex.cur = Bb(b as u32);
         ex.span = ex.body.blocks[b].term_span;
+        ex.unw = unwind;
         ex.builtin(x, args, dest)?;
         ex.goto(next);
     }
@@ -149,6 +151,9 @@ struct Ex<'b, 'p, 'g> {
     /// and SkipWhile (their `next` is a `find`). Take and Skip then step
     /// as their `try_fold` does (`next_in`).
     fold: bool,
+    /// The expanded call's cleanup successor: every call and statement
+    /// of its expansion that can unwind continues there (panic=unwind).
+    unw: Option<Bb>,
 }
 
 impl Ex<'_, '_, '_> {
@@ -164,7 +169,13 @@ impl Ex<'_, '_, '_> {
     }
     fn push(&mut self, kind: StmtKind) {
         let span = self.span;
-        self.body.blocks[self.cur.0 as usize].stmts.push(Stmt { kind, span });
+        let unwinds = !matches!(kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_));
+        let stmts = &mut self.body.blocks[self.cur.0 as usize].stmts;
+        stmts.push(Stmt { kind, span });
+        if let Some(u) = self.unw.filter(|_| unwinds && self.p.unwind) {
+            let n = stmts.len() as u32 - 1;
+            self.body.stmt_unwind.push((self.cur, n, u));
+        }
     }
     fn assign(&mut self, pl: Place, rv: Rvalue) {
         self.push(StmtKind::Assign(pl, rv));
@@ -173,6 +184,10 @@ impl Ex<'_, '_, '_> {
         self.push(StmtKind::Drop(l));
     }
     fn term(&mut self, t: Terminator) {
+        if let Some(u) = self.unw.filter(|_| self.p.unwind && matches!(t, Terminator::Panic(_))) {
+            let n = self.body.blocks[self.cur.0 as usize].stmts.len() as u32;
+            self.body.stmt_unwind.push((self.cur, n, u));
+        }
         let b = &mut self.body.blocks[self.cur.0 as usize];
         b.term = t;
         b.term_span = self.span;
@@ -183,7 +198,7 @@ impl Ex<'_, '_, '_> {
     /// Ends the current block with a call and continues after it.
     fn call(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place) {
         let next = self.block();
-        self.term(Terminator::Call { target, args, dest, next, unwind: None });
+        self.term(Terminator::Call { target, args, dest, next, unwind: self.unw });
         self.cur = next;
     }
     fn call_builtin(&mut self, b: Builtin, args: Vec<Operand>, dest: Place) {

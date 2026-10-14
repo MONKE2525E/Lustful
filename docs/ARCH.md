@@ -3686,6 +3686,62 @@ Keep `panic = "abort"` crates (wasm
 profile in ts-rust's `Cargo.toml:38-47`) on the old
 path: no checks, `catch_unwind` rejected there.
 
+#### 7.2.1 As built (W-UNWIND)
+
+The build follows the plan above: explicit propagation, cleanup
+ladders from lowering, no C TLS, one global load on the fast path.
+These parts differ from the plan, and why:
+
+- Mode. `-C panic=unwind` sets `ProfileFlags::panic_abort` false.
+  Cargo packages follow their profile's `panic` setting once threads
+  unwind (Cargo's dev and release profiles unwind; until then a
+  package builds with panic=abort, and `thread::spawn` under
+  panic=unwind is L0820). The profile is part
+  of the session key, so the daemon keeps one session per mode and
+  never mixes their IR or C. `Program::unwind` carries the mode to
+  lowering and codegen; `cfg(panic)` follows it. Under panic=abort
+  the IR and the C are unchanged.
+- State. No `gen` counter and no separate unwind and catch depths.
+  Each thread has Rust's local panic count (`panicking()` is
+  `count > 0`; a catch lowers it), an in-hook bit, and a *pending*
+  exception. When a frame takes its unwind edge it moves the pending
+  exception into a frame local (`lust_exc ex`), so nothing is pending
+  while its destructors run, and gives it back at the end of its
+  ladder. The global `lust_unw_pending` counts threads with a pending
+  exception, so it is 0 during cleanup too and destructors take the
+  fast path. A drop that ends with a new pending exception in a
+  cleanup block aborts with Rust's "panic in a destructor during
+  cleanup".
+- Statement edges. Panics also start inside statements (overflow,
+  indexes, unwrap, RefCell, runtime helpers, drop glue of a scope
+  exit). Lowering records a cleanup entry for each statement that can
+  unwind (`Body::stmt_unwind`; empty under abort), built from the
+  same ladder as calls. A scope's drops lower while the scope is
+  still on the stack, so a panicking drop still drops its siblings.
+  Codegen checks after such a statement, wraps each call statement in
+  it (`cgen/unwind.rs`), and emits an index as a GNU statement
+  expression that jumps to cleanup before it reads the element (tcc
+  and gcc both accept a `goto` out of one).
+- Code that runs on. A runtime helper that panics returns a safe
+  placeholder (an empty range, 0 for a division) so the rest of its C
+  statement does no harm, and any lust fn called while its thread has
+  a pending exception returns at once (one check in the prologue).
+  That covers glue and runtime callbacks (sort comparators, hash
+  callbacks) without changing them: they finish with placeholder
+  answers and the caller's check unwinds.
+- Glue. Drop glue drops the remaining fields and elements as cleanup
+  after a panic (`lust_unw_dstep`) and passes the exception on at its
+  end, as Rust's drop glue does. A print writes piece by piece
+  through the stream (`lust_print_begin`, both modes); a fmt impl that
+  panics stops the print like a fmt error, so the text it wrote stays
+  in order with what its cleanup prints.
+- Hook text. The default hook prints the backtrace note only for the
+  first panic of the process; a panic while panicking prints Rust's
+  "stack backtrace:" header and no frames (difftest drops frame lines
+  on both sides). A TLS destructor that panics aborts with Rust's
+  "thread local panicked on drop" line. `main` that ends by a panic
+  exits 101 after TLS destructors and the stdout flush.
+
 ### 7.3 Threads, TLS, atomics, sync
 
 - Runtime: pthreads through tcclib-linked libc.

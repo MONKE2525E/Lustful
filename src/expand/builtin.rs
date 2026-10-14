@@ -105,6 +105,9 @@ pub struct CfgEnv {
     /// environment (section 1.6) wins where the two disagree. Empty on
     /// the single-file path, which keeps the host facts.
     pub facts: Vec<(String, Option<String>)>,
+    /// The panic strategy is unwind (`-C panic=unwind`): `cfg(panic)`
+    /// in the host facts below.
+    pub panic_unwind: bool,
 }
 
 impl CfgEnv {
@@ -112,16 +115,15 @@ impl CfgEnv {
         if !self.facts.is_empty() {
             return self.facts.iter().any(|(n, v)| n == name && v.as_deref() == value);
         }
-        // The host target as `rustc --print cfg -C panic=abort` prints it
-        // for x86_64/aarch64 Linux: lust builds with panic=abort and for the
-        // host, so these are the facts a cfg in user code sees.
+        // The host target as `rustc --print cfg` prints it for
+        // x86_64/aarch64 Linux with the build's panic strategy: lust builds
+        // for the host, so these are the facts a cfg in user code sees.
         match (name, value) {
             ("test", None) => self.test,
             ("debug_assertions", None) => self.debug_assertions,
             ("unix", None) => true,
             ("windows", None) => false,
-            ("panic", Some("abort")) => true,
-            ("panic", Some(_)) => false,
+            ("panic", Some(v)) => v == if self.panic_unwind { "unwind" } else { "abort" },
             ("target_family", Some("unix")) => true,
             ("target_family", Some(_)) => false,
             ("target_os", Some("linux")) => true,

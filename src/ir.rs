@@ -294,6 +294,13 @@ pub struct Body<'g> {
     /// keeps all their regions live to the drop, which lowering emits
     /// even for a hidden type without drop glue (a no-op in codegen).
     pub opaque_locals: Vec<Local>,
+    /// The cleanup entry of each statement that can unwind, as
+    /// (block, statement index, cleanup block), in panic=unwind
+    /// builds only (empty under panic=abort). An index equal to the
+    /// block's statement count names its `Panic` terminator. A `Call`
+    /// keeps its own `unwind` successor. Codegen checks for a new
+    /// exception after each such statement (docs/ARCH.md section 7.2).
+    pub stmt_unwind: Vec<(Bb, u32, Bb)>,
 }
 
 impl Body<'_> {

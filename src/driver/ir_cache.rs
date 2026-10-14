@@ -416,6 +416,9 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
             }
         }
     }
+    for &(b, i, u) in &body.stmt_unwind {
+        (b.0, i, u.0).hash(&mut h);
+    }
     h.finish()
 }
 
@@ -510,6 +513,7 @@ pub(crate) struct CachedBody {
     tys: Vec<TyTree>,
     locals: Vec<(u32, bool, Option<String>)>,
     blocks: Vec<CachedBlock>,
+    stmt_unwind: Vec<(Bb, u32, Bb)>,
 }
 
 #[derive(Clone, Debug)]
@@ -955,7 +959,8 @@ pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, us
             term_span: blk.term_span,
         })
         .collect();
-    CachedBody { file_hash, slot_at_gen: slot, used_at_gen, ir_fp, arg_count: body.arg_count, tys: b.out, locals, blocks }
+    let stmt_unwind = body.stmt_unwind.clone();
+    CachedBody { file_hash, slot_at_gen: slot, used_at_gen, ir_fp, arg_count: body.arg_count, tys: b.out, locals, blocks, stmt_unwind }
 }
 
 /// Rebuilds one cached body against today's program. None when any
@@ -1123,7 +1128,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
         };
         blocks.push(BlockData { stmts, term, term_span: blk.term_span });
     }
-    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: Vec::new(), index_exprs: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new() })
+    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: Vec::new(), index_exprs: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new(), stmt_unwind: cached.stmt_unwind.clone() })
 }
 
 #[cfg(test)]

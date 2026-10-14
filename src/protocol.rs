@@ -298,7 +298,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Default)]
@@ -385,6 +385,8 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let (mut release, mut profile, mut rustc) = (false, None, false);
     let mut max_errors = 20usize;
     let mut crate_flags = CrateFlags::default();
+    // `-C panic=unwind|abort`, as rustc takes it. None keeps the default.
+    let mut panic_abort: Option<bool> = None;
     // Splits one `--features` value (comma- or space-separated, as Cargo takes).
     fn push_features(into: &mut Vec<String>, value: &str) -> Option<()> {
         let names: Vec<&str> = value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
@@ -417,6 +419,11 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             _ if a.starts_with("--features=") => push_features(&mut crate_flags.features, &a["--features=".len()..])?,
             "--no-default-features" => crate_flags.no_default_features = true,
             "--all-features" => crate_flags.all_features = true,
+            "-C" => match it.next()?.as_str() {
+                "panic=unwind" => panic_abort = Some(false),
+                "panic=abort" => panic_abort = Some(true),
+                _ => return None,
+            },
             "--target" => crate_flags.target_triple = Some(it.next()?.clone()),
             _ if a.starts_with("--target=") => crate_flags.target_triple = Some(a["--target=".len()..].to_string()),
             "--" => run_args = it.by_ref().cloned().collect(),
@@ -435,13 +442,13 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
     if rustc {
-        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() {
+        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || panic_abort.is_some() {
             return None;
         }
         return Some(Invocation::RustcCheck { file: abs(&file) });
     }
     if release || profile.is_some() {
-        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() {
+        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() {
             return None;
         }
         if release && profile.is_none() {
@@ -456,7 +463,10 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     if let Some(p) = crate_flags.manifest_path.take() {
         crate_flags.manifest_path = Some(abs(&p));
     }
-    let session = session_key_for(&file, crate_flags);
+    let mut session = session_key_for(&file, crate_flags);
+    if let Some(abort) = panic_abort {
+        session.profile.panic_abort = abort;
+    }
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
         session,

@@ -91,17 +91,19 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        stmt_unwind: body.stmt_unwind.clone(),
     };
-    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), access_site: None };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), access_site: None, unw: None };
     for b in 0..ex.body.blocks.len() {
         let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
         if !is_key_method(x) {
             continue;
         }
         let term = std::mem::replace(&mut ex.body.blocks[b].term, Terminator::Unreachable);
-        let Terminator::Call { args, dest, next, .. } = term else { unreachable!() };
+        let Terminator::Call { args, dest, next, unwind, .. } = term else { unreachable!() };
         ex.cur = Bb(b as u32);
         ex.span = ex.body.blocks[b].term_span;
+        ex.unw = unwind;
         ex.method(x, args, dest)?;
         ex.goto(next);
     }
@@ -116,6 +118,8 @@ struct Ex<'b, 'p, 'g> {
     /// The local.rs line and column the next `access` reports a
     /// destroyed value at, when not `with`'s (see `set`).
     access_site: Option<(u32, u32)>,
+    /// The expanded call's cleanup successor (as in lower/iter.rs).
+    unw: Option<Bb>,
 }
 
 impl Ex<'_, '_, '_> {
@@ -130,12 +134,21 @@ impl Ex<'_, '_, '_> {
         Bb(self.body.blocks.len() as u32 - 1)
     }
     fn assign(&mut self, pl: Place, rv: Rvalue) {
-        let span = self.span;
-        self.body.blocks[self.cur.0 as usize].stmts.push(Stmt { kind: StmtKind::Assign(pl, rv), span });
+        self.push(StmtKind::Assign(pl, rv));
     }
     fn drop_local(&mut self, l: Local) {
+        self.push(StmtKind::Drop(l));
+    }
+    /// Appends a statement; under panic=unwind it continues at the
+    /// expanded call's cleanup successor when it panics.
+    fn push(&mut self, kind: StmtKind) {
         let span = self.span;
-        self.body.blocks[self.cur.0 as usize].stmts.push(Stmt { kind: StmtKind::Drop(l), span });
+        let stmts = &mut self.body.blocks[self.cur.0 as usize].stmts;
+        stmts.push(Stmt { kind, span });
+        if let Some(u) = self.unw.filter(|_| self.p.unwind) {
+            let n = stmts.len() as u32 - 1;
+            self.body.stmt_unwind.push((self.cur, n, u));
+        }
     }
     fn term(&mut self, t: Terminator) {
         let b = &mut self.body.blocks[self.cur.0 as usize];
@@ -157,7 +170,7 @@ impl Ex<'_, '_, '_> {
     /// Ends the current block with a call and continues after it.
     fn call(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place) {
         let next = self.block();
-        self.term(Terminator::Call { target, args, dest, next, unwind: None });
+        self.term(Terminator::Call { target, args, dest, next, unwind: self.unw });
         self.cur = next;
     }
     /// The type of an operand. Every operand of a key method call is a
