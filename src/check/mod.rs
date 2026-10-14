@@ -7833,12 +7833,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         }
-        // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
-        if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
+        // `AtomicUsize::new`, `Arc::new`, `sync::Weak::new`, and the other
+        // sync types by their full path (check/sync.rs), ahead of the
+        // `rc::Weak` names below.
+        if let Some(r) = self.sync_assoc(&names, std_ty, span) {
             return r;
         }
-        // `AtomicUsize::new` and the other sync types (check/sync.rs).
-        if let Some(r) = self.sync_assoc(&names, std_ty, span) {
+        // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
+        if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
             return r;
         }
         if let Some(r) = self.exit_code_assoc(ty_name, item, std_ty, span) {
@@ -9344,7 +9346,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return if b == Builtin::BoxNew { self.tys.mk_boxed(at) } else { self.tys.mk_rc(at) };
                 }
                 let (params, ret): (Vec<Ty>, Ty) = match b {
-                    Builtin::Sync(op) => self.sync_call_sig(op),
+                    Builtin::Sync(op) => self.sync_call_sig(op, callee, span),
                     Builtin::Clone => {
                         // The associated form `Type::clone(&x)`:
                         // the argument fixes the type.

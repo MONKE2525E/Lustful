@@ -78,7 +78,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // kin) wins at its step: rustc probes inherent methods first.
         // Only the types below have none.
         let plain = |cx: &Self, t: Ty| {
-            matches!(cx.tys.builtin_of(t), None | Some(BuiltinTy::String | BuiltinTy::Vec | BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Boxed | BuiltinTy::Rc))
+            matches!(
+                cx.tys.builtin_of(t),
+                None | Some(BuiltinTy::String | BuiltinTy::Vec | BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Boxed | BuiltinTy::Rc)
+                    | Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc))
+            )
         };
         let conv = match n {
             "as_ref" => Conv::AsRef,

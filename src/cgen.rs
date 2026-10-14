@@ -443,6 +443,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(t.clone());
             collect_types(e, out);
         }
+        CTy::Sync(k, e) => sync::sync_collect_types(*k, e, out),
         _ => {}
     }
 }
@@ -1592,7 +1593,7 @@ impl FnGen<'_, '_, '_> {
                     e = format!("(*{e})");
                     t = *inner;
                 }
-                (Proj::Deref, CTy::Rc(inner)) => {
+                (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
                     e = format!("{e}->v");
                     t = *inner;
                 }

@@ -371,7 +371,10 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Args) => "std::env::Args".into(),
             Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
             Some(BuiltinTy::ExitCode) => "ExitCode".into(),
-            Some(BuiltinTy::Sync(k)) => k.name().into(),
+            Some(BuiltinTy::Sync(k)) => match tys.adt_first_ty_arg(t) {
+                Some(e) => format!("{}<{}>", k.display(), ty_name(p, tys, e)),
+                None => k.display(),
+            },
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
@@ -891,10 +894,17 @@ pub fn resolve_ty(
             }
             // The sync and thread types (W-THREADS): by their std path,
             // or by a bare name a module glob of their std module imports.
-            if let Some(k) = crate::check::sync::sync_type_named(interner, segs, std_prefixed || !type_names.contains_key(&name))
-                && k.arity() == 0
-            {
-                return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
+            if let Some(k) = crate::check::sync::sync_type_named(interner, segs) {
+                if k.arity() == 0 {
+                    return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
+                }
+                let args = seg.type_args();
+                if args.len() != k.arity() {
+                    return Err(Diag::new("L0110", span, format!("{} takes one type argument", k.name()), format!("Write `{}<T>`.", k.name())));
+                }
+                let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
+                crate::check::sync::check_sync_arg(tys, k, e, span)?;
+                return Ok(crate::ty::sync::sync_ty(tys, k, &[e]));
             }
             // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A; the import
             // itself is checked where paths resolve).
@@ -4125,7 +4135,7 @@ pub fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
         _ if tys.is_chars_ty(t) => true,
         // A `RefCell` guard holds its borrow of the cell.
         _ if tys.guard_elem(t).is_some() => true,
-        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.weak_elem(t)).or_else(|| tys.refcell_elem(t)).or_else(|| tys.cell_elem(t)) {
+        _ => match tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.weak_elem(t)).or_else(|| tys.arc_weak_elem(t)).or_else(|| tys.refcell_elem(t)).or_else(|| tys.cell_elem(t)) {
             Some(e) => contains_ref(tys, e),
             None => match tys.result_args(t) {
                 Some((a, b)) => contains_ref(tys, a) || contains_ref(tys, b),
@@ -4264,7 +4274,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     if tys.is_string_ty(t) || tys.is_exit_code(t) {
         return true;
     }
-    if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() {
+    if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
         return true;
     }
     // `Ref`/`RefMut` are not Clone (`Ref::clone` is an associated fn);
@@ -4642,7 +4652,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
             // no such rendering, so it is not Debug here (a reject).
-            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
                 return true;
             }
             if let Some(b) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
@@ -4696,7 +4706,7 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Array(e, _) => return needs_drop(p, tys, e),
         _ => {}
     }
-    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() {
+    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
         return true;
     }
     if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)) {

@@ -11,6 +11,10 @@ use super::*;
 /// One sync or thread type lust knows by def.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SyncTy {
+    /// `alloc::sync::Arc<T>`: the `Rc` header with atomic counts.
+    Arc,
+    /// `alloc::sync::Weak<T>`.
+    ArcWeak,
     AtomicBool,
     AtomicI8,
     AtomicU8,
@@ -25,7 +29,9 @@ pub enum SyncTy {
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 11] = [
+    pub const ALL: [SyncTy; 13] = [
+        SyncTy::Arc,
+        SyncTy::ArcWeak,
         SyncTy::AtomicBool,
         SyncTy::AtomicI8,
         SyncTy::AtomicU8,
@@ -42,6 +48,8 @@ impl SyncTy {
     /// The struct name (the def hash input and the printed name).
     pub fn name(self) -> &'static str {
         match self {
+            SyncTy::Arc => "Arc",
+            SyncTy::ArcWeak => "Weak",
             SyncTy::AtomicBool => "AtomicBool",
             SyncTy::AtomicI8 => "AtomicI8",
             SyncTy::AtomicU8 => "AtomicU8",
@@ -59,22 +67,42 @@ impl SyncTy {
     /// The std module path the type lives in, under `std` (and under
     /// `core` or `alloc` for the types those crates define).
     pub fn module(self) -> &'static [&'static str] {
-        &["sync", "atomic"]
+        match self {
+            SyncTy::Arc | SyncTy::ArcWeak => &["sync"],
+            _ => &["sync", "atomic"],
+        }
     }
 
-    /// The crates whose module path also names the type (`std` always).
+    /// The crates whose module path also names the type (`std` always;
+    /// the def hashes under the first).
     pub fn crates(self) -> &'static [&'static str] {
-        &["std", "core"]
+        match self {
+            SyncTy::Arc | SyncTy::ArcWeak => &["alloc", "std"],
+            _ => &["core", "std"],
+        }
     }
 
     /// The number of type parameters.
     pub fn arity(self) -> usize {
-        0
+        match self {
+            SyncTy::Arc | SyncTy::ArcWeak => 1,
+            _ => 0,
+        }
+    }
+
+    /// The name rustc prints for the type (`std::sync::Weak` keeps its
+    /// module, as rustc tells it from `rc::Weak`).
+    pub fn display(self) -> String {
+        match self {
+            SyncTy::ArcWeak => "std::sync::Weak".into(),
+            k => k.name().into(),
+        }
     }
 
     /// The value type of an atomic: `bool` or the integer type.
     pub fn atomic_value(self) -> Option<AtomicVal> {
         Some(match self {
+            SyncTy::Arc | SyncTy::ArcWeak => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),
             SyncTy::AtomicU8 => AtomicVal::Int(IntTy::U8),

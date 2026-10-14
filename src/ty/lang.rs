@@ -830,11 +830,13 @@ pub fn std_glob_names() -> impl Iterator<Item = &'static str> {
 /// The `use` path to suggest for a non-prelude std type lust knows by
 /// name (`needs_std_use`), as `std::module::Name`.
 pub fn std_use_hint(name: &str) -> String {
-    if let Some(k) = crate::ty::sync::SyncTy::ALL.iter().find(|k| k.name() == name) {
-        return format!("std::{}::{name}", k.module().join("::"));
+    if let Some(t) = STD_IMPORTED_TYPES.iter().find(|t| t.2 == name) {
+        return format!("std::{}::{name}", t.1);
     }
-    let m = STD_IMPORTED_TYPES.iter().find(|t| t.2 == name).map_or("rc", |t| t.1);
-    format!("std::{m}::{name}")
+    match crate::ty::sync::SyncTy::ALL.iter().find(|k| k.name() == name) {
+        Some(k) => format!("std::{}::{name}", k.module().join("::")),
+        None => format!("std::rc::{name}"),
+    }
 }
 
 /// The variant names of the std enum at `path` (`std::cmp::Ordering`

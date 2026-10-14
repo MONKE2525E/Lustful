@@ -501,7 +501,9 @@ impl AdtTables {
             Some(BuiltinTy::RefGuard) => return (Variance::Co, DropMode::None),
             // Interior mutability: `Cell<T>` and `RefCell<T>` are invariant.
             Some(BuiltinTy::Cell | BuiltinTy::RefCell) => return (Variance::Inv, DropMode::Owned),
-            // The atomics take no type args (W-THREADS).
+            // `Arc<T>` and `sync::Weak<T>` are like `Rc` and `rc::Weak`;
+            // the atomics take no type args (W-THREADS).
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => return (Variance::Co, DropMode::Owned),
             Some(BuiltinTy::Sync(_)) => return (Variance::Inv, DropMode::Owned),
             None => {}
         }
@@ -538,7 +540,7 @@ fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Adt(_, args) => {
             tys.guard_elem(t).is_some()
-                || (tys.builtin_of(t) != Some(BuiltinTy::Weak)
+                || (!matches!(tys.builtin_of(t), Some(BuiltinTy::Weak | BuiltinTy::Sync(crate::ty::sync::SyncTy::ArcWeak)))
                     && tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| drops_guard(tys, e))))
         }
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| drops_guard(tys, e)),
@@ -2893,11 +2895,20 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             // `Rc::downgrade(&Rc<T>) -> Weak<T>` and `Weak::upgrade(&Weak<T>)
             // -> Option<Rc<T>>` share `T`; the borrow of the argument is
             // not part of the result (rustc's signatures).
-            _ if let CallTarget::Builtin(crate::check::Builtin::RcDowngrade | crate::check::Builtin::WeakUpgrade) = target
+            _ if let CallTarget::Builtin(
+                crate::check::Builtin::RcDowngrade
+                | crate::check::Builtin::WeakUpgrade
+                | crate::check::Builtin::Sync(crate::check::sync::SyncOp::ArcDowngrade | crate::check::sync::SyncOp::ArcWeakUpgrade),
+            ) = target
                 && let [(at, av)] = avs.as_slice()
                 && let TyKind::Ref(_, _, inner) = self.body.tys.kind(*at)
-                && let Some(el) = self.body.tys.rc_elem(inner).or_else(|| self.body.tys.weak_elem(inner))
-                && let Some(rl) = self.body.tys.weak_elem(dt).or_else(|| self.body.tys.option_elem(dt).and_then(|o| self.body.tys.rc_elem(o)))
+                && let Some(el) = self.body.tys.rc_elem(inner).or_else(|| self.body.tys.weak_elem(inner)).or_else(|| self.body.tys.arc_weak_elem(inner))
+                && let Some(rl) = self
+                    .body
+                    .tys
+                    .weak_elem(dt)
+                    .or_else(|| self.body.tys.arc_weak_elem(dt))
+                    .or_else(|| self.body.tys.option_elem(dt).and_then(|o| self.body.tys.rc_elem(o)))
                 && rl == el
                 && !av.is_empty()
                 && self.relate(el, &av[1..], rl, &dv, Variance::Co) => {}

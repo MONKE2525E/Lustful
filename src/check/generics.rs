@@ -2537,10 +2537,17 @@ fn resolve_path_ty(
     }
     // The sync and thread types (W-THREADS): by their std path, or by a
     // bare name a module glob of their std module imports.
-    if let Some(k) = crate::check::sync::sync_type_named(interner, segs, std_path || !cx.type_names.contains_key(&name)) {
+    if let Some(k) = crate::check::sync::sync_type_named(interner, segs) {
         if k.arity() == 0 {
             return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
         }
+        let args = match &seg.args {
+            GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, k.name())?,
+            _ => return Err(Diag::new("L0110", span, format!("`{}` takes one type argument", k.name()), "Write it with its element type.")),
+        };
+        let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
+        crate::check::sync::check_sync_arg(tys, k, elem, span)?;
+        return Ok(crate::ty::sync::sync_ty(tys, k, &[elem]));
     }
     // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A).
     if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)

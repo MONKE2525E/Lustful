@@ -815,6 +815,8 @@ fn compute(
             // An atomic: its value's size and alignment, with no niche
             // (`UnsafeCell`), as std lays out `Atomic<T>` (W-THREADS).
             Some(BuiltinTy::Sync(k)) if let Some(v) = k.atomic_value() => Ok(Layout::simple(v.bytes() as u64, v.bytes() as u64, None)),
+            // `Arc<T>` and `sync::Weak<T>`: one non-null pointer.
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => Ok(ptr_layout()),
             Some(_) => Err(()),
             None => {
                 let id = tys.local_adt(t).ok_or(())?;

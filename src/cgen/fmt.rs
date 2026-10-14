@@ -35,7 +35,7 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::Unit => format!("lust_f_unit({f})"),
         CTy::FnPtr(..) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
         CTy::Ref(inner) | CTy::Boxed(inner) => fmt_expr(inner, kind, f, &format!("(*{v})"), need),
-        CTy::Rc(inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
+        CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // A `RefCell` guard formats its value (W-STD-A).
         CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
         // An atomic's Debug formats a relaxed load of its value (W-THREADS).
@@ -293,6 +293,7 @@ fn may_fail(t: &CTy) -> bool {
     match t {
         CTy::Adt(_) => true,
         CTy::Vec(e) | CTy::Option(e) | CTy::Ref(e) | CTy::Array(e, _) | CTy::Slice(e) | CTy::Boxed(e) | CTy::Rc(e) => may_fail(e),
+        CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => may_fail(e),
         // std's cells and boxed slices (W-STD-A) format their contents.
         CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
         CTy::Result(a, b) => may_fail(a) || may_fail(b),

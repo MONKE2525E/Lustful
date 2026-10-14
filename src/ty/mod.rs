@@ -862,15 +862,25 @@ pub trait TyIntern {
             _ => None,
         }
     }
-    /// The pointee type of an `Rc<T>`.
+    /// The pointee type of a shared counted pointer: an `Rc<T>` or an
+    /// `Arc<T>` (W-THREADS). Both deref to a shared `T` only, are
+    /// `Clone` for every `T`, and convert to `&T` alike; the builtins
+    /// that make one (`Rc::new`, `Arc::new`) keep their own types.
     fn rc_elem(&self, t: Ty) -> Option<Ty> {
-        (self.builtin_of(t) == Some(BuiltinTy::Rc)).then(|| self.adt_first_ty_arg(t)).flatten()
+        match self.builtin_of(t) {
+            Some(BuiltinTy::Rc | BuiltinTy::Sync(sync::SyncTy::Arc)) => self.adt_first_ty_arg(t),
+            _ => None,
+        }
     }
     /// The pointee type of a `Box<T>`, an `Rc<T>`, or a `RefCell`
     /// guard (`Ref<T>`, `RefMut<T>`): the smart pointers method calls,
     /// fields, and coercions deref through.
     fn smart_elem(&self, t: Ty) -> Option<Ty> {
         self.boxed_elem(t).or_else(|| self.rc_elem(t)).or_else(|| self.guard_elem(t).map(|g| g.0))
+    }
+    /// The element type of a `sync::Weak<T>` (W-THREADS).
+    fn arc_weak_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::Sync(sync::SyncTy::ArcWeak))).then(|| self.adt_first_ty_arg(t)).flatten()
     }
     /// The value type of a `RefCell` guard and whether it is `RefMut`.
     fn guard_elem(&self, t: Ty) -> Option<(Ty, bool)> {
