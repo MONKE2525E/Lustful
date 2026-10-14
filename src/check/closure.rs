@@ -748,6 +748,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 other => other,
             },
+            // `map[&q]` (W-STD-B): the value behind `get`'s reference, a
+            // call with the base borrowed (the walk records that borrow).
+            (Expr::Index { .. }, Res::MapIndex { .. }) => Cat::Rvalue,
             (Expr::Index { base, .. }, Res::Index { derefs }) => {
                 let bt = self.out.expr_ty[self.ei(*base)];
                 let bt = self.cap_peel(bt, derefs);
@@ -1273,10 +1276,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.cap_walk(*base, mut_ctx, w),
             Expr::Deref(inner) => self.cap_walk(*inner, mut_ctx, w),
             Expr::Index { base, index } => {
-                if let Res::Index { derefs } | Res::SliceIndex { derefs } = res {
+                if let Res::Index { derefs } | Res::SliceIndex { derefs } | Res::MapIndex { derefs } = res {
                     let bt = self.out.expr_ty[self.ei(*base)];
                     let bt = self.cap_peel(bt, derefs);
-                    let overloaded = self.tys.vec_elem(bt).is_some() || matches!(res, Res::SliceIndex { .. });
+                    let overloaded = self.tys.vec_elem(bt).is_some() || matches!(res, Res::SliceIndex { .. } | Res::MapIndex { .. });
                     if overloaded {
                         // `Index::index(&base)` / `IndexMut::index_mut(&mut base)`.
                         let span = self.span(*base);

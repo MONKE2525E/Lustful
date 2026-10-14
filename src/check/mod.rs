@@ -644,6 +644,11 @@ pub enum Res {
     SliceIndex {
         derefs: u8,
     },
+    /// `map[&q]` on a HashMap (W-STD-B, check/hashmap.rs `map_index`):
+    /// the value behind `get`'s shared reference.
+    MapIndex {
+        derefs: u8,
+    },
     /// A static item read, by index into `Program::statics` (W-CORELANG).
     Static(u32),
     /// A compile-time usize constant: `size_of`, `align_of`, `offset_of!`.
@@ -6010,7 +6015,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 for _ in 0..4 {
                     let indexable = matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Error)
                         || self.tys.vec_elem(inner).is_some()
-                        || self.tys.is_string_ty(inner);
+                        || self.tys.is_string_ty(inner)
+                        || crate::ty::hash::hash_parts(&self.tys, inner).is_some_and(|(k, _)| k == crate::ty::hash::HashTy::HashMap);
                     // rustc tries the type's own `Index` impl before any
                     // deref; `[]` through a user `Index` impl is not
                     // supported yet, so such a type stops here (L0113).
@@ -6058,6 +6064,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             return ERROR;
                         }
                     }
+                }
+                if let Some((crate::ty::hash::HashTy::HashMap, targs)) = crate::ty::hash::hash_parts(&self.tys, inner) {
+                    return self.map_index(e, *base, *index, &targs, derefs, span);
                 }
                 self.expect_expr(*index, USIZE);
                 match self.kind(inner) {

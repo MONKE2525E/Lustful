@@ -423,6 +423,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(ret)
     }
 
+    /// `map[&q]`: std's `Index<&Q> for HashMap<K, V, S>` with `get`'s
+    /// bounds (`K: Borrow<Q>`, `Q: Hash + Eq`, `S: BuildHasher`); the
+    /// result is the value place. There is no `IndexMut`: lowering reads
+    /// through `get`'s shared reference, so a write or a move out is the
+    /// borrow checker's error, as rustc's E0594 and E0507.
+    pub(super) fn map_index(&mut self, e: ExprId, base: ExprId, index: ExprId, targs: &[Ty], derefs: u8, span: Span) -> Ty {
+        let (k, v, s) = (targs[0], targs[1], targs[2]);
+        let q = self.new_var(false);
+        let rq = self.tys.mk_ref(false, q);
+        self.check_packed_borrow(base, span);
+        self.check_args(&[rq], &[index], span);
+        let q = self.deep(q);
+        self.require_lookup(k, q, s, span);
+        self.set_res(e, Res::MapIndex { derefs });
+        v
+    }
+
     /// The iterator sources of a map or set: `iter` and kin through an
     /// autoref, `into_keys`/`into_values` by value, and `into_iter` by
     /// Rust's probe (the first autoderef step with an `IntoIterator`

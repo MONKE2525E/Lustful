@@ -645,6 +645,48 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.mark_index_loc(i, at);
                 b.project(Proj::Index(i))
             }
+            // `map[&q]` (W-STD-B): std's `Index<&Q>` is
+            // `self.get(key).expect("no entry found for key")`. The place is
+            // behind that shared reference; with no `IndexMut`, a write or a
+            // move out is the borrow checker's error, as rustc's.
+            (Expr::Index { base, index }, Res::MapIndex { derefs }) => {
+                let span = self.span(e);
+                let (b, root_ty) = match self.deref_steps(e, *base, span) {
+                    Some(root) => {
+                        let t = self.body.locals[root.local as usize].ty;
+                        (root, t)
+                    }
+                    None => (self.place(*base), self.ty(*base)),
+                };
+                let b = Self::derefs(b, derefs);
+                let map_ref = self.ref_ty(false, self.peel(root_ty, derefs));
+                let m = self.temp(map_ref);
+                self.assign(Place::local(m), Rvalue::Ref(false, b), span);
+                let q = self.temp(self.ty(*index));
+                let saved = std::mem::take(&mut self.mut_index);
+                self.expr_into(*index, Some(&Place::local(q)));
+                self.mut_index = saved;
+                let v_ref = self.ref_ty(false, self.ty(e));
+                let opt_ty = self.body.tys.mk_option(v_ref);
+                let opt = self.temp(opt_ty);
+                let args = vec![Operand::Copy(Place::local(m)), Operand::Copy(Place::local(q))];
+                self.call_into(CallTarget::Builtin(Builtin::MapGet), args, Place::local(opt), span);
+                let d = self.temp(int(IntTy::U32));
+                self.assign(Place::local(d), Rvalue::Discriminant(Place::local(opt)), span);
+                let (some_b, none_b) = (self.new_block(), self.new_block());
+                let blk = &mut self.body.blocks[self.cur.0 as usize];
+                blk.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(1, some_b)], none_b);
+                blk.term_span = span;
+                self.cur = none_b;
+                // rustc reports the `[`, as for any `Index::index` panic.
+                let at = self.bracket_span(e, *base, *index);
+                self.terminate(Terminator::Panic(vec![FmtPart::Lit("no entry found for key".into())]), at);
+                self.cur = some_b;
+                let r = self.temp(v_ref);
+                let some = Place::local(opt).project(Proj::Downcast(1)).project(Proj::Field(0));
+                self.assign(Place::local(r), Rvalue::Use(Operand::Copy(some)), span);
+                Place::local(r).deref()
+            }
             (Expr::Deref(inner), _) => match self.ck.coerce(*inner) {
                 // `*cow` (W-STD-B): the place behind the Cow's `&B` view.
                 Coerce::CowRecv(n, view) => {
