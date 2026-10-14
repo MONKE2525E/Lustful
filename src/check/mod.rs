@@ -12449,8 +12449,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // A const path pattern does not auto-deref (unlike a
                 // literal or a variant): if peeling references above
                 // was needed to reach the const's type, the pattern
-                // does not match the scrutinee (rustc E0308).
-                if self.out.pat_derefs[pi] > 0 {
+                // does not match the scrutinee (rustc E0308). A const
+                // whose own type is a reference (a `&str` const) needs
+                // no peeling: its type already is the scrutinee type.
+                let const_is_ref = match self.out.pat_res[pi] {
+                    PatRes::ConstItem(idx) => matches!(self.kind(self.p.consts[idx as usize].ty), TyKind::Ref(..)),
+                    PatRes::BodyConst(ci) => matches!(self.kind(self.p.body_consts[ci as usize].ty), TyKind::Ref(..)),
+                    _ => false,
+                };
+                if self.out.pat_derefs[pi] > 0 && !const_is_ref {
                     self.mismatch(span, scrut_t, t);
                 }
                 return;
@@ -12640,8 +12647,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if segs.len() == 1 {
                         match self.pat_ident(segs[0].name) {
                             PatIdent::Const(idx) => {
-                                // As above: a const pattern does not auto-deref.
-                                if self.out.pat_derefs[pi] > 0 {
+                                // As above: a const pattern does not
+                                // auto-deref, unless its own type is a
+                                // reference.
+                                if self.out.pat_derefs[pi] > 0 && !matches!(self.kind(p.consts[idx as usize].ty), TyKind::Ref(..)) {
                                     self.mismatch(span, scrut_t, t);
                                     return;
                                 }
