@@ -15,6 +15,7 @@ use std::fmt::Write;
 mod fmt;
 mod sync;
 mod hash;
+mod split;
 
 /// A body-independent type, so glue can be shared across functions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -284,6 +285,7 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
                 if owned { r } else { CTy::Ref(Box::new(r)) }
             }
             Field::Chars => CTy::Chars,
+            Field::Str => CTy::Ref(Box::new(CTy::Str)),
         })
         .collect();
     CTy::Tuple(fields)
@@ -2318,7 +2320,10 @@ impl FnGen<'_, '_, '_> {
             }
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
                 Some(v) => v,
-                None => self.builtin(b, args, loc, post),
+                None => match self.split_builtin(b, args, dest_cty, loc, post) {
+                    Some(v) => v,
+                    None => self.builtin(b, args, loc, post),
+                },
             },
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
             CallTarget::Dyn(k) => {
@@ -3422,6 +3427,9 @@ impl FnGen<'_, '_, '_> {
             | B::HashInto
             | B::HashOne
             | B::HasherCall => unreachable!("hash builtins emit in cgen/hash.rs"),
+            B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce => {
+                unreachable!("split builtins emit in cgen/split.rs")
+            }
             B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
@@ -4441,6 +4449,7 @@ impl FnGen<'_, '_, '_> {
             | B::HashFromArray
             | B::DlEntries
             | B::DmEntries
+            | B::StrSplit
             | B::IterSizeHint
             | B::IterNextBack
             | B::StrCharIndices

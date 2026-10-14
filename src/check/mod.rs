@@ -25,6 +25,7 @@ pub mod obligations;
 pub mod opaque;
 pub mod picks;
 pub mod platform;
+pub mod split;
 pub mod project;
 pub mod sized;
 pub mod stdtypes;
@@ -533,6 +534,16 @@ pub enum Builtin {
     /// `x.hash(&mut state)` where `x`'s Hash is core's or derived
     /// (W-STD-B): the hash glue's exact write sequence into the hasher.
     HashInto,
+    /// The str split family (W-STD-B, check/split.rs): `s.split(p)` and
+    /// kin build a `StrSplit` (expanded in lower/iter.rs); its `next` and
+    /// `next_back`, `split_ascii_whitespace`'s upper bound, and
+    /// `split_once`/`rsplit_once` run in the runtime (cgen/split.rs).
+    StrSplit,
+    StrSplitNext,
+    StrSplitNextBack,
+    StrSplitUpper,
+    StrSplitOnce,
+    StrRSplitOnce,
     /// `BuildHasher::hash_one(&self, x)`: build a hasher, hash `x`,
     /// finish (W-STD-B).
     HashOne,
@@ -11312,6 +11323,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // `x.hash(&mut h)`, `s.hash_one(x)`, and Hasher methods on a
             // concrete hasher (check/hashmap.rs).
             if let Some(ret) = self.hasher_method(e, base, derefs, name, name_span, args) {
+                return ret;
+            }
+            // The str split family (check/split.rs).
+            if let Some(ret) = self.str_split_method(e, base, derefs, name, name_span, args) {
                 return ret;
             }
         }

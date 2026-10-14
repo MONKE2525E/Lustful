@@ -411,6 +411,26 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 a.first().and_then(|g| g.as_ty()).map_or("_".into(), |e| ty_name(p, tys, e))
             }
+            // A str split prints as its std struct (W-STD-B).
+            Some(BuiltinTy::Iter(crate::ty::iter::IterKind::StrSplit)) => {
+                use crate::ty::iter::SplitMode as M;
+                let a: Vec<Ty> = tys.adt_parts(t).map(|(_, a)| tys.args(a).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+                let mode = a.get(1).and_then(|&m| crate::ty::iter::split_mode(tys, m));
+                let name = match mode {
+                    Some(M::RSplit) => "RSplit",
+                    Some(M::SplitTerminator) => "SplitTerminator",
+                    Some(M::RSplitTerminator) => "RSplitTerminator",
+                    Some(M::SplitN) => "SplitN",
+                    Some(M::RSplitN) => "RSplitN",
+                    Some(M::SplitInclusive) => "SplitInclusive",
+                    Some(M::SplitWhitespace) => return "std::str::SplitWhitespace".into(),
+                    Some(M::SplitAsciiWhitespace) => return "std::str::SplitAsciiWhitespace".into(),
+                    Some(M::Lines) => return "std::str::Lines".into(),
+                    _ => "Split",
+                };
+                let p_name = a.first().map_or("_".into(), |&e| ty_name(p, tys, e));
+                format!("std::str::{name}<{p_name}>")
+            }
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();

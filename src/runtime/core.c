@@ -1445,6 +1445,190 @@ uint32_t lust_utf8_prev(const uint8_t *p, uint64_t *end) LUST_BODY({
     return c;
 })
 
+/* The str split family (W-STD-B): std's SplitInternal and SplitNInternal
+   over its searchers (CharSearcher, MultiCharEqSearcher for char sets and
+   predicates, StrSearcher with its EmptyNeedle form). `lust_split` is the
+   common start of the generated iterator struct (ty/iter.rs StrSplit):
+   the haystack, the part not yet yielded (start..end), the searcher's
+   front and back positions, flags, and a SplitN count. `lust_pat` names
+   the pattern for one step. Modes follow ty/iter.rs SplitMode. */
+typedef struct { lust_str hay; uint64_t start, end, fpos, bpos, flags, count; } lust_split;
+typedef struct {
+    uint8_t kind;
+    uint32_t ch;
+    lust_str needle;
+    const uint32_t *set;
+    uint64_t n;
+    uint8_t (*pred)(void *, uint32_t);
+    void *env;
+} lust_pat;
+enum { LUST_PAT_CHAR, LUST_PAT_STR, LUST_PAT_SET, LUST_PAT_PRED, LUST_PAT_SPACE, LUST_PAT_ASCII_SPACE };
+enum { LUST_SPLIT_FINISHED = 1, LUST_SPLIT_TRAILING = 2, LUST_SPLIT_MATCH_FW = 4, LUST_SPLIT_MATCH_BW = 8, LUST_SPLIT_EMPTY_DONE = 16 };
+
+/* One char against a char-at-a-time pattern (each predicate call once,
+   in scan order, as MultiCharEqSearcher). */
+int lust_pat_hit(const lust_pat *p, uint32_t c) LUST_BODY({
+    switch (p->kind) {
+    case LUST_PAT_CHAR: return c == p->ch;
+    case LUST_PAT_SET:
+        for (uint64_t i = 0; i < p->n; i++)
+            if (p->set[i] == c) return 1;
+        return 0;
+    case LUST_PAT_PRED: return p->pred(p->env, c) != 0;
+    case LUST_PAT_SPACE: return lust_is_space(c);
+    default: return c == ' ' || c == '\t' || c == '\n' || c == 0x0C || c == '\r';
+    }
+})
+
+/* next_match: the next match in fpos..bpos from the front (the empty
+   needle walks from fpos to the haystack's end, as std). */
+int lust_split_match_fw(lust_split *s, const lust_pat *p, uint64_t *a, uint64_t *b) LUST_BODY({
+    const uint8_t *h = s->hay.ptr;
+    if (p->kind == LUST_PAT_STR) {
+        uint64_t m = p->needle.len;
+        if (m == 0) {
+            for (;;) {
+                if (s->flags & LUST_SPLIT_EMPTY_DONE) return 0;
+                int hit = (s->flags & LUST_SPLIT_MATCH_FW) != 0;
+                s->flags ^= LUST_SPLIT_MATCH_FW;
+                uint64_t pos = s->fpos;
+                if (hit) { *a = pos; *b = pos; return 1; }
+                if (pos >= s->hay.len) { s->flags |= LUST_SPLIT_EMPTY_DONE; return 0; }
+                lust_utf8_next(h, &s->fpos);
+            }
+        }
+        for (uint64_t i = s->fpos; i + m <= s->bpos; i++) {
+            if (memcmp(h + i, p->needle.ptr, m) == 0) { *a = i; *b = i + m; s->fpos = i + m; return 1; }
+        }
+        s->fpos = s->bpos;
+        return 0;
+    }
+    while (s->fpos < s->bpos) {
+        uint64_t i = s->fpos;
+        uint32_t c = lust_utf8_next(h, &s->fpos);
+        if (lust_pat_hit(p, c)) { *a = i; *b = s->fpos; return 1; }
+    }
+    return 0;
+})
+
+/* next_match_back: the last match in fpos..bpos (the empty needle walks
+   from bpos to the haystack's start, as std). */
+int lust_split_match_bw(lust_split *s, const lust_pat *p, uint64_t *a, uint64_t *b) LUST_BODY({
+    const uint8_t *h = s->hay.ptr;
+    if (p->kind == LUST_PAT_STR) {
+        uint64_t m = p->needle.len;
+        if (m == 0) {
+            for (;;) {
+                if (s->flags & LUST_SPLIT_EMPTY_DONE) return 0;
+                int hit = (s->flags & LUST_SPLIT_MATCH_BW) != 0;
+                s->flags ^= LUST_SPLIT_MATCH_BW;
+                uint64_t end = s->bpos;
+                if (hit) { *a = end; *b = end; return 1; }
+                if (end == 0) { s->flags |= LUST_SPLIT_EMPTY_DONE; return 0; }
+                lust_utf8_prev(h, &s->bpos);
+            }
+        }
+        for (uint64_t j = s->bpos; j >= s->fpos + m && j >= m; j--) {
+            if (memcmp(h + j - m, p->needle.ptr, m) == 0) { *a = j - m; *b = j; s->bpos = j - m; return 1; }
+            if (j == 0) break;
+        }
+        s->bpos = s->fpos;
+        return 0;
+    }
+    while (s->bpos > s->fpos) {
+        uint64_t j = s->bpos;
+        uint32_t c = lust_utf8_prev(h, &s->bpos);
+        if (lust_pat_hit(p, c)) { *a = s->bpos; *b = j; return 1; }
+    }
+    return 0;
+})
+
+lust_str lust_split_sub(lust_str h, uint64_t a, uint64_t b) LUST_BODY({ lust_str r; r.ptr = h.ptr + a; r.len = b - a; return r; })
+
+/* SplitInternal::get_end. */
+int lust_split_get_end(lust_split *s, lust_str *out) LUST_BODY({
+    if (s->flags & LUST_SPLIT_FINISHED) return 0;
+    s->flags |= LUST_SPLIT_FINISHED;
+    if ((s->flags & LUST_SPLIT_TRAILING) || s->end > s->start) { *out = lust_split_sub(s->hay, s->start, s->end); return 1; }
+    return 0;
+})
+
+/* SplitInternal::next, and next_inclusive when `incl`. */
+int lust_split_fw(lust_split *s, const lust_pat *p, int incl, lust_str *out) LUST_BODY({
+    if (s->flags & LUST_SPLIT_FINISHED) return 0;
+    uint64_t a, b;
+    if (lust_split_match_fw(s, p, &a, &b)) {
+        *out = lust_split_sub(s->hay, s->start, incl ? b : a);
+        s->start = b;
+        return 1;
+    }
+    return lust_split_get_end(s, out);
+})
+
+/* SplitInternal::next_back, and next_back_inclusive when `incl`. */
+int lust_split_bw(lust_split *s, const lust_pat *p, int incl, lust_str *out) LUST_BODY({
+    if (s->flags & LUST_SPLIT_FINISHED) return 0;
+    if (!(s->flags & LUST_SPLIT_TRAILING)) {
+        s->flags |= LUST_SPLIT_TRAILING;
+        lust_str e;
+        if (lust_split_bw(s, p, incl, &e) && e.len > 0) { *out = e; return 1; }
+        if (s->flags & LUST_SPLIT_FINISHED) return 0;
+    }
+    uint64_t a, b;
+    if (lust_split_match_bw(s, p, &a, &b)) {
+        *out = lust_split_sub(s->hay, b, s->end);
+        s->end = incl ? b : a;
+        return 1;
+    }
+    s->flags |= LUST_SPLIT_FINISHED;
+    *out = lust_split_sub(s->hay, s->start, s->end);
+    return 1;
+})
+
+/* One `next` (`next_back` when `back`) of a split iterator in `mode`. */
+int lust_split_step(lust_split *s, const lust_pat *p, uint8_t mode, int back, lust_str *out) LUST_BODY({
+    switch (mode) {
+    case 0: case 2: return back ? lust_split_bw(s, p, 0, out) : lust_split_fw(s, p, 0, out);
+    case 1: case 3: return back ? lust_split_fw(s, p, 0, out) : lust_split_bw(s, p, 0, out);
+    case 4: case 5:
+        if (s->count == 0) return 0;
+        if (s->count == 1) { s->count = 0; return lust_split_get_end(s, out); }
+        s->count--;
+        return mode == 4 ? lust_split_fw(s, p, 0, out) : lust_split_bw(s, p, 0, out);
+    case 6: return back ? lust_split_bw(s, p, 1, out) : lust_split_fw(s, p, 1, out);
+    case 7: case 8:
+        for (;;) {
+            int got = back ? lust_split_bw(s, p, 0, out) : lust_split_fw(s, p, 0, out);
+            if (!got) return 0;
+            if (out->len > 0) return 1;
+        }
+    default: {
+        int got = back ? lust_split_bw(s, p, 1, out) : lust_split_fw(s, p, 1, out);
+        if (got && out->len > 0 && out->ptr[out->len - 1] == '\n') {
+            out->len--;
+            if (out->len > 0 && out->ptr[out->len - 1] == '\r') out->len--;
+        }
+        return got;
+    }
+    }
+})
+
+/* `split_ascii_whitespace`'s upper bound (slice::Split's, through the
+   filter): 0 once finished, else the bytes left plus one. */
+uint64_t lust_split_upper(const lust_split *s) LUST_BODY({ return (s->flags & LUST_SPLIT_FINISHED) ? 0 : s->end - s->start + 1; })
+
+/* `split_once` (`rsplit_once` when `back`): the first (last) match. */
+int lust_str_split_once(lust_str hay, const lust_pat *p, int back, lust_str *a, lust_str *b) LUST_BODY({
+    lust_split s;
+    s.hay = hay; s.start = 0; s.end = hay.len; s.fpos = 0; s.bpos = hay.len;
+    s.flags = LUST_SPLIT_MATCH_FW | LUST_SPLIT_MATCH_BW; s.count = 0;
+    uint64_t x, y;
+    if (!(back ? lust_split_match_bw(&s, p, &x, &y) : lust_split_match_fw(&s, p, &x, &y))) return 0;
+    *a = lust_split_sub(hay, 0, x);
+    *b = lust_split_sub(hay, y, hay.len);
+    return 1;
+})
+
 /* str::to_uppercase and str::to_lowercase as Rust 1.99 runs them
    (W-STD-B): the ASCII prefix byte by byte into a String with the str's
    length as capacity (`convert_while_ascii`), then each char through

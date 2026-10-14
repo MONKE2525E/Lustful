@@ -121,6 +121,60 @@ pub enum IterKind {
     Flatten,
     /// `option::IntoIter<T>` (W-STD-B): args `[T]`, the option itself.
     OptionIntoIter,
+    /// The `str` split iterators (W-STD-B): `Split`, `RSplit`,
+    /// `SplitTerminator`, `RSplitTerminator`, `SplitN`, `RSplitN`,
+    /// `SplitInclusive`, `SplitWhitespace`, `SplitAsciiWhitespace`, and
+    /// `Lines`, by `SplitMode`. Args `[P, M]`: the pattern's type and the
+    /// mode as `[u8; mode]` (a marker, never a value). Item `&str`.
+    /// Fields: the runtime's `lust_split` state (haystack, start, end,
+    /// front and back search positions, flags, count left), then the
+    /// pattern (runtime/core.c `lust_split_step`).
+    StrSplit,
+}
+
+/// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitMode {
+    Split,
+    RSplit,
+    SplitTerminator,
+    RSplitTerminator,
+    SplitN,
+    RSplitN,
+    SplitInclusive,
+    SplitWhitespace,
+    SplitAsciiWhitespace,
+    Lines,
+}
+
+impl SplitMode {
+    const ALL: [SplitMode; 10] = [
+        SplitMode::Split,
+        SplitMode::RSplit,
+        SplitMode::SplitTerminator,
+        SplitMode::RSplitTerminator,
+        SplitMode::SplitN,
+        SplitMode::RSplitN,
+        SplitMode::SplitInclusive,
+        SplitMode::SplitWhitespace,
+        SplitMode::SplitAsciiWhitespace,
+        SplitMode::Lines,
+    ];
+}
+
+/// A `StrSplit` type: pattern type `p` (CHAR for the whitespace and
+/// line modes, which have none) and its mode.
+pub fn mk_split(tys: &mut impl TyIntern, p: Ty, mode: SplitMode) -> Ty {
+    let c = tys.intern_const(ConstKind::Int(mode as u128));
+    let marker = tys.intern(TyKind::Array(int(IntTy::U8), c));
+    mk_iter(tys, IterKind::StrSplit, &[p, marker])
+}
+
+/// The mode of a `StrSplit` type's marker argument.
+pub fn split_mode(tys: &impl TyIntern, marker: Ty) -> Option<SplitMode> {
+    let TyKind::Array(_, c) = tys.kind(marker) else { return None };
+    let ConstKind::Int(n) = tys.const_kind(c) else { return None };
+    SplitMode::ALL.get(n as usize).copied()
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -145,10 +199,12 @@ pub enum Field {
     Recv(u8, bool),
     /// `str::Chars`.
     Chars,
+    /// `&str`.
+    Str,
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 41] = [
+    pub const ALL: [IterKind; 42] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -190,6 +246,7 @@ impl IterKind {
         IterKind::CharIndices,
         IterKind::Flatten,
         IterKind::OptionIntoIter,
+        IterKind::StrSplit,
     ];
 
     /// True for the hashed-collection iterators.
@@ -252,6 +309,7 @@ impl IterKind {
             K::CharIndices => (&["core", "str"], "CharIndices"),
             K::Flatten => (ADAPT, "Flatten"),
             K::OptionIntoIter => (&["core", "option"], "IntoIter"),
+            K::StrSplit => (&["core", "str", "iter"], "Split"),
         }
     }
 
@@ -261,7 +319,17 @@ impl IterKind {
         match self {
             K::Map | K::FilterMap => 3,
             K::Flatten => 2,
-            K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned | K::ArrayIntoIter | K::ByNext => 2,
+            K::Filter
+            | K::Chain
+            | K::Zip
+            | K::TakeWhile
+            | K::SkipWhile
+            | K::Inspect
+            | K::Copied
+            | K::Cloned
+            | K::ArrayIntoIter
+            | K::ByNext
+            | K::StrSplit => 2,
             K::MapIter
             | K::MapIterMut
             | K::MapKeys
@@ -320,6 +388,7 @@ impl IterKind {
             K::CharIndices => "std::str::CharIndices",
             K::Flatten => "std::iter::Flatten",
             K::OptionIntoIter => "std::option::IntoIter",
+            K::StrSplit => "std::str::Split",
         }
     }
 
@@ -328,7 +397,7 @@ impl IterKind {
     pub fn shown_args(self) -> usize {
         match self {
             IterKind::Map | IterKind::FilterMap => 2,
-            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten => 1,
+            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit => 1,
             k => k.n_args(),
         }
     }
@@ -376,6 +445,7 @@ impl IterKind {
             K::CharIndices => &[F::Chars, F::Usize],
             K::Flatten => &[F::OptArg(0), F::OptArg(1), F::OptArg(1)],
             K::OptionIntoIter => &[F::OptArg(0)],
+            K::StrSplit => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
         }
     }
 }
@@ -460,6 +530,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         }
         K::Flatten => item_ty(tys, a[1])?,
         K::OptionIntoIter => a[0],
+        K::StrSplit => REF_STR,
     })
 }
 
@@ -551,6 +622,7 @@ pub fn field_ty(tys: &mut impl TyIntern, f: Field, args: &[Ty]) -> Ty {
             if owned { r } else { tys.mk_ref(false, r) }
         }
         Field::Chars => CHARS,
+        Field::Str => REF_STR,
     }
 }
 
@@ -570,6 +642,7 @@ pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) 
             | IterKind::SliceIterMut
             | IterKind::Windows
             | IterKind::CharIndices
+            | IterKind::StrSplit
             | IterKind::MapIter
             | IterKind::MapIterMut
             | IterKind::MapKeys

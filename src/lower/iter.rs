@@ -80,6 +80,7 @@ fn expands(b: Builtin) -> bool {
             | B::HashFromArray
             | B::DlEntries
             | B::DmEntries
+            | B::StrSplit
             | B::IterSizeHint
             | B::IterFold
             | B::IterForEach
@@ -577,6 +578,50 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
                 self.drop_local(fl);
                 return Ok(());
+            }
+            // A str split iterator (W-STD-B, check/split.rs): the runtime's
+            // state over the receiver's `&str` (runtime/core.c
+            // `lust_split`), then the pattern; the whitespace and line
+            // modes have none (a placeholder char).
+            B::StrSplit => {
+                use it::SplitMode as M;
+                let s = arg()?;
+                let st = self.op_ty(&s)?;
+                let hay = match self.body.tys.kind(st) {
+                    TyKind::Ref(_, _, i) if self.body.tys.is_string_ty(i) => {
+                        let v = self.local(REF_STR);
+                        self.call_builtin(Builtin::StringAsStr, vec![s], Place::local(v));
+                        Operand::Copy(Place::local(v))
+                    }
+                    _ => s,
+                };
+                let (_, a) = self.kind_args(dest_ty).ok_or("iterator expansion: bad split iterator")?;
+                let mode = it::split_mode(&self.body.tys, a[1]).ok_or("iterator expansion: bad split mode")?;
+                let (count, pat) = match mode {
+                    M::SplitN | M::RSplitN => (arg()?, arg()?),
+                    M::SplitWhitespace | M::SplitAsciiWhitespace | M::Lines => (Self::usize_c(0), Operand::Const(Const::Char('\n'))),
+                    _ => (Self::usize_c(0), arg()?),
+                };
+                let hl = self.local(REF_STR);
+                self.assign(Place::local(hl), Rvalue::Use(hay));
+                let len = self.local(USIZE);
+                self.call_builtin(Builtin::StrLen, vec![Operand::Copy(Place::local(hl))], Place::local(len));
+                // MATCH_FW 4 and MATCH_BW 8 (the empty needle's first step
+                // matches), and TRAILING 2 for the splits that keep a
+                // trailing empty piece.
+                let trailing = matches!(mode, M::Split | M::RSplit | M::SplitN | M::RSplitN | M::SplitWhitespace | M::SplitAsciiWhitespace);
+                let flags = 12 + if trailing { 2 } else { 0 };
+                let fields = vec![
+                    Operand::Copy(Place::local(hl)),
+                    Self::usize_c(0),
+                    Operand::Copy(Place::local(len)),
+                    Self::usize_c(0),
+                    Operand::Copy(Place::local(len)),
+                    Self::usize_c(flags),
+                    count,
+                    pat,
+                ];
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, fields));
             }
             // `entries(iter)` on a Debug builder (W-STD-B): an `entry`
             // per item, each formatted and then dropped, as std loops.
@@ -1281,6 +1326,13 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = bnone;
                 self.none(&dest, opt);
+                self.goto(join);
+            }
+            // The str splits (W-STD-B): one runtime step (cgen/split.rs).
+            K::StrSplit => {
+                let r = self.ref_to(true, itp, ty);
+                let b = if back { Builtin::StrSplitNextBack } else { Builtin::StrSplitNext };
+                self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
             // `option::IntoIter` (W-STD-B): `self.inner.take()`, from either end.
@@ -2960,6 +3012,19 @@ impl Ex<'_, '_, '_> {
             K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Rev => return self.hint(f(0), a[0]),
             // `CharIndices` forwards to its `Chars`.
             K::CharIndices => return self.hint(f(0), CHARS),
+            // The str splits: std's default `(0, None)`, but
+            // `split_ascii_whitespace`, whose slice split bounds it.
+            K::StrSplit => {
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                if it::split_mode(&self.body.tys, a[1]) == Some(it::SplitMode::SplitAsciiWhitespace) {
+                    let r = self.ref_to(false, itp, ty);
+                    let u = self.local(USIZE);
+                    self.call_builtin(Builtin::StrSplitUpper, vec![Operand::Move(Place::local(r))], Place::local(u));
+                    self.some(&Place::local(hi), ou, Operand::Copy(Place::local(u)));
+                } else {
+                    self.none(&Place::local(hi), ou);
+                }
+            }
             // `option::IntoIter`: exact, 0 or 1.
             K::OptionIntoIter => {
                 let (s, n) = self.switch_opt(&f(0));
@@ -3316,7 +3381,7 @@ impl Ex<'_, '_, '_> {
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
-            K::ByNext | K::CharIndices => false,
+            K::ByNext | K::CharIndices | K::StrSplit => false,
             K::Windows | K::OptionIntoIter => true,
             // std's impls: an outer TrustedLen over arrays (or references
             // to arrays) of a fixed size.

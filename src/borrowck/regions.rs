@@ -579,7 +579,10 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     match tys.builtin_of(t) {
         Some(
             BuiltinTy::Chars
-            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows | IterKind::CharIndices)
+            | BuiltinTy::Iter(
+                IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows | IterKind::CharIndices,
+            )
+            | BuiltinTy::Iter(IterKind::StrSplit)
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
@@ -3810,6 +3813,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::CharIndices => Vec::new(),
             K::Flatten => self.item_slots(a[1], &args[1])?,
             K::OptionIntoIter => args[0].clone(),
+            // `&'a str` of the haystack (W-STD-B).
+            K::StrSplit => own,
         })
     }
 
@@ -4207,6 +4212,15 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     None => false,
                 }
             }
+            // A str split's item is `&'a str` of its haystack: the own
+            // region (W-STD-B).
+            K::StrSplit => match vars.first() {
+                Some(&r) => {
+                    out.push(vec![r]);
+                    true
+                }
+                None => false,
+            },
             // The other W-STD-B kinds (hash iterators, array::IntoIter,
             // repeat_n, Windows, CharIndices, Flatten, option::IntoIter): the
             // conservative item rule (`item_slots` for the hash forms).

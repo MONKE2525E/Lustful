@@ -931,6 +931,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // Forward only in lust so far.
             K::Flatten => false,
             K::OptionIntoIter => true,
+            // The str splits (W-STD-B): by mode, and over a pattern whose
+            // searcher is double-ended (char, char sets, predicates; not
+            // `&str`), as std's `DoubleEndedSearcher` impls.
+            K::StrSplit => match it::split_mode(&self.tys, a[1]) {
+                Some(it::SplitMode::SplitN | it::SplitMode::RSplitN) | None => false,
+                Some(it::SplitMode::SplitWhitespace | it::SplitMode::SplitAsciiWhitespace | it::SplitMode::Lines) => true,
+                Some(_) => !crate::check::split::str_needle(&self.tys, a[0]),
+            },
         }
     }
 
