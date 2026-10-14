@@ -169,6 +169,23 @@ require_dir tests/fail
 require_dir tests/reject
 rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A unconditional_panic -A warnings)
 
+# lust_stderr <case file> <lust stderr>: lust's stderr as difftest compares it to rustc's
+# (mask_stderr, the case path as @CASE@). Known gap (source std, W-STD): lust's std
+# source is spliced after the case's own text, so a panic raised inside it names a case
+# line past the file's end, where rustc names its library/ line (or, for a track_caller
+# std method, the caller). Only that location takes rustc's text; the rest stays exact.
+lust_stderr() {
+  local n at
+  n=$(wc -l <"$1")
+  at=$(sed -nE "s/^thread '[^']*' \([0-9]+\) panicked at (.*):$/\1/p" rustc.stderr | head -1)
+  mask_stderr "$2" | sed "s|$1|@CASE@|g" | awk -v n="$n" -v at="$at" '
+    at != "" && /^thread .* panicked at @CASE@:[0-9]+:[0-9]+:$/ {
+      k = split($0, w, ":")
+      if (w[k - 2] + 0 > n + 1) { sub(/@CASE@:[0-9]+:[0-9]+:$/, at ":") }
+    }
+    { print }'
+}
+
 # pass_case <name> <file>: one tests/pass case (see the header).
 pass_case() {
   local name=$1 f=$2 rs ls panic_expect msg
@@ -186,8 +203,8 @@ pass_case() {
     report bad "$name" "exit status rustc=$rs lust=$ls"
   elif ! diff -q rustc.out "$name.lust.out" >/dev/null; then
     report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
-  elif ! cmp -s <(mask_stderr rustc.stderr) <(mask_stderr "$name.lust.stderr" | sed "s|$f|@CASE@|g"); then
-    report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr) <(mask_stderr "$name.lust.stderr" | sed "s|$f|@CASE@|g") | head -10
+  elif ! cmp -s <(mask_stderr rustc.stderr) <(lust_stderr "$f" "$name.lust.stderr"); then
+    report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr) <(lust_stderr "$f" "$name.lust.stderr") | head -10
   elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$name.lust.stderr"; then
     report bad "$name" "lust stderr lacks panic text '$panic_expect': $(head -3 "$name.lust.stderr")"
   elif [ "${SANITIZE:-0}" = 1 ]; then
