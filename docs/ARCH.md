@@ -2030,7 +2030,19 @@ where output can observe it:
   tested today with printing `Drop` impls. Std source
   must not reorder drops: `Vec` drops elements front
   to back, scope drops run in reverse declaration
-  order, temporaries drop at Rust's points. Early-exit
+  order, temporaries drop at Rust's points. Lowering
+  follows rustc's MIR building: temporary lifetime
+  extension by rustc's `record_rvalue_scope` rules (the
+  operand of an extending borrow in a `let` initializer,
+  found through struct, tuple, array, and cast operands,
+  resolved-path constructor arguments, block tails, and
+  `if`/`match` arms; a `ref` pattern extends the whole
+  initializer); a temporary drops before its own
+  expression's temporaries; destructuring leftovers drop
+  at the end of the `let`; an expression statement's
+  value is a statement temporary; a `match` scrutinee's
+  temporaries live to the end of the statement; each
+  `&&`/`||` operand is a terminating scope. Early-exit
   paths (`?`, `collect::<Result>` short-circuit) drop
   in Rust order (VERIFY G P4: closure captures drop
   before partial Vec elements). Edition 2024 has three
@@ -2865,6 +2877,15 @@ The engine is rustc's NLL (`src/borrowck/regions.rs`):
    dies is L0306, or L0307 when the loan reaches the return
    place. A universal region that reaches another without
    a declared or implied relation is L0733.
+6. The uses rustc's MIR adds are in the IR too: a `let`
+   binding is used right after its initializer (rustc
+   `FakeRead(ForLet)`, so `let _x = { let y = ..; &y };` is
+   an error); `let _ = place` mentions the place (`FakeRead`:
+   live there, no access, so it may be mutably borrowed);
+   a reference-typed `if`/`match` arm after the first one
+   that does not diverge is read after its block ends
+   (rustc's LUB reborrow); a value built through `Self` has
+   the impl's regions (a body annotation on its temporary).
 
 Calls lust cannot read precisely (builtins, intrinsics,
 fn pointers, a signature it cannot pair) use the
