@@ -1145,6 +1145,17 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         if let Some(&hidden) = p.gx.opaque_hidden.get(&crate::check::generics::opaque_def(def)) {
             hash_ty_deep(&mut h, p, &p.tys, hidden, &mut seen);
         }
+        // The bounds of its `impl Trait` return: all callers see of it
+        // (`impl Sh + Clone` to `impl Sh + Send` drops `.clone()`).
+        match p.gx.opaques.get(&crate::check::generics::opaque_def(def)) {
+            Some(o) => {
+                (o.bounds.len() as u64).hash(&mut h);
+                for pred in &o.bounds {
+                    hash_predicate(&mut h, p, &p.tys, pred);
+                }
+            }
+            None => u64::MAX.hash(&mut h),
+        }
         // `fn f(x: &str)` and `fn f(x: &'static str)` erase alike;
         // callers' borrow checks read the region signature (W-BORROW).
         hash_region_sig(&mut h, p, p.regions.fns.get(&local));

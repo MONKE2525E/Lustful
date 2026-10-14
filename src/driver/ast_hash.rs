@@ -33,16 +33,26 @@ fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
     let mut w = Walker { ast, idents: None, inner: Some(&mut inner) };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
+    // A fn returning `impl Trait`: its body decides the hidden type
+    // callers generate code for (check/opaque.rs), so the body is part
+    // of the item, not a body-only edit (as in `scan::scan`).
+    let rpit = |f: &FnDef| f.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. }));
     let fn_name = match &item.kind {
-        ItemKind::Fn(f) => Some(f.name),
+        ItemKind::Fn(f) if !rpit(f) => Some(f.name),
         _ => None,
     };
-    let scan = scan::ItemScan { hash: h.finish(), fn_name };
-    let bodies: Vec<(u64, Vec<Sym>)> = match &item.kind {
-        ItemKind::Fn(f) => vec![body_scan(ast, f, Some(&mut inner))],
-        ItemKind::Impl(imp) => imp.fns.iter().map(|f| body_scan(ast, f, Some(&mut inner))).collect(),
+    let fns: Vec<&FnDef> = match &item.kind {
+        ItemKind::Fn(f) => vec![f],
+        ItemKind::Impl(imp) => imp.fns.iter().collect(),
         _ => Vec::new(),
     };
+    let bodies: Vec<(u64, Vec<Sym>)> = fns.iter().map(|f| body_scan(ast, f, Some(&mut inner))).collect();
+    for (f, b) in fns.iter().zip(&bodies) {
+        if rpit(f) {
+            b.0.hash(&mut h);
+        }
+    }
+    let scan = scan::ItemScan { hash: h.finish(), fn_name };
     (scan, bodies, inner)
 }
 
