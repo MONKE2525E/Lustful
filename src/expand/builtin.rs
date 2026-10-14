@@ -35,7 +35,9 @@ pub fn is_passthrough(name: &str) -> bool {
 /// against rustc. Where the shape of the arguments is not checked here,
 /// the larger value applies, so lust never allows a depth rustc rejects.
 pub fn rustc_depth(name: &str, inner: &[Tt]) -> (u32, u32) {
-    let args = split_args(inner).len();
+    // The argument count `split_args` would give, without copying them.
+    let commas = inner.iter().filter(|t| t.is_tok(Tok::Comma)).count();
+    let args = if inner.is_empty() { 0 } else { commas + 1 - usize::from(inner.last().is_some_and(|t| t.is_tok(Tok::Comma))) };
     match name {
         "println" | "eprintln" if args == 0 => (2, 2),
         "println" | "eprintln" | "print" | "eprint" | "format" | "write" => (1, 2),

@@ -1107,28 +1107,31 @@ pub struct MacroSeed {
     pub import_into: Option<Vec<Sym>>,
 }
 
+/// The value of a `recursion_limit` attribute from the trees after its
+/// name (`= "N"`), read as rustc reads it (`usize` from the whole
+/// string). A malformed one is an error in rustc, wherever it is, even
+/// in a module where a valid one is ignored; so it is one here too.
+fn recursion_limit_value(after_name: &[Tt], strings: &[String], span: Span) -> Result<usize, Diag> {
+    match after_name {
+        [Tt::Tok(eq), Tt::Tok(Token { tok: Tok::Str(idx), .. })] if eq.tok == Tok::Eq => {
+            strings.get(*idx as usize).and_then(|s| s.parse::<usize>().ok())
+        }
+        _ => None,
+    }
+    .ok_or_else(|| {
+        err(C_SYNTAX, span, "malformed `recursion_limit` attribute", "Write `#![recursion_limit = \"N\"]` with N a non-negative integer.")
+    })
+}
+
 /// The crate's `#![recursion_limit = "N"]` among a root file's leading
-/// inner attributes, with its span. The first one wins, as in rustc,
-/// and N is read as rustc reads it (`usize` from the whole string). A
-/// malformed one is an error in rustc, so it is one here too.
+/// inner attributes, with its span. The first one wins, as in rustc.
 fn scan_recursion_limit(trees: &[Tt], strings: &[String], interner: &Interner) -> Result<Option<(usize, Span)>, Diag> {
     let mut found = None;
     let mut i = 0;
     while tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pound) && tok_at(trees, i + 1).map(|t| t.tok) == Some(Tok::Bang) {
         let Some(Tt::Delim(Delim::Bracket, body, span)) = trees.get(i + 2) else { break };
         if seg_text(tok_at(body, 0).map_or(Tok::Eof, |t| t.tok), interner).as_deref() == Some("recursion_limit") {
-            let n = match (body.len(), tok_at(body, 1).map(|t| t.tok), tok_at(body, 2).map(|t| t.tok)) {
-                (3, Some(Tok::Eq), Some(Tok::Str(idx))) => strings.get(idx as usize).and_then(|s| s.parse::<usize>().ok()),
-                _ => None,
-            };
-            let Some(n) = n else {
-                return Err(err(
-                    C_SYNTAX,
-                    *span,
-                    "malformed `recursion_limit` attribute",
-                    "Write `#![recursion_limit = \"N\"]` with N a non-negative integer.",
-                ));
-            };
+            let n = recursion_limit_value(&body[1..], strings, *span)?;
             found.get_or_insert((n, *span));
         }
         i += 3;
@@ -1701,7 +1704,7 @@ impl<'a> Expander<'a> {
     /// expansion step only, never chased: callers re-walk it.
     pub fn transcribe_call(&mut self, def: &MacroDef, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
         use std::sync::atomic::Ordering;
-        self.check_depth(depth, 0, &def.name_text, call.span)?;
+        self.check_depth(depth, 0, call.span, || def.name_text.clone())?;
         let key = CacheKey {
             def_fingerprint: def.fingerprint,
             input_hash: hash_tts(&call.inner, &self.strings),
@@ -2162,14 +2165,15 @@ fn take(trees: &mut [Tt], i: usize) -> Tt {
 }
 
 impl<'a> Expander<'a> {
-    /// Errors when a call to `name!` at `depth`, whose own expansion
+    /// Errors when a call to `name()!` at `depth`, whose own expansion
     /// reaches `extra` levels deeper (see `builtin::rustc_depth`), would
     /// pass the recursion limit. Past `RECURSION_CAP` the limit is
     /// lust's, not the crate's, and the message says so.
-    fn check_depth(&self, depth: u32, extra: u32, name: &str, span: Span) -> Result<(), Diag> {
+    fn check_depth(&self, depth: u32, extra: u32, span: Span, name: impl FnOnce() -> String) -> Result<(), Diag> {
         if depth + extra < self.recursion_limit {
             return Ok(());
         }
+        let name = name();
         if self.limit_capped {
             return Err(err(
                 C_CAP,
@@ -2313,7 +2317,7 @@ impl<'a> Expander<'a> {
                 // of it does (see `builtin::rustc_depth`).
                 let (extra, args) = builtin::rustc_depth(fmt_name, &inner);
                 let call_span = segs.first().map_or(group_span, |s| s.span.to(group_span));
-                self.check_depth(depth, extra, fmt_name, call_span)?;
+                self.check_depth(depth, extra, call_span, || fmt_name.to_string())?;
                 let mut expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1)?;
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
@@ -2482,8 +2486,10 @@ impl<'a> Expander<'a> {
         _depth: u32,
     ) -> Result<usize, Diag> {
         // The expander reads `#![recursion_limit]` itself and the
-        // parser has no form for it, so it is consumed here.
+        // parser has no form for it, so it is consumed here, once its
+        // value is checked.
         if first.inner_attr && first.path == "recursion_limit" {
+            recursion_limit_value(&first.inner, &self.strings, first.span)?;
             return Ok(first.end);
         }
         // An inner attribute applies to the enclosing item or crate:
@@ -2692,7 +2698,7 @@ impl<'a> Expander<'a> {
     /// a token builtin through `builtin`, a parser macro through
     /// unchanged with its arguments expanded.
     pub fn expand_call(&mut self, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
-        self.check_depth(depth, 0, &call.path_text(), call.span)?;
+        self.check_depth(depth, 0, call.span, || call.path_text())?;
         if let Some(idx) = self.lookup_macro(&call.segs, call.leading_colon) {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
@@ -2712,11 +2718,11 @@ impl<'a> Expander<'a> {
             // run from `depth + args - 1`.
             let (extra, args) = builtin::rustc_depth(&name, &call.inner);
             if builtin::is_token_builtin(&name) {
-                self.check_depth(depth, extra, &name, call.span)?;
+                self.check_depth(depth, extra, call.span, || name.clone())?;
                 return builtin::expand_builtin(self, &name, call, depth + args - 1);
             }
             if builtin::is_passthrough(&name) {
-                self.check_depth(depth, extra, &name, call.span)?;
+                self.check_depth(depth, extra, call.span, || name.clone())?;
                 // The head already ends with the call's `!`. The parser
                 // owns only the plain `name!` form, so keep just the
                 // last segment and the bang of a qualified path.
