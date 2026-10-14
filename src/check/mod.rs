@@ -794,6 +794,12 @@ struct Ctx<'p, 'a> {
     /// the overflow lint, so no analysis reads the fake value)
     /// purely so the template body lowers for borrowck.
     abstract_consts: Vec<ExprId>,
+    /// While the const evaluator runs a const fn body (`CheckCx`'s
+    /// `enter_const_fn`), the Adt `Self` means there: the fn's impl
+    /// type, not this body's. Saved (override, Self type) pairs restore
+    /// on exit.
+    const_fn_self: Option<Option<AdtId>>,
+    const_fn_saved: Vec<(Option<Option<AdtId>>, Option<Ty>)>,
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
@@ -1008,6 +1014,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         },
         generic_sites: Vec::new(),
         abstract_consts: Vec::new(),
+        const_fn_self: None,
+        const_fn_saved: Vec::new(),
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
@@ -6814,6 +6822,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// scope's Self type (a trait default assoc fn has no receiver to
     /// name an owner).
     fn self_adt(&self) -> Option<AdtId> {
+        if let Some(a) = self.const_fn_self {
+            return a;
+        }
         self.f.owner.or_else(|| self.body_scope.self_ty.and_then(|t| self.tys.local_adt(t)))
     }
 
@@ -14214,6 +14225,20 @@ struct CheckCx<'x, 'p, 'a> {
 
 impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     type Tys = Tys<'p>;
+
+    fn enter_const_fn(&mut self, owner: Option<Sym>) {
+        let cx = &mut *self.cx;
+        let a = owner.and_then(|n| cx.p.type_names.get(&n).copied());
+        cx.const_fn_saved.push((cx.const_fn_self, cx.body_scope.self_ty));
+        cx.const_fn_self = Some(a);
+        cx.body_scope.self_ty = a.map(|a| cx.tys.adt_ty(a));
+    }
+    fn exit_const_fn(&mut self) {
+        if let Some((o, t)) = self.cx.const_fn_saved.pop() {
+            self.cx.const_fn_self = o;
+            self.cx.body_scope.self_ty = t;
+        }
+    }
 
     fn tys(&mut self) -> &mut Tys<'p> {
         &mut self.cx.tys

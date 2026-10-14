@@ -1,5 +1,5 @@
 // `Self` in an inherent associated const initializer names the owning
-// Adt: tuple ctor, variants, and struct literals (the scanner kernel's
+// Adt (trait impl consts too): tuple ctor, variants, and struct literals (the scanner kernel's
 // go_flags! consts are `Self(value as u32)`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum E {
@@ -17,6 +17,12 @@ struct P {
 impl P {
     const Z: Self = Self { x: 9 };
 }
+trait Tr {
+    const C: Self;
+}
+impl Tr for P {
+    const C: Self = Self { x: 1 };
+}
 #[derive(Clone, Copy, Debug)]
 pub struct F(u32);
 impl F {
@@ -25,5 +31,5 @@ impl F {
 }
 fn main() {
     println!("{:?} {:?}", F::A, F::B);
-    println!("{:?} {:?} {:?}", E::X, E::Y, P::Z);
+    println!("{:?} {:?} {:?} {:?}", E::X, E::Y, P::Z, P::C);
 }

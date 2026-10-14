@@ -3510,6 +3510,15 @@ impl CollectCx<'_, '_> {
         let prev_pat = self.self_pat;
         (self.self_name, self.self_pat) = match self.pending[idx].0.assoc {
             Some(PendingAssoc::Inherent { owner, self_pat, .. }) => (Some(self.p.adts[owner.0 as usize].name), Some(self_pat)),
+            // A trait impl const over a local Adt: `Self` is that Adt.
+            Some(PendingAssoc::TraitImpl { impl_def, .. }) => {
+                let self_ty =
+                    self.p.gx.index.by_def(impl_def).and_then(|(_, r)| self.p.tys.args(r.trait_ref.args).first().and_then(|g| g.as_ty()));
+                match self_ty.and_then(|t| self.p.tys.local_adt(t)) {
+                    Some(a) => (Some(self.p.adts[a.0 as usize].name), self_ty),
+                    None => (None, None),
+                }
+            }
             _ => (None, None),
         };
         let prev_module = self.module;
