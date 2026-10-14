@@ -254,14 +254,14 @@
   {
    "id": "lifetimes.static_anon",
    "title": "'static and '_ lifetimes, std lifetime carriers",
-   "status": "partial",
-   "milestone": 6,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "7a",
    "root_cause": "lifetimes",
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_static_anon.rs and _b pass: &'static refs and fields, T: 'static, and Formatter<'_> in Display impls. lifetimes_static_anon_c.rs fails: a named std carrier in a return type (slice Iter<'_>) is an unknown type (L0102).",
+   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_static_anon.rs, _b and _c pass: &'static refs and fields, T: 'static, Formatter<'_> in Display impls, and a named std carrier in a return type (slice Iter<'_>).",
    "primary_keys": [
     "lt.ref.static",
     "lt.ref.anon",
