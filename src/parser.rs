@@ -1555,6 +1555,12 @@ impl<'a> Parser<'a> {
                     _ => break,
                 }
             }
+            if self.cfg_syntax && path.is_empty() {
+                // A path this loop does not read (`::a`, `self::a`,
+                // `unsafe(..)`): the grammar check below judges it.
+                self.cfg_attr_grammar(start, body_start, body_end)?;
+                continue;
+            }
             let Some(first) = path.first().map(|s| s.name) else {
                 return Err(syntax(start, "expected an attribute name"));
             };
@@ -1590,55 +1596,12 @@ impl<'a> Parser<'a> {
                 span: start.to(name_span),
             };
             if self.cfg_syntax {
-                // Only the meta-item grammar runs here: a path, then
-                // nothing, one `(...)` group, or `= literal`. Which
-                // names exist is checked only for enabled code.
-                let rest = &body[bi..];
-                let meta_ok = if rest.is_empty() {
-                    true
-                } else if rest[0].tok == Tok::LParen {
-                    let mut d = 0usize;
-                    let mut end = None;
-                    for (j, t) in rest.iter().enumerate() {
-                        match t.tok {
-                            Tok::LParen => d += 1,
-                            Tok::RParen => {
-                                d = d.saturating_sub(1);
-                                if d == 0 {
-                                    end = Some(j);
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    end == Some(rest.len() - 1)
-                } else if rest[0].tok == Tok::Eq {
-                    let lit = |t: Tok| {
-                        matches!(
-                            t,
-                            Tok::Str(..)
-                                | Tok::ByteStr(_)
-                                | Tok::ByteChar(_)
-                                | Tok::Char(..)
-                                | Tok::Int(..)
-                                | Tok::Float(_)
-                                | Tok::True
-                                | Tok::False
-                        )
-                    };
-                    match rest {
-                        [_, v] => lit(v.tok),
-                        [_, m, v] => m.tok == Tok::Minus && matches!(v.tok, Tok::Int(..) | Tok::Float(_)),
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-                if !meta_ok {
-                    return Err(syntax(start, "malformed attribute input"));
+                // Only the attribute grammar runs here (`cfg_attr_grammar`).
+                // Which names exist is checked only for enabled code.
+                self.cfg_attr_grammar(start, body_start, body_end)?;
+                if !path.is_empty() {
+                    out.attrs.push(attr);
                 }
-                out.attrs.push(attr);
                 continue;
             }
             let k = self.known;
@@ -1724,6 +1687,77 @@ impl<'a> Parser<'a> {
             out.attrs.push(attr);
         }
         Ok(out)
+    }
+
+    /// The attribute grammar rustc checks in cfg-disabled code, on the
+    /// body tokens `lo..hi` (between `#[` and `]`): `unsafe(item)` or an
+    /// item, where an item is a path (`::`-separated names, an optional
+    /// leading `::`) followed by nothing, one delimited token group, or
+    /// `= expression`. Doc comments are `doc = "..."` items. Names and
+    /// values are not checked, as rustc checks those only after it
+    /// strips disabled code.
+    fn cfg_attr_grammar(&mut self, start: Span, lo: usize, hi: usize) -> PResult<()> {
+        let malformed = || syntax(start, "malformed attribute input");
+        // The matching close of the group that opens at `i`, if any.
+        let close_of = |i: usize| -> Option<usize> {
+            let mut d = 0usize;
+            for j in i..hi {
+                match self.toks[j].tok {
+                    Tok::LParen | Tok::LBracket | Tok::LBrace => d += 1,
+                    Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                        d = d.checked_sub(1)?;
+                        if d == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+        let at = |i: usize| if i < hi { self.toks[i].tok } else { Tok::Eof };
+        if at(lo) == Tok::Unsafe && at(lo + 1) == Tok::LParen {
+            return match close_of(lo + 1) {
+                Some(c) if c + 1 == hi => self.cfg_attr_grammar(start, lo + 2, c),
+                _ => Err(malformed()),
+            };
+        }
+        let mut i = lo;
+        if at(i) == Tok::PathSep {
+            i += 1;
+        }
+        loop {
+            if !matches!(at(i), Tok::Ident(_) | Tok::SelfLower | Tok::SelfUpper | Tok::Super | Tok::Crate) {
+                return Err(syntax(if i < hi { self.toks[i].span } else { start }, "expected an attribute name"));
+            }
+            i += 1;
+            if at(i) != Tok::PathSep {
+                break;
+            }
+            i += 1;
+        }
+        match at(i) {
+            Tok::Eof => Ok(()),
+            Tok::LParen | Tok::LBracket | Tok::LBrace if close_of(i) == Some(hi - 1) => Ok(()),
+            // A doc comment (`doc = DocStr`), which no expression parse takes.
+            Tok::Eq if i + 2 == hi && matches!(at(i + 1), Tok::DocStr(_)) => Ok(()),
+            Tok::Eq if i + 1 < hi => {
+                let saved = self.pos;
+                self.pos = i + 1;
+                let parsed = self.expr();
+                let end = self.pos;
+                self.pos = saved;
+                match parsed {
+                    Ok(_) if end == hi => Ok(()),
+                    Ok(_) => Err(syntax(self.toks[end.min(hi)].span, "expected `]` after the attribute value")),
+                    // A valid form lust cannot build: the value cannot be
+                    // judged past it, so it counts as clean.
+                    Err(d) if d.code != "L0001" => Ok(()),
+                    Err(d) => Err(d),
+                }
+            }
+            _ => Err(malformed()),
+        }
     }
 
     /// `derive` and `test` placement, as in rustc: `#[derive(..)]` applies
@@ -2651,7 +2685,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Type => types.push(self.assoc_type()?),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
-                Tok::Const | Tok::Unsafe | Tok::Async if self.cfg_syntax => {
+                Tok::Const | Tok::Unsafe | Tok::Async | Tok::Extern if self.cfg_syntax => {
                     while matches!(self.peek(), Tok::Const | Tok::Unsafe | Tok::Async) {
                         self.bump();
                     }
@@ -2704,7 +2738,12 @@ impl<'a> Parser<'a> {
         let start = self.expect(Tok::Impl, "`impl`")?;
         let generics = self.generics(true)?;
         let is_negative = self.eat(Tok::Bang);
-        let (trait_ref, self_ty) = if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper) {
+        // A trait path may also start with `crate`, `super`, `self`, or
+        // `::`. Only the cfg syntax check takes those for now: in enabled
+        // code later passes do not resolve such a trait ref yet.
+        let path_start = matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper)
+            || (self.cfg_syntax && matches!(self.peek(), Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep));
+        let (trait_ref, self_ty) = if path_start {
             let header_start = self.span();
             let path = self.trait_path()?;
             if self.eat(Tok::For) {
@@ -2770,7 +2809,7 @@ impl<'a> Parser<'a> {
                     def.qual.is_const = true;
                     fns.push(def);
                 }
-                Tok::Unsafe | Tok::Async if self.cfg_syntax => {
+                Tok::Unsafe | Tok::Async | Tok::Extern if self.cfg_syntax => {
                     while matches!(self.peek(), Tok::Unsafe | Tok::Async | Tok::Const) {
                         self.bump();
                     }

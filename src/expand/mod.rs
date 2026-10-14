@@ -1987,9 +1987,18 @@ pub fn attr_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<AttrInfo> 
         j += 1;
     }
     let Tt::Delim(Delim::Bracket, body, _) = trees.get(j)? else { return None };
-    // Path: segments joined by :: from the front of the body.
+    // `#[unsafe(..)]` reads as one attribute named `unsafe`, so no
+    // attribute the expander acts on (cfg and kin) matches it.
+    if tok_at(body, 0).map(|t| t.tok) == Some(Tok::Unsafe)
+        && let Some(Tt::Delim(Delim::Paren, group, _)) = body.get(1)
+    {
+        return Some(AttrInfo { path: "unsafe".to_string(), inner: group.clone(), end: j + 1, span, inner_attr });
+    }
+    // Path: segments joined by :: from the front of the body. A leading
+    // `::` stays in the path text, so `#[::cfg(..)]` is not `cfg`.
+    let global = tok_at(body, 0).map(|t| t.tok) == Some(Tok::PathSep);
     let mut segs = Vec::new();
-    let mut k = 0;
+    let mut k = usize::from(global);
     loop {
         match tok_at(body, k).map(|t| t.tok) {
             Some(t) if is_seg_tok(t) => {
@@ -2014,6 +2023,7 @@ pub fn attr_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<AttrInfo> 
         _ => body[k..].to_vec(),
     };
     let path = segs.iter().filter_map(|t| seg_text(*t, interner)).collect::<Vec<_>>().join("::");
+    let path = if global { format!("::{path}") } else { path };
     Some(AttrInfo { path, inner, end: j + 1, span, inner_attr })
 }
 
