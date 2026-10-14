@@ -121,7 +121,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
     };
-    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default() };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false };
     let n = ex.body.blocks.len();
     for b in 0..n {
         let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
@@ -143,6 +143,10 @@ struct Ex<'b, 'p, 'g> {
     body: Body<'g>,
     cur: Bb,
     span: Span,
+    /// The pull is a step of std's `try_fold` (`find`, `position`,
+    /// `any`, `all`, `find_map` on a borrowed iterator), not `next`:
+    /// Take and Skip then step as their `try_fold` does (`next_in`).
+    fold: bool,
 }
 
 impl Ex<'_, '_, '_> {
@@ -1139,8 +1143,20 @@ impl Ex<'_, '_, '_> {
 
     // ---------- next and next_back ----------
 
-    /// `dest = itp.next()` (`next_back` when `back`).
+    /// `dest = itp.next()` (`next_back` when `back`). Under `fold`, Zip
+    /// and StepBy still pull their inner iterators with `next` and
+    /// `nth`, as std's `try_fold` of both does.
     fn next(&mut self, itp: Place, ty: Ty, dest: Place, back: bool) -> R {
+        let saved = self.fold;
+        if matches!(self.kind_args(ty), Some((IterKind::Zip | IterKind::StepBy, _))) {
+            self.fold = false;
+        }
+        let r = self.next_in(itp, ty, dest, back);
+        self.fold = saved;
+        r
+    }
+
+    fn next_in(&mut self, itp: Place, ty: Ty, dest: Place, back: bool) -> R {
         use crate::ast::BinOp::*;
         use IterKind as K;
         let item = self.item(ty)?;
@@ -1599,8 +1615,18 @@ impl Ex<'_, '_, '_> {
                 let c = self.cmp(Ne, Operand::Copy(f(1)), Self::usize_c(0));
                 let (s, n) = self.branch(c);
                 self.cur = s;
-                self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
-                self.next(f(0), a[0], dest.clone(), false)?;
+                if self.fold {
+                    // `try_fold`: the count drops per item the inner yields.
+                    self.next(f(0), a[0], dest.clone(), false)?;
+                    let (got, end) = self.switch_opt(&dest);
+                    self.cur = got;
+                    self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                    self.goto(join);
+                    self.cur = end;
+                } else {
+                    self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                    self.next(f(0), a[0], dest.clone(), false)?;
+                }
                 self.goto(join);
                 self.cur = n;
                 self.none(&dest, opt);
@@ -1614,10 +1640,27 @@ impl Ex<'_, '_, '_> {
                 let (s, n) = self.branch(c);
                 self.cur = s;
                 let cnt = self.local(USIZE);
-                self.assign(Place::local(cnt), Rvalue::Use(Operand::Copy(f(1))));
-                self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
-                self.nth(f(0), a[0], cnt, dest.clone())?;
-                self.goto(join);
+                if self.fold {
+                    // `try_fold`: `nth(n - 1)` drops the skipped items, an
+                    // end there ends the fold, then the inner's own items.
+                    self.assign(Place::local(cnt), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                    self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                    let t = self.local(opt);
+                    self.nth(f(0), a[0], cnt, Place::local(t))?;
+                    let (got, end) = self.switch_opt(&Place::local(t));
+                    self.cur = end;
+                    self.none(&dest, opt);
+                    self.goto(join);
+                    self.cur = got;
+                    self.drop_local(t);
+                    self.next(f(0), a[0], dest.clone(), false)?;
+                    self.goto(join);
+                } else {
+                    self.assign(Place::local(cnt), Rvalue::Use(Operand::Copy(f(1))));
+                    self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                    self.nth(f(0), a[0], cnt, dest.clone())?;
+                    self.goto(join);
+                }
                 self.cur = n;
                 self.next(f(0), a[0], dest, false)?;
                 self.goto(join);
@@ -1924,8 +1967,16 @@ impl Ex<'_, '_, '_> {
     /// `dest = itp.nth(n)`, with Rust 1.99's per-kind overrides: the
     /// adapters Rust delegates through (`Skip`, `Take`, `Enumerate`,
     /// `Rev`, `Peekable`, `Copied`, `Chain`, `StepBy`) and the O(1)
-    /// range forms. Other kinds take the default via `advance`.
+    /// range forms. Other kinds take the default via `advance`. Its
+    /// pulls are `next` steps, not `try_fold` ones (see `Ex::fold`).
     fn nth(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
+        let saved = std::mem::replace(&mut self.fold, false);
+        let r = self.nth_in(itp, ty, n, dest);
+        self.fold = saved;
+        r
+    }
+
+    fn nth_in(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
         use crate::ast::BinOp::*;
         use IterKind as K;
         let item = self.item(ty)?;
@@ -2496,7 +2547,11 @@ impl Ex<'_, '_, '_> {
         self.goto(join);
         self.cur = pull;
         let t = self.local(opt);
-        self.next(itp.clone(), ty, Place::local(t), back)?;
+        // core's default `advance_by` is a `try_fold` (see `Ex::fold`).
+        let saved = std::mem::replace(&mut self.fold, true);
+        let pulled = self.next(itp.clone(), ty, Place::local(t), back);
+        self.fold = saved;
+        pulled?;
         let (s, none) = self.switch_opt(&Place::local(t));
         self.cur = none;
         self.assign(Place::local(rem), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(i))));
@@ -4002,7 +4057,9 @@ impl Ex<'_, '_, '_> {
     }
 
     /// `any`, `all`, `find`, `find_map`, and `position`: pull until the
-    /// closure decides, then stop (the rest stays in the iterator).
+    /// closure decides, then stop (the rest stays in the iterator). The
+    /// pulls are std's `try_fold` steps, so a Take's count drops only per
+    /// item its inner yields.
     #[allow(clippy::too_many_arguments)]
     fn search(&mut self, b: Builtin, itp: Place, ty: Ty, fpl: Place, fty: Ty, dest: Place, dest_ty: Ty) -> R {
         use Builtin as B;
@@ -4012,7 +4069,11 @@ impl Ex<'_, '_, '_> {
         let lp = self.block();
         self.goto(lp);
         self.cur = lp;
-        let (_, n, x, item) = self.pull(&itp, ty)?;
+        // std runs these through `try_fold` (see `Ex::fold`).
+        let saved = std::mem::replace(&mut self.fold, true);
+        let pulled = self.pull(&itp, ty);
+        self.fold = saved;
+        let (_, n, x, item) = pulled?;
         match b {
             B::IterAny | B::IterAll => {
                 let ax = self.take(Place::local(x), item);
