@@ -869,7 +869,26 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
             cx.set_res(d.e, Res::Fn(stub));
             continue;
         }
-        let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
+        let Selection::Impl { id, args: impl_args, .. } = sel else {
+            if d.path {
+                // `From` by structure: core's identity impl or a numeric
+                // widening, picked once the arg's type was known
+                // (`S::from(v.pop().unwrap())` before `v.push(S { .. })`):
+                // a move or a cast, as `assoc_call`'s FromCast.
+                if matches!(sel, Selection::ParamEvidence(usize::MAX))
+                    && d.tr.def == p.gx.lang.from
+                    && let Expr::Call { callee, .. } = p.ast.expr(d.e)
+                {
+                    cx.set_res(*callee, Res::FromCast);
+                    cx.set_res(d.e, Res::FromCast);
+                } else if cx.errs.is_empty() {
+                    // The hard run reported a miss; a path call keeps
+                    // no unresolved callee even if it did not.
+                    path_call_unresolved(cx, d.e);
+                }
+            }
+            continue;
+        };
         let rec = p.gx.index.get(id);
         let target = match rec.items.iter().copied().find_map(|x| p.local_def(x.hash).filter(|&l| p.fn_info(l).name == d.name)) {
             Some(l) => Some((l, impl_args)),
@@ -878,7 +897,12 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
                 (l, raw.iter().map(|&g| if let GenericArg::Ty(t) = g { GenericArg::Ty(cx.deep(t)) } else { g }).collect())
             }),
         };
-        let Some((local, mut prefix)) = target else { continue };
+        let Some((local, mut prefix)) = target else {
+            if d.path {
+                path_call_unresolved(cx, d.e);
+            }
+            continue;
+        };
         if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
             prefix.extend(d.own.iter().copied());
             let ei = cx.ei(d.e);
@@ -887,6 +911,17 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
         let res = if d.path { Res::Fn(local) } else { Res::Method { f: local, derefs: d.derefs, autoref: d.autoref } };
         cx.set_res(d.e, res);
     }
+}
+
+/// A deferred path call whose selection named no fn to call.
+fn path_call_unresolved(cx: &mut Ctx, e: ExprId) {
+    let span = cx.span(e);
+    cx.err(
+        "L0104",
+        span,
+        "no associated function in the impl this call selects",
+        "Name the impl's fn with a qualified path, such as `<Type as Trait>::name`.",
+    );
 }
 
 /// A call the param env proves (a template check: `t.m()` with
