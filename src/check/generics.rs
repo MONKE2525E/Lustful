@@ -772,6 +772,10 @@ pub struct Scope {
     /// (`check::defaults`): a default that leads back to itself stops at
     /// a limit instead of looping.
     pub default_depth: u32,
+    /// `impl Trait` nested in a fn's argument types (`&impl Tr`,
+    /// `&[impl Tr]`, `Option<impl Tr>`): each node's synthetic type
+    /// param (rustc APIT), set by `resolve_fn_sig`.
+    pub apit: Vec<(ast::TyId, Ty)>,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -1549,7 +1553,10 @@ pub fn resolve_scoped(
             }
             None => Err(not_yet("L0602", span, "inferred types (`_`) in signatures")),
         },
-        TyExpr::ImplTrait { .. } => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
+        TyExpr::ImplTrait { .. } => match scope.apit.iter().find(|(n, _)| *n == id) {
+            Some(&(_, t)) => Ok(t),
+            None => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
+        },
         TyExpr::Dyn { binder, bounds, lifetime } => {
             let ty = resolve_dyn(ast, interner, known, cx, tys, &scope.erased(), binder, bounds, *lifetime, span)?;
             keep_object_lifetime(interner, tys, scope, ty, bounds, *lifetime, span)
@@ -3193,27 +3200,20 @@ pub fn resolve_fn_sig(
             },
         });
     }
+    // `impl Trait` in argument position is a fresh type parameter with
+    // those bounds (section 2.11), also nested in an argument's type.
     for param in &def.params {
-        // `impl Trait` in argument position is a fresh type
-        // parameter with those bounds (section 2.11).
         if let TyExpr::ImplTrait { bounds } = ast.ty(param.ty) {
-            let idx = generics.params.len() as u32;
-            let name = interner.intern(&format!("impl#{idx}"));
-            generics.params.push(ParamDef { name, kind: ParamKind::Type, span: param.span });
-            scope.type_params.push((name, idx));
-            let lhs = tys.intern(TyKind::Param(ParamId(idx)));
-            let mut preds: Vec<Predicate> = Vec::new();
-            let mut relaxed: Vec<u32> = Vec::new();
-            for b in bounds {
-                bound_predicates(ast, interner, known, cx, tys, &scope, lhs, b, &mut preds, &mut relaxed, errs);
-            }
-            if !relaxed.contains(&idx) {
-                let args = tys.intern_args(&[GenericArg::Ty(lhs)]);
-                preds.push(Predicate::Trait(Binder::plain(TraitRef { def: cx.lang.sized, args, bindings: EMPTY_BINDINGS })));
-            }
-            generics.predicates.extend(preds);
+            let lhs = apit_param(ast, interner, known, cx, tys, &mut generics, &mut scope, bounds, param.span, errs);
             params.push(lhs);
             continue;
+        }
+        let mut nested: Vec<ast::TyId> = Vec::new();
+        nested_impl_traits(ast, param.ty, &mut nested);
+        for n in nested {
+            let TyExpr::ImplTrait { bounds } = ast.ty(n) else { continue };
+            let lhs = apit_param(ast, interner, known, cx, tys, &mut generics, &mut scope, bounds, ast.ty_span(n), errs);
+            scope.apit.push((n, lhs));
         }
         match resolve_scoped(ast, interner, known, cx, tys, param.ty, &scope) {
             Ok(t) => {
@@ -3314,6 +3314,66 @@ pub fn resolve_fn_sig(
     }
     let region_sig = region_sig(ast, interner, known, tys, cx, def, &scope, self_ty, &params, errs);
     (params, ret, ret_borrows_from, generics, scope, region_sig, opaque)
+}
+
+/// One `impl Trait` argument's synthetic type param (`impl#N`, after the
+/// declared ones): its bounds and an implicit `Sized` unless relaxed.
+#[allow(clippy::too_many_arguments)]
+fn apit_param(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    generics: &mut Generics,
+    scope: &mut Scope,
+    bounds: &[ast::TraitBound],
+    span: Span,
+    errs: &mut Vec<Diag>,
+) -> Ty {
+    let idx = generics.params.len() as u32;
+    let name = interner.intern(&format!("impl#{idx}"));
+    generics.params.push(ParamDef { name, kind: ParamKind::Type, span });
+    scope.type_params.push((name, idx));
+    let lhs = tys.intern(TyKind::Param(ParamId(idx)));
+    let mut preds: Vec<Predicate> = Vec::new();
+    let mut relaxed: Vec<u32> = Vec::new();
+    for b in bounds {
+        bound_predicates(ast, interner, known, cx, tys, scope, lhs, b, &mut preds, &mut relaxed, errs);
+    }
+    if !relaxed.contains(&idx) {
+        let args = tys.intern_args(&[GenericArg::Ty(lhs)]);
+        preds.push(Predicate::Trait(Binder::plain(TraitRef { def: cx.lang.sized, args, bindings: EMPTY_BINDINGS })));
+    }
+    generics.predicates.extend(preds);
+    lhs
+}
+
+/// The `impl Trait` nodes nested in an argument type, outermost first:
+/// under references, slices, arrays, tuples, and generic args. Not under
+/// fn pointers or `dyn`, where rustc rejects them (E0562), and not inside
+/// another `impl Trait`'s bounds.
+fn nested_impl_traits(ast: &Ast, id: ast::TyId, out: &mut Vec<ast::TyId>) {
+    match ast.ty(id) {
+        TyExpr::ImplTrait { .. } => out.push(id),
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } => {
+            nested_impl_traits(ast, *inner, out)
+        }
+        TyExpr::Array { inner, .. } => nested_impl_traits(ast, *inner, out),
+        TyExpr::Tuple(elems) => elems.iter().for_each(|&e| nested_impl_traits(ast, e, out)),
+        TyExpr::Path(segs) => {
+            for seg in segs {
+                if let ast::GenericArgs::Angle(args) = &seg.args {
+                    for a in args {
+                        if let ast::GenericArg::Type(t) = a {
+                            nested_impl_traits(ast, *t, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The region signature of one fn (W-BORROW, ARCH 5.2): its params and
