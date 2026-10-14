@@ -29,6 +29,14 @@ fn main() {
     }
     println!("{:?} {:?}", m.values().copied().collect::<Vec<_>>(), m.values_mut().count());
     println!("{:?}", m.values().collect::<BTreeSet<_>>().into_iter().rev().collect::<Vec<_>>());
+    let mut dd: VecDeque<Vec<i32>> = VecDeque::new();
+    dd.push_back(vec![1, 2]);
+    dd.push_back(vec![3]);
+    println!("{:?} {:?}", dd.iter().flatten().collect::<Vec<_>>(), dd.iter().flat_map(|v| v.iter()).collect::<Vec<_>>());
+    println!("{:?} {:?}", m.keys().size_hint(), m.values().rposition(|v| *v == 21));
+    let mut kit = m.keys();
+    println!("{:?} {:?}", kit.next_back(), kit.next());
+    println!("{:?}", m.values().chain(m.values()).collect::<Vec<_>>());
     let ks: Vec<i32> = m.clone().into_keys().collect();
     let vs: Vec<i32> = m.clone().into_values().collect();
     println!("{:?} {:?} {:?}", ks, vs, m.into_iter().collect::<Vec<_>>());

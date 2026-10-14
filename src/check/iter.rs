@@ -770,6 +770,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// needs an `Iterator` impl lust can call (`by_next_fns`); one it
     /// cannot call is L0640 and gives ERROR.
     fn by_next_item(&mut self, base: Ty, span: Span) -> Option<Ty> {
+        // A collection iterator struct is handled as its inner
+        // iterator (iter_method), never through `ByNext`.
+        if self.p.collection_iter_inner(&mut self.tys, base).is_some() {
+            return None;
+        }
         let p = self.p;
         let lang = p.gx.lang;
         let user = match self.kind(base) {
@@ -858,6 +863,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Vec, slice, or array as a slice iterator, a Vec by value as
     /// `vec::IntoIter`. None for other types.
     fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
+        // A collection iterator struct chains as its inner iterator.
+        if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, t) {
+            return Some(inner);
+        }
         // A user iterator type by value: its `next` wrapper (W-STD-B).
         if !it::is_iter(&self.tys, t)
             && !self.param_iter(t)
@@ -867,10 +876,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if it::is_iter(&self.tys, t) || self.param_iter(t) {
             return Some(t);
-        }
-        // A collection iterator struct chains as its inner iterator.
-        if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, t) {
-            return Some(inner);
         }
         if let Some(el) = self.tys.vec_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el]));

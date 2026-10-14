@@ -54,6 +54,10 @@ fn main() {
     let v = vec![K(3), K(2), K(1)];
     println!("{:?} {:?} {:?}", v.iter().max(), v.iter().min(), v.binary_search(&K(2)));
     println!("{:?}", v.binary_search_by_key(&&2, |k| &k.0));
+    // `Cow` sorts as the value it derefs to, in both orders.
+    let mut cows: Vec<std::borrow::Cow<'static, str>> = vec![std::borrow::Cow::Borrowed("b"), std::borrow::Cow::Owned(String::from("a"))];
+    cows.sort();
+    println!("{:?}", cows);
     // A key may borrow from a capture, just not from the element.
     let keys = vec![30, 10, 20];
     let mut idx = vec![2usize, 0, 1];
