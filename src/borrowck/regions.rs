@@ -1188,7 +1188,11 @@ impl OwnSig {
         // them (`call_opaque`): each region of the returned value must
         // outlive one fresh universal that every other universal outlives
         // (W-CHECK-G3).
-        if crate::check::opaque::mentions_opaque(&p.tys, p.ret_view(body.fn_id), None) && !own.slots.is_empty() {
+        // An `impl Trait + 'static` return: every region of the returned
+        // value is `'static` instead.
+        if opaque_static_ret(p, p.ret_view(body.fn_id)) && !own.slots.is_empty() {
+            own.slots[0].fill(0);
+        } else if crate::check::opaque::mentions_opaque(&p.tys, p.ret_view(body.fn_id), None) && !own.slots.is_empty() {
             let ret: Vec<Univ> = own.slots[0].clone();
             let n = own.n_univ;
             for &r in &ret {
@@ -1846,6 +1850,12 @@ pub(super) struct Builder<'b, 'p, 'a> {
     /// While a call's signature is instantiated: the erased type each
     /// type param binds (`inst_walk`), for trait-selection checks.
     bind_tys: FxMap<u32, Ty>,
+    /// The capture var of each local that may hold an `impl Trait` value
+    /// (`Body::opaque_locals`): the regions the opaque type captures
+    /// (edition 2024: every argument region of the defining call), which
+    /// the revealed hidden type may have no slot for (`String` behind
+    /// `impl Display`). Owned by the local and drop-live (`cap_flow`).
+    cap_var: FxMap<Local, u32>,
 }
 
 impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
@@ -1874,6 +1884,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             created: FxMap::default(),
             root_check: None,
             bind_tys: FxMap::default(),
+            cap_var: FxMap::default(),
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -1896,6 +1907,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             for i in 0..n as usize {
                 b.owner.push(l as u32 + 1);
                 b.drop_slot.push(dl[i]);
+            }
+            if body.opaque_locals.contains(&(l as Local)) {
+                b.cap_var.insert(l as Local, b.owner.len() as u32);
+                b.owner.push(l as u32 + 1);
+                b.drop_slot.push(true);
             }
         }
         for _ in 0..n_loans {
@@ -2424,7 +2440,66 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
+    /// Carries the capture vars (`cap_var`) of the opaque locals `srcs`
+    /// moves or copies into `dest`: into the dest local's capture var,
+    /// or into every slot of a dest that has none (a reference to an
+    /// opaque value, a `Box<dyn Tr>` made from one).
+    fn cap_flow(&mut self, srcs: &[&Operand], dest: &Place) {
+        let caps = self.caps_of(srcs.iter().copied());
+        self.cap_into(&caps, dest);
+    }
+
+    /// The capture vars of the opaque locals the operands read.
+    fn caps_of<'o>(&self, ops: impl Iterator<Item = &'o Operand>) -> Vec<u32> {
+        ops.filter_map(|o| match o {
+            Operand::Move(pl) | Operand::Copy(pl) => self.cap_var.get(&pl.local).copied(),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// Makes the vars `caps` outlive what `dest` captures (`cap_flow`).
+    fn cap_into(&mut self, caps: &[u32], dest: &Place) {
+        if caps.is_empty() {
+            return;
+        }
+        if let Some(&dc) = self.cap_var.get(&dest.local) {
+            self.flow_all(caps, &[dc]);
+            return;
+        }
+        let (mut dv, mut d) = (Vec::new(), Vec::new());
+        self.place(dest, &mut dv, &mut d);
+        self.flow_all(caps, &dv);
+    }
+
     fn assign(&mut self, bi: usize, si: usize, dest: &Place, rv: &Rvalue) {
+        if !self.cap_var.is_empty() {
+            // Only the rvalues that move or copy a value into the result
+            // carry its captures; a comparison or a format reads it.
+            match rv {
+                Rvalue::Use(o)
+                | Rvalue::Cast(o, _)
+                | Rvalue::Opt(_, Some(o))
+                | Rvalue::Res(_, _, o)
+                | Rvalue::MakeDyn { ptr: o, .. }
+                | Rvalue::DynUpcast { ptr: o, .. }
+                | Rvalue::DynData { ptr: o, .. }
+                | Rvalue::VecRepeat(_, o, _)
+                | Rvalue::ArrayRepeat(_, o, _) => self.cap_flow(&[o], dest),
+                Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
+                    let ops: Vec<&Operand> = ops.iter().collect();
+                    self.cap_flow(&ops, dest);
+                }
+                // A reference to an opaque value holds what it captures
+                // (`&'r Opaque<'s>` needs `'s: 'r`).
+                Rvalue::Ref(_, pl) => {
+                    if let Some(&c) = self.cap_var.get(&pl.local) {
+                        self.cap_into(&[c], dest);
+                    }
+                }
+                _ => {}
+            }
+        }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
         match rv {
             Rvalue::Use(o) | Rvalue::Cast(o, _) => {
@@ -2820,6 +2895,21 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
         let dt = self.place(dest, &mut dv, &mut d);
+        // A call of an `impl Trait` fn: its value captures every argument
+        // region. Any call carries the captures of the opaque values it
+        // takes by value to an opaque result (`cap_var`).
+        if let Some(&dc) = self.cap_var.get(&dest.local) {
+            // A template callee (`lust check` makes no instances) keeps
+            // its opaque return in `FnInfo::ret`.
+            if let CallTarget::Fn(f) = target
+                && (self.p.gx.opaque_ret_of.contains_key(&f) || crate::check::opaque::mentions_opaque(&self.p.tys, self.p.fn_info(f).ret, None))
+            {
+                let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+                self.flow_all(&all, &[dc]);
+            }
+            let caps = self.caps_of(args.iter());
+            self.flow_all(&caps, &[dc]);
+        }
         // Free closure arguments first: a closure with no captures has no
         // creating statement, so its argument vars are made here. A builtin
         // links them to its other arguments; a generic fn through its bound
@@ -5686,6 +5776,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             _ => {}
         }
     }
+}
+
+/// True when `ret` is an `impl Trait` type with a `'static` bound.
+fn opaque_static_ret(p: &Program, ret: Ty) -> bool {
+    let TyKind::Opaque(od, _) = p.tys.kind(ret) else { return false };
+    p.gx.opaques.get(&od).is_some_and(|o| o.bounds.iter().any(|b| matches!(b, Predicate::TypeOutlives(_, Region::Static))))
 }
 
 /// True for a bare slice or `str` type: as a local's type it is a fat
