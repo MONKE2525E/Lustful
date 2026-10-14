@@ -1470,12 +1470,23 @@ fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
 /// serves one `SessionKey`: a request for another key is a routing bug and
 /// gets an internal error, never this session's state.
 
-/// Splices the checked source std fns after `src` (see the call site in
-/// `compile`). Returns the shipped byte ranges and the std fn routes.
+/// One std splice into a compile's source (see `splice_std`).
+struct Spliced {
+    /// The shipped byte ranges of the combined source, by crate.
+    ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
+    /// The `STD_FNS` rows the splice defines.
+    routes: Vec<&'static crate::ty::lang::StdFnDef>,
+    /// The byte range of the lang method chunks (`Ast::lang_methods`).
+    methods: (u32, u32),
+}
+
+/// Splices the checked source std that `needs` asks for after `src`
+/// (see the call site in `compile`).
 fn splice_std(
     src: &mut String,
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
-) -> Result<(Vec<(u32, u32, crate::ty::lang::ShippedCrate)>, Vec<&'static crate::ty::lang::StdFnDef>), Response> {
+    needs: crate::ty::lang::StdNeeds,
+) -> Result<Spliced, Response> {
     let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
     let load = match load {
         Ok(l) => l,
@@ -1485,15 +1496,23 @@ fn splice_std(
     if !src.ends_with('\n') {
         src.push('\n');
     }
-    for (krate, text) in &load.splices {
+    let splice = match load.splice(needs) {
+        Ok(s) => s,
+        Err(e) => return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() }),
+    };
+    let mut methods = (0, 0);
+    for (i, (krate, text)) in splice.blocks.iter().enumerate() {
         let lo = src.len() as u32;
         src.push_str(text);
         if !src.ends_with('\n') {
             src.push('\n');
         }
         ranges.push((lo, src.len() as u32, *krate));
+        if splice.methods_block == Some(i) {
+            methods = (lo, src.len() as u32);
+        }
     }
-    Ok((ranges, load.fns.clone()))
+    Ok(Spliced { ranges, routes: splice.routes, methods })
 }
 
 /// The resolver front end (W-RESOLVE): Cargo graph selection, the
@@ -1517,6 +1536,7 @@ fn resolved_setup(
     crate_ids_default: CrateIds,
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
+    std_methods: &mut (u32, u32),
     t: &mut Timer,
 ) -> Result<(SourceMap, Vec<usize>, Vec<usize>, bool, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
     use crate::resolve::cargo::{self, GraphRequest};
@@ -1569,14 +1589,15 @@ fn resolved_setup(
         (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem)
     };
     // Std splice, in the root file text, exactly as the single-file path
-    // (user spans do not move). A second resolve runs when only a
-    // non-root file mentions a source std fn.
-    let mut spliced = false;
-    if crate::ty::lang::needs_std_load(&root_text) {
-        let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
-        *std_ranges = ranges;
-        *std_routes = routes;
-        spliced = true;
+    // (user spans do not move). A second resolve runs when another file
+    // names std source the root file does not: the splice then serves
+    // every file's needs (`all_text` holds them all).
+    let unspliced_root = root_text.clone();
+    let mut spliced_needs = crate::ty::lang::std_needs(&root_text);
+    let mut spliced = spliced_needs.any();
+    if spliced {
+        let sp = splice_std(&mut root_text, std_cache, spliced_needs)?;
+        (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
         t.lap("std load+splice");
     }
     // Routing lexed the single-file root already: hand its tokens to
@@ -1601,22 +1622,32 @@ fn resolved_setup(
         };
         match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {
-                if r.needs_std && !spliced {
-                    let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
-                    *std_ranges = ranges;
-                    *std_routes = routes;
-                    spliced = true;
-                    t.lap("std load+splice");
-                    continue;
+                if r.needs_std {
+                    let all = crate::ty::lang::std_needs(&r.all_text);
+                    let needs = crate::ty::lang::StdNeeds {
+                        fns: all.fns || spliced_needs.fns,
+                        methods: all.methods || spliced_needs.methods,
+                        modules: all.modules || spliced_needs.modules,
+                    };
+                    if !spliced || needs != spliced_needs {
+                        root_text.clone_from(&unspliced_root);
+                        let sp = splice_std(&mut root_text, std_cache, needs)?;
+                        (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
+                        spliced = true;
+                        spliced_needs = needs;
+                        t.lap("std load+splice");
+                        continue;
+                    }
                 }
                 break r;
             }
             Err(e) => {
                 if e.needs_std && !spliced {
-                    let (ranges, routes) = splice_std(&mut root_text, std_cache)?;
-                    *std_ranges = ranges;
-                    *std_routes = routes;
+                    let needs = crate::ty::lang::std_needs(&e.all_text);
+                    let sp = splice_std(&mut root_text, std_cache, needs)?;
+                    (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
                     spliced = true;
+                    spliced_needs = needs;
                     continue;
                 }
                 let mut diags = e.diags;
@@ -1851,12 +1882,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // mention a source std fn pays one byte scan and nothing else.
     let mut std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)> = Vec::new();
     let mut std_routes: Vec<&'static crate::ty::lang::StdFnDef> = Vec::new();
-    if !use_resolver && crate::ty::lang::needs_std_load(&src) {
-        match splice_std(&mut src, std_cache) {
-            Ok((ranges, routes)) => {
-                std_ranges = ranges;
-                std_routes = routes;
-            }
+    let mut std_methods = (0u32, 0u32);
+    let needs = crate::ty::lang::std_needs(&src);
+    if !use_resolver && needs.any() {
+        match splice_std(&mut src, std_cache, needs) {
+            Ok(sp) => (std_ranges, std_routes, std_methods) = (sp.ranges, sp.routes, sp.methods),
             Err(resp) => return resp,
         }
         t.lap("std load+splice");
@@ -1864,7 +1894,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Both front ends produce the same locals for the shared tail.
     let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
-        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, crate_ids, &mut std_ranges, &mut std_routes, &mut t) {
+        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t) {
             Ok(x) => x,
             Err(resp) => return resp,
         }
@@ -2456,6 +2486,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).
+    front.ast.shipped = std_ranges.clone();
+    front.ast.lang_methods = std_methods;
     let mut program = match collect::collect_reuse(
         &front.ast,
         &front.interner,

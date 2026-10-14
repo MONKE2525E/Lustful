@@ -2749,7 +2749,15 @@ fn resolve_one(
         let per_work = par_map(&cells, |(fi, cell)| {
             let mut w = cell.lock().unwrap();
             let module = w.module;
-            let mut rw = Rewrite { tables, interner, list_module: &list_module, local_names: &local_names, diags: Vec::new(), gen_params: Vec::new() };
+            let mut rw = Rewrite {
+                tables,
+                interner,
+                list_module: &list_module,
+                local_names: &local_names,
+                diags: Vec::new(),
+                gen_params: Vec::new(),
+                std_splice_lo: input.std_splice_lo,
+            };
             rw.file_items(&mut w.ast, *fi, module, &[]);
             rw.diags
         });
@@ -4158,6 +4166,12 @@ struct Rewrite<'a> {
     /// segment, so such paths stay as written; check resolves them
     /// against the item's generics.
     gen_params: Vec<(Sym, bool)>,
+    /// `CrateInput::std_splice_lo`: a top-level inherent impl at or after
+    /// it in the root file is a std method chunk of a lang enum (`impl<T>
+    /// Option<T>`, stdload's `MethodChunk`), left as written. Std source
+    /// must not resolve to user names; check resolves it in `STD_MODULE`.
+    /// (The std source modules are `mod` items: the rewrite walks them.)
+    std_splice_lo: Option<u32>,
 }
 
 impl Rewrite<'_> {
@@ -4220,6 +4234,13 @@ impl Rewrite<'_> {
 
     fn items(&mut self, ast: &mut Ast, items: &mut Vec<Item>, fi: usize, module: ModuleId, prefix: &[Sym]) {
         for item in items.iter_mut() {
+            if module == ROOT_MODULE
+                && item.span.file == crate::diag::FileId(0)
+                && self.std_splice_lo.is_some_and(|lo| item.span.lo >= lo)
+                && matches!(&item.kind, ItemKind::Impl(imp) if imp.trait_ref.is_none())
+            {
+                continue;
+            }
             match &mut item.kind {
                 ItemKind::Fn(f) => {
                     let mut def = std::mem::replace(f, dummy_fn());

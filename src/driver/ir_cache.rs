@@ -1236,7 +1236,9 @@ fn main() {
     /// reused both units before).
     #[test]
     fn ir_fingerprint_tracks_track_caller() {
-        const TC: &str = "fn g(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\nfn main() {\n    println!(\"{}\", g(None));\n}\n";
+        // A plain panic: this helper compiles without the std splice, so
+        // std's (source) `Option::unwrap` is not there.
+        const TC: &str = "fn g(x: u8) -> u8 {\n    if x == 0 {\n        panic!(\"zero\");\n    }\n    x\n}\nfn main() {\n    println!(\"{}\", g(0));\n}\n";
         let fp_of = |src: &str| -> Vec<(String, u64)> {
             let mut out = Vec::new();
             lowered(src, |p, map, bodies| {

@@ -2679,8 +2679,10 @@ pub(crate) fn resolve_path_ty(
     // Past the checks above, a multi-segment path is a canonical std
     // path: it names std's type, never a user type of that name.
     let std_path = segs.len() > 1;
-    // A user type named `Rc` shadows std's (which needs a `use`).
-    if name == known.Vec || name == known.Option || name == known.Box || (name == known.Rc && (std_path || !cx.type_names.contains_key(&name))) {
+    // A user type named `Rc` shadows std's (which needs a `use`), and
+    // so does a user `Option` or `Result` (prelude names, as in Rust).
+    let shadowed = !std_path && cx.type_names.contains_key(&name);
+    if name == known.Vec || (name == known.Option && !shadowed) || name == known.Box || (name == known.Rc && !shadowed) {
         let args = match &seg.args {
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, interner.get(name))?,
             _ => {
@@ -2806,7 +2808,7 @@ pub(crate) fn resolve_path_ty(
     if interner.get(name) == "ExitCode" && (std_path || !cx.type_names.contains_key(&name)) {
         return no_generics(tys.exit_code_ty());
     }
-    if name == known.Result {
+    if name == known.Result && !shadowed {
         let args = match &seg.args {
             GenericArgs::Angle(a) => {
                 resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false, false], 2, span, interner.get(name))?
@@ -3872,6 +3874,11 @@ pub struct GenTables<'a> {
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
     pub has_generics: bool,
+    /// True when user code (not only spliced std source) sets
+    /// `has_generics`. Without it, the generics are std's methods of
+    /// the lang enums only, and mono skips work no instance needs
+    /// (see `materialize`).
+    pub user_generics: bool,
     /// (templates checked, concrete instances made).
     pub mono_counts: (usize, usize),
     /// The template checks, by checked fn: each template body is
@@ -3988,6 +3995,7 @@ impl Default for GenTables<'_> {
             hash_impls: FxMap::default(),
             borrow_impls: FxMap::default(),
             has_generics: false,
+            user_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
             trait_picks: FxMap::default(),
@@ -4016,6 +4024,30 @@ impl Default for GenTables<'_> {
 
 impl GenTables<'_> {
     /// The resolve context over the tables built so far.
+    /// `resolve_cx` for an item of spliced std source when `std` is set:
+    /// no user type, alias, or trait is visible (see `STD_MODULE`).
+    pub fn resolve_cx_in<'x>(&'x self, type_names: &'x FxMap<Sym, AdtId>, aliases: &'x FxMap<Sym, Ty>, std: bool) -> ResolveCx<'x> {
+        static NO_ADTS: std::sync::LazyLock<FxMap<Sym, AdtId>> = std::sync::LazyLock::new(FxMap::default);
+        static NO_TYS: std::sync::LazyLock<FxMap<Sym, Ty>> = std::sync::LazyLock::new(FxMap::default);
+        static NO_DEFS: std::sync::LazyLock<FxMap<Sym, DefId>> = std::sync::LazyLock::new(FxMap::default);
+        static NO_ALIASES: std::sync::LazyLock<FxMap<Sym, GenericAlias>> = std::sync::LazyLock::new(FxMap::default);
+        static NO_ITEMS: std::sync::LazyLock<FxMap<Sym, u32>> = std::sync::LazyLock::new(FxMap::default);
+        if !std {
+            return self.resolve_cx(type_names, aliases);
+        }
+        ResolveCx {
+            type_names: &NO_ADTS,
+            adt_info: &self.adt_info,
+            adt_lifetimes: &self.adt_lifetimes,
+            trait_names: &NO_DEFS,
+            aliases: &NO_TYS,
+            generic_aliases: &NO_ALIASES,
+            index: &self.index,
+            lang: &self.lang,
+            item_index: &NO_ITEMS,
+        }
+    }
+
     pub fn resolve_cx<'x>(&'x self, type_names: &'x FxMap<Sym, AdtId>, aliases: &'x FxMap<Sym, Ty>) -> ResolveCx<'x> {
         ResolveCx {
             type_names,
@@ -4099,6 +4131,7 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
     for item in &p.ast.items {
         let ast::ItemKind::Trait(tdef) = &item.kind else { continue };
         p.gx.has_generics = true;
+        p.gx.user_generics = true;
         let ordinal = ordinals.get(&tdef.name).copied().unwrap_or(0);
         ordinals.insert(tdef.name, ordinal + 1);
         let def = trait_def_id(p, p.interner, tdef.name, ordinal);
@@ -6130,6 +6163,17 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
         insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
+    // `thread::AccessError` (W-TLS): Copy, Clone, Debug, Display,
+    // PartialEq, Eq, as in std; std source's `Result::unwrap` asks
+    // `E: Debug` of it.
+    {
+        let def = p.tys.builtins().access_error;
+        let t = p.tys.mk_adt(def, &[]);
+        for tr in [lang.copy, lang.clone, lang.debug, lang.display, lang.eq] {
+            insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
     let p1 = p.tys.intern(TyKind::Param(ParamId(1)));
     let one = Generics {
@@ -7151,71 +7195,98 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
     let mut errs: Vec<Diag> = Vec::new();
     let mut reuse = std::mem::take(&mut p.gx.reuse);
     for t in templates {
-        // A template whose stored check still holds (driver session
-        // reuse) contributes its picks and closure call kinds without
-        // a recheck. A body with closure expressions always rechecks:
-        // its check also registers closure body fns.
-        let defines_opaque = p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
-        if !defines_opaque && let Some((picks, calls)) = reuse.template(p, t) {
-            reuse.note_template_out(p, t, &picks, &calls, &[]);
-            p.gx.trait_picks.extend(picks);
-            record_template_closures(p, t, Vec::new(), calls);
+        // The lang enum methods (checked when the library was built)
+        // check only when mono makes their first instance (`materialize`):
+        // a compile splices all of them and instantiates a few.
+        if p.is_lang_method(t) {
             continue;
         }
-        // Closures first: their body fns must exist before the body
-        // lowers (its closure calls name them), and the capture
-        // analysis is recorded for the instances. Only bodies with
-        // closure expressions pay this extra check.
-        let mut closure_fns: Vec<LocalDefId> = Vec::new();
-        let mut template_shapes: ClosureShapes = Vec::new();
-        if fn_has_closures(p, t) {
-            let (owned, shapes) = {
-                let (c, _) = crate::check::check_fn(p, t);
-                (snapshot_closures(&c), closure_shapes(&c))
-            };
-            template_shapes.clone_from(&shapes);
-            record_template_closures(p, t, shapes, Vec::new());
-            if let Some(owned) = owned {
-                closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
-            }
-        }
-        let (body_errs, picks, calls, reads, hidden) = {
-            let (c, mut e) = crate::check::check_fn(p, t);
-            let picks = c.trait_picks.clone();
-            let hidden: Vec<(DefId, OwnedTy)> =
-                c.opaque_hidden.iter().filter_map(|&(od, h)| snapshot_ty(&c.tys, h).map(|o| (od, o))).collect();
-            let calls = c.closure_calls.clone();
-            let reads = c.reads.clone();
-            if e.is_empty() {
-                let body = crate::lower::lower(p, t, c);
-                e.extend(crate::borrowck::borrowck(p, &body));
-                for &cf in &closure_fns {
-                    let (cc, _) = crate::check::check_fn(p, cf);
-                    let cbody = crate::lower::lower(p, cf, cc);
-                    e.extend(crate::borrowck::borrowck(p, &cbody));
-                }
-            }
-            (e, picks, calls, reads, hidden)
-        };
-        for (od, owned) in hidden {
-            let h = build_owned_ty(p, &owned);
-            p.gx.opaque_hidden.insert(od, h);
-        }
-        reuse.templates_checked += 1;
-        reuse.template_errors += body_errs.len();
-        reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
-        if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
-            reuse.store_template(p, t, &reads, &picks, &calls);
-        }
-        record_template_closures(p, t, Vec::new(), calls);
-        errs.extend(body_errs);
-        for (call, pick) in picks {
-            p.gx.trait_picks.insert(call, pick);
-        }
-        p.gx.mono_counts.0 += 1;
+        errs.extend(check_template(p, t, &mut reuse));
     }
     p.gx.reuse = reuse;
     errs
+}
+
+/// Checks every lang enum method template now (std load's validation
+/// of library/core; a compile checks them lazily, see `template_check`).
+pub fn check_lang_templates(p: &mut Program) -> Vec<Diag> {
+    let mut reuse = std::mem::take(&mut p.gx.reuse);
+    let mut errs = Vec::new();
+    for f in (0..p.fns.len() as u32).map(LocalDefId) {
+        if p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Template) && p.is_lang_method(f) {
+            errs.extend(check_template(p, f, &mut reuse));
+        }
+    }
+    p.gx.reuse = reuse;
+    errs
+}
+
+/// One template's check against its param env (see `template_check`):
+/// its picks, closure call kinds, and closure bodies are recorded for
+/// its instances. Returns the check's errors.
+fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::driver::gen_reuse::GenReuse) -> Vec<Diag> {
+    // A template whose stored check still holds (driver session
+    // reuse) contributes its picks and closure call kinds without
+    // a recheck. A body with closure expressions always rechecks:
+    // its check also registers closure body fns.
+    let defines_opaque = p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
+    if !defines_opaque && let Some((picks, calls)) = reuse.template(p, t) {
+        reuse.note_template_out(p, t, &picks, &calls, &[]);
+        p.gx.trait_picks.extend(picks);
+        record_template_closures(p, t, Vec::new(), calls);
+        return Vec::new();
+    }
+    // Closures first: their body fns must exist before the body
+    // lowers (its closure calls name them), and the capture
+    // analysis is recorded for the instances. Only bodies with
+    // closure expressions pay this extra check.
+    let mut closure_fns: Vec<LocalDefId> = Vec::new();
+    let mut template_shapes: ClosureShapes = Vec::new();
+    if fn_has_closures(p, t) {
+        let (owned, shapes) = {
+            let (c, _) = crate::check::check_fn(p, t);
+            (snapshot_closures(&c), closure_shapes(&c))
+        };
+        template_shapes.clone_from(&shapes);
+        record_template_closures(p, t, shapes, Vec::new());
+        if let Some(owned) = owned {
+            closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
+        }
+    }
+    let (body_errs, picks, calls, reads, hidden) = {
+        let (c, mut e) = crate::check::check_fn(p, t);
+        let picks = c.trait_picks.clone();
+        let hidden: Vec<(DefId, OwnedTy)> =
+            c.opaque_hidden.iter().filter_map(|&(od, h)| snapshot_ty(&c.tys, h).map(|o| (od, o))).collect();
+        let calls = c.closure_calls.clone();
+        let reads = c.reads.clone();
+        if e.is_empty() {
+            let body = crate::lower::lower(p, t, c);
+            e.extend(crate::borrowck::borrowck(p, &body));
+            for &cf in &closure_fns {
+                let (cc, _) = crate::check::check_fn(p, cf);
+                let cbody = crate::lower::lower(p, cf, cc);
+                e.extend(crate::borrowck::borrowck(p, &cbody));
+            }
+        }
+        (e, picks, calls, reads, hidden)
+    };
+    for (od, owned) in hidden {
+        let h = build_owned_ty(p, &owned);
+        p.gx.opaque_hidden.insert(od, h);
+    }
+    reuse.templates_checked += 1;
+    reuse.template_errors += body_errs.len();
+    reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
+    if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
+        reuse.store_template(p, t, &reads, &picks, &calls);
+    }
+    record_template_closures(p, t, Vec::new(), calls);
+    for (call, pick) in picks {
+        p.gx.trait_picks.insert(call, pick);
+    }
+    p.gx.mono_counts.0 += 1;
+    body_errs
 }
 
 /// Normalizes one global type through the solver, lifting the
@@ -7484,6 +7555,27 @@ fn closure_shapes(c: &crate::check::Checked) -> ClosureShapes {
 }
 
 /// True when a fn body holds a closure expression.
+/// The method names std source defines on the lang enums (`impl<T>
+/// Option<T>` in library/core), as this program interns them.
+fn lang_enum_method_names(p: &Program) -> Vec<Sym> {
+    let b = p.tys.builtins();
+    let mut names: Vec<Sym> = p.gx.inherent_methods.keys().filter(|(d, _)| *d == b.option || *d == b.result).map(|&(_, n)| n).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// True if the body of `fid` calls one of `names` as a method or
+/// names it as a path's last segment (`Option::map`).
+fn names_lang_enum_method(p: &Program, fid: LocalDefId, names: &[Sym]) -> bool {
+    let (lo, hi) = p.fn_info(fid).def.exprs;
+    (lo..hi).any(|x| match p.ast.expr(ast::ExprId(x)) {
+        ast::Expr::MethodCall { name, .. } => names.binary_search(name).is_ok(),
+        ast::Expr::Path(segs) => segs.last().is_some_and(|s| names.binary_search(&s.name).is_ok()),
+        _ => false,
+    })
+}
+
 fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
     let (lo, hi) = p.fn_info(fid).def.exprs;
     (lo..hi).any(|x| matches!(p.ast.expr(ast::ExprId(x)), ast::Expr::Closure { .. }))
@@ -7976,12 +8068,14 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // its own fn with a slot, made here (ARCH 2.9, 4.1); and so do
     // `dyn Fn` values made from fn items, whose vtables only body
     // checks ask for.
-    if !p.gx.has_generics
-        && (p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. }))
-            || p.ast.tys.iter().any(|t| matches!(t, TyExpr::Dyn { .. }))
-            || !p.gx.opaques.is_empty())
-    {
-        p.gx.has_generics = true;
+    if !p.gx.user_generics {
+        let user = |sp: &Span| !p.in_lang_methods(*sp);
+        let closures = p.ast.exprs.iter().zip(&p.ast.expr_spans).any(|(e, sp)| matches!(e, ast::Expr::Closure { .. }) && user(sp));
+        let dyns = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, sp)| matches!(t, TyExpr::Dyn { .. }) && user(sp));
+        if closures || dyns || !p.gx.opaques.is_empty() {
+            p.gx.has_generics = true;
+            p.gx.user_generics = true;
+        }
     }
     if !p.gx.has_generics {
         return Vec::new();
@@ -8005,12 +8099,26 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     let first_instance = p.fns.len();
     let mut queue: Vec<LocalDefId> =
         (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Plain)).collect();
+    // Generics from std's lang enum methods only: a plain body asks for
+    // an instance only by naming one of the methods, and `lust check`
+    // walks no instances, so the discovery pass (a second check of
+    // every body) runs only for bodies that name one, and only in a
+    // build. No user closures, dyn values, or generic Adts exist then.
+    if !p.gx.user_generics {
+        if p.gx.walk_instances {
+            let names = lang_enum_method_names(p);
+            queue.retain(|&f| names_lang_enum_method(p, f, &names));
+        } else {
+            queue.clear();
+        }
+    }
     crate::mono::vtable::eager_vtables(p, &mut queue);
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
     let mut drop_done = 0u32;
     let mut drop_created = 0usize;
     let mut reuse = std::mem::take(&mut p.gx.reuse);
+    let mut lang_checked: Vec<LocalDefId> = Vec::new();
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -8134,6 +8242,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 let args_id = p.tys.intern_args(&lifted);
                 if p.gx.instance_by_key.contains_key(&(template_def, args_id)) {
                     continue;
+                }
+                // A lang enum method checks as a template before its
+                // first instance (see `template_check`).
+                if p.is_lang_method(template) && !lang_checked.contains(&template) {
+                    lang_checked.push(template);
+                    errs.extend(check_template(p, template, &mut reuse));
                 }
                 let inst = fn_instance(p, template, &lifted);
                 depths.insert(inst, depth + 1);

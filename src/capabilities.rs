@@ -2,7 +2,7 @@
 //
 // Where the compiler has a table, this output is generated from that table so it cannot drift:
 // integer types from `IntTy::ALL`, std methods from the `Builtin` enum (an exhaustive match maps
-// each builtin to its type and name), std free functions from `Builtin` plus the source std
+// each builtin to its type and name) and the std source of Option and Result, std free functions from `Builtin` plus the source std
 // registry (`ty::lang::STD_FNS`, S5), macros from `MacroKind`, operators from `BinOp::symbol`,
 // and error codes from the explain docs. The rejected list names the same feature strings as the
 // `unsupported(...)` call sites; scripts/agentkit-test.sh greps those call sites and checks that
@@ -132,20 +132,6 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::Pow,
     Builtin::Min,
     Builtin::Max,
-    Builtin::OptIsSome,
-    Builtin::OptIsNone,
-    Builtin::OptUnwrap,
-    Builtin::OptExpect,
-    Builtin::OptUnwrapOr,
-    Builtin::ResIsOk,
-    Builtin::ResIsErr,
-    Builtin::ResUnwrap,
-    Builtin::ResExpect,
-    Builtin::ResUnwrapErr,
-    Builtin::ResExpectErr,
-    Builtin::ResOk,
-    Builtin::ResErr,
-    Builtin::ResUnwrapOr,
     Builtin::VecPop,
     Builtin::VecGet,
     Builtin::VecFirst,
@@ -311,7 +297,6 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CharsBytesLeft,
     Builtin::CharsNextBack,
     Builtin::DefaultGlue,
-    Builtin::OptUnwrapOrDefault,
     Builtin::FmtWriteStr,
     Builtin::FmtWriteChar,
     Builtin::FmtPad,
@@ -346,12 +331,6 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::ConvRcInner,
     Builtin::ConvInto,
     Builtin::CmpCode,
-    Builtin::OptAsRef,
-    Builtin::OptAsMut,
-    Builtin::OptTake,
-    Builtin::OptReplace,
-    Builtin::ResAsRef,
-    Builtin::ResAsMut,
     Builtin::SliceSort,
     Builtin::SliceSortUnstable,
     Builtin::SliceSortBy,
@@ -587,20 +566,6 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::Pow => (&["integers"], vec![k.pow], Call::Method),
         B::Min => (&["integers"], vec![k.min], Call::Method),
         B::Max => (&["integers"], vec![k.max], Call::Method),
-        B::OptIsSome => (&["Option<T>"], vec![k.is_some], Call::Method),
-        B::OptIsNone => (&["Option<T>"], vec![k.is_none], Call::Method),
-        B::OptUnwrap => (&["Option<T>"], vec![k.unwrap], Call::Method),
-        B::OptExpect => (&["Option<T>"], vec![k.expect], Call::Method),
-        B::OptUnwrapOr => (&["Option<T>"], vec![k.unwrap_or], Call::Method),
-        B::ResIsOk => (&["Result<T, E>"], vec![i.intern("is_ok")], Call::Method),
-        B::ResIsErr => (&["Result<T, E>"], vec![i.intern("is_err")], Call::Method),
-        B::ResUnwrap => (&["Result<T, E>"], vec![k.unwrap], Call::Method),
-        B::ResExpect => (&["Result<T, E>"], vec![k.expect], Call::Method),
-        B::ResUnwrapErr => (&["Result<T, E>"], vec![i.intern("unwrap_err")], Call::Method),
-        B::ResExpectErr => (&["Result<T, E>"], vec![i.intern("expect_err")], Call::Method),
-        B::ResOk => (&["Result<T, E>"], vec![i.intern("ok")], Call::Method),
-        B::ResErr => (&["Result<T, E>"], vec![i.intern("err")], Call::Method),
-        B::ResUnwrapOr => (&["Result<T, E>"], vec![k.unwrap_or], Call::Method),
         B::VecPop => (&["Vec<T>"], vec![k.pop], Call::Method),
         B::VecGet => (&["Vec<T>"], vec![k.get], Call::Method),
         B::VecFirst => (&["Vec<T>"], vec![k.first], Call::Method),
@@ -758,7 +723,6 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::CharsBytesLeft => (&["str::Chars"], vec![i.intern("size_hint")], Call::Method),
         B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
         B::DefaultGlue => (&["any Default type"], vec![k.default], Call::Associated),
-        B::OptUnwrapOrDefault => (&["Option<T>"], vec![k.unwrap_or_default], Call::Method),
         B::FmtWriteStr => (&["fmt::Formatter"], vec![i.intern("write_str")], Call::Method),
         B::FmtWriteChar => (&["fmt::Formatter"], vec![i.intern("write_char")], Call::Method),
         B::FmtPad => (&["fmt::Formatter"], vec![i.intern("pad")], Call::Method),
@@ -886,12 +850,6 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             Call::Method,
         ),
         B::CmpCode => (&["any Ord type"], vec![i.intern("cmp")], Call::Method),
-        B::OptAsRef => (&["Option<T>"], vec![i.intern("as_ref")], Call::Method),
-        B::OptAsMut => (&["Option<T>"], vec![i.intern("as_mut")], Call::Method),
-        B::OptTake => (&["Option<T>"], vec![i.intern("take")], Call::Method),
-        B::OptReplace => (&["Option<T>"], vec![i.intern("replace")], Call::Method),
-        B::ResAsRef => (&["Result<T, E>"], vec![i.intern("as_ref")], Call::Method),
-        B::ResAsMut => (&["Result<T, E>"], vec![i.intern("as_mut")], Call::Method),
         B::SliceSort => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort")], Call::Method),
         B::SliceSortUnstable => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_unstable")], Call::Method),
         B::SliceSortBy => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("sort_by")], Call::Method),
@@ -1269,6 +1227,16 @@ fn grouped(want: Call) -> Vec<(String, Vec<String>)> {
                 if !entry.1.contains(&name) {
                     entry.1.push(name);
                 }
+            }
+        }
+    }
+    // The std source methods of Option and Result (library/core).
+    if want == Call::Method {
+        for (ty, name) in crate::stdload::lang_method_names() {
+            match groups.iter_mut().find(|(g, _)| g == ty) {
+                Some((_, names)) if !names.iter().any(|n| n == name) => names.push(name.to_string()),
+                Some(_) => {}
+                None => groups.push((ty.to_string(), vec![name.to_string()])),
             }
         }
     }

@@ -400,6 +400,27 @@ impl<'a> Program<'a> {
     pub fn fn_shipped_crate(&self, f: LocalDefId) -> Option<ShippedCrate> {
         self.shipped_crate_at(self.fn_info(f).def.name_span)
     }
+    /// True for a span in the std methods of the lang enums
+    /// (`Ast::lang_methods`): std source with its own scope, where no
+    /// user name is visible.
+    pub fn in_lang_methods(&self, span: Span) -> bool {
+        let (lo, hi) = self.ast.lang_methods;
+        span.file == crate::diag::FileId(0) && span.lo >= lo && span.lo < hi
+    }
+    /// True for a std method of a lang enum (`Option::map`), its
+    /// instances included; closure bodies inside one are not.
+    pub fn is_lang_method(&self, f: LocalDefId) -> bool {
+        !self.gx.closure_fns.contains_key(&f) && self.in_lang_methods(self.fn_info(f).def.name_span)
+    }
+    /// Marks the program generic, from an item at `span`: code other
+    /// than the lang enum methods also sets `user_generics` (see
+    /// `GenTables::user_generics`).
+    pub fn mark_generic(&mut self, span: Span) {
+        self.gx.has_generics = true;
+        if !self.in_lang_methods(span) {
+            self.gx.user_generics = true;
+        }
+    }
     /// The local fn a shipped std path (for example
     /// `std::process::exit`) was routed to in this compile, if any.
     pub fn std_fn_for_path(&self, path: &[Sym]) -> Option<LocalDefId> {
@@ -552,7 +573,10 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
 /// associated type uses is unconstrained (rustc E0207).
 fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mut generics::Scope, errs: &mut Vec<Diag>) {
     let (ast, interner, known) = (p.ast, p.interner, p.known);
-    if let Some(span) = hidden_lifetime(p, imp.self_ty) {
+    // Std source names no user type (`resolve_cx_in`), so the hidden
+    // lifetime test (which reads the user type table) does not apply.
+    let std = p.in_lang_methods(imp.span);
+    if !std && let Some(span) = hidden_lifetime(p, imp.self_ty) {
         errs.push(Diag::new(
             "L0202",
             span,
@@ -566,7 +590,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
     let mut ks = scope.clone();
     ks.regions = generics::RegionMode::Keep { next: Some(counter.clone()), elided: None };
     let self_r = {
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
         match generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, imp.self_ty, &ks) {
             Ok(t) => t,
             Err(_) => return,
@@ -590,7 +614,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
     }
     if !trait_lts.is_empty() {
         let where_lts = {
-            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             generics::trait_lts_of(ast, interner, known, &cx, &ks, &imp.generics, &imp.where_clause)
         };
         p.regions.impl_heads.insert(impl_def, crate::borrowck::ImplHead { self_ty: self_r, trait_lifetimes: trait_lts.clone(), where_lts });
@@ -612,7 +636,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
             if let ast::GenericArgs::Angle(args) = &seg.args {
                 for g in args {
                     if let ast::GenericArg::Type(t) = g {
-                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                         if let Ok(r) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, *t, &ks) {
                             crate::borrowck::regions_of(&p.tys, r, &mut in_header);
                         }
@@ -622,7 +646,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
         }
     }
     for at in &imp.types {
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
         let Some(aty) = at.default else { continue };
         let Ok(t) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, aty, &ks) else { continue };
         let mut used: Vec<Region> = Vec::new();
@@ -2016,7 +2040,7 @@ pub fn collect_reuse<'a>(
         fn_defs: Vec::new(),
         def_by_hash: HashMap::default(),
         std_fns: Vec::new(),
-        shipped_ranges: Vec::new(),
+        shipped_ranges: ast.shipped.clone(),
         resolved,
         gx: GenTables::default(),
         record_reads: true,
@@ -2150,6 +2174,7 @@ pub fn collect_reuse<'a>(
     // A program that names `Cow` (W-STD-B) instantiates it: mono runs.
     if ast_mentions(ast, interner.intern("Cow")) {
         p.gx.has_generics = true;
+        p.gx.user_generics = true;
     }
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
@@ -2341,7 +2366,7 @@ pub fn collect_reuse<'a>(
             _ => 0,
         };
         if n_params > 0 {
-            p.gx.has_generics = true;
+            p.mark_generic(item.span);
         }
         // The Adt's stable identity (ARCH 1.7): same name earlier in the file is a
         // duplicate definition (the error above), and the disambiguator keeps the
@@ -2982,8 +3007,9 @@ pub fn collect_reuse<'a>(
                   errs: &mut Vec<Diag>|
      -> LocalDefId {
         let shift = parent_gen.generics.params.len() as u32;
+        let std = p.in_lang_methods(def.name_span);
         let (own_generics, own_scope) = {
-            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             generics::build_generics_shifted(
                 ast,
                 interner,
@@ -3024,12 +3050,12 @@ pub fn collect_reuse<'a>(
         // Associated sources from every bound in the combined env,
         // so `T::Assoc` resolves in this signature.
         {
-            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
             scope.assoc_srcs.append(&mut srcs);
         }
         let (params, ret, ret_borrows_from, generics, scope, region_sig, opaque) = {
-            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             let owner = DefId { krate: p.krate, hash };
             generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, Some(owner), errs)
         };
@@ -3042,7 +3068,7 @@ pub fn collect_reuse<'a>(
         let env = generics::body_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let is_template = !generics.params.is_empty();
         if is_template {
-            p.gx.has_generics = true;
+            p.mark_generic(def.name_span);
         }
         let id = LocalDefId(p.fns.len() as u32);
         if let Some(mut rs) = region_sig {
@@ -3053,7 +3079,7 @@ pub fn collect_reuse<'a>(
                 *e = true;
             }
             if let Some((g, w)) = parent_gen.ast_generics {
-                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                 rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
                 rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
             }
@@ -3179,17 +3205,18 @@ pub fn collect_reuse<'a>(
                     }
                 }
                 let impl_def = DefId { krate: p.krate, hash: parent };
+                let std = p.in_lang_methods(imp.span);
                 p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, known.self_type, Vis::Priv, imp.span));
 
                 let (impl_generics, mut impl_scope) = {
-                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                     generics::build_generics(ast, interner, known, &cx, &mut p.tys, &imp.generics, &imp.where_clause, &mut errs)
                 };
                 if !impl_generics.params.is_empty() {
-                    p.gx.has_generics = true;
+                    p.mark_generic(imp.span);
                 }
                 let self_pat = {
-                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                     match generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, imp.self_ty, &impl_scope) {
                         Ok(t) => t,
                         Err(d) => {
@@ -3214,8 +3241,8 @@ pub fn collect_reuse<'a>(
                 let trait_ref = match &imp.trait_ref {
                     None => None,
                     Some(tref) => {
-                        p.gx.has_generics = true;
-                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        p.mark_generic(imp.span);
+                        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                         match generics::resolve_trait_ref(ast, interner, known, &cx, &mut p.tys, &impl_scope, self_pat, tref, imp.span) {
                             Ok(tr) => {
                                 impl_traits.insert(item_idx, tr.def);
@@ -3251,7 +3278,7 @@ pub fn collect_reuse<'a>(
                 // type, found by the dyn receiver probe (check/method.rs).
                 let dyn_self = trait_ref.is_none() && matches!(p.tys.kind(self_pat), TyKind::Dyn(..));
                 if dyn_self {
-                    p.gx.has_generics = true;
+                    p.mark_generic(imp.span);
                     p.gx.dyn_impl_sites.push((self_pat, ast.ty_span(imp.self_ty)));
                 }
                 // A header dyn whose object lifetime is `'static` (a dyn
@@ -3296,7 +3323,20 @@ pub fn collect_reuse<'a>(
                     ));
                     continue;
                 }
-                if trait_ref.is_none() && owner.is_none() && !dyn_self {
+                // Std source's inherent impls of the builtin lang enums
+                // (`impl<T> Option<T>` in library/core): their methods are
+                // found by the builtin receiver probe in check's method call.
+                let lang_self = match p.tys.kind(self_pat) {
+                    TyKind::Adt(def, _)
+                        if trait_ref.is_none()
+                            && matches!(p.tys.builtins().kind_of(def), Some(BuiltinTy::Option | BuiltinTy::Result))
+                            && p.in_lang_methods(imp.span) =>
+                    {
+                        Some(def)
+                    }
+                    _ => None,
+                };
+                if trait_ref.is_none() && owner.is_none() && !dyn_self && lang_self.is_none() {
                     errs.push(Diag::new(
                         "L0102",
                         ast.ty_span(imp.self_ty),
@@ -3400,6 +3440,9 @@ pub fn collect_reuse<'a>(
                         if let Some(owner) = owner {
                             p.methods.entry((owner, def.name)).or_default().push(id);
                             let adt_def = p.gx.adt_info[owner.0 as usize].0;
+                            p.gx.inherent_methods.entry((adt_def, def.name)).or_default().push(id);
+                            p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
+                        } else if let Some(adt_def) = lang_self {
                             p.gx.inherent_methods.entry((adt_def, def.name)).or_default().push(id);
                             p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
                         }

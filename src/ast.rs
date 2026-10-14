@@ -41,6 +41,15 @@ pub struct Ast {
     /// per literal, indexed by `Expr::ByteStr`. Large blobs stay one
     /// buffer end to end, never one node or value per byte.
     pub blobs: Vec<ByteBlob>,
+    /// Byte ranges of spliced shipped std source in file 0, by crate
+    /// (the driver's std splice, or a whole shipped file at std load).
+    /// Set before collect, which copies it to `Program::shipped_ranges`
+    /// so the impls of std source (`impl<T> Option<T>`) collect as std.
+    pub shipped: Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
+    /// The byte range in file 0 of the std methods of the lang enums
+    /// (`impl<T> Option<T>` and kin, inside `shipped`): their own scope,
+    /// where no user name is visible (`Program::in_lang_methods`).
+    pub lang_methods: (u32, u32),
 }
 
 /// A byte buffer shared by reference, with a window into it. Cloning
@@ -1495,6 +1504,8 @@ impl Ast {
             blocks: Vec::with_capacity(sh.b as usize),
             strings: Vec::with_capacity(sh.s as usize),
             blobs: Vec::with_capacity(sh.bl as usize),
+            shipped: Vec::new(),
+            lang_methods: (0, 0),
         };
         for mut c in chunks {
             out.inner_attrs.append(&mut c.inner_attrs);

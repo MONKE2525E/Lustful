@@ -262,6 +262,34 @@ pub(super) fn inherent_template_probe(
     Probe::Miss
 }
 
+/// How many inherent method templates of the probe's Self type accept
+/// its receiver type, by a receiver unify that is rolled back. More
+/// than one means the call is ambiguous (rustc E0034: `copied` on an
+/// `Option<_>` whose payload is not known yet fits both `Option<&T>`
+/// and `Option<&mut T>`); `confirm_method` would take the first.
+pub(super) fn inherent_template_fits(cx: &mut Ctx, e: ExprId, probe: RcvProbe, name: Sym, name_span: Span) -> usize {
+    let p = cx.p;
+    let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return 0 };
+    let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return 0 };
+    let mut n = 0;
+    for template in templates {
+        let Some(Some(tmpl)) = p.gx.fn_templates.get(template.0 as usize).cloned() else { continue };
+        let snap_vars = cx.snapshot_vars();
+        let obl_len = cx.obl_len();
+        let sites_len = cx.generic_sites.len();
+        let err_len = cx.errs.len();
+        let (params, _, _) = cx.instantiate_template(e, template, &tmpl.generics, &[], name_span);
+        if params.first().is_some_and(|&want| cx.unify(want, probe.recv_ty)) {
+            n += 1;
+        }
+        cx.rollback_vars(snap_vars);
+        cx.obl_truncate(obl_len);
+        cx.generic_sites.truncate(sites_len);
+        cx.errs.truncate(err_len);
+    }
+    n
+}
+
 /// Probes trait methods for one receiver-type probe group (the
 /// variants of one autoderef step that share a receiver type).
 /// Hits are counted across the whole group, as rustc counts

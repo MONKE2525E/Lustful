@@ -1296,6 +1296,10 @@ impl<'a> Program<'a> {
     /// recording door. The resolver tables (W-RESOLVE) answer here
     /// first, so replays see the same answers as `binding`.
     fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
+        // Spliced std source sees no user names (see `STD_MODULE`).
+        if module == crate::ty::defs::STD_MODULE {
+            return BindingRes::Absent;
+        }
         // W-RESOLVE: the section 1.3 module tables answer first when the
         // crate went through the resolver; a miss falls through to the
         // single-file layer (builtins) below.

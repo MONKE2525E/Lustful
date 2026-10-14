@@ -22,6 +22,12 @@ pub struct ModuleId(pub u32);
 /// The crate root module, the only module today.
 pub const ROOT_MODULE: ModuleId = ModuleId(0);
 
+/// The scope of spliced std source (`impl<T> Option<T>` in library/core,
+/// W-STD-A): no user item or import is visible from it, so a user's
+/// own `Option` or `Some` cannot capture std's names. Names resolve to
+/// builtins and the lang items only.
+pub const STD_MODULE: ModuleId = ModuleId(u32::MAX - 1);
+
 /// Visibility of a def. The restricted forms (`pub(crate)`, `pub(in path)`) get
 /// one case here; ARCH 1.5 owns their meaning.
 #[allow(dead_code)] // Restricted forms are recorded when modules land (W-RESOLVE).

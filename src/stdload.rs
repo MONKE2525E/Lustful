@@ -13,7 +13,11 @@
 // shipped crate's own stable hash, so def identity and intrinsic
 // privilege are proven in the shipped crate first; the splice range
 // then carries the same provenance into the user compile. Only
-// non-generic fns route this way (section 9.2 S5).
+// non-generic fns route this way (section 9.2 S5). The std methods of
+// Option and Result (core's option.rs and result.rs) are impls, not
+// routed fns: they splice whole, unrenamed, and check resolves them in
+// their own scope (`StdLoad::methods`, `Ast::lang_methods`). A compile
+// only reads their text; the tests check them.
 //
 // Every failure here is a compiler installation error (a broken
 // `library/`, a registry row with no source fn, a missing required
@@ -40,6 +44,8 @@ struct SourceFile {
 const SOURCE_FILES: &[SourceFile] = &[
     SourceFile { krate: ShippedCrate::Core, module: &[], rel: "core/src/lib.rs" },
     SourceFile { krate: ShippedCrate::Core, module: &["intrinsics"], rel: "core/src/intrinsics.rs" },
+    SourceFile { krate: ShippedCrate::Core, module: &["option"], rel: "core/src/option.rs" },
+    SourceFile { krate: ShippedCrate::Core, module: &["result"], rel: "core/src/result.rs" },
     SourceFile { krate: ShippedCrate::Alloc, module: &[], rel: "alloc/src/lib.rs" },
     SourceFile { krate: ShippedCrate::Std, module: &[], rel: "std/src/lib.rs" },
     SourceFile { krate: ShippedCrate::Std, module: &["prelude"], rel: "std/src/prelude.rs" },
@@ -51,6 +57,8 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
     Some(match rel {
         "core/src/lib.rs" => include_str!("../library/core/src/lib.rs"),
         "core/src/intrinsics.rs" => include_str!("../library/core/src/intrinsics.rs"),
+        "core/src/option.rs" => include_str!("../library/core/src/option.rs"),
+        "core/src/result.rs" => include_str!("../library/core/src/result.rs"),
         "alloc/src/lib.rs" => include_str!("../library/alloc/src/lib.rs"),
         "std/src/lib.rs" => include_str!("../library/std/src/lib.rs"),
         "std/src/prelude.rs" => include_str!("../library/std/src/prelude.rs"),
@@ -90,17 +98,74 @@ struct CheckedFile {
     ast: Ast,
 }
 
-/// What a session needs from one std load.
+/// What a session needs from one std load. Most compiles only need
+/// the lang enum methods, so the rest (the `STD_FNS` files, the lang
+/// items, the std source modules) loads on first use (`StdLoad::rest`).
 pub struct StdLoad {
+    /// The std methods of the lang enums (core's option.rs and
+    /// result.rs, impls only), spliced whole when a compile names one.
+    /// The text never changes inside a session, so the daemon's reused
+    /// chunks and instances stay put.
+    methods: String,
+    rest: std::sync::OnceLock<Result<StdRest, String>>,
+}
+
+/// The part of a std load past the lang enum methods.
+pub struct StdRest {
     /// The resolved lang items of this load. Read by later waves; S5
     /// only proves that required items resolve.
     #[allow(dead_code)] // First consumers are W-STD and W-MONO; the load guarantee is the S5 gate.
     pub lang: LangItems,
-    /// Splice text per shipped crate, in load order. The driver appends
-    /// each block after the user file and records its byte range.
-    pub splices: Vec<(ShippedCrate, String)>,
-    /// The implemented `STD_FNS` rows whose bodies ride in `splices`.
-    pub fns: Vec<&'static StdFnDef>,
+    /// Splice text of the `STD_FNS` files, per shipped crate.
+    fn_splices: Vec<(ShippedCrate, String)>,
+    /// The implemented `STD_FNS` rows whose bodies ride in `fn_splices`.
+    fns: Vec<&'static StdFnDef>,
+    /// The std source modules (src/stdmods.rs) as hidden-module splice
+    /// text. Their bodies call lang enum methods.
+    modules: Vec<(ShippedCrate, String)>,
+}
+
+/// One compile's std splice (`StdLoad::splice`).
+pub struct Splice {
+    /// Text blocks per shipped crate, in load order. The driver appends
+    /// each after the user file and records its byte range.
+    pub blocks: Vec<(ShippedCrate, String)>,
+    /// The index in `blocks` of the lang method chunks, if any.
+    pub methods_block: Option<usize>,
+    /// The `STD_FNS` rows whose bodies ride in `blocks`.
+    pub routes: Vec<&'static StdFnDef>,
+}
+
+impl StdLoad {
+    /// The splice for one compile: the lang enum methods when a method
+    /// (or a std source module, whose bodies call them) is named, the
+    /// `STD_FNS` files when one of their fns is, and the std source
+    /// modules when one is.
+    pub fn splice(&self, needs: lang::StdNeeds) -> Result<Splice, String> {
+        let mut blocks: Vec<(ShippedCrate, String)> = Vec::new();
+        let mut methods_block = None;
+        if needs.methods || needs.modules {
+            methods_block = Some(0);
+            blocks.push((ShippedCrate::Core, self.methods.clone()));
+        }
+        let mut routes = Vec::new();
+        if needs.fns || needs.modules {
+            let rest = self.rest()?;
+            if needs.fns {
+                blocks.extend(rest.fn_splices.iter().cloned());
+                routes = rest.fns.clone();
+            }
+            if needs.modules {
+                blocks.extend(rest.modules.iter().cloned());
+            }
+        }
+        Ok(Splice { blocks, methods_block, routes })
+    }
+
+    /// The rest of the load, read and parsed on first use.
+    pub fn rest(&self) -> Result<&StdRest, String> {
+        self.rest.get_or_init(|| load_rest(&mut |rel| source_text(rel), false)).as_ref().map_err(String::clone)
+    }
 }
 
 /// Extracts the `#[lust_lang = "<name>"]` marks from shipped source:
@@ -142,12 +207,13 @@ fn scan_lang_attrs(src: &str, rel: &str) -> Result<(String, Vec<(String, u32)>),
 
 /// One diagnostic as one line of an installation error.
 fn diag_line(rel: &str, d: &Diag) -> String {
-    format!("library/{rel}: {}: {}", d.code, d.message)
+    format!("library/{rel}: {}: {} @{}.{}", d.code, d.message, d.span.lo, d.span.hi)
 }
 
-/// Parses, collects, checks, lowers, and borrow-checks one shipped
-/// file as its own crate. Returns the file plus its lang marks.
-fn check_file(file: &SourceFile, text: &str) -> Result<(CheckedFile, Vec<(String, u32)>), String> {
+/// Parses one shipped file and, when `validate` is set, collects,
+/// checks, lowers, and borrow-checks it as its own crate. Returns the
+/// file plus its lang marks.
+fn check_file(file: &SourceFile, text: &str, validate: bool) -> Result<(CheckedFile, Vec<(String, u32)>), String> {
     let (clean, marks) = scan_lang_attrs(text, file.rel)?;
     let interner = Interner::default();
     let known = Known::new(&interner);
@@ -157,15 +223,35 @@ fn check_file(file: &SourceFile, text: &str) -> Result<(CheckedFile, Vec<(String
             crate::expand::expand_lexed(l, &ctx)
         })
         .map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
-    let ast = parser::parse(&lexed, &interner, &known).map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
+    let mut ast = parser::parse(&lexed, &interner, &known).map_err(|d| format!("lust std load failed: {}", diag_line(file.rel, &d)))?;
+    // The whole file is shipped source: intrinsic calls in it run the
+    // privilege test against this file's crate, and its impls of lang
+    // types collect as std impls.
+    ast.shipped = vec![(0, clean.len() as u32, file.krate)];
+    if is_lang_method_file(file.krate, file.module) {
+        ast.lang_methods = (0, clean.len() as u32);
+    }
+    if !validate {
+        return Ok((CheckedFile { krate: file.krate, module: file.module, rel: file.rel, clean, interner, ast }, marks));
+    }
     let ids = CrateIds { local: LOCAL_CRATE, stable: file.krate.stable_hash() };
     let mut program = collect::collect(&ast, &interner, &known, ids)
         .map_err(|ds| format!("lust std load failed: {}", ds.iter().map(|d| diag_line(file.rel, d)).collect::<Vec<_>>().join("; ")))?;
-    // The whole file is shipped source: intrinsic calls in it run the
-    // privilege test against this file's crate.
-    program.shipped_ranges = vec![(0, clean.len() as u32, file.krate)];
+    // Collect ran mono: templates were checked (and borrow-checked)
+    // against their param envs there, as in the driver, except the lang
+    // enum methods, which a compile checks only when it instantiates
+    // one: check them all here. Plain fns, instances, and closure
+    // bodies check below; stubs never do.
+    let lang_errs = crate::check::generics::check_lang_templates(&mut program);
+    if !lang_errs.is_empty() {
+        return Err(format!("lust std load failed: {}", lang_errs.iter().map(|d| diag_line(file.rel, d)).collect::<Vec<_>>().join("; ")));
+    }
     for i in 0..program.fns.len() {
+        use crate::check::generics::FnClass;
         let f = LocalDefId(i as u32);
+        if !matches!(program.gx.fn_class.get(i).copied().unwrap_or_default(), FnClass::Plain | FnClass::Instance | FnClass::Closure) {
+            continue;
+        }
         let (checked, errs) = check::check_fn(&program, f);
         if !errs.is_empty() {
             return Err(format!("lust std load failed: {}", errs.iter().map(|d| diag_line(file.rel, d)).collect::<Vec<_>>().join("; ")));
@@ -179,32 +265,62 @@ fn check_file(file: &SourceFile, text: &str) -> Result<(CheckedFile, Vec<(String
     Ok((CheckedFile { krate: file.krate, module: file.module, rel: file.rel, clean, interner, ast }, marks))
 }
 
-/// Loads and checks the whole shipped library. Called at most once
-/// per session (the driver caches the result), and only when a user
-/// compile can mention a source std fn.
+/// Loads the whole shipped library. Called at most once per session
+/// (the driver caches the result), and only when a user compile can
+/// mention a source std fn. The built-in text is checked by this
+/// module's tests (`shipped_library_loads`), so a compile only parses
+/// it; a `LUST_STD_SRC` tree is checked in full at every load.
 pub fn load_std() -> Result<StdLoad, String> {
-    load_std_from(&mut |rel| source_text(rel))
+    let validate = std::env::var_os("LUST_STD_SRC").is_some_and(|d| !d.is_empty());
+    load_std_from(&mut |rel| source_text(rel), validate)
 }
 
 /// `load_std` over a caller-supplied text source, so tests can feed
 /// fixture shipped source without touching the real `library/`.
-fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>) -> Result<StdLoad, String> {
+fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>, validate: bool) -> Result<StdLoad, String> {
+    let mut methods = String::new();
+    for file in SOURCE_FILES.iter().filter(|f| is_lang_method_file(f.krate, f.module)) {
+        let text = read(file.rel)?;
+        // A compile only needs the text; validation checks the files as
+        // a crate (their templates included).
+        let clean = if validate {
+            let (checked, _) = check_file(file, &text, true)?;
+            if let Some(it) = checked.ast.items.iter().find(|it| !matches!(it.kind, ItemKind::Impl(_))) {
+                return Err(format!("lust std load failed: library/{}: only impls can ride in a lang method file (item at {})", file.rel, it.span.lo));
+            }
+            checked.clean
+        } else {
+            scan_lang_attrs(&text, file.rel)?.0
+        };
+        methods.push_str(&clean);
+    }
+    let rest = std::sync::OnceLock::new();
+    if validate {
+        let _ = rest.set(Ok(load_rest(read, true)?));
+    }
+    Ok(StdLoad { methods, rest })
+}
+
+/// Loads the shipped files past the lang enum methods: the `STD_FNS`
+/// files and the lang items they mark, and the std source modules.
+fn load_rest(read: &mut dyn FnMut(&str) -> Result<String, String>, validate: bool) -> Result<StdRest, String> {
     let mut files: Vec<CheckedFile> = Vec::new();
     let mut marks: Vec<(usize, String, u32)> = Vec::new(); // (file index, lang name, next-line offset)
-    for file in SOURCE_FILES {
+    for file in SOURCE_FILES.iter().filter(|f| !is_lang_method_file(f.krate, f.module)) {
         let text = read(file.rel)?;
-        let (checked, file_marks) = check_file(file, &text)?;
+        let (checked, file_marks) = check_file(file, &text, validate)?;
         let idx = files.len();
         marks.extend(file_marks.into_iter().map(|(n, at)| (idx, n, at)));
         files.push(checked);
     }
     let lang_items = resolve_lang_items(&files, &marks)?;
-    let (mut splices, fns) = build_splices(&files)?;
+    let (fn_splices, fns) = build_splices(&files)?;
+    let mut modules = Vec::new();
     for m in crate::stdmods::STD_MODULES {
         let text = read(m.rel)?;
-        splices.push((m.krate, module_splice(m, &text)?));
+        modules.push((m.krate, module_splice(m, &text)?));
     }
-    Ok(StdLoad { lang: lang_items, splices, fns })
+    Ok(StdRest { lang: lang_items, fn_splices, fns, modules })
 }
 
 /// The splice text of one std source module (src/stdmods.rs). The file
@@ -293,11 +409,32 @@ fn resolve_lang_items(files: &[CheckedFile], marks: &[(usize, String, u32)]) -> 
     Ok(items)
 }
 
-/// Builds splice text for every implemented `STD_FNS` row: finds the
-/// row's fn in its checked shipped file, renames it to the row's
-/// mangled name (by its recorded name span, so no other text moves),
-/// and rejects a spliced file that defines anything the registry
-/// does not name (a stray name could collide with user code).
+/// True for a shipped file of std methods on a lang type (`impl<T>
+/// Option<T>` in core): it splices whole (`StdLoad::methods`).
+fn is_lang_method_file(krate: ShippedCrate, module: &[&str]) -> bool {
+    krate == ShippedCrate::Core && matches!(module, ["option"] | ["result"])
+}
+
+/// The std methods of the lang enums in the built-in source, by type
+/// (`Option<T>`, `Result<T, E>`), for `lust capabilities`.
+pub fn lang_method_names() -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    for (rel, ty) in [("core/src/option.rs", "Option<T>"), ("core/src/result.rs", "Result<T, E>")] {
+        for line in builtin_text(rel).unwrap_or_default().lines() {
+            if let Some(rest) = line.strip_prefix("    pub fn ").or_else(|| line.strip_prefix("    pub const fn ")) {
+                let end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rest.len());
+                out.push((ty, &rest[..end]));
+            }
+        }
+    }
+    out
+}
+
+/// Builds splice text for every implemented `STD_FNS` row: its file
+/// with the row's fn renamed to the row's mangled name (by its
+/// recorded name span, so no other text moves). A spliced file that
+/// defines anything the registry does not name is rejected (a stray
+/// name could collide with user code).
 fn build_splices(files: &[CheckedFile]) -> Result<(Vec<(ShippedCrate, String)>, Vec<&'static StdFnDef>), String> {
     let mut splices: Vec<(ShippedCrate, String)> = Vec::new();
     let mut spliced_files: Vec<&str> = Vec::new();
@@ -358,21 +495,57 @@ mod tests {
     }
 
     /// The shipped library loads: required lang items resolve, the exit
-    /// fn is checked and renamed into the std splice.
+    /// fn is checked and renamed into the std splice, and the
+    /// Option/Result method files splice whole.
     #[test]
     fn shipped_library_loads() {
-        let load = load_std_from(&mut builtin_reader()).expect("shipped library must load");
-        assert!(load.lang.required_missing().is_empty());
-        assert_eq!(load.fns.len(), 1);
-        assert_eq!(load.fns[0].path, ["std", "process", "exit"]);
-        // The process fns, then one hidden module per std source module.
-        assert_eq!(load.splices.len(), 1 + crate::stdmods::STD_MODULES.len());
-        assert!(load.splices[1].1.starts_with("pub mod __lust_core_time {\n"));
-        let (krate, text) = &load.splices[0];
+        let load = load_std_from(&mut builtin_reader(), true).expect("shipped library must load");
+        let rest = load.rest().unwrap();
+        assert!(rest.lang.required_missing().is_empty());
+        let want = lang::STD_FNS.iter().filter(|d| d.implemented).count();
+        assert_eq!(rest.fns.len(), want, "every implemented registry row is routed");
+        assert!(rest.fns.iter().any(|d| d.path == ["std", "process", "exit"]));
+        let sp = load.splice(lang::std_needs("fn main() { std::process::exit(0); }")).unwrap();
+        assert_eq!(sp.routes.len(), want);
+        assert!(sp.methods_block.is_none(), "no method chunks when no method is named");
+        assert_eq!(sp.blocks.len(), 1, "only the process fns when no std module is named");
+        let (krate, text) = &sp.blocks[0];
         assert_eq!(*krate, ShippedCrate::Std);
         assert!(text.contains("fn __lust_std_process_exit(code: i32)"), "splice carries the mangled name:\n{text}");
         assert!(!text.contains("fn exit("), "the unmangled name must not ride in the splice");
         assert!(text.contains("core::intrinsics::exit(code)"), "the body still names the intrinsic");
+    }
+
+    /// A compile that names a lang method splices both method files
+    /// whole, first; one that names none splices neither.
+    #[test]
+    fn splice_takes_lang_methods() {
+        let load = load_std_from(&mut builtin_reader(), true).expect("shipped library must load");
+        let sp = load.splice(lang::std_needs("fn f(x: Option<u8>) -> bool { x.is_none() }")).unwrap();
+        assert!(sp.routes.is_empty());
+        assert_eq!((sp.blocks.len(), sp.methods_block), (1, Some(0)));
+        let text = &sp.blocks[0].1;
+        assert!(text.contains("impl<T> Option<T> {") && text.contains("impl<T, E> Result<T, E> {"));
+        assert!(load.splice(lang::std_needs("fn main() {}")).unwrap().blocks.is_empty());
+    }
+
+    /// `STD_LANG_METHODS` (the load trigger) names exactly the methods
+    /// the shipped Option and Result files define.
+    #[test]
+    fn lang_methods_match_source() {
+        let mut names: Vec<String> = Vec::new();
+        for rel in ["core/src/option.rs", "core/src/result.rs"] {
+            let file = SOURCE_FILES.iter().find(|f| f.rel == rel).unwrap();
+            let (checked, _) = check_file(file, builtin_text(rel).unwrap(), true).expect("method file checks");
+            for it in &checked.ast.items {
+                if let ItemKind::Impl(imp) = &it.kind {
+                    names.extend(imp.fns.iter().map(|f| checked.interner.get(f.name).to_string()));
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        assert_eq!(names, lang::STD_LANG_METHODS, "STD_LANG_METHODS must list the shipped methods, sorted");
     }
 
     /// A `#[lust_lang]` mark in shipped source resolves to the next
@@ -390,8 +563,8 @@ mod tests {
                 builtin_text(rel).map(str::to_string).ok_or_else(|| format!("no builtin {rel}"))
             }
         };
-        let load = load_std_from(&mut read).expect("fixture library must load");
-        assert!(load.lang.get(lang::LangItem::PhantomData).is_some(), "mark resolves to a def");
+        let load = load_std_from(&mut read, true).expect("fixture library must load");
+        assert!(load.rest().unwrap().lang.get(lang::LangItem::PhantomData).is_some(), "mark resolves to a def");
     }
 
     /// A malformed mark is an installation error, never a silent skip.
@@ -413,7 +586,7 @@ mod tests {
                 builtin_text(rel).map(str::to_string).ok_or_else(|| format!("no builtin {rel}"))
             }
         };
-        let err = load_std_from(&mut read).map(|_| ()).unwrap_err();
+        let err = load_std_from(&mut read, true).map(|_| ()).unwrap_err();
         assert!(err.contains("L0642"), "want a privilege error, got: {err}");
     }
 
@@ -428,7 +601,7 @@ mod tests {
                 builtin_text(rel).map(str::to_string).ok_or_else(|| format!("no builtin {rel}"))
             }
         };
-        let err = load_std_from(&mut read).map(|_| ()).unwrap_err();
+        let err = load_std_from(&mut read, true).map(|_| ()).unwrap_err();
         assert!(err.contains("std::process::exit"), "error names the missing fn: {err}");
     }
 }

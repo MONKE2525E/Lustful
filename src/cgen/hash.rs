@@ -715,6 +715,9 @@ impl FnGen<'_, '_, '_> {
                     Some(CTy::Int(i)) => write_int(*i),
                     Some(_) => HASHER_METHODS.iter().position(|n| *n == "write").unwrap_or(1),
                 };
+                // The call can name the `&[u8]` struct (an integer write
+                // goes through `write`): this unit must declare it.
+                collect_types(&bytes_cty(), &mut self.sig_types);
                 let call = hasher_call(self.p, self.slots, &hc, m, &format!("({})", vals[0]), vals.get(1).map_or("", |v| v.as_str()));
                 if m == 0 {
                     return Some(call);

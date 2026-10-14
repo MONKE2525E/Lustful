@@ -1201,11 +1201,126 @@ pub fn needs_std_use(name: &str) -> bool {
     STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name) || crate::ty::sync::SyncTy::ALL.iter().any(|k| k.name() == name) || STD_MPSC_ADTS.contains(&name)
 }
 
-/// True if `src` can mention an implemented source std fn, so the driver
-/// must load std before it compiles. A plain byte scan: it runs on every
-/// compile, so it stays a few memmem passes with no allocation.
+/// The methods std source defines on `Option` and `Result`
+/// (library/core/src/{option,result}.rs, W-STD-A), sorted. A user
+/// source that names none of them after a `.` or `::` (and no
+/// implemented `STD_FNS` row) compiles without std source. The
+/// loader test `lang_methods_match_source` keeps this list equal to
+/// the methods the shipped files define.
+pub const STD_LANG_METHODS: &[&str] = &[
+    "and",
+    "and_then",
+    "as_mut",
+    "as_ref",
+    "cloned",
+    "copied",
+    "err",
+    "expect",
+    "expect_err",
+    "filter",
+    "flatten",
+    "get_or_insert",
+    "get_or_insert_default",
+    "get_or_insert_with",
+    "insert",
+    "inspect",
+    "inspect_err",
+    "is_err",
+    "is_err_and",
+    "is_none",
+    "is_none_or",
+    "is_ok",
+    "is_ok_and",
+    "is_some",
+    "is_some_and",
+    "map",
+    "map_err",
+    "map_or",
+    "map_or_default",
+    "map_or_else",
+    "ok",
+    "ok_or",
+    "ok_or_else",
+    "or",
+    "or_else",
+    "replace",
+    "take",
+    "take_if",
+    "transpose",
+    "unwrap",
+    "unwrap_err",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "unzip",
+    "xor",
+    "zip",
+];
+
+/// The std source one compile needs: found by `std_needs`, read by
+/// the std splice (`StdLoad::splice`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StdNeeds {
+    /// An implemented `STD_FNS` row's trigger occurs.
+    pub fns: bool,
+    /// A `STD_LANG_METHODS` name follows a `.` or a `::`.
+    pub methods: bool,
+    /// A std source module can be named (`stdmods::needs`).
+    pub modules: bool,
+}
+
+impl StdNeeds {
+    pub fn any(self) -> bool {
+        self.fns || self.methods || self.modules
+    }
+}
+
+/// The std source `src` can mention: implemented `STD_FNS` triggers,
+/// and each `STD_LANG_METHODS` name that follows a `.` or a `::`
+/// (whitespace allowed between). Plain byte scans with no allocation:
+/// this runs on every compile. A miss (a name only a macro builds)
+/// costs a "no method" reject, never a wrong accept.
+pub fn std_needs(src: &str) -> StdNeeds {
+    // Bit n of FIRST[c]: some method name starts with byte c and has
+    // length n. It turns away almost every other name (`push`, `len`)
+    // before a search, which keeps the scan near memory speed.
+    const FIRST: [u32; 128] = {
+        let mut t = [0u32; 128];
+        let mut i = 0;
+        while i < STD_LANG_METHODS.len() {
+            let n = STD_LANG_METHODS[i].as_bytes();
+            t[n[0] as usize] |= 1 << n.len();
+            i += 1;
+        }
+        t
+    };
+    let b = src.as_bytes();
+    let named_at = |mut j: usize| -> bool {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let start = j;
+        if j >= b.len() || b[j] >= 128 || FIRST[b[j] as usize] == 0 {
+            return false;
+        }
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        let len = j - start;
+        len < 32 && FIRST[b[start] as usize] & (1 << len) != 0 && STD_LANG_METHODS.binary_search(&&src[start..j]).is_ok()
+    };
+    // `match_indices` on one char uses std's memchr searcher, much
+    // faster than a byte loop (or a two-byte `"::"` search).
+    let methods = src.match_indices('.').any(|(i, _)| named_at(i + 1))
+        || src.match_indices(':').any(|(i, _)| b.get(i + 1) == Some(&b':') && named_at(i + 2));
+    StdNeeds { fns: STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger)), methods, modules: crate::stdmods::needs(src) }
+}
+
+/// True if `src` can mention an implemented source std fn or a std
+/// method of `Option`/`Result`, so the driver must load std before it
+/// compiles.
 pub fn needs_std_load(src: &str) -> bool {
-    STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger)) || crate::stdmods::needs(src)
+    std_needs(src).any()
 }
 
 /// What namespace a canonical std path names its item in. A path
@@ -1801,5 +1916,9 @@ mod tests {
         assert!(needs_std_load("fn main() { std::process::exit(0); }"));
         assert!(!needs_std_load("fn main() { std::process::abort(); }"));
         assert!(!needs_std_load("fn main() { println!(\"hi\"); }"));
+        assert!(needs_std_load("fn main() { let _ = Some(1).unwrap(); }"));
+        assert!(needs_std_load("fn main() { let _ = x.is_ok(); }"));
+        assert!(needs_std_load("fn main() { let _ = x\n    . unwrap(); }"));
+        assert!(!needs_std_load("fn main() { let unwrap = 1; }"));
     }
 }

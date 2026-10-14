@@ -168,22 +168,8 @@ pub enum Builtin {
     Pow,
     Min,
     Max,
-    OptIsSome,
-    OptIsNone,
-    OptUnwrap,
-    OptExpect,
-    OptUnwrapOr,
     /// `Result` methods without closures (W-STD-A phase 3): a stopgap
     /// until the source std move of Option and Result.
-    ResIsOk,
-    ResIsErr,
-    ResUnwrap,
-    ResExpect,
-    ResUnwrapErr,
-    ResExpectErr,
-    ResOk,
-    ResErr,
-    ResUnwrapOr,
     VecPop,
     VecGet,
     VecFirst,
@@ -366,7 +352,6 @@ pub enum Builtin {
     DefaultGlue,
     /// `Option::unwrap_or_default`: the payload, or the `default`
     /// glue's value of the payload type on `None`.
-    OptUnwrapOrDefault,
     /// `core::fmt` (W-STD-B, check/fmt.rs): Formatter methods, the Debug
     /// builders (`FmtFinish` and kin serve every builder; the receiver
     /// type tells which), `write_fmt`, and `fmt` on a builtin value.
@@ -421,12 +406,6 @@ pub enum Builtin {
     CmpCode,
     /// `Option::as_ref`, `as_mut`, `take`, `replace`, and
     /// `Result::as_ref`, `as_mut` (W-STD-A phase 3).
-    OptAsRef,
-    OptAsMut,
-    OptTake,
-    OptReplace,
-    ResAsRef,
-    ResAsMut,
     SliceSort,
     SliceSortUnstable,
     SliceSortBy,
@@ -1340,6 +1319,11 @@ struct OrFrame {
 /// parent). Without resolver tables every body is in the root.
 fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
     let root = crate::ty::defs::ROOT_MODULE;
+    // The lang enum methods (their instances and closure bodies share
+    // their def) see no user names.
+    if p.in_lang_methods(p.fn_info(fid).def.name_span) {
+        return crate::ty::defs::STD_MODULE;
+    }
     let Some(tables) = &p.resolved else { return root };
     // A def's defining module from the resolver table. Associated
     // defs (trait methods) are not module items, so the walk
@@ -1669,8 +1653,11 @@ fn check_fn_mode<'p, 'a>(
     let mut errs = errs;
     // A `const fn` body must also pass the const-context rules: the
     // const evaluator only sees the calls made from const items, so a
-    // body that is never const-evaluated needs its own check.
-    if f.is_const {
+    // body that is never const-evaluated needs its own check. Std
+    // source's const fns are core's, const as rustc checks them; lust's
+    // walk is coarser (it sees a drop of `self` in `unwrap`'s `None`
+    // arm), so they skip it.
+    if f.is_const && !p.is_lang_method(fid) {
         let prior_errs = !errs.is_empty();
         errs.extend(constfn::check_const_fn(p, &out, f, prior_errs));
     }
@@ -2000,6 +1987,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         None
     }
 
+    /// True when this body checks in generic mode (trait selection for
+    /// operators and `for`, written-type well-formedness, the generic
+    /// method search): the program has user generics, or the body is a
+    /// lang enum method or a closure in one. A program whose only
+    /// generics are those methods checks its own bodies as a program
+    /// with no generics does (`GenTables::user_generics`).
+    fn generic_mode(&self) -> bool {
+        let p = self.p;
+        p.gx.has_generics && (p.gx.user_generics || p.in_lang_methods(p.fn_info(self.fid).def.name_span))
+    }
+
     fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
         let p = self.p;
         let module = self.module;
@@ -2145,7 +2143,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return PatIdent::Variant(a, 0);
             }
         }
-        // Without resolver tables the flat name maps answer directly.
+        // Without resolver tables the flat name maps answer directly
+        // (user names: std source sees none of them).
+        if self.module == crate::ty::defs::STD_MODULE {
+            return PatIdent::Other;
+        }
         if let Some(&i) = p.const_names.get(&name) {
             return PatIdent::Const(i);
         }
@@ -5397,7 +5399,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// and for every projection its trait ref. The parts
     /// `check::sized::parts` names must be `Sized` here (L0110).
     fn wf_check_written(&mut self, t: Ty, span: Span) {
-        let generic = self.p.gx.has_generics;
+        let generic = self.generic_mode();
         let mut stack: Vec<Ty> = vec![t];
         let mut seen: Vec<Ty> = Vec::new();
         let mut need: Vec<Ty> = Vec::new();
@@ -8580,17 +8582,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(Res::Builtin(b));
         }
         // Qualified builtin variant constructors: `Option::Some(..)`,
-        // `Result::Ok(..)`, `Result::Err(..)`.
-        if ty_name == k.Option && item == k.Some {
+        // `Result::Ok(..)`, `Result::Err(..)`, unless a user type of
+        // the name shadows std's.
+        let lang_ty = std_ty || !self.p.type_names.contains_key(&ty_name);
+        if ty_name == k.Option && item == k.Some && lang_ty {
             return Some(Res::OptSome);
         }
-        if ty_name == k.Option && item == k.None {
+        if ty_name == k.Option && item == k.None && lang_ty {
             return Some(Res::OptNone);
         }
-        if ty_name == k.Result && item == k.Ok {
+        if ty_name == k.Result && item == k.Ok && lang_ty {
             return Some(Res::ResOk);
         }
-        if ty_name == k.Result && item == k.Err {
+        if ty_name == k.Result && item == k.Err && lang_ty {
             return Some(Res::ResErr);
         }
         let adt = if ty_name == p.known.self_type {
@@ -11233,7 +11237,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // methods with the same recorded reads, in step+form
         // order. Builtin and scalar receivers stay on the path
         // below.
-        if p.gx.has_generics
+        if self.generic_mode()
             && !builtin_only
             && (self.tys.local_adt(base).is_some()
                 || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..) | TyKind::Opaque(..)))
@@ -11242,6 +11246,42 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 method::Probe::Hit(ret) => return ret,
                 method::Probe::Failed => return ERROR,
                 method::Probe::Miss => {}
+            }
+        }
+        // Std source methods of `Option` and `Result` (library/core,
+        // W-STD-A): generic inherent templates on the builtin def,
+        // probed by receiver form like a generic user Adt's.
+        if !builtin_only
+            && matches!(self.tys.builtin_of(base), Some(BuiltinTy::Option | BuiltinTy::Result))
+            && let Some((def, _)) = self.tys.adt_parts(base)
+            && p.gx.inherent_methods.contains_key(&(def, name))
+        {
+            for form in ReceiverForm::PROBE_ORDER {
+                let probe = method::RcvProbe::at(self, base, form);
+                if p.gx.inherent_methods.get(&(def, name)).is_some_and(|ts| ts.len() > 1)
+                    && method::inherent_template_fits(self, e, probe, name, name_span) > 1
+                {
+                    self.err(
+                        "L0610",
+                        name_span,
+                        format!("type annotations needed: more than one `{}` method fits this receiver", self.name(name)),
+                        "Annotate the receiver's type, for example `let x: Option<&i32> = ..`.",
+                    );
+                    for &a in args {
+                        self.expr(a, None);
+                    }
+                    return ERROR;
+                }
+                match method::inherent_template_probe(self, e, probe, derefs, name, name_span, args, &explicit) {
+                    method::Probe::Hit(ret) => {
+                        if probe.autoref != Autoref::None {
+                            self.check_packed_borrow(recv, name_span);
+                        }
+                        return ret;
+                    }
+                    method::Probe::Failed => return ERROR,
+                    method::Probe::Miss => {}
+                }
             }
         }
         // Every candidate of every form, in probe order. The set
@@ -11663,69 +11703,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     None
                 }
             }
-            (Some(BuiltinTy::Option), _) => {
-                let inner = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
-                if name == k.is_some {
-                    Some((B::OptIsSome, Autoref::Ref, vec![], BOOL))
-                } else if name == k.is_none {
-                    Some((B::OptIsNone, Autoref::Ref, vec![], BOOL))
-                } else if name == k.unwrap {
-                    Some((B::OptUnwrap, Autoref::None, vec![], inner))
-                } else if name == k.expect {
-                    Some((B::OptExpect, Autoref::None, vec![REF_STR], inner))
-                } else if name == k.unwrap_or {
-                    Some((B::OptUnwrapOr, Autoref::None, vec![inner], inner))
-                } else if name == k.unwrap_or_default && has_default(p, &self.tys, inner) {
-                    // `T: Default`: the `default` glue builds the value
-                    // only on `None`.
-                    self.record_glue_reads(p.gx.lang.default, inner);
-                    Some((B::OptUnwrapOrDefault, Autoref::None, vec![], inner))
-                } else {
-                    match self.name(name) {
-                        "as_ref" => {
-                            let r = self.tys.mk_ref(false, inner);
-                            Some((B::OptAsRef, Autoref::Ref, vec![], self.tys.mk_option(r)))
-                        }
-                        "as_mut" => {
-                            let r = self.tys.mk_ref(true, inner);
-                            Some((B::OptAsMut, Autoref::RefMut, vec![], self.tys.mk_option(r)))
-                        }
-                        "take" => Some((B::OptTake, Autoref::RefMut, vec![], base)),
-                        "replace" => Some((B::OptReplace, Autoref::RefMut, vec![inner], base)),
-                        _ => None,
-                    }
-                }
-            }
-            (Some(BuiltinTy::Result), _) => {
-                let (ok, err) = self.tys.result_args(base).unwrap_or((ERROR, ERROR));
-                match self.name(name) {
-                    "is_ok" => Some((B::ResIsOk, Autoref::Ref, vec![], BOOL)),
-                    "is_err" => Some((B::ResIsErr, Autoref::Ref, vec![], BOOL)),
-                    "unwrap" | "expect" => {
-                        // The panic message shows the error with Debug.
-                        self.deferred_debug.push((err, name_span));
-                        if name == k.unwrap { Some((B::ResUnwrap, Autoref::None, vec![], ok)) } else { Some((B::ResExpect, Autoref::None, vec![REF_STR], ok)) }
-                    }
-                    "unwrap_err" => {
-                        self.deferred_debug.push((ok, name_span));
-                        Some((B::ResUnwrapErr, Autoref::None, vec![], err))
-                    }
-                    "expect_err" => {
-                        self.deferred_debug.push((ok, name_span));
-                        Some((B::ResExpectErr, Autoref::None, vec![REF_STR], err))
-                    }
-                    "ok" => Some((B::ResOk, Autoref::None, vec![], self.tys.mk_option(ok))),
-                    "err" => Some((B::ResErr, Autoref::None, vec![], self.tys.mk_option(err))),
-                    "unwrap_or" => Some((B::ResUnwrapOr, Autoref::None, vec![ok], ok)),
-                    "as_ref" | "as_mut" => {
-                        let m = self.name(name) == "as_mut";
-                        let (ro, re) = (self.tys.mk_ref(m, ok), self.tys.mk_ref(m, err));
-                        let b = if m { B::ResAsMut } else { B::ResAsRef };
-                        Some((b, if m { Autoref::RefMut } else { Autoref::Ref }, vec![], self.tys.mk_result(ro, re)))
-                    }
-                    _ => None,
-                }
-            }
             (Some(BuiltinTy::Chars), _) => {
                 let opt = self.tys.mk_option(CHAR);
                 if name == k.next {
@@ -11801,7 +11778,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // A trait method still applies: selection fixes the
                 // integer type when exactly one impl matches, as in
                 // rustc. Inherent integer methods need the type.
-                if p.gx.has_generics && !builtin_only {
+                if self.generic_mode() && !builtin_only {
                     match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                         method::Probe::Hit(ret) => return ret,
                         method::Probe::Failed => return ERROR,
@@ -11842,7 +11819,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             None => {
                 // Generic and trait methods over the full autoderef
                 // chain (check/method.rs).
-                if p.gx.has_generics && !builtin_only {
+                if self.generic_mode() && !builtin_only {
                     match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                         method::Probe::Hit(ret) => return ret,
                         method::Probe::Failed => return ERROR,
@@ -12264,7 +12241,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn trait_binop(&mut self, e: ExprId, op: BinOp, li: Ty, ri: Ty, ld: u8, rd: u8, span: Span) -> Option<Ty> {
         use BinOp::*;
         let p = self.p;
-        if !p.gx.has_generics {
+        if !self.generic_mode() {
             return None;
         }
         let lang = &p.gx.lang;
@@ -12555,7 +12532,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// bound's `Output`, normalized.
     fn trait_unop(&mut self, e: ExprId, op: ast::UnOp, inner: Ty, ld: u8, span: Span) -> Option<Ty> {
         let p = self.p;
-        if !p.gx.has_generics {
+        if !self.generic_mode() {
             return None;
         }
         let lang = &p.gx.lang;
@@ -12597,7 +12574,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn trait_assign_op(&mut self, e: ExprId, op: BinOp, lt: Ty, rinner: Ty, rd: u8, span: Span) -> bool {
         use BinOp::*;
         let p = self.p;
-        if !p.gx.has_generics {
+        if !self.generic_mode() {
             return false;
         }
         let lang = &p.gx.lang;
@@ -13127,7 +13104,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// instances lowering calls, and answer the item type.
     fn for_trait_iter(&mut self, for_e: ExprId, iter: ExprId, t: Ty) -> Option<Ty> {
         let p = self.p;
-        if !p.gx.has_generics {
+        if !self.generic_mode() {
             return None;
         }
         self.run_obligations(false);

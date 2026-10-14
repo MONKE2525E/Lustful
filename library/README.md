@@ -21,9 +21,9 @@ machine-checked tables are in `src/ty/lang.rs`; the loader is
   mangled names, in a source range the checker knows belongs to the
   shipped crate. Intrinsic privilege keys on that provenance, never
   on names user code can write (section 3.1 item 1).
-- Generic std waits for the minimal generic pipeline (section 9.3).
-  No `Builtin` case is deleted by S5; String, Vec, and Option stay
-  builtin until W-STD moves them.
+- Generic std rides the generic pipeline: the Option and Result
+  methods are source (see below). String and Vec stay builtin until
+  W-STD moves them.
 - `LUST_STD_SRC=<dir>` makes the loader read module files from
   `<dir>/std/src/` instead of the copies built into the compiler
   (the section 3.8 override, for std authors). Std is otherwise
@@ -102,6 +102,39 @@ named `std` when a file can name a platform module (a byte scan for
 |---|---|---|
 | `std::process::exit` | library/std/src/process.rs | Over intrinsic `exit` (`lust_exit`: flush, then libc exit). Test: tests/pass/std_process_exit.rs. |
 | `std::process::abort` | Declared, no body | A call rejects with L0640 (declared surface, section 3.1). Body needs the abort runtime hook; W-STD. |
+
+## Option and Result methods (library/core/src/{option,result}.rs, W-STD-A)
+
+The enums stay compiler-known lang types; their inherent methods are
+core's impl blocks (`impl<T> Option<T> { .. }`, `impl<T> Option<&T>`,
+`impl<T, E> Option<Result<T, E>>`, and so on), closure methods
+included. There is no builtin version left.
+
+- Load: `STD_LANG_METHODS` (src/ty/lang.rs) lists the method names.
+  A compile that names one after a `.` or `::` (or splices a std
+  source module, whose bodies call them) splices both files whole.
+  The splice text is constant inside a session, so the daemon's
+  reused chunks and instances do not move. `lust check` never checks
+  their templates (std load's tests do); a build checks one when mono
+  makes its first instance. A program whose only generics are these
+  methods skips the discovery recheck of bodies that name none.
+- Scope: the methods see no user name (`STD_MODULE`; the resolver
+  rewrite skips them), so a user `Result` alias or `struct E` cannot
+  change them. A user type named `Option` or `Result` shadows std's,
+  as in Rust.
+- Check: an `Option`/`Result` receiver probes these impls like a
+  generic user Adt's. Two impls that both fit an open receiver
+  (`copied` on `Option<_>`) reject as ambiguous (rustc E0034).
+- Panics: core's messages; `#[track_caller]` where core has it
+  (unwrap, expect, unwrap_err, expect_err, unwrap_or_else), so a
+  panic reports the caller's location.
+- `const fn` exactly where core 1.99 has it stable; `consteval`
+  evaluates the const ones by name.
+- Not here yet (a call rejects): `as_deref`, `as_deref_mut`, `iter`,
+  `iter_mut`, `into_iter`, `as_slice`, `as_mut_slice`, `as_pin_ref`,
+  `as_pin_mut`, the `unsafe` unchecked unwraps, and path forms
+  (`Option::map(x, f)`, `.map(Option::unwrap)`). `?` stays the
+  compiler's desugaring.
 
 ## Std source modules (`STD_MODULES` in src/stdmods.rs, W-STD-C)
 
@@ -197,7 +230,6 @@ source when the generic std pipeline can carry it.
 | `process::ExitCode` | check/process.rs | `main` may return it, or `Result<ExitCode, E>`. |
 | `String::from_utf8`, `str::from_utf8`, `FromUtf8Error`, `Utf8Error` | check/utf8.rs, runtime core.c | The error types are synthetic std Adts (check/collect.rs), so derived Debug/Clone/Eq are the struct machinery. |
 | `Box<[T]>` | cgen.rs `CTy::BoxSlice` | `into_boxed_slice`, `into_vec`, by-value iteration (`vec::IntoIter`), deref to `[T]`. No `Box<[T; N]>` coercion yet. |
-| `Option`/`Result` methods without closures | check/mod.rs `Opt*`, `Res*` | Stopgap: Result is_ok, is_err, ok, err, unwrap, expect, unwrap_err, expect_err, unwrap_or, as_ref, as_mut; Option as_ref, as_mut, take, replace (next to the older is_some..unwrap_or_default). The closure methods wait for the source move (phase-1 WIP on a2/w-std-a-srcopt-wip). |
 
 Non-prelude std types (`Rc`, `Weak`, `RefCell`, `Cell`, `Ordering`,
 `ExitCode`, `FromUtf8Error`, `Utf8Error`) need a `use` as in Rust

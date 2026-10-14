@@ -216,13 +216,6 @@ fn builtin_is_const(b: Builtin) -> bool {
             | CharIsControlUnicode
             | CharFromU32
             | CharFromDigit
-            // `Option` queries and unwraps that are const in 1.99
-            // (`unwrap_or` and `unwrap_or_default` are only
-            // conditionally const there, so they stay out).
-            | OptIsSome
-            | OptIsNone
-            | OptUnwrap
-            | OptExpect
             // `core::mem::swap` and `replace` are const; `take` needs
             // `Default`, which is only conditionally const in 1.99.
             | MemSwap
