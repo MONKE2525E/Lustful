@@ -1,0 +1,4 @@
+fn main ( ) { println ! ( "{0} {1} {2} {3}" , "one" , "other" , "other" , "other" ) ; println ! (
+"{0} {1} {2}" , "a" , "other" , "other" ) ; println ! ( "{0} {1} {2}" , "a" , "other" , "other" ) ;
+println ! ( "{0} {1}" , "doc" , "other" ) ; println ! ( "{0} {1} {2}" , "other" , "other" , "one" )
+; println ! ( "{0}" , "0x10 \'\\x61\' \"\\x62\" 1_000u32 r#\"z\"#" ) ; }

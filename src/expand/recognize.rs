@@ -170,7 +170,7 @@ fn is_seg(t: Tok) -> bool {
 
 /// True for one literal token.
 fn is_literal(t: Tok) -> bool {
-    matches!(t, Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(_) | Tok::True | Tok::False)
+    matches!(t, Tok::Int(..) | Tok::Float(_) | Tok::Str(..) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(..) | Tok::True | Tok::False)
 }
 
 // ---------- Paths, generic arguments, types ----------
@@ -564,7 +564,7 @@ fn is_fn_ty_start(c: &Cur) -> bool {
     }
     if t(j) == Some(Tok::Extern) {
         j += 1;
-        if matches!(t(j), Some(Tok::Str(_))) {
+        if matches!(t(j), Some(Tok::Str(..))) {
             j += 1;
         }
     }
@@ -574,7 +574,7 @@ fn is_fn_ty_start(c: &Cur) -> bool {
 /// Parses `unsafe extern "C" fn(A) -> B` and its plainer forms.
 fn parse_fn_ty(c: &mut Cur) -> bool {
     c.eat(Tok::Unsafe);
-    if c.eat(Tok::Extern) && matches!(c.tok(), Some(Tok::Str(_))) {
+    if c.eat(Tok::Extern) && matches!(c.tok(), Some(Tok::Str(..))) {
         c.bump();
     }
     if !c.eat(Tok::Fn) {
@@ -847,7 +847,7 @@ fn parse_pat_path_pat(c: &mut Cur) -> bool {
                 _ => None,
             };
             if tok(1) == Some(Tok::Colon) {
-                return matches!(tok(0), Some(Tok::Ident(_) | Tok::Int(_, None))) && is_pat(&p[2..], c.interner, true);
+                return matches!(tok(0), Some(Tok::Ident(_) | Tok::Int(_, None, _))) && is_pat(&p[2..], c.interner, true);
             }
             let mut i = 0;
             if tok(i) == Some(Tok::Ref) {
@@ -929,10 +929,10 @@ fn operand_start(c: &Cur) -> bool {
                 | Tok::Super
                 | Tok::Int(..)
                 | Tok::Float(_)
-                | Tok::Str(_)
+                | Tok::Str(..)
                 | Tok::ByteStr(_)
                 | Tok::ByteChar(_)
-                | Tok::Char(_)
+                | Tok::Char(..)
                 | Tok::True
                 | Tok::False
                 | Tok::Minus
@@ -1526,7 +1526,7 @@ fn struct_fields(inner: &[Tt], interner: &Interner, ed2024: bool) -> bool {
         // `name`; rustc rejects keywords and numbers as a shorthand.
         match p.iter().position(|t| matches!(t, Tt::Tok(x) if x.tok == Tok::Colon)) {
             Some(1) => {
-                matches!(p.first(), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Ident(_) | Tok::Int(_, None)))
+                matches!(p.first(), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Ident(_) | Tok::Int(_, None, _)))
                     && is_expr(&p[2..], interner, ed2024)
             }
             Some(_) => false,
@@ -1801,14 +1801,14 @@ fn parse_item(c: &mut Cur) -> bool {
                 // their own, not fn qualifiers.
                 if matches!(tok_at(c.ts, c.i + 1).map(|t| t.tok), Some(Tok::Crate))
                     || matches!(c.ts.get(c.i + 1), Some(Tt::Delim(Delim::Brace, _, _)))
-                    || (matches!(tok_at(c.ts, c.i + 1).map(|t| t.tok), Some(Tok::Str(_)))
+                    || (matches!(tok_at(c.ts, c.i + 1).map(|t| t.tok), Some(Tok::Str(..)))
                         && matches!(c.ts.get(c.i + 2), Some(Tt::Delim(Delim::Brace, _, _))))
                 {
                     break;
                 }
                 saw_extern = true;
                 c.bump();
-                if matches!(c.tok(), Some(Tok::Str(_))) {
+                if matches!(c.tok(), Some(Tok::Str(..))) {
                     c.bump();
                 }
             }
@@ -1996,7 +1996,7 @@ fn parse_item(c: &mut Cur) -> bool {
                 }
                 return c.eat(Tok::Semi);
             }
-            if matches!(c.tok(), Some(Tok::Str(_))) {
+            if matches!(c.tok(), Some(Tok::Str(..))) {
                 c.bump();
             }
             item_list(c)

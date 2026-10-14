@@ -244,7 +244,7 @@ impl CfgEnv {
         if matches!(trees.get(*pos), Some(TokenTree::Token(t)) if t.tok == Tok::Eq) {
             let value = match trees.get(*pos + 1) {
                 Some(TokenTree::Token(t)) => match t.tok {
-                    Tok::Str(i) => strings.get(i as usize).cloned().unwrap_or_default(),
+                    Tok::Str(i, _) => strings.get(i as usize).cloned().unwrap_or_default(),
                     Tok::Ident(s) => interner.get(s).to_string(),
                     _ => String::new(),
                 },

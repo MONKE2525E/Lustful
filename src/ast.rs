@@ -1141,11 +1141,7 @@ impl Shift {
     fn trees(&self, trees: &mut [TokenTree]) {
         for tree in trees {
             match tree {
-                TokenTree::Token(tok) => {
-                    if let Some(i) = tok.tok.string_index_mut() {
-                        *i += self.s;
-                    }
-                }
+                TokenTree::Token(tok) => tok.tok.shift_strings(self.s),
                 TokenTree::Delim(_, inner, _) => self.trees(inner),
             }
         }

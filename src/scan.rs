@@ -51,17 +51,17 @@ fn hash_tok(h: &mut FxHasher, t: &Tok, strings: &[String]) {
     std::mem::discriminant(t).hash(h);
     match t {
         Tok::Ident(s) | Tok::Reserved(s) => s.hash(h),
-        Tok::Int(v, suf) => {
+        Tok::Int(v, suf, _) => {
             v.hash(h);
             suf.map(|s| s as u8).hash(h);
         }
         Tok::Lifetime(s) => s.hash(h),
-        Tok::Char(c) => c.hash(h),
-        t => {
-            if let Some(i) = t.string_index() {
-                strings[i as usize].hash(h);
-            }
-        }
+        Tok::Char(c, _) => c.hash(h),
+        _ => {}
+    }
+    // Strings, including a literal's written text: `0x1` and `1` differ.
+    for i in t.string_indices() {
+        strings[i as usize].hash(h);
     }
 }
 
@@ -432,7 +432,7 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                     Some("path") => {
                         // `path = "file.rs"`: the string token after `=`.
                         if let Some(s) = body.iter().find_map(|t| match t.tok {
-                            Tok::Str(x) => lexed.strings.get(x as usize).cloned(),
+                            Tok::Str(x, _) => lexed.strings.get(x as usize).cloned(),
                             _ => None,
                         }) {
                             pending.path_attr = Some(s);

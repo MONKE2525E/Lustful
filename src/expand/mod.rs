@@ -225,16 +225,17 @@ pub fn hash_token(h: &mut impl Hasher, tok: &Token, strings: &[String]) {
     tok.span.ctxt.0.hash(h);
     match tok.tok {
         Tok::Ident(s) | Tok::Reserved(s) | Tok::Lifetime(s) => s.0.hash(h),
-        Tok::Int(v, suffix) => {
+        Tok::Int(v, suffix, _) => {
             v.hash(h);
             suffix.map(|s| s as u8).hash(h);
         }
-        Tok::Char(c) => c.hash(h),
-        t => {
-            if let Some(i) = t.string_index() {
-                strings.get(i as usize).hash(h);
-            }
-        }
+        Tok::Char(c, _) => c.hash(h),
+        _ => {}
+    }
+    // Strings, including a literal's written text, which matching and
+    // `stringify!` read: `0x1` and `1` are different inputs.
+    for i in tok.tok.string_indices() {
+        strings.get(i as usize).hash(h);
     }
 }
 
@@ -371,43 +372,10 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
     match tok {
         Ident(s) | Reserved(s) => return interner.get(*s).to_string(),
         Lifetime(s) => return format!("'{}", interner.get(*s)),
-        Int(v, suffix) => {
-            let suf = suffix.map_or("", |s| match s {
-                crate::lexer::IntSuffix::I8 => "i8",
-                crate::lexer::IntSuffix::I16 => "i16",
-                crate::lexer::IntSuffix::I32 => "i32",
-                crate::lexer::IntSuffix::I64 => "i64",
-                crate::lexer::IntSuffix::Isize => "isize",
-                crate::lexer::IntSuffix::U8 => "u8",
-                crate::lexer::IntSuffix::U16 => "u16",
-                crate::lexer::IntSuffix::U32 => "u32",
-                crate::lexer::IntSuffix::U64 => "u64",
-                crate::lexer::IntSuffix::Usize => "usize",
-                crate::lexer::IntSuffix::I128 => "i128",
-                crate::lexer::IntSuffix::U128 => "u128",
-            });
-            return format!("{v}{suf}");
+        // Literals print as written (see `lexer::lit_text`).
+        Int(..) | Float(_) | Str(..) | DocStr(_) | ByteStr(_) | ByteChar(_) | Char(..) => {
+            return crate::lexer::lit_text(tok, strings).unwrap_or_default().into_owned();
         }
-        Float(i) => return strings.get(*i as usize).cloned().unwrap_or_default(),
-        Str(i) => return format!("{:?}", strings.get(*i as usize).map_or("", String::as_str)),
-        // A doc comment's literal prints as the raw string rustc uses
-        // for it in token streams, with enough `#`s to close safely.
-        DocStr(i) => {
-            let text = strings.get(*i as usize).map_or("", String::as_str);
-            let mut hashes = 0usize;
-            let bytes = text.as_bytes();
-            for (j, &b) in bytes.iter().enumerate() {
-                if b == b'"' {
-                    let run = bytes[j + 1..].iter().take_while(|&&c| c == b'#').count();
-                    hashes = hashes.max(run + 1);
-                }
-            }
-            let marks = "#".repeat(hashes);
-            return format!("r{marks}\"{text}\"{marks}");
-        }
-        // Byte literals store their verbatim source text (see lexer::Tok).
-        ByteStr(i) | ByteChar(i) => return strings.get(*i as usize).cloned().unwrap_or_default(),
-        Char(c) => return format!("{c:?}"),
         As => "as",
         Break => "break",
         Const => "const",
@@ -503,13 +471,13 @@ pub fn tok_text(tok: &Tok, strings: &[String], interner: &Interner) -> String {
 }
 
 /// True when two plain tokens match as token-tree literals in a matcher:
-/// same kind and same value. Span and context do not take part.
+/// the same token, and a literal with the same written text, as rustc
+/// compares them (`0x1` is not `1`, `'\x61'` is not `'a'`, and a doc
+/// comment's `/// a` is `#[doc = r" a"]`). Span and context do not take part.
 pub fn tok_matches(pattern: &Tok, input: &Tok, strings: &[String]) -> bool {
-    match (pattern.string_index(), input.string_index()) {
-        (Some(a), Some(b)) => {
-            std::mem::discriminant(pattern) == std::mem::discriminant(input) && strings.get(a as usize) == strings.get(b as usize)
-        }
-        _ => pattern == input,
+    match crate::lexer::lit_text(pattern, strings) {
+        Some(text) => crate::lexer::lit_text(input, strings).is_some_and(|t| t == text),
+        None => pattern == input,
     }
 }
 
@@ -964,7 +932,7 @@ impl<'a> Expander<'a> {
     /// A string literal tree holding `text` at `span`.
     pub fn str_tree(&mut self, text: &str, span: Span) -> Tt {
         let i = self.push_string(text.to_string());
-        Tt::Tok(Token { tok: Tok::Str(i), span })
+        Tt::Tok(Token { tok: Tok::Str(i, None), span })
     }
 
     /// An identifier tree for `name` at `span`.
@@ -1034,9 +1002,7 @@ impl<'a> Expander<'a> {
                 .map(|t| match t {
                     Tt::Tok(tok) => {
                         let mut tok = tok.tok;
-                        if let Some(i) = tok.string_index_mut() {
-                            *i += offset;
-                        }
+                        tok.shift_strings(offset);
                         Tt::Tok(Token { tok, span })
                     }
                     Tt::Delim(d, inner, _) => Tt::Delim(*d, remap(inner, offset, span), span),
@@ -1063,9 +1029,7 @@ impl<'a> Expander<'a> {
                 .map(|t| match t {
                     Tt::Tok(tok) => {
                         let mut kind = tok.tok;
-                        if let Some(i) = kind.string_index_mut() {
-                            *i += offset;
-                        }
+                        kind.shift_strings(offset);
                         Tt::Tok(Token { tok: kind, span: tok.span })
                     }
                     Tt::Delim(d, inner, span) => Tt::Delim(*d, remap(inner, offset), *span),
@@ -1122,7 +1086,7 @@ pub struct MacroSeed {
 /// in a module where a valid one is ignored; so it is one here too.
 fn recursion_limit_value(after_name: &[Tt], strings: &[String], span: Span) -> Result<usize, Diag> {
     match after_name {
-        [Tt::Tok(eq), Tt::Tok(Token { tok: Tok::Str(idx), .. })] if eq.tok == Tok::Eq => {
+        [Tt::Tok(eq), Tt::Tok(Token { tok: Tok::Str(idx, _), .. })] if eq.tok == Tok::Eq => {
             strings.get(*idx as usize).and_then(|s| s.parse::<usize>().ok())
         }
         _ => None,
@@ -1354,7 +1318,7 @@ fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
                 if matches!(inner.as_slice(), [Tt::Tok(t)] if matches!(t.tok, Tok::DocStr(_))) =>
             {
                 if let [Tt::Tok(Token { tok: Tok::DocStr(i), span })] = inner.as_slice() {
-                    out.push(Token { tok: Tok::Str(*i), span: *span });
+                    out.push(Token { tok: Tok::Str(*i, None), span: *span });
                 }
             }
             // A negative literal fragment (`-2`) is one operand; without
@@ -1403,7 +1367,7 @@ impl builtin::CfgRead for Expander<'_> {
     }
     fn string_text(&self, tok: Tok) -> Option<String> {
         match tok {
-            Tok::Str(i) => self.strings.get(i as usize).cloned(),
+            Tok::Str(i, _) => self.strings.get(i as usize).cloned(),
             _ => None,
         }
     }
@@ -1591,9 +1555,7 @@ impl<'a> Expander<'a> {
             .iter()
             .map(|t| {
                 let mut tok = t.tok;
-                if let Some(i) = tok.string_index_mut() {
-                    *i += offset;
-                }
+                tok.shift_strings(offset);
                 Token { tok, span: t.span }
             })
             .collect();
@@ -2066,7 +2028,7 @@ fn item_end(trees: &[Tt], start: usize, interner: &Interner) -> Option<usize> {
 fn is_str_lit_arg(trees: &[Tt]) -> bool {
     let end = trees.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(trees.len());
     match &trees[..end] {
-        [Tt::Tok(t)] => matches!(t.tok, Tok::Str(_)),
+        [Tt::Tok(t)] => matches!(t.tok, Tok::Str(..)),
         [Tt::Frag(_, inner, _)] => is_str_lit_arg(inner),
         _ => false,
     }
@@ -2083,7 +2045,7 @@ fn mark_format_str(expanded: &mut [Tt], span: Span) {
     }
     fn first_str(trees: &mut [Tt], span: Span) {
         match trees {
-            [Tt::Tok(t)] if matches!(t.tok, Tok::Str(_)) => stamp(t, span),
+            [Tt::Tok(t)] if matches!(t.tok, Tok::Str(..)) => stamp(t, span),
             [Tt::Frag(_, inner, _)] => first_str(inner, span),
             _ => {}
         }

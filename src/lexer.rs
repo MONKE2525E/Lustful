@@ -18,17 +18,45 @@ pub enum IntSuffix {
     U128,
 }
 
+impl IntSuffix {
+    /// The suffix as written (`u8`).
+    pub fn name(self) -> &'static str {
+        match self {
+            IntSuffix::I8 => "i8",
+            IntSuffix::I16 => "i16",
+            IntSuffix::I32 => "i32",
+            IntSuffix::I64 => "i64",
+            IntSuffix::Isize => "isize",
+            IntSuffix::U8 => "u8",
+            IntSuffix::U16 => "u16",
+            IntSuffix::U32 => "u32",
+            IntSuffix::U64 => "u64",
+            IntSuffix::Usize => "usize",
+            IntSuffix::I128 => "i128",
+            IntSuffix::U128 => "u128",
+        }
+    }
+}
+
+/// Literal tokens keep their written text, because rustc compares
+/// literal tokens in macro matchers by it (`0x1` is not `1`) and
+/// `stringify!` prints it. `Int`, `Str`, and `Char` carry the value the
+/// parser reads plus an optional text index into `Lexed::strings`: None
+/// when the text is the canonical form `lit_text` prints from the value
+/// (`1`, `"a"`, `'a'`), which is also the text of a token a builtin
+/// macro makes. `Float`, `ByteStr`, and `ByteChar` hold only their text.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tok {
     Ident(Sym),
     /// A Rust 2024 keyword that cannot be used as an identifier (`gen`, `try`, `await`, and kin).
     /// The parser rejects it wherever an identifier is expected, with a clearer message.
     Reserved(Sym),
-    Int(u128, Option<IntSuffix>),
+    /// Value, suffix, and written text (see above).
+    Int(u128, Option<IntSuffix>, Option<u32>),
     /// Index into `Lexed::strings`, holding the literal text (the parser rejects floats for now).
     Float(u32),
-    /// Index into `Lexed::strings`.
-    Str(u32),
+    /// Indexes into `Lexed::strings`: the value, and the written text (see above).
+    Str(u32, Option<u32>),
     /// The string of a doc comment (`///`, `/** */`, and kin). The lexer
     /// emits a doc comment as the `#[doc = ...]` tokens it stands for in
     /// rustc's token trees; this is the literal's index into
@@ -43,7 +71,8 @@ pub enum Tok {
     ByteStr(u32),
     /// A byte char literal (`b'x'`). Like `ByteStr`, the index holds verbatim source text.
     ByteChar(u32),
-    Char(char),
+    /// Value and written text (see above).
+    Char(char, Option<u32>),
     /// A lifetime or loop label name, without the leading `'` (`'a`, `'static`, `'_`).
     Lifetime(Sym),
     // Keywords.
@@ -149,22 +178,67 @@ pub enum Tok {
 }
 
 impl Tok {
-    /// The `Lexed::strings` index this token carries, writable: `Float`,
-    /// `Str`, `DocStr`, `ByteStr`, and `ByteChar` hold one. This is the one
-    /// list of such kinds. Every pass that moves token streams between
-    /// string tables (concat, splice, slice) or compares or hashes their
-    /// strings goes through it, so a new kind is added here only.
-    pub fn string_index_mut(&mut self) -> Option<&mut u32> {
+    /// The `Lexed::strings` indexes this token carries, writable: `Float`,
+    /// `DocStr`, `ByteStr`, and `ByteChar` hold one, `Str` a value and
+    /// maybe a text, `Int` and `Char` maybe a text. This is the one list
+    /// of such kinds. Every pass that moves token streams between string
+    /// tables (concat, splice, slice) or hashes their strings goes
+    /// through it, so a new kind is added here only.
+    pub fn string_indices_mut(&mut self) -> [Option<&mut u32>; 2] {
         match self {
-            Tok::Float(i) | Tok::Str(i) | Tok::DocStr(i) | Tok::ByteStr(i) | Tok::ByteChar(i) => Some(i),
-            _ => None,
+            Tok::Float(i) | Tok::DocStr(i) | Tok::ByteStr(i) | Tok::ByteChar(i) => [Some(i), None],
+            Tok::Str(i, text) => [Some(i), text.as_mut()],
+            Tok::Int(_, _, text) | Tok::Char(_, text) => [text.as_mut(), None],
+            _ => [None, None],
         }
     }
 
-    /// The `Lexed::strings` index this token carries (see `string_index_mut`).
-    pub fn string_index(mut self) -> Option<u32> {
-        self.string_index_mut().map(|i| *i)
+    /// The `Lexed::strings` indexes this token carries (see `string_indices_mut`).
+    pub fn string_indices(mut self) -> impl Iterator<Item = u32> {
+        self.string_indices_mut().map(|i| i.map(|i| *i)).into_iter().flatten()
     }
+
+    /// Adds `offset` to every `Lexed::strings` index this token carries:
+    /// the token moved to a table whose strings start `offset` later.
+    pub fn shift_strings(&mut self, offset: u32) {
+        for i in self.string_indices_mut().into_iter().flatten() {
+            *i += offset;
+        }
+    }
+}
+
+/// The written text of a literal token (`0x1`, `'\x61'`, `r"a"`, a doc
+/// comment's `r" hi"`), or None for any other token. rustc's macro
+/// matcher compares literal tokens by this text, and `stringify!` prints
+/// it. A token with no text index prints canonically from its value.
+pub fn lit_text<'s>(tok: &Tok, strings: &'s [String]) -> Option<std::borrow::Cow<'s, str>> {
+    use std::borrow::Cow;
+    let at = |i: u32| strings.get(i as usize).map_or("", String::as_str);
+    Some(match *tok {
+        Tok::Int(_, _, Some(t)) | Tok::Str(_, Some(t)) | Tok::Char(_, Some(t)) | Tok::Float(t) | Tok::ByteStr(t) | Tok::ByteChar(t) => {
+            Cow::Borrowed(at(t))
+        }
+        Tok::Int(v, suffix, None) => Cow::Owned(format!("{v}{}", suffix.map_or("", IntSuffix::name))),
+        // rustc's form for a string it makes (`escape_string_symbol`).
+        Tok::Str(i, None) => Cow::Owned(format!("\"{}\"", at(i).escape_debug())),
+        Tok::Char(c, None) => Cow::Owned(format!("{c:?}")),
+        // A doc comment's literal is the raw string rustc uses for it in
+        // token streams, with enough `#`s to close safely.
+        Tok::DocStr(i) => {
+            let text = at(i);
+            let mut hashes = 0usize;
+            let bytes = text.as_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if b == b'"' {
+                    let run = bytes[j + 1..].iter().take_while(|&&c| c == b'#').count();
+                    hashes = hashes.max(run + 1);
+                }
+            }
+            let marks = "#".repeat(hashes);
+            Cow::Owned(format!("r{marks}\"{text}\"{marks}"))
+        }
+        _ => return None,
+    })
 }
 
 /// A delimiter kind for token trees.
@@ -433,8 +507,8 @@ fn push_doc_tokens(
     tokens.push(Token { tok: Tok::LBracket, span: at(shift(s + 1), shift(s + 2)) });
     tokens.push(Token { tok: Tok::Ident(interner.intern("doc")), span: at(shift(s + 2), shift(s + 3)) });
     tokens.push(Token { tok: Tok::Eq, span: at(shift(s + 4), shift(s + 5)) });
-    strings.push(content.to_string());
-    tokens.push(Token { tok: Tok::DocStr(strings.len() as u32 - 1), span: at(shift(s + 6).min(end), end) });
+    let content = push_text(strings, content);
+    tokens.push(Token { tok: Tok::DocStr(content), span: at(shift(s + 6).min(end), end) });
     tokens.push(Token { tok: Tok::RBracket, span: at(end, end) });
 }
 
@@ -481,6 +555,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             let inner = b.get(start + 2) == Some(&b'!');
             if inner || (b.get(start + 2) == Some(&b'/') && b.get(start + 3) != Some(&b'/')) {
                 let content = src[start + 3..i].strip_suffix('\r').unwrap_or(&src[start + 3..i]);
+                if let Some(at) = bare_cr(content.as_bytes()) {
+                    return Err(err(start + 3 + at, start + 4 + at, "bare CR not allowed in doc-comment"));
+                }
                 push_doc_tokens(&mut tokens, &mut strings, interner, file, base, start, i, content, inner);
             }
             continue;
@@ -509,6 +586,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             let inner = b.get(start + 2) == Some(&b'!');
             let outer = b.get(start + 2) == Some(&b'*') && b.get(start + 3) != Some(&b'*') && &b[start..i] != b"/**/";
             if (inner || outer) && i >= start + 5 {
+                if let Some(at) = bare_cr(&b[start + 3..i - 2]) {
+                    return Err(err(start + 3 + at, start + 4 + at, "bare CR not allowed in doc-comment"));
+                }
                 push_doc_tokens(&mut tokens, &mut strings, interner, file, base, start, i, &src[start + 3..i - 2], inner);
             }
             continue;
@@ -543,17 +623,17 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 let Some(close) = close else {
                     return Err(err(start, i, "unterminated raw string literal"));
                 };
-                let text = if plain { Some(src[content..close].to_string()) } else { None };
+                if let Some(at) = bare_cr(&b[content..close]) {
+                    return Err(err(content + at, content + at + 1, "bare CR not allowed in raw string"));
+                }
                 i = close + 1 + hashes;
-                match text {
-                    Some(text) => {
-                        strings.push(text);
-                        Tok::Str(strings.len() as u32 - 1)
-                    }
-                    None => {
-                        strings.push(src[start..i].to_string());
-                        Tok::ByteStr(strings.len() as u32 - 1)
-                    }
+                if plain {
+                    // The value, then the written text (never canonical: it has the `r`).
+                    strings.push(src[content..close].replace("\r\n", "\n"));
+                    let value = strings.len() as u32 - 1;
+                    Tok::Str(value, Some(push_text(&mut strings, &src[start..i])))
+                } else {
+                    Tok::ByteStr(push_text(&mut strings, &src[start..i]))
                 }
             } else if (s == "b" || s == "c") && b.get(i) == Some(&b'"') {
                 i += 1;
@@ -565,11 +645,13 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                             break;
                         }
                         Some(b'\\') => i = (i + 2).min(b.len()),
+                        Some(b'\r') if b.get(i + 1) != Some(&b'\n') => {
+                            return Err(err(i, i + 1, "bare CR not allowed in string, use `\\r` instead"));
+                        }
                         Some(_) => i += 1,
                     }
                 }
-                strings.push(src[start..i].to_string());
-                Tok::ByteStr(strings.len() as u32 - 1)
+                Tok::ByteStr(push_text(&mut strings, &src[start..i]))
             } else if s == "b" && b.get(i) == Some(&b'\'') {
                 i += 1;
                 if b.get(i) == Some(&b'\\') {
@@ -577,8 +659,11 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     if b.get(i.wrapping_sub(1)) == Some(&b'x') {
                         i = (i + 2).min(b.len());
                     }
-                } else if i < b.len() {
-                    i += src[i..].chars().next().map_or(1, |ch| ch.len_utf8());
+                } else if let Some(ch) = src[i..].chars().next() {
+                    if let Some(esc) = must_escape(ch) {
+                        return Err(err(i, i + ch.len_utf8(), &format!("byte constant must be escaped: `{esc}`")));
+                    }
+                    i += ch.len_utf8();
                 }
                 if b.get(i) != Some(&b'\'') {
                     return Err(err(start, i, "unterminated byte char literal"));
@@ -629,6 +714,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
         } else if c == b'"' {
             i += 1;
             let mut s = String::new();
+            // The text is canonical (`lit_text` prints it back from the
+            // value) with no escape and only printable ASCII but `'`.
+            let mut canonical = true;
             loop {
                 match b.get(i) {
                     None => return Err(err(start, i, "unterminated string literal")),
@@ -637,10 +725,17 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         break;
                     }
                     Some(b'\\') => {
-                        // A backslash before a newline skips the newline and leading whitespace.
-                        if b.get(i + 1) == Some(&b'\n') {
-                            i += 2;
-                            while i < b.len() && b[i].is_ascii_whitespace() {
+                        canonical = false;
+                        // A backslash before a newline skips the newline and
+                        // the spaces, tabs, and newlines after it.
+                        let newline = match (b.get(i + 1), b.get(i + 2)) {
+                            (Some(b'\n'), _) => 1,
+                            (Some(b'\r'), Some(b'\n')) => 2,
+                            _ => 0,
+                        };
+                        if newline > 0 {
+                            i += 1 + newline;
+                            while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
                                 i += 1;
                             }
                             continue;
@@ -648,15 +743,25 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         let ch = lex_escape(src, &mut i).ok_or_else(|| err(i, i + 2, "invalid escape"))?;
                         s.push(ch);
                     }
+                    // rustc reads CRLF as LF (the LF is read next round); a bare CR is an error.
+                    Some(b'\r') => {
+                        if b.get(i + 1) != Some(&b'\n') {
+                            return Err(err(i, i + 1, "bare CR not allowed in string, use `\\r` instead"));
+                        }
+                        canonical = false;
+                        i += 1;
+                    }
                     Some(_) => {
                         let ch = src[i..].chars().next().unwrap();
+                        canonical &= (' '..='~').contains(&ch) && ch != '\'';
                         s.push(ch);
                         i += ch.len_utf8();
                     }
                 }
             }
             strings.push(s);
-            Tok::Str(strings.len() as u32 - 1)
+            let value = strings.len() as u32 - 1;
+            Tok::Str(value, (!canonical).then(|| push_text(&mut strings, &src[start..i])))
         } else if c == b'\'' {
             // Either a char literal or a lifetime.
             let next = src[i + 1..].chars().next();
@@ -689,10 +794,14 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::Lifetime(*cache.entry(name).or_insert_with(|| interner.intern(name)))
             } else {
                 i += 1;
-                let ch = if b.get(i) == Some(&b'\\') {
+                let escaped = b.get(i) == Some(&b'\\');
+                let ch = if escaped {
                     lex_escape(src, &mut i).ok_or_else(|| err(i, i + 2, "invalid escape"))?
                 } else {
                     let ch = src[i..].chars().next().ok_or_else(|| err(start, i, "bad char literal"))?;
+                    if let Some(esc) = must_escape(ch) {
+                        return Err(err(i, i + ch.len_utf8(), &format!("character constant must be escaped: `{esc}`")));
+                    }
                     i += ch.len_utf8();
                     ch
                 };
@@ -700,7 +809,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     return Err(err(start, i, "unterminated char literal"));
                 }
                 i += 1;
-                Tok::Char(ch)
+                // Canonical text (see the string case): unescaped printable ASCII.
+                let canonical = !escaped && (' '..='~').contains(&ch);
+                Tok::Char(ch, (!canonical).then(|| push_text(&mut strings, &src[start..i])))
             }
         } else {
             // `#` runs are reserved in edition 2024: a guarded string
@@ -787,6 +898,31 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
 
 // `>>` is never lexed as one token, so generics like `Vec<Vec<i64>>` parse without splitting.
 // The parser joins two `>` tokens into a shift when they touch.
+
+/// Stores a literal's written text and returns its `Lexed::strings`
+/// index. rustc reads the file with every CRLF as LF, so the text does.
+fn push_text(strings: &mut Vec<String>, text: &str) -> u32 {
+    strings.push(if text.contains('\r') { text.replace("\r\n", "\n") } else { text.to_string() });
+    strings.len() as u32 - 1
+}
+
+/// The offset of the first CR in `bytes` that does not start a CRLF:
+/// rustc rejects one inside a string literal.
+fn bare_cr(bytes: &[u8]) -> Option<usize> {
+    (0..bytes.len()).find(|&k| bytes[k] == b'\r' && bytes.get(k + 1) != Some(&b'\n'))
+}
+
+/// How rustc spells a char that a char or byte literal must escape, or
+/// None when it may stand as written.
+fn must_escape(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        '\'' => "'",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        _ => return None,
+    })
+}
 
 /// If a raw string opening (`#` run plus `"`) starts at `i`, returns the `#` count.
 fn raw_open(b: &[u8], i: usize) -> Option<usize> {
@@ -885,7 +1021,12 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
     if !any {
         return None;
     }
-    Some(Tok::Int(value, suffix(suf)?))
+    let suffix = suffix(suf)?;
+    // The text is canonical (`lit_text` prints it back from the value)
+    // when it is plain decimal: no radix prefix, `_`, or leading zero.
+    let text = &src[start..*i];
+    let canonical = radix == 10 && !text.contains('_') && !(text.len() > 1 && text.starts_with('0') && b[start + 1].is_ascii_digit());
+    Some(Tok::Int(value, suffix, (!canonical).then(|| push_text(strings, text))))
 }
 
 fn lex_escape(src: &str, i: &mut usize) -> Option<char> {

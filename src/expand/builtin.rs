@@ -263,7 +263,7 @@ fn unwrap_frag(trees: &[Tt]) -> &[Tt] {
 fn literal_string(st: &Expander, trees: &[Tt]) -> Option<(String, Span)> {
     match unwrap_frag(trees) {
         [Tt::Tok(t)] => match t.tok {
-            Tok::Str(i) => st.strings.get(i as usize).map(|s| (s.clone(), t.span)),
+            Tok::Str(i, _) => st.strings.get(i as usize).map(|s| (s.clone(), t.span)),
             _ => None,
         },
         _ => None,
@@ -298,11 +298,11 @@ fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
 }
 
 /// The text of one token for `stringify!`. Written tokens print as
-/// written: raw identifiers and lifetimes keep `r#`, raw and byte strings keep their
-/// prefixes, integer literals keep their radix and suffix. The source
-/// slice at the token's span holds that text; the guards keep a slice
-/// from a different file (an included file's tokens after the swap
-/// back) from leaking in, by checking it against the token's value.
+/// written. Literals carry their written text (`lexer::lit_text`), in
+/// any file. Raw identifiers and lifetimes keep `r#`: the source slice at
+/// the token's span holds that text, and the guards keep a slice from a
+/// different file (an included file's tokens after the swap back) from
+/// leaking in, by checking it against the token's name.
 fn stringify_tok_text(st: &Expander, t: &Token) -> String {
     let plain = tok_text(&t.tok, &st.strings, st.ctx.interner);
     let span = t.span;
@@ -323,22 +323,6 @@ fn stringify_tok_text(st: &Expander, t: &Token) -> String {
         // A raw lifetime keeps its `r#` (`'r#fn`).
         Tok::Lifetime(_) => match slice {
             Some(s) if s.strip_prefix("'r#") == plain.strip_prefix('\'') => s.to_string(),
-            _ => plain,
-        },
-        Tok::Str(_) => match slice {
-            Some(s) if s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#") => s.to_string(),
-            _ => plain,
-        },
-        Tok::ByteStr(_) | Tok::ByteChar(_) => match slice {
-            Some(s) if s.starts_with(['b', 'c']) => s.to_string(),
-            _ => plain,
-        },
-        Tok::Char(_) => match slice {
-            Some(s) if s.starts_with('\'') => s.to_string(),
-            _ => plain,
-        },
-        Tok::Int(..) => match slice {
-            Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => s.to_string(),
             _ => plain,
         },
         _ => plain,
@@ -437,9 +421,9 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
                                 | Tok::SelfLower
                                 | Tok::Int(..)
                                 | Tok::Float(_)
-                                | Tok::Str(_)
+                                | Tok::Str(..)
                                 | Tok::DocStr(_)
-                                | Tok::Char(_)
+                                | Tok::Char(..)
                                 | Tok::PathSep
                                 | Tok::Bang
                                 | Tok::Gt
@@ -504,7 +488,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let site = crate::diag::call_site_span(span);
             let (line, col) = st.line_col(site);
             let value = if name == "line" { line } else { col };
-            Ok(vec![Tt::Tok(Token { tok: Tok::Int(value as u128, Some(crate::lexer::IntSuffix::U32)), span })])
+            Ok(vec![Tt::Tok(Token { tok: Tok::Int(value as u128, Some(crate::lexer::IntSuffix::U32), None), span })])
         }
         "file" => {
             expect_args(name, call, 0)?;
@@ -608,7 +592,7 @@ fn expect_args(name: &str, call: &Call, n: usize) -> Result<(), Diag> {
 /// and digit separators.
 fn concat_number(st: &Expander, tok: Tok) -> Option<String> {
     match tok {
-        Tok::Int(v, _) => Some(v.to_string()),
+        Tok::Int(v, ..) => Some(v.to_string()),
         Tok::Float(i) => {
             let text = st.strings.get(i as usize)?;
             let text = text.strip_suffix("f32").or_else(|| text.strip_suffix("f64")).unwrap_or(text);
@@ -628,8 +612,8 @@ fn concat_value(st: &Expander, trees: &[Tt]) -> Option<String> {
     }
     let [Tt::Tok(t)] = trees else { return None };
     Some(match t.tok {
-        Tok::Str(i) => st.strings.get(i as usize)?.clone(),
-        Tok::Char(c) => c.to_string(),
+        Tok::Str(i, _) => st.strings.get(i as usize)?.clone(),
+        Tok::Char(c, _) => c.to_string(),
         Tok::Int(..) | Tok::Float(_) => concat_number(st, t.tok)?,
         Tok::True => "true".to_string(),
         Tok::False => "false".to_string(),
@@ -725,11 +709,11 @@ fn write_macro(st: &mut Expander, newline: bool, call: &Call) -> Result<Vec<Tt>,
         let mut done = false;
         for tree in fmt_args.iter_mut() {
             if let Tt::Tok(t) = tree
-                && let Tok::Str(i) = t.tok
+                && let Tok::Str(i, _) = t.tok
                 && let Some(text) = st.strings.get(i as usize).cloned()
             {
                 let i2 = st.push_string(format!("{text}\n"));
-                t.tok = Tok::Str(i2);
+                t.tok = Tok::Str(i2, None);
                 done = true;
                 break;
             }

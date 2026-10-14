@@ -210,7 +210,7 @@ fn lex_file(text: &str, file: FileId, interner: &Interner) -> Result<lexer::Lexe
 }
 
 /// Joins piece lexes in order: one final `Eof`, and string-table indexes
-/// (`Tok::string_index_mut`) moved past the strings of earlier pieces.
+/// (`Tok::shift_strings`) moved past the strings of earlier pieces.
 fn join_lexed(parts: Vec<lexer::Lexed>) -> lexer::Lexed {
     let mut out = lexer::Lexed { tokens: Vec::with_capacity(parts.iter().map(|p| p.tokens.len()).sum()), strings: Vec::new() };
     let last = parts.len() - 1;
@@ -220,9 +220,7 @@ fn join_lexed(parts: Vec<lexer::Lexed>) -> lexer::Lexed {
             part.tokens.pop();
         }
         out.tokens.extend(part.tokens.into_iter().map(|mut t| {
-            if let Some(i) = t.tok.string_index_mut() {
-                *i += base;
-            }
+            t.tok.shift_strings(base);
             t
         }));
         out.strings.append(&mut part.strings);
@@ -807,16 +805,16 @@ fn hash_lexed(l: &lexer::Lexed) -> u64 {
         std::mem::discriminant(&t.tok).hash(&mut h);
         match t.tok {
             Tok::Ident(s) | Tok::Reserved(s) | Tok::Lifetime(s) => h.write_u64(s.0 as u64),
-            Tok::Int(v, suffix) => {
+            Tok::Int(v, suffix, _) => {
                 h.write_u128(v);
                 std::mem::discriminant(&suffix).hash(&mut h);
             }
-            Tok::Char(c) => h.write_u64(c as u64),
-            t => {
-                if let Some(i) = t.string_index() {
-                    l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
-                }
-            }
+            Tok::Char(c, _) => h.write_u64(c as u64),
+            _ => {}
+        }
+        // Strings, including a literal's written text.
+        for i in t.tok.string_indices() {
+            l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
         }
         h.write_u64(t.span.file.0 as u64);
         h.write_u64(t.span.lo as u64);
@@ -2064,9 +2062,7 @@ impl MacroEnv {
             base.iter()
                 .map(|t| {
                     let mut tok = t.tok;
-                    if let Some(i) = tok.string_index_mut() {
-                        *i += offset;
-                    }
+                    tok.shift_strings(offset);
                     Token { tok, span: t.span }
                 })
                 .collect()
@@ -3181,7 +3177,7 @@ fn path_attr_value(attrs: &[Attr], ast: &Ast, interner: &Interner) -> Option<Str
             AttrInput::List(_, trees) => {
                 for t in trees {
                     if let crate::lexer::TokenTree::Token(tok) = t
-                        && let crate::lexer::Tok::Str(i) = tok.tok
+                        && let crate::lexer::Tok::Str(i, _) = tok.tok
                     {
                         return ast.strings.get(i as usize).cloned();
                     }
@@ -5236,7 +5232,7 @@ mod tests {
         // The string-table kinds all occur past the first cut.
         let first_cut = pieces[0].1 as u32;
         let later = |k: fn(lexer::Tok) -> bool| serial.tokens.iter().any(|t| t.span.lo >= first_cut && k(t.tok));
-        assert!(later(|t| matches!(t, lexer::Tok::Str(_))));
+        assert!(later(|t| matches!(t, lexer::Tok::Str(..))));
         assert!(later(|t| matches!(t, lexer::Tok::ByteStr(_))));
         assert!(later(|t| matches!(t, lexer::Tok::ByteChar(_))));
         assert!(later(|t| matches!(t, lexer::Tok::Float(_))));

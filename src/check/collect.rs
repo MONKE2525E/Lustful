@@ -1404,7 +1404,7 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         "packed" => {
                             repr.kind = ReprKind::Packed;
                             if let Some(TokenTree::Delim(_, inner, _)) = trees.get(i + 1) {
-                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, _)));
+                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, _, _)));
                                 if !ok {
                                     return Err(bad("packed(N)"));
                                 }
@@ -1414,7 +1414,7 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         "align" => match trees.get(i + 1) {
                             Some(TokenTree::Delim(_, inner, _)) => match inner.as_slice() {
                                 [TokenTree::Token(t2)] => match t2.tok {
-                                    Tok::Int(n, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
+                                    Tok::Int(n, _, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
                                         repr.align = Some(n as u64);
                                         i += 1;
                                     }

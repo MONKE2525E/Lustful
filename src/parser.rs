@@ -139,7 +139,7 @@ pub fn parse_seeded(lexed: &Lexed, interner: &Interner, known: &Known, seed_allo
 /// Parses the whole items in `lexed.tokens[range]` into their own `Ast`, as `parse` parses
 /// them in place. The resolver parses a big file in item segments in parallel this way
 /// (`resolve::worklist::item_segments`). The `Ast` holds only the strings its tokens name
-/// (`Tok::string_index`), re-indexed from zero, so it stands alone like any chunk `Ast`.
+/// (`Tok::string_indices`), re-indexed from zero, so it stands alone like any chunk `Ast`.
 pub fn parse_items(lexed: &Lexed, range: std::ops::Range<usize>, interner: &Interner, known: &Known) -> PResult<Ast> {
     parse_items_seeded(lexed, range, interner, known, &[])
 }
@@ -155,13 +155,13 @@ pub fn parse_items_seeded(
     seed_allows: &[Attr],
 ) -> PResult<Ast> {
     let toks = &lexed.tokens[range];
-    let lo = toks.iter().filter_map(|t| t.tok.string_index()).min().unwrap_or(0);
-    let hi = toks.iter().filter_map(|t| t.tok.string_index()).max().map_or(lo, |i| i + 1);
+    let lo = toks.iter().flat_map(|t| t.tok.string_indices()).min().unwrap_or(0);
+    let hi = toks.iter().flat_map(|t| t.tok.string_indices()).max().map_or(lo, |i| i + 1);
     let mut v: Vec<Token> = toks
         .iter()
         .map(|&t| {
             let mut t = t;
-            if let Some(i) = t.tok.string_index_mut() {
+            for i in t.tok.string_indices_mut().into_iter().flatten() {
                 *i -= lo;
             }
             t
@@ -614,11 +614,11 @@ fn tok_name(t: Tok) -> &'static str {
         Reserved(_) => "reserved keyword",
         Int(..) => "integer literal",
         Float(_) => "float literal",
-        Str(_) => "string literal",
+        Str(..) => "string literal",
         DocStr(_) => "doc comment string",
         ByteStr(_) => "byte string literal",
         ByteChar(_) => "byte char literal",
-        Char(_) => "char literal",
+        Char(..) => "char literal",
         Lifetime(_) => "lifetime",
         As => "`as`",
         Break => "`break`",
@@ -1503,7 +1503,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Extern if qual.abi.is_none() => {
                     self.bump();
-                    if let Tok::Str(i) = self.peek() {
+                    if let Tok::Str(i, _) = self.peek() {
                         self.bump();
                         qual.abi = Some(i + self.str_base);
                     } else {
@@ -2587,7 +2587,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Minus => self.prefix(false),
             Tok::LBrace => self.block_like_expr(false),
-            Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false, false),
+            Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false, false),
             _ => Err(self.reject(C_CONST, "const generic arguments in this form")),
         }
     }
@@ -2606,7 +2606,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     self.bump();
                     let kind = match self.peek() {
-                        Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
+                        Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
                             BindingKind::EqConst(self.const_arg_expr()?)
                         }
                         _ => BindingKind::EqTy(self.ty()?),
@@ -2620,7 +2620,7 @@ impl<'a> Parser<'a> {
                     let bounds = self.bounds()?;
                     args.push(GenericArg::Binding { name, span, kind: BindingKind::Constraint(bounds) });
                 }
-                Tok::Int(..) | Tok::Str(_) | Tok::Char(_) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
+                Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Minus | Tok::LBrace => {
                     args.push(GenericArg::Const(self.const_arg_expr()?));
                 }
                 _ => args.push(GenericArg::Type(self.ty()?)),
@@ -2961,8 +2961,8 @@ impl<'a> Parser<'a> {
                 | Tok::ByteStr(_)
                 | Tok::ByteChar(_)
                 | Tok::Minus
-                | Tok::Str(_)
-                | Tok::Char(_)
+                | Tok::Str(..)
+                | Tok::Char(..)
                 | Tok::True
                 | Tok::False
         )
@@ -3010,7 +3010,7 @@ impl<'a> Parser<'a> {
                     Pat::Binding { name, mutable, by_ref }
                 }
             }
-            Tok::Int(..) | Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Minus | Tok::Str(_) | Tok::Char(_)
+            Tok::Int(..) | Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Minus | Tok::Str(..) | Tok::Char(..)
             | Tok::True | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
@@ -3246,12 +3246,12 @@ impl<'a> Parser<'a> {
         let start = self.span();
         let neg = self.eat(Tok::Minus);
         let e = match self.bump().tok {
-            Tok::Int(v, s) => Expr::Int(v, s),
+            Tok::Int(v, s, _) => Expr::Int(v, s),
             Tok::Float(i) => Expr::Float(i + self.str_base),
             Tok::ByteChar(i) if !neg => self.byte_char_expr(i, start)?,
             Tok::ByteStr(i) if !neg => self.byte_str_expr(i, start)?,
-            Tok::Str(i) if !neg => Expr::Str(i + self.str_base),
-            Tok::Char(c) if !neg => Expr::Char(c),
+            Tok::Str(i, _) if !neg => Expr::Str(i + self.str_base),
+            Tok::Char(c, _) if !neg => Expr::Char(c),
             Tok::True if !neg => Expr::Bool(true),
             Tok::False if !neg => Expr::Bool(false),
             t => return Err(syntax(start, format!("expected a literal, found {}", tok_name(t)))),
@@ -3556,19 +3556,7 @@ impl<'a> Parser<'a> {
                         }
                         return Err(syntax(self.span(), "expected identifier, found float literal"));
                     }
-                    if let Tok::Int(v, suffix) = self.peek() {
-                        if suffix.is_some() || v > u32::MAX as u128 {
-                            return Err(syntax(self.span(), "invalid tuple field index"));
-                        }
-                        // A tuple index is written with no leading zero and
-                        // no underscores: its text is exactly its decimal
-                        // digits (rustc E0609 for `t.01`).
-                        let sp = self.span();
-                        if v.to_string().len() as u32 != sp.hi - sp.lo {
-                            return Err(syntax(sp, "tuple index has a leading zero"));
-                        }
-                        let index = v as u32;
-                        self.bump();
+                    if let Some(index) = self.tuple_index()? {
                         e = self.push_expr(Expr::TupleField { base: e, index }, start.to(self.prev_span()));
                         continue;
                     }
@@ -3725,7 +3713,7 @@ impl<'a> Parser<'a> {
     fn primary(&mut self, no_struct: bool, inner_ok: bool) -> PResult<ExprId> {
         let start = self.span();
         let e = match self.peek() {
-            Tok::Int(v, s) => {
+            Tok::Int(v, s, _) => {
                 self.bump();
                 Expr::Int(v, s)
             }
@@ -3741,11 +3729,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.byte_str_expr(i, start)?
             }
-            Tok::Str(i) => {
+            Tok::Str(i, _) => {
                 self.bump();
                 Expr::Str(i + self.str_base)
             }
-            Tok::Char(c) => {
+            Tok::Char(c, _) => {
                 self.bump();
                 Expr::Char(c)
             }
@@ -3972,12 +3960,9 @@ impl<'a> Parser<'a> {
             // A tuple struct literal names fields by index: `T { 0: 5, ..a }`.
             // Tuple field names are the index text (collect).
             let index = matches!(self.peek(), Tok::Int(..));
-            let (name, span) = if let Tok::Int(v, suffix) = self.peek() {
-                if suffix.is_some() || v > u32::MAX as u128 {
-                    return Err(syntax(self.span(), "invalid tuple field index"));
-                }
-                let index = v as u32;
-                let span = self.bump().span;
+            let (name, span) = if index {
+                let span = self.span();
+                let index = self.tuple_index()?.unwrap_or_default();
                 (self.interner.intern(&index.to_string()), span)
             } else {
                 self.ident()?
@@ -4003,16 +3988,28 @@ impl<'a> Parser<'a> {
     /// One step of an `offset_of!` field path: a field name, or an
     /// unsuffixed integer for a tuple field.
     fn offset_field(&mut self) -> PResult<crate::ast::OffsetField> {
-        if let Tok::Int(v, suffix) = self.peek() {
-            if suffix.is_some() || v > u32::MAX as u128 {
-                return Err(syntax(self.span(), "invalid tuple field index"));
-            }
-            let index = v as u32;
-            self.bump();
+        if let Some(index) = self.tuple_index()? {
             return Ok(crate::ast::OffsetField::Index(index));
         }
         let (name, _) = self.ident()?;
         Ok(crate::ast::OffsetField::Name(name))
+    }
+
+    /// A tuple field index at the current integer token (`t.0`, `T { 0: x }`),
+    /// or None at any other token. rustc names the field by the written text,
+    /// so only plain decimal is an index: `t.01`, `t.0x1`, and `t.1_` name no
+    /// field (E0609), and a suffix is an error. A `Tok::Int` with no text
+    /// index is exactly plain decimal (see `lexer::Tok`).
+    fn tuple_index(&mut self) -> PResult<Option<u32>> {
+        let Tok::Int(v, suffix, text) = self.peek() else { return Ok(None) };
+        if suffix.is_some() {
+            return Err(syntax(self.span(), "suffixes on a tuple index are invalid"));
+        }
+        if text.is_some() || v > u32::MAX as u128 {
+            return Err(syntax(self.span(), "invalid tuple index: write it in plain decimal, with no leading zero or `_`"));
+        }
+        self.bump();
+        Ok(Some(v as u32))
     }
 
     /// The body of an `offset_of!` call, after the `!`: `(Type, field)`,
@@ -4109,10 +4106,10 @@ impl<'a> Parser<'a> {
             }
             // `print!`, `eprint!`, and `format!` need a format string; `println!` and kin do not.
             let needs_str = matches!(kind, MacroKind::Print | MacroKind::Eprint | MacroKind::Format | MacroKind::FormatArgs);
-            if needs_str && !matches!(self.peek(), Tok::Str(_)) {
+            if needs_str && !matches!(self.peek(), Tok::Str(..)) {
                 return Err(syntax(self.span(), "expected a format string literal"));
             }
-            if let Tok::Str(si) = self.peek() {
+            if let Tok::Str(si, _) = self.peek() {
                 let lit_span = self.bump().span;
                 let mut extra = Vec::new();
                 while self.eat(Tok::Comma) {

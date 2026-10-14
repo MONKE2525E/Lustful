@@ -1075,7 +1075,7 @@ fn is_ident_tok(tok: Tok) -> bool {
 fn is_literal_tok(tok: Tok) -> bool {
     matches!(
         tok,
-        Tok::Int(..) | Tok::Float(_) | Tok::Str(_) | Tok::DocStr(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(_) | Tok::True | Tok::False
+        Tok::Int(..) | Tok::Float(_) | Tok::Str(..) | Tok::DocStr(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(..) | Tok::True | Tok::False
     )
 }
 
@@ -1809,7 +1809,7 @@ fn is_fn_type(m: &mut Matcher, slice: &[Tt]) -> bool {
     }
     if tok_at(slice, i).map(|t| t.tok) == Some(Tok::Extern) {
         i += 1;
-        if matches!(tok_at(slice, i).map(|t| t.tok), Some(Tok::Str(_))) {
+        if matches!(tok_at(slice, i).map(|t| t.tok), Some(Tok::Str(..))) {
             i += 1;
         }
     }
@@ -2077,7 +2077,7 @@ fn probe_flatten_impl(m: &Matcher, kind: FragKind, trees: &[Tt], bounds: Option<
             FragKind::Pat | FragKind::PatParam => out.push(tok(Tok::Underscore)),
             FragKind::Block => out.extend([Tok::LBrace, Tok::RBrace].map(tok)),
             FragKind::Vis => {}
-            _ => out.push(tok(Tok::Int(0, None))),
+            _ => out.push(tok(Tok::Int(0, None, None))),
         }
     }
     /// A forwarded fragment of kind `frag` (followed by trees `rest`)
@@ -2104,14 +2104,14 @@ fn probe_flatten_impl(m: &Matcher, kind: FragKind, trees: &[Tt], bounds: Option<
             FragKind::Pat | FragKind::PatParam => {
                 out.extend([Tok::LBracket, Tok::Ref, Tok::Ident(m.interner.intern("__lust_p")), Tok::RBracket].map(tok))
             }
-            FragKind::Expr | FragKind::Expr2021 | FragKind::Literal => out.push(tok(Tok::Int(0, None))),
+            FragKind::Expr | FragKind::Expr2021 | FragKind::Literal => out.push(tok(Tok::Int(0, None, None))),
             // An inner block, so a path before it does not read it as
             // a struct literal body.
             FragKind::Block if matches!(out.as_slice(), [.., l, c] if matches!(l.tok, Tok::Lifetime(_)) && c.tok == Tok::Colon) => out.push(bad),
             FragKind::Block => out.extend([Tok::LBrace, Tok::LBrace, Tok::RBrace, Tok::RBrace].map(tok)),
             FragKind::Item => placeholder(m, frag, span, out),
             // A whole statement, valid only where one stands.
-            FragKind::Stmt => out.extend([Tok::Let, Tok::Underscore, Tok::Eq, Tok::Int(0, None), Tok::Semi].map(tok)),
+            FragKind::Stmt => out.extend([Tok::Let, Tok::Underscore, Tok::Eq, Tok::Int(0, None, None), Tok::Semi].map(tok)),
             FragKind::Vis if ctx == FragKind::Item || (ctx == FragKind::Stmt && super::starts_item(rest, m.interner)) => {}
             _ => out.push(bad),
         }

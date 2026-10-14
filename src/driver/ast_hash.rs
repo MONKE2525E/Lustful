@@ -177,16 +177,16 @@ impl Walker<'_> {
                     std::mem::discriminant(&tok.tok).hash(h);
                     match &tok.tok {
                         Tok::Ident(s) | Tok::Reserved(s) | Tok::Lifetime(s) => self.sym(h, *s),
-                        Tok::Int(v, suf) => {
+                        Tok::Int(v, suf, _) => {
                             v.hash(h);
                             suf.map(|s| s as u8).hash(h);
                         }
-                        Tok::Char(c) => c.hash(h),
-                        t => {
-                            if let Some(i) = t.string_index() {
-                                self.string_at(h, i);
-                            }
-                        }
+                        Tok::Char(c, _) => c.hash(h),
+                        _ => {}
+                    }
+                    // Strings, including a literal's written text.
+                    for i in tok.tok.string_indices() {
+                        self.string_at(h, i);
                     }
                 }
                 TokenTree::Delim(d, inner, _) => {
