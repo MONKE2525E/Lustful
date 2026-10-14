@@ -8248,6 +8248,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return ERROR;
                 }
                 self.expr(args[0], None);
+                self.reject_unsized_value(args[0]);
                 self.set_res(e, Res::Builtin(Builtin::MemDrop));
                 return UNIT;
             }
@@ -8866,7 +8867,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.expr(a, None);
                     }
                 }
+                self.reject_unsized_value(a);
             }
+        }
+    }
+
+    /// An argument moves its value, which needs a statically known size
+    /// (rustc E0277): `drop(*b)` for `b: Box<dyn Tr>`.
+    fn reject_unsized_value(&mut self, a: ExprId) {
+        let t = self.deep(self.out.expr_ty[self.ei(a)]);
+        if self.out.coerce[self.ei(a)] == Coerce::None && matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Str | TyKind::Slice(_)) {
+            let (tn, span) = (self.tn(t), self.span(a));
+            self.err(
+                "L0110",
+                span,
+                format!("the size for values of type `{tn}` cannot be known, so it cannot be passed by value"),
+                "Pass a reference instead: `&*b`.",
+            );
         }
     }
 
@@ -14971,6 +14988,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 );
             }
             self.out.vtable_requests.push((x, y));
+        }
+        // Every local has a statically known size (rustc E0277): `let x
+        // = *b;` for `b: Box<dyn Tr>` is a move out of the box that the
+        // borrow checker allows for a sized pointee.
+        for i in 0..self.out.locals.len() {
+            let t = self.deep(self.out.locals[i].ty);
+            if matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Str | TyKind::Slice(_)) {
+                let (tn, span) = (self.tn(t), self.out.locals[i].span);
+                self.err(
+                    "L0110",
+                    span,
+                    format!("the size for values of type `{tn}` cannot be known, so it cannot be a local variable"),
+                    "Bind a reference instead: `let x = &*b;`.",
+                );
+            }
         }
         self.overflow_lint();
         // Abstract associated const reads (see `abstract_consts`)
