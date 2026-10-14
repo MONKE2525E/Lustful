@@ -483,6 +483,7 @@ fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
 /// True when `c` has the Unicode XID_Start property (Unicode 17, as
 /// rustc 1.99). Callers add `_`, which Rust allows but XID_Start
 /// does not. ASCII answers come from the first two table ranges.
+#[inline]
 fn is_xid_start(c: char) -> bool {
     if c.is_ascii() {
         return c.is_ascii_alphabetic();
@@ -492,6 +493,7 @@ fn is_xid_start(c: char) -> bool {
 
 /// True when `c` has the Unicode XID_Continue property. Every
 /// XID_Start char is also XID_Continue.
+#[inline]
 fn is_xid_continue(c: char) -> bool {
     if c.is_ascii() {
         return c.is_ascii_alphanumeric() || c == '_';
@@ -500,7 +502,10 @@ fn is_xid_continue(c: char) -> bool {
 }
 
 /// True when an identifier can start at byte `at` of `src`: an ASCII
-/// letter or `_`, or a non-ASCII XID_Start char.
+/// letter or `_`, or a non-ASCII XID_Start char. The ASCII cases
+/// answer from the byte alone; only a byte at or above 0x80 decodes
+/// a char and looks in the XID table.
+#[inline]
 fn is_ident_start_at(src: &str, b: &[u8], at: usize) -> bool {
     match b.get(at) {
         Some(&c) if c.is_ascii_alphabetic() || c == b'_' => true,
@@ -510,31 +515,50 @@ fn is_ident_start_at(src: &str, b: &[u8], at: usize) -> bool {
 }
 
 /// Scans identifier chars from `*i`, which must be at a valid start
-/// char. ASCII letters, digits, and `_` scan in a byte loop first;
-/// a non-ASCII char switches to a char loop that stops at the
-/// first char that is not XID_Continue (rustc ends the name there
-/// and then rejects that char on its own). Returns true when the
-/// scanned text holds a non-ASCII char.
+/// char. ASCII letters, digits, and `_` scan in a byte loop in a
+/// local index, with no char decode and no table lookup, so an
+/// ASCII name costs one branch per byte. Only a byte at or above
+/// 0x80 goes to the char loop. Returns true when the scanned text
+/// holds a non-ASCII char.
+#[inline]
 fn scan_ident_tail(src: &str, b: &[u8], i: &mut usize) -> bool {
-    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
-        *i += 1;
+    let mut j = *i;
+    while j < b.len() {
+        let c = b[j];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            j += 1;
+        } else {
+            break;
+        }
     }
-    if *i >= b.len() || b[*i] < 0x80 {
+    *i = j;
+    if j >= b.len() || b[j] < 0x80 {
         return false;
     }
-    while *i < b.len() {
-        if b[*i].is_ascii_alphanumeric() || b[*i] == b'_' {
-            *i += 1;
-        } else if b[*i] < 0x80 {
+    scan_ident_tail_unicode(src, b, i)
+}
+
+/// Continues an identifier scan at `*i`, which is at a non-ASCII
+/// char, with a char loop that stops at the first char that is not
+/// XID_Continue (rustc ends the name there and then rejects that
+/// char on its own). Always returns true: the name is non-ASCII.
+fn scan_ident_tail_unicode(src: &str, b: &[u8], i: &mut usize) -> bool {
+    let mut j = *i;
+    while j < b.len() {
+        let c = b[j];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            j += 1;
+        } else if c < 0x80 {
             break;
         } else {
-            let ch = src[*i..].chars().next().unwrap();
+            let ch = src[j..].chars().next().unwrap();
             if !is_xid_continue(ch) {
                 break;
             }
-            *i += ch.len_utf8();
+            j += ch.len_utf8();
         }
     }
+    *i = j;
     true
 }
 
