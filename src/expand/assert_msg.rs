@@ -113,7 +113,10 @@ fn is_pattern_ws(c: char) -> bool {
 fn def_alone(st: &Expander, span: Span, pos: u32) -> Option<bool> {
     let src = st.cur_src.as_bytes();
     let here = st.root_file == Some(span.file) && st.cur_file == st.ctx.file_path;
-    let delims = matches!((src.get(span.lo as usize), span.hi.checked_sub(1).and_then(|h| src.get(h as usize))), (Some(b'(' | b'[' | b'{'), Some(b')' | b']' | b'}')));
+    let delims = matches!(
+        (src.get(span.lo as usize), span.hi.checked_sub(1).and_then(|h| src.get(h as usize))),
+        (Some(b'(' | b'[' | b'{'), Some(b')' | b']' | b'}'))
+    );
     (here && delims).then(|| src_alone(&st.cur_src, pos))
 }
 
@@ -153,7 +156,13 @@ fn flatten(st: &Expander, trees: &[Tt], group: Option<CtxtId>, out: &mut Vec<T>)
                 // rustc's transcriber forces `Alone` after a body's `]`.
                 let close_alone = if !root && *d == Delim::Bracket { Some(true) } else { at(span.hi) };
                 let lo = span.hi.saturating_sub(1).max(span.lo + 1);
-                out.push(T { text: close.into(), k: K::Close(*d), span: Span { lo, hi: lo + 1, ..*span }, alone: close_alone, subst: false });
+                out.push(T {
+                    text: close.into(),
+                    k: K::Close(*d),
+                    span: Span { lo, hi: lo + 1, ..*span },
+                    alone: close_alone,
+                    subst: false,
+                });
             }
             Tt::Frag(kind, inner, span) if !kind.transparent() => {
                 out.push(T { text: String::new(), k: K::FragOpen(*kind), span: *span, alone: Some(false), subst: false });
@@ -214,7 +223,18 @@ fn ident_like(t: Tok) -> bool {
 }
 
 fn is_punct(t: Tok) -> bool {
-    !ident_like(t) && !matches!(t, Tok::Int(..) | Tok::Float(_) | Tok::Str(..) | Tok::DocStr(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Char(..) | Tok::Lifetime(_))
+    !ident_like(t)
+        && !matches!(
+            t,
+            Tok::Int(..)
+                | Tok::Float(_)
+                | Tok::Str(..)
+                | Tok::DocStr(_)
+                | Tok::ByteStr(_)
+                | Tok::ByteChar(_)
+                | Tok::Char(..)
+                | Tok::Lifetime(_)
+        )
 }
 
 fn print(toks: Vec<T>) -> Option<String> {
@@ -622,10 +642,17 @@ impl P {
     /// `&` of a `&&` token.
     fn addr_of(&mut self, r: R, outer: &str) -> Option<Ex> {
         self.i += 1;
-        let raw = matches!(self.peek(), Some(K::Tok(Tok::Ident(_)))) && self.t[self.i].text == "raw" && matches!(self.tok_at(self.i + 1), Some(Tok::Const | Tok::Mut));
+        let raw = matches!(self.peek(), Some(K::Tok(Tok::Ident(_))))
+            && self.t[self.i].text == "raw"
+            && matches!(self.tok_at(self.i + 1), Some(Tok::Const | Tok::Mut));
         let m = if raw {
             self.i += 1;
-            if self.eat(Tok::Const) { "raw const " } else { self.bump(); "raw mut " }
+            if self.eat(Tok::Const) {
+                "raw const "
+            } else {
+                self.bump();
+                "raw mut "
+            }
         } else if self.eat(Tok::Mut) {
             "mut "
         } else {
@@ -1571,7 +1598,10 @@ impl P {
             (Some(Tok::Dollar), Some(t)) if ident_like(t) && !next_nt => false,
             (_, Some(Tok::Comma | Tok::Semi | Tok::Dot)) if !punct(first) => false,
             (_, Some(Tok::Bang)) if plain_ident => false,
-            (_, None) if self.t[c].k == K::Open(Delim::Paren) && (plain_ident || !nt && matches!(first, Some(Tok::Fn | Tok::SelfUpper | Tok::Pub))) => {
+            (_, None)
+                if self.t[c].k == K::Open(Delim::Paren)
+                    && (plain_ident || !nt && matches!(first, Some(Tok::Fn | Tok::SelfUpper | Tok::Pub))) =>
+            {
                 false
             }
             (Some(Tok::Pound), None) if self.t[c].k == K::Open(Delim::Bracket) => false,
