@@ -3843,6 +3843,13 @@ pub struct GenTables<'a> {
     /// derived bodies call the field type's impl (iface: W-CGEN
     /// reads this, like `drop_methods`).
     pub glue_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    /// The written `PartialOrd::partial_cmp` methods cgen's `PCmp`
+    /// glue may call: like `glue_methods`, but an `Ord` impl may also
+    /// exist (the `Cmp` glue then means `Ord::cmp` and cannot serve
+    /// both), and only an `lt` override disqualifies (sort compares
+    /// with `lt`, whose default is `partial_cmp == Some(Less)`).
+    /// Keyed by (Adt, `PartialOrd` trait) (iface: W-CGEN reads this).
+    pub pcmp_methods: FxMap<(AdtId, DefId), LocalDefId>,
     /// The user `fmt` method instance for one concrete Adt and fmt
     /// trait (`FmtKind as u8`: Display or Debug), for cgen's Debug and
     /// Display glue (W-STD-B; iface: W-CGEN reads this).
@@ -3987,6 +3994,7 @@ impl Default for GenTables<'_> {
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),
+            pcmp_methods: FxMap::default(),
             fmt_methods: FxMap::default(),
             deferred_debug_fields: Vec::new(),
             hasher_methods: FxMap::default(),
@@ -8645,6 +8653,7 @@ fn compute_glue_methods(p: &mut Program) {
     use crate::traits::index::Synthetic;
     let lang = p.gx.lang;
     let mut out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
+    let mut pcmp_out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
     for (_, rec) in p.gx.index.all_impls() {
         if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
             continue;
@@ -8676,6 +8685,17 @@ fn compute_glue_methods(p: &mut Program) {
             continue;
         }
         let has = |n: &str| rec.items.iter().any(|&m| p.local_def(m.hash).is_some_and(|l| p.name(p.fn_info(l).name) == n));
+        // The `PCmp` glue's written method (`pcmp_methods`): a
+        // `PartialOrd` with `Rhs = Self` and core's `lt`. An `Ord`
+        // impl may exist too; its `cmp` is the `Cmp` glue's business.
+        if rec.trait_def == lang.partial_ord
+            && !has("lt")
+            && p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()) == Some(self_ty)
+            && let Some(f) = rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == "partial_cmp"))
+            && !p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some())
+        {
+            pcmp_out.insert((a, lang.partial_ord), f);
+        }
         // `PartialEq` with `Rhs = Self` and core's `ne`: the eq glue
         // answers `!=` as `!eq`, which is then exactly core's default.
         if rec.trait_def == lang.partial_eq
@@ -8704,6 +8724,7 @@ fn compute_glue_methods(p: &mut Program) {
         out.insert((a, rec.trait_def), f);
     }
     p.gx.glue_methods = out;
+    p.gx.pcmp_methods = pcmp_out;
 }
 
 /// Fills `written_hash` and `borrow_impls` (W-STD-B): the written

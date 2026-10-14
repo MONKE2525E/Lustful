@@ -155,8 +155,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// The sort and binary-search family on a Vec, slice, or array
     /// (runtime/sort.h ports Rust 1.99's algorithms). Comparators are
-    /// closures; `sort`, `binary_search`, and the `_by_key` keys need
-    /// an `Ord` type lust compares (collect.rs `has_total_ord`).
+    /// closures; `binary_search` and its `_by_key` key need an `Ord`
+    /// type lust compares (collect.rs `has_total_ord`), and the sorts
+    /// also need a `PartialOrd::lt` lust can call (`has_partial_cmp`):
+    /// std's sort compares with `lt`, not `Ord::cmp`.
     #[allow(clippy::too_many_arguments)]
     fn seq_sort(&mut self, e: ExprId, recv: ExprId, el: Ty, derefs: u8, n: &str, span: Span, args: &[ExprId]) -> Ty {
         use Builtin as B;
@@ -165,7 +167,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let res = self.tys.mk_result(USIZE, USIZE);
         let (b, autoref, params, ret) = match n {
             "sort" | "sort_unstable" => {
-                self.deferred_ord.push((el, span));
+                self.deferred_sort_ord.push((el, span));
                 (if n == "sort" { B::SliceSort } else { B::SliceSortUnstable }, Autoref::RefMut, vec![], UNIT)
             }
             "sort_by" | "sort_unstable_by" => {
@@ -173,9 +175,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (if n == "sort_by" { B::SliceSortBy } else { B::SliceSortUnstableBy }, Autoref::RefMut, vec![f], UNIT)
             }
             "sort_by_key" | "sort_unstable_by_key" => {
+                // Rust's bound is `F: FnMut(&T) -> K` with a
+                // higher-ranked `&T`, so the key cannot borrow from
+                // the element (as in `min_by_key`/`max_by_key` below).
+                // `binary_search_by_key` is the opposite: its `&'a T`
+                // is tied to the slice, so it keeps `fn_mut_param`.
                 let key = self.new_var(false);
-                let f = self.fn_mut_param(&[r_el], key, span);
-                self.deferred_ord.push((key, span));
+                let f = self.fn_mut_param_ref(&[r_el], key, span);
+                self.deferred_sort_ord.push((key, span));
                 (if n == "sort_by_key" { B::SliceSortByKey } else { B::SliceSortUnstableByKey }, Autoref::RefMut, vec![f], UNIT)
             }
             "binary_search" => {

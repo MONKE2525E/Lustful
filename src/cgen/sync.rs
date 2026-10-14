@@ -134,6 +134,7 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         let (proto, call) = match g {
             Glue::Eq => (format!("uint8_t eq_{m}({ct} *a, {ct} *b)"), format!("eq_{rm}(a, b)")),
             Glue::Cmp => (format!("int8_t cmp_{m}({ct} *a, {ct} *b)"), format!("cmp_{rm}(a, b)")),
+            Glue::PCmp => (format!("int8_t pcmp_{m}({ct} *a, {ct} *b)"), format!("pcmp_{rm}(a, b)")),
             Glue::Debug => (format!("int dbg_{m}(lust_Formatter *f, {ct} *p)"), format!("dbg_{rm}(f, p)")),
             Glue::Display => (format!("int disp_{m}(lust_Formatter *f, {ct} *p)"), format!("disp_{rm}(f, p)")),
             Glue::Default => (format!("{ct} default_{m}(void)"), format!("default_{rm}()")),

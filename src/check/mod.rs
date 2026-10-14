@@ -1186,6 +1186,10 @@ struct Ctx<'p, 'a> {
     /// Item or key types an iterator method needs to be Ord (`min`,
     /// `max`, `min_by_key`, `max_by_key`), re-tested at finish.
     deferred_ord: Vec<(Ty, Span)>,
+    /// Element or key types of `sort`/`sort_unstable`/`sort_by_key`:
+    /// Ord, and a `PartialOrd::lt` lust can call (std's sort compares
+    /// with `lt`, not `Ord::cmp`), re-tested at finish.
+    deferred_sort_ord: Vec<(Ty, Span)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
@@ -1463,6 +1467,7 @@ fn check_fn_mode<'p, 'a>(
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
+        deferred_sort_ord: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
@@ -16974,6 +16979,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !has_total_ord(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Derive Ord on the type, or compare integers, chars, strings, or tuples of them.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_sort_ord) {
+            let t = self.deep(t);
+            if matches!(self.kind(t), TyKind::Error) {
+                continue;
+            }
+            if !has_total_ord(self.p, &self.tys, t) {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("`{tn}` does not implement Ord, or lust cannot compare it yet"), "Derive Ord on the type, or compare integers, chars, strings, or tuples of them.");
+            } else if !has_partial_cmp(self.p, &self.tys, t) {
+                let tn = self.tn(t);
+                self.err(
+                    "L0640",
+                    span,
+                    format!("sorting `{tn}` compares with its written `PartialOrd::lt`, which lust cannot call yet"),
+                    "Sort with `sort_by` and an explicit comparator, or derive `PartialOrd`.",
+                );
             }
         }
         // A `thread_local!` `const { .. }` init fn proves its const part (check/tls.rs).

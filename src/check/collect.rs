@@ -5589,27 +5589,45 @@ pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_cmp(p, tys, t, true, &mut Vec::new())
 }
 
+/// True when `PartialOrd::lt` of `t` is exactly the `PCmp` glue:
+/// `has_ord` shapes, plus an Adt whose written `partial_cmp` the
+/// glue can call even when an `Ord` impl also exists (then the
+/// `Cmp` glue means `Ord::cmp`, which may disagree with `lt`).
+/// Std's `sort` family compares with `lt`, so it needs both this
+/// and `has_total_ord`.
+pub fn has_partial_cmp(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_cmp_mode(p, tys, t, false, &mut Vec::new(), true)
+}
+
 /// The structural walk behind `has_ord` and `has_total_ord`. `seen`
 /// holds the Adt types on the walk (a recursive type through `Box`
 /// or `Vec` compares by the same glue: the cycle adds no field type).
 fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>) -> bool {
+    glue_cmp_mode(p, tys, t, total, seen, false)
+}
+
+/// `glue_cmp` with the `PCmp` rule (`pcmp`): a written `partial_cmp`
+/// in `pcmp_methods` also answers, and a parameter bound by `Ord`
+/// answers for its `PartialOrd` supertrait. Field walks that the
+/// derive rule sends to `Ord` (`fields_total`) use the plain walk.
+fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>, pcmp: bool) -> bool {
     // `Cow<B>` compares as the `B` it derefs to (W-STD-B).
     if let Some(b) = cow_arg(tys, t) {
-        return glue_cmp(p, tys, b, total, seen);
+        return glue_cmp_mode(p, tys, b, total, seen, pcmp);
     }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => {
             if total {
                 env_proves(tys, t, p.gx.lang.ord, None)
             } else {
-                env_proves(tys, t, p.gx.lang.partial_ord, Some(t))
+                env_proves(tys, t, p.gx.lang.partial_ord, Some(t)) || (pcmp && env_proves(tys, t, p.gx.lang.ord, None))
             }
         }
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Float(_) => !total,
         TyKind::Infer(v) => v.is_int() || (v.is_float() && !total),
-        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp(p, tys, e, total, seen),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_cmp(p, tys, e, total, seen)),
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp_mode(p, tys, e, total, seen, pcmp),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_cmp_mode(p, tys, e, total, seen, pcmp)),
         _ => {
             if tys.is_string_ty(t) {
                 return true;
@@ -5619,15 +5637,18 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
                 return false;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
-                return glue_cmp(p, tys, e, total, seen);
+                return glue_cmp_mode(p, tys, e, total, seen, pcmp);
             }
             if let Some((a, b)) = tys.result_args(t) {
-                return glue_cmp(p, tys, a, total, seen) && glue_cmp(p, tys, b, total, seen);
+                return glue_cmp_mode(p, tys, a, total, seen, pcmp) && glue_cmp_mode(p, tys, b, total, seen, pcmp);
             }
             match tys.local_adt(t) {
                 // A written non-generic `PartialOrd` (and no `Ord`): the
                 // glue calls its `partial_cmp`.
                 Some(a) if !total && p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_ord)) => true,
+                // The `PCmp` glue calls a written `partial_cmp` even
+                // when an `Ord` impl also exists.
+                Some(a) if pcmp && !total && p.gx.pcmp_methods.contains_key(&(a, p.gx.lang.partial_ord)) => true,
                 Some(a) => {
                     let d = p.adt(a).derives;
                     if !(if total { d.ord } else { d.partial_ord }) {
@@ -5639,7 +5660,7 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
                     let generic = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some())
                         || p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
                     let fields_total = total || (d.ord && !generic);
-                    adt_fields_all(p, a, t, seen, &mut |f, seen| glue_cmp(p, tys, f, fields_total, seen))
+                    adt_fields_all(p, a, t, seen, &mut |f, seen| glue_cmp_mode(p, tys, f, fields_total, seen, pcmp && !fields_total))
                 }
                 None => false,
             }

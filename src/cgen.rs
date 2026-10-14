@@ -126,6 +126,12 @@ pub enum Glue {
     /// gives -1 (less), 0 (equal), 1 (greater), or 2 (unordered: a
     /// float NaN decided it), as derived and core `PartialOrd` order.
     Cmp,
+    /// Like `Cmp`, but `PartialOrd::partial_cmp` order where it can
+    /// differ from `Ord::cmp`: a written `partial_cmp` is called even
+    /// when an `Ord` impl exists, and composite types compare their
+    /// parts with `PCmp`. Only the sort adapters ask for it (std's
+    /// sort compares with `lt`).
+    PCmp,
     /// `T default_T(void)`: the value derived and core `Default` build.
     Default,
     /// Display of a type with a user `impl Display` (cgen/fmt.rs).
@@ -3140,12 +3146,16 @@ impl FnGen<'_, '_, '_> {
     /// C statements (into `out`) comparing the values at pointer
     /// expressions `a` and `b` of an Ord type lust compares
     /// (check/collect.rs `has_total_ord`); returns the name of an int32_t
-    /// that is negative, zero, or positive like `Ord::cmp`.
-    fn cmp3_c(&mut self, out: &mut String, t: &CTy, a: &str, b: &str) -> String {
+    /// that is negative, zero, or positive like `Ord::cmp`. With
+    /// `partial`, the comparison is `PartialOrd::partial_cmp` (the
+    /// sort adapters: std's sort compares with `lt`); the code 2
+    /// (unordered) can then also reach the caller, whose `< 0` test
+    /// is `lt`.
+    fn cmp3_c(&mut self, out: &mut String, t: &CTy, a: &str, b: &str, partial: bool) -> String {
         if let CTy::Ref(inner) = t
             && **inner != CTy::Str
         {
-            return self.cmp3_c(out, inner, &format!("(*{a})"), &format!("(*{b})"));
+            return self.cmp3_c(out, inner, &format!("(*{a})"), &format!("(*{b})"), partial);
         }
         let v = self.tmp();
         match t {
@@ -3169,14 +3179,17 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(out, "  int32_t {v} = 0;");
                 for (i, e) in es.iter().enumerate() {
                     let _ = writeln!(out, "  if (!{v}) {{");
-                    let c = self.cmp3_c(out, e, &format!("(&({a})->f{i})"), &format!("(&({b})->f{i})"));
+                    let c = self.cmp3_c(out, e, &format!("(&({a})->f{i})"), &format!("(&({b})->f{i})"), partial);
                     let _ = writeln!(out, "  {v} = {c}; }}");
                 }
             }
-            // A derived `Ord` (check/collect.rs `has_total_ord`).
+            // A derived `Ord` (check/collect.rs `has_total_ord`), or,
+            // for `partial`, its `PartialOrd` (check/collect.rs
+            // `has_partial_cmp`).
             _ => {
-                self.want(Glue::Cmp, t);
-                let _ = writeln!(out, "  int32_t {v} = cmp_{}({a}, {b});", mangle(t));
+                let (g, pre) = if partial { (Glue::PCmp, "pcmp") } else { (Glue::Cmp, "cmp") };
+                self.want(g, t);
+                let _ = writeln!(out, "  int32_t {v} = {pre}_{}({a}, {b});", mangle(t));
             }
         }
         v
@@ -3201,7 +3214,7 @@ impl FnGen<'_, '_, '_> {
             (B::SliceSortByKey | B::SliceSortUnstableByKey, Some(f)) => {
                 let (ka, kt) = self.closure_call_c(&mut body, f, "ctx", &[a]);
                 let (kb, _) = self.closure_call_c(&mut body, f, "ctx", &[bb]);
-                let c = self.cmp3_c(&mut body, &kt, &format!("(&{ka})"), &format!("(&{kb})"));
+                let c = self.cmp3_c(&mut body, &kt, &format!("(&{ka})"), &format!("(&{kb})"), true);
                 if needs_drop_c(self.p, &kt) {
                     self.want(Glue::Drop, &kt);
                     let _ = writeln!(body, "  drop_{0}(&{kb}); drop_{0}(&{ka});", mangle(&kt));
@@ -3209,7 +3222,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(body, "  return {c} < 0;");
             }
             _ => {
-                let c = self.cmp3_c(&mut body, elem, &a, &bb);
+                let c = self.cmp3_c(&mut body, elem, &a, &bb, true);
                 let _ = writeln!(body, "  return {c} < 0;");
             }
         }
@@ -3235,7 +3248,7 @@ impl FnGen<'_, '_, '_> {
             (B::SliceBinarySearchByKey, Some(f)) => {
                 let (k, kt) = self.closure_call_c(&mut body, f, "((void**)ctx)[0]", &[p]);
                 let kp = ctype(&CTy::Ref(Box::new(kt.clone())));
-                let c = self.cmp3_c(&mut body, &kt, &format!("(&{k})"), &format!("(({kp})((void**)ctx)[1])"));
+                let c = self.cmp3_c(&mut body, &kt, &format!("(&{k})"), &format!("(({kp})((void**)ctx)[1])"), false);
                 if needs_drop_c(self.p, &kt) {
                     self.want(Glue::Drop, &kt);
                     let _ = writeln!(body, "  drop_{}(&{k});", mangle(&kt));
@@ -3243,7 +3256,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(body, "  return {c};");
             }
             _ => {
-                let c = self.cmp3_c(&mut body, elem, &p, &format!("(({pt})ctx)"));
+                let c = self.cmp3_c(&mut body, elem, &p, &format!("(({pt})ctx)"), false);
                 let _ = writeln!(body, "  return {c};");
             }
         }
@@ -6972,12 +6985,19 @@ fn glue_def(
             }
             let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
         }
-        Glue::Cmp => {
-            let _ = writeln!(protos, "int8_t cmp_{m}({ct} *a, {ct} *b);");
+        Glue::Cmp | Glue::PCmp => {
+            // `PCmp` is this same body with `PartialOrd` order:
+            // a written `partial_cmp` from `pcmp_methods` (an `Ord`
+            // impl may also exist) and `PCmp` field compares, except
+            // where a derive rule below sends fields to `Ord`.
+            let partial = *g == Glue::PCmp;
+            let pre = if partial { "pcmp" } else { "cmp" };
+            let _ = writeln!(protos, "int8_t {pre}_{m}({ct} *a, {ct} *b);");
             // A written `partial_cmp` (see `glue_methods`): its
             // `Option<Ordering>` becomes the glue's code.
+            let written = if partial { &p.gx.pcmp_methods } else { &p.gx.glue_methods };
             if let CTy::Adt(adt_id) | CTy::Unsized(adt_id, _) = t
-                && let Some(&f) = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_ord))
+                && let Some(&f) = written.get(&(*adt_id, p.gx.lang.partial_ord))
                 && let Some(ord) = p.tys.local_adt_of(crate::check::generics::ordering_def())
             {
                 // An unsized newtype's `&self` is its fat value (W-SHIM).
@@ -6995,7 +7015,22 @@ fn glue_def(
                 let ord_ct = ctype(&CTy::Adt(ord));
                 let idx = disc_call(p, &CTy::Adt(ord), "(&o)");
                 let _ = writeln!(body, "  if (!{some}) return 2;\n  {ord_ct} o = {pay};\n  return (int8_t)((int)({idx}) - 1);");
-                let _ = writeln!(defs, "int8_t cmp_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
+                let _ = writeln!(defs, "int8_t {pre}_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
+                return;
+            }
+            // rustc's derived `partial_cmp` on a non-generic type
+            // that also derives `Ord` is `Some(self.cmp(other))`
+            // (collect.rs `glue_cmp_mode`): the `PCmp` glue of such
+            // a type is its `Cmp` glue, field `Ord` compares included.
+            if partial
+                && let CTy::Adt(adt_id) = t
+                && p.adt(*adt_id).derives.partial_ord
+                && p.adt(*adt_id).derives.ord
+                && !p.gx.adt_instance_of.get(adt_id.0 as usize).is_some_and(|o| o.is_some())
+                && !p.gx.adt_generics.get(adt_id.0 as usize).is_some_and(|g| !g.params.is_empty())
+            {
+                need(Glue::Cmp, t);
+                let _ = writeln!(defs, "int8_t pcmp_{m}({ct} *a, {ct} *b) {{\n  return cmp_{m}(a, b);\n}}\n");
                 return;
             }
             // One field pair `x`, `y` (C lvalues): scalars inline, the
@@ -7010,8 +7045,8 @@ fn glue_def(
                     CTy::Bool | CTy::Char | CTy::Int(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y})))"),
                     CTy::Float(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y}) ? 1 : ({x}) == ({y}) ? 0 : 2))"),
                     _ => {
-                        need(Glue::Cmp, t);
-                        format!("cmp_{}(&{x}, &{y})", mangle(t))
+                        need(if partial { Glue::PCmp } else { Glue::Cmp }, t);
+                        format!("{pre}_{}(&{x}, &{y})", mangle(t))
                     }
                 }
             };
@@ -7121,7 +7156,7 @@ fn glue_def(
                     let _ = writeln!(body, "  return {c};");
                 }
             }
-            let _ = writeln!(defs, "int8_t cmp_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
+            let _ = writeln!(defs, "int8_t {pre}_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
         }
         Glue::Default => {
             let _ = writeln!(protos, "{ct} default_{m}(void);");
