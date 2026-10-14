@@ -4317,6 +4317,49 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     /// Binds the variables of an already-tested pattern.
+    /// rustc's pattern-level check of `x @ sub`, which holds even when the
+    /// bindings are never used: a by-move non-Copy `x` cannot have `ref`
+    /// bindings in `sub` (L0301), a by-ref `x` cannot have by-move non-Copy
+    /// ones (L0311), and `ref mut` conflicts with any other by-ref binding
+    /// (L0303). Modes are after default binding modes. A pattern bound
+    /// more than once (guard rows) reports once.
+    fn check_at_conflicts(&mut self, pat: PatId, inner: PatId, mode: BindMode) {
+        let mut subs: Vec<(BindMode, Ty)> = Vec::new();
+        let mut stack = vec![inner];
+        while let Some(q) = stack.pop() {
+            if let PatRes::Binding { mode, .. } = self.ck.pat_res(q)
+                && matches!(self.p.ast.pat(q), Pat::Binding { .. } | Pat::At { .. })
+            {
+                subs.push((mode, self.ck.pat_ty(q)));
+            }
+            stack.extend(self.pat_children(q));
+        }
+        let moves = |this: &Self, t: Ty| !is_copy(this.p, &this.body.tys, t);
+        let err = match mode {
+            BindMode::Move if !moves(self, self.ck.pat_ty(pat)) => None,
+            BindMode::Move => subs
+                .iter()
+                .any(|&(m, _)| m != BindMode::Move)
+                .then_some(("L0301", "borrow of moved value: the `@` binding moves the value its subpattern borrows")),
+            BindMode::Ref(outer) => {
+                if subs.iter().any(|&(m, t)| m == BindMode::Move && moves(self, t)) {
+                    Some(("L0311", "cannot move out of a value the `@` binding borrows"))
+                } else if subs.iter().any(|&(m, _)| matches!(m, BindMode::Ref(inner) if inner || outer)) {
+                    Some(("L0303", "cannot borrow a value as mutable because the `@` pattern also borrows it"))
+                } else {
+                    None
+                }
+            }
+        };
+        let span = self.p.ast.pat_span(pat);
+        if let Some((code, msg)) = err
+            && !self.body.lower_errs.iter().any(|d| d.span == span && d.code == code)
+        {
+            let fix = "Bind the parts in the subpattern only, or bind the whole value by `ref` with `ref` parts.";
+            self.body.lower_errs.push(crate::diag::Diag::new(code, span, msg, fix));
+        }
+    }
+
     fn bind_pat(&mut self, pat: PatId, place: Place) {
         // Or-pattern tags a re-test inside this bind made belong
         // to this one bind: a statically repeated bind of the
@@ -4419,6 +4462,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             (Pat::Ref { inner, .. }, _) => self.bind_pat(*inner, place.deref()),
             (Pat::At { inner, .. }, PatRes::Binding { local, mode }) => {
+                self.check_at_conflicts(pat, *inner, mode);
                 // Subpattern bindings first: copying Copy fields out leaves the
                 // whole value movable for the `@` binding, as in Rust. A
                 // moving subpattern then makes the whole move an error.
