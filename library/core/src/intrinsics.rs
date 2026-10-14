@@ -12,6 +12,9 @@
 //     pub fn xxh3_64(input: &[u8], seed: u64) -> u64;          // xxhash-rust
 //     pub fn xxh3_128(input: &[u8], seed: u64) -> u128;        // xxhash-rust
 //     pub fn ryu_js_fmt_f64(out: &mut String, value: f64);     // ryu-js
+//     pub fn clock_now_raw() -> u128;      // std: CLOCK_MONOTONIC, lo tv_sec, hi tv_nsec
+//     pub fn system_time_raw() -> u128;    // std: CLOCK_REALTIME, same packing
+//     pub fn fmt_align(f: &mut Formatter<'_>) -> u32;  // core, std: 0 left 1 right 2 center 3 none
 //
 // The std platform crate (library/std/src/platform.rs, W-SHIM; C in
 // src/runtime/sys.c):

@@ -103,6 +103,25 @@ named `std` when a file can name a platform module (a byte scan for
 | `std::process::exit` | library/std/src/process.rs | Over intrinsic `exit` (`lust_exit`: flush, then libc exit). Test: tests/pass/std_process_exit.rs. |
 | `std::process::abort` | Declared, no body | A call rejects with L0640 (declared surface, section 3.1). Body needs the abort runtime hook; W-STD. |
 
+## Std source modules (`STD_MODULES` in src/stdmods.rs, W-STD-C)
+
+Whole std modules in source, generic code included. When a compile can
+mention one (its module segment, such as `time`, as a whole word), the
+driver routes it through the resolver and the loader splices each file
+as a hidden inline module after the user text. The resolver binds the
+hidden module nowhere and walks the row's std paths into it, so imports,
+privacy, impls, and const items are the normal module machinery. Types
+defined there are std types: user inherent impls and orphan impls on
+them reject (L0616), and layout queries on them reject (L0652), because
+std's niche fields (`Nanoseconds`) are plain integers here. Rules for
+these files: stable items only, `const fn` exactly where std has it,
+std's panic messages, and `Self::` in associated const values.
+
+| Std paths | File | Items | Notes |
+|---|---|---|---|
+| `core::time` | library/core/src/time.rs | `Duration`, `TryFromFloatSecsError` | Every stable method and op; exact Debug (precision, `+`, width, fill, align through the `fmt_align` intrinsic). No `Sum` impls yet (user `Sum` impls are not supported). |
+| `std::time` | library/std/src/time.rs | `Instant`, `SystemTime`, `UNIX_EPOCH`, `SystemTimeError`, re-exports of `core::time` | Clocks through `clock_now_raw` / `system_time_raw` (C in src/runtime/stdc.c). No `Error` impl yet. |
+
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)
 
 Implemented (codegen emits them): `exit`; the platform crate's
@@ -113,7 +132,8 @@ and the syscalls of env, fs, and process (`sys_getenv`, `sys_environ`,
 `sys_argv`, `sys_getcwd`, `sys_chdir`, `sys_readlink`, `sys_read_file`,
 `sys_write_file`, `sys_path_op`, `sys_rename`, `sys_stat`,
 `sys_realpath`, `sys_read_dir`, `sys_remove_dir_all`, `sys_getpid`; C in
-src/runtime/sys.c); the adapter cores
+src/runtime/sys.c); `clock_now_raw`, `system_time_raw`, and `fmt_align`
+(W-STD-C, src/runtime/stdc.c); the adapter cores
 `xxh3_64`/`xxh3_128` (xxhash-rust, C in src/runtime/deps.c) and
 `ryu_js_fmt_f64` (ryu-js, the JS printer in src/runtime/float.c).
 Adapter crates get their privilege from the resolver's record of their

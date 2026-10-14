@@ -55,6 +55,8 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
         "std/src/lib.rs" => include_str!("../library/std/src/lib.rs"),
         "std/src/prelude.rs" => include_str!("../library/std/src/prelude.rs"),
         "std/src/process.rs" => include_str!("../library/std/src/process.rs"),
+        "core/src/time.rs" => include_str!("../library/core/src/time.rs"),
+        "std/src/time.rs" => include_str!("../library/std/src/time.rs"),
         _ => return None,
     })
 }
@@ -193,8 +195,33 @@ fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>) -> Result
         files.push(checked);
     }
     let lang_items = resolve_lang_items(&files, &marks)?;
-    let (splices, fns) = build_splices(&files)?;
+    let (mut splices, fns) = build_splices(&files)?;
+    for m in crate::stdmods::STD_MODULES {
+        let text = read(m.rel)?;
+        splices.push((m.krate, module_splice(m, &text)?));
+    }
     Ok(StdLoad { lang: lang_items, splices, fns })
+}
+
+/// The splice text of one std source module (src/stdmods.rs). The file
+/// must lex, expand, and parse on its own; its items are checked in the
+/// user compile, inside their hidden module, because they use imports
+/// and module paths the standalone flat check here does not resolve.
+fn module_splice(m: &crate::stdmods::StdModule, text: &str) -> Result<String, String> {
+    let (clean, marks) = scan_lang_attrs(text, m.rel)?;
+    if !marks.is_empty() {
+        return Err(format!("lust std load failed: library/{}: a std source module cannot hold #[lust_lang] marks yet", m.rel));
+    }
+    let interner = Interner::default();
+    let known = Known::new(&interner);
+    let lexed = lexer::lex(&clean, FileId(0), 0, &interner)
+        .and_then(|l| {
+            let ctx = crate::expand::ExpandCtx::for_file(&interner, &known, std::path::Path::new(m.rel), &clean, false);
+            crate::expand::expand_lexed(l, &ctx)
+        })
+        .map_err(|d| format!("lust std load failed: {}", diag_line(m.rel, &d)))?;
+    parser::parse(&lexed, &interner, &known).map_err(|d| format!("lust std load failed: {}", diag_line(m.rel, &d)))?;
+    Ok(crate::stdmods::splice_text(m, &clean))
 }
 
 /// Fills the lang table: builtin defs first, then one def per
@@ -334,7 +361,9 @@ mod tests {
         assert!(load.lang.required_missing().is_empty());
         assert_eq!(load.fns.len(), 1);
         assert_eq!(load.fns[0].path, ["std", "process", "exit"]);
-        assert_eq!(load.splices.len(), 1);
+        // The process fns, then one hidden module per std source module.
+        assert_eq!(load.splices.len(), 1 + crate::stdmods::STD_MODULES.len());
+        assert!(load.splices[1].1.starts_with("pub mod __lust_core_time {\n"));
         let (krate, text) = &load.splices[0];
         assert_eq!(*krate, ShippedCrate::Std);
         assert!(text.contains("fn __lust_std_process_exit(code: i32)"), "splice carries the mangled name:\n{text}");

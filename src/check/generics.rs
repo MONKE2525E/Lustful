@@ -4945,13 +4945,19 @@ pub fn finish_trait_impl(
         head,
         blanket,
     });
-    // The orphan rule (section 2.3).
-    {
+    // The orphan rule (section 2.3). Std source impls are std's own;
+    // std source module types are foreign to user impls (W-STD-C).
+    if !p.std_source_span(imp.span) {
         let rec_scoped = p.gx.index.get(impl_id).clone();
         // A def of a shipped crate in the session (an adapter, or the
         // std platform crate of W-SHIM) is foreign to every other crate.
         let impl_crate = p.shipped_crate_at(imp.span);
-        let is_local = |d: DefId| d.krate == p.krate && p.defs.get(d).is_none_or(|x| p.shipped_crate_at(x.span) == impl_crate);
+        // A std source module type (W-STD-C) is foreign too.
+        let is_local = |d: DefId| {
+            d.krate == p.krate
+                && p.defs.get(d).is_none_or(|x| p.shipped_crate_at(x.span) == impl_crate)
+                && !p.tys.local_adt_of(d).is_some_and(|a| p.is_std_adt(a))
+        };
         // `Box` is fundamental: `Box<Local>` counts as local.
         let fundamental = [p.tys.builtins().boxed];
         if !p.gx.index.orphan_ok(&p.tys, &rec_scoped, &fundamental, &is_local) {

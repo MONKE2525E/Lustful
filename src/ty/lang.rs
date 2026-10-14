@@ -259,6 +259,8 @@ pub enum SigTy {
     Str,
     /// `String` by value (a `lust_String` in C).
     String,
+    /// `&mut fmt::Formatter<'_>`.
+    FmtMut,
 }
 
 impl SigTy {
@@ -290,6 +292,10 @@ impl SigTy {
             SigTy::Arguments => super::fmt::fmt_ty(tys, super::fmt::FmtTy::Arguments),
             SigTy::Str => super::REF_STR,
             SigTy::String => super::STRING,
+            SigTy::FmtMut => {
+                let f = super::fmt::fmt_ty(tys, super::fmt::FmtTy::Formatter);
+                tys.intern(TyKind::Ref(super::Region::Erased, Mut::Mut, f))
+            }
         }
     }
 }
@@ -626,21 +632,17 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         implemented: false,
     },
     // Time.
-    IntrinsicDef {
-        name: "clock_now_raw",
-        c_symbol: "lust_clock_now_raw",
-        params: &[S::Ptr],
-        ret: S::Unit,
-        allowed: ONLY_STD,
-        implemented: false,
-    },
+    // A clock reading: the low word is tv_sec (i64 bits), the high word
+    // tv_nsec (W-STD-C; runtime/stdc.c). Monotonic for `Instant`,
+    // realtime for `SystemTime`.
+    IntrinsicDef { name: "clock_now_raw", c_symbol: "lust_clock_now_raw", params: &[], ret: S::U128, allowed: ONLY_STD, implemented: true },
     IntrinsicDef {
         name: "system_time_raw",
         c_symbol: "lust_system_time_raw",
-        params: &[S::Ptr],
-        ret: S::Unit,
+        params: &[],
+        ret: S::U128,
         allowed: ONLY_STD,
-        implemented: false,
+        implemented: true,
     },
     // Raw fd IO plus errno.
     IntrinsicDef {
@@ -966,6 +968,10 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
+    // 1 right, 2 center, 3 none written), for Debug impls that pad by
+    // hand like `Duration`'s (W-STD-C; runtime/stdc.c).
+    IntrinsicDef { name: "fmt_align", c_symbol: "lust_fmt_align", params: &[S::FmtMut], ret: S::U32, allowed: CORE_STD, implemented: true },
 ];
 
 /// The intrinsic with this `core::intrinsics` name: its registry id.
@@ -1108,7 +1114,7 @@ pub fn needs_std_use(name: &str) -> bool {
 /// must load std before it compiles. A plain byte scan: it runs on every
 /// compile, so it stays a few memmem passes with no allocation.
 pub fn needs_std_load(src: &str) -> bool {
-    STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger))
+    STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger)) || crate::stdmods::needs(src)
 }
 
 /// What namespace a canonical std path names its item in. A path

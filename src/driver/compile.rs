@@ -1588,6 +1588,7 @@ fn resolved_setup(
             crate_name: crate_name.clone(),
             deps: externs.clone(),
             client: front.client.clone(),
+            std_splice_lo: std_ranges.first().map(|r| r.0),
         };
         match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {
@@ -1809,6 +1810,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     } else {
         crate::resolve::worklist::route_root(&src, &front.interner)
     };
+    // A std source module splices as an inline `mod` (src/stdmods.rs),
+    // which only the resolver front end understands (W-STD-C).
+    let wants_resolver = wants_resolver || crate::stdmods::needs(&src);
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;

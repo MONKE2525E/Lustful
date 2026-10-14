@@ -1498,3 +1498,5 @@ uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY
 
 /* The std platform crate's syscalls (src/runtime/sys.h, W-SHIM). */
 #include "sys.h"
+/* Std runtime hooks for time and fmt (src/runtime/stdc.h, W-STD-C). */
+#include "stdc.h"

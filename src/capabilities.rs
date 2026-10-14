@@ -981,6 +981,7 @@ const TYPES: &[&str] = &[
     "&dyn Trait and &mut dyn Trait for traits defined in the crate, with + Send / + Sync",
     "std::env::Args (from std::env::args())",
     "str::Chars (from s.chars())",
+    "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
 ];
 
 const CONTROL_FLOW: &[&str] = &[

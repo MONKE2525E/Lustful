@@ -5138,6 +5138,9 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"hash.h\"", &hash, 1);
     let src = src.replacen("#include \"deps.h\"", &deps, 1);
     let src = src.replacen("#include \"sync.c\"\n", include_str!("runtime/sync.c"), 1);
+    let stdc =
+        include_str!("runtime/stdc.h").replacen("#include \"stdc.c\"", if with_impls { include_str!("runtime/stdc.c") } else { "" }, 1);
+    let src = src.replacen("#include \"stdc.h\"", &stdc, 1);
     let sys = include_str!("runtime/sys.h").replacen("#include \"sys.c\"", if with_impls { include_str!("runtime/sys.c") } else { "" }, 1);
     src.replacen("#include \"sys.h\"", &sys, 1)
 }

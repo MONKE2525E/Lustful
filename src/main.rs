@@ -33,6 +33,7 @@ mod protocol;
 mod resolve;
 mod scan;
 mod stdload;
+mod stdmods;
 mod tcc;
 mod testrun;
 #[allow(dead_code)] // See `mod mono`.

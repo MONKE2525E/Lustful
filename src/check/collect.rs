@@ -305,6 +305,17 @@ impl<'a> Program<'a> {
         }
         self.shipped_ranges.iter().find(|(lo, hi, _)| span.lo >= *lo && span.lo < *hi).map(|(_, _, k)| *k)
     }
+    /// True when `span` is in the std splice of the selected crate's
+    /// root file: shipped std source, not user source (W-STD-C).
+    pub fn std_source_span(&self, span: Span) -> bool {
+        span.file == crate::diag::FileId(0) && self.resolved.as_ref().and_then(|t| t.std_splice_lo).is_some_and(|lo| span.lo >= lo)
+    }
+    /// True when Adt `a` is defined in spliced std source (a std source
+    /// module type such as `Duration`): a std type, foreign to the user
+    /// crate for coherence and with no user-visible layout.
+    pub fn is_std_adt(&self, a: AdtId) -> bool {
+        self.adts.get(a.0 as usize).is_some_and(|adt| self.std_source_span(adt.span))
+    }
     /// The adapter crate whose source file holds `span`, if any. The
     /// resolver records each adapter crate's files (W-DEPS).
     pub fn adapter_at(&self, span: Span) -> Option<&crate::resolve::imports::AdapterCrate> {
@@ -3001,6 +3012,20 @@ pub fn collect_reuse<'a>(
                         "Implement the trait for `dyn Tr` itself, or for a type without `&'static dyn`.",
                     ));
                 }
+                // Rustc E0116: no inherent impl on a std type (W-STD-C).
+                if trait_ref.is_none()
+                    && let Some(a) = owner
+                    && p.is_std_adt(a)
+                    && !p.std_source_span(imp.span)
+                {
+                    errs.push(Diag::new(
+                        "L0616",
+                        ast.ty_span(imp.self_ty),
+                        "cannot define an inherent impl for a type outside of the crate where the type is defined",
+                        "Define a trait with the methods, and implement it for the type.",
+                    ));
+                    continue;
+                }
                 if trait_ref.is_none() && owner.is_none() && !dyn_self {
                     errs.push(Diag::new(
                         "L0102",
@@ -4895,6 +4920,11 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_, '_> {
     fn adt_shape(&self, id: AdtId) -> Option<crate::ty::layout::AdtShape> {
         let p = self.0;
         let adt = p.adts.get(id.0 as usize)?;
+        // Std source module types (W-STD-C) keep std's niches out of
+        // their source form, so no layout query may see them.
+        if p.std_source_span(adt.span) {
+            return None;
+        }
         if let Some(a) = p.adapter_at(adt.span) {
             let path = p.display_path(adt.name);
             if !a.exact_layout.iter().any(|t| *t == path) {

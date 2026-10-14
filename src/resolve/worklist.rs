@@ -51,6 +51,10 @@ pub struct CrateInput {
     pub deps: Vec<super::cargo::DepUnit>,
     /// The requesting client's env and shown paths, for `env!` and `file!` in every crate.
     pub client: crate::expand::ClientView,
+    /// Where the driver's std splice starts in `root_text`, if it
+    /// spliced. Std source modules (src/stdmods.rs) are hidden only
+    /// when they sit at or after this offset.
+    pub std_splice_lo: Option<u32>,
 }
 
 /// One crate's own resolve inputs inside a workspace session (the
@@ -66,6 +70,9 @@ struct OneInput {
     /// so one identity space per merged program is consistent.
     crate_ids: CrateIds,
     crate_name: String,
+    /// `CrateInput::std_splice_lo` for the selected crate; None for a
+    /// dependency.
+    std_splice_lo: Option<u32>,
 }
 
 /// The resolved crate the driver compiles: the merged Ast, the source
@@ -1109,7 +1116,7 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
     let mut env = input.env.with_features(&[]);
     env.allow_lust_dev = true;
     jobs.push(CrateJob {
-        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name: "std".to_string() },
+        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name: "std".to_string(), std_splice_lo: None },
         root_module,
         flat_prefix: format!("k{:016x}$", stable.0),
         magic,
@@ -1129,6 +1136,7 @@ fn resolve_crate_with(
 ) -> Result<ResolvedCrate, ResolveError> {
     cache.begin(input);
     let mut tables = ResolvedTables::new(interner.intern(&input.crate_name));
+    tables.std_splice_lo = input.std_splice_lo;
     let main_magic = interner.intern(&crate_magic_name(input.crate_ids.stable));
     tables.crate_magic.insert(main_magic, ROOT_MODULE);
     let mut jobs: Vec<CrateJob> = vec![CrateJob {
@@ -1138,6 +1146,7 @@ fn resolve_crate_with(
             env: input.env.clone(),
             crate_ids: input.crate_ids,
             crate_name: input.crate_name.clone(),
+            std_splice_lo: input.std_splice_lo,
         },
         root_module: ROOT_MODULE,
         flat_prefix: String::new(),
@@ -1351,7 +1360,7 @@ fn add_dep_job(
     let idx = jobs.len();
     by_key.insert(key, idx);
     jobs.push(CrateJob {
-        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name },
+        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name, std_splice_lo: None },
         root_module,
         flat_prefix: format!("k{:016x}$", stable.0),
         magic,
@@ -3578,8 +3587,17 @@ fn record_display(tables: &mut ResolvedTables, input: &OneInput, flat_prefix: &s
         s.push_str(&input.crate_name);
         s.push_str("::");
     }
-    for seg in &tables.modules[module.0 as usize].path.clone() {
-        s.push_str(interner.get(*seg));
+    for (i, seg) in tables.modules[module.0 as usize].path.clone().iter().enumerate() {
+        // A std source module shows as its std path (`std::time`).
+        let hidden = if i == 0 && flat_prefix.is_empty() && tables.std_modules.iter().any(|&(n, _)| n == *seg) {
+            crate::stdmods::display_path(interner.get(*seg))
+        } else {
+            None
+        };
+        match hidden {
+            Some(p) => s.push_str(&p),
+            None => s.push_str(interner.get(*seg)),
+        }
         s.push_str("::");
     }
     s.push_str(interner.get(name));
@@ -3640,6 +3658,12 @@ fn register_items(
                 check_dup(seen, Namespace::Type, m.name, m.name_span, &mut reported, diags);
                 let mut key = prefix.to_vec();
                 key.push(m.name);
+                // A std source module of the std splice (W-STD-C): bound
+                // nowhere, reached only through its std paths.
+                let hidden = module == ROOT_MODULE
+                    && m.name_span.file == FileId(0)
+                    && input.std_splice_lo.is_some_and(|lo| m.name_span.lo >= lo)
+                    && crate::stdmods::by_name(interner.get(m.name)).is_some();
                 if let Some(&child) = list_module.get(&(fi, key.clone())) {
                     tables.module_defs[child.0 as usize] = DefId {
                         krate: input.crate_ids.local,
@@ -3651,7 +3675,13 @@ fn register_items(
                             0,
                         ),
                     };
-                    bind(tables, Namespace::Type, m.name, Target::Module(child), vis());
+                    if hidden {
+                        if !tables.std_modules.iter().any(|&(_, c)| c == child) {
+                            tables.std_modules.push((m.name, child));
+                        }
+                    } else {
+                        bind(tables, Namespace::Type, m.name, Target::Module(child), vis());
+                    }
                     if let Some(body) = &mut m.body {
                         register_items(
                             body,
@@ -4110,6 +4140,12 @@ impl Rewrite<'_> {
                     for t in const_tys {
                         self.ty(ast, t, module, &[]);
                     }
+                    // Associated const values resolve like a const
+                    // item's: in this module, with no locals in scope.
+                    let values: Vec<crate::ast::ExprId> = imp.consts.iter().filter_map(|c| c.default).collect();
+                    for v in values {
+                        self.expr(ast, v, module, &mut vec![Frame::default()]);
+                    }
                     let mut fns = std::mem::take(&mut imp.fns);
                     for f in &mut fns {
                         self.fn_def(ast, f, module);
@@ -4131,6 +4167,10 @@ impl Rewrite<'_> {
                     let const_tys: Vec<crate::ast::TyId> = t.consts.iter().map(|c| c.ty).collect();
                     for ty in const_tys {
                         self.ty(ast, ty, module, &[]);
+                    }
+                    let values: Vec<crate::ast::ExprId> = t.consts.iter().filter_map(|c| c.default).collect();
+                    for v in values {
+                        self.expr(ast, v, module, &mut vec![Frame::default()]);
                     }
                     let mut fns = std::mem::take(&mut t.fns);
                     for f in &mut fns {
@@ -5629,6 +5669,7 @@ mod tests {
             crate_name: name.into(),
             deps: Vec::new(),
             client: Default::default(),
+            std_splice_lo: None,
         };
         let out = [true, false].map(|one_shot| resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(one_shot)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5766,6 +5807,7 @@ mod tests {
             crate_name: crate_name.into(),
             deps: Vec::new(),
             client: Default::default(),
+            std_splice_lo: None,
         };
         // The interner must outlive the tables' Syms only for lookups in
         // the test; leak it (tests are short-lived).
@@ -5796,6 +5838,7 @@ mod tests {
             crate_name: "cachetest".into(),
             deps: Vec::new(),
             client: Default::default(),
+            std_splice_lo: None,
         };
         let mut cache = ResolveCache::new(false);
         let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");
@@ -5865,6 +5908,7 @@ mod tests {
             crate_name: "displaytest".into(),
             deps: Vec::new(),
             client: Default::default(),
+            std_splice_lo: None,
         };
         let r = resolve_crate(&input, interner, known).ok().expect("display test crate resolves");
         let shown = |flat_text: &str| r.tables.display_names.get(&interner.intern(flat_text)).map(|&d| interner.get(d).to_string());
@@ -5902,6 +5946,7 @@ mod tests {
             crate_name: "nestedtest".into(),
             deps: Vec::new(),
             client: Default::default(),
+            std_splice_lo: None,
         };
         let mut cache = ResolveCache::new(false);
         for round in 0..2 {

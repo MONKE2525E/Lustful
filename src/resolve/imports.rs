@@ -226,6 +226,15 @@ pub struct ResolvedTables {
     /// name. None when no file of the session mentions a platform
     /// module, so the crate was not loaded.
     pub std_platform: Option<(ModuleId, Sym)>,
+    /// The hidden std source modules the std splice defined in the
+    /// selected crate's root (src/stdmods.rs, W-STD-C): their names and
+    /// module ids. They are bound nowhere; `std_module_at` walks the
+    /// std paths of their rows into them.
+    pub std_modules: Vec<(Sym, ModuleId)>,
+    /// Where the std splice starts in the selected crate's root file
+    /// (`CrateInput::std_splice_lo`): every byte from here on in file 0
+    /// is shipped std source.
+    pub std_splice_lo: Option<u32>,
 }
 
 /// The std modules whose items can come from the shipped platform
@@ -307,6 +316,8 @@ impl ResolvedTables {
             adapters: Vec::new(),
             std_globs: Vec::new(),
             std_platform: None,
+            std_modules: Vec::new(),
+            std_splice_lo: None,
         }
     }
 
@@ -759,6 +770,13 @@ impl ResolvedTables {
                 e.unsupported.hash(h);
             });
         }
+        for (name, m) in &self.std_modules {
+            fold!(0x48, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(name.0 as u64);
+                h.write_u64(m.0 as u64);
+                h.write_u64(self.std_splice_lo.map_or(u64::MAX, |lo| lo as u64));
+            });
+        }
         for (magic, root) in &self.crate_magic {
             fold!(0x46, |h: &mut crate::intern::FxHasher| {
                 h.write_u64(magic.0 as u64);
@@ -986,6 +1004,19 @@ impl ResolvedTables {
         self.externs.iter().position(|e| e.owner == owner && e.name == name).map(|i| i as u32)
     }
 
+    /// The hidden std source module that segment `seg` names under std
+    /// extern `i` (`std::time`), when the std splice defined one
+    /// (src/stdmods.rs).
+    pub fn std_module_at(&self, i: u32, seg: Sym, interner: &Interner) -> Option<ModuleId> {
+        let e = &self.externs[i as usize];
+        if !e.is_std_lib || self.std_modules.is_empty() {
+            return None;
+        }
+        let seg = interner.get(seg);
+        let row = crate::stdmods::STD_MODULES.iter().find(|m| m.paths.iter().any(|(k, s)| *k == e.name && *s == seg))?;
+        self.std_modules.iter().find(|(n, _)| interner.get(*n) == row.name).map(|(_, m)| *m)
+    }
+
     /// The path target an extern prelude entry resolves to: the
     /// dependency crate's root module when lust compiles it from
     /// source in this session, else the extern root itself.
@@ -1141,6 +1172,14 @@ impl ResolvedTables {
                 {
                     cur = Target::Module(self.std_platform.map(|(root, _)| root).unwrap_or(ModuleId(0)));
                     continue;
+                }
+                // `std::time` and the other std source modules walk into
+                // their hidden module (W-STD-C).
+                Target::Extern(i)
+                    if seg_ns == Namespace::Type
+                        && let Some(m) = self.std_module_at(i, seg, interner) =>
+                {
+                    cur = Target::Module(m);
                 }
                 Target::Def(_) | Target::Extern(_) | Target::Variant(..) => return PathRes::Partial(cur, idx),
             }
@@ -1837,6 +1876,25 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut inserted = false;
                     if let Some(why) = &tables.externs[i as usize].unsupported {
                         diags.push(unsupported_diag(why, imp.span));
+                    } else if mod_path.len() == 1
+                        && let Some(m) = tables.std_module_at(i, last, interner)
+                    {
+                        // `use std::time;`: a std source module binds
+                        // like a local module (W-STD-C).
+                        let bind_name = import_bind_name(*name, Target::Module(m), interner);
+                        let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
+                        let out = tables.insert(
+                            imp.module,
+                            Namespace::Type,
+                            bind_name,
+                            Bind { target: Target::Module(m), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
+                        );
+                        if dup && interner.get(*name) != "_" {
+                            diags.push(dup_diag(imp, *name, interner));
+                        } else {
+                            report_dup(out, imp, *name, interner, diags);
+                        }
+                        inserted = out == InsertOut::Changed;
                     } else if tables.externs[i as usize].is_std_lib {
                         inserted = record_std_alias(tables, imp, path, *name, interner, diags);
                     }
