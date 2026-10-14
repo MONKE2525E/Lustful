@@ -544,13 +544,17 @@ fn parts_operands<'r>(parts: &'r [FmtPart], f: &mut impl FnMut(&'r Operand)) {
 }
 
 /// True if two places may refer to overlapping memory.
-fn overlap(a: &Place, b: &Place) -> bool {
+/// `consts` are the constant index locals (`Ck::const_index`): two
+/// different constant indexes, which only patterns make, name disjoint
+/// elements, as rustc's `ConstantIndex`.
+fn overlap(a: &Place, b: &Place, consts: &std::collections::HashMap<Local, u64>) -> bool {
     if a.local != b.local {
         return false;
     }
     for (x, y) in a.proj.iter().zip(&b.proj) {
         match (x, y) {
             (Proj::Field(i), Proj::Field(j)) if i != j => return false,
+            (Proj::Index(i), Proj::Index(j)) if consts.get(i).is_some_and(|c| consts.get(j).is_some_and(|d| c != d)) => return false,
             _ => {}
         }
     }
@@ -2020,8 +2024,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
             let mutable = loan.mutable && self.reserved != Some(li);
             let conflict = match kind {
-                Access::Read | Access::BorrowShared => mutable && overlap(p, &loan.place),
-                Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place),
+                Access::Read | Access::BorrowShared => mutable && overlap(p, &loan.place, &self.const_index),
+                Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place, &self.const_index),
                 Access::Dead => loan.place.local == p.local && !self.through_ref(&loan.place),
             };
             if !conflict {
