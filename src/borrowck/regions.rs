@@ -2481,6 +2481,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 for (i, o) in ops.iter().enumerate() {
                     self.into_place(o, dest, &[Proj::Field(i as u32)]);
                 }
+                // A `ByNext` wrapper (W-STD-B): its item type is not a
+                // field, so tie it here: the wrapped iterator's regions
+                // outlive the item's.
+                if let Some((crate::ty::iter::IterKind::ByNext, a)) = crate::ty::iter::iter_parts(&self.body.tys, *ty) {
+                    self.place(dest, &mut dv, &mut d);
+                    let own = adt_regions(self.p, &self.body.tys, *ty) as usize;
+                    let n0 = self.sc.slots(a[0]) as usize;
+                    let n1 = self.sc.slots(a[1]) as usize;
+                    if let (Some(src), Some(item)) = (dv.get(own..own + n0), dv.get(own + n0..own + n0 + n1)) {
+                        let (src, item) = (src.to_vec(), item.to_vec());
+                        self.flow_all(&src, &item);
+                    }
+                }
                 if let TyKind::Closure(def, args) = self.body.tys.kind(*ty) {
                     // The closure contract (`closure_roles`): its body may
                     // make any captured source outlive any captured sink.
@@ -4180,8 +4193,22 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 out.push(item);
                 true
             }
-            // The W-STD-B kinds (hash iterators, array::IntoIter, repeat_n,
-            // Windows, CharIndices, ByNext, Flatten, option::IntoIter): the
+            // A user iterator through its `next` (W-STD-B): the item's own
+            // slots, which its construction ties to the iterator's.
+            K::ByNext => {
+                let Some(&a1) = a.get(1) else { return false };
+                let own = adt_regions(self.p, &self.body.tys, t) as usize;
+                let n1 = self.sc.slots(a1) as usize;
+                match vars.get(own + n0..own + n0 + n1) {
+                    Some(v) => {
+                        out.push(v.to_vec());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            // The other W-STD-B kinds (hash iterators, array::IntoIter,
+            // repeat_n, Windows, CharIndices, Flatten, option::IntoIter): the
             // conservative item rule (`item_slots` for the hash forms).
             K::MapIter
             | K::MapIterMut
@@ -4195,7 +4222,6 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::SetIntoIter
             | K::ArrayIntoIter
             | K::RepeatN
-            | K::ByNext
             | K::Windows
             | K::CharIndices
             | K::Flatten

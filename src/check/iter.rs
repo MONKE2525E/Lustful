@@ -132,8 +132,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Some(ERROR);
             }
             let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[base, item]);
-            let i = self.ei(recv);
-            self.out.coerce[i] = Coerce::ByNext(wrapped);
+            // The `&mut self` consumers and `size_hint` borrow the
+            // iterator, which stays (and drops) where Rust has it: the
+            // call takes it by reference, and the expansion wraps the
+            // reference (lower/iter.rs `user_iter`). The rest move it in.
+            if !matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint") {
+                let i = self.ei(recv);
+                self.out.coerce[i] = Coerce::ByNext(wrapped);
+            }
             return Some(self.iter_call(e, recv, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
@@ -567,7 +573,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             _ => return self.iter_unknown(n, span, base, args),
         };
-        let autoref = if by_value { Autoref::None } else { Autoref::RefMut };
+        let autoref = match (by_value, n) {
+            (true, _) => Autoref::None,
+            // `size_hint(&self)`.
+            (false, "size_hint") => Autoref::Ref,
+            (false, _) => Autoref::RefMut,
+        };
         if autoref != Autoref::None {
             self.check_packed_borrow(recv, span);
         }
@@ -1057,6 +1068,8 @@ const ITER_METHODS: &[&str] = &[
 pub struct ByNextFns {
     pub next: LocalDefId,
     pub size_hint: Option<LocalDefId>,
+    /// The impl's `type Item`.
+    pub item: Option<Ty>,
 }
 
 /// `by_next_fns` for a user type `t` (concrete), or why lust cannot
@@ -1083,5 +1096,6 @@ pub fn by_next_fns(p: &Program, t: Ty) -> Result<ByNextFns, &'static str> {
             _ => return Err("its `Iterator` impl defines a provided method"),
         }
     }
-    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint })
+    let item = rec.assoc_tys.iter().find(|(d, _)| *d == lang.assoc_item).map(|&(_, t)| t);
+    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint, item })
 }

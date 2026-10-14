@@ -512,6 +512,7 @@ impl Ex<'_, '_, '_> {
             B::IterSizeHint => {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
+                let (itp, ty) = self.user_iter(itp, ty)?;
                 let (lo, hi) = self.hint(itp, ty)?;
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Copy(Place::local(lo)), Operand::Move(Place::local(hi))]));
             }
@@ -656,6 +657,7 @@ impl Ex<'_, '_, '_> {
             B::IterNth => {
                 let (r, n) = (arg()?, arg()?);
                 let (itp, ty) = self.deref_arg(r)?;
+                let (itp, ty) = self.user_iter(itp, ty)?;
                 let nl = self.local(USIZE);
                 self.assign(Place::local(nl), Rvalue::Use(n));
                 self.nth(itp, ty, nl, dest)?;
@@ -663,6 +665,7 @@ impl Ex<'_, '_, '_> {
             B::IterAny | B::IterAll | B::IterFind | B::IterFindMap | B::IterPosition | B::IterRposition => {
                 let (r, f) = (arg()?, arg()?);
                 let (itp, ty) = self.deref_arg(r)?;
+                let (itp, ty) = self.user_iter(itp, ty)?;
                 let fty = self.op_ty(&f)?;
                 let fl = self.local(fty);
                 self.assign(Place::local(fl), Rvalue::Use(f));
@@ -965,6 +968,35 @@ impl Ex<'_, '_, '_> {
         })
     }
 
+    /// A user iterator (or other non-builtin one) that a borrowing
+    /// consumer reaches through its `&mut` (check/iter.rs passes it as
+    /// is): a `ByNext` wrapper over a reborrow of it, so the expansion
+    /// steps it through its own `next` and `size_hint` and it stays put.
+    /// Builtin iterators come back unchanged.
+    fn user_iter(&mut self, itp: Place, ty: Ty) -> Result<(Place, Ty), String> {
+        if self.kind_args(ty).is_some() || self.body.tys.is_chars_ty(ty) {
+            return Ok((itp, ty));
+        }
+        let fns = crate::check::iter::by_next_fns(self.p, ty)?;
+        let item = fns.item.ok_or("iterator expansion: no `Item` in the impl")?;
+        let held = self.body.tys.mk_ref(true, ty);
+        let w = it::mk_iter(&mut self.body.tys, IterKind::ByNext, &[held, item]);
+        let r = self.ref_to(true, itp, ty);
+        let v = self.local(w);
+        self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![Operand::Move(Place::local(r))]));
+        Ok((Place::local(v), w))
+    }
+
+    /// The iterator a `ByNext` wrapper holds (its first type argument
+    /// `held`, at place `at`): itself, or what the reference it holds
+    /// for a borrowing consumer (`user_iter`) points to.
+    fn by_next_held(&self, held: Ty, at: Place) -> (Ty, Place) {
+        match self.body.tys.kind(held) {
+            TyKind::Ref(_, _, inner) => (inner, at.deref()),
+            _ => (held, at),
+        }
+    }
+
     /// The iterator place and type behind a `&mut I` argument.
     fn deref_arg(&mut self, r: Operand) -> Result<(Place, Ty), String> {
         let rt = self.op_ty(&r)?;
@@ -1262,8 +1294,9 @@ impl Ex<'_, '_, '_> {
             }
             // The wrapped iterator's own `next` (W-STD-B): forward only.
             K::ByNext => {
-                let fns = crate::check::iter::by_next_fns(self.p, a[0])?;
-                let r = self.ref_to(true, f(0), a[0]);
+                let (inner, at) = self.by_next_held(a[0], f(0));
+                let fns = crate::check::iter::by_next_fns(self.p, inner)?;
+                let r = self.ref_to(true, at, inner);
                 self.call(CallTarget::Fn(fns.next), vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
@@ -2825,9 +2858,10 @@ impl Ex<'_, '_, '_> {
             }
             // The wrapped iterator's own `size_hint`, else the trait's
             // default `(0, None)` (W-STD-B).
-            K::ByNext => match crate::check::iter::by_next_fns(self.p, a[0])?.size_hint {
+            K::ByNext => match crate::check::iter::by_next_fns(self.p, self.by_next_held(a[0], f(0)).0)?.size_hint {
                 Some(sh) => {
-                    let r = self.ref_to(false, f(0), a[0]);
+                    let (inner, at) = self.by_next_held(a[0], f(0));
+                    let r = self.ref_to(false, at, inner);
                     let tt = self.tuple_ty(&[USIZE, ou]);
                     let t = self.local(tt);
                     self.call(CallTarget::Fn(sh), vec![Operand::Move(Place::local(r))], Place::local(t));
