@@ -1,6 +1,5 @@
-// expect: L0112
-// A user type named `Cell` makes `Cell::get` its own fn, which rustc calls
-// here; lust takes std fn paths only as `with` callables.
+// A user type named `Cell` makes `Cell::get` its own fn: `with` calls it
+// (fn values as `Fn`), as rustc does. Prints 101.
 use std::cell::Cell as StdCell;
 struct Cell(u8);
 impl Cell {
