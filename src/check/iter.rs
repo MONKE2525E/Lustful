@@ -201,7 +201,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(self.iter_bail(args));
         }
         let arg = args[0];
-        let form = self.drain_range_form(e, arg, name_span)?;
+        let Some(form) = self.drain_range_form(e, arg, name_span) else { return Some(ERROR) };
         self.check_packed_borrow(recv, name_span);
         self.out.drain_ranges.push((e, form));
         let (b, ret) = match elem {
