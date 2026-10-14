@@ -509,7 +509,42 @@ pub fn unify_patterns(tys: &impl TyIntern, map: &mut FxMap<ParamId, Ty>, a: Ty, 
         (TyKind::FnDef(d, x), TyKind::FnDef(e, y)) => d == e && unify_pattern_args(tys, map, x, y),
         (TyKind::Projection(d, x), TyKind::Projection(e, y)) => d == e && unify_pattern_args(tys, map, x, y),
         (TyKind::Opaque(d, x), TyKind::Opaque(e, y)) => d == e && unify_pattern_args(tys, map, x, y),
+        // The object lifetime bound is a region, and regions do not
+        // split impls: `dyn T + 'static` and `dyn T + 'a` are one
+        // type here (rustc E0119 for two impls of them).
+        (TyKind::Dyn(x, _), TyKind::Dyn(y, _)) => unify_dyn_bounds(tys, map, x, y),
         (ka, kb) => ka == kb,
+    }
+}
+
+/// Two dyn bound lists unify when the auto bits match and the
+/// principals are the same trait ref up to pattern unification
+/// (args and bindings; the Self slot is `DYN_SELF`, an error type,
+/// which unifies with anything). The `supertraits` field is a
+/// derived set, so the principal decides it.
+fn unify_dyn_bounds(tys: &impl TyIntern, map: &mut FxMap<ParamId, Ty>, a: BoundsId, b: BoundsId) -> bool {
+    let (a, b) = (tys.dyn_bounds(a), tys.dyn_bounds(b));
+    if a.auto != b.auto {
+        return false;
+    }
+    match (a.principal, b.principal) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            let (x, y) = (x.value, y.value);
+            if x.def != y.def || !unify_pattern_args(tys, map, x.args, y.args) {
+                return false;
+            }
+            let yb: Vec<(DefId, GenericArg)> = tys.bindings(y.bindings).to_vec();
+            tys.bindings(x.bindings).len() == yb.len()
+                && tys.bindings(x.bindings).iter().all(|&(assoc, ga)| {
+                    match (ga, yb.iter().find(|(d, _)| *d == assoc)) {
+                        (GenericArg::Ty(u), Some(&(_, GenericArg::Ty(v)))) => unify_patterns(tys, map, u, v),
+                        (GenericArg::Ty(_), _) => false,
+                        _ => true,
+                    }
+                })
+        }
+        _ => false,
     }
 }
 
@@ -670,6 +705,12 @@ impl ImplIndex {
         by_construction: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
     ) -> bool {
+        // The builtin object impl has no impl record: `dyn T`
+        // implements `T` and every supertrait of `T` by
+        // construction, so such a clause can hold.
+        if self.dyn_object_impl_holds(tys, tr) {
+            return false;
+        }
         for &id in self.impls_of_trait(tr.def) {
             let rec = self.get(id).clone();
             let n = rec.generics.params.len();
@@ -689,6 +730,41 @@ impl ImplIndex {
             }
         }
         true
+    }
+
+    /// True when the goal holds by the builtin object impl: its
+    /// Self type is a dyn type whose principal trait (or a
+    /// supertrait of it, transitively) is the goal trait, with
+    /// arguments that unify as patterns. The principal's Self
+    /// slot is `DYN_SELF`, which unifies with anything.
+    fn dyn_object_impl_holds(&self, tys: &mut impl TyIntern, tr: TraitRef) -> bool {
+        let Some(self_ty) = tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
+        let TyKind::Dyn(b, _) = tys.kind(self_ty) else { return false };
+        let Some(principal) = tys.dyn_bounds(b).principal.map(|p| p.value) else { return false };
+        let mut work: Vec<TraitRef> = vec![principal];
+        let mut seen: Vec<TraitRef> = Vec::new();
+        while let Some(cand) = work.pop() {
+            if seen.contains(&cand) {
+                continue;
+            }
+            seen.push(cand);
+            if cand.def == tr.def {
+                let mut map: FxMap<ParamId, Ty> = FxMap::default();
+                if unify_pattern_args(tys, &mut map, cand.args, tr.args) {
+                    return true;
+                }
+            }
+            for pred in self.supertraits_of(tys, &cand) {
+                // Only predicates on the principal's own Self are
+                // supertraits; bounds on its other params are not.
+                if let Predicate::Trait(s) = pred
+                    && tys.args(s.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| t == DYN_SELF || t == self_ty)
+                {
+                    work.push(s.value);
+                }
+            }
+        }
+        false
     }
 
     /// The orphan-based impossibility test of section 2.6 for one
