@@ -6010,6 +6010,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// The written type args on a builtin `Option`/`Result` constructor
+    /// path (`None::<u8>`, `Option::<u8>::Some`, `Ok::<u8, E>`,
+    /// `Result::<u8, E>::Err`), `n` of them in the type's param order;
+    /// `_` is a fresh variable. None when the path writes no type args;
+    /// a wrong count is rustc's E0107.
+    fn builtin_ctor_args(&mut self, segs: &[ast::PathSeg], n: usize, span: Span) -> Option<Vec<Ty>> {
+        let p = self.p;
+        let written: Vec<ast::TyId> = segs.iter().flat_map(|s| s.type_args()).collect();
+        if written.is_empty() {
+            return None;
+        }
+        if written.len() != n {
+            self.err(
+                "L0107",
+                span,
+                format!("this type takes {n} generic argument(s) but {} were given", written.len()),
+                "Write one type per parameter.",
+            );
+            return Some((0..n).map(|_| ERROR).collect());
+        }
+        Some(
+            written
+                .into_iter()
+                .map(|g| if matches!(p.ast.ty(g), ast::TyExpr::Infer) { self.new_var(false) } else { self.resolve_written(g) })
+                .collect(),
+        )
+    }
+
     /// The const generic param a body path names (`N`): its index in
     /// the template's generics, its declared type, and in an instance
     /// its value from the instance's args (None in the template). None
@@ -6131,7 +6159,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             if name == p.known.None {
                 self.set_res(e, Res::OptNone);
-                let v = self.new_var(false);
+                let v = match self.builtin_ctor_args(segs, 1, span) {
+                    Some(a) => a[0],
+                    None => self.new_var(false),
+                };
                 return self.tys.mk_option(v);
             }
             if let BindingRes::Def(def) = bound
@@ -6297,7 +6328,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
             if r == Res::OptNone {
-                let v = self.new_var(false);
+                let v = match self.builtin_ctor_args(segs, 1, span) {
+                    Some(a) => a[0],
+                    None => self.new_var(false),
+                };
                 return self.tys.mk_option(v);
             }
             if let Res::Variant(a, v) = r {
@@ -7722,6 +7756,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0105", span, "`Some` takes one argument", "Write `Some(value)`.");
                 return ERROR;
             }
+            // Turbofish (`Some::<u8>(..)`, `Option::<u8>::Some(..)`) fixes
+            // the element type; the argument is a coercion site for it.
+            if let Expr::Path(segs) = p.ast.expr(callee)
+                && let Some(a) = self.builtin_ctor_args(segs, 1, span)
+            {
+                self.expect_expr(args[0], a[0]);
+                return self.tys.mk_option(a[0]);
+            }
             // Under an `Option<&dyn Tr>` expectation the argument is a
             // coercion site for `&dyn Tr`, as rustc's expected inputs make it.
             let elem = expected.and_then(|t| self.tys.option_elem(self.resolve(t)));
@@ -7742,14 +7784,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return ERROR;
             }
             // Turbofish on the constructor or on `Result` itself pins
-            // both sides; otherwise the other side is a fresh var.
+            // both sides (`_` is a fresh var); otherwise the other side
+            // is a fresh var.
             let turbo: Vec<Ty> = match p.ast.expr(callee) {
-                Expr::Path(segs) => segs
-                    .iter()
-                    .flat_map(|s| s.type_args())
-                    .filter(|&g| !matches!(p.ast.ty(g), ast::TyExpr::Infer))
-                    .map(|g| self.resolve_written(g))
-                    .collect(),
+                Expr::Path(segs) => self.builtin_ctor_args(segs, 2, span).unwrap_or_default(),
                 _ => Vec::new(),
             };
             // Under a `Result<&dyn Tr, _>` expectation the argument is a
