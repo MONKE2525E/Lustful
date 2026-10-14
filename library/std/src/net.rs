@@ -325,10 +325,7 @@ impl Ipv6Addr {
         let mut need_colon = false;
         while i < 8 {
             if i == best_start {
-                if need_colon {
-                    s.push(':');
-                }
-                s.push(':');
+                s.push_str("::");
                 need_colon = false;
                 i += best_len;
                 if i >= 8 {

@@ -61,5 +61,8 @@ fn read<T: FromStr>(s: &str) -> Option<T> {
 fn main() {
     println!("{:?}", Pair::from_str("12,30"));
     println!("{:?}", Pair::from_str("12"));
-    println!("{:?}", read::<Pair>("7,8").map(|p| p.0 + p.1));
+    match read::<Pair>("7,8") {
+        Some(p) => println!("{:?}", Some(p.0 + p.1)),
+        None => println!("{:?}", None::<i32>),
+    }
 }
