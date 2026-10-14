@@ -17,8 +17,10 @@ fn main() {
     let c = Loud("c");
     mem::forget(a);
     forget(b);
-    std::mem::forget(vec![Loud("in vec")]);
-    core::mem::forget(String::from("leaked"));
+    // Only values with no heap buffer: a forgotten buffer is a real
+    // leak, which the SANITIZE=1 difftest run reports.
+    core::mem::forget(Loud("core path"));
+    std::mem::forget([Loud("x"), Loud("y")]);
     let mut d = Loud("d");
     let old = mem::replace(&mut d, Loud("e"));
     forget(old);
