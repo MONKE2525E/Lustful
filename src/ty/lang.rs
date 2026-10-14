@@ -1244,6 +1244,8 @@ pub fn needs_std_use(name: &str) -> bool {
 pub const STD_LANG_METHODS: &[&str] = &[
     "and",
     "and_then",
+    "as_deref",
+    "as_deref_mut",
     "as_mut",
     "as_ref",
     "cloned",

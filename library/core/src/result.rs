@@ -3,8 +3,8 @@
 // see option.rs in this crate for how the splice works and what is
 // left out of core's forms.
 //
-// Not here yet (a call rejects): as_deref, as_deref_mut, iter,
-// iter_mut, unwrap_unchecked, unwrap_err_unchecked.
+// Not here yet (a call rejects): iter, iter_mut, unwrap_unchecked,
+// unwrap_err_unchecked, and `as_deref` on a user `Deref` type.
 
 impl<T, E> Result<T, E> {
     pub const fn is_ok(&self) -> bool {
@@ -243,6 +243,49 @@ impl<T, E> Result<T, E> {
         match self {
             Ok(t) => t,
             Err(e) => op(e),
+        }
+    }
+}
+
+// `as_deref` and `as_deref_mut` at each std `Deref` type lust knows
+// (see option.rs).
+impl<E> Result<String, E> {
+    pub fn as_deref(&self) -> Result<&str, &E> {
+        match *self {
+            Ok(ref t) => Ok(t.as_str()),
+            Err(ref e) => Err(e),
+        }
+    }
+}
+
+impl<T, E> Result<Vec<T>, E> {
+    pub fn as_deref(&self) -> Result<&[T], &E> {
+        match *self {
+            Ok(ref t) => Ok(t.as_slice()),
+            Err(ref e) => Err(e),
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Result<&mut [T], &mut E> {
+        match *self {
+            Ok(ref mut t) => Ok(t.as_mut_slice()),
+            Err(ref mut e) => Err(e),
+        }
+    }
+}
+
+impl<T, E> Result<Box<T>, E> {
+    pub fn as_deref(&self) -> Result<&T, &E> {
+        match *self {
+            Ok(ref t) => Ok(&**t),
+            Err(ref e) => Err(e),
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Result<&mut T, &mut E> {
+        match *self {
+            Ok(ref mut t) => Ok(&mut **t),
+            Err(ref mut e) => Err(e),
         }
     }
 }

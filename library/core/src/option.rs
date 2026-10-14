@@ -9,7 +9,8 @@
 // `#[track_caller]` sits where core has it.
 //
 // Not here yet (a call rejects): as_pin_ref, as_pin_mut, as_slice,
-// as_mut_slice, unwrap_unchecked, iter, iter_mut.
+// as_mut_slice, unwrap_unchecked, iter, iter_mut, and `as_deref` on a
+// user `Deref` type.
 
 impl<T> Option<T> {
     pub const fn is_some(&self) -> bool {
@@ -272,6 +273,77 @@ impl<T> Option<T> {
         match (self, other) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
+        }
+    }
+}
+
+// `as_deref` and `as_deref_mut`: core has one impl over `T: Deref`;
+// lust has no `Deref` impls for its builtin types yet, so these are
+// that impl at each std `Deref` type lust knows. Same results; a user
+// `Deref` type rejects (no method), and an `Option<_>` whose payload
+// is still open rejects as ambiguous (check's lang enum probe).
+impl Option<String> {
+    pub fn as_deref(&self) -> Option<&str> {
+        match *self {
+            Some(ref t) => Some(t.as_str()),
+            None => None,
+        }
+    }
+}
+
+impl<T> Option<Vec<T>> {
+    pub fn as_deref(&self) -> Option<&[T]> {
+        match *self {
+            Some(ref t) => Some(t.as_slice()),
+            None => None,
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Option<&mut [T]> {
+        match *self {
+            Some(ref mut t) => Some(t.as_mut_slice()),
+            None => None,
+        }
+    }
+}
+
+impl<T> Option<Box<T>> {
+    pub fn as_deref(&self) -> Option<&T> {
+        match *self {
+            Some(ref t) => Some(&**t),
+            None => None,
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Option<&mut T> {
+        match *self {
+            Some(ref mut t) => Some(&mut **t),
+            None => None,
+        }
+    }
+}
+
+impl<T> Option<&T> {
+    pub fn as_deref(&self) -> Option<&T> {
+        match *self {
+            Some(t) => Some(t),
+            None => None,
+        }
+    }
+}
+
+impl<T> Option<&mut T> {
+    pub fn as_deref(&self) -> Option<&T> {
+        match *self {
+            Some(ref t) => Some(&**t),
+            None => None,
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Option<&mut T> {
+        match *self {
+            Some(ref mut t) => Some(&mut **t),
+            None => None,
         }
     }
 }

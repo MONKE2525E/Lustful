@@ -273,12 +273,15 @@ pub(super) fn inherent_template_fits(cx: &mut Ctx, e: ExprId, probe: RcvProbe, n
     let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return 0 };
     let mut n = 0;
     for template in templates {
-        let Some(Some(tmpl)) = p.gx.fn_templates.get(template.0 as usize).cloned() else { continue };
         let snap_vars = cx.snapshot_vars();
         let obl_len = cx.obl_len();
         let sites_len = cx.generic_sites.len();
         let err_len = cx.errs.len();
-        let (params, _, _) = cx.instantiate_template(e, template, &tmpl.generics, &[], name_span);
+        let params = match p.gx.fn_templates.get(template.0 as usize).cloned() {
+            Some(Some(tmpl)) => cx.instantiate_template(e, template, &tmpl.generics, &[], name_span).0,
+            // A non-generic impl's method (`impl Option<String>`).
+            _ => p.fn_info(template).params.clone(),
+        };
         if params.first().is_some_and(|&want| cx.unify(want, probe.recv_ty)) {
             n += 1;
         }
@@ -288,6 +291,34 @@ pub(super) fn inherent_template_fits(cx: &mut Ctx, e: ExprId, probe: RcvProbe, n
         cx.errs.truncate(err_len);
     }
     n
+}
+
+/// Probes the non-generic methods of the lang enums' std impls
+/// (`impl Option<String> { fn as_deref .. }`): `inherent_template_probe`
+/// covers the generic ones.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lang_plain_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
+    let p = cx.p;
+    let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return Probe::Miss };
+    let Some(cands) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
+    for f in cands {
+        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            continue;
+        }
+        let params = p.fn_info(f).params.clone();
+        let ret = p.ret_view(f);
+        let snap = cx.snapshot_vars();
+        let obl_len = cx.obl_len();
+        if params.first().is_none_or(|&want| !cx.unify(want, probe.recv_ty)) {
+            cx.rollback_vars(snap);
+            cx.obl_truncate(obl_len);
+            continue;
+        }
+        cx.set_res(e, Res::Method { f, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
+        cx.check_args(&params[1.min(params.len())..], args, name_span);
+        return Probe::Hit(ret);
+    }
+    Probe::Miss
 }
 
 /// Probes trait methods for one receiver-type probe group (the

@@ -11429,7 +11429,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     return ERROR;
                 }
-                match method::inherent_template_probe(self, e, probe, derefs, name, name_span, args, &explicit) {
+                let hit = match method::inherent_template_probe(self, e, probe, derefs, name, name_span, args, &explicit) {
+                    method::Probe::Miss => method::lang_plain_probe(self, e, probe, derefs, name, name_span, args),
+                    other => other,
+                };
+                match hit {
                     method::Probe::Hit(ret) => {
                         if probe.autoref != Autoref::None {
                             self.check_packed_borrow(recv, name_span);

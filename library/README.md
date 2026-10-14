@@ -130,7 +130,12 @@ included. There is no builtin version left.
   panic reports the caller's location.
 - `const fn` exactly where core 1.99 has it stable; `consteval`
   evaluates the const ones by name.
-- Not here yet (a call rejects): `as_deref`, `as_deref_mut`, `iter`,
+- `as_deref` and `as_deref_mut` are core's `T: Deref` impl written
+  once per std `Deref` type lust has (String, Vec, Box, `&T`, `&mut
+  T`; no `Option<String>::as_deref_mut` yet): lust has no `Deref`
+  impls for its builtin types. A user `Deref` type rejects, and so
+  does an `Option<_>` whose payload is still open (rustc accepts it).
+- Not here yet (a call rejects): `iter`,
   `iter_mut`, `into_iter`, `as_slice`, `as_mut_slice`, `as_pin_ref`,
   `as_pin_mut`, the `unsafe` unchecked unwraps, and path forms
   (`Option::map(x, f)`, `.map(Option::unwrap)`). `?` stays the
