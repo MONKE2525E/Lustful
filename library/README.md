@@ -46,7 +46,9 @@ the upstream features it implements, and its exact-layout types.
 | deps/memchr | Adapter for 2.8.2: byte and substring search in source (deps/memchr/README.md). | W-DEPS |
 | deps/xxhash-rust | Adapter for 0.8.15: `xxh3` over the C core (deps/xxhash-rust/README.md). | W-DEPS |
 | deps/ryu-js | Adapter for 1.0.2: `Buffer::format` for f64 over the runtime JS printer (deps/ryu-js/README.md). | W-DEPS |
-| deps/bumpalo, deps/num-bigint, deps/num-traits | No crate yet (section 3.6). | W-DEPS |
+| deps/num-traits | Adapter for 0.2.19: `ToPrimitive` with the f64 impl (deps/num-traits/README.md). | W-DEPS |
+| deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
+| deps/bumpalo | No crate yet (section 3.6). | W-DEPS |
 
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 

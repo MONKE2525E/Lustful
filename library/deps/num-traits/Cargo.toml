@@ -1,0 +1,15 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package num-traits 0.2.19; release
+# builds use the real crate through Cargo. The driver checks `version`
+# against the resolved package and the metadata against
+# src/resolve/adapters.rs.
+[package]
+name = "num-traits"
+version = "0.2.19"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# `i128` and `std` change no API this adapter has; `libm` is not here.
+features = ["default", "i128", "std"]
