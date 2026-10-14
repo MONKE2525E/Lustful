@@ -434,8 +434,8 @@
   {
    "id": "threads.sync",
    "title": "Threads and synchronization (Arc, Mutex, atomics, mpsc)",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "8",
    "root_cause": "threads-sync",
    "fix_class": "compiler",

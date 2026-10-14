@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `92b8e4b8` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `9cf6a977` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -31,21 +31,21 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `std.rc_refcell` | unsupported | 5 | W-STD-B | 246 | 310285 | 22 | 13949 |
+| 1 | `std.rc_refcell` | partial | 5 | W-STD-B | 246 | 310285 | 22 | 13949 |
 | 2 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 10 | 5514 |
 | 3 | `std.runtime` | unsupported | 5 | W-STD-B | 167 | 216508 | 3 | 798 |
 | 4 | `ext.rustc_hash` | unsupported | 5 | W-DEPS | 139 | 201724 | 1 | 807 |
 | 5 | `traits.impl_trait_arg` | partial | 5 | W-CHECK-G | 96 | 153296 | 3 | 1809 |
 | 6 | `std.lazy_once_lock` | unsupported | 5 | W-STD-B | 63 | 103221 | 1 | 234 |
-| 7 | `threads.sync` | unsupported | 7 | wave C (threads) | 86 | 101671 | 0 | 0 |
-| 8 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 1 | 68 |
-| 9 | `threads.thread_local` | unsupported | 7 | W-TLS | 38 | 75561 | 0 | 0 |
-| 10 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
-| 11 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
-| 12 | `traits.impl_trait_ret` | unsupported | 5 | W-CHECK-G | 20 | 52753 | 0 | 0 |
-| 13 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 0 | 0 |
-| 14 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 1 | 1419 |
-| 15 | `macros.std_unsupported` | partial | 4 | W-CHECK-G | 34 | 33075 | 0 | 0 |
+| 7 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 1 | 68 |
+| 8 | `threads.thread_local` | unsupported | 7 | W-TLS | 38 | 75561 | 0 | 0 |
+| 9 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
+| 10 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
+| 11 | `traits.impl_trait_ret` | unsupported | 5 | W-CHECK-G | 20 | 52753 | 0 | 0 |
+| 12 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 0 | 0 |
+| 13 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 1 | 1419 |
+| 14 | `macros.std_unsupported` | partial | 4 | W-CHECK-G | 34 | 33075 | 0 | 0 |
+| 15 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 0 | 0 |
 
 ## Core CLI curve
 
@@ -53,8 +53,8 @@ files where this feature is the only blocker: land it and those files compile.
 |---|---|---|---|
 | supported today | 91 | 22.4 | 7.2 |
 | milestone 4 | 102 | 25.1 | 8.9 |
-| milestone 5 | 293 | 72.2 | 65.8 |
-| milestone 6 | 296 | 72.9 | 66.7 |
+| milestone 5 | 331 | 81.5 | 73.3 |
+| milestone 6 | 334 | 82.3 | 74.2 |
 | milestone 7 | 400 | 98.5 | 98.0 |
 | milestone 8 | 402 | 99.0 | 99.1 |
 
@@ -62,10 +62,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 230 | 29.8 | 8.7 |
-| milestone 4 | 247 | 32.0 | 10.1 |
-| milestone 5 | 601 | 77.7 | 64.1 |
-| milestone 6 | 605 | 78.3 | 64.8 |
+| supported today | 234 | 30.3 | 9.2 |
+| milestone 4 | 251 | 32.5 | 10.6 |
+| milestone 5 | 673 | 87.1 | 73.9 |
+| milestone 6 | 678 | 87.7 | 74.6 |
 | milestone 7 | 764 | 98.8 | 97.6 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 
