@@ -1109,6 +1109,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | Expr::Float(_)
             | Expr::Bool(_)
             | Expr::Str(_)
+            | Expr::ByteStr(_)
             | Expr::Char(_)
             | Expr::Unit
             | Expr::Path(_)

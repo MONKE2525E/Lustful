@@ -12,7 +12,9 @@
 // The evaluator is generic over a `ConstCx` that answers name and type
 // questions (const items, const fns, struct and variant shapes, layouts),
 // so collect and body checking share it. Step cap: 1,000,000 steps per
-// const item, then the same outside-the-bound error.
+// const item, plus a per-byte allowance for the largest byte blob the
+// item touches (a loop that is linear in its data stays in bound),
+// then the same outside-the-bound error.
 #![allow(dead_code)] // OffsetOf and aggregate statics land with their callers.
 
 use super::FloatTy;
@@ -45,6 +47,13 @@ pub enum ConstValue {
     Variant(u32, Vec<ConstValue>),
     /// A repeated element, from `[value; n]` with a const value.
     Repeat(Box<ConstValue>, u64),
+    /// Byte data as one buffer: a byte string literal, an
+    /// `include_bytes!` blob, or a slice of one. Its type is
+    /// `[u8; N]`, `[u8]`, or (as a slice backing, like an aggregate
+    /// at a slice type) `&[u8]`. One value holds every byte, so a
+    /// loop over a megabyte blob reads bytes in place and never
+    /// clones per element.
+    Bytes(ast::ByteBlob),
     /// A promoted reference to a const value (`&EXPR` in const position).
     Ref(Box<ConstValue>),
     /// A reference to a static item, by index into the program's statics.
@@ -472,7 +481,7 @@ pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
 /// Evaluates one const expression. `expected` is the type the context wants,
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
-    let mut ev = Evaluator { steps: 0, call_depth: 0 };
+    let mut ev = Evaluator { steps: 0, extra_cap: 0, call_depth: 0 };
     let mut env: Env = Vec::new();
     match ev.expr(cx, &mut env, e, expected)? {
         Flow::Val(v) => Ok(v),
@@ -482,19 +491,41 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
 
 struct Evaluator {
     steps: u64,
+    /// Extra steps a byte blob grants: a loop over N bytes needs a
+    /// bounded number of steps per byte, so work that is linear in
+    /// the data it reads stays inside the bound, while a plain
+    /// infinite loop still hits the plain cap. Set from the largest
+    /// blob the evaluation touches (see `note_blob`).
+    extra_cap: u64,
     /// How deep the evaluator is in called const fn bodies. Field
     /// privacy asks run only at depth 0: a called const fn's body is
     /// written in its own module and checked there.
     call_depth: u32,
 }
 
+/// Steps one blob byte grants. A hash loop body (index, xor or
+/// shift, multiply, increment, test) stays well under this.
+const STEPS_PER_BLOB_BYTE: u64 = 96;
+
 impl Evaluator {
     fn step(&mut self, span: Span) -> Result<(), Diag> {
         self.steps += 1;
-        if self.steps > STEP_CAP {
+        if self.steps > STEP_CAP + self.extra_cap {
             return Err(outside(span, "this const item (step limit reached)"));
         }
         Ok(())
+    }
+
+    /// Records a blob value this evaluation touches, raising the
+    /// step cap in proportion to its length.
+    fn note_blob(&mut self, v: &ConstValue) {
+        match v {
+            ConstValue::Bytes(b) => {
+                self.extra_cap = self.extra_cap.max((b.len() as u64).saturating_mul(STEPS_PER_BLOB_BYTE));
+            }
+            ConstValue::Ref(inner) => self.note_blob(inner),
+            _ => {}
+        }
     }
 
     /// Rejects a named field the context calls private to this const
@@ -581,6 +612,18 @@ impl Evaluator {
             Expr::Bool(b) => (ConstValue::Bool(*b), BOOL),
             Expr::Char(c) => (ConstValue::Char(*c), CHAR),
             Expr::Str(i) => (ConstValue::Str(*i), REF_STR),
+            Expr::ByteStr(i) => {
+                // One blob value for the whole literal, at its
+                // `[u8; N]` array type, however large it is.
+                let Some(b) = cx.ast().blobs.get(*i as usize) else {
+                    return Err(outside(span, "this byte string literal"));
+                };
+                let b = b.clone();
+                self.note_blob(&ConstValue::Bytes(b.clone()));
+                let c = cx.tys().intern_const(super::ConstKind::Int(b.len() as u128));
+                let t = cx.tys().intern(TyKind::Array(super::int(IntTy::U8), c));
+                (ConstValue::Bytes(b), t)
+            }
             Expr::Unit => (ConstValue::Unit, UNIT),
             Expr::Path(segs) => return Ok(Flow::Val(self.path_value(cx, env, segs, span, expected)?)),
             Expr::Block(b) => return self.block(cx, env, *b, expected),
@@ -747,7 +790,7 @@ impl Evaluator {
                     (v, t)
                 } else if let Some(et) = expected
                     && matches!(cx.tys_ref().kind(et), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_)))
-                    && matches!(v, ConstValue::Aggregate(_) | ConstValue::Repeat(..))
+                    && matches!(v, ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_))
                 {
                     // `&[1, 2]` at a slice type: the aggregate is the slice
                     // backing; materialization builds the fat value.
@@ -805,6 +848,10 @@ impl Evaluator {
                 }
             }
             Expr::Index { base, index } => {
+                // A range index stays outside: rustc rejects it in
+                // const too (the `Index` trait is not const-stable,
+                // E0658); slice patterns and `split_at` are the const
+                // slicing forms. It falls through to the outside error.
                 // A local base is read in place: cloning a large array
                 // (an `include_bytes!` blob) per element read would make
                 // a loop over it quadratic (W-CHECK-G3).
@@ -830,6 +877,7 @@ impl Evaluator {
                 let got = match v {
                     ConstValue::Aggregate(vals) => vals.into_iter().nth(i),
                     ConstValue::Repeat(v, n) if (i as u64) < n => Some(*v),
+                    ConstValue::Bytes(b) => b.as_slice().get(i).map(|&x| ConstValue::Int(x as i128)),
                     _ => None,
                 };
                 match got {
@@ -967,26 +1015,63 @@ impl Evaluator {
                 return Ok(Flow::Val(self.method_call(cx, env, *recv, *name, args, expected, span)?));
             }
             Expr::If { cond, then, els } => {
-                let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
-                let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
-                if b {
-                    return self.block(cx, env, *then, expected);
-                }
-                match els {
-                    Some(els) => return self.expr(cx, env, *els, expected),
-                    None => (ConstValue::Unit, UNIT),
+                // `if let pat = scrut { .. }`: the bindings live in
+                // the then block only.
+                if let Expr::Let { pat, scrut } = cx.ast().expr(*cond) {
+                    let (pat, scrut) = (*pat, *scrut);
+                    let (sv, st) = self.value(cx, env, scrut, None)?;
+                    let mut binds = Vec::new();
+                    if self.match_pat(cx, env, pat, &sv, st, true, &mut binds)? {
+                        let saved = env.len();
+                        env.extend(binds);
+                        let r = self.block(cx, env, *then, expected);
+                        env.truncate(saved);
+                        return r;
+                    }
+                    match els {
+                        Some(els) => return self.expr(cx, env, *els, expected),
+                        None => (ConstValue::Unit, UNIT),
+                    }
+                } else {
+                    let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
+                    let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
+                    if b {
+                        return self.block(cx, env, *then, expected);
+                    }
+                    match els {
+                        Some(els) => return self.expr(cx, env, *els, expected),
+                        None => (ConstValue::Unit, UNIT),
+                    }
                 }
             }
             Expr::Match { scrut, arms } => return self.match_expr(cx, env, *scrut, arms, expected, span),
             Expr::While { label, cond, body } => {
                 loop {
                     self.step(span)?;
-                    let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
-                    let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
-                    if !b {
+                    // `while let pat = scrut { .. }`: bindings are
+                    // fresh per iteration and live in the body.
+                    let saved = env.len();
+                    let go = if let Expr::Let { pat, scrut } = cx.ast().expr(*cond) {
+                        let (pat, scrut) = (*pat, *scrut);
+                        let (sv, st) = self.value(cx, env, scrut, None)?;
+                        let mut binds = Vec::new();
+                        let m = self.match_pat(cx, env, pat, &sv, st, true, &mut binds)?;
+                        if m {
+                            env.extend(binds);
+                        }
+                        m
+                    } else {
+                        let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
+                        let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
+                        b
+                    };
+                    if !go {
+                        env.truncate(saved);
                         break;
                     }
-                    match self.block(cx, env, *body, Some(UNIT))? {
+                    let flow = self.block(cx, env, *body, Some(UNIT));
+                    env.truncate(saved);
+                    match flow? {
                         Flow::Val(_) => {}
                         Flow::Continue(l) if l.is_none() || l == label.map(|x| x.name) => {}
                         Flow::Break(_, l) if l.is_none() || l == label.map(|x| x.name) => break,
@@ -1048,7 +1133,13 @@ impl Evaluator {
     /// Evaluates to a plain value (any control-flow escape is an error here).
     fn value<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
         match self.expr(cx, env, e, expected)? {
-            Flow::Val(v) => Ok(v),
+            Flow::Val(v) => {
+                // A blob that arrives here (a const item's value, a
+                // call argument) grants its per-byte step allowance
+                // even when no literal was evaluated in this item.
+                self.note_blob(&v.0);
+                Ok(v)
+            }
             _ => Err(outside(cx.ast().expr_span(e), "control flow out of a const expression")),
         }
     }
@@ -1912,6 +2003,25 @@ impl Evaluator {
         }
     }
 
+    /// The `lo..hi` window of a sequence const value (through a
+    /// promoted reference): a blob windows in O(1), an aggregate
+    /// clones only the window. None when the window is out of
+    /// bounds or the value is not a sequence. This backs const
+    /// slicing forms rustc allows (`split_at`); range indexing
+    /// itself is not const-stable in rustc and stays outside.
+    fn sub_seq(&self, v: &ConstValue, lo: usize, hi: usize) -> Option<ConstValue> {
+        if lo > hi || hi > self.seq_len(v)? {
+            return None;
+        }
+        match v {
+            ConstValue::Bytes(b) => b.sub(lo, hi).map(ConstValue::Bytes),
+            ConstValue::Aggregate(vals) => Some(ConstValue::Aggregate(vals[lo..hi].to_vec())),
+            ConstValue::Repeat(x, _) => Some(ConstValue::Repeat(x.clone(), (hi - lo) as u64)),
+            ConstValue::Ref(inner) => self.sub_seq(inner, lo, hi),
+            _ => None,
+        }
+    }
+
     /// The element count of a slice or array const value, through a
     /// promoted reference if the value carries one.
     /// `base[index]` when `base` names a local holding an array, a slice,
@@ -1937,6 +2047,7 @@ impl Evaluator {
         let got = match v {
             ConstValue::Aggregate(vals) => vals.get(i).cloned(),
             ConstValue::Repeat(v, n) if (i as u64) < *n => Some((**v).clone()),
+            ConstValue::Bytes(b) => b.as_slice().get(i).map(|&x| ConstValue::Int(x as i128)),
             ConstValue::Aggregate(_) | ConstValue::Repeat(..) => None,
             _ => return Ok(None),
         };
@@ -1950,6 +2061,7 @@ impl Evaluator {
         match v {
             ConstValue::Aggregate(vals) => Some(vals.len()),
             ConstValue::Repeat(_, n) => Some(*n as usize),
+            ConstValue::Bytes(b) => Some(b.len()),
             ConstValue::Ref(inner) => self.seq_len(inner),
             _ => None,
         }
@@ -1973,6 +2085,7 @@ impl Evaluator {
                 ConstValue::Int(i) => Some(vec![u8::try_from(i).ok()?; *n as usize]),
                 _ => None,
             },
+            ConstValue::Bytes(b) => Some(b.as_slice().to_vec()),
             ConstValue::Ref(inner) => self.seq_bytes(inner),
             _ => None,
         }
@@ -2041,10 +2154,11 @@ impl Evaluator {
                     "is_empty" if no_args(args) => Ok((ConstValue::Bool(bytes.is_empty()), BOOL)),
                     "is_ascii" if no_args(args) => Ok((ConstValue::Bool(bytes.iter().all(|b| b.is_ascii())), BOOL)),
                     "as_bytes" if no_args(args) => {
-                        let vals: Vec<ConstValue> = bytes.iter().map(|&b| ConstValue::Int(b as i128)).collect();
+                        // One blob for the string's bytes, so a hash
+                        // over a large `include_str!` stays linear.
                         let slice = cx.tys().intern(TyKind::Slice(super::int(IntTy::U8)));
                         let t = cx.tys().mk_ref(false, slice);
-                        Ok((ConstValue::Aggregate(vals), t))
+                        Ok((ConstValue::Bytes(ast::ByteBlob::new(bytes.to_vec())), t))
                     }
                     _ => Err(outside_err()),
                 }
@@ -2110,7 +2224,7 @@ impl Evaluator {
                     _ => Err(outside_err()),
                 }
             }
-            ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Ref(_) => {
+            ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_) | ConstValue::Ref(_) => {
                 // A slice or array receiver. The element type comes
                 // from the receiver type, through its reference.
                 let elem = match cx.tys_ref().kind(rt) {
@@ -2136,6 +2250,23 @@ impl Evaluator {
                         Some(bs) => Ok((ConstValue::Bool(bs.iter().all(|b| b.is_ascii())), BOOL)),
                         None => Err(outside_err()),
                     },
+                    // `split_at` is a const fn in core; a mid past
+                    // the end panics there, so it rejects here. A
+                    // blob receiver splits by moving two windows.
+                    "split_at" if args.len() == 1 => {
+                        let len = self.seq_len(&rv).ok_or_else(outside_err)?;
+                        let mid = self.int_arg(cx, env, args[0], USIZE, span)?;
+                        let mid = usize::try_from(mid).map_err(|_| outside_err())?;
+                        let lo_v = self.sub_seq(&rv, 0, mid).ok_or_else(|| outside(span, "this `split_at` (out of bounds)"))?;
+                        let hi_v = self.sub_seq(&rv, mid, len).ok_or_else(outside_err)?;
+                        let sref = {
+                            let s = cx.tys().intern(TyKind::Slice(elem));
+                            cx.tys().mk_ref(false, s)
+                        };
+                        let tt = cx.tys().intern_tys(&[sref, sref]);
+                        let t = cx.tys().intern(TyKind::Tuple(tt));
+                        Ok((ConstValue::Aggregate(vec![lo_v, hi_v]), t))
+                    }
                     _ => Err(outside_err()),
                 }
             }
@@ -2911,6 +3042,72 @@ impl Evaluator {
                 Ok(true)
             }
             Pat::Slice { prefix, middle, suffix } => {
+                // A blob matches in place: fixed elements read single
+                // bytes and the middle is an O(1) sub-window, so the
+                // `[b0, .., tail @ ..]` loop shape stays linear.
+                let blob_of = match v {
+                    ConstValue::Bytes(b) => Some(b.clone()),
+                    ConstValue::Ref(inner) => match &**inner {
+                        ConstValue::Bytes(b) => Some(b.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(b) = &blob_of {
+                    let len = b.len() as u64;
+                    let fixed = (prefix.len() + suffix.len()) as u64;
+                    if if middle.is_some() { len < fixed } else { len != fixed } {
+                        return Ok(false);
+                    }
+                    // Matching a reference scrutinee (`&[u8]`) binds
+                    // elements by reference and the middle as a
+                    // slice reference, as match ergonomics does; an
+                    // owned array binds by value.
+                    let (elem_ty, by_ref) = match cx.tys_ref().kind(t) {
+                        TyKind::Array(e, _) | TyKind::Slice(e) => (e, false),
+                        TyKind::Ref(_, _, inner) => match cx.tys_ref().kind(inner) {
+                            TyKind::Array(e, _) | TyKind::Slice(e) => (e, true),
+                            _ => (ERROR, false),
+                        },
+                        _ => (ERROR, false),
+                    };
+                    let elem = |cx: &mut C, byte: u8| -> TypedValue {
+                        let v = ConstValue::Int(byte as i128);
+                        if by_ref {
+                            let rt = cx.tys().mk_ref(false, elem_ty);
+                            (ConstValue::Ref(Box::new(v)), rt)
+                        } else {
+                            (v, elem_ty)
+                        }
+                    };
+                    for (i, &sub) in prefix.iter().enumerate() {
+                        let (ev, et) = elem(cx, b.as_slice()[i]);
+                        if !self.match_pat(cx, env, sub, &ev, et, _in_match, binds)? {
+                            return Ok(false);
+                        }
+                    }
+                    for (j, &sub) in suffix.iter().enumerate() {
+                        let (ev, et) = elem(cx, b.as_slice()[b.len() - suffix.len() + j]);
+                        if !self.match_pat(cx, env, sub, &ev, et, _in_match, binds)? {
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(mid) = middle {
+                        let mid_blob = b.sub(prefix.len(), b.len() - suffix.len());
+                        let Some(mid_blob) = mid_blob else { return Ok(false) };
+                        let mid_ty = if by_ref {
+                            let s = cx.tys().intern(TyKind::Slice(elem_ty));
+                            cx.tys().mk_ref(false, s)
+                        } else {
+                            let c = cx.tys().intern_const(super::ConstKind::Int(mid_blob.len() as u128));
+                            cx.tys().intern(TyKind::Array(elem_ty, c))
+                        };
+                        if !self.match_pat(cx, env, *mid, &ConstValue::Bytes(mid_blob), mid_ty, _in_match, binds)? {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 let (vals, repeat): (Vec<ConstValue>, Option<(ConstValue, u64)>) = match v {
                     ConstValue::Aggregate(vals) => (vals.clone(), None),
                     ConstValue::Repeat(x, n) => (Vec::new(), Some(((**x).clone(), *n))),
@@ -3222,6 +3419,14 @@ impl Evaluator {
                         *cell = v;
                         Ok(())
                     }
+                    ConstValue::Bytes(b) => {
+                        // Copy on write in the blob keeps other
+                        // holders of the same array value unchanged.
+                        let ConstValue::Int(x) = v else { return Err(outside(span, "this assignment")) };
+                        let byte = u8::try_from(x).map_err(|_| outside(span, "this assignment"))?;
+                        let i = usize::try_from(i).map_err(|_| outside(span, "this assignment (index out of bounds)"))?;
+                        if b.set(i, byte) { Ok(()) } else { Err(outside(span, "this assignment (index out of bounds)")) }
+                    }
                     _ => Err(outside(span, "this assignment")),
                 }
             }
@@ -3311,6 +3516,19 @@ fn values_eq(a: &ConstValue, b: &ConstValue) -> bool {
         (ConstValue::Repeat(x, n), ConstValue::Aggregate(vals)) => vals.len() as u64 == *n && vals.iter().all(|v| values_eq(v, x)),
         (ConstValue::Aggregate(vals), ConstValue::Repeat(x, n)) => vals.len() as u64 == *n && vals.iter().all(|v| values_eq(v, x)),
         (ConstValue::Repeat(x, xn), ConstValue::Repeat(y, yn)) => xn == yn && values_eq(x, y),
+        // A blob compares by its bytes against any sequence form.
+        (ConstValue::Bytes(b), other) | (other, ConstValue::Bytes(b)) => match other {
+            ConstValue::Bytes(o) => b == o,
+            ConstValue::Aggregate(vals) => {
+                vals.len() == b.len()
+                    && vals.iter().zip(b.as_slice()).all(|(v, &x)| matches!(v, ConstValue::Int(i) if *i == x as i128))
+            }
+            ConstValue::Repeat(x, n) => {
+                *n as usize == b.len() && matches!(&**x, ConstValue::Int(i) if b.as_slice().iter().all(|&y| y as i128 == *i))
+            }
+            ConstValue::Ref(inner) => values_eq(&ConstValue::Bytes(b.clone()), inner),
+            _ => false,
+        },
         _ => a == b,
     }
 }

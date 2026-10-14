@@ -829,6 +829,15 @@ impl Walker<'_> {
                     }
                 }
             }
+            Expr::ByteStr(i) => {
+                47u8.hash(h);
+                // The bytes themselves: an include_bytes! file edit
+                // changes them under the same index.
+                match self.ast.blobs.get(*i as usize) {
+                    Some(b) => b.as_slice().hash(h),
+                    None => 0u64.hash(h),
+                }
+            }
         }
     }
 

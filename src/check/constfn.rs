@@ -469,7 +469,7 @@ impl Walk<'_, '_, '_> {
             }
         }
         match ex {
-            Expr::Int(..) | Expr::Bool(_) | Expr::Str(_) | Expr::Char(_) | Expr::Unit | Expr::Float(_) | Expr::Underscore => {}
+            Expr::Int(..) | Expr::Bool(_) | Expr::Str(_) | Expr::ByteStr(_) | Expr::Char(_) | Expr::Unit | Expr::Float(_) | Expr::Underscore => {}
             Expr::Path(_) | Expr::SelfValue | Expr::QPath { .. } => {}
             Expr::Block(b) | Expr::UnsafeBlock(b) => self.block(*b, consumed, depth),
             Expr::LabeledBlock { body, .. } => self.block(*body, consumed, depth),

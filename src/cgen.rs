@@ -607,6 +607,39 @@ fn c_string_lit(bytes: &[u8]) -> String {
     s
 }
 
+/// A byte blob as C string literal text, for one array initializer.
+/// Adjacent literals of at most 256 source bytes each: C joins them
+/// into one literal, and no single literal grows to megabyte size.
+fn c_bytes_lit(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() + bytes.len() / 64 + 2);
+    s.push('"');
+    let mut n = 0usize;
+    for &b in bytes {
+        if n == 256 {
+            s.push_str("\" \"");
+            n = 0;
+        }
+        n += 1;
+        match b {
+            b'"' => s.push_str("\\\""),
+            b'\\' => s.push_str("\\\\"),
+            b'?' => s.push_str("\\077"),
+            0x20..=0x7e => s.push(b as char),
+            _ => {
+                let _ = write!(s, "\\{:03o}", b);
+            }
+        }
+    }
+    s.push('"');
+    s
+}
+
+/// One blob as a C array value: a single generated array struct
+/// whose `v` member takes the whole byte string at once.
+fn bytes_array_lit(p: &Program, t: &CTy, bytes: &[u8]) -> String {
+    if bytes.is_empty() { zero_lit(p, t) } else { format!("(({}){{ .v = {} }})", ctype(t), c_bytes_lit(bytes)) }
+}
+
 /// The generated code for one function, plus the glue it needs.
 #[derive(Default)]
 pub struct FnOut {
@@ -1847,6 +1880,10 @@ impl FnGen<'_, '_, '_> {
                 Const::Str(i) => {
                     let s = &self.p.ast.strings[*i as usize];
                     (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len()), CTy::Ref(Box::new(CTy::Str)))
+                }
+                Const::Bytes(b) => {
+                    let t = CTy::Array(Box::new(CTy::Int(IntTy::U8)), b.len() as u64);
+                    (bytes_array_lit(self.p, &t, b.as_slice()), t)
                 }
                 Const::Unit => ("((lust_Unit){})".into(), CTy::Unit),
             },
@@ -5592,7 +5629,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             format!("(({})&{name})", ctype(t))
         }
         (CV::Ref(inner), CTy::Slice(el)) => {
-            // A slice over a promoted aggregate.
+            // A slice over a promoted aggregate or blob.
             match &**inner {
                 CV::Aggregate(vals) => {
                     let at = CTy::Array(el.clone(), vals.len() as u64);
@@ -5601,6 +5638,14 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                     let name = format!("lust_promoted_{counter}");
                     let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
                     format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
+                }
+                CV::Bytes(b) => {
+                    let at = CTy::Array(el.clone(), b.len() as u64);
+                    let init = const_init(p, inner, &at, pre, counter, slots);
+                    *counter += 1;
+                    let name = format!("lust_promoted_{counter}");
+                    let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+                    format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
                 }
                 _ => zero_lit(p, t),
             }
@@ -5677,6 +5722,18 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
             format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
         }
+        // One C array for the whole blob, at an array type; at a
+        // slice type it is the promoted backing array, as an
+        // aggregate slice backing is above.
+        (CV::Bytes(b), CTy::Array(..)) => bytes_array_lit(p, t, b.as_slice()),
+        (CV::Bytes(b), CTy::Slice(e)) => {
+            let at = CTy::Array(e.clone(), b.len() as u64);
+            let init = const_init(p, v, &at, pre, counter, slots);
+            *counter += 1;
+            let name = format!("lust_promoted_{counter}");
+            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+            format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
+        }
         _ => zero_lit(p, t),
     }
 }
@@ -5702,10 +5759,17 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
     use crate::ty::consteval::ConstValue as CV;
     match (v, t) {
         (CV::Ref(inner), CTy::Slice(el)) => {
-            if let CV::Aggregate(vals) = &**inner {
-                let at = CTy::Array(el.clone(), vals.len() as u64);
-                collect_types(&at, out);
-                collect_promoted(p, inner, &at, out);
+            match &**inner {
+                CV::Aggregate(vals) => {
+                    let at = CTy::Array(el.clone(), vals.len() as u64);
+                    collect_types(&at, out);
+                    collect_promoted(p, inner, &at, out);
+                }
+                CV::Bytes(b) => {
+                    let at = CTy::Array(el.clone(), b.len() as u64);
+                    collect_types(&at, out);
+                }
+                _ => {}
             }
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
@@ -5714,6 +5778,10 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
             for x in vals {
                 collect_promoted(p, x, e, out);
             }
+        }
+        (CV::Bytes(b), CTy::Slice(e)) => {
+            let at = CTy::Array(e.clone(), b.len() as u64);
+            collect_types(&at, out);
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => collect_promoted(p, inner, inner_ct, out),
         (CV::Aggregate(vals), CTy::Tuple(es)) => {

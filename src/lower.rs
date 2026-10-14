@@ -845,6 +845,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Bool(b) => Operand::Const(Const::Bool(*b)),
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
+            Expr::ByteStr(i) => Operand::Const(Const::Bytes(
+                self.p.ast.blobs.get(*i as usize).cloned().unwrap_or_else(|| crate::ast::ByteBlob::new(Vec::new())),
+            )),
             Expr::Unit => Operand::Const(Const::Unit),
             _ if self.is_place_expr(e) => {
                 let p = self.place(e);
@@ -990,7 +993,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             return;
         }
         match p.ast.expr(e) {
-            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => {
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::ByteStr(_) | Expr::Unit => {
                 if let Some(d) = dest {
                     let op = self.operand_raw(e);
                     self.assign(d.clone(), Rvalue::Use(op), span);
@@ -1426,9 +1429,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                 // `&[]` and `&mut []` are promoted to `'static`, as in rustc:
                 // the empty array has no bytes, so a temporary that never
                 // dies serves, and it makes no loan (`Body::promoted`).
-                if let Expr::Array(elems) = p.ast.expr(*expr)
-                    && elems.is_empty()
-                {
+                if match p.ast.expr(*expr) {
+                    Expr::Array(elems) => elems.is_empty(),
+                    Expr::ByteStr(i) => p.ast.blobs.get(*i as usize).is_some_and(|b| b.is_empty()),
+                    _ => false,
+                } {
                     let at = self.ty(*expr);
                     let t = self.new_local(at, true, None);
                     self.assign(Place::local(t), Rvalue::ArrayAgg(at, Vec::new()), span);
@@ -4029,9 +4034,13 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     /// The bytes of a byte string literal pattern, which the parser
-    /// builds as `&[b0, b1, ..]` over `u8` integer literals.
+    /// builds as a reference to one blob node (an empty C string in
+    /// cfg syntax keeps the empty array form).
     fn byte_str_bytes(&self, l: ExprId) -> Option<Vec<u8>> {
         let Expr::Ref { mutable: false, raw: false, expr } = self.p.ast.expr(l) else { return None };
+        if let Expr::ByteStr(i) = self.p.ast.expr(*expr) {
+            return self.p.ast.blobs.get(*i as usize).map(|b| b.as_slice().to_vec());
+        }
         let Expr::Array(elems) = self.p.ast.expr(*expr) else { return None };
         let mut out = Vec::with_capacity(elems.len());
         for &e in elems {
@@ -4800,6 +4809,7 @@ impl<'p, 'a> Lower<'p, 'a> {
             CV::Bool(b) => Operand::Const(Const::Bool(*b)),
             CV::Char(c) => Operand::Const(Const::Char(*c)),
             CV::Str(i) => Operand::Const(Const::Str(*i)),
+            CV::Bytes(b) if matches!(self.kind(ty), TyKind::Array(..)) => Operand::Const(Const::Bytes(b.clone())),
             CV::Unit => Operand::Const(Const::Unit),
             CV::StaticRef(idx) => {
                 let t = self.temp(ty);
@@ -4829,11 +4839,12 @@ impl<'p, 'a> Lower<'p, 'a> {
         // temporary array and a SliceOf, like the coercion path.
         if let TyKind::Ref(_, _, inner) = self.kind(ty)
             && let TyKind::Slice(elem) = self.kind(inner)
-            && matches!(v, CV::Aggregate(_) | CV::Repeat(..))
+            && matches!(v, CV::Aggregate(_) | CV::Repeat(..) | CV::Bytes(_))
         {
             let n = match v {
                 CV::Aggregate(vals) => vals.len() as u128,
                 CV::Repeat(_, n) => *n as u128,
+                CV::Bytes(b) => b.len() as u128,
                 _ => unreachable!(),
             };
             let c = self.body.tys.intern_const(ConstKind::Int(n));

@@ -5558,6 +5558,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Bool(_) => BOOL,
             Expr::Char(_) => CHAR,
             Expr::Str(_) => REF_STR,
+            Expr::ByteStr(i) => {
+                // A byte string's array value: `[u8; N]` over its blob.
+                let n = p.ast.blobs.get(*i as usize).map_or(0, |b| b.len());
+                let c = self.tys.intern_const(ConstKind::Int(n as u128));
+                self.tys.intern(TyKind::Array(int(IntTy::U8), c))
+            }
             Expr::Unit => UNIT,
             Expr::SelfValue => match self.lookup(p.known.self_value, span.ctxt) {
                 Some(l) => {
@@ -7394,7 +7400,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// builds as a reference to a byte array literal.
     fn is_byte_str_lit(&self, e: ExprId) -> bool {
         match self.p.ast.expr(e) {
-            Expr::Ref { mutable: false, raw: false, expr } => matches!(self.p.ast.expr(*expr), Expr::Array(_)),
+            Expr::Ref { mutable: false, raw: false, expr } => matches!(self.p.ast.expr(*expr), Expr::ByteStr(_) | Expr::Array(_)),
             _ => false,
         }
     }

@@ -51,6 +51,9 @@ pub enum Const {
     Char(char),
     /// Index into the AST string table.
     Str(u32),
+    /// A byte array value (`[u8; N]`) as one shared buffer, never
+    /// one operand per byte.
+    Bytes(crate::ast::ByteBlob),
     Unit,
 }
 

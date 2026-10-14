@@ -1192,6 +1192,7 @@ impl<'a> Parser<'a> {
             Expr::Int(..)
             | Expr::Bool(_)
             | Expr::Str(_)
+            | Expr::ByteStr(_)
             | Expr::Char(_)
             | Expr::Unit
             | Expr::SelfValue
@@ -3731,8 +3732,10 @@ impl<'a> Parser<'a> {
     }
 
     /// The `&[u8; N]` expression for a byte string literal token
-    /// (`b".."`, `br".."`, `br#".."#`): a reference to a byte array
-    /// literal, which is its Rust type. C string literals share the
+    /// (`b".."`, `br".."`, `br#".."#`): a reference to one blob node
+    /// holding the bytes, which is its Rust type. The bytes stay one
+    /// buffer, never one element node per byte, so a megabyte
+    /// `include_bytes!` costs one node. C string literals share the
     /// token and stay rejected.
     fn byte_str_expr(&mut self, i: u32, start: Span) -> PResult<Expr> {
         let text = self.ast.strings[(i + self.str_base) as usize].clone();
@@ -3744,9 +3747,9 @@ impl<'a> Parser<'a> {
             return Err(not_yet(C_LIT, start, "C string literals"));
         }
         let Some(bytes) = decode_byte_str(&text) else { return Err(syntax(start, "invalid byte string literal")) };
-        let elems: Vec<ExprId> =
-            bytes.iter().map(|&b| self.push_expr(Expr::Int(b as u128, Some(crate::lexer::IntSuffix::U8)), start)).collect();
-        let arr = self.push_expr(Expr::Array(elems), start);
+        let id = self.ast.blobs.len() as u32;
+        self.ast.blobs.push(crate::ast::ByteBlob::new(bytes));
+        let arr = self.push_expr(Expr::ByteStr(id), start);
         Ok(Expr::Ref { mutable: false, raw: false, expr: arr })
     }
 

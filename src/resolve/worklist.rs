@@ -5710,6 +5710,7 @@ impl KindChildren for Expr {
             Expr::Int(..)
             | Expr::Bool(_)
             | Expr::Str(_)
+            | Expr::ByteStr(_)
             | Expr::Char(_)
             | Expr::Unit
             | Expr::SelfValue

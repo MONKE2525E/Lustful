@@ -37,6 +37,79 @@ pub struct Ast {
     pub ty_spans: Vec<Span>,
     pub blocks: Vec<Block>,
     pub strings: Vec<String>,
+    /// Byte string literal data (`b".."`, `include_bytes!`): one buffer
+    /// per literal, indexed by `Expr::ByteStr`. Large blobs stay one
+    /// buffer end to end, never one node or value per byte.
+    pub blobs: Vec<ByteBlob>,
+}
+
+/// A byte buffer shared by reference, with a window into it. Cloning
+/// and slicing are O(1): a sub-slice keeps the same buffer with a new
+/// window. Writing one byte copies the window only when the buffer
+/// is still shared (copy on write), which matches array value
+/// semantics: two holders of one array value never see each other's
+/// writes.
+#[derive(Clone)]
+pub struct ByteBlob {
+    buf: std::sync::Arc<Vec<u8>>,
+    start: u32,
+    len: u32,
+}
+
+impl ByteBlob {
+    /// A blob over all of `bytes`.
+    pub fn new(bytes: Vec<u8>) -> ByteBlob {
+        let len = bytes.len() as u32;
+        ByteBlob { buf: std::sync::Arc::new(bytes), start: 0, len }
+    }
+
+    /// The bytes in the window.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start as usize..(self.start + self.len) as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The window `lo..hi`, when it is inside this blob.
+    pub fn sub(&self, lo: usize, hi: usize) -> Option<ByteBlob> {
+        if lo > hi || hi > self.len() {
+            return None;
+        }
+        Some(ByteBlob { buf: self.buf.clone(), start: self.start + lo as u32, len: (hi - lo) as u32 })
+    }
+
+    /// Sets one byte, copying the window first when it is shared or
+    /// is not the whole buffer. False when `i` is out of bounds.
+    pub fn set(&mut self, i: usize, b: u8) -> bool {
+        if i >= self.len() {
+            return false;
+        }
+        if self.start != 0 || self.len as usize != self.buf.len() {
+            *self = ByteBlob::new(self.as_slice().to_vec());
+        }
+        std::sync::Arc::make_mut(&mut self.buf)[i] = b;
+        true
+    }
+}
+
+impl PartialEq for ByteBlob {
+    fn eq(&self, other: &ByteBlob) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl Eq for ByteBlob {}
+
+impl std::fmt::Debug for ByteBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.as_slice();
+        write!(f, "ByteBlob(len {}, {:?}..)", s.len(), &s[..s.len().min(8)])
+    }
 }
 
 impl Ast {
@@ -1035,6 +1108,10 @@ pub enum Expr {
         ty: TyId,
         fields: Vec<OffsetField>,
     },
+    /// A byte string literal's array value (`[u8; N]`): an index into
+    /// the AST blob table. The parser wraps it in `Ref`, which is the
+    /// literal's Rust type (`&[u8; N]`).
+    ByteStr(u32),
 }
 
 #[derive(Clone)]
@@ -1109,6 +1186,8 @@ struct Shift {
     t: u32,
     b: u32,
     s: u32,
+    /// Offset of this chunk's byte blobs in the merged `blobs`.
+    bl: u32,
     /// Offset of this chunk's body items in the merged `stmt_items`.
     si: u32,
 }
@@ -1384,7 +1463,7 @@ impl Shift {
 impl Ast {
     /// Merges chunk ASTs in order. Index shifting runs in parallel, one chunk per task.
     pub fn concat(mut chunks: Vec<Ast>) -> Ast {
-        let mut sh = Shift { e: 0, p: 0, t: 0, b: 0, s: 0, si: 0 };
+        let mut sh = Shift { e: 0, p: 0, t: 0, b: 0, s: 0, bl: 0, si: 0 };
         let mut shifts = Vec::with_capacity(chunks.len());
         for c in &chunks {
             shifts.push(sh);
@@ -1394,6 +1473,7 @@ impl Ast {
                 t: sh.t + c.tys.len() as u32,
                 b: sh.b + c.blocks.len() as u32,
                 s: sh.s + c.strings.len() as u32,
+                bl: sh.bl + c.blobs.len() as u32,
                 si: sh.si + c.stmt_items.len() as u32,
             };
         }
@@ -1414,6 +1494,7 @@ impl Ast {
             ty_spans: Vec::with_capacity(sh.t as usize),
             blocks: Vec::with_capacity(sh.b as usize),
             strings: Vec::with_capacity(sh.s as usize),
+            blobs: Vec::with_capacity(sh.bl as usize),
         };
         for mut c in chunks {
             out.inner_attrs.append(&mut c.inner_attrs);
@@ -1427,6 +1508,7 @@ impl Ast {
             out.ty_spans.append(&mut c.ty_spans);
             out.blocks.append(&mut c.blocks);
             out.strings.append(&mut c.strings);
+            out.blobs.append(&mut c.blobs);
         }
         out
     }
@@ -1446,6 +1528,7 @@ impl Ast {
             t: self.tys.len() as u32,
             b: self.blocks.len() as u32,
             s: self.strings.len() as u32,
+            bl: self.blobs.len() as u32,
             si: stmt_base,
         };
         o.shift(sh);
@@ -1457,6 +1540,7 @@ impl Ast {
         self.ty_spans.append(&mut o.ty_spans);
         self.blocks.append(&mut o.blocks);
         self.strings.append(&mut o.strings);
+        self.blobs.append(&mut o.blobs);
         (o.items, o.stmt_items, o.inner_attrs)
     }
 
@@ -1471,6 +1555,7 @@ impl Ast {
             match e {
                 Expr::Int(..) | Expr::Bool(_) | Expr::Char(_) | Expr::Unit | Expr::SelfValue | Expr::Continue(_) | Expr::Underscore => {}
                 Expr::Str(i) | Expr::Float(i) => *i += sh.s,
+                Expr::ByteStr(i) => *i += sh.bl,
                 Expr::Path(segs) => sh.path(segs),
                 Expr::Block(b)
                 | Expr::Loop { body: b, .. }
