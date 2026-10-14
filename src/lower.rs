@@ -93,6 +93,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         reads,
         lower_errs: Vec::new(),
         annotations: Vec::new(),
+        promoted: Vec::new(),
     };
     let mut lw = Lower {
         p,
@@ -1255,6 +1256,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Expr::Ref { mutable, expr, .. } => {
+                // `&[]` and `&mut []` are promoted to `'static`, as in rustc:
+                // the empty array has no bytes, so a temporary that never
+                // dies serves, and it makes no loan (`Body::promoted`).
+                if let Expr::Array(elems) = p.ast.expr(*expr)
+                    && elems.is_empty()
+                {
+                    let at = self.ty(*expr);
+                    let t = self.new_local(at, true, None);
+                    self.assign(Place::local(t), Rvalue::ArrayAgg(at, Vec::new()), span);
+                    self.body.promoted.push(t);
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::Ref(*mutable, Place::local(t)), span);
+                    }
+                    return;
+                }
                 if let Res::Static(idx) = self.ck.res(*expr) {
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::StaticRef(idx), span);

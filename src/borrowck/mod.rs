@@ -617,6 +617,8 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     StmtKind::Assign(_, Rvalue::Subslice { base, mutable, .. }) => Some((*mutable, base)),
                     _ => None,
                 };
+                // A promoted temporary (`&[]`) is `'static`: no loan.
+                let loan_src = loan_src.filter(|(_, place)| !self.body.promoted.contains(&place.local));
                 if let (StmtKind::Assign(dest, _), Some((m, place))) = (&s.kind, loan_src) {
                     self.loan_block.push(bi as u32);
                     self.loan_stmt.push(si as u32);
