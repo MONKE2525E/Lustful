@@ -809,6 +809,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
             }
             Coerce::Unsize(target) => self.unsize(op, ty, target, span),
+            Coerce::ReifyFn(target) => self.reify_fn(op, ty, target, span),
             // Through user `Deref` impls: the coerced reference's place,
             // then each impl's `deref` (or `deref_mut`).
             Coerce::UserDeref(target) => {
@@ -845,7 +846,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match self.ck.coerce(e) {
             Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
-            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) => t,
+            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) => t,
             // A receiver-only coercion: `operand` leaves the value as is.
             Coerce::CowRecv(..) => ty,
             Coerce::ByNext(w) => w,
@@ -872,6 +873,22 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.ref_ty(m, slice)
             }
         }
+    }
+
+    /// Lowers a fn item value to the fn pointer `target`: the
+    /// zero-sized operand is read (for its side effects), then the slot
+    /// trampoline of the item `found` names (its mono instance for a
+    /// generic fn) is the value.
+    fn reify_fn(&mut self, op: Operand, found: Ty, target: Ty, span: Span) -> Operand {
+        let zst = self.temp(found);
+        self.assign(Place::local(zst), Rvalue::Use(op), span);
+        let TyKind::FnDef(def, args) = self.kind(found) else { unreachable!("ReifyFn on a non fn item type") };
+        let f = self.p.local_def(def.hash).expect("ReifyFn names a local fn");
+        let args = self.body.tys.args(args).to_vec();
+        let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &args).unwrap_or(f) };
+        let t = self.temp(target);
+        self.assign(Place::local(t), Rvalue::FnValue(f, target), span);
+        Operand::Copy(Place::local(t))
     }
 
     /// Lowers an unsizing coercion (ARCH 2.8) of the reference `op` (of

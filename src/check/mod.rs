@@ -900,6 +900,11 @@ pub enum Coerce {
     /// (the payload's type, W-STD-B check/iter.rs): adapters over a
     /// user iterator call its `next`.
     ByNext(Ty),
+    /// A value of a fn item type that is not a plain path to the fn (a
+    /// local, a field, an index, a call result) to a fn pointer: the
+    /// zero-sized value is evaluated, then the trampoline of the item
+    /// its type names is the result. The payload is the fn pointer type.
+    ReifyFn(Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4406,12 +4411,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // A plain fn item coerces to a function pointer with the
             // same signature (the value materializes as its trampoline).
             (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(found) && self.fn_item_ptr_unifies(found, expected) => {
-                // The expression now has the pointer type, so lowering
-                // materializes the trampoline value for it.
-                if let Some(e) = e {
-                    self.set(e, expected);
+                // A path to the fn gets the pointer type, so lowering
+                // materializes the trampoline value for it. Any other
+                // expression keeps its zero-sized item type, and the
+                // coercion builds the trampoline from that type.
+                match e {
+                    Some(e)
+                        if !matches!(self.p.ast.expr(e), Expr::Path(_) | Expr::QPath { .. })
+                            || !matches!(self.out.expr_res[self.ei(e)], Res::Fn(_)) =>
+                    {
+                        Coerce::ReifyFn(expected)
+                    }
+                    Some(e) => {
+                        self.set(e, expected);
+                        Coerce::None
+                    }
+                    None => Coerce::None,
                 }
-                Coerce::None
             }
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
@@ -17033,6 +17049,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Coerce::CowDeref(n, t) => self.out.coerce[i] = Coerce::CowDeref(n, self.zonk(t)),
                 Coerce::CowRecv(n, t) => self.out.coerce[i] = Coerce::CowRecv(n, self.zonk(t)),
                 Coerce::ByNext(t) => self.out.coerce[i] = Coerce::ByNext(self.zonk(t)),
+                Coerce::ReifyFn(t) => self.out.coerce[i] = Coerce::ReifyFn(self.zonk(t)),
                 _ => {}
             }
         }
