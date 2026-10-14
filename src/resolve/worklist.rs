@@ -2706,6 +2706,7 @@ fn resolve_one(
     for w in works.iter() {
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
         check_vis_restrictions(&w.ast.items, w.module, interner, tables, &mut inner_diags);
+        check_stmt_vis_restrictions(&w.ast, w.module, interner, tables, &mut inner_diags);
     }
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, needs_std });
@@ -3988,6 +3989,61 @@ fn check_vis_restrictions(items: &[Item], module: ModuleId, interner: &Interner,
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Reports bad restricted visibilities on items inside function
+/// bodies (`Ast::stmt_items`), like `check_vis_restrictions` does for
+/// module items: a `pub(super)` or `pub(in ..)` there names modules
+/// from the enclosing fn's module (rustc E0433 for one that names
+/// none). The enclosing module is the smallest item span that holds
+/// the body item, else the file's module.
+fn check_stmt_vis_restrictions(ast: &Ast, module: ModuleId, interner: &Interner, tables: &ResolvedTables, diags: &mut Vec<Diag>) {
+    if ast.stmt_items.is_empty() {
+        return;
+    }
+    fn item_spans(items: &[Item], module: ModuleId, tables: &ResolvedTables, out: &mut Vec<(Span, ModuleId)>) {
+        for item in items {
+            out.push((item.span, module));
+            if let ItemKind::Mod(m) = &item.kind
+                && let Some(body) = &m.body
+            {
+                let mut full = tables.modules[module.0 as usize].path.clone();
+                full.push(m.name);
+                if let Some(child) = tables.module_by_path_in(tables.root_of(module), &full) {
+                    item_spans(body, child, tables, out);
+                }
+            }
+        }
+    }
+    let mut spans: Vec<(Span, ModuleId)> = Vec::new();
+    item_spans(&ast.items, module, tables, &mut spans);
+    for item in &ast.stmt_items {
+        let m = spans
+            .iter()
+            .filter(|(s, _)| s.file == item.span.file && s.lo <= item.span.lo && item.span.hi <= s.hi)
+            .min_by_key(|(s, _)| s.hi - s.lo)
+            .map_or(module, |(_, m)| *m);
+        let check = |v: &Vis, diags: &mut Vec<Diag>| {
+            if let Vis::Restricted { span, .. } = v
+                && !tables.restriction_ok(&vis_from_ast(v, interner), m, interner)
+            {
+                diags.push(Diag::new(
+                    "L0511",
+                    *span,
+                    "this visibility names no enclosing module",
+                    "Write `pub(crate)`, or `pub(in path)` with a path from `crate`, `self`, or `super` to an enclosing module.",
+                ));
+            }
+        };
+        check(&item.vis, diags);
+        if let ItemKind::Struct(s) = &item.kind
+            && let VariantFields::Tuple(fs) | VariantFields::Struct(fs) = &s.fields
+        {
+            for f in fs {
+                check(&f.vis, diags);
+            }
         }
     }
 }
