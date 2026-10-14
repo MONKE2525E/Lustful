@@ -253,10 +253,16 @@ pub(super) fn inherent_template_probe(
 ) -> Probe {
     let p = cx.p;
     let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return Probe::Miss };
-    p.inherent_reads(&mut cx.out.reads, adt_def, name);
     let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
-    for template in templates {
-        let Some(Some(tmpl)) = p.gx.fn_templates.get(template.0 as usize).cloned() else { continue };
+    let templates: Vec<(LocalDefId, crate::check::generics::FnTemplate)> = templates
+        .into_iter()
+        .filter_map(|t| p.gx.fn_templates.get(t.0 as usize).cloned().flatten().map(|tmpl| (t, tmpl)))
+        .collect();
+    if templates.is_empty() {
+        return Probe::Miss;
+    }
+    p.inherent_reads(&mut cx.out.reads, adt_def, name);
+    for (template, tmpl) in templates {
         if let Some(ret) = confirm_method(cx, e, template, &tmpl.generics.clone(), &[], explicit, probe, derefs, args, name_span) {
             return Probe::Hit(ret);
         }
