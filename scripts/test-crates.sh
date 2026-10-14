@@ -189,8 +189,8 @@ for dir in "$fixtures"/*/; do
       continue
     fi
     timeout 30 "$case_dir/san.bin" "${prog_args[@]}" >"$case_dir/san.run.out" 2>"$case_dir/san.run.err"; ss=$?
-    if grep -q "runtime error\|Sanitizer" "$case_dir/san.run.err"; then
-      report bad "$name" "sanitizer: $(grep -m2 'runtime error\|Sanitizer' "$case_dir/san.run.err")"
+    if grep -qE "[0-9]: runtime error|Sanitizer" "$case_dir/san.run.err"; then
+      report bad "$name" "sanitizer: $(grep -m2 -E '[0-9]: runtime error|Sanitizer' "$case_dir/san.run.err")"
       continue
     fi
     if [ $ss -ne $cs ] || ! cmp -s "$case_dir/cargo.run.out" "$case_dir/san.run.out"; then
