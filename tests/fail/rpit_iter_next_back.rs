@@ -1,5 +1,6 @@
-// expect: L0104
-// rustc E0599: `next_back` is not a method of an `impl Iterator` value.
+// expect: L0612
+// rustc E0599: `next_back` needs DoubleEndedIterator, which an `impl
+// Iterator` value does not have.
 fn evens() -> impl Iterator<Item = u32> {
     vec![2u32, 4].into_iter()
 }

@@ -6270,9 +6270,11 @@ pub fn add_synthetic_impls(p: &mut Program) {
         };
         insert_synthetic(p, &mut ordinal, lang.into, p0, &[p1], g2, Vec::new(), Synthetic::Lang, false, span);
     }
-    // std's `From` impls between builtin types (W-STD-B, check/convert.rs
-    // `std_from`, which also answers the array forms by structure):
-    // selection and coherence only; calls are `Builtin::ConvInto`.
+    // The rest of std's `From` impls between builtin types (W-STD-B,
+    // check/convert.rs `std_from`, which also answers the array forms by
+    // structure; the block above has String from &str, &String, and
+    // char, and Box<T> and Rc<T> from T): selection and coherence only;
+    // calls are `Builtin::ConvInto`.
     {
         let ref_str = p.tys.mk_ref(false, STR);
         let mut_str = p.tys.mk_ref(true, STR);
@@ -6288,15 +6290,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let box_slice = p.tys.mk_boxed(slice_p0);
         let mut cloned = one.clone();
         cloned.predicates = pred_on_p0(p, lang.clone);
-        for (dst, src) in [
-            (STRING, ref_str),
-            (STRING, mut_str),
-            (STRING, ref_string),
-            (STRING, CHAR),
-            (STRING, cow_str),
-            (bytes, STRING),
-            (bytes, ref_str),
-        ] {
+        for (dst, src) in [(STRING, mut_str), (STRING, cow_str), (bytes, STRING), (bytes, ref_str)] {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         for (dst, src) in [(cow_str, ref_str), (cow_str, STRING), (cow_str, ref_string)] {
@@ -6313,9 +6307,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], cloned.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         let opt_p0 = p.tys.mk_option(p0);
-        let box_p0 = p.tys.mk_boxed(p0);
-        let rc_p0 = p.tys.mk_rc(p0);
-        for (dst, src) in [(vec_p0, box_slice), (box_slice, vec_p0), (opt_p0, p0), (box_p0, p0), (rc_p0, p0)] {
+        for (dst, src) in [(vec_p0, box_slice), (box_slice, vec_p0), (opt_p0, p0)] {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
     }
