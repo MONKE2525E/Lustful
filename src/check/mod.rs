@@ -15496,7 +15496,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The same for a const argument in an expression that is no
         // local (`S;` for a unit struct with a const param, rustc E0284):
         // codegen has no value for it.
+        // Only a body that made a const variable can keep one.
         if self.errs.is_empty()
+            && self.next_const_id > generics::INFER_MARKER_BASE
             && let Some(i) = (0..self.out.expr_ty.len()).find(|&i| self.has_unbound_const(self.out.expr_ty[i]))
         {
             let span = self.span(ExprId(self.out.expr_base + i as u32));
