@@ -592,6 +592,41 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             S::Channel | S::SyncChannel => unreachable!("channel calls go through channel_new"),
+            // An mpsc iterator: a one-field tuple of the receiver (or a
+            // reference to it).
+            S::RecvMakeIter(u) => {
+                let el = match deref_cty(&tys[0]) {
+                    CTy::Sync(_, e) => *e,
+                    other => unreachable!("a Receiver operand, found {other:?}"),
+                };
+                let rx = CTy::Sync(SyncTy::Receiver, Box::new(el));
+                let field = if u == 2 { rx } else { CTy::Ref(Box::new(rx)) };
+                let it = CTy::Tuple(vec![field]);
+                collect_types(&it, &mut self.sig_types);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t}; {t}.f0 = {};", ctype(&it), vals[0]);
+                t
+            }
+            S::RecvNext(block) => {
+                let el = match deref_cty(&tys[0]) {
+                    CTy::Sync(_, e) => *e,
+                    other => unreachable!("a Receiver operand, found {other:?}"),
+                };
+                let opt = CTy::Option(Box::new(el));
+                collect_types(&opt, &mut self.sig_types);
+                let t = self.tmp();
+                let f = variant_field(self.p, &opt, &t, 1, 0);
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; if (lust_chan_recv(*{}, &{f}, {}) == 0) {{ {} }} else {{ {} }}",
+                    ctype(&opt),
+                    vals[0],
+                    u8::from(block),
+                    disc_set(self.p, &opt, &t, 1),
+                    disc_set(self.p, &opt, &t, 0)
+                );
+                t
+            }
             S::DurNew => format!("lust_dur_new({}, {}, {loc})", vals[0], vals[1]),
             S::DurFrom(u) => {
                 let per = [1u64, 1_000, 1_000_000, 1_000_000_000][u as usize & 3];

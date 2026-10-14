@@ -603,6 +603,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
             K::Enumerate | K::Take | K::Skip | K::Zip | K::StepBy => false,
             K::TakeWhile | K::SkipWhile => false,
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
         }
     }
 

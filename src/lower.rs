@@ -3146,6 +3146,16 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     // ---------- Loops ----------
 
+    /// For an mpsc `Receiver<T>` (true) or `&Receiver<T>` (false): the
+    /// element type `T`.
+    fn recv_iterable(&self, t: Ty) -> Option<(bool, Ty)> {
+        let (owned, r) = match self.kind(t) {
+            TyKind::Ref(_, m, inner) if !m.is_mut() => (false, inner),
+            _ => (true, t),
+        };
+        (crate::ty::sync::sync_kind(&self.body.tys, r) == Some(crate::ty::sync::SyncTy::Receiver)).then(|| self.body.tys.adt_first_ty_arg(r)).flatten().map(|e| (owned, e))
+    }
+
     fn for_loop(
         &mut self,
         for_e: ExprId,
@@ -3252,11 +3262,27 @@ impl<'p, 'a> Lower<'p, 'a> {
             self.cur = bodyb;
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             self.assign(Place::local(item), Rvalue::Use(Operand::Copy(c)), span);
-        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter)) || self.body.tys.boxed_slice_elem(self.ty(iter)).is_some() {
+        } else if crate::ty::iter::is_iter(&self.body.tys, self.ty(iter))
+            || self.body.tys.boxed_slice_elem(self.ty(iter)).is_some()
+            || self.recv_iterable(self.ty(iter)).is_some()
+        {
             // `for x in it` over a builtin iterator (ty/iter.rs): call
             // `next` until it returns None, like the Chars arm. A boxed
             // slice by value iterates its `vec::IntoIter` (Rust 2024).
+            let recv = self.recv_iterable(self.ty(iter));
             let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
+                // An mpsc receiver (W-THREADS): `for x in rx` iterates
+                // its `IntoIter`, `for x in &rx` its `Iter`.
+                _ if let Some((owned, el)) = recv => {
+                    let src = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(src)));
+                    let k = if owned { crate::ty::iter::IterKind::RecvIntoIter } else { crate::ty::iter::IterKind::RecvIter };
+                    let it_ty = crate::ty::iter::mk_iter(&mut self.body.tys, k, &[el]);
+                    let it = self.temp(it_ty);
+                    let op = crate::check::sync::SyncOp::RecvMakeIter(if owned { 2 } else { 0 });
+                    self.call_into(CallTarget::Builtin(Builtin::Sync(op)), vec![Operand::Move(Place::local(src))], Place::local(it), span);
+                    (it_ty, it)
+                }
                 Some(el) => {
                     let bx = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(bx)));

@@ -4798,7 +4798,7 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         // `vec::IntoIter` owns its buffer. Other kinds drop what their
         // args hold (an over-count for the `Map` item arg is harmless:
         // the drop glue only drops stored fields).
-        return k == crate::ty::iter::IterKind::VecIntoIter || a.iter().any(|&e| needs_drop(p, tys, e));
+        return matches!(k, crate::ty::iter::IterKind::VecIntoIter | crate::ty::iter::IterKind::RecvIntoIter) || a.iter().any(|&e| needs_drop(p, tys, e));
     }
     match tys.local_adt(t) {
         Some(a) => {

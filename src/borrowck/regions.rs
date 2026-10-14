@@ -474,6 +474,11 @@ impl AdtTables {
     fn arg_modes(&self, p: &Program, def: DefId, j: usize) -> (Variance, DropMode) {
         use crate::ty::iter::IterKind;
         match p.tys.builtins().kind_of(def) {
+            // `mpsc::Iter<'a, T>` holds `&'a Receiver<T>` (invariant in
+            // `T`); `mpsc::IntoIter<T>` owns the receiver, whose `Drop`
+            // reads `T` (W-THREADS).
+            Some(BuiltinTy::Iter(IterKind::RecvIter | IterKind::RecvTryIter)) => return (Variance::Inv, DropMode::None),
+            Some(BuiltinTy::Iter(IterKind::RecvIntoIter)) => return (Variance::Inv, DropMode::All),
             // `slice::IterMut<'a, T>` holds `&'a mut [T]`: invariant in `T`.
             Some(BuiltinTy::Iter(IterKind::SliceIterMut)) => return (Variance::Inv, DropMode::None),
             Some(BuiltinTy::Iter(IterKind::SliceIter)) => return (Variance::Co, DropMode::None),
@@ -539,7 +544,10 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     use crate::ty::iter::IterKind;
     match tys.builtin_of(t) {
         Some(
-            BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut) | BuiltinTy::RefGuard | BuiltinTy::RefMutGuard,
+            BuiltinTy::Chars
+            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter)
+            | BuiltinTy::RefGuard
+            | BuiltinTy::RefMutGuard,
         ) => return 1,
         // A Debug builder holds `&mut Formatter` (W-STD-B).
         Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
@@ -572,6 +580,7 @@ fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Adt(_, args) => {
             tys.guard_elem(t).is_some()
                 || matches!(crate::ty::sync::sync_kind(tys, t), Some(S::Sender | S::SyncSender | S::Receiver | S::JoinHandle | S::ScopedJoinHandle))
+                || tys.builtin_of(t) == Some(BuiltinTy::Iter(crate::ty::iter::IterKind::RecvIntoIter))
                 || (!matches!(tys.builtin_of(t), Some(BuiltinTy::Weak | BuiltinTy::Sync(crate::ty::sync::SyncTy::ArcWeak)))
                     && tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| drops_guard(tys, e))))
         }
@@ -3682,7 +3691,16 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 out.push(vars.to_vec());
                 true
             }
-            K::VecIntoIter | K::Range | K::RangeInclusive => match vars.get(..n0) {
+            // `mpsc::Iter<'a, T>` holds `&'a Receiver<T>`: its own region,
+            // then `T`'s slots; `IntoIter<T>` holds the receiver.
+            K::RecvIter | K::RecvTryIter => match vars.get(1..1 + n0) {
+                Some(v) => {
+                    out.push(v.to_vec());
+                    true
+                }
+                None => false,
+            },
+            K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIntoIter => match vars.get(..n0) {
                 Some(v) => {
                     out.push(v.to_vec());
                     true
@@ -5204,6 +5222,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
                     | crate::check::sync::SyncOp::OnceGetMut
                     | crate::check::sync::SyncOp::OnceTake
                     | crate::check::sync::SyncOp::TryLock(_)
+                    | crate::check::sync::SyncOp::RecvMakeIter(0 | 1)
             )
     )
 }

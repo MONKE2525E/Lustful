@@ -584,6 +584,19 @@ impl Ex<'_, '_, '_> {
         let (k, a) = self.kind_args(ty).ok_or("iterator expansion: not an iterator")?;
         let f = |i: u32| itp.project(Proj::Field(i));
         match k {
+            // The mpsc iterators (W-THREADS): `recv` (or `try_recv` for
+            // `TryIter`) through the receiver, `None` once it fails.
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => {
+                let rt = crate::ty::sync::sync_ty(&mut self.body.tys, crate::ty::sync::SyncTy::Receiver, &[a[0]]);
+                let r = if k == K::RecvIntoIter {
+                    Operand::Move(Place::local(self.ref_to(false, f(0), rt)))
+                } else {
+                    Operand::Copy(f(0))
+                };
+                let b = Builtin::Sync(crate::check::sync::SyncOp::RecvNext(k != K::RecvTryIter));
+                self.call_builtin(b, vec![r], dest);
+                self.goto(join);
+            }
             K::SliceIter | K::SliceIterMut => {
                 let m = k == K::SliceIterMut;
                 let sd = f(0).deref();
@@ -2103,6 +2116,11 @@ impl Ex<'_, '_, '_> {
         let (k, a) = self.kind_args(ty).ok_or("iterator expansion: size_hint of a non-iterator")?;
         let f = |i: u32| itp.project(Proj::Field(i));
         match k {
+            // std's default `(0, None)`.
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => {
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                self.none(&Place::local(hi), ou);
+            }
             K::SliceIter | K::SliceIterMut | K::Range | K::Zip if k != K::Zip || (self.tra(a[0]) && self.tra(a[1])) => {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
@@ -2364,6 +2382,7 @@ impl Ex<'_, '_, '_> {
             K::Chain | K::Zip => self.trusted_len(a[0]) && self.trusted_len(a[1]),
             K::Skip | K::StepBy => self.tra(a[0]),
             K::Filter | K::FilterMap | K::TakeWhile | K::SkipWhile | K::Inspect => false,
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
         }
     }
 

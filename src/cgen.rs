@@ -210,6 +210,10 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
             Field::SliceRef(i, _) => CTy::Slice(Box::new(cty(tys, arg(i)))),
             Field::VecArg(i) => CTy::Vec(Box::new(cty(tys, arg(i)))),
             Field::PeekSlot(i) => CTy::Option(Box::new(CTy::Option(Box::new(iter_item_cty(tys, arg(i)))))),
+            Field::Recv(i, owned) => {
+                let r = CTy::Sync(crate::ty::sync::SyncTy::Receiver, Box::new(cty(tys, arg(i))));
+                if owned { r } else { CTy::Ref(Box::new(r)) }
+            }
         })
         .collect();
     CTy::Tuple(fields)

@@ -11932,6 +11932,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 match elem {
                     Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),
+                    None if self.recv_elem(t).is_some() => self.recv_elem(t).unwrap_or(ERROR),
                     None => {
                         let s = self.span(iter);
                         let tn = self.tn(t);
@@ -11942,6 +11943,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             TyKind::Array(elem, _) => elem,
             _ if self.tys.vec_elem(self.resolve(t)).is_some() => self.tys.vec_elem(self.resolve(t)).unwrap_or(ERROR),
+            // `for x in rx` and `for x in &rx` over an mpsc receiver
+            // (W-THREADS): `recv` until every sender is gone.
+            _ if self.recv_elem(t).is_some() => self.recv_elem(t).unwrap_or(ERROR),
             // A boxed slice by value (Rust 2024): its `vec::IntoIter`.
             _ if self.tys.boxed_slice_elem(self.resolve(t)).is_some() => self.tys.boxed_slice_elem(self.resolve(t)).unwrap_or(ERROR),
             TyKind::Error => ERROR,

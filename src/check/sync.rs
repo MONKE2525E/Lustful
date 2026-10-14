@@ -147,11 +147,17 @@ pub enum SyncOp {
     ThreadSleep,
     /// `Mutex::try_lock`, `RwLock::try_read` (false), `try_write` (true).
     TryLock(bool),
+    /// `rx.iter()` (0), `rx.try_iter()` (1), `rx.into_iter()` (2), and
+    /// the `for x in &rx` / `for x in rx` conversions.
+    RecvMakeIter(u8),
+    /// One `next` of an mpsc iterator: `recv` (true) or `try_recv`, as
+    /// an `Option<T>` (lower/iter.rs makes these calls).
+    RecvNext(bool),
 }
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 96] = [
+    pub const ALL: [SyncOp; 99] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -248,6 +254,9 @@ impl SyncOp {
         SyncOp::ThreadSleep,
         SyncOp::TryLock(false),
         SyncOp::TryLock(true),
+        SyncOp::RecvMakeIter(0),
+        SyncOp::RecvMakeIter(1),
+        SyncOp::RecvMakeIter(2),
     ];
 
     /// (types, names, how it is called) for `lust capabilities`.
@@ -345,6 +354,8 @@ impl SyncOp {
             SyncOp::ThreadSleep => (&["std::thread"], &["sleep"], f),
             SyncOp::TryLock(false) => (&["std::sync::Mutex<T>", "std::sync::RwLock<T>"], &["try_lock", "try_read"], m),
             SyncOp::TryLock(true) => (&["std::sync::RwLock<T>"], &["try_write"], m),
+            SyncOp::RecvMakeIter(u) => (&["std::sync::mpsc::Receiver<T>"], [&["iter"], &["try_iter"], &["into_iter"], &["iter"]][u as usize & 3], m),
+            SyncOp::RecvNext(_) => (&[], &[], m),
         }
     }
 }
@@ -720,6 +731,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         f
     }
 
+    /// The element of an mpsc `Receiver<T>` or `&Receiver<T>` (a `for`
+    /// loop's iterable).
+    pub(super) fn recv_elem(&mut self, t: Ty) -> Option<Ty> {
+        let t = self.resolve(t);
+        let r = match self.kind(t) {
+            TyKind::Ref(_, m, inner) if !m.is_mut() => self.resolve(inner),
+            _ => t,
+        };
+        (crate::ty::sync::sync_kind(&self.tys, r) == Some(SyncTy::Receiver)).then(|| self.tys.adt_first_ty_arg(r)).flatten()
+    }
+
     /// The pending obligation `t: Send`.
     fn require_send(&mut self, t: Ty, span: Span) {
         let send = self.p.gx.lang.send;
@@ -823,7 +845,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let er = self.tys.intern(TyKind::Adt(crate::check::generics::try_recv_error_def(), EMPTY_ARGS));
                     (SyncOp::ChanTryRecv, Autoref::Ref, self.tys.mk_result(el, er))
                 }
-                (_, "try_send" | "send_timeout" | "recv_timeout" | "recv_deadline" | "iter" | "try_iter" | "into_iter") => {
+                (SyncTy::Receiver, "iter" | "try_iter" | "into_iter") => {
+                    let (u, kind, autoref) = match n.as_str() {
+                        "iter" => (0, crate::ty::iter::IterKind::RecvIter, Autoref::Ref),
+                        "try_iter" => (1, crate::ty::iter::IterKind::RecvTryIter, Autoref::Ref),
+                        _ => (2, crate::ty::iter::IterKind::RecvIntoIter, Autoref::None),
+                    };
+                    (SyncOp::RecvMakeIter(u), autoref, crate::ty::iter::mk_iter(&mut self.tys, kind, &[el]))
+                }
+                (_, "try_send" | "send_timeout" | "recv_timeout" | "recv_deadline") => {
                     self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `send`, `recv`, or `try_recv`.");
                     return Some(self.iter_bail(args));
                 }
@@ -1238,6 +1268,7 @@ pub fn builtin_auto(
                         let sl = tys.intern(TyKind::Slice(args[i as usize]));
                         parts.push(tys.mk_ref(m, sl));
                     }
+                    F::Recv(..) => parts.push(crate::ty::iter::field_ty(tys, *f, &args)),
                     // The peeked item: not modelled, so not proven.
                     F::PeekSlot(_) => return Some(None),
                 }

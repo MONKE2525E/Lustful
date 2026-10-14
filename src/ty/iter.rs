@@ -62,6 +62,13 @@ pub enum IterKind {
     Peekable,
     /// `Inspect<I, F>`: args `[I, F]`.
     Inspect,
+    /// `std::sync::mpsc::Iter<'a, T>` (`rx.iter()`, `for x in &rx`):
+    /// args `[T]`, item `T`; blocks in `recv` (W-THREADS).
+    RecvIter,
+    /// `std::sync::mpsc::TryIter<'a, T>` (`rx.try_iter()`): args `[T]`.
+    RecvTryIter,
+    /// `std::sync::mpsc::IntoIter<T>` (`for x in rx`): args `[T]`.
+    RecvIntoIter,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -81,10 +88,13 @@ pub enum Field {
     VecArg(u8),
     /// `Option<Option<item of arg>>`: the peeked slot of `Peekable`.
     PeekSlot(u8),
+    /// `&Receiver<arg>`, or `Receiver<arg>` by value when the flag is
+    /// set (the mpsc iterators, W-THREADS).
+    Recv(u8, bool),
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 21] = [
+    pub const ALL: [IterKind; 24] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -106,6 +116,9 @@ impl IterKind {
         IterKind::StepBy,
         IterKind::Peekable,
         IterKind::Inspect,
+        IterKind::RecvIter,
+        IterKind::RecvTryIter,
+        IterKind::RecvIntoIter,
     ];
 
     /// The std module path and struct name: the def hash input and
@@ -135,6 +148,9 @@ impl IterKind {
             K::StepBy => (ADAPT, "StepBy"),
             K::Peekable => (ADAPT, "Peekable"),
             K::Inspect => (ADAPT, "Inspect"),
+            K::RecvIter => (&["std", "sync", "mpsc"], "Iter"),
+            K::RecvTryIter => (&["std", "sync", "mpsc"], "TryIter"),
+            K::RecvIntoIter => (&["std", "sync", "mpsc"], "IntoIter"),
         }
     }
 
@@ -173,6 +189,9 @@ impl IterKind {
             K::StepBy => "std::iter::StepBy",
             K::Peekable => "std::iter::Peekable",
             K::Inspect => "std::iter::Inspect",
+            K::RecvIter => "std::sync::mpsc::Iter",
+            K::RecvTryIter => "std::sync::mpsc::TryIter",
+            K::RecvIntoIter => "std::sync::mpsc::IntoIter",
         }
     }
 
@@ -207,6 +226,8 @@ impl IterKind {
             K::TakeWhile | K::SkipWhile => &[F::Arg(0), F::Bool, F::Arg(1)],
             K::StepBy => &[F::Arg(0), F::Usize, F::Bool],
             K::Peekable => &[F::Arg(0), F::PeekSlot(0)],
+            K::RecvIter | K::RecvTryIter => &[F::Recv(0, false)],
+            K::RecvIntoIter => &[F::Recv(0, true)],
         }
     }
 }
@@ -247,7 +268,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     Some(match k {
         K::SliceIter => tys.mk_ref(false, a[0]),
         K::SliceIterMut => tys.mk_ref(true, a[0]),
-        K::VecIntoIter | K::Range | K::RangeInclusive => a[0],
+        K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIter | K::RecvTryIter | K::RecvIntoIter => a[0],
         K::Map | K::FilterMap => a[2],
         K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
             item_ty(tys, a[0])?
@@ -283,6 +304,10 @@ pub fn field_ty(tys: &mut impl TyIntern, f: Field, args: &[Ty]) -> Ty {
             let item = item_ty(tys, args[i as usize]).unwrap_or(ERROR);
             let inner = tys.mk_option(item);
             tys.mk_option(inner)
+        }
+        Field::Recv(i, owned) => {
+            let r = super::sync::sync_ty(tys, super::sync::SyncTy::Receiver, &[args[i as usize]]);
+            if owned { r } else { tys.mk_ref(false, r) }
         }
     }
 }
