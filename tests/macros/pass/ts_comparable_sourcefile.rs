@@ -19,9 +19,9 @@ macro_rules! go_comparable_by_value {
 
 go_comparable_by_value!(u32, bool, char);
 
-pub struct Info { pub name: String, pub version: u32 }
-pub struct File { pub name: String, pub version: u32 }
-pub enum SourceFileFields { Published(Info), Parsed(File) }
+pub struct Info { pub name: String, pub version: u32, }
+pub struct File { pub name: String, pub version: u32, }
+pub enum SourceFileFields { Published(Info), Parsed(File), }
 
 macro_rules! source_file_field {
     ($fields:expr, $field:ident) => {
@@ -36,6 +36,7 @@ fn main() {
     println!("eq={} ne={}", 7u32.go_eq(&7), true.go_eq(&false));
     let a = SourceFileFields::Published(Info { name: "a.ts".into(), version: 3 });
     let b = SourceFileFields::Parsed(File { name: "b.ts".into(), version: 5 });
-    println!("{}:{} {}:{}", source_file_field!(&a, name), source_file_field!(&a, version),
-        source_file_field!(&b, name), source_file_field!(&b, version));
+    let (ra, rb) = (&a, &b);
+    println!("{}:{} {}:{}", source_file_field!(ra, name), source_file_field!(ra, version),
+        source_file_field!(rb, name), source_file_field!(rb, version));
 }

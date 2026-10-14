@@ -6,10 +6,10 @@ version : u32 , } pub struct File { pub name : String , pub version : u32 , } pu
 SourceFileFields { Published ( Info ) , Parsed ( File ) , } fn main ( ) { println ! (
 "eq={0} ne={1}" , 7u32 . go_eq ( & 7 ) , true . go_eq ( & false ) ) ; let a = SourceFileFields ::
 Published ( Info { name : "a.ts" . into ( ) , version : 3 } ) ; let b = SourceFileFields :: Parsed (
-File { name : "b.ts" . into ( ) , version : 5 } ) ; println ! ( "{0}:{1} {2}:{3}" , match & a {
-SourceFileFields :: Published ( info ) => & info . name , SourceFileFields :: Parsed ( file ) => &
-file . name , } , match & a { SourceFileFields :: Published ( info ) => & info . version ,
-SourceFileFields :: Parsed ( file ) => & file . version , } , match & b { SourceFileFields ::
-Published ( info ) => & info . name , SourceFileFields :: Parsed ( file ) => & file . name , } ,
-match & b { SourceFileFields :: Published ( info ) => & info . version , SourceFileFields :: Parsed
-( file ) => & file . version , } ) ; }
+File { name : "b.ts" . into ( ) , version : 5 } ) ; let ( ra , rb ) = ( & a , & b ) ; println ! (
+"{0}:{1} {2}:{3}" , match ra { SourceFileFields :: Published ( info ) => & info . name ,
+SourceFileFields :: Parsed ( file ) => & file . name , } , match ra { SourceFileFields :: Published
+( info ) => & info . version , SourceFileFields :: Parsed ( file ) => & file . version , } , match
+rb { SourceFileFields :: Published ( info ) => & info . name , SourceFileFields :: Parsed ( file )
+=> & file . name , } , match rb { SourceFileFields :: Published ( info ) => & info . version ,
+SourceFileFields :: Parsed ( file ) => & file . version , } ) ; }
