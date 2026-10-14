@@ -804,6 +804,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
             Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) => t,
+            // A receiver-only coercion: `operand` leaves the value as is.
+            Coerce::CowRecv(..) => ty,
+            Coerce::ByNext(w) => w,
             Coerce::Deref(n) => self.peel(ty, n),
             Coerce::BoxToRef(n, m) => {
                 let elem = self.peel(ty, n);

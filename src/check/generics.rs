@@ -2557,7 +2557,7 @@ pub(crate) fn resolve_path_ty(
                 let args: Vec<Ty> = match &seg.args {
                     GenericArgs::Angle(a) => {
                         let kinds = vec![false; a.len()];
-                        resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, k.path().1)?
+                        resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, kinds.len(), span, k.path().1)?
                             .into_iter()
                             .filter_map(|g| g.as_ty())
                             .collect()
@@ -2977,7 +2977,7 @@ fn resolve_cow_path(
     if written.len() > 1 {
         return Err(Diag::new("L0110", span, "`Cow` takes 1 lifetime argument", "Write one lifetime, or none."));
     }
-    let args: Vec<GenericArg> = resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], span, "Cow")?
+    let args: Vec<GenericArg> = resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "Cow")?
         .into_iter()
         .filter(|g| g.as_ty().is_some())
         .collect();
@@ -3011,7 +3011,7 @@ fn resolve_hash_path(
         GenericArgs::None => Vec::new(),
         GenericArgs::Angle(a) => {
             let kinds = vec![false; a.len()];
-            resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, span, k.path().1)?
+            resolve_generic_args(ast, interner, known, cx, tys, scope, a, &kinds, kinds.len(), span, k.path().1)?
                 .into_iter()
                 .filter_map(|g| g.as_ty())
                 .collect()
@@ -6480,11 +6480,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
         g1.predicates = vec![Predicate::TypeOutlives(p0, Region::Static)];
         insert_synthetic(p, &mut ordinal, lang.any, p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
-    // IntoIterator for the std collections and slices (W-STD-B): Vec<T>
-    // and its references, `&[T]` and `&mut [T]`, and the hash maps and
-    // sets with their references. Selection and Item/IntoIter only;
-    // `into_iter` and `for` stay builtin. Arrays have no record (no
-    // const-param records yet).
+    // IntoIterator for the hash maps and sets with their references
+    // (W-STD-B; Vec and slices are in the block above). Selection and
+    // Item/IntoIter only; `into_iter` and `for` stay builtin.
     {
         use crate::ty::hash::{HashTy, mk_hash};
         use crate::ty::iter::{IterKind as K, mk_iter};
@@ -6506,27 +6504,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
             predicates: Vec::new(),
         };
         let p2 = p.tys.intern(TyKind::Param(ParamId(2)));
-        let vec_p0 = p.tys.mk_vec(p0);
-        let slice_p0 = p.tys.intern(TyKind::Slice(p0));
         let ref_p0 = p.tys.mk_ref(false, p0);
-        let mut_p0 = p.tys.mk_ref(true, p0);
-        let vec_iter = mk_iter(&mut p.tys, K::VecIntoIter, &[p0]);
-        let slice_iter = mk_iter(&mut p.tys, K::SliceIter, &[p0]);
-        let slice_iter_mut = mk_iter(&mut p.tys, K::SliceIterMut, &[p0]);
-        let ref_vec = p.tys.mk_ref(false, vec_p0);
-        let mut_vec = p.tys.mk_ref(true, vec_p0);
-        let ref_slice = p.tys.mk_ref(false, slice_p0);
-        let mut_slice = p.tys.mk_ref(true, slice_p0);
-        for (s, item, iter) in [
-            (vec_p0, p0, vec_iter),
-            (ref_vec, ref_p0, slice_iter),
-            (mut_vec, mut_p0, slice_iter_mut),
-            (ref_slice, ref_p0, slice_iter),
-            (mut_slice, mut_p0, slice_iter_mut),
-        ] {
-            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, iter)];
-            insert_synthetic(p, &mut ordinal, lang.into_iterator, s, &[], one.clone(), assoc, Synthetic::Lang, false, span);
-        }
         // HashMap<K, V, S> by value, `&`, `&mut`; HashSet<T, S> by value, `&`.
         let map = mk_hash(&mut p.tys, HashTy::HashMap, &[p0, p1, p2]);
         let ref_map = p.tys.mk_ref(false, map);
@@ -8231,7 +8209,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
             let new_bindings: Vec<(DefId, GenericArg)> = old_bindings
                 .into_iter()
                 .map(|(d, g)| match g {
-                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite_impl_projections(p, t, &rec.assoc_tys))),
+                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys))),
                     other => (d, other),
                 })
                 .collect();

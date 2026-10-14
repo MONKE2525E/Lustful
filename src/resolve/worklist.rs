@@ -5529,7 +5529,9 @@ impl Rewrite<'_> {
         // as an imported fn, resolved to the item before).
         if let Expr::Closure { params, ret, body, .. } = &ast.exprs[id.0 as usize] {
             let (pats, ret, body): (Vec<PatId>, Option<TyId>, ExprId) = (params.iter().map(|p| p.pat).collect(), *ret, *body);
-            if let Some(t) = ret {
+            // Parameter types too (`|c: &Cow<str>|` names an import).
+            let tys: Vec<TyId> = params.iter().filter_map(|p| p.ty).collect();
+            for t in tys.into_iter().chain(ret) {
                 self.ty(ast, t, module, scopes);
             }
             let mut frame = Frame::default();
