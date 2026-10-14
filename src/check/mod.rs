@@ -1534,10 +1534,28 @@ enum KVal {
     /// A known enum discriminant: the adt and the variant index. The
     /// payload stays unknown.
     Enum(AdtId, u32),
+    /// A known float: its bits (`f32` bits zero-extended) and type.
+    Float(u64, crate::ty::FloatTy),
     Agg(Vec<Option<KVal>>),
 }
 
 type KEnv = Vec<Option<KVal>>;
+
+/// A known float's value. An `f32` widens to f64 exactly.
+fn k_float(bits: u64, f: crate::ty::FloatTy) -> f64 {
+    match f {
+        crate::ty::FloatTy::F32 => f32::from_bits(bits as u32) as f64,
+        _ => f64::from_bits(bits),
+    }
+}
+
+/// The bits of `x` rounded once to float type `f`.
+fn k_float_bits(x: f64, f: crate::ty::FloatTy) -> u64 {
+    match f {
+        crate::ty::FloatTy::F32 => (x as f32).to_bits() as u64,
+        _ => x.to_bits(),
+    }
+}
 
 /// Whether a match pattern matches a known scrutinee value, when the
 /// overflow lint can tell.
@@ -14813,6 +14831,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.k_math(v, t)
     }
 
+    /// The discriminant of a known enum variant, for an `as` cast. It
+    /// records the enum's layout read: a discriminant edit changes the
+    /// lint's answer for this body.
+    fn k_discriminant(&mut self, a: AdtId, v: u32) -> i128 {
+        let p = self.p;
+        if p.resolved.is_some()
+            && let Some(def) = p.defs.def_of_adt(a)
+        {
+            let _ = p.layout_of(&mut self.out.reads, def);
+        }
+        p.adt(a).variants[v as usize].disc
+    }
+
     /// The value range of an integer type, when it fits in i128 values.
     fn k_range(&self, t: Ty) -> Option<(IntTy, i128, i128)> {
         match self.tys.kind(t) {
@@ -14855,14 +14886,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// array type (through any number of references) and the index
     /// value is known. Slice and `Vec` bases keep a runtime length
     /// rustc does not const-propagate, so they never fire here.
-    fn k_check_index(&mut self, base: ExprId, iv: &Option<KVal>, span: Span, lint: &KLint) {
+    fn k_check_index(&mut self, e: ExprId, base: ExprId, iv: &Option<KVal>, span: Span, lint: &KLint) {
         let Some(KVal::Int(i)) = iv else { return };
-        let mut t = self.out.expr_ty[self.ei(base)];
-        loop {
-            match self.tys.kind(t) {
-                TyKind::Ref(_, _, e) => t = e,
-                _ => break,
-            }
+        // The indexed place autoderefs as check's `Expr::Index` did:
+        // references, Box/Rc/Arc/Ref, then any user `Deref` steps it
+        // recorded on `e`. A known array length is rustc's `Len`.
+        let (_, mut t) = self.autoderef_smart(self.out.expr_ty[self.ei(base)]);
+        if !matches!(self.tys.kind(t), TyKind::Array(..))
+            && let Some((_, d)) = self.out.deref_recv.iter().rev().find(|(x, _)| *x == e)
+        {
+            t = self.autoderef_smart(d.target_ref).1;
         }
         let TyKind::Array(_, c) = self.tys.kind(t) else { return };
         let crate::ty::ConstKind::Int(len) = self.tys.const_kind(c) else { return };
@@ -15121,6 +15154,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             CV::Int(v) => self.k_math(*v, t).map(KVal::Int),
             CV::Bool(b) => Some(KVal::Bool(*b)),
             CV::Char(c) => Some(KVal::Int(*c as i128)),
+            CV::Float(b, f) => Some(KVal::Float(*b, *f)),
             CV::Variant(v, _) => match self.tys.kind(t) {
                 TyKind::Adt(def, _) => match self.p.adt_by_def(def) {
                     Some(a) if self.p.adt(a).is_enum => Some(KVal::Enum(a, *v)),
@@ -15147,6 +15181,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Int(v, _) => Some(KVal::Int(*v as u128 as i128)),
             Expr::Bool(b) => Some(KVal::Bool(*b)),
             Expr::Char(c) => Some(KVal::Int(*c as i128)),
+            Expr::Float(i) => match self.tys.kind(ety) {
+                TyKind::Float(f) => crate::check::collect::parse_float_literal_as(&p.ast.strings[*i as usize], f).map(|b| KVal::Float(b, f)),
+                _ => None,
+            },
             Expr::Path(_) | Expr::SelfValue => match self.out.expr_res[self.ei(e)] {
                 Res::Local(l) => env.get(l as usize).cloned().unwrap_or(None),
                 Res::Variant(a, v) if p.adt(a).is_enum => Some(KVal::Enum(a, v)),
@@ -15382,7 +15420,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Expr::Index { base, index } => {
                 let bv = self.k_expr(*base, env, lint);
                 let iv = self.k_expr(*index, env, lint);
-                self.k_check_index(*base, &iv, span, lint);
+                self.k_check_index(e, *base, &iv, span, lint);
                 match (bv, iv) {
                     (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => items.get(i as usize).cloned().unwrap_or(None),
                     _ => None,
@@ -15448,10 +15486,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Expr::Cast { expr, .. } => {
                 let v = self.k_expr(*expr, env, lint);
+                let from = self.out.expr_ty[self.ei(*expr)];
                 match (v, self.tys.kind(ety)) {
                     (Some(KVal::Int(x)), TyKind::Int(_) | TyKind::Char) => self.k_wrap(x, ety).map(KVal::Int),
                     (Some(KVal::Bool(b)), TyKind::Int(_)) => Some(KVal::Int(b as i128)),
                     (Some(KVal::Bool(b)), TyKind::Bool) => Some(KVal::Bool(b)),
+                    (Some(KVal::Enum(a, v)), TyKind::Int(_)) => {
+                        let d = self.k_discriminant(a, v);
+                        self.k_wrap(d, ety).map(KVal::Int)
+                    }
+                    (Some(KVal::Float(b, f)), TyKind::Int(it)) => {
+                        // `as` saturates and maps NaN to 0.
+                        let x = k_float(b, f);
+                        match self.k_range(ety) {
+                            Some((_, lo, hi)) if it.signed() => Some(KVal::Int((x as i128).clamp(lo, hi))),
+                            Some((_, _, hi)) => Some(KVal::Int(((x as u128).min(hi as u128)) as i128)),
+                            None => Some(KVal::Int((x as u128) as i128)),
+                        }
+                    }
+                    (Some(KVal::Float(b, f)), TyKind::Float(g)) => Some(KVal::Float(k_float_bits(k_float(b, f), g), g)),
+                    (Some(KVal::Int(x)), TyKind::Float(g)) => {
+                        // An unsigned source converts from its value, which
+                        // for u128 sits in the bits.
+                        let unsigned = matches!(self.tys.kind(from), TyKind::Int(it) if !it.signed());
+                        let bits = match (g, unsigned) {
+                            (crate::ty::FloatTy::F32, true) => ((x as u128) as f32).to_bits() as u64,
+                            (crate::ty::FloatTy::F32, false) => (x as f32).to_bits() as u64,
+                            (_, true) => ((x as u128) as f64).to_bits(),
+                            (_, false) => (x as f64).to_bits(),
+                        };
+                        Some(KVal::Float(bits, g))
+                    }
                     _ => None,
                 }
             }
@@ -15566,7 +15631,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.k_place_parts(*base, env, lint);
                 let iv = self.k_expr(*index, env, lint);
                 let span = self.span(e);
-                self.k_check_index(*base, &iv, span, lint);
+                self.k_check_index(e, *base, &iv, span, lint);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.k_place_parts(*base, env, lint),
             Expr::Deref(inner) => {
@@ -15616,7 +15681,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             KVal::Int(i) => self.k_scalar_covers(pat, *i, sty),
             KVal::Bool(b) => self.k_scalar_covers(pat, *b as i128, sty),
             KVal::Enum(a, var) => self.k_enum_covers(pat, *a, *var),
-            KVal::Agg(_) => KCov::Unknown,
+            KVal::Float(..) | KVal::Agg(_) => KCov::Unknown,
         }
     }
 
@@ -15815,6 +15880,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if matches!(self.out.expr_res[self.ei(e)], Res::TraitBin { .. }) {
             return None;
         }
+        // Float arithmetic is IEEE in rustc's const propagation too; an
+        // f32 result computed in f64 and rounded once is exact for these.
+        if let (Some(KVal::Float(a, f)), Some(KVal::Float(b, _))) = (&lv, &rv) {
+            let (x, y) = (k_float(*a, *f), k_float(*b, *f));
+            let r = match op {
+                BinOp::Add => x + y,
+                BinOp::Sub => x - y,
+                BinOp::Mul => x * y,
+                BinOp::Div => x / y,
+                BinOp::Rem => x % y,
+                _ => return None,
+            };
+            return Some(KVal::Float(k_float_bits(r, *f), *f));
+        }
         match op {
             BinOp::And => match (lv, rv) {
                 (Some(KVal::Bool(a)), Some(KVal::Bool(b))) => Some(KVal::Bool(a && b)),
@@ -15941,6 +16020,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let v = self.k_expr(inner, env, lint);
         match op {
             UnOp::Neg => {
+                if let Some(KVal::Float(b, f)) = v {
+                    return Some(KVal::Float(k_float_bits(-k_float(b, f), f), f));
+                }
                 let Some(KVal::Int(x)) = v else { return None };
                 let t = self.out.expr_ty[self.ei(e)];
                 // A literal under the minus is a magnitude, not a
