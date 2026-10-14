@@ -73,6 +73,22 @@ struct Lower<'p, 'a> {
     /// temporaries live to the end of the enclosing block, with the
     /// index of that block's scope (see `let_stmt`, `materialize`).
     extended: Vec<(ExprId, usize)>,
+    /// The shared unwind cleanup ladder of `call_into`: one block
+    /// per (local, successor) pair, dropping that local and going
+    /// to the successor, so cleanup paths that share a suffix
+    /// share its blocks. Without sharing, each call re-emitted a
+    /// drop for every local in scope, so a chain of n calls in one
+    /// scope made O(n^2) statements (a 2000-link method chain
+    /// lowered to about 2M statements).
+    unwind_steps: crate::intern::FxMap<(Local, Bb), Bb>,
+    /// The shared last block of every cleanup path: no drops, an
+    /// `Unreachable` terminator.
+    unwind_end: Option<Bb>,
+    /// The most recent cleanup path, as its drop sequence (first
+    /// local dropped first) and its entry block. A call whose
+    /// sequence ends with it reuses it as the suffix, so only the
+    /// locals added since then need new ladder steps.
+    unwind_last: Option<(Vec<Local>, Bb)>,
 }
 
 /// Lowers one checked function body to IR.
@@ -120,6 +136,9 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         prelowered: Vec::new(),
         spine_gen: 0,
         extended: Vec::new(),
+        unwind_steps: Default::default(),
+        unwind_end: None,
+        unwind_last: None,
     };
     // A template's own `impl Trait` return is its hidden type here, so the
     // borrow checker sees the returned value's regions (check/opaque.rs).
@@ -251,34 +270,65 @@ impl<'p, 'a> Lower<'p, 'a> {
         crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f)
     }
     /// Emits a call terminator that writes its result to `dest` and continues
-    /// in a fresh block. The unwind successor is a cleanup block chain: one
-    /// block per enclosing scope, innermost first, each dropping that
-    /// scope's locals through the same `emit_drops` pass scope exit uses,
-    /// then propagating to the next outer scope (docs/ARCH.md section 7.2).
-    /// The innermost cleanup ends in `Unreachable`, where the wave C
-    /// runtime resumes the exception.
+    /// in a fresh block. The unwind successor is a cleanup path that drops
+    /// every enclosing scope's locals, innermost first, through the same
+    /// `emit_drops` order scope exit uses, then ends in `Unreachable`,
+    /// where the wave C runtime resumes the exception (docs/ARCH.md
+    /// section 7.2). The path comes from the shared ladder
+    /// (`unwind_block`), never from a fresh copy per call.
     fn call_into(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place, span: Span) {
         let next = self.new_block();
-        // Build the cleanup chain outside-in first so each block can name
-        // its successor, then fill the blocks innermost first.
-        let depth = self.scopes.len();
-        let mut chain: Vec<Bb> = (0..depth).map(|_| self.new_block()).collect();
-        chain.reverse();
-        let unwind = chain.first().copied();
+        let unwind = Some(self.unwind_block(span));
         let b = &mut self.body.blocks[self.cur.0 as usize];
         b.term = Terminator::Call { target, args, dest, next, unwind };
         b.term_span = span;
-        for (i, &cb) in chain.iter().enumerate() {
-            self.cur = cb;
-            let scope_idx = depth - 1 - i;
-            let locals = self.scopes[scope_idx].clone();
-            self.emit_drops(&locals, span);
-            match chain.get(i + 1) {
-                Some(&outer) => self.goto(outer, span),
-                None => self.terminate(Terminator::Unreachable, span),
-            }
-        }
         self.cur = next;
+    }
+
+    /// The entry block of the cleanup path for a call at the current
+    /// scopes (see `call_into`). Builds only the ladder steps this
+    /// path needs that no earlier call built: the last path built,
+    /// when it is a suffix of this one, serves as the suffix, and
+    /// every step goes through the `(local, successor)` table.
+    fn unwind_block(&mut self, span: Span) -> Bb {
+        // The drop sequence: innermost scope first, reversed in scope.
+        let mut seq: Vec<Local> = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            seq.extend(scope.iter().rev().copied());
+        }
+        if self.unwind_end.is_none() {
+            self.unwind_end = Some(self.new_block());
+        }
+        let suffix = match &self.unwind_last {
+            Some((last, entry)) if seq.len() >= last.len() && seq[seq.len() - last.len()..] == last[..] => {
+                Some((*entry, seq.len() - last.len()))
+            }
+            _ => None,
+        };
+        let (mut bb, wrap) = suffix.unwrap_or((self.unwind_end.unwrap(), seq.len()));
+        for &l in seq[..wrap].iter().rev() {
+            bb = self.unwind_step(l, bb, span);
+        }
+        self.unwind_last = Some((seq, bb));
+        bb
+    }
+
+    /// One ladder step: the shared block that drops `l` (the same
+    /// statements `emit_drops` makes for it at scope exit) and goes
+    /// to `next`. A step is built once per (local, successor) pair;
+    /// its statements keep the span of the call that built it.
+    fn unwind_step(&mut self, l: Local, next: Bb, span: Span) -> Bb {
+        if let Some(&bb) = self.unwind_steps.get(&(l, next)) {
+            return bb;
+        }
+        let bb = self.new_block();
+        let saved = self.cur;
+        self.cur = bb;
+        self.emit_drops(&[l], span);
+        self.goto(next, span);
+        self.cur = saved;
+        self.unwind_steps.insert((l, next), bb);
+        bb
     }
     /// The place a call result goes: the given destination, or a throwaway
     /// temporary for a call in statement position.
@@ -4995,5 +5045,38 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::def::{CrateIds, LOCAL_CRATE};
+    use crate::diag::FileId;
+    use crate::intern::{Interner, Known};
+    use crate::{lexer, parser};
+
+    /// A deep method chain lowers to a linear number of IR
+    /// statements (the shared unwind ladder of `call_into`).
+    /// Before the ladder, each call's cleanup re-emitted a drop
+    /// for every local in scope, so a 400-link chain lowered to
+    /// about 80000 statements (~links^2/2), which every later
+    /// phase then paid for in time and memory.
+    #[test]
+    fn deep_chain_lowers_to_linear_ir() {
+        let links = 400;
+        let src = format!("fn main() {{ println!(\"{{}}\", 5i64{}); }}\n", ".abs()".repeat(links));
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = lexer::lex(&src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = crate::check::collect::collect(&ast, &interner, &known, ids).unwrap();
+        let main = program.main.unwrap();
+        let (ck, errs) = crate::check::check_fn(&program, main);
+        assert!(errs.is_empty(), "{errs:?}");
+        let body = lower(&program, main, ck);
+        let stmts: usize = body.blocks.iter().map(|b| b.stmts.len()).sum();
+        assert!(stmts < 20 * links, "linear IR for a {links}-link chain, got {stmts} statements in {} blocks", body.blocks.len());
     }
 }
