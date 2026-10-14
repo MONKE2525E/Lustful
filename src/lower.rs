@@ -858,7 +858,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         // constructor from the type.
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span)
                     } else {
-                        self.set_or_temp(dest, Rvalue::Aggregate(a, v, Vec::new()), ty, span)
+                        self.aggregate_into(e, Rvalue::Aggregate(a, v, Vec::new()), dest, ty, span)
                     }
                 }
                 Res::Fn(f) => {
@@ -1102,7 +1102,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(b), ops, d, span);
                     }
-                    Res::Variant(a, v) => self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span),
+                    Res::Variant(a, v) => self.aggregate_into(e, Rvalue::Aggregate(a, v, ops), dest, ty, span),
                     Res::ConstUsize(v) => {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
@@ -1389,7 +1389,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     }
                 }
                 let ops = ops.into_iter().map(|o| o.unwrap()).collect();
-                self.set_or_temp(dest, Rvalue::Aggregate(a, v, ops), ty, span);
+                self.aggregate_into(e, Rvalue::Aggregate(a, v, ops), dest, ty, span);
             }
             // A range value (check/iter.rs): the std struct's fields,
             // `start`, `end`, and `exhausted` for the inclusive form.
@@ -4483,6 +4483,60 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let t = self.temp(ty);
                 self.assign(Place::local(t), rv, span);
             }
+        }
+    }
+
+    /// An Adt value built by `e` (`set_or_temp`). Built through a `Self`
+    /// path, it has the impl's own lifetimes, as in rustc (W-BORROW):
+    /// it goes into a temporary whose regions equal them (a body
+    /// annotation), so its fields must outlive them, and then moves on.
+    fn aggregate_into(&mut self, e: ExprId, rv: Rvalue, dest: Option<&Place>, ty: Ty, span: Span) {
+        match self.self_ctor_regions(e) {
+            Some(r) => {
+                let t = self.temp(ty);
+                self.assign(Place::local(t), rv, span);
+                self.body.annotations.push((t, r));
+                self.set_or_temp(dest, Rvalue::Use(Operand::Move(Place::local(t))), ty, span);
+            }
+            None => self.set_or_temp(dest, rv, ty, span),
+        }
+    }
+
+    /// The impl's regioned `Self` type when `e` builds a value through a
+    /// `Self` path (`Self { .. }`, `Self(..)`, `Self::V(..)`, `Self::V`)
+    /// and that type has lifetimes. Template and plain bodies only: an
+    /// instance's types are concrete, and its template carries the check.
+    fn self_ctor_regions(&self, e: ExprId) -> Option<Ty> {
+        let p = self.p;
+        let head = match p.ast.expr(e) {
+            Expr::StructLit { path, .. } | Expr::Path(path) => path.first(),
+            Expr::Call { callee, .. } => match p.ast.expr(*callee) {
+                Expr::Path(segs) => segs.first(),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        let fid = self.body.fn_id;
+        if head.name != p.known.self_type || self.in_instance(fid) {
+            return None;
+        }
+        let t = p.gx.fn_scopes.get(fid.0 as usize)?.scope.self_ty_regioned?;
+        let mut regs = Vec::new();
+        crate::borrowck::regions_of(&self.body.tys, t, &mut regs);
+        regs.iter().any(|r| matches!(r, Region::Static | Region::Param(_))).then_some(t)
+    }
+
+    /// True for a mono instance body, or a closure body fn inside one.
+    fn in_instance(&self, fid: LocalDefId) -> bool {
+        use crate::check::generics::FnClass;
+        let p = self.p;
+        match p.gx.fn_class.get(fid.0 as usize) {
+            Some(FnClass::Instance) => true,
+            Some(FnClass::Closure) => {
+                let parent = p.gx.closure_fns.get(&fid).and_then(|d| p.gx.closures.get(d)).map(|c| c.parent);
+                parent.is_some_and(|f| f != fid && self.in_instance(f))
+            }
+            _ => false,
         }
     }
 }
