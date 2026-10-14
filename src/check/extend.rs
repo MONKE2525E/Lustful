@@ -1,5 +1,6 @@
 // `Extend` on Vec and String in body checking (W-STD-B). The argument
-// goes through `IntoIterator` (`ty::iter::as_iter_ty`); the item kinds
+// goes through `IntoIterator` (`ty::iter::as_iter_ty`, or `ByNext` for an
+// iterator lust calls through its `next`); the item kinds
 // are the impls std declares: `Vec<T>: Extend<T>` and `Extend<&T>` for
 // `T: Copy`; `String: Extend<char | &char | &str | String | Box<str> |
 // Cow<str>>`. The iterator expansion (lower/iter.rs) writes Rust's
@@ -31,11 +32,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let at = self.expr(*a, None);
         let at = self.deep(at);
-        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at) else {
+        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at).or_else(|| self.by_next_arg(*a, at)) else {
             let tn = self.tn(at);
             self.err("L0640", self.span(*a), format!("`extend` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a slice.");
             return Some(ERROR);
         };
+        if it == ERROR {
+            return Some(ERROR);
+        }
         if let TyKind::Array(el, _) = self.kind(at)
             && !self.array_iter_elem_ok(el, self.span(*a))
         {

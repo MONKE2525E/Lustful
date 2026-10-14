@@ -392,8 +392,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// `map.extend(iter)` (`Extend<(K, V)>`) and `set.extend(iter)`
     /// (`Extend<T>`) over anything `as_iter_ty` turns into a builtin
-    /// iterator. The `&`-item forms (`Extend<(&K, &V)>` for Copy types)
-    /// are not ported yet (L0640).
+    /// iterator, or any other iterator through its `next` (`ByNext`);
+    /// also the `&`-item forms (`Extend<(&K, &V)>`, `Extend<&T>`) for
+    /// Copy parts.
     #[allow(clippy::too_many_arguments)]
     fn hash_extend(&mut self, e: ExprId, recv: ExprId, kind: HashTy, targs: &[Ty], derefs: u8, span: Span, args: &[ExprId]) -> Ty {
         let [a] = args else {
@@ -405,11 +406,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let at = self.expr(*a, None);
         let at = self.deep(at);
-        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at) else {
+        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at).or_else(|| self.by_next_arg(*a, at)) else {
             let tn = self.tn(at);
             self.err("L0640", self.span(*a), format!("`extend` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a map.");
             return ERROR;
         };
+        if it == ERROR {
+            return ERROR;
+        }
         if let TyKind::Array(el, _) = self.kind(at)
             && !self.array_iter_elem_ok(el, self.span(*a))
         {

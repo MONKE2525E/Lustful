@@ -715,6 +715,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.iter_bail(args)
     }
 
+    /// An `IntoIterator` argument `a` of type `t` that is an iterator lust
+    /// calls through its own `next` (a user type, or a type parameter
+    /// with an `Iterator` bound): moved into its `ByNext` wrapper, whose
+    /// type is returned. None for other types; ERROR after L0640.
+    pub(super) fn by_next_arg(&mut self, a: ExprId, t: Ty) -> Option<Ty> {
+        if it::is_iter(&self.tys, t) {
+            return None;
+        }
+        let item = self.by_next_item(t, self.span(a))?;
+        if item == ERROR {
+            return Some(ERROR);
+        }
+        let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[t, item]);
+        let i = self.ei(a);
+        self.out.coerce[i] = Coerce::ByNext(wrapped);
+        Some(wrapped)
+    }
+
     /// The item type of `base` as an iterator through its own `next`
     /// (`IterKind::ByNext`, W-STD-B), or None when it is not one. A type
     /// parameter, projection, or opaque type needs an `Iterator` bound
