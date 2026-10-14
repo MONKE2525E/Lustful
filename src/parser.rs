@@ -4112,7 +4112,7 @@ impl<'a> Parser<'a> {
         // feature gate runs after cfg stripping), so a cfg syntax check
         // reads them and goes on to the expression.
         if self.cfg_syntax && self.peek() == Tok::Pound && self.peek_at(1) == Tok::LBracket {
-            self.part_attributes()?;
+            self.part_attributes("expressions", 0)?;
         }
         let start = self.span();
         let e = match self.peek() {

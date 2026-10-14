@@ -2511,6 +2511,7 @@ pub fn collect_reuse<'a>(
                 shape: VariantShape::Tuple,
                 fields: vec![Field { name: zero, ty }],
                 disc,
+                non_exhaustive: false,
             };
             p.adts[id.0 as usize] = AdtDef {
                 name,
@@ -2519,6 +2520,7 @@ pub fn collect_reuse<'a>(
                 derives: Derives::default(),
                 span,
                 repr: crate::ty::layout::Repr::default(),
+                non_exhaustive: false,
             };
             p.gx.adt_info[id.0 as usize] = (def, 1);
             p.gx.adt_lifetimes.insert(def, vec![interner.intern("a")]);
