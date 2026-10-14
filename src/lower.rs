@@ -3528,13 +3528,14 @@ impl<'p, 'a> Lower<'p, 'a> {
             let by_ref_guard = arm.guard.is_some() && !self.pat_has_slice_middle_move(arm.pat);
             // Under a guard, an or-pattern arm runs as one row
             // per combination of alternatives: a guard that
-            // fails on one row's bindings tries the next row, as
-            // in Rust, before the next arm. Rows beyond a bound
+            // fails on one row tries the next matching row, as
+            // in Rust, before the next arm (so the guard may run
+            // more than once). Rows beyond a bound
             // keep the single tag-switched test; the checker
             // accepts those programs, so cap the expansion and
             // report it below instead of risking such a split.
             let rows: Vec<Vec<(PatId, usize)>> =
-                if by_ref_guard && self.pat_has_or_binding(arm.pat) { self.or_rows(arm.pat) } else { vec![Vec::new()] };
+                if by_ref_guard && self.pat_has_or(arm.pat) { self.or_rows(arm.pat) } else { vec![Vec::new()] };
             if rows.len() > 64 {
                 self.body.lower_errs.push(crate::diag::Diag::new(
                     "L9001",
@@ -3690,13 +3691,12 @@ impl<'p, 'a> Lower<'p, 'a> {
         matches!(self.ck.pat_res(pat), PatRes::Binding { .. }) || self.pat_children(pat).iter().any(|&s| self.pat_has_binding(s))
     }
 
-    /// True when some or-pattern in the pattern binds a name:
-    /// the shape whose alternatives a guard must retry.
-    fn pat_has_or_binding(&self, pat: PatId) -> bool {
-        if matches!(self.p.ast.pat(pat), Pat::Or(_)) && self.pat_has_binding(pat) {
-            return true;
-        }
-        self.pat_children(pat).iter().any(|&s| self.pat_has_or_binding(s))
+    /// True when the pattern holds an or-pattern: the shape whose
+    /// alternatives a guard must retry. Rust runs the guard once per
+    /// matching combination of alternatives, with or without bindings
+    /// (`Some(_) | Some(3) if g()` calls `g` twice on `Some(3)`).
+    fn pat_has_or(&self, pat: PatId) -> bool {
+        matches!(self.p.ast.pat(pat), Pat::Or(_)) || self.pat_children(pat).iter().any(|&s| self.pat_has_or(s))
     }
 
     /// The alternative a guard row fixes this or-pattern to.
