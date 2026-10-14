@@ -634,7 +634,7 @@ fn validate_appended(mut bytes: Vec<u8>, start: usize) -> (String, bool) {
 /// staged through a fresh Vec because safe code cannot write into a
 /// Vec's spare capacity; the reader sees the same buffer sizes and
 /// the Vec grows the same way.
-fn read_to_end_default<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
+pub(crate) fn read_to_end_default<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
     let start = buf.len();
     let mut probe_ok = true;
     loop {
@@ -1261,6 +1261,72 @@ impl<W: Write + fmt::Debug> fmt::Debug for BufWriter<W> {
             .field("writer", &self.inner)
             .field("buffer", &BufferUsed { used: self.buf.len(), cap: self.buf.capacity() })
             .finish()
+    }
+}
+
+/// A seek position: from the start, the end, or the current
+/// position of a stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeekFrom {
+    Start(u64),
+    End(i64),
+    Current(i64),
+}
+
+/// A trait for objects which can seek within a stream of bytes.
+pub trait Seek {
+    /// Seeks to a position, returning the new position from the
+    /// start of the stream.
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+
+    /// Seeks back to the start of the stream.
+    fn rewind(&mut self) -> Result<()> {
+        match self.seek(SeekFrom::Start(0)) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The current position from the start of the stream.
+    fn stream_position(&mut self) -> Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
+
+    /// Seeks by a relative offset.
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        match self.seek(SeekFrom::Current(offset)) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl<S: Seek + ?Sized> Seek for &mut S {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (**self).seek(pos)
+    }
+
+    fn rewind(&mut self) -> Result<()> {
+        (**self).rewind()
+    }
+
+    fn stream_position(&mut self) -> Result<u64> {
+        (**self).stream_position()
+    }
+}
+
+/// One seek on a file descriptor (for `File`).
+pub(crate) fn seek_fd(fd: i32, pos: SeekFrom) -> Result<u64> {
+    let (off, whence) = match pos {
+        SeekFrom::Start(n) => (n as i64, 0),
+        SeekFrom::End(n) => (n, 2),
+        SeekFrom::Current(n) => (n, 1),
+    };
+    let v = core::intrinsics::sys_fd_seek(fd, off, whence);
+    if v < 0 {
+        Err(Error::from_raw_os_error((-v) as i32))
+    } else {
+        Ok(v as u64)
     }
 }
 

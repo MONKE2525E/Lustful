@@ -995,6 +995,15 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     IntrinsicDef { name: "sys_fd_dup", c_symbol: "lust_sys_fd_dup", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
     // fsync.
     IntrinsicDef { name: "sys_fd_sync", c_symbol: "lust_sys_fd_sync", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // fdatasync.
+    IntrinsicDef {
+        name: "sys_fd_sync_data",
+        c_symbol: "lust_sys_fd_sync_data",
+        params: &[S::I32],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // ftruncate to the length.
     IntrinsicDef {
         name: "sys_fd_truncate",

@@ -23,6 +23,8 @@ int32_t lust_sys_fd_close(int32_t fd);
 int32_t lust_sys_fd_dup(int32_t fd);
 /* fsync(2): 0, or errno. */
 int32_t lust_sys_fd_sync(int32_t fd);
+/* fdatasync(2): 0, or errno. */
+int32_t lust_sys_fd_sync_data(int32_t fd);
 /* ftruncate(2) to `len`: 0, or errno. */
 int32_t lust_sys_fd_truncate(int32_t fd, uint64_t len);
 /* lseek(2) `off` from `whence` (0 start, 1 current, 2 end): the new

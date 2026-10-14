@@ -55,6 +55,301 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
     status(core::intrinsics::sys_write_file(bytes_of(path.as_ref()), data))
 }
 
+/// The `mode: 0o000666` field of the `OpenOptions` Debug form.
+struct CreateMode;
+
+impl fmt::Debug for CreateMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("0o000666")
+    }
+}
+
+/// Options for opening a file: access, creation, and truncation, as
+/// std validates and applies them on Linux.
+#[derive(Clone)]
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
+    create_new: bool,
+}
+
+impl OpenOptions {
+    /// A blank set of options, ready to configure.
+    pub fn new() -> OpenOptions {
+        OpenOptions { read: false, write: false, append: false, truncate: false, create: false, create_new: false }
+    }
+
+    /// Read access.
+    pub fn read(&mut self, read: bool) -> &mut OpenOptions {
+        self.read = read;
+        self
+    }
+
+    /// Write access.
+    pub fn write(&mut self, write: bool) -> &mut OpenOptions {
+        self.write = write;
+        self
+    }
+
+    /// Append access: writes go to the end of the file.
+    pub fn append(&mut self, append: bool) -> &mut OpenOptions {
+        self.append = append;
+        self
+    }
+
+    /// Truncate the file to empty on open.
+    pub fn truncate(&mut self, truncate: bool) -> &mut OpenOptions {
+        self.truncate = truncate;
+        self
+    }
+
+    /// Create the file when it does not exist.
+    pub fn create(&mut self, create: bool) -> &mut OpenOptions {
+        self.create = create;
+        self
+    }
+
+    /// Create the file, failing when it already exists.
+    pub fn create_new(&mut self, create_new: bool) -> &mut OpenOptions {
+        self.create_new = create_new;
+        self
+    }
+
+    /// Opens the file with these options.
+    pub fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+        let path: &Path = path.as_ref();
+        let bytes = bytes_of(path);
+        if bytes.contains(&0) {
+            return match status(-1) {
+                Ok(()) => unreachable!(),
+                Err(e) => Err(e),
+            };
+        }
+        if (self.truncate && (self.append || !self.write)) || ((self.create || self.create_new) && !self.write && !self.append) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "creating or truncating a file requires write or append access"));
+        }
+        if !self.read && !self.write && !self.append {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "must specify at least one of read, write, or append access"));
+        }
+        // std's access_mode: append dominates write.
+        let access: i32 = if self.append {
+            if self.read { 2 } else { 1 }
+        } else if self.read && self.write {
+            2
+        } else if self.write {
+            1
+        } else {
+            0
+        };
+        let mut flags = access;
+        if self.create || self.create_new {
+            flags |= 4;
+        }
+        if self.truncate {
+            flags |= 8;
+        }
+        if self.append {
+            flags |= 16;
+        }
+        if self.create_new {
+            flags |= 32;
+        }
+        let fd = core::intrinsics::sys_fd_open(bytes, flags);
+        if fd < 0 {
+            Err(io::Error::from_raw_os_error(-fd))
+        } else {
+            Ok(File { fd, read: access != 1, write: access != 0 })
+        }
+    }
+}
+
+/// The inner struct of the `OpenOptions` Debug form.
+struct OpenOptionsInner<'a>(&'a OpenOptions);
+
+impl fmt::Debug for OpenOptionsInner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("read", &self.0.read)
+            .field("write", &self.0.write)
+            .field("append", &self.0.append)
+            .field("truncate", &self.0.truncate)
+            .field("create", &self.0.create)
+            .field("create_new", &self.0.create_new)
+            .field("custom_flags", &0)
+            .field("mode", &CreateMode)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("OpenOptions").field(&OpenOptionsInner(self)).finish()
+    }
+}
+
+/// An open file. Dropping it closes the descriptor.
+pub struct File {
+    fd: i32,
+    read: bool,
+    write: bool,
+}
+
+impl File {
+    /// Opens a file for reading.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
+        OpenOptions::new().read(true).open(path)
+    }
+
+    /// Creates a file for writing, truncating it when it exists.
+    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
+        OpenOptions::new().write(true).create(true).truncate(true).open(path)
+    }
+
+    /// Creates a file for writing, failing when it already exists.
+    pub fn create_new<P: AsRef<Path>>(path: P) -> io::Result<File> {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+
+    /// A blank `OpenOptions`, as a starting point.
+    pub fn options() -> OpenOptions {
+        OpenOptions::new()
+    }
+
+    /// A new handle to the same open file (they share the position).
+    pub fn try_clone(&self) -> io::Result<File> {
+        let fd = core::intrinsics::sys_fd_dup(self.fd);
+        if fd < 0 {
+            Err(io::Error::from_raw_os_error(-fd))
+        } else {
+            Ok(File { fd, read: self.read, write: self.write })
+        }
+    }
+
+    /// Flushes the file's data and metadata to storage.
+    pub fn sync_all(&self) -> io::Result<()> {
+        status(core::intrinsics::sys_fd_sync(self.fd))
+    }
+
+    /// Flushes the file's data to storage.
+    pub fn sync_data(&self) -> io::Result<()> {
+        status(core::intrinsics::sys_fd_sync_data(self.fd))
+    }
+
+    /// Sets the file's length (extending with zeros, or truncating).
+    pub fn set_len(&self, size: u64) -> io::Result<()> {
+        status(core::intrinsics::sys_fd_truncate(self.fd, size))
+    }
+
+    /// The file's metadata.
+    pub fn metadata(&self) -> io::Result<Metadata> {
+        let mut raw: Vec<u8> = Vec::new();
+        if let Err(e) = status(core::intrinsics::sys_fd_stat(self.fd, &mut raw)) {
+            return Err(e);
+        }
+        Ok(metadata_from_raw(&raw))
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            let _ = core::intrinsics::sys_fd_close(self.fd);
+        }
+    }
+}
+
+impl fmt::Debug for File {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let link = format!("/proc/self/fd/{}", self.fd);
+        let mut raw: Vec<u8> = Vec::new();
+        let _ = core::intrinsics::sys_readlink(core::intrinsics::sys_str_as_bytes(&link), &mut raw);
+        f.debug_struct("File")
+            .field("fd", &self.fd)
+            .field("path", &PathBuf::from_os_string(OsString::from_vec(raw)))
+            .field("read", &self.read)
+            .field("write", &self.write)
+            .finish()
+    }
+}
+
+/// Reserves std's `File::read_to_end` size hint: the metadata
+/// length past the current position.
+fn file_hint_reserve(file: &File, buf: &mut Vec<u8>) {
+    if let Ok(m) = file.metadata() {
+        if let Ok(pos) = io::seek_fd(file.fd, io::SeekFrom::Current(0)) {
+            let left = m.len().saturating_sub(pos) as usize;
+            if left > 0 {
+                buf.reserve(left);
+            }
+        }
+    }
+}
+
+impl io::Read for File {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::read_fd(self.fd, buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        file_hint_reserve(self, buf);
+        io::read_to_end_default(self, buf)
+    }
+}
+
+impl io::Read for &File {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::read_fd(self.fd, buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        file_hint_reserve(self, buf);
+        io::read_to_end_default(self, buf)
+    }
+}
+
+impl io::Write for File {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::write_fd(self.fd, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Write for &File {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::write_fd(self.fd, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Seek for File {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        io::seek_fd(self.fd, pos)
+    }
+}
+
+impl io::Seek for &File {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        io::seek_fd(self.fd, pos)
+    }
+}
+
+impl From<File> for crate::process::Stdio {
+    fn from(mut file: File) -> crate::process::Stdio {
+        let fd = file.fd;
+        file.fd = -1;
+        crate::process::Stdio::from_fd(fd)
+    }
+}
+
 /// Creates one directory (mode 0777 before the umask).
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     status(core::intrinsics::sys_path_op(bytes_of(path.as_ref()), 0))
@@ -295,12 +590,8 @@ impl Metadata {
     }
 }
 
-/// stat (follow) or lstat of a path.
-fn stat(path: &Path, follow: bool) -> io::Result<Metadata> {
-    let mut raw: Vec<u8> = Vec::new();
-    if let Err(e) = status(core::intrinsics::sys_stat(bytes_of(path), follow, &mut raw)) {
-        return Err(e);
-    }
+/// The metadata from the runtime's 8-byte stat fields.
+fn metadata_from_raw(raw: &[u8]) -> Metadata {
     let field = |i: usize| {
         let mut v: u64 = 0;
         for k in 0..8 {
@@ -308,7 +599,16 @@ fn stat(path: &Path, follow: bool) -> io::Result<Metadata> {
         }
         v
     };
-    Ok(Metadata { mode: field(0), len: field(1) })
+    Metadata { mode: field(0), len: field(1) }
+}
+
+/// stat (follow) or lstat of a path.
+fn stat(path: &Path, follow: bool) -> io::Result<Metadata> {
+    let mut raw: Vec<u8> = Vec::new();
+    if let Err(e) = status(core::intrinsics::sys_stat(bytes_of(path), follow, &mut raw)) {
+        return Err(e);
+    }
+    Ok(metadata_from_raw(&raw))
 }
 
 /// The metadata of a path, following symlinks.

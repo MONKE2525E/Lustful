@@ -54,6 +54,8 @@ int32_t lust_sys_fd_dup(int32_t fd) {
 
 int32_t lust_sys_fd_sync(int32_t fd) { return fsync(fd) == 0 ? 0 : errno; }
 
+int32_t lust_sys_fd_sync_data(int32_t fd) { return fdatasync(fd) == 0 ? 0 : errno; }
+
 int32_t lust_sys_fd_truncate(int32_t fd, uint64_t len) { return ftruncate(fd, (off_t)len) == 0 ? 0 : errno; }
 
 int64_t lust_sys_fd_seek(int32_t fd, int64_t off, int32_t whence) {
