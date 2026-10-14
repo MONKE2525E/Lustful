@@ -103,14 +103,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// of `gx.written_hash` and `gx.glue_methods`, so a key that reaches
     /// another written `Hash` or `PartialEq` impl (a generic one, say),
     /// or a lookup through a written `Borrow` impl the glue cannot call
-    /// (not in `gx.borrow_impls`), rejects with L0640.
-    /// A key that does not
-    /// implement the traits at all is the obligation queue's report.
+    /// (not in `gx.borrow_impls`), rejects with L0640. A key that does
+    /// not implement the traits at all is the obligation queue's L0612,
+    /// already reported at this span when this runs (`finish`).
     pub(super) fn check_hash_key(&mut self, k: Ty, q: Ty, span: Span) {
         let (k, q) = (self.deep(k), self.deep(q));
         let (k, q) = (self.normalize_here(k), self.normalize_here(q));
         let unknown = |cx: &Self, t: Ty| matches!(cx.kind(t), TyKind::Error | TyKind::Infer(_)) || cx.tys.flags(t).contains_param();
-        if unknown(self, k) || unknown(self, q) {
+        if unknown(self, k) || unknown(self, q) || self.errs.iter().any(|d| d.span == span) {
             return;
         }
         let p = self.p;
