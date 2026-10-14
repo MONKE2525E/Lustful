@@ -3426,6 +3426,7 @@ impl FnGen<'_, '_, '_> {
             | B::HashReserve
             | B::HashInto
             | B::HashOne
+            | B::BuildHasher
             | B::HasherCall => unreachable!("hash builtins emit in cgen/hash.rs"),
             B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce => {
                 unreachable!("split builtins emit in cgen/split.rs")

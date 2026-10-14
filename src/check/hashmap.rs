@@ -193,7 +193,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// `x.hash(&mut state)` (Hash::hash for core and derived impls),
-    /// `s.hash_one(x)` (BuildHasher), and Hasher methods on a concrete
+    /// `s.hash_one(x)` (BuildHasher), `s.build_hasher()` on std's
+    /// builders, and Hasher methods on a concrete
     /// hasher that lust's glue answers (DefaultHasher's, and the
     /// provided `write_*` of a user hasher; a written method is the
     /// impl's own fn, found before this). None for other calls.
@@ -230,6 +231,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.glue_hashable(at, self.span(args[0]));
                 self.set_res(e, Res::BuiltinMethod { b: B::HashOne, derefs, autoref: Autoref::Ref });
                 Some(int(IntTy::U64))
+            }
+            // std's builders (a user builder's written method is found
+            // before this): RandomState builds a DefaultHasher,
+            // BuildHasherDefault<H> an `H::default()`.
+            "build_hasher" if args.is_empty() && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+                let h = match hash_parts(&self.tys, base) {
+                    Some((HashTy::RandomState, _)) => mk_hash(&mut self.tys, HashTy::DefaultHasher, &[]),
+                    Some((HashTy::BuildHasherDefault, a)) if self.implements(lang.build_hasher, base) => a[0],
+                    _ => return None,
+                };
+                self.set_res(e, Res::BuiltinMethod { b: B::BuildHasher, derefs, autoref: Autoref::Ref });
+                Some(h)
             }
             m if HASHER_METHODS.contains(&m) && self.hash_trait_in_scope(lang.hasher, "Hasher") => {
                 // A concrete hasher only: a bound's methods are its stubs.

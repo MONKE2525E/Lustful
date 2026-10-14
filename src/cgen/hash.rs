@@ -602,6 +602,7 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::HashReserve
             | B::HashInto
             | B::HashOne
+            | B::BuildHasher
             | B::HasherCall
     )
 }
@@ -674,6 +675,17 @@ impl FnGen<'_, '_, '_> {
                     self.want(Glue::Drop, x);
                     let _ = writeln!(self.out, "    drop_{}(&{t}_x);", mangle(x));
                 }
+                Some(t)
+            }
+            // `s.build_hasher()`: (&S,), a std builder.
+            B::BuildHasher => {
+                let Some(CTy::Ref(s)) = tys.first() else { return Some("0".into()) };
+                let mut need = Vec::new();
+                let init = build_into(self.p, self.slots, s, &format!("({})", vals[0]), &t, &mut |g, c| need.push((g, c.clone())));
+                for (g, c) in need {
+                    self.want(g, &c);
+                }
+                let _ = writeln!(self.out, "    {init}");
                 Some(t)
             }
             // A Hasher method, picked by its argument (check/mod.rs `HasherCall`).

@@ -547,6 +547,9 @@ pub enum Builtin {
     /// `BuildHasher::hash_one(&self, x)`: build a hasher, hash `x`,
     /// finish (W-STD-B).
     HashOne,
+    /// `BuildHasher::build_hasher(&self)` on RandomState or
+    /// BuildHasherDefault<H> (W-STD-B).
+    BuildHasher,
     /// A Hasher method on a concrete hasher (DefaultHasher, or a user
     /// hasher's provided `write_*`): the method is read off the
     /// argument (none: `finish`; `&[u8]`: `write`; an integer: its
