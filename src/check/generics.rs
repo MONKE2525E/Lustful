@@ -6447,6 +6447,25 @@ pub fn add_synthetic_impls(p: &mut Program) {
             insert_synthetic(p, &mut ordinal, lang.default, self_pat, &[], gd, Vec::new(), Synthetic::Lang, false, span);
             let gf = g(p, lang.debug, &elems);
             insert_synthetic(p, &mut ordinal, lang.debug, self_pat, &[], gf, Vec::new(), Synthetic::Lang, false, span);
+            // PartialEq and Eq (Rhs = Self): the keys `Eq + Hash`, a
+            // map's values PartialEq (Eq), `S: BuildHasher`.
+            for tr in [lang.partial_eq, lang.eq] {
+                let rhs = |p: &mut Program, tr: DefId, t: Ty| {
+                    let mut a = vec![GenericArg::Ty(t)];
+                    if tr == lang.partial_eq {
+                        a.push(GenericArg::Ty(t));
+                    }
+                    let args = p.tys.intern_args(&a);
+                    Predicate::Trait(Binder::plain(TraitRef { def: tr, args, bindings: EMPTY_BINDINGS }))
+                };
+                let mut preds = vec![pred_on(p, lang.eq, elems[0]), pred_on(p, lang.hash, elems[0]), pred_on(p, lang.build_hasher, s)];
+                if let Some(&v) = elems.get(1) {
+                    preds.push(rhs(p, tr, v));
+                }
+                let ge = Generics { parent: None, params: params.clone(), predicates: preds };
+                let rest: Vec<Ty> = if tr == lang.partial_eq { vec![self_pat] } else { Vec::new() };
+                insert_synthetic(p, &mut ordinal, tr, self_pat, &rest, ge, Vec::new(), Synthetic::Lang, false, span);
+            }
         }
     }
     // The IntoIterator blanket: impl<I: Iterator> IntoIterator

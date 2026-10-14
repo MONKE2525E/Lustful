@@ -5193,6 +5193,16 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_eq(p, tys, a, seen) && glue_eq(p, tys, b, seen);
             }
+            // HashMap and HashSet (W-STD-B): keys the glue hashes and
+            // compares, a map's values compared.
+            if let Some((k, args)) = crate::ty::hash::hash_parts(tys, t) {
+                use crate::ty::hash::HashTy;
+                return match k {
+                    HashTy::HashMap => has_hash(p, tys, args[0]) && glue_eq(p, tys, args[0], seen) && glue_eq(p, tys, args[1], seen),
+                    HashTy::HashSet => has_hash(p, tys, args[0]) && glue_eq(p, tys, args[0], seen),
+                    _ => false,
+                };
+            }
             match tys.local_adt(t) {
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,

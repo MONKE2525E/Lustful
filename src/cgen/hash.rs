@@ -459,6 +459,29 @@ fn eq_expr(p: &Program, t: &CTy, a: &str, b: &str, need: &mut dyn FnMut(Glue, &C
     }
 }
 
+/// The body of `uint8_t eq_<table>(T *a, T *b)`: std's PartialEq of a
+/// map or set. The lengths agree, and each element of `a`, in bucket
+/// order, is found in `b` by `b`'s builder (`other.get(k)`); a map's
+/// values then compare, `a`'s on the left.
+pub(super) fn table_eq_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let CTy::Hash(k, _) = t else { return "  return 0;\n".into() };
+    let (m, e) = (mangle(t), ctype(&elem_cty(t)));
+    need(Glue::HashKey, t);
+    need(Glue::HashEq, t);
+    let key = key_of(t, "x");
+    let mut s = format!(
+        "  if (lust_hash_len(&a->t) != lust_hash_len(&b->t)) return 0;\n  lust_hash_iter it; lust_hash_iter_init(&it, &a->t);\n  {e} *x;\n  while ((x = ({e}*)lust_hash_iter_next(&it, 0))) {{\n    {e} *y = ({e}*)lust_hash_find(&b->t, hk_{m}(&b->s, {key}), heq_{m}, (void*){key}, 0);\n    if (!y) return 0;\n"
+    );
+    if *k == HashTy::HashMap
+        && let CTy::Tuple(parts) = elem_cty(t)
+    {
+        let c = eq_expr(p, &parts[1], "(&x->f1)", "(&y->f1)", need);
+        let _ = writeln!(s, "    if (!{c}) return 0;");
+    }
+    s.push_str("  }\n  return 1;\n");
+    s
+}
+
 /// The drop glue body of a table: the builder first, then every
 /// element in bucket order (hashbrown's field order and drop loop).
 pub(super) fn drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {

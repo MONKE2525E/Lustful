@@ -7052,6 +7052,8 @@ fn glue_def(
             match t {
                 CTy::ExitCode => body.push_str("  return *a == *b;\n"),
                 CTy::AccessError => body.push_str("  return 1;\n"),
+                // HashMap and HashSet (W-STD-B, cgen/hash.rs).
+                CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::table_eq_body(p, t, &mut need)),
                 // `Cow<B>` compares the `B` views (W-STD-B).
                 _ if cow.0.is_some() => {
                     let ((rb, da), (_, db)) = (cow.0.clone().unwrap(), cow.1.clone().unwrap());
