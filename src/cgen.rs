@@ -2176,12 +2176,7 @@ impl FnGen<'_, '_, '_> {
             StmtKind::Print { stderr, newline, parts } => {
                 self.out.push_str("  {\n");
                 let mut post = Vec::new();
-                let s = self.format(parts, &loc, &mut post, if *stderr { 3 } else { 2 });
-                if *newline {
-                    let _ = writeln!(self.out, "    lust_string_push_bytes(&{s}, \"\\n\", 1);");
-                }
-                let f = if *stderr { "1" } else { "0" };
-                let _ = writeln!(self.out, "    lust_write({f}, &{s});");
+                self.print(parts, *newline, *stderr, &loc, &mut post);
                 self.out.push_str("  }\n");
             }
         }
@@ -6209,7 +6204,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
                 let _ = writeln!(c, "  int rc = 0;");
                 let _ = writeln!(
                     c,
-                    "  if ({disc}) {{ lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}{ok}",
+                    "  if ({disc}) {{ lust_sink k; lust_print_begin(&k, 1); lust_Formatter f; lust_f_init(&f, &k); lust_f_write(&f, \"Error: \", 7); (void)dbg_{}(&f, &{field}); lust_f_write(&f, \"\\n\", 1); lust_print_end(1); rc = 1; }}{ok}",
                     mangle(&ec)
                 );
             }

@@ -461,13 +461,43 @@ impl FnGen<'_, '_, '_> {
             return s;
         }
         let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, &{s}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
+        if self.format_parts(parts, &s, loc, post) {
+            let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
+        }
+        s
+    }
+
+    /// Emits `print!` (`eprint!` with `stderr`; `newline` for the `ln`
+    /// forms). As in std, each piece goes to the locked stream as it is
+    /// formatted: a print inside a fmt impl comes out between the pieces
+    /// around it, and the pieces before a fmt impl error stay written.
+    pub(super) fn print(&mut self, parts: &[FmtPart], newline: bool, stderr: bool, loc: &str, post: &mut Vec<String>) {
+        let s = self.tmp();
+        let fd = u8::from(stderr);
+        let _ = writeln!(self.out, "    lust_sink {s}k; lust_print_begin(&{s}k, {fd}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
+        let fallible = self.format_parts(parts, &s, loc, post);
+        let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
+        if newline {
+            let _ = writeln!(self.out, "    {guard}lust_f_write(&{s}f, \"\\n\", 1);");
+        }
+        if fallible {
+            let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed(2, {loc});");
+        }
+        let _ = writeln!(self.out, "    lust_print_end({fd});");
+    }
+
+    /// Emits the writes of `parts` through the Formatter `{s}f` the
+    /// caller set up, with its error flag `{s}e`: after a fmt impl
+    /// error nothing more is written, as `fmt::write` stops. Returns
+    /// whether any argument's impl can fail.
+    fn format_parts(&mut self, parts: &[FmtPart], s: &str, loc: &str, post: &mut Vec<String>) -> bool {
         let mut fallible = false;
         for part in parts {
             match part {
                 FmtPart::Lit(text) => {
                     if !text.is_empty() {
                         let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
-                        let _ = writeln!(self.out, "    {guard}lust_string_push_bytes(&{s}, {}, {});", c_string_lit(text.as_bytes()), text.len());
+                        let _ = writeln!(self.out, "    {guard}lust_f_write(&{s}f, {}, {});", c_string_lit(text.as_bytes()), text.len());
                     }
                 }
                 FmtPart::Arg { value, ty, spec, .. } => {
@@ -494,15 +524,7 @@ impl FnGen<'_, '_, '_> {
                 }
             }
         }
-        if fallible {
-            if what >= 2 {
-                // A print writes the pieces before the failing one, as Rust does.
-                let _ = writeln!(self.out, "    if ({s}e) lust_print_failed({}, &{s});", what - 2);
-            } else {
-                let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
-            }
-        }
-        s
+        fallible
     }
 }
 

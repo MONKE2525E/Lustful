@@ -16,6 +16,30 @@ void lust_sink_string(lust_sink *k, lust_String *s) {
     k->direct = s;
 }
 
+/* The sinks of `print!` and `eprint!`: std formats straight into its
+   locked Stdout (a LineWriter, panic.c `lust_print_out`) or its
+   unbuffered Stderr, so each piece is written as it is formatted. */
+static int lust_stdout_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
+    (void)k;
+    lust_print_out(p, n);
+    return 0;
+}
+
+static int lust_stderr_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
+    (void)k;
+    fwrite(p, 1, n, stderr);
+    fflush(stderr);
+    return 0;
+}
+
+void lust_print_begin(lust_sink *k, int to_stderr) {
+    flockfile(to_stderr ? stderr : stdout);
+    k->write = to_stderr ? lust_stderr_sink_write : lust_stdout_sink_write;
+    k->direct = NULL;
+}
+
+void lust_print_end(int to_stderr) { funlockfile(to_stderr ? stderr : stdout); }
+
 /* PadAdapter::write_str: indent at each line start, over
    `s.split_inclusive('\n')`. */
 static int lust_pad_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
