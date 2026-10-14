@@ -186,6 +186,17 @@ impl Ex<'_, '_, '_> {
         self.assign(Place::local(r), Rvalue::Ref(mutable, pl));
         r
     }
+    /// `dest = mem::replace(&mut *pl, None)`: an `Option::take` on a
+    /// place inside an iterator. A move out of the place plus an
+    /// assign of `None` would drop the moved-out value twice: drop
+    /// elaboration cannot track partial moves through a deref, so the
+    /// assign still drops the old contents.
+    fn take_none(&mut self, pl: Place, ty: Ty, dest: Place) {
+        let nl = self.local(ty);
+        self.none(&Place::local(nl), ty);
+        let r = self.ref_to(true, pl, ty);
+        self.call_builtin(Builtin::MemReplace, vec![Operand::Move(Place::local(r)), Operand::Move(Place::local(nl))], dest);
+    }
     fn some(&mut self, dest: &Place, opt_ty: Ty, v: Operand) {
         self.assign(dest.clone(), Rvalue::Opt(opt_ty, Some(v)));
     }
@@ -955,21 +966,42 @@ impl Ex<'_, '_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            K::Peekable if back => {
+                // `match self.peeked.as_mut() { Some(v @ Some(_)) => self.iter.next_back().or_else(|| v.take()),
+                //  Some(None) => None, None => self.iter.next_back() }`
+                let slot = f(1);
+                let (s, n) = self.switch_opt(&slot);
+                self.cur = n;
+                self.next(f(0), a[0], dest.clone(), true)?;
+                self.goto(join);
+                self.cur = s;
+                let inner = Self::payload(&slot);
+                let (full, spent) = self.switch_opt(&inner);
+                self.cur = spent;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = full;
+                let t = self.local(opt);
+                self.next(f(0), a[0], Place::local(t), true)?;
+                let (hit, miss) = self.switch_opt(&Place::local(t));
+                self.cur = hit;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.goto(join);
+                self.cur = miss;
+                self.take_none(inner.clone(), opt, dest.clone());
+                self.goto(join);
+            }
             K::Peekable => {
                 // `match self.peeked.take() { Some(v) => v, None => self.iter.next() }`
                 let slot = f(1);
                 let (s, n) = self.switch_opt(&slot);
                 self.cur = s;
                 let pty = self.place_ty(&slot)?;
-                let v = self.local(opt);
-                self.assign(Place::local(v), Rvalue::Use(Operand::Move(Self::payload(&slot))));
-                self.none(&slot, pty);
-                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(v))));
+                let o = self.local(pty);
+                self.take_none(slot.clone(), pty, Place::local(o));
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Self::payload(&Place::local(o)))));
                 self.goto(join);
                 self.cur = n;
-                if back {
-                    return Err("iterator expansion: Peekable is forward-only here".into());
-                }
                 self.next(f(0), a[0], dest, false)?;
                 self.goto(join);
             }
@@ -1015,35 +1047,901 @@ impl Ex<'_, '_, '_> {
         Ok(())
     }
 
-    /// `dest = itp.nth(n)`: pull and drop `n` items, then `next`.
-    fn nth(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
-        use crate::ast::BinOp::*;
+    /// A fresh local holding an operand's value.
+    fn copy_local(&mut self, v: Operand, ty: Ty) -> Local {
+        let l = self.local(ty);
+        self.assign(Place::local(l), Rvalue::Use(v));
+        l
+    }
+
+    /// A fresh local holding `v` cast to `ty` (Rust `as` semantics).
+    fn cast_local(&mut self, v: Operand, ty: Ty) -> Local {
+        let l = self.local(ty);
+        self.assign(Place::local(l), Rvalue::Cast(v, ty));
+        l
+    }
+
+    /// The wide type range step math runs in, with the element's int
+    /// type: `i128` for elements up to 64 bits (every sum and
+    /// difference of two elements and a `usize` fits), `u128` bit
+    /// patterns for 128-bit elements (Rust's wrapping step math).
+    fn wide_ty(&self, elem: Ty) -> Result<(Ty, IntTy), String> {
+        let TyKind::Int(it) = self.body.tys.kind(elem) else {
+            return Err("iterator expansion: range over a non-integer".into());
+        };
+        Ok((if it.bits() <= 64 { int(IntTy::I128) } else { int(IntTy::U128) }, it))
+    }
+
+    /// Wide `a + b` or `a - b`: plain in `i128` (cannot overflow, see
+    /// `wide_ty`), wrapping in `u128`.
+    fn wide_bin(&mut self, sub: bool, a: Local, b: Local, w: Ty) -> Local {
+        let l = self.local(w);
+        if w == int(IntTy::I128) {
+            let op = if sub { crate::ast::BinOp::Sub } else { crate::ast::BinOp::Add };
+            self.assign(Place::local(l), Rvalue::Bin(op, Operand::Copy(Place::local(a)), Operand::Copy(Place::local(b))));
+        } else {
+            let f = if sub { Builtin::WrappingSub } else { Builtin::WrappingAdd };
+            self.call_builtin(f, vec![Operand::Copy(Place::local(a)), Operand::Copy(Place::local(b))], Place::local(l));
+        }
+        l
+    }
+
+    /// The element type's MAX or MIN as a wide local.
+    fn wide_bound(&mut self, it: IntTy, w: Ty, max: bool) -> Local {
+        let bits = it.bits();
+        let max_v: u128 = if it.signed() { (1u128 << (bits - 1)) - 1 } else if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
+        let wit = if w == int(IntTy::I128) { IntTy::I128 } else { IntTy::U128 };
+        let max_l = self.copy_local(Operand::Const(Const::Int(max_v, wit)), w);
+        if max {
+            return max_l;
+        }
+        // MIN: -MAX - 1 in signed wide math; MAX + 1 in `u128` patterns
+        // (0 for unsigned elements, the sign bit for `i128`).
+        let one = self.cast_local(Self::usize_c(1), w);
+        if w == int(IntTy::I128) {
+            let zero = self.copy_local(Operand::Const(Const::Int(0, IntTy::I128)), w);
+            let neg = self.wide_bin(true, zero, max_l, w);
+            self.wide_bin(true, neg, one, w)
+        } else {
+            self.wide_bin(false, max_l, one, w)
+        }
+    }
+
+    /// The default `nth`: `advance_by(n)` then `next` (or the back
+    /// forms), as in Rust's `Iterator` and `DoubleEndedIterator`.
+    fn nth_via_advance(&mut self, itp: Place, ty: Ty, n: Local, dest: Place, back: bool) -> R {
         let item = self.item(ty)?;
         let opt = self.body.tys.mk_option(item);
         let join = self.block();
+        let rem = if back { self.advance_back(itp.clone(), ty, n)? } else { self.advance(itp.clone(), ty, n)? };
+        let z = self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+        let (go, no) = self.branch(z);
+        self.cur = go;
+        self.next(itp, ty, dest.clone(), back)?;
+        self.goto(join);
+        self.cur = no;
+        self.none(&dest, opt);
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// `dest = itp.nth(n)`, with Rust 1.99's per-kind overrides: the
+    /// adapters Rust delegates through (`Skip`, `Take`, `Enumerate`,
+    /// `Rev`, `Peekable`, `Copied`, `Chain`, `StepBy`) and the O(1)
+    /// range forms. Other kinds take the default via `advance`.
+    fn nth(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let item = self.item(ty)?;
+        let opt = self.body.tys.mk_option(item);
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.nth_via_advance(itp, ty, n, dest, false);
+        };
+        let join = self.block();
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range => {
+                // `spec_nth`: `start + n` checked, else `start = end`.
+                let (w, _) = self.wide_ty(a[0])?;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let fail = self.block();
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, no) = self.branch(c);
+                self.cur = no;
+                self.goto(fail);
+                self.cur = go;
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let c2 = self.cmp(Lt, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(steps)));
+                let (hit, miss) = self.branch(c2);
+                self.cur = miss;
+                self.goto(fail);
+                self.cur = hit;
+                let plus = self.wide_bin(false, ws, wn, w);
+                let v = self.cast_local(Operand::Copy(Place::local(plus)), a[0]);
+                let one_w = self.cast_local(Self::usize_c(1), w);
+                let ns_w = self.wide_bin(false, plus, one_w, w);
+                let ns = self.cast_local(Operand::Copy(Place::local(ns_w)), a[0]);
+                self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(ns))));
+                self.some(&dest, opt, Operand::Copy(Place::local(v)));
+                self.goto(join);
+                self.cur = fail;
+                self.assign(f(0), Rvalue::Use(Operand::Copy(f(1))));
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::RangeInclusive => {
+                // Rust's overflowing form: the state advances by
+                // `n + 1` wrapping steps whether or not an item comes
+                // out; the result needs `start + n <= end` exactly.
+                let (w, it) = self.wide_ty(a[0])?;
+                let none_b = self.block();
+                let (ex, live) = self.branch(Operand::Copy(f(2)));
+                self.cur = ex;
+                self.goto(none_b);
+                self.cur = live;
+                let c = self.cmp(Le, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, empty) = self.branch(c);
+                self.cur = empty;
+                self.goto(none_b);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let plus = self.wide_bin(false, ws, wn, w);
+                let one_w = self.cast_local(Self::usize_c(1), w);
+                let ns_w = self.wide_bin(false, plus, one_w, w);
+                let ns = self.cast_local(Operand::Copy(Place::local(ns_w)), a[0]);
+                let maxw = self.wide_bound(it, w, true);
+                let to_max = self.wide_bin(true, maxw, ws, w);
+                // The new start, both paths; exhausted is set on the
+                // hit path when `plus` is MAX, on the miss path when
+                // the step overflowed or `plus` is MAX.
+                let le = self.cmp(Le, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(steps)));
+                let (hit, miss) = self.branch(le);
+                self.cur = hit;
+                self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(ns))));
+                let ismax = self.cmp(Eq, Operand::Copy(Place::local(plus)), Operand::Copy(Place::local(maxw)));
+                let (atmax, below) = self.branch(ismax);
+                let ret = self.block();
+                self.cur = atmax;
+                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+                self.goto(ret);
+                self.cur = below;
+                self.goto(ret);
+                self.cur = ret;
+                let v = self.cast_local(Operand::Copy(Place::local(plus)), a[0]);
+                self.some(&dest, opt, Operand::Copy(Place::local(v)));
+                self.goto(join);
+                self.cur = miss;
+                self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(ns))));
+                let on = self.cmp(Gt, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(to_max)));
+                let ismax = self.cmp(Eq, Operand::Copy(Place::local(plus)), Operand::Copy(Place::local(maxw)));
+                let set_ex = self.block();
+                let (onb, offb) = self.branch(on);
+                self.cur = onb;
+                self.goto(set_ex);
+                self.cur = offb;
+                let (maxb, plain) = self.branch(ismax);
+                self.cur = maxb;
+                self.goto(set_ex);
+                self.cur = plain;
+                self.goto(none_b);
+                self.cur = set_ex;
+                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+                self.goto(none_b);
+                self.cur = none_b;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::Skip => {
+                let c = self.cmp(Gt, Operand::Copy(f(1)), Self::usize_c(0));
+                let (skip_b, plain) = self.branch(c);
+                self.cur = plain;
+                self.nth(f(0), a[0], n, dest.clone())?;
+                self.goto(join);
+                self.cur = skip_b;
+                let skip = self.copy_local(Operand::Copy(f(1)), USIZE);
+                self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                let ou = self.body.tys.mk_option(USIZE);
+                let sum = self.local(ou);
+                self.call_builtin(Builtin::CheckedAdd, vec![Operand::Copy(Place::local(skip)), Operand::Copy(Place::local(n))], Place::local(sum));
+                let (fits, over) = self.switch_opt(&Place::local(sum));
+                self.cur = fits;
+                let tot = self.copy_local(Operand::Copy(Self::payload(&Place::local(sum))), USIZE);
+                self.nth(f(0), a[0], tot, dest.clone())?;
+                self.goto(join);
+                self.cur = over;
+                // Overflow: a first `nth(skip - 1)`, dropped, must hit.
+                let s1 = self.local(USIZE);
+                self.assign(Place::local(s1), Rvalue::Bin(Sub, Operand::Copy(Place::local(skip)), Self::usize_c(1)));
+                let t = self.local(opt);
+                self.nth(f(0), a[0], s1, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = no;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s;
+                self.drop_local(t);
+                self.nth(f(0), a[0], n, dest.clone())?;
+                self.goto(join);
+            }
+            K::Take => {
+                let c = self.cmp(Gt, Operand::Copy(f(1)), Operand::Copy(Place::local(n)));
+                let (go, stop) = self.branch(c);
+                self.cur = go;
+                let n1 = self.local(USIZE);
+                self.assign(Place::local(n1), Rvalue::Bin(Add, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+                self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Operand::Copy(Place::local(n1))));
+                self.nth(f(0), a[0], n, dest.clone())?;
+                self.goto(join);
+                self.cur = stop;
+                let c2 = self.cmp(Gt, Operand::Copy(f(1)), Self::usize_c(0));
+                let (drain, done) = self.branch(c2);
+                self.cur = drain;
+                let m1 = self.local(USIZE);
+                self.assign(Place::local(m1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                let t = self.local(opt);
+                self.nth(f(0), a[0], m1, Place::local(t))?;
+                self.drop_local(t);
+                self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                self.goto(done);
+                self.cur = done;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::Enumerate => {
+                let ii = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(ii);
+                let t = self.local(iopt);
+                self.nth(f(0), a[0], n, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = no;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s;
+                let i = self.local(USIZE);
+                self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(n))));
+                self.assign(f(1), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+                let px = self.take(Self::payload(&Place::local(t)), ii);
+                let tup = self.local(item);
+                self.assign(Place::local(tup), Rvalue::TupleAgg(item, vec![Operand::Copy(Place::local(i)), px]));
+                let at = self.take(Place::local(tup), item);
+                self.some(&dest, opt, at);
+                self.goto(join);
+            }
+            K::Rev => {
+                self.nth_back(f(0), a[0], n, dest)?;
+                self.goto(join);
+            }
+            K::Copied => {
+                let ii = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(ii);
+                let t = self.local(iopt);
+                self.nth(f(0), a[0], n, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                self.some(&dest, opt, Operand::Copy(Self::payload(&Place::local(t)).deref()));
+                self.goto(join);
+                self.cur = no;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::Peekable => {
+                let slot = f(1);
+                let pty = self.place_ty(&slot)?;
+                let (full, empty) = self.switch_opt(&slot);
+                self.cur = empty;
+                self.nth(f(0), a[0], n, dest.clone())?;
+                self.goto(join);
+                self.cur = full;
+                let inner = Self::payload(&slot);
+                let (some, spent) = self.switch_opt(&inner);
+                self.cur = spent;
+                self.none(&slot, pty);
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = some;
+                // The peeked item is taken out now; on the `n > 0`
+                // path it drops after the inner `nth`, as in Rust.
+                let o = self.local(pty);
+                self.take_none(slot.clone(), pty, Place::local(o));
+                let v = self.local(item);
+                let pv = self.take(Self::payload(&Self::payload(&Place::local(o))), item);
+                self.assign(Place::local(v), Rvalue::Use(pv));
+                let z = self.cmp(Eq, Operand::Copy(Place::local(n)), Self::usize_c(0));
+                let (zero, more) = self.branch(z);
+                self.cur = zero;
+                let av = self.take(Place::local(v), item);
+                self.some(&dest, opt, av);
+                self.goto(join);
+                self.cur = more;
+                let n1 = self.local(USIZE);
+                self.assign(Place::local(n1), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+                self.nth(f(0), a[0], n1, dest.clone())?;
+                self.drop_local(v);
+                self.goto(join);
+            }
+            K::Chain => {
+                let aty = self.place_ty(&f(0))?;
+                let n2 = self.local(USIZE);
+                let bside = self.block();
+                let (asome, anone) = self.switch_opt(&f(0));
+                self.cur = anone;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(bside);
+                self.cur = asome;
+                let rem = self.advance(Self::payload(&f(0)), a[0], n)?;
+                let z = self.cmp(Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+                let (adv_ok, adv_err) = self.branch(z);
+                self.cur = adv_err;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(rem))));
+                self.none(&f(0), aty);
+                self.goto(bside);
+                self.cur = adv_ok;
+                let t = self.local(opt);
+                self.next(Self::payload(&f(0)), a[0], Place::local(t), false)?;
+                let (hit, miss) = self.switch_opt(&Place::local(t));
+                self.cur = hit;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.goto(join);
+                self.cur = miss;
+                self.assign(Place::local(n2), Rvalue::Use(Self::usize_c(0)));
+                self.none(&f(0), aty);
+                self.goto(bside);
+                self.cur = bside;
+                let (bs, bn) = self.switch_opt(&f(1));
+                self.cur = bn;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = bs;
+                self.nth(Self::payload(&f(1)), a[1], n2, dest.clone())?;
+                self.goto(join);
+            }
+            K::StepBy if !self.stepby_range_spec(a[0]) => {
+                // The general `spec_nth`: the first item, then one
+                // inner `nth((n + 1) * step - 1)`, chunked on overflow.
+                // An inner unsigned range takes Rust's other spec,
+                // whose `nth` is the default loop (the `_` arm).
+                let m = self.copy_local(Operand::Copy(Place::local(n)), USIZE);
+                let step = self.local(USIZE);
+                self.assign(Place::local(step), Rvalue::Bin(Add, Operand::Copy(f(1)), Self::usize_c(1)));
+                let body = self.block();
+                let (first, later) = self.branch(Operand::Copy(f(2)));
+                self.cur = later;
+                self.goto(body);
+                self.cur = first;
+                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(false))));
+                let t = self.local(opt);
+                self.next(f(0), a[0], Place::local(t), false)?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = no;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s;
+                let z = self.cmp(Eq, Operand::Copy(Place::local(m)), Self::usize_c(0));
+                let (zero, more) = self.branch(z);
+                self.cur = zero;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.goto(join);
+                self.cur = more;
+                self.drop_local(t);
+                self.assign(Place::local(m), Rvalue::Bin(Sub, Operand::Copy(Place::local(m)), Self::usize_c(1)));
+                self.goto(body);
+                self.cur = body;
+                let after_max = self.block();
+                let mx = self.cmp(Eq, Operand::Copy(Place::local(m)), Self::usize_c(u64::MAX));
+                let (is_max, not_max) = self.branch(mx);
+                self.cur = not_max;
+                self.assign(Place::local(m), Rvalue::Bin(Add, Operand::Copy(Place::local(m)), Self::usize_c(1)));
+                self.goto(after_max);
+                self.cur = is_max;
+                let sm1 = self.copy_local(Operand::Copy(f(1)), USIZE);
+                let t2 = self.local(opt);
+                self.nth(f(0), a[0], sm1, Place::local(t2))?;
+                let (s2, no2) = self.switch_opt(&Place::local(t2));
+                self.cur = no2;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s2;
+                self.drop_local(t2);
+                self.goto(after_max);
+                self.cur = after_max;
+                let lp = self.block();
+                self.goto(lp);
+                self.cur = lp;
+                let ou = self.body.tys.mk_option(USIZE);
+                let mul = self.local(ou);
+                self.call_builtin(Builtin::CheckedMul, vec![Operand::Copy(Place::local(m)), Operand::Copy(Place::local(step))], Place::local(mul));
+                let (fits, over) = self.switch_opt(&Place::local(mul));
+                self.cur = fits;
+                let tot = self.local(USIZE);
+                self.assign(Place::local(tot), Rvalue::Bin(Sub, Operand::Copy(Self::payload(&Place::local(mul))), Self::usize_c(1)));
+                self.nth(f(0), a[0], tot, dest.clone())?;
+                self.goto(join);
+                self.cur = over;
+                let (div_n, div_step) = (self.local(USIZE), self.local(USIZE));
+                self.assign(Place::local(div_n), Rvalue::Bin(Div, Self::usize_c(u64::MAX), Operand::Copy(Place::local(m))));
+                self.assign(Place::local(div_step), Rvalue::Bin(Div, Self::usize_c(u64::MAX), Operand::Copy(Place::local(step))));
+                let (nth_n, nth_step) = (self.local(USIZE), self.local(USIZE));
+                self.assign(Place::local(nth_n), Rvalue::Bin(Mul, Operand::Copy(Place::local(div_n)), Operand::Copy(Place::local(m))));
+                self.assign(Place::local(nth_step), Rvalue::Bin(Mul, Operand::Copy(Place::local(div_step)), Operand::Copy(Place::local(step))));
+                let chunk = self.local(USIZE);
+                let pick = self.cmp(Gt, Operand::Copy(Place::local(nth_n)), Operand::Copy(Place::local(nth_step)));
+                let (use_n, use_step) = self.branch(pick);
+                let go = self.block();
+                self.cur = use_n;
+                self.assign(Place::local(step), Rvalue::Bin(Sub, Operand::Copy(Place::local(step)), Operand::Copy(Place::local(div_n))));
+                self.assign(Place::local(chunk), Rvalue::Use(Operand::Copy(Place::local(nth_n))));
+                self.goto(go);
+                self.cur = use_step;
+                self.assign(Place::local(m), Rvalue::Bin(Sub, Operand::Copy(Place::local(m)), Operand::Copy(Place::local(div_step))));
+                self.assign(Place::local(chunk), Rvalue::Use(Operand::Copy(Place::local(nth_step))));
+                self.goto(go);
+                self.cur = go;
+                let c1 = self.local(USIZE);
+                self.assign(Place::local(c1), Rvalue::Bin(Sub, Operand::Copy(Place::local(chunk)), Self::usize_c(1)));
+                let t3 = self.local(opt);
+                self.nth(f(0), a[0], c1, Place::local(t3))?;
+                let (s3, no3) = self.switch_opt(&Place::local(t3));
+                self.cur = no3;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s3;
+                self.drop_local(t3);
+                self.goto(lp);
+            }
+            _ => {
+                self.nth_via_advance(itp, ty, n, dest, false)?;
+                self.goto(join);
+            }
+        }
+        self.cur = join;
+        Ok(())
+    }
+
+    /// True when Rust 1.99 specializes `StepBy` over this inner type
+    /// (an unsigned `Range` up to `usize` wide): its `nth` then pulls
+    /// item by item instead of delegating.
+    fn stepby_range_spec(&self, ty: Ty) -> bool {
+        use IterKind as K;
+        let Some((K::Range, a)) = self.kind_args(ty) else { return false };
+        matches!(self.body.tys.kind(a[0]), TyKind::Int(IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Usize))
+    }
+
+    /// `dest = itp.nth_back(n)`: the back form of `nth`, used by
+    /// `Rev::nth`. Only the kinds check marks double-ended reach
+    /// here; of those, Rust delegates for `Rev` and `Chain` and the
+    /// ranges are O(1). The rest take the default via `advance_back`.
+    fn nth_back(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let item = self.item(ty)?;
+        let opt = self.body.tys.mk_option(item);
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.nth_via_advance(itp, ty, n, dest, true);
+        };
+        let join = self.block();
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range => {
+                // `spec_nth_back`: `end - n` checked against `start`,
+                // else `end = start`.
+                let (w, _) = self.wide_ty(a[0])?;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let fail = self.block();
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, no) = self.branch(c);
+                self.cur = no;
+                self.goto(fail);
+                self.cur = go;
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let c2 = self.cmp(Lt, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(steps)));
+                let (hit, miss) = self.branch(c2);
+                self.cur = miss;
+                self.goto(fail);
+                self.cur = hit;
+                let minus = self.wide_bin(true, we, wn, w);
+                let one_w = self.cast_local(Self::usize_c(1), w);
+                let ne_w = self.wide_bin(true, minus, one_w, w);
+                let v = self.cast_local(Operand::Copy(Place::local(ne_w)), a[0]);
+                self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(v))));
+                self.some(&dest, opt, Operand::Copy(Place::local(v)));
+                self.goto(join);
+                self.cur = fail;
+                self.assign(f(1), Rvalue::Use(Operand::Copy(f(0))));
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::RangeInclusive => {
+                // The back form of the inclusive `nth` above.
+                let (w, it) = self.wide_ty(a[0])?;
+                let none_b = self.block();
+                let (ex, live) = self.branch(Operand::Copy(f(2)));
+                self.cur = ex;
+                self.goto(none_b);
+                self.cur = live;
+                let c = self.cmp(Le, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, empty) = self.branch(c);
+                self.cur = empty;
+                self.goto(none_b);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let minus = self.wide_bin(true, we, wn, w);
+                let one_w = self.cast_local(Self::usize_c(1), w);
+                let ne_w = self.wide_bin(true, minus, one_w, w);
+                let ne = self.cast_local(Operand::Copy(Place::local(ne_w)), a[0]);
+                let minw = self.wide_bound(it, w, false);
+                let from_min = self.wide_bin(true, we, minw, w);
+                let le = self.cmp(Le, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(steps)));
+                let (hit, miss) = self.branch(le);
+                self.cur = hit;
+                self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(ne))));
+                let ismin = self.cmp(Eq, Operand::Copy(Place::local(minus)), Operand::Copy(Place::local(minw)));
+                let (atmin, above) = self.branch(ismin);
+                let ret = self.block();
+                self.cur = atmin;
+                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+                self.goto(ret);
+                self.cur = above;
+                self.goto(ret);
+                self.cur = ret;
+                let v = self.cast_local(Operand::Copy(Place::local(minus)), a[0]);
+                self.some(&dest, opt, Operand::Copy(Place::local(v)));
+                self.goto(join);
+                self.cur = miss;
+                self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(ne))));
+                let on = self.cmp(Gt, Operand::Copy(Place::local(wn)), Operand::Copy(Place::local(from_min)));
+                let ismin = self.cmp(Eq, Operand::Copy(Place::local(minus)), Operand::Copy(Place::local(minw)));
+                let set_ex = self.block();
+                let (onb, offb) = self.branch(on);
+                self.cur = onb;
+                self.goto(set_ex);
+                self.cur = offb;
+                let (minb, plain) = self.branch(ismin);
+                self.cur = minb;
+                self.goto(set_ex);
+                self.cur = plain;
+                self.goto(none_b);
+                self.cur = set_ex;
+                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+                self.goto(none_b);
+                self.cur = none_b;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::Rev => {
+                self.nth(f(0), a[0], n, dest)?;
+                self.goto(join);
+            }
+            K::Copied => {
+                let ii = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(ii);
+                let t = self.local(iopt);
+                self.nth_back(f(0), a[0], n, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                self.some(&dest, opt, Operand::Copy(Self::payload(&Place::local(t)).deref()));
+                self.goto(join);
+                self.cur = no;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            K::Chain => {
+                let bty = self.place_ty(&f(1))?;
+                let n2 = self.local(USIZE);
+                let aside = self.block();
+                let (bsome, bnone) = self.switch_opt(&f(1));
+                self.cur = bnone;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(aside);
+                self.cur = bsome;
+                let rem = self.advance_back(Self::payload(&f(1)), a[1], n)?;
+                let z = self.cmp(Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+                let (adv_ok, adv_err) = self.branch(z);
+                self.cur = adv_err;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(rem))));
+                self.none(&f(1), bty);
+                self.goto(aside);
+                self.cur = adv_ok;
+                let t = self.local(opt);
+                self.next(Self::payload(&f(1)), a[1], Place::local(t), true)?;
+                let (hit, miss) = self.switch_opt(&Place::local(t));
+                self.cur = hit;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.goto(join);
+                self.cur = miss;
+                self.assign(Place::local(n2), Rvalue::Use(Self::usize_c(0)));
+                self.none(&f(1), bty);
+                self.goto(aside);
+                self.cur = aside;
+                let (asome, anone) = self.switch_opt(&f(0));
+                self.cur = anone;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = asome;
+                self.nth_back(Self::payload(&f(0)), a[0], n2, dest.clone())?;
+                self.goto(join);
+            }
+            _ => {
+                self.nth_via_advance(itp, ty, n, dest, true)?;
+                self.goto(join);
+            }
+        }
+        self.cur = join;
+        Ok(())
+    }
+
+    /// The pull-and-drop loop behind the default `advance_by` (the
+    /// back form when `back`): the remainder local is 0 when all `n`
+    /// items were pulled, else how many are missing.
+    fn advance_loop(&mut self, itp: Place, ty: Ty, n: Local, back: bool) -> Result<Local, String> {
+        use crate::ast::BinOp::*;
+        let item = self.item(ty)?;
+        let opt = self.body.tys.mk_option(item);
+        let rem = self.local(USIZE);
         let i = self.local(USIZE);
         self.assign(Place::local(i), Rvalue::Use(Self::usize_c(0)));
+        let join = self.block();
         let lp = self.block();
         self.goto(lp);
         self.cur = lp;
         let c = self.cmp(Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(n)));
-        let (pull, last) = self.branch(c);
+        let (pull, done) = self.branch(c);
+        self.cur = done;
+        self.assign(Place::local(rem), Rvalue::Use(Self::usize_c(0)));
+        self.goto(join);
         self.cur = pull;
         let t = self.local(opt);
-        self.next(itp.clone(), ty, Place::local(t), false)?;
+        self.next(itp.clone(), ty, Place::local(t), back)?;
         let (s, none) = self.switch_opt(&Place::local(t));
         self.cur = none;
-        self.none(&dest, opt);
+        self.assign(Place::local(rem), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(i))));
         self.goto(join);
         self.cur = s;
         self.drop_local(t);
         self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
         self.goto(lp);
-        self.cur = last;
-        self.next(itp, ty, dest, false)?;
-        self.goto(join);
         self.cur = join;
-        Ok(())
+        Ok(rem)
+    }
+
+    /// `itp.advance_by(n)` as the remainder local (0 when fully
+    /// advanced), with Rust 1.99's per-kind overrides. The O(1) form
+    /// is `Range` only: `RangeInclusive` advances item by item in
+    /// Rust, like the default loop used for the other kinds.
+    fn advance(&mut self, itp: Place, ty: Ty, n: Local) -> Result<Local, String> {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.advance_loop(itp, ty, n, false);
+        };
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range => {
+                let (w, _) = self.wide_ty(a[0])?;
+                let rem = self.local(USIZE);
+                let join = self.block();
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, no) = self.branch(c);
+                self.cur = no;
+                self.assign(Place::local(rem), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(join);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let taken_w = self.local(w);
+                let lt = self.cmp(Lt, Operand::Copy(Place::local(steps)), Operand::Copy(Place::local(wn)));
+                let (fewer, enough) = self.branch(lt);
+                let mid = self.block();
+                self.cur = fewer;
+                self.assign(Place::local(taken_w), Rvalue::Use(Operand::Copy(Place::local(steps))));
+                self.goto(mid);
+                self.cur = enough;
+                self.assign(Place::local(taken_w), Rvalue::Use(Operand::Copy(Place::local(wn))));
+                self.goto(mid);
+                self.cur = mid;
+                let ns_w = self.wide_bin(false, ws, taken_w, w);
+                let ns = self.cast_local(Operand::Copy(Place::local(ns_w)), a[0]);
+                self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(ns))));
+                let taken = self.cast_local(Operand::Copy(Place::local(taken_w)), USIZE);
+                self.assign(Place::local(rem), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(taken))));
+                self.goto(join);
+                self.cur = join;
+                Ok(rem)
+            }
+            K::Skip => {
+                let skip_inner = self.copy_local(Operand::Copy(f(1)), USIZE);
+                let saa = self.local(USIZE);
+                self.call_builtin(
+                    Builtin::SaturatingAdd,
+                    vec![Operand::Copy(Place::local(skip_inner)), Operand::Copy(Place::local(n))],
+                    Place::local(saa),
+                );
+                let rem1 = self.advance(f(0), a[0], saa)?;
+                let advanced = self.local(USIZE);
+                self.assign(Place::local(advanced), Rvalue::Bin(Sub, Operand::Copy(Place::local(saa)), Operand::Copy(Place::local(rem1))));
+                let subbed = self.local(USIZE);
+                self.call_builtin(
+                    Builtin::SaturatingSub,
+                    vec![Operand::Copy(Place::local(advanced)), Operand::Copy(Place::local(skip_inner))],
+                    Place::local(subbed),
+                );
+                let nn = self.local(USIZE);
+                self.assign(Place::local(nn), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(subbed))));
+                let newn = self.local(USIZE);
+                self.call_builtin(
+                    Builtin::SaturatingSub,
+                    vec![Operand::Copy(f(1)), Operand::Copy(Place::local(advanced))],
+                    Place::local(newn),
+                );
+                self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(newn))));
+                // The saturated sum may leave a rest to advance.
+                let join = self.block();
+                let z = self.cmp(Eq, Operand::Copy(Place::local(rem1)), Self::usize_c(0));
+                let (full, short) = self.branch(z);
+                self.cur = short;
+                self.goto(join);
+                self.cur = full;
+                let pos = self.cmp(Gt, Operand::Copy(Place::local(nn)), Self::usize_c(0));
+                let (rest, done) = self.branch(pos);
+                self.cur = done;
+                self.goto(join);
+                self.cur = rest;
+                let rem2 = self.advance(f(0), a[0], nn)?;
+                self.assign(Place::local(nn), Rvalue::Use(Operand::Copy(Place::local(rem2))));
+                self.goto(join);
+                self.cur = join;
+                Ok(nn)
+            }
+            K::Take => {
+                let minl = self.local(USIZE);
+                self.call_builtin(Builtin::Min, vec![Operand::Copy(f(1)), Operand::Copy(Place::local(n))], Place::local(minl));
+                let rem = self.advance(f(0), a[0], minl)?;
+                let advanced = self.local(USIZE);
+                self.assign(Place::local(advanced), Rvalue::Bin(Sub, Operand::Copy(Place::local(minl)), Operand::Copy(Place::local(rem))));
+                self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Operand::Copy(Place::local(advanced))));
+                let out = self.local(USIZE);
+                self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(advanced))));
+                Ok(out)
+            }
+            K::Enumerate => {
+                let rem = self.advance(f(0), a[0], n)?;
+                let advanced = self.local(USIZE);
+                self.assign(Place::local(advanced), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(rem))));
+                self.assign(f(1), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(advanced))));
+                Ok(rem)
+            }
+            K::Rev => self.advance_back(f(0), a[0], n),
+            K::Copied => self.advance(f(0), a[0], n),
+            K::Chain => {
+                let aty = self.place_ty(&f(0))?;
+                let out = self.local(USIZE);
+                let n2 = self.local(USIZE);
+                let join = self.block();
+                let bside = self.block();
+                let (asome, anone) = self.switch_opt(&f(0));
+                self.cur = anone;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(bside);
+                self.cur = asome;
+                let rem = self.advance(Self::payload(&f(0)), a[0], n)?;
+                let z = self.cmp(Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+                let (full, short) = self.branch(z);
+                self.cur = full;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = short;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(rem))));
+                self.none(&f(0), aty);
+                self.goto(bside);
+                self.cur = bside;
+                let (bs, bn) = self.switch_opt(&f(1));
+                self.cur = bn;
+                self.assign(Place::local(out), Rvalue::Use(Operand::Copy(Place::local(n2))));
+                self.goto(join);
+                self.cur = bs;
+                let rb = self.advance(Self::payload(&f(1)), a[1], n2)?;
+                self.assign(Place::local(out), Rvalue::Use(Operand::Copy(Place::local(rb))));
+                self.goto(join);
+                self.cur = join;
+                Ok(out)
+            }
+            _ => self.advance_loop(itp, ty, n, false),
+        }
+    }
+
+    /// `itp.advance_back_by(n)` as the remainder local: the back
+    /// form of `advance`, with the same per-kind overrides.
+    fn advance_back(&mut self, itp: Place, ty: Ty, n: Local) -> Result<Local, String> {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.advance_loop(itp, ty, n, true);
+        };
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range => {
+                let (w, _) = self.wide_ty(a[0])?;
+                let rem = self.local(USIZE);
+                let join = self.block();
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, no) = self.branch(c);
+                self.cur = no;
+                self.assign(Place::local(rem), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(join);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let wn = self.cast_local(Operand::Copy(Place::local(n)), w);
+                let taken_w = self.local(w);
+                let lt = self.cmp(Lt, Operand::Copy(Place::local(steps)), Operand::Copy(Place::local(wn)));
+                let (fewer, enough) = self.branch(lt);
+                let mid = self.block();
+                self.cur = fewer;
+                self.assign(Place::local(taken_w), Rvalue::Use(Operand::Copy(Place::local(steps))));
+                self.goto(mid);
+                self.cur = enough;
+                self.assign(Place::local(taken_w), Rvalue::Use(Operand::Copy(Place::local(wn))));
+                self.goto(mid);
+                self.cur = mid;
+                let ne_w = self.wide_bin(true, we, taken_w, w);
+                let ne = self.cast_local(Operand::Copy(Place::local(ne_w)), a[0]);
+                self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(ne))));
+                let taken = self.cast_local(Operand::Copy(Place::local(taken_w)), USIZE);
+                self.assign(Place::local(rem), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(taken))));
+                self.goto(join);
+                self.cur = join;
+                Ok(rem)
+            }
+            K::Rev => self.advance(f(0), a[0], n),
+            K::Copied => self.advance_back(f(0), a[0], n),
+            K::Chain => {
+                let bty = self.place_ty(&f(1))?;
+                let out = self.local(USIZE);
+                let n2 = self.local(USIZE);
+                let join = self.block();
+                let aside = self.block();
+                let (bsome, bnone) = self.switch_opt(&f(1));
+                self.cur = bnone;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(n))));
+                self.goto(aside);
+                self.cur = bsome;
+                let rem = self.advance_back(Self::payload(&f(1)), a[1], n)?;
+                let z = self.cmp(Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+                let (full, short) = self.branch(z);
+                self.cur = full;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = short;
+                self.assign(Place::local(n2), Rvalue::Use(Operand::Copy(Place::local(rem))));
+                self.none(&f(1), bty);
+                self.goto(aside);
+                self.cur = aside;
+                let (asome, anone) = self.switch_opt(&f(0));
+                self.cur = anone;
+                self.assign(Place::local(out), Rvalue::Use(Operand::Copy(Place::local(n2))));
+                self.goto(join);
+                self.cur = asome;
+                let ra = self.advance_back(Self::payload(&f(0)), a[0], n2)?;
+                self.assign(Place::local(out), Rvalue::Use(Operand::Copy(Place::local(ra))));
+                self.goto(join);
+                self.cur = join;
+                Ok(out)
+            }
+            _ => self.advance_loop(itp, ty, n, true),
+        }
     }
 
     // ---------- Random access (TrustedRandomAccess) ----------
@@ -1585,11 +2483,12 @@ impl Ex<'_, '_, '_> {
                 self.cur = none;
                 self.goto(done);
                 self.cur = some;
-                let v = self.local(item);
-                let pv = self.take(Self::payload(&Self::payload(&slot)), item);
-                self.assign(Place::local(v), Rvalue::Use(pv));
                 let sty = self.place_ty(&slot)?;
-                self.none(&slot, sty);
+                let o = self.local(sty);
+                self.take_none(slot.clone(), sty, Place::local(o));
+                let v = self.local(item);
+                let pv = self.take(Self::payload(&Self::payload(&Place::local(o))), item);
+                self.assign(Place::local(v), Rvalue::Use(pv));
                 k(self, v, item)?;
                 self.goto(go);
                 self.cur = go;
@@ -1735,7 +2634,163 @@ impl Ex<'_, '_, '_> {
         }
     }
 
+    /// `dest = itp.count()`, with Rust 1.99's per-kind overrides:
+    /// the O(1) range forms (with the `count overflowed usize`
+    /// panic) and the delegating adapters. Other kinds count by
+    /// internal iteration, as the default `fold` does.
     fn count(&mut self, itp: Place, ty: Ty, dest: Place) -> R {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.count_loop(itp, ty, dest);
+        };
+        let join = self.block();
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range => {
+                let (w, _) = self.wide_ty(a[0])?;
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, no) = self.branch(c);
+                self.cur = no;
+                self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let maxu = self.cast_local(Self::usize_c(u64::MAX), w);
+                let over = self.cmp(Gt, Operand::Copy(Place::local(steps)), Operand::Copy(Place::local(maxu)));
+                let (bad, good) = self.branch(over);
+                self.cur = good;
+                let cnt = self.cast_local(Operand::Copy(Place::local(steps)), USIZE);
+                self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(cnt))));
+                self.goto(join);
+                self.cur = bad;
+                self.term(Terminator::Panic(vec![FmtPart::Lit("count overflowed usize".into())]));
+            }
+            K::RangeInclusive => {
+                let (w, _) = self.wide_ty(a[0])?;
+                let zero = self.block();
+                let (ex, live) = self.branch(Operand::Copy(f(2)));
+                self.cur = ex;
+                self.goto(zero);
+                self.cur = live;
+                let c = self.cmp(Le, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (go, empty) = self.branch(c);
+                self.cur = empty;
+                self.goto(zero);
+                self.cur = go;
+                let ws = self.cast_local(Operand::Copy(f(0)), w);
+                let we = self.cast_local(Operand::Copy(f(1)), w);
+                let steps = self.wide_bin(true, we, ws, w);
+                let maxu = self.cast_local(Self::usize_c(u64::MAX), w);
+                let over = self.cmp(Ge, Operand::Copy(Place::local(steps)), Operand::Copy(Place::local(maxu)));
+                let (bad, good) = self.branch(over);
+                self.cur = good;
+                let cnt = self.cast_local(Operand::Copy(Place::local(steps)), USIZE);
+                self.assign(dest.clone(), Rvalue::Bin(Add, Operand::Copy(Place::local(cnt)), Self::usize_c(1)));
+                self.goto(join);
+                self.cur = bad;
+                self.term(Terminator::Panic(vec![FmtPart::Lit("count overflowed usize".into())]));
+                self.cur = zero;
+                self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+            }
+            K::Skip => {
+                let c = self.cmp(Gt, Operand::Copy(f(1)), Self::usize_c(0));
+                let (skip_b, plain) = self.branch(c);
+                self.cur = plain;
+                self.count(f(0), a[0], dest.clone())?;
+                self.goto(join);
+                self.cur = skip_b;
+                let item = self.item(ty)?;
+                let opt = self.body.tys.mk_option(item);
+                let m1 = self.local(USIZE);
+                self.assign(Place::local(m1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                let t = self.local(opt);
+                self.nth(f(0), a[0], m1, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = no;
+                self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = s;
+                self.drop_local(t);
+                self.count(f(0), a[0], dest.clone())?;
+                self.goto(join);
+            }
+            K::Take => {
+                let z = self.cmp(Eq, Operand::Copy(f(1)), Self::usize_c(0));
+                let (zero, go) = self.branch(z);
+                self.cur = zero;
+                self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = go;
+                let budget = self.copy_local(Operand::Copy(f(1)), USIZE);
+                let rem = self.advance(f(0), a[0], budget)?;
+                self.assign(dest, Rvalue::Bin(Sub, Operand::Copy(Place::local(budget)), Operand::Copy(Place::local(rem))));
+                self.goto(join);
+            }
+            K::Enumerate | K::Copied => {
+                self.count(f(0), a[0], dest)?;
+                self.goto(join);
+            }
+            K::Peekable => {
+                let item = self.item(ty)?;
+                let slot = f(1);
+                let pty = self.place_ty(&slot)?;
+                let (full, empty) = self.switch_opt(&slot);
+                self.cur = empty;
+                self.count(f(0), a[0], dest.clone())?;
+                self.goto(join);
+                self.cur = full;
+                let inner = Self::payload(&slot);
+                let (some, spent) = self.switch_opt(&inner);
+                self.cur = spent;
+                self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = some;
+                // The peeked item counts once and drops after the
+                // inner count, as in Rust.
+                let o = self.local(pty);
+                self.take_none(slot.clone(), pty, Place::local(o));
+                let v = self.local(item);
+                let pv = self.take(Self::payload(&Self::payload(&Place::local(o))), item);
+                self.assign(Place::local(v), Rvalue::Use(pv));
+                let cnt = self.local(USIZE);
+                self.count(f(0), a[0], Place::local(cnt))?;
+                self.drop_local(v);
+                self.assign(dest, Rvalue::Bin(Add, Operand::Copy(Place::local(cnt)), Self::usize_c(1)));
+                self.goto(join);
+            }
+            K::Chain => {
+                let (ca, cb) = (self.local(USIZE), self.local(USIZE));
+                for (side, out) in [(0u32, ca), (1u32, cb)] {
+                    let nxt = self.block();
+                    let (s, no) = self.switch_opt(&f(side));
+                    self.cur = no;
+                    self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                    self.goto(nxt);
+                    self.cur = s;
+                    self.count(Self::payload(&f(side)), a[side as usize], Place::local(out))?;
+                    let sty = self.place_ty(&f(side))?;
+                    self.none(&f(side), sty);
+                    self.goto(nxt);
+                    self.cur = nxt;
+                }
+                self.assign(dest, Rvalue::Bin(Add, Operand::Copy(Place::local(ca)), Operand::Copy(Place::local(cb))));
+                self.goto(join);
+            }
+            _ => {
+                self.count_loop(itp, ty, dest)?;
+                self.goto(join);
+            }
+        }
+        self.cur = join;
+        Ok(())
+    }
+
+    /// The default `count`: internal iteration, one per item.
+    fn count_loop(&mut self, itp: Place, ty: Ty, dest: Place) -> R {
         let c = self.local(USIZE);
         self.assign(Place::local(c), Rvalue::Use(Self::usize_c(0)));
         self.each(&itp, ty, &mut |this, x, _| {
@@ -1747,7 +2802,138 @@ impl Ex<'_, '_, '_> {
         Ok(())
     }
 
+    /// `dest = itp.last()`, with Rust 1.99's per-kind overrides: the
+    /// ranges answer with `next_back`, and `Skip`, `Copied`,
+    /// `Peekable`, and `Chain` delegate. Other kinds take the
+    /// default internal iteration.
     fn last(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
+        use crate::ast::BinOp::*;
+        use IterKind as K;
+        let Some((k, a)) = self.kind_args(ty) else {
+            return self.last_loop(itp, ty, dest, dest_ty);
+        };
+        let join = self.block();
+        let f = |i: u32| itp.project(Proj::Field(i));
+        match k {
+            K::Range | K::RangeInclusive => {
+                self.next(itp, ty, dest.clone(), true)?;
+                self.goto(join);
+            }
+            K::Skip => {
+                let c = self.cmp(Gt, Operand::Copy(f(1)), Self::usize_c(0));
+                let (skip_b, plain) = self.branch(c);
+                self.cur = plain;
+                self.last(f(0), a[0], dest.clone(), dest_ty)?;
+                self.goto(join);
+                self.cur = skip_b;
+                let item = self.item(ty)?;
+                let opt = self.body.tys.mk_option(item);
+                let m1 = self.local(USIZE);
+                self.assign(Place::local(m1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                let t = self.local(opt);
+                self.nth(f(0), a[0], m1, Place::local(t))?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = no;
+                self.none(&dest, dest_ty);
+                self.goto(join);
+                self.cur = s;
+                self.drop_local(t);
+                self.last(f(0), a[0], dest.clone(), dest_ty)?;
+                self.goto(join);
+            }
+            K::Copied => {
+                let ii = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(ii);
+                let t = self.local(iopt);
+                self.last(f(0), a[0], Place::local(t), iopt)?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                self.some(&dest, dest_ty, Operand::Copy(Self::payload(&Place::local(t)).deref()));
+                self.goto(join);
+                self.cur = no;
+                self.none(&dest, dest_ty);
+                self.goto(join);
+            }
+            K::Peekable => {
+                let item = self.item(ty)?;
+                let slot = f(1);
+                let pty = self.place_ty(&slot)?;
+                let held = self.local(dest_ty);
+                let (full, empty) = self.switch_opt(&slot);
+                let go = self.block();
+                self.cur = empty;
+                self.none(&Place::local(held), dest_ty);
+                self.goto(go);
+                self.cur = full;
+                let inner = Self::payload(&slot);
+                let (some, spent) = self.switch_opt(&inner);
+                self.cur = spent;
+                self.none(&dest, dest_ty);
+                self.goto(join);
+                self.cur = some;
+                let o = self.local(pty);
+                self.take_none(slot.clone(), pty, Place::local(o));
+                let v = self.local(item);
+                let pv = self.take(Self::payload(&Self::payload(&Place::local(o))), item);
+                self.assign(Place::local(v), Rvalue::Use(pv));
+                let av = self.take(Place::local(v), item);
+                self.some(&Place::local(held), dest_ty, av);
+                self.goto(go);
+                self.cur = go;
+                let t = self.local(dest_ty);
+                self.last(f(0), a[0], Place::local(t), dest_ty)?;
+                let (s, no) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.drop_local(held);
+                self.goto(join);
+                self.cur = no;
+                self.assign(dest, Rvalue::Use(Operand::Move(Place::local(held))));
+                self.goto(join);
+            }
+            K::Chain => {
+                // Both sides run, a first; b's last wins.
+                let la = self.local(dest_ty);
+                let (asome, anone) = self.switch_opt(&f(0));
+                let bside = self.block();
+                self.cur = anone;
+                self.none(&Place::local(la), dest_ty);
+                self.goto(bside);
+                self.cur = asome;
+                self.last(Self::payload(&f(0)), a[0], Place::local(la), dest_ty)?;
+                let aty = self.place_ty(&f(0))?;
+                self.none(&f(0), aty);
+                self.goto(bside);
+                self.cur = bside;
+                let (bsome, bnone) = self.switch_opt(&f(1));
+                self.cur = bnone;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(la))));
+                self.goto(join);
+                self.cur = bsome;
+                let lb = self.local(dest_ty);
+                self.last(Self::payload(&f(1)), a[1], Place::local(lb), dest_ty)?;
+                let bty = self.place_ty(&f(1))?;
+                self.none(&f(1), bty);
+                let (s, no) = self.switch_opt(&Place::local(lb));
+                self.cur = s;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(lb))));
+                self.drop_local(la);
+                self.goto(join);
+                self.cur = no;
+                self.assign(dest, Rvalue::Use(Operand::Move(Place::local(la))));
+                self.goto(join);
+            }
+            _ => {
+                self.last_loop(itp, ty, dest, dest_ty)?;
+                self.goto(join);
+            }
+        }
+        self.cur = join;
+        Ok(())
+    }
+
+    /// The default `last`: internal iteration keeping the newest item.
+    fn last_loop(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
         let l = self.local(dest_ty);
         self.none(&Place::local(l), dest_ty);
         self.each(&itp, ty, &mut |this, x, item| {
@@ -1889,6 +3075,10 @@ impl Ex<'_, '_, '_> {
     #[allow(clippy::too_many_arguments)]
     fn min_max(&mut self, max: bool, itp: Place, ty: Ty, key: Option<(Place, Ty)>, dest: Place, dest_ty: Ty) -> R {
         let item = self.item(ty)?;
+        if key.is_none() && matches!(self.kind_args(ty), Some((IterKind::Range | IterKind::RangeInclusive, _))) {
+            // Rust's range `min` is `next`, its `max` is `next_back`.
+            return self.next(itp, ty, dest, max);
+        }
         let join = self.block();
         // `reduce`: the first item by `next`, the rest by `fold`.
         let (_, n, first, _) = self.pull(&itp, ty)?;
