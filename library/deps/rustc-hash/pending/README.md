@@ -16,11 +16,8 @@ reads written out. Gate: `scripts/test-adapters.sh rustc-hash`.
   tuple (seeded), and Vec<u8> keys print the same order and capacity as
   the real crate (the aliases were left out there: that tree has no
   generic aliases).
-- Two spellings differ from upstream with the same meaning: `write`
-  calls the 64-bit body of `write_u64` directly, and
-  `FxSeededState::build_hasher` returns `FxHasher`, not `Self::Hasher`
-  (lust compiles that projection return wrong; repro in the W-DEPS
-  report).
+- One spelling differs from upstream with the same meaning: `write`
+  calls the 64-bit body of `write_u64` directly.
 
 ## Rejected (lust error, never a different answer)
 
