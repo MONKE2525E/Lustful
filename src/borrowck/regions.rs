@@ -939,6 +939,49 @@ pub(super) fn may_entail_bounds(p: &Program, body: &Body) -> bool {
         || body.blocks.iter().any(|b| b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Assign(_, Rvalue::FnValue(..)))))
 }
 
+/// What a region of a `Fn` signature is when one signature proves
+/// another (`match_fn_sides`): a fixed var of this body, a binder of the
+/// signature (each elided input lifetime of `Fn` sugar is its own,
+/// numbered in order, and an elided output is the one input's; a fn
+/// item's late-bound lifetime is one wherever it is written), or a region
+/// nothing ties (a type param's instantiation).
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Tie(u32),
+    Binder(u32),
+    Free,
+}
+
+/// The sides of a source signature's regions in order (`Side`): `F`'s
+/// bound over this body's universals, or a fn item's (`early`: its
+/// early-bound lifetimes, fresh vars of this use).
+struct FnSides {
+    item: Option<Vec<bool>>,
+    early: FxMap<u32, u32>,
+    n: u32,
+}
+
+impl FnSides {
+    fn new(item: Option<Vec<bool>>) -> Self {
+        FnSides { item, early: FxMap::default(), n: 0 }
+    }
+
+    fn side(&mut self, b: &mut Builder<'_, '_, '_>, r: Region, out: bool) -> Side {
+        match (r, &self.item) {
+            (Region::Static, _) => Side::Tie(0),
+            (Region::Param(k), None) => Side::Tie(k + 1),
+            (Region::Param(k), Some(e)) if e.get(k as usize) == Some(&true) => Side::Tie(*self.early.entry(k).or_insert_with(|| b.fresh())),
+            (Region::Param(k), Some(_)) => Side::Binder(k),
+            (Region::Bound(_), None) if out => Side::Binder(0),
+            (Region::Bound(_), None) => {
+                self.n += 1;
+                Side::Binder(self.n - 1)
+            }
+            _ => Side::Free,
+        }
+    }
+}
+
 /// The pairs of regions at the same places of two regioned types (a
 /// callee's bound and the argument's signature, `entail_bound`); a type
 /// param or projection on either side (an instantiation) pairs nothing.
@@ -2340,13 +2383,142 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 };
                 match obj {
                     Some(o) if dv.len() == if refs.1 { 2 } else { 1 } => {
-                        for x in data {
+                        for &x in &data {
                             self.edge(x, o);
                         }
                     }
                     _ => self.equate_all(&ov, &dv),
                 }
+                if let Rvalue::MakeDyn { src, dyn_ty, .. } = rv {
+                    // A `'static` object lifetime (`Box<dyn Tr>` in a
+                    // signature or field, `+ 'static`, a `'static` trait)
+                    // may not be a slot of the place the object goes to:
+                    // the data outlives `'static` here.
+                    if crate::check::object::dyn_is_static(self.p, &self.body.tys, *dyn_ty) {
+                        for &x in &data {
+                            self.edge(x, 0);
+                        }
+                    }
+                    self.dyn_fn_coercion(*src, *dyn_ty, &data);
+                }
             }
+            _ => {}
+        }
+    }
+
+    /// The inputs and output of a `dyn Fn*(I..) -> O` type, behind any
+    /// references and smart pointers, in this body's types. None for any
+    /// other type. Every region in them is elided (check rejects written
+    /// ones, L0203), so late-bound: the `dyn Fn` rules below rely on it.
+    fn dyn_fn_sig(&self, t: Ty) -> Option<(Vec<Ty>, Ty)> {
+        let tys = &self.body.tys;
+        let mut t = t;
+        loop {
+            match tys.kind(t) {
+                TyKind::Ref(_, _, inner) => t = inner,
+                _ => match tys.smart_elem(t) {
+                    Some(inner) => t = inner,
+                    None => break,
+                },
+            }
+        }
+        let lang = self.p.gx.lang;
+        let pr = crate::check::object::principal_of(tys, t)?;
+        if !lang.is_fn_family(pr.def) {
+            return None;
+        }
+        let tuple = tys.args(pr.args).get(1).and_then(|g| g.as_ty())?;
+        let ins = match tys.kind(tuple) {
+            TyKind::Tuple(ts) => tys.tys_of(ts).to_vec(),
+            TyKind::Unit => Vec::new(),
+            _ => return None,
+        };
+        let out_def = lang.output_of(lang.fn_once)?;
+        let out = tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+        Some((ins, out))
+    }
+
+    /// A call through a `dyn Fn*` value (`call_late_bound`, the receiver
+    /// first). The receiver lends nothing to the result, and an argument
+    /// reaches nothing else: whatever is behind the object takes any
+    /// region there (`dyn_fn_coercion`).
+    fn call_dyn_fn(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((rt, _)) = avs.first() else { return false };
+        let Some((ins, out)) = self.dyn_fn_sig(*rt) else { return false };
+        self.call_late_bound(&ins, out, &avs[1..], dt, dv)
+    }
+
+    /// A call of a signature whose regions are all elided, so late-bound
+    /// (a `dyn Fn*` value, a fn pointer: check rejects written lifetimes
+    /// there, L0203): each input slot is a fresh region of this call that
+    /// the argument outlives, and each output slot is the one input
+    /// slot's (elision; L0202 otherwise). False when the shapes do not
+    /// pair or the output is not the one input's (the caller's rule then).
+    fn call_late_bound(&mut self, ins: &[Ty], out: Ty, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        if ins.len() != avs.len() {
+            return false;
+        }
+        let mut slots: Vec<u32> = Vec::new();
+        for (i, &it) in ins.iter().enumerate() {
+            let (at, av) = &avs[i];
+            let pv: Vec<u32> = (0..self.sc.slots(it)).map(|_| self.fresh()).collect();
+            if !av.is_empty() && !self.relate(*at, av, it, &pv, Variance::Co) {
+                return false;
+            }
+            slots.extend(pv);
+        }
+        if dv.is_empty() {
+            return true;
+        }
+        let [one] = slots[..] else { return false };
+        let rv = vec![one; self.sc.slots(out) as usize];
+        self.relate(out, &rv, dt, dv, Variance::Co)
+    }
+
+    /// A coercion to `dyn Fn*(I..) -> O`, whose regions are all
+    /// late-bound (`dyn_fn_sig`): the source must take any region in each
+    /// input slot and return the one input's in each output slot, as
+    /// rustc proves `for<'r> Fn(&'r I) -> &'r O` of it. A closure with a
+    /// free argument slot (a `let` closure, a named annotation) is not
+    /// general enough (L0735), and what it returns from its captures
+    /// (`data`, the env's slots) must be `'static`; a type param or a fn
+    /// item is checked by its signature (`entail_dyn`).
+    fn dyn_fn_coercion(&mut self, src: Ty, dyn_ty: Ty, data: &[u32]) {
+        let p = self.p;
+        let Some((ins, out)) = self.dyn_fn_sig(dyn_ty) else { return };
+        let n_out = self.sc.slots(out) as usize;
+        match self.body.tys.kind(src) {
+            TyKind::Closure(def, args) => {
+                let Some(c) = p.gx.closures.get(&def) else { return };
+                if closure_arg_slots(&mut self.sc, c).is_ok_and(|v| v.iter().any(|(r, _)| r.is_some())) {
+                    self.not_general_enough();
+                    return;
+                }
+                if n_out == 0 {
+                    return;
+                }
+                let mut roles = Vec::new();
+                closure_roles(&mut self.sc, args, &mut roles);
+                match self.closure_reqs(def, &roles) {
+                    Some(reqs) => {
+                        for &(x, y) in reqs.iter() {
+                            if let (End::Cap(i), End::Out(_)) = (x, y)
+                                && let Some(&v) = data.get(i as usize)
+                            {
+                                self.edge(v, 0);
+                            }
+                        }
+                    }
+                    None => {
+                        for (i, &(src, _)) in roles.iter().enumerate() {
+                            if src && let Some(&v) = data.get(i) {
+                                self.edge(v, 0);
+                            }
+                        }
+                    }
+                }
+            }
+            TyKind::Param(_) | TyKind::FnDef(..) => self.entail_dyn(src, &ins, out),
             _ => {}
         }
     }
@@ -2482,6 +2654,18 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
         }
         self.flow_all(&srcs, &dv);
+        if matches!(target, CallTarget::Dyn(_)) && self.call_dyn_fn(&avs, dt, &dv) {
+            return;
+        }
+        if let CallTarget::Indirect(l) = target
+            && let TyKind::FnPtr(sig) = self.body.tys.kind(self.body.locals[l as usize].ty)
+        {
+            let s = self.body.tys.sig(sig).value;
+            let ins: Vec<Ty> = self.body.tys.tys_of(s.inputs).to_vec();
+            if self.call_late_bound(&ins, s.output, &avs, dt, &dv) {
+                return;
+            }
+        }
         // A vtable call takes the trait method's signature, which every
         // impl satisfies (`impl_contract`). The object's hidden regions
         // stay alive through the pointer's region (`MakeDyn`), so a
@@ -2626,6 +2810,10 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone)) && self.call_clone(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::ConvDeref | crate::check::Builtin::ConvRcInner))
+                && self.call_conv_deref(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap))
+                && self.call_mem(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone))
@@ -2669,6 +2857,54 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let mut roles = Vec::new();
         closure_roles(&mut self.sc, args, &mut roles);
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, dt, dv, Variance::Co))
+    }
+
+    /// `as_ref`, `borrow`, and `deref` to a pointee (`ConvDeref`,
+    /// `ConvRcInner`): `&'r C` to `&T`, where `C` is a `Box<T>`, an
+    /// `Rc<T>`, or a `&'c T`. The result borrows the receiver for `'r`
+    /// (and `'c`), and `T`'s own regions carry over; the opaque rule would
+    /// tie the receiver's borrow to all of them, a box's `'static` object
+    /// lifetime included. False when the shapes differ.
+    fn call_conv_deref(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let [(t0, v0)] = avs else { return false };
+        let (TyKind::Ref(_, _, c), TyKind::Ref(_, _, di)) = (self.body.tys.kind(*t0), self.body.tys.kind(dt)) else { return false };
+        let (Some((&r, cv)), Some((&d0, dvi))) = (v0.split_first(), dv.split_first()) else { return false };
+        let (inner, iv) = match self.body.tys.kind(c) {
+            TyKind::Ref(_, _, i) => {
+                let Some((&cr, rest)) = cv.split_first() else { return false };
+                self.edge(cr, d0);
+                (i, rest)
+            }
+            _ => match self.body.tys.smart_elem(c) {
+                Some(i) if adt_regions(self.p, &self.body.tys, c) == 0 => (i, cv),
+                _ => return false,
+            },
+        };
+        self.edge(r, d0);
+        (iv.is_empty() && dvi.is_empty()) || self.relate(inner, iv, di, dvi, Variance::Co)
+    }
+
+    /// `mem::replace(dest, src)` and `mem::swap(a, b)`: values trade places
+    /// through the `&mut`, whose own region reaches neither. The old value
+    /// (the pointee's regions) is the result, and the new one takes the
+    /// pointee's regions. False when the shapes differ.
+    fn call_mem(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        match avs {
+            [(rt, rv), (st, sv)] if matches!(self.body.tys.kind(*st), TyKind::Ref(_, Mut::Mut, _)) => {
+                // swap
+                let (TyKind::Ref(_, _, a), TyKind::Ref(_, _, b)) = (self.body.tys.kind(*rt), self.body.tys.kind(*st)) else { return false };
+                let (Some((_, av)), Some((_, bv))) = (rv.split_first(), sv.split_first()) else { return false };
+                let (av, bv) = (av.to_vec(), bv.to_vec());
+                (av.is_empty() && bv.is_empty()) || (self.relate(a, &av, b, &bv, Variance::Co) && self.relate(b, &bv, a, &av, Variance::Co))
+            }
+            [(rt, rv), (st, sv)] => {
+                let TyKind::Ref(_, _, inner) = self.body.tys.kind(*rt) else { return false };
+                let Some((_, pv)) = rv.split_first() else { return false };
+                let pv = pv.to_vec();
+                (sv.is_empty() || self.relate(*st, sv, inner, &pv, Variance::Co)) && (dv.is_empty() || self.relate(inner, &pv, dt, dv, Variance::Co))
+            }
+            _ => false,
+        }
     }
 
     /// `Clone::clone(&self) -> Self` (derived and builtin clones): the
@@ -4049,29 +4285,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let n_in = p.tys.tys_of(ts).len();
         let Some(g) = sig.fn_bounds.iter().find(|b| b.param == jg.0 && b.inputs.len() == n_in).cloned() else { return };
         let Some(&ft) = self.bind_tys.get(&jg.0) else { return };
-        let mut t = ft;
-        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
-            t = inner;
-        }
-        // The argument's signature, and what its regions are: `F`'s
-        // bound has this body's universals and one binder; a fn item has
-        // per-lifetime binders (late-bound) and fresh early-bound ones.
-        let root = root_fn(p, self.body.fn_id);
-        let in_closure = root != self.body.fn_id;
-        let (inputs, output, item) = match self.body.tys.kind(t) {
-            TyKind::Param(jf) => {
-                let f = p.regions.body_sig(p, root).and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned());
-                match f {
-                    Some(f) => (f.inputs, f.output, None),
-                    None => return self.unproved_bound(&g),
-                }
-            }
-            TyKind::FnDef(def, _) => match p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) {
-                Some(fs) if fs.params.len() == n_in => (fs.params.clone(), Some(fs.ret), Some(fs.early.clone())),
-                _ => return self.unproved_bound(&g),
-            },
-            _ => return,
-        };
+        let Some(src) = self.source_fn_sig(ft, n_in) else { return };
+        let Some((inputs, output, item)) = src else { return self.unproved_bound(&g) };
         let mut ins: Vec<(Region, Region)> = Vec::new();
         let mut outs: Vec<(Region, Region)> = Vec::new();
         let paired = g.inputs.iter().zip(&inputs).all(|(&a, &b)| region_pairs(&p.tys, a, b, &mut ins))
@@ -4088,24 +4303,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if !paired {
             return self.unproved_bound(&g);
         }
-        if item.is_none() && in_closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
-            self.errs.push(Diag::new(
-                "L0203",
-                self.span,
-                "a type param whose `Fn` bound names a lifetime of the enclosing fn, passed to a generic fn inside a closure, is not supported yet",
-                "Make the call outside the closure, or pass a closure written in place.",
-            ));
-            return;
-        }
-        // A binder of a signature: each elided input lifetime of `Fn`
-        // sugar is its own (numbered in order), an elided output is the
-        // one input's; a fn item's late-bound lifetime is one wherever it
-        // is written.
-        #[derive(Clone, Copy, PartialEq)]
-        enum Side {
-            Tie(u32),
-            Binder(u32),
-            Free,
+        if item.is_none() && self.own.closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
+            return self.closure_param_bound_cut();
         }
         let gside = |r: Region, n: &mut u32, out: bool| match r {
             Region::Static => Side::Tie(0),
@@ -4117,27 +4316,102 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
             _ => Side::Free,
         };
-        let mut early: FxMap<u32, u32> = FxMap::default();
-        let mut fside = |this: &mut Self, r: Region, n: &mut u32, out: bool| match (r, &item) {
-            (Region::Static, _) => Side::Tie(0),
-            (Region::Param(k), None) => Side::Tie(k + 1),
-            (Region::Param(k), Some(e)) if e.get(k as usize) == Some(&true) => Side::Tie(*early.entry(k).or_insert_with(|| this.fresh())),
-            (Region::Param(k), Some(_)) => Side::Binder(k),
-            (Region::Bound(_), None) if out => Side::Binder(0),
-            (Region::Bound(_), None) => {
-                *n += 1;
-                Side::Binder(*n - 1)
+        let mut sides = FnSides::new(item);
+        let mut gn = 0u32;
+        let ins: Vec<(Side, Side)> = ins.iter().map(|&(a, b)| (gside(a, &mut gn, false), sides.side(self, b, false))).collect();
+        let outs: Vec<(Side, Side)> = outs.iter().map(|&(a, b)| (gside(a, &mut gn, true), sides.side(self, b, true))).collect();
+        self.match_fn_sides(&ins, &outs);
+    }
+
+    /// The regioned signature of a type param `F` of this body's fn (its
+    /// `Fn` bound with `n_in` inputs) or of a fn item (also behind `&`),
+    /// passed where a `Fn*` bound or a `dyn Fn` is expected: inputs,
+    /// output, and for a fn item which of its lifetimes are early-bound.
+    /// `Some(None)` for such a source without a signature that pairs;
+    /// None for any other type (closures have their own rules).
+    #[allow(clippy::type_complexity)]
+    fn source_fn_sig(&self, t: Ty, n_in: usize) -> Option<Option<(Vec<Ty>, Option<Ty>, Option<Vec<bool>>)>> {
+        let p = self.p;
+        let mut t = t;
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            t = inner;
+        }
+        Some(match self.body.tys.kind(t) {
+            TyKind::Param(jf) => p
+                .regions
+                .body_sig(p, root_fn(p, self.body.fn_id))
+                .and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned())
+                .map(|f| (f.inputs, f.output, None)),
+            TyKind::FnDef(def, _) => match p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) {
+                Some(fs) if fs.params.len() == n_in => Some((fs.params.clone(), Some(fs.ret), Some(fs.early.clone()))),
+                _ => None,
+            },
+            _ => return None,
+        })
+    }
+
+    /// `entail_bound` for a coercion to `dyn Fn*(I..) -> O` (`dyn_fn_sig`):
+    /// every input slot there is its own binder, and every output slot
+    /// the one input slot's. A source whose signature does not pair takes
+    /// the conservative answer (L0733 when the target has regions).
+    fn entail_dyn(&mut self, src: Ty, ins: &[Ty], out: Ty) {
+        let p = self.p;
+        let Some(src) = self.source_fn_sig(src, ins.len()) else { return };
+        let n_slots: Vec<usize> = ins.iter().map(|&t| self.sc.slots(t) as usize).collect();
+        let n_out = self.sc.slots(out) as usize;
+        let unproved = |this: &mut Self| {
+            if n_slots.iter().sum::<usize>() + n_out > 0 {
+                this.bound_mismatch();
             }
-            _ => Side::Free,
         };
-        // Per binder of the argument: the `G` binder it takes, or the
-        // lifetime `G` writes there (trait args are invariant, so one of
-        // them, once).
+        let Some((f_ins, f_out, item)) = src else { return unproved(self) };
+        let mut f_in_regions: Vec<Region> = Vec::new();
+        for (&t, &n) in f_ins.iter().zip(&n_slots) {
+            let mut rs = Vec::new();
+            regions_of(&p.tys, t, &mut rs);
+            if rs.len() != n {
+                return unproved(self);
+            }
+            f_in_regions.extend(rs);
+        }
+        let mut f_out_regions: Vec<Region> = Vec::new();
+        if let Some(o) = f_out {
+            regions_of(&p.tys, o, &mut f_out_regions);
+        }
+        if f_out_regions.len() != n_out || (n_out > 0 && f_in_regions.len() != 1) {
+            return unproved(self);
+        }
+        if item.is_none() && self.own.closure && f_in_regions.iter().chain(&f_out_regions).any(|r| matches!(r, Region::Param(_))) {
+            return self.closure_param_bound_cut();
+        }
+        let mut sides = FnSides::new(item);
+        let ins: Vec<(Side, Side)> = f_in_regions.iter().enumerate().map(|(i, &r)| (Side::Binder(i as u32), sides.side(self, r, false))).collect();
+        let outs: Vec<(Side, Side)> = f_out_regions.iter().map(|&r| (Side::Binder(0), sides.side(self, r, true))).collect();
+        self.match_fn_sides(&ins, &outs);
+    }
+
+    /// L0203: inside a closure, a type param whose `Fn` bound names a
+    /// lifetime of the enclosing fn, passed on (the closure body cannot
+    /// name that lifetime).
+    fn closure_param_bound_cut(&mut self) {
+        self.errs.push(Diag::new(
+            "L0203",
+            self.span,
+            "a type param whose `Fn` bound names a lifetime of the enclosing fn, passed to a generic fn inside a closure, is not supported yet",
+            "Make the call outside the closure, or pass a closure written in place.",
+        ));
+    }
+
+    /// Proves a target `Fn` signature (the left side of each pair) from a
+    /// source's (the right), place by place in the inputs, then the
+    /// outputs. A source binder takes either one target binder, where the
+    /// target is higher-ranked, or the one lifetime the target writes there
+    /// (trait args are invariant); a target binder needs a source binder
+    /// (L0735); outputs agree the same way (L0733).
+    fn match_fn_sides(&mut self, ins: &[(Side, Side)], outs: &[(Side, Side)]) {
         let mut takes: FxMap<u32, u32> = FxMap::default();
         let mut inst: FxMap<u32, u32> = FxMap::default();
-        let (mut gn, mut fnn) = (0u32, 0u32);
-        for &(a, b) in &ins {
-            let (ga, fb) = (gside(a, &mut gn, false), fside(self, b, &mut fnn, false));
+        for &(ga, fb) in ins {
             match (ga, fb) {
                 (Side::Binder(gi), Side::Binder(k)) => {
                     if inst.contains_key(&k) || takes.get(&k).is_some_and(|&gj| gj != gi) {
@@ -4167,8 +4441,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 _ => {}
             }
         }
-        for &(a, b) in &outs {
-            let (ga, fb) = (gside(a, &mut gn, true), fside(self, b, &mut fnn, true));
+        for &(ga, fb) in outs {
             match (ga, fb) {
                 (Side::Binder(gi), Side::Binder(k)) if takes.get(&k) == Some(&gi) => {}
                 (Side::Tie(u), Side::Binder(k)) if inst.contains_key(&k) => {

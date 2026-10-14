@@ -195,6 +195,46 @@ impl<'p, 'a> Ctx<'p, 'a> {
         inputs.map(|i| (i, output))
     }
 
+    /// `t` with every region `Region::Bound(0)`, Adt lifetime args
+    /// included: the output of a `dyn Fn` signature, whose regions are all
+    /// the one input region's (`ClosureInfo::bound_output`).
+    fn rebind_bound(&mut self, t: Ty) -> Ty {
+        let b = Region::Bound(0);
+        match self.kind(t) {
+            TyKind::Ref(_, m, e) => {
+                let e = self.rebind_bound(e);
+                self.tys.intern(TyKind::Ref(b, m, e))
+            }
+            TyKind::Tuple(ts) => {
+                let es: Vec<Ty> = self.tys.tys_of(ts).to_vec().into_iter().map(|e| self.rebind_bound(e)).collect();
+                let ts = self.tys.intern_tys(&es);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Slice(e) => {
+                let e = self.rebind_bound(e);
+                self.tys.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.rebind_bound(e);
+                self.tys.intern(TyKind::Array(e, n))
+            }
+            TyKind::Adt(d, args) => {
+                let n = self.p.gx.adt_lifetimes.get(&d).map_or(0, |v| v.len());
+                let mut new: Vec<GenericArg> = vec![GenericArg::Lifetime(b); n];
+                for g in self.tys.args(args).to_vec() {
+                    match g {
+                        GenericArg::Ty(e) => new.push(GenericArg::Ty(self.rebind_bound(e))),
+                        GenericArg::Lifetime(_) => {}
+                        c => new.push(c),
+                    }
+                }
+                let a = self.tys.intern_args(&new);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            _ => t,
+        }
+    }
+
     /// The parts of a `dyn Fn(A, B) -> R` type (any of the Fn family):
     /// the trait, the input tuple `(A, B)`, and `R`. None for another
     /// type.
@@ -227,6 +267,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // (lowering materializes its body fn's trampoline).
         let mut to_fn_ptr: Option<(Ty, Ty, Ty)> = None;
         let mut dyn_sig: Option<(Ty, Option<Ty>)> = None;
+        let mut dyn_out: Option<Ty> = None;
         if let Some(t) = expected {
             let t = self.resolve(t);
             match self.kind(t) {
@@ -251,6 +292,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 TyKind::Dyn(..) => {
                     if let Some((_, tuple, out)) = self.dyn_fn_parts(t) {
                         dyn_sig = Some((tuple, Some(out)));
+                        dyn_out = Some(out);
                     }
                 }
                 _ => {}
@@ -264,6 +306,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let bound_output = expected.and_then(|t| match self.kind(self.resolve(t)) {
             TyKind::Infer(v) => self.closure_bound_outputs.get(&v.0).copied(),
             _ => None,
+        });
+        // W-BORROW: every region of a `dyn Fn` signature is elided, so an
+        // output region is the one input region's (Fn sugar elision).
+        let bound_output = bound_output.or_else(|| {
+            let o = self.deep(dyn_out?);
+            Some(self.rebind_bound(o))
         });
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).

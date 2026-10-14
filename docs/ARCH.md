@@ -3103,8 +3103,9 @@ the gate shapes (`lifetime_gate_parser`,
 Each case runs against rustc 1.99 in difftest.
 
 Known gaps: regions of body types other than `let`
-annotations (casts, turbofish, closure params); fn pointer
-regions and regions in a dyn type's trait args; closure
+annotations (casts, turbofish, closure params); written
+lifetimes in fn pointer types and a dyn type's trait args
+(L0203); closure
 arguments are higher-ranked outside iterator methods and
 bounds over type params (rustc also frees an unannotated
 closure's arguments); the closure contract's coarser source-to-sink
@@ -3115,22 +3116,33 @@ return annotation (`'static` works); promotion of constants
 other than `&[]` and `&mut []` (they need static storage in
 codegen; `Body::promoted` covers the empty array only).
 
-Fn pointer and `dyn Fn` regions need check's types to keep
-which regions are bound: erased types cannot tell
-`fn(&mut Parser<'a>) -> Node` from `fn(&mut Parser<'_>) ->
-Node` (unify ignores regions, and an Adt drops its lifetime
-args), so a borrowck-only model either loses a free region
-through a copy or misses rustc's "one type is more general
-than the other" when a free pointer meets a higher-ranked
-type. The interface to add with the `dyn Fn` typing: inside
-fn pointer and `dyn Fn(..)` types, an elided (late-bound)
-region is `Region::Bound(k)` and a written one stays
-(`Erased` for a named lifetime, `Static`), also for Adt
-lifetime args there; check rejects a coercion that puts a
-free region where the target is bound; borrowck then gives
-those types one slot per free region, instantiates bound
-ones per call, and relates fn items and closures by their
-signatures.
+Fn pointer and `dyn Fn` regions: check rejects written
+lifetimes there (L0203), so every region of such a
+signature is elided, so late-bound (an elided output is the
+one input lifetime, else L0202, as in `Fn` sugar and fn
+pointer types anywhere). Borrowck relies on that:
+
+- A call through a `dyn Fn*` value or a fn pointer
+  (`call_late_bound`) gives each input slot a fresh region
+  of the call that the argument outlives, and each output
+  slot the one input slot's. The receiver lends nothing to
+  the result, and an argument reaches nothing else.
+- A coercion to `dyn Fn*` (`dyn_fn_coercion`) proves the
+  source takes any region there: a closure with a free
+  argument slot (a `let` closure, a named annotation) is
+  L0735, and what a closure returns from its captures must
+  be `'static`; a closure written there may return its one
+  argument (`ClosureEntry::bound_output`); a type param or
+  a fn item is proved by its signature (`entail_dyn`, as
+  `entail_bound`). A coercion to a `'static` object lifetime
+  makes the data outlive `'static`.
+- Fn items coerce to fn pointers through
+  `fn_item_coercions` (early-bound lifetimes and `'static`
+  inputs are less general than the pointer).
+
+Written lifetimes there (`fn(&mut Parser<'a>) -> Node`,
+`dyn Fn(&'a T)`) need check's types to say which regions are
+bound: erased types cannot tell them from elided ones.
 
 ## 6. Macros
 

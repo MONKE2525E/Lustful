@@ -1428,6 +1428,7 @@ fn resolve_trait_path_args(
             if !cx.lang.is_fn_family(trait_def) {
                 return Err(Diag::new("L0110", span, "parenthesized trait sugar is only for Fn traits", "Use angle arguments."));
             }
+            sugar_elision(ast, interner, known, cx, tys, scope, inputs, *output)?;
             let mut parts = Vec::new();
             for t in inputs {
                 parts.push(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?);
@@ -1669,6 +1670,8 @@ pub fn resolve_scoped(
                     "Elide the lifetimes (`fn(&T) -> &U`), or use a generic `F: Fn(&T) -> &U` parameter.",
                 ));
             }
+            let in_tys: Vec<ast::TyId> = inputs.iter().map(|p| p.ty).collect();
+            sugar_elision(ast, interner, known, cx, tys, scope, &in_tys, *ret)?;
             let erased = scope.erased();
             let scope = &erased;
             let mut ins = Vec::with_capacity(inputs.len());
@@ -3743,7 +3746,7 @@ fn region_sig(
             bounded.push((j.0, bounds));
         }
     }
-    let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded, Some(errs));
+    let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
     Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds })
 }
@@ -3843,13 +3846,43 @@ pub fn fn_bounds_of(
     generics: &ast::Generics,
     where_clause: &ast::WhereClause,
 ) -> Vec<crate::borrowck::FnBound> {
-    fn_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause), None)
+    fn_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause))
+}
+
+/// rustc E0106 inside `Fn` sugar and fn pointer types, which are their
+/// own elision scope: an elided lifetime in the output needs exactly one
+/// lifetime (written or elided) in the inputs (L0202). Resolves both with
+/// regions kept; the main resolution erases them and reports any other
+/// error.
+#[allow(clippy::too_many_arguments)]
+fn sugar_elision(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    inputs: &[ast::TyId],
+    output: Option<ast::TyId>,
+) -> Result<(), Diag> {
+    let Some(out) = output else { return Ok(()) };
+    let mut ks = scope.clone();
+    ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let mut lts: Vec<Region> = Vec::new();
+    for &t in inputs {
+        let Ok(t) = resolve_scoped(ast, interner, known, cx, tys, t, &ks) else { return Ok(()) };
+        crate::borrowck::regions_of(tys, t, &mut lts);
+    }
+    ks.regions = RegionMode::Keep { next: None, elided: if let [r] = lts[..] { Some(r) } else { None } };
+    match resolve_scoped(ast, interner, known, cx, tys, out, &ks) {
+        Err(d) if d.code == "L0202" => Err(d),
+        _ => Ok(()),
+    }
 }
 
 /// `fn_bounds_of` over bounds already found, by type param index. An
 /// elided output lifetime is the only input lifetime, as in a fn
-/// signature; with none or several it is L0202 (rustc E0106), reported
-/// into `errs` when given.
+/// signature (`sugar_elision` reports the rest).
 #[allow(clippy::too_many_arguments)]
 fn fn_bounds_in(
     ast: &Ast,
@@ -3859,7 +3892,6 @@ fn fn_bounds_in(
     cx: &ResolveCx,
     scope: &Scope,
     bounded: &[(u32, &[TraitBound])],
-    mut errs: Option<&mut Vec<Diag>>,
 ) -> Vec<crate::borrowck::FnBound> {
     let mut bs = scope.clone();
     bs.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
@@ -3879,14 +3911,7 @@ fn fn_bounds_in(
                     os.regions = RegionMode::Keep { next: None, elided: if let [r] = lts[..] { Some(r) } else { None } };
                     match resolve_scoped(ast, interner, known, cx, tys, *t, &os) {
                         Ok(t) => Some(t),
-                        Err(d) => {
-                            if d.code == "L0202"
-                                && let Some(errs) = errs.as_deref_mut()
-                            {
-                                errs.push(d);
-                            }
-                            continue;
-                        }
+                        Err(_) => continue,
                     }
                 }
                 None => None,
