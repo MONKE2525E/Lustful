@@ -105,6 +105,7 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         || (trait_def == lang.borrow && cx.std_trait_imported("borrow", "Borrow"))
         || (trait_def == lang.borrow_mut && cx.std_trait_imported("borrow", "BorrowMut"))
         || (trait_def == lang.any && cx.std_trait_imported("any", "Any"))
+        || (trait_def == lang.range_bounds && cx.std_trait_imported("ops", "RangeBounds"))
     {
         return true;
     }
@@ -122,6 +123,7 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.into_iterator,
         lang.from_iterator,
         // Prelude traits of user iterators and collections (W-STD-B).
+        lang.exact_size_iterator,
         lang.double_ended_iterator,
         lang.extend,
         lang.from,

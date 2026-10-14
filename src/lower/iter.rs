@@ -47,6 +47,13 @@ fn expands(b: Builtin) -> bool {
             | B::IterLen
             | B::RangeStartBound
             | B::RangeEndBound
+            | B::BoundAsRef
+            | B::BoundMap
+            | B::BoundCloned
+            | B::RangeIsEmpty
+            | B::RangeContains
+            | B::RangeInclStart
+            | B::RangeInclEnd
             | B::IterMap
             | B::IterFilter
             | B::IterFilterMap
@@ -782,6 +789,36 @@ impl Ex<'_, '_, '_> {
                 let si = self.local(inner[0]);
                 self.assign(Place::local(si), Rvalue::TupleAgg(inner[0], vec![Operand::Move(Place::local(v))]));
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(si))]));
+            B::BoundAsRef | B::BoundCloned => {
+                let r = arg()?;
+                let (itp, ty) = if b == B::BoundAsRef {
+                    self.deref_arg(r)?
+                } else {
+                    let (l, ty) = self.own(r)?;
+                    (Place::local(l), ty)
+                };
+                self.bound_map_like(b, itp, ty, None, dest, dest_ty)?;
+            }
+            B::RangeIsEmpty | B::RangeInclStart | B::RangeInclEnd => {
+                let r = arg()?;
+                let (itp, ty) = self.deref_arg(r)?;
+                self.range_query(b, itp, ty, None, dest)?;
+            }
+            B::RangeContains => {
+                let (r, x) = (arg()?, arg()?);
+                let (itp, ty) = self.deref_arg(r)?;
+                let xt = self.op_ty(&x)?;
+                let xp = self.op_place(x, xt);
+                self.range_query(b, itp, ty, Some(xp.deref()), dest)?;
+            }
+            B::BoundMap => {
+                let (r, f) = (arg()?, arg()?);
+                let (l, ty) = self.own(r)?;
+                let fty = self.op_ty(&f)?;
+                let fl = self.local(fty);
+                self.assign(Place::local(fl), Rvalue::Use(f));
+                self.bound_map_like(b, Place::local(l), ty, Some((Place::local(fl), fty)), dest, dest_ty)?;
+                self.drop_local(fl);
             }
             B::IterPeek => {
                 let r = arg()?;
@@ -1558,6 +1595,20 @@ impl Ex<'_, '_, '_> {
                 self.cur = last;
                 self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
                 self.some(&dest, opt, Operand::Copy(if back { f(1) } else { f(0) }));
+                // The cursor moves past the end it came from,
+                // wrapping, as std's fields do (observable through
+                // `start()`, `end()`, and `contains`).
+                if back {
+                    let t = self.local(a[0]);
+                    let one = Self::one(a[0], &self.body.tys)?;
+                    self.call_builtin(Builtin::WrappingSub, vec![Operand::Copy(f(1)), one], Place::local(t));
+                    self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(t))));
+                } else {
+                    let t = self.local(a[0]);
+                    let one = Self::one(a[0], &self.body.tys)?;
+                    self.call_builtin(Builtin::WrappingAdd, vec![Operand::Copy(f(0)), one], Place::local(t));
+                    self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(t))));
+                }
                 self.goto(join);
                 self.cur = none_b;
                 self.none(&dest, opt);
@@ -3601,17 +3652,171 @@ impl Ex<'_, '_, '_> {
         self.assign(Place::local(d), Rvalue::Discriminant(side.clone()));
         let (inc_b, exc_b, unb_b) = (self.block(), self.block(), self.block());
         self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, inc_b), (1, exc_b)], unb_b));
+        let payload_is_ref = match self.body.tys.kind(ty) {
+            TyKind::Tuple(ts) => {
+                let es: Vec<Ty> = self.body.tys.tys_of(ts).to_vec();
+                es.first().and_then(|&e| crate::check::generics::bound_elem(&self.body.tys, e))
+                    .is_some_and(|p| matches!(self.body.tys.kind(p), TyKind::Ref(..)))
+            }
+            _ => false,
+        };
         for (bb, variant) in [(inc_b, 0u32), (exc_b, 1u32)] {
             self.cur = bb;
             let payload = side.project(Proj::Downcast(variant)).project(Proj::Field(0));
-            let r = self.ref_to(false, payload, idx);
-            self.assign(dest.clone(), Rvalue::Aggregate(bound, variant, vec![Operand::Move(Place::local(r))]));
+            let op = if payload_is_ref {
+                Operand::Copy(payload)
+            } else {
+                let r = self.ref_to(false, payload, idx);
+                Operand::Move(Place::local(r))
+            };
+            self.assign(dest.clone(), Rvalue::Aggregate(bound, variant, vec![op]));
             self.goto(join);
         }
         self.cur = unb_b;
         self.assign(dest, Rvalue::Aggregate(bound, 2, Vec::new()));
         self.goto(join);
         self.cur = join;
+        Ok(())
+    }
+
+    /// One `Bound` inherent method (`as_ref`, `map`, `cloned`): rebuild the same variant of the destination
+    /// `Bound` around the transformed payload.
+    fn bound_map_like(&mut self, b: Builtin, itp: Place, ty: Ty, f: Option<(Place, Ty)>, dest: Place, dest_ty: Ty) -> R {
+        let bound = match self.body.tys.local_adt(dest_ty) {
+            Some(a) => a,
+            None => self.p.adt_by_def(crate::check::generics::bound_def()).ok_or("iterator expansion: Bound has no Adt")?,
+        };
+        let elem = crate::check::generics::bound_elem(&self.body.tys, ty).ok_or("iterator expansion: Bound has no type argument")?;
+        let out_elem = crate::check::generics::bound_elem(&self.body.tys, dest_ty).ok_or("iterator expansion: Bound has no type argument")?;
+        let join = self.block();
+        let d = self.local(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(itp.clone()));
+        let (inc_b, exc_b, unb_b) = (self.block(), self.block(), self.block());
+        self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, inc_b), (1, exc_b)], unb_b));
+        for (bb, variant) in [(inc_b, 0u32), (exc_b, 1u32)] {
+            self.cur = bb;
+            let payload = itp.project(Proj::Downcast(variant)).project(Proj::Field(0));
+            let op = match b {
+                Builtin::BoundAsRef => {
+                    let r = self.ref_to(false, payload, elem);
+                    Operand::Move(Place::local(r))
+                }
+                Builtin::BoundCloned => {
+                    let y = self.local(out_elem);
+                    self.call_builtin(Builtin::Clone, vec![Operand::Copy(payload)], Place::local(y));
+                    Operand::Move(Place::local(y))
+                }
+                _ => {
+                    let (fp, fty) = f.clone().ok_or("iterator expansion: Bound::map has no closure")?;
+                    let y = self.local(out_elem);
+                    let x = self.take(payload, elem);
+                    self.call_fn(fty, fp, vec![x], Place::local(y))?;
+                    Operand::Move(Place::local(y))
+                }
+            };
+            self.assign(dest.clone(), Rvalue::Aggregate(bound, variant, vec![op]));
+            self.goto(join);
+        }
+        self.cur = unb_b;
+        self.assign(dest, Rvalue::Aggregate(bound, 2, Vec::new()));
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// One range query (`is_empty`, `contains`, or
+    /// `RangeInclusive::start`/`end`) over a builtin range kind's
+    /// stored fields, or one pair side per bound for a
+    /// `(Bound, Bound)` pair's `contains` (core's formulas).
+    fn range_query(&mut self, b: Builtin, itp: Place, ty: Ty, item: Option<Place>, dest: Place) -> R {
+        use crate::ast::BinOp::{And, Ge, Le, Lt, Or};
+        use IterKind as K;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let cp = |pl: Place| Operand::Copy(pl);
+        if b == Builtin::RangeInclStart || b == Builtin::RangeInclEnd {
+            let idx = self.kind_args(ty).map(|(_, a)| a[0]).ok_or("iterator expansion: range has no index type")?;
+            let r = self.ref_to(false, f(if b == Builtin::RangeInclStart { 0 } else { 1 }), idx);
+            self.assign(dest, Rvalue::Use(Operand::Move(Place::local(r))));
+            return Ok(());
+        }
+        if let Some((k, _)) = self.kind_args(ty) {
+            if b == Builtin::RangeIsEmpty {
+                let v = match k {
+                    K::Range => self.cmp(Ge, cp(f(0)), cp(f(1))),
+                    K::RangeInclusive => {
+                        let gt = self.cmp(crate::ast::BinOp::Gt, cp(f(0)), cp(f(1)));
+                        self.cmp(Or, Operand::Copy(f(2)), gt)
+                    }
+                    _ => return Err("iterator expansion: is_empty of a range kind without one".into()),
+                };
+                self.assign(dest, Rvalue::Use(v));
+                return Ok(());
+            }
+            // contains
+            let Some(x) = item else { return Err("iterator expansion: contains has no item".into()) };
+            let xo = Operand::Copy(x);
+            let both = |this: &mut Self, a: Operand, b2: Operand| this.cmp(And, a, b2);
+            let v = match k {
+                K::Range => {
+                    let a = self.cmp(Le, cp(f(0)), xo.clone());
+                    let b2 = self.cmp(Lt, xo, cp(f(1)));
+                    both(self, a, b2)
+                }
+                K::RangeInclusive => {
+                    let a = self.cmp(Le, cp(f(0)), xo.clone());
+                    let b2 = self.cmp(Le, xo, cp(f(1)));
+                    both(self, a, b2)
+                }
+                K::RangeFrom => self.cmp(Le, cp(f(0)), xo),
+                K::RangeTo => self.cmp(Lt, xo, cp(f(0))),
+                K::RangeToInclusive => self.cmp(Le, xo, cp(f(0))),
+                _ => Operand::Const(Const::Bool(true)),
+            };
+            self.assign(dest, Rvalue::Use(v));
+            return Ok(());
+        }
+        // A `(Bound<T>, Bound<T>)` pair's contains: each side as core
+        // tests it. The payload may be a reference itself.
+        let Some(x) = item else { return Err("iterator expansion: contains has no item".into()) };
+        let payload_is_ref = match self.body.tys.kind(ty) {
+            TyKind::Tuple(ts) => {
+                let es: Vec<Ty> = self.body.tys.tys_of(ts).to_vec();
+                es.first().and_then(|&e| crate::check::generics::bound_elem(&self.body.tys, e))
+                    .is_some_and(|p| matches!(self.body.tys.kind(p), TyKind::Ref(..)))
+            }
+            _ => false,
+        };
+        let mut side_ok = |this: &mut Self, side: Place, is_start: bool| -> Local {
+            let out = this.local(BOOL);
+            let d = this.local(int(IntTy::U32));
+            this.assign(Place::local(d), Rvalue::Discriminant(side.clone()));
+            let (inc_b, exc_b, unb_b, join) = (this.block(), this.block(), this.block(), this.block());
+            this.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, inc_b), (1, exc_b)], unb_b));
+            for (bb, variant, strict) in [(inc_b, 0u32, false), (exc_b, 1u32, true)] {
+                this.cur = bb;
+                let mut payload = side.project(Proj::Downcast(variant)).project(Proj::Field(0));
+                if payload_is_ref {
+                    payload = payload.deref();
+                }
+                let v = match (is_start, strict) {
+                    (true, false) => this.cmp(Le, Operand::Copy(payload), Operand::Copy(x.clone())),
+                    (true, true) => this.cmp(Lt, Operand::Copy(payload), Operand::Copy(x.clone())),
+                    (false, false) => this.cmp(Le, Operand::Copy(x.clone()), Operand::Copy(payload)),
+                    (false, true) => this.cmp(Lt, Operand::Copy(x.clone()), Operand::Copy(payload)),
+                };
+                this.assign(Place::local(out), Rvalue::Use(v));
+                this.goto(join);
+            }
+            this.cur = unb_b;
+            this.assign(Place::local(out), Rvalue::Use(Operand::Const(Const::Bool(true))));
+            this.goto(join);
+            this.cur = join;
+            out
+        };
+        let lo = side_ok(self, f(0), true);
+        let hi = side_ok(self, f(1), false);
+        let v = self.cmp(And, Operand::Copy(Place::local(lo)), Operand::Copy(Place::local(hi)));
+        self.assign(dest, Rvalue::Use(v));
         Ok(())
     }
 

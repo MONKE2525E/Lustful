@@ -4296,7 +4296,7 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             // Expanded into plain IR before codegen (lower/iter.rs).
-            B::IterNextBack | B::IterSizeHint | B::IterLen | B::RangeStartBound | B::RangeEndBound => {
+            B::IterNextBack | B::IterSizeHint | B::IterLen | B::RangeStartBound | B::RangeEndBound | B::BoundAsRef | B::BoundMap | B::BoundCloned | B::RangeIsEmpty | B::RangeContains | B::RangeInclStart | B::RangeInclEnd => {
                 unreachable!("iterator expansion left a builtin for codegen")
             }
             // `Rc` weak refs, `RefCell`, and `Cell` (W-STD-A, check/cells.rs).

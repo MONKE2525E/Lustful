@@ -49,7 +49,27 @@ fn exact<I: ExactSizeIterator>(i: &I) -> usize {
     i.len()
 }
 
+fn queries() {
+    println!("{} {}", (1..1).is_empty(), (1..2).is_empty());
+    println!("{} {}", (0..=0).is_empty(), (3..=2).is_empty());
+    println!("{} {}", (-5..-2).contains(&-3), (..0).contains(&-1));
+    println!("pair {} {}", (std::ops::Bound::Excluded(1), std::ops::Bound::Excluded(3)).contains(&2), (std::ops::Bound::Excluded(1), std::ops::Bound::Excluded(3)).contains(&1));
+    let mut r = 0..=2;
+    while r.next().is_some() {}
+    println!("exhausted {} {} {} {}", r.is_empty(), r.contains(&0), *r.start(), *r.end());
+    let rf: std::ops::RangeFrom<i32> = -2..;
+    println!("rf {} {}", rf.contains(&-2), rf.contains(&-3));
+    println!("full {}", (..).contains(&7usize));
+    println!("fields {} {} {} {}", (1..4).start, (1..4).end, (2..).start, (..5).end);
+    let b: std::ops::Bound<&i32> = std::ops::Bound::Included(&5);
+    println!("{:?}", b.cloned());
+    let b: std::ops::Bound<i32> = std::ops::Bound::Excluded(3);
+    println!("{:?} {:?}", b.as_ref(), b.map(|v| v * 2));
+    println!("{:?}", std::ops::Bound::<i32>::Unbounded.map(|v: i32| v + 1));
+}
+
 fn main() {
+    queries();
     show(2..5, 9);
     show(..3, 9);
     show(2.., 9);

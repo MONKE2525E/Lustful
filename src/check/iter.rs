@@ -226,7 +226,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let t = self.expr(arg, None);
         let t = self.deep(t);
-        if let Some(form) = self.drain_form_of(t) {
+        if let Some(form) = self.drain_form_of(t, span) {
             return Some(DR::Value(form));
         }
         // A generic parameter (or projection) whose env proves the
@@ -240,8 +240,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // (the `&R` blanket over a written impl, say).
                     return self.drain_reject(t, span);
                 }
-                let (start, ..) = self.method_instance_for_impl(e, id, tr, impl_args.clone(), "start_bound", span)?;
-                let (end, ..) = self.method_instance_for_impl(arg, id, tr, impl_args, "end_bound", span)?;
+                // Impl validation for a lang trait does not check
+                // that every method is written (generics.rs needs a
+                // template), so check the two methods this call
+                // runs: present, and returning `Bound<&usize>`.
+                let written = |this: &mut Self, site: ExprId, name: &str| -> Option<LocalDefId> {
+                    let (f, _, ret) = this.method_instance_for_impl(site, id, tr, impl_args.clone(), name, span)?;
+                    let in_impl = rec.items.iter().any(|&d| this.p.local_def(d.hash) == Some(f));
+                    let ok = in_impl
+                        && generics::bound_elem(&this.tys, this.resolve(ret)).is_some_and(|r| {
+                            matches!(this.kind(this.resolve(r)), TyKind::Ref(_, _, i) if this.unify(i, USIZE))
+                        });
+                    ok.then_some(f)
+                };
+                let (Some(start), Some(end)) = (written(self, e, "start_bound"), written(self, arg, "end_bound")) else {
+                    return self.drain_reject(t, span);
+                };
                 Some(DR::Trait { start, end })
             }
             Selection::ParamEvidence(_) => Some(DR::Param),
@@ -273,7 +287,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// six range kinds over `usize` (the index type unifies with
     /// `usize`), a `(Bound<usize>, Bound<usize>)` pair, or a shared
     /// reference to one of those.
-    fn drain_form_of(&mut self, t: Ty) -> Option<crate::check::DrainForm> {
+    fn drain_form_of(&mut self, t: Ty, span: Span) -> Option<crate::check::DrainForm> {
         use crate::check::DrainForm as F;
         use IterKind as K;
         let t = self.resolve(t);
@@ -293,13 +307,75 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let es: Vec<Ty> = self.tys.tys_of(ts).to_vec();
             if es.len() == 2
                 && let (Some(a), Some(b)) = (generics::bound_elem(&self.tys, es[0]), generics::bound_elem(&self.tys, es[1]))
-                && self.unify(a, USIZE)
-                && self.unify(b, USIZE)
             {
-                return Some(F::Bounds);
+                // The two pair impls in core: `(Bound<T>, Bound<T>)`
+                // and `(Bound<&T>, Bound<&T>)`. When both payloads are
+                // unbound plain variables (two `Unbounded`s with no
+                // annotation), the impl is ambiguous, as rustc finds.
+                let (ra, rb) = (self.resolve(a), self.resolve(b));
+                let plain = |k: TyKind| matches!(k, TyKind::Infer(v) if !v.is_int() && !v.is_float());
+                if plain(self.kind(ra)) && plain(self.kind(rb)) {
+                    self.err(
+                        "L0610",
+                        span,
+                        "type annotations needed: the bound type must be known here",
+                        "Annotate the bounds, such as `Bound::Unbounded::<usize>`.",
+                    );
+                    return Some(F::Bounds);
+                }
+                let rus = self.tys.mk_ref(false, USIZE);
+                let snap = self.snapshot_vars();
+                if self.unify(a, rus) && self.unify(b, rus) {
+                    return Some(F::BoundsRef);
+                }
+                self.rollback_vars(snap);
+                if self.unify(a, USIZE) && self.unify(b, USIZE) {
+                    return Some(F::Bounds);
+                }
             }
         }
         None
+    }
+
+    /// The inherent methods of `core::ops::Bound<T>`: `as_ref`,
+    /// `map` and `cloned` (`copied` is unstable in 1.99).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bound_adt_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+    ) -> Option<Ty> {
+        use Builtin as B;
+        let elem = generics::bound_elem(&self.tys, self.resolve(base))?;
+        let n = self.name(name);
+        let (b, autoref, params, ret): (Builtin, Autoref, Vec<Ty>, Ty) = match n {
+            "as_ref" => {
+                let r = self.tys.mk_ref(false, elem);
+                (B::BoundAsRef, Autoref::Ref, vec![], generics::bound_ty(&mut self.tys, r))
+            }
+            "map" => {
+                let out = self.new_var(false);
+                let f = self.fn_mut_param(&[elem], out, name_span);
+                (B::BoundMap, Autoref::None, vec![f], generics::bound_ty(&mut self.tys, out))
+            }
+            "cloned" => {
+                let TyKind::Ref(_, Mut::Shared, inner) = self.kind(self.resolve(elem)) else { return None };
+                self.deferred_clone.push((inner, name_span));
+                (B::BoundCloned, Autoref::None, vec![], generics::bound_ty(&mut self.tys, inner))
+            }
+            _ => return None,
+        };
+        if autoref != Autoref::None {
+            self.check_packed_borrow(recv, name_span);
+        }
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        self.check_args(&params, args, name_span);
+        Some(ret)
     }
 
     /// `RangeBounds::start_bound` and `end_bound` on a builtin range
@@ -327,8 +403,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => return None,
         };
         // The receiver must at least be a builtin range kind or pair
-        // (a user type of the same method names is not this hook).
-        if !self.is_range_value_ty(base) {
+        // (a user type of the same method names is not this hook),
+        // and the trait must be in scope, as for any trait method.
+        if !self.is_range_value_ty(base) || !super::method::trait_in_scope_pub(self, self.p.gx.lang.range_bounds) {
             return None;
         }
         // The index type: the range's element or the pair's Bound
@@ -354,6 +431,114 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let ret = generics::bound_ty(&mut self.tys, r);
         let b = if start { B::RangeStartBound } else { B::RangeEndBound };
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        Some(ret)
+    }
+
+    /// A public field of a builtin range kind: `start` and `end`
+    /// on `Range`, `start` on `RangeFrom`, `end` on `RangeTo` and
+    /// `RangeToInclusive`, as (field index, type).
+    /// `RangeInclusive`'s fields are private in std.
+    pub(super) fn range_field(&mut self, t: Ty, name: Sym) -> Option<(u32, Ty)> {
+        use IterKind as K;
+        let (k, a) = it::iter_parts(&self.tys, self.resolve(t))?;
+        let idx = a.first().copied()?;
+        match (k, self.name(name)) {
+            (K::Range, "start") | (K::RangeFrom, "start") => Some((0, idx)),
+            (K::Range, "end") => Some((1, idx)),
+            (K::RangeTo, "end") | (K::RangeToInclusive, "end") => Some((0, idx)),
+            _ => None,
+        }
+    }
+
+    /// `contains` and `is_empty` on the builtin range kinds and
+    /// `(Bound, Bound)` pairs, and `RangeInclusive::start`/`end`.
+    /// `is_empty` is inherent on `Range` and `RangeInclusive` only
+    /// (the trait's is unstable in 1.99); `contains` on `RangeFull`
+    /// and pairs needs the trait in scope, the kinds' own are
+    /// inherent.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn range_query_method(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+    ) -> Option<Ty> {
+        use Builtin as B;
+        use IterKind as K;
+        let n = self.name(name).to_string();
+        let n = n.as_str();
+        if !matches!(n, "contains" | "is_empty" | "start" | "end") {
+            return None;
+        }
+        if !self.is_range_value_ty(base) {
+            return None;
+        }
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on this method"));
+            return Some(self.iter_bail(args));
+        }
+        let kind = it::iter_parts(&self.tys, self.resolve(base)).map(|(k, _)| k);
+        let (b, params, ret): (Builtin, Vec<Ty>, Ty) = match n {
+            "start" | "end" => {
+                if kind != Some(K::RangeInclusive) {
+                    return None;
+                }
+                let idx = self.range_index_ty(base)?;
+                let r = self.tys.mk_ref(false, idx);
+                (if n == "start" { B::RangeInclStart } else { B::RangeInclEnd }, vec![], r)
+            }
+            "is_empty" => {
+                if !matches!(kind, Some(K::Range | K::RangeInclusive)) {
+                    return None;
+                }
+                (B::RangeIsEmpty, vec![], BOOL)
+            }
+            _ => {
+                // contains: `RangeFull` and pairs answer through the
+                // trait, so the trait must be in scope for those.
+                let inherent = matches!(kind, Some(K::Range | K::RangeInclusive | K::RangeFrom | K::RangeTo | K::RangeToInclusive));
+                if !inherent && !super::method::trait_in_scope_pub(self, self.p.gx.lang.range_bounds) {
+                    return None;
+                }
+                let idx = match self.range_index_ty(base) {
+                    Some(i) => i,
+                    None => {
+                        // RangeFull: the argument names the index type.
+                        let Some(&a) = args.first() else {
+                            self.err("L0105", name_span, "`contains` takes 1 argument", "Pass the item to look for.");
+                            return Some(self.iter_bail(args));
+                        };
+                        let at = self.expr(a, None);
+                        match self.kind(self.resolve(at)) {
+                            TyKind::Ref(_, _, i) => i,
+                            _ => return Some(ERROR),
+                        }
+                    }
+                };
+                // The expansion compares with scalar order.
+                match self.kind(self.resolve(idx)) {
+                    TyKind::Int(_) | TyKind::Char | TyKind::Param(_) | TyKind::Projection(..) | TyKind::Error => {}
+                    k if k.is_int_infer() => {}
+                    _ => {
+                        self.errs.push(not_yet("L0640", name_span, "`contains` over this index type"));
+                        return Some(self.iter_bail(args));
+                    }
+                }
+                let r = self.tys.mk_ref(false, idx);
+                // The argument of the RangeFull form checked above.
+                if self.range_index_ty(base).is_none() {
+                    self.set_res(e, Res::BuiltinMethod { b: B::RangeContains, derefs, autoref: Autoref::Ref });
+                    return Some(BOOL);
+                }
+                (B::RangeContains, vec![r], BOOL)
+            }
+        };
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        self.check_args(&params, args, name_span);
         Some(ret)
     }
 
@@ -400,7 +585,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 && let (Some(a), Some(b)) = (generics::bound_elem(&self.tys, es[0]), generics::bound_elem(&self.tys, es[1]))
                 && self.unify(a, b)
             {
-                return Some(a);
+                // The `(Bound<&T>, Bound<&T>)` impl answers for `T`.
+                return Some(match self.kind(self.resolve(a)) {
+                    TyKind::Ref(_, _, i) => i,
+                    _ => a,
+                });
             }
         }
         None

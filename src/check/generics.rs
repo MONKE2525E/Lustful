@@ -518,7 +518,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
         rec(lang.double_ended_iterator, "DoubleEndedIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["next_back"]),
         rec(lang.extend, "Extend", 1, vec![], vec![], &["extend"]),
-        rec(lang.range_bounds, "RangeBounds", 1, vec![], vec![], &["start_bound", "end_bound"]),
+        rec(lang.range_bounds, "RangeBounds", 1, vec![], vec![], &["start_bound", "end_bound", "contains"]),
         rec(lang.as_ref, "AsRef", 1, vec![], vec![], &["as_ref"]),
         rec(lang.as_mut, "AsMut", 1, vec![], vec![], &["as_mut"]),
         rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
@@ -923,6 +923,9 @@ pub fn lang_method_sigs(
                 (d, "next_back") if d == lang.double_ended_iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                }
+                (d, "contains") if d == lang.range_bounds => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0, r1], ret: BOOL, ret_borrows_from: None }
                 }
                 (d, "start_bound" | "end_bound") if d == lang.range_bounds => {
                     let r1 = tys.mk_ref(false, p1);
@@ -6643,6 +6646,11 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let pair_ts = p.tys.intern_tys(&[b0, b0]);
         let pair = p.tys.intern(TyKind::Tuple(pair_ts));
         insert_synthetic(p, &mut ordinal, lang.range_bounds, pair, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        let rp0 = p.tys.mk_ref(false, p0);
+        let br = bound_ty(&mut p.tys, rp0);
+        let pairr_ts = p.tys.intern_tys(&[br, br]);
+        let pairr = p.tys.intern(TyKind::Tuple(pairr_ts));
+        insert_synthetic(p, &mut ordinal, lang.range_bounds, pairr, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
     // IntoIterator for the builtin collections, as alloc and core
     // declare it: Vec<T> by value (vec::IntoIter<T>), &Vec<T> and &[T]

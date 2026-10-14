@@ -2813,9 +2813,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                     F::RangeTo => (z(2), z(0), z(1), f(0)),
                     F::RangeToInclusive => (z(2), z(0), z(0), f(0)),
                     F::RangeFull => (z(2), z(0), z(2), z(0)),
-                    F::Bounds => {
-                        let (stag, sval) = self.bound_side(pl.project(Proj::Field(0)), false, span);
-                        let (etag, eval) = self.bound_side(pl.project(Proj::Field(1)), false, span);
+                    F::Bounds | F::BoundsRef => {
+                        let deref = form == F::BoundsRef;
+                        let (stag, sval) = self.bound_side(pl.project(Proj::Field(0)), deref, span);
+                        let (etag, eval) = self.bound_side(pl.project(Proj::Field(1)), deref, span);
                         (stag, sval, etag, eval)
                     }
                 }

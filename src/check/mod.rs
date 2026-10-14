@@ -607,6 +607,17 @@ pub enum Builtin {
     /// lower/iter.rs into a `Bound<&T>` value.
     RangeStartBound,
     RangeEndBound,
+    /// The inherent methods of `core::ops::Bound<T>`: expanded in
+    /// lower/iter.rs like the iterator builtins.
+    BoundAsRef,
+    BoundMap,
+    BoundCloned,
+    /// `Range::is_empty` and the range kinds' `contains`, plus
+    /// `RangeInclusive::start` and `end`: expanded in lower/iter.rs.
+    RangeIsEmpty,
+    RangeContains,
+    RangeInclStart,
+    RangeInclEnd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -907,6 +918,8 @@ pub enum DrainForm {
     RangeToInclusive,
     /// A `(Bound<usize>, Bound<usize>)` pair.
     Bounds,
+    /// A `(Bound<&usize>, Bound<&usize>)` pair.
+    BoundsRef,
 }
 
 /// Which `Checked` table a generic `deref` fn's site fills in.
@@ -6275,6 +6288,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             };
                         }
                     }
+                    // The public fields of the range kinds (`start`
+                    // and `end`; `RangeInclusive`'s are private).
+                    if let Some((i, fty)) = self.range_field(inner, *name) {
+                        self.set_res(e, Res::Field { derefs, index: i });
+                        return fty;
+                    }
                     // rustc's autoderef goes on through a user `Deref`
                     // impl (`info.file_index` on a type that derefs to
                     // the struct holding it).
@@ -11483,6 +11502,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `LocalKey` methods on a `thread_local!` static (check/tls.rs).
         if let Some(ret) = self.tls_method(e, recv, base, derefs, name, name_span, args) {
+        // The inherent methods of `core::ops::Bound<T>` (same).
+        if let Some(ret) = self.bound_adt_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         // The inherent methods of `alloc::borrow::Cow` (W-STD-B).
@@ -11681,6 +11702,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `start_bound` and `end_bound` on a builtin range value.
         if let Some(ret) = self.bound_method(e, base, derefs, name, name_span, args, turbofish, expected) {
+            return ret;
+        }
+        // `contains`, `is_empty`, and `RangeInclusive::start/`end`.
+        if let Some(ret) = self.range_query_method(e, base, derefs, name, name_span, args, turbofish) {
             return ret;
         }
         // Iterator sources on sequences and every method on a builtin

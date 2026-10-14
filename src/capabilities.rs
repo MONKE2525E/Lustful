@@ -451,6 +451,13 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::IterLen,
     Builtin::RangeStartBound,
     Builtin::RangeEndBound,
+    Builtin::BoundAsRef,
+    Builtin::BoundMap,
+    Builtin::BoundCloned,
+    Builtin::RangeIsEmpty,
+    Builtin::RangeContains,
+    Builtin::RangeInclStart,
+    Builtin::RangeInclEnd,
 ];
 
 /// How a builtin is called.
@@ -939,6 +946,13 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::IterLen => (&["Iterator"], vec![i.intern("len")], Call::Method),
         B::RangeStartBound => (&["RangeBounds"], vec![i.intern("start_bound")], Call::Method),
         B::RangeEndBound => (&["RangeBounds"], vec![i.intern("end_bound")], Call::Method),
+        B::BoundAsRef => (&["Bound<T>"], vec![i.intern("as_ref")], Call::Method),
+        B::BoundMap => (&["Bound<T>"], vec![i.intern("map")], Call::Method),
+        B::BoundCloned => (&["Bound<T>"], vec![i.intern("cloned")], Call::Method),
+        B::RangeIsEmpty => (&["Range", "RangeInclusive"], vec![i.intern("is_empty")], Call::Method),
+        B::RangeContains => (&["RangeBounds"], vec![i.intern("contains")], Call::Method),
+        B::RangeInclStart => (&["RangeInclusive"], vec![i.intern("start")], Call::Method),
+        B::RangeInclEnd => (&["RangeInclusive"], vec![i.intern("end")], Call::Method),
         B::LocationCaller => (&["std::panic::Location"], vec![i.intern("caller")], Call::Associated),
         B::LocationFile => (&["std::panic::Location"], vec![i.intern("file")], Call::Method),
         B::LocationLine => (&["std::panic::Location"], vec![i.intern("line")], Call::Method),
