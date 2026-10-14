@@ -81,6 +81,7 @@ impl Ctx<'_, '_> {
     /// its index in this body's env (`TraitPick::env_pred`).
     /// `usize::MAX` is selection's structural answer, not a predicate.
     pub(super) fn record_pick_env(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm, env: Option<usize>) {
+        self.last_pick = Some((e, trait_def));
         if self.records_picks() {
             // An index past the fn's own env names an opaque type's bound
             // (`Ctx::solve_env`): the revealed check selects on the hidden

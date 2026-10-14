@@ -24,6 +24,7 @@ pub mod platform;
 pub mod project;
 pub mod sized;
 pub mod stdtypes;
+pub mod std_inherent;
 pub mod tls;
 pub mod usefulness;
 pub mod sync;
@@ -1006,6 +1007,16 @@ struct Ctx<'p, 'a> {
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
+    /// Method calls where rustc picks a std inherent item before any user
+    /// trait's method (check/std_inherent.rs): the trait probe skips user
+    /// traits for them.
+    std_first: Vec<ExprId>,
+    /// The method call `method_via_user_deref` is probing on its target:
+    /// its receiver is `&Target` there, where rustc's step is the place.
+    user_deref_call: Option<ExprId>,
+    /// The last trait pick a probe confirmed (`record_pick_env`): the call
+    /// and its trait.
+    last_pick: Option<(ExprId, DefId)>,
     /// Operators whose result waits on an `Output` obligation because
     /// an operand was a general variable at their first check (see
     /// `binary`).
@@ -1297,6 +1308,9 @@ fn check_fn_mode<'p, 'a>(
         const_fn_self: None,
         const_fn_saved: Vec::new(),
         deferred_methods: Vec::new(),
+        std_first: Vec::new(),
+        user_deref_call: None,
+        last_pick: None,
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
         deferred_layout: Vec::new(),
@@ -4613,7 +4627,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let depth = self.deref_depth;
         let tref = self.tys.mk_ref(false, target);
         self.deref_depth += 1;
+        let outer = self.user_deref_call.replace(e);
         let ret = self.method_call_with_rt(e, recv, tref, name, name_span, args, turbofish, expected);
+        self.user_deref_call = outer;
         self.deref_depth -= 1;
         let mutable = match self.out.expr_res[self.ei(e)] {
             Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } | Res::DynMethod { autoref, .. } => autoref == Autoref::RefMut,
@@ -8780,6 +8796,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         span: Span,
     ) -> Option<Ty> {
         let p = self.p;
+        // `Type::name` with no written trait: a std item of the name wins
+        // or ties (check/std_inherent.rs).
+        if hint.is_none() && self.replay_pick(e).is_none() && self.std_shadow_path(base, name, false, span) {
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        }
         // An instance replays the template's param-env evidence for a
         // `from` call (`U: From<u8>` fixes the input: check/picks.rs).
         let hint = match self.replayed_trait_ref(e, p.gx.lang.from) {
@@ -10760,6 +10784,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 None => builtin_only = true,
             }
         }
+        // A user trait's method next to a std item of the same name: who
+        // wins in rustc's probe order (check/std_inherent.rs).
+        if !builtin_only && let Some(ret) = self.std_shadow_call(e, rt, base, name, name_span, args, &explicit, expected) {
+            return ret;
+        }
         // The inherent methods of `core::cmp::Ordering` (no user
         // impl can add inherent methods to it).
         if let Some(ret) = self.ordering_method(e, base, derefs, name, name_span, args) {
@@ -11374,6 +11403,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 for &a in args {
                     self.expr(a, None);
+                }
+                // A user trait's method was skipped for std's item, which
+                // lust does not model.
+                if self.std_first.contains(&e) {
+                    self.report_std_shadow(base, name, false, name_span);
+                    return ERROR;
                 }
                 let tn = self.tn(base);
                 self.err(
@@ -13249,6 +13284,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         span: Span,
     ) -> Option<(Option<u32>, Ty)> {
         let p = self.p;
+        if hint.is_none() && pick_e.and_then(|e| self.replay_pick(e)).is_none() && self.std_shadow_path(base, name, true, span) {
+            return Some((None, ERROR));
+        }
         // Every user trait that declares an associated const `name`.
         let mut by_name: Vec<DefId> = Vec::new();
         for &assoc in p.gx.trait_assoc_consts.keys() {

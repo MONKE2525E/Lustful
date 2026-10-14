@@ -77,7 +77,8 @@ prints "reserved, not yet emitted".
 | L0640 | Std surface | W-STD | in use | Std item is declared but not yet implemented (S5) |
 | L0641 | Std surface | W-STD | in use | Float or byte literal, known std type, or format form is not supported yet (S3b) |
 | L0642 | Std surface | W-STD | in use | Intrinsic called from a crate that may not use intrinsics (S5) |
-| L0643-L0649 | Std surface | W-STD | reserved | |
+| L0643 | Std surface | fx-alias-builtin | in use | A std item of the name may win over or tie with a non-std trait item (rule zero) |
+| L0644-L0649 | Std surface | W-STD | reserved | |
 | L0650 | Layout | W-CORELANG | in use | `offset_of!` on a default-repr type |
 | L0651-L0652 | Layout | W-CORELANG | in use | L0651 reference to a packed field, L0652 unsupported layout form |
 | L0653-L0659 | Layout | W-CORELANG | reserved | |

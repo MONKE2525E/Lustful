@@ -185,12 +185,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// `Cache::default()` through an alias, or `String::default()`: a
-    /// type-relative call to a name the builtin type has no item for,
-    /// through the std trait that declares it. A user trait's method of
-    /// that name is not taken: std may have an inherent fn of that name
-    /// lust does not model, which rustc picks first (`<T as Tr>::f`
-    /// names the trait). None when no std trait applies.
+    /// `Cache::default()` through an alias, `String::default()`, or a
+    /// user trait's fn (`V4::mk()`): a type-relative call to a name the
+    /// builtin type has no item for, through the trait that declares it.
+    /// `assoc_call` rejects a user trait's item where std has an item of
+    /// the name lust does not model (L0643). None when no trait applies.
     pub(super) fn std_trait_assoc_call(
         &mut self,
         e: ExprId,
@@ -200,11 +199,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
         args: &[ExprId],
         span: Span,
     ) -> Option<Ty> {
-        let p = self.p;
-        let traits = p.gx.traits_by_method.get(&name).cloned().unwrap_or_default();
-        if traits.into_iter().any(|d| d.krate != crate::ty::BUILTIN_CRATE && method::trait_in_scope_pub(self, d)) {
-            return None;
-        }
         self.assoc_call(e, callee, base, None, name, args, span)
     }
 

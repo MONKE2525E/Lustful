@@ -332,6 +332,10 @@ pub(super) fn trait_probe_for(
         if only.is_none() && !trait_in_scope(cx, trait_def) {
             continue;
         }
+        // rustc picks a std inherent item first here (check/std_inherent.rs).
+        if only.is_none() && cx.std_first.contains(&e) && cx.is_user_trait(trait_def) {
+            continue;
+        }
         let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
         let Some(method_def) = rec.method_by_name(name) else { continue };
         // Lang traits have no method templates: the receiver

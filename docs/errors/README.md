@@ -88,6 +88,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0640](L0640.md) | this std item is declared but not yet implemented |
 | [L0641](L0641.md) | this literal or std form is not supported yet |
 | [L0642](L0642.md) | intrinsics can only be called from lust's shipped library crates |
+| [L0643](L0643.md) | a std item of this name may win over the trait item here |
 | [L0650](L0650.md) | `offset_of!` on a default-repr type |
 | [L0651](L0651.md) | reference to a packed field |
 | [L0652](L0652.md) | unsupported layout form |
