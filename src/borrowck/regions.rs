@@ -106,10 +106,23 @@ pub struct RegionSig {
     pub names: Vec<String>,
     /// Per named lifetime (universals `0..early.len()`): early-bound.
     pub early: Vec<bool>,
-    /// The `Fn*(A..)` bounds on the fn's type params, with regions: the
-    /// param's index and the input types (a written lifetime as itself,
-    /// an elided one `Region::Bound`: higher-ranked).
-    pub fn_bounds: Vec<(u32, Vec<Ty>)>,
+    /// The `Fn*(A..) -> R` bounds on the type params of the fn, its impl,
+    /// or its trait, with regions (see `FnBound`).
+    pub fn_bounds: Vec<FnBound>,
+}
+
+/// A `F: Fn*(A..) -> R` bound on a type param, with regions: a lifetime
+/// the bound writes as itself (the fn's universal or `'static`), an elided
+/// one `Region::Bound` (higher-ranked by the sugar). Closures passed for
+/// `F` (`link_bound_closure`) and calls through `F` in the body
+/// (`call_fn_bound`) follow it.
+#[derive(Clone, Debug)]
+pub struct FnBound {
+    /// The type param's index.
+    pub param: u32,
+    pub inputs: Vec<Ty>,
+    /// The written output type (`-> R`); `None` for `()`.
+    pub output: Option<Ty>,
 }
 
 /// The borrow checker's side table of region signatures (W-BORROW, ARCH 5),
@@ -1467,6 +1480,10 @@ pub(super) struct Builder<'b, 'p, 'a> {
     /// types (`trait_view`): fresh vars per projection, which the impl's
     /// own instantiation constrains.
     proj: Option<FxMap<Ty, Vec<u32>>>,
+    /// While a call through an `Fn*` bound instantiates it
+    /// (`call_fn_bound`): the one fresh var its elided (higher-ranked)
+    /// lifetime takes, so an output elided like an input ties to it.
+    bound_var: Option<u32>,
     /// The argument slot vars of each closure created here whose
     /// arguments are free (`ClosureEntry::free_args`), by closure def.
     closure_args: FxMap<DefId, Vec<u32>>,
@@ -1502,6 +1519,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             own,
             errs: Vec::new(),
             proj: None,
+            bound_var: None,
             closure_args: FxMap::default(),
             closure_reqs: FxMap::default(),
             bound_linked: Vec::new(),
@@ -2257,6 +2275,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             if !self.call_sig_with(sig, &t.params, t.ret, &avs, dt, &dv, &[]) {
                 self.call_opaque(&avs, dt, &dv);
             }
+            return;
+        }
+        if let CallTarget::Fn(f) = target
+            && self.call_fn_bound(f, &avs, dt, &dv)
+        {
             return;
         }
         let callee = match target {
@@ -3221,6 +3244,63 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         ok
     }
 
+    /// A call through the `Fn*` bound of a type param of this body
+    /// (`(self.f)(x)`: the callee is the bound's `call`, `call_mut`, or
+    /// `call_once` stub, the receiver `F`, `&F`, or `&mut F`), with the
+    /// bound from this fn's region signature (the fn's own, its impl's,
+    /// or its trait's): the arguments flow into the bound's inputs and its
+    /// output into the destination; a lifetime the bound writes is this
+    /// fn's own, an elided one a fresh region of this call (higher-ranked).
+    /// False when no regioned bound pairs: the caller then takes the
+    /// conservative rule, which ties the result to the receiver too.
+    fn call_fn_bound(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let p = self.p;
+        if self.own.closure || p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {
+            return false;
+        }
+        let Some(m) = p.regions.stub_method(p, f) else { return false };
+        let lang = p.gx.lang;
+        let is_call = [(lang.fn_, "call"), (lang.fn_mut, "call_mut"), (lang.fn_once, "call_once")]
+            .iter()
+            .any(|&(tr, name)| p.gx.index.trait_record(tr).and_then(|r| r.method_by_name(p.interner.intern(name))) == Some(m));
+        let Some((rt, _)) = avs.first() else { return false };
+        let mut t = *rt;
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            t = inner;
+        }
+        let TyKind::Param(j) = self.body.tys.kind(t) else { return false };
+        let Some(sig) = p.regions.body_sig(p, self.body.fn_id) else { return false };
+        let Some(b) = sig.fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() + 1 == avs.len()).cloned() else { return false };
+        if !is_call {
+            return false;
+        }
+        let univ: Vec<u32> = (1..=sig.n_univ).collect();
+        let bv = self.fresh();
+        self.bound_var = Some(bv);
+        let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
+        self.bind_tys.clear();
+        let mut ok = true;
+        for (i, &it) in b.inputs.iter().enumerate() {
+            let (at, av) = &avs[i + 1];
+            let mut pv = Vec::new();
+            ok &= self.inst(it, *at, &univ, &mut binds, &mut pv);
+            if !av.is_empty() {
+                ok &= self.relate(*at, av, *at, &pv, Variance::Co);
+            }
+        }
+        if let Some(ot) = b.output {
+            let mut rv = Vec::new();
+            ok &= self.inst(ot, dt, &univ, &mut binds, &mut rv);
+            if !dv.is_empty() {
+                ok &= self.relate(dt, &rv, dt, dv, Variance::Co);
+            }
+        } else {
+            ok &= dv.is_empty();
+        }
+        self.bound_var = None;
+        ok
+    }
+
     /// The free argument slots of the closure bound to `F` in a call's
     /// `F: Fn*(A..)` bound (`trait_args`; found through the type `F` binds,
     /// so a mono instance pairs like its template), equated with the
@@ -3249,7 +3329,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         // come from the callee's signature; without them every written
         // reference counts as higher-ranked.
         let regioned: Option<Vec<Ty>> =
-            sig.fn_bounds.iter().find(|(j, ins)| *j == jf.0 && ins.len() == inputs_tmpl.len()).map(|(_, ins)| ins.clone());
+            sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == inputs_tmpl.len()).map(|b| b.inputs.clone());
         let tmpl = regioned.unwrap_or_else(|| inputs_tmpl.clone());
         let mut kinds: Vec<BoundSlot> = Vec::with_capacity(slots.len());
         for (i, &it) in inputs.iter().enumerate() {
@@ -3427,6 +3507,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         match r {
             Region::Static => 0,
             Region::Param(k) => univ.get(k as usize).copied().unwrap_or_else(|| self.fresh()),
+            Region::Bound(_) if let Some(v) = self.bound_var => v,
             _ => self.fresh(),
         }
     }

@@ -2177,7 +2177,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// names that lifetime (`&'static Message`, `&'a T`: free, and
     /// borrowck ties it); any other input with regions makes every
     /// argument higher-ranked (no entry).
-    fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg], fn_bounds: &[(u32, Vec<Ty>)]) {
+    fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg], fn_bounds: &[crate::borrowck::FnBound]) {
         let p = self.p;
         for pred in preds {
             let Predicate::Trait(b) = pred else { continue };
@@ -2193,7 +2193,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let TyKind::Tuple(ts) = p.tys.kind(inputs) else { continue };
             let opaque = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..)) || !bound_type_has_regions(p, t);
             let n_in = p.tys.tys_of(ts).len();
-            let regioned = fn_bounds.iter().find(|(jj, ins)| *jj == j.0 && ins.len() == n_in).map(|(_, ins)| ins.as_slice());
+            let regioned = fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() == n_in).map(|b| b.inputs.as_slice());
             let named_ref = |i: usize| {
                 regioned.and_then(|ins| ins.get(i)).is_some_and(|&rt| matches!(p.tys.kind(rt), TyKind::Ref(Region::Static | Region::Param(_), _, _)))
             };
@@ -2222,7 +2222,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// `push_predicates` for a fn template whose region signature keeps
     /// its `Fn` bounds with regions (`note_closure_bounds`).
-    fn push_predicates_with(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span, fn_bounds: &[(u32, Vec<Ty>)]) {
+    fn push_predicates_with(&mut self, preds: &[Predicate], subst_args: &[GenericArg], span: Span, fn_bounds: &[crate::borrowck::FnBound]) {
         self.note_closure_bounds(preds, subst_args, fn_bounds);
         let mut out: Vec<obligations::Obligation> = Vec::new();
         for &pred in preds {

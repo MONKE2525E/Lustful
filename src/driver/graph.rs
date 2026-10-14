@@ -735,12 +735,13 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
     }
     rs.early.hash(h);
     (rs.fn_bounds.len() as u64).hash(h);
-    for (j, ins) in &rs.fn_bounds {
-        j.hash(h);
-        (ins.len() as u64).hash(h);
-        for &t in ins {
+    for b in &rs.fn_bounds {
+        b.param.hash(h);
+        (b.inputs.len() as u64).hash(h);
+        for &t in b.inputs.iter().chain(b.output.iter()) {
             hash_regions_deep(h, p, t, &mut seen);
         }
+        b.output.is_some().hash(h);
     }
 }
 

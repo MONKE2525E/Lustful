@@ -3525,10 +3525,27 @@ fn region_sig(
     let early: Vec<bool> = (0..n_named)
         .map(|i| scope.region_facts.iter().any(|&(a, b)| a == i || b == i) || !in_inputs.contains(&Region::Param(i)))
         .collect();
-    // `F: Fn*(A..)` bounds (parenthesized sugar names only those traits):
-    // their inputs with written lifetimes kept and elided ones bound by
-    // the sugar (`Region::Bound`), so borrowck knows which are
-    // higher-ranked. A bound it cannot resolve is left out.
+    let fn_bounds = fn_bounds_of(ast, interner, known, tys, cx, scope, &def.generics, &def.where_clause);
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds })
+}
+
+/// The `F: Fn*(A..) -> R` bounds that a generics list and its where
+/// clause put on type params of `scope` (W-BORROW, `RegionSig::fn_bounds`;
+/// parenthesized sugar names only those traits): inputs and output with
+/// written lifetimes kept and elided ones bound by the sugar
+/// (`Region::Bound`), so borrowck knows which are higher-ranked. A method
+/// also takes its impl's or trait's. A bound it cannot resolve is left out.
+#[allow(clippy::too_many_arguments)]
+pub fn fn_bounds_of(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &mut impl TyIntern,
+    cx: &ResolveCx,
+    scope: &Scope,
+    generics: &ast::Generics,
+    where_clause: &ast::WhereClause,
+) -> Vec<crate::borrowck::FnBound> {
     let mut bs = scope.clone();
     bs.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
     let type_param = |t: ast::TyId| match ast.ty(t) {
@@ -3538,32 +3555,39 @@ fn region_sig(
         _ => None,
     };
     let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
-    for gp in &def.generics.params {
+    for gp in &generics.params {
         if let ast::GenericParam::Type { name, bounds, .. } = gp
             && let Some(&(_, j)) = scope.type_params.iter().find(|&&(n, _)| n == *name)
         {
             bounded.push((j, bounds));
         }
     }
-    for pred in &def.where_clause.preds {
+    for pred in &where_clause.preds {
         if let ast::WherePred::Type { ty, bounds, .. } = pred
             && let Some(j) = type_param(*ty)
         {
             bounded.push((j, bounds));
         }
     }
-    let mut fn_bounds: Vec<(u32, Vec<Ty>)> = Vec::new();
+    let mut out = Vec::new();
     for (j, bounds) in bounded {
         for b in bounds {
             let TraitBound::Trait { trait_ref, .. } = b else { continue };
-            let Some(ast::GenericArgs::Parenthesized { inputs, .. }) = trait_ref.path.last().map(|s| &s.args) else { continue };
+            let Some(ast::GenericArgs::Parenthesized { inputs, output }) = trait_ref.path.last().map(|s| &s.args) else { continue };
             let tys_in: Option<Vec<Ty>> = inputs.iter().map(|&t| resolve_scoped(ast, interner, known, cx, tys, t, &bs).ok()).collect();
-            if let Some(tys_in) = tys_in {
-                fn_bounds.push((j, tys_in));
+            let out_ty = match output {
+                Some(t) => match resolve_scoped(ast, interner, known, cx, tys, *t, &bs) {
+                    Ok(t) => Some(t),
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            if let Some(inputs) = tys_in {
+                out.push(crate::borrowck::FnBound { param: j, inputs, output: out_ty });
             }
         }
     }
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds })
+    out
 }
 
 /// True when a written type holds a `dyn` type with a written object
@@ -3764,7 +3788,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
             };
-            if let Some(rs) = region_sig {
+            if let Some(mut rs) = region_sig {
+                // `F: Fn*` bounds on the trait's own type params too (W-BORROW).
+                let ast = p.ast;
+                if let ast::ItemKind::Trait(tdef) = &ast.items[item_i].kind {
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    rs.fn_bounds.extend(fn_bounds_of(ast, p.interner, p.known, &mut p.tys, &cx, &mscope, &tdef.generics, &tdef.where_clause));
+                }
                 p.regions.trait_methods.insert(method_def, rs);
             }
             let menv = body_env(&mut p.tys, &p.gx.index, &combined.predicates);

@@ -2417,11 +2417,14 @@ pub fn collect_reuse<'a>(
     // its FnInfo holds the signature over `Param` tys, and mono appends a
     // concrete FnInfo per instance after this pass. Plain fns are their
     // own only instance, exactly as before generics.
-    struct ParentGen {
+    struct ParentGen<'g> {
         generics: Generics,
         scope: generics::Scope,
+        /// The impl's written generics and where clause: their `F: Fn*`
+        /// bounds join each method's region signature (W-BORROW).
+        ast_generics: Option<(&'g ast::Generics, &'g ast::WhereClause)>,
     }
-    let plain_parent = || ParentGen { generics: Generics::default(), scope: generics::Scope::default() };
+    let plain_parent = || ParentGen { generics: Generics::default(), scope: generics::Scope::default(), ast_generics: None };
     let add_fn = |p: &mut Program<'a>,
                   def: &'a ast::FnDef,
                   owner: Option<AdtId>,
@@ -2501,6 +2504,10 @@ pub fn collect_reuse<'a>(
             // is generic over them).
             for e in rs.early.iter_mut().take(parent_gen.scope.lifetimes.len()) {
                 *e = true;
+            }
+            if let Some((g, w)) = parent_gen.ast_generics {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
             }
             p.regions.fns.insert(id, rs);
         }
@@ -2752,7 +2759,8 @@ pub fn collect_reuse<'a>(
                         assocs: rec.assoc_items.iter().map(|&(d, n, _)| (n, d)).collect(),
                     });
                 }
-                let parent_gen = ParentGen { generics: impl_generics.clone(), scope: impl_scope };
+                let parent_gen =
+                    ParentGen { generics: impl_generics.clone(), scope: impl_scope, ast_generics: Some((&imp.generics, &imp.where_clause)) };
                 let mut method_ids: Vec<LocalDefId> = Vec::new();
                 for def in &imp.fns {
                     // Functions in trait impls cannot be declared const
