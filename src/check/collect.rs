@@ -4534,6 +4534,11 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
                 return all(tys, vec![a, b], seen);
             }
             if let Some(a) = tys.local_adt(t) {
+                // Written `unsafe impl Send for S {}` replaces the
+                // structural rule (W-THREADS).
+                if let Some(r) = crate::check::sync::explicit_auto_impl(p, tys, t, trait_def) {
+                    return Some(r);
+                }
                 seen.push((trait_def, t));
                 let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();

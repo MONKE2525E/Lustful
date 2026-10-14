@@ -1058,6 +1058,22 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
     }
 }
 
+/// A written impl of an auto trait for a user Adt (`unsafe impl Send for
+/// S {}`): rustc then uses only the written impls, not the structural
+/// rule. Some(true) when an impl holds for every instantiation (no bound
+/// beyond `Sized`); Some(false) when only conditional impls exist (lust
+/// does not prove their bounds yet: a safe reject); None with no written
+/// impl (the caller walks the fields).
+pub fn explicit_auto_impl(p: &crate::check::collect::Program, tys: &impl TyIntern, t: Ty, trait_def: DefId) -> Option<bool> {
+    use crate::traits::index::{SelfHead, Synthetic};
+    let (def, _) = tys.adt_parts(t)?;
+    let any = p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
+        let rec = p.gx.index.get(id);
+        rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
+    });
+    any.then(|| crate::check::fmt::user_impl_holds(p, tys, t, trait_def))
+}
+
 /// The auto trait facts (`Send`, `Sync`, `Unpin`) of the std builtin
 /// types, as std's own impls give them (ARCH 2.7): Some(answer) for a
 /// builtin with a fixed rule, None for a type the caller walks by
