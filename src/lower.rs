@@ -2592,6 +2592,14 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
+        // A method call reports caller locations (track_caller builtins
+        // such as unwrap and pow) at the method name, as rustc does, not
+        // at the receiver. A qualified-path call (`Type::name(..)`) is a
+        // plain call here and keeps the whole-expression span.
+        let span = match self.p.ast.expr(e) {
+            Expr::MethodCall { name_span, .. } => *name_span,
+            _ => span,
+        };
         if let Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, .. } = self.ck.res(e) {
             self.write_fmt_into(e, recv, args, derefs, dest, span);
             return;
