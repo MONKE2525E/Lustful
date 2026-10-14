@@ -187,6 +187,8 @@ struct Shape {
 ///
 /// - `init`, `uninit`, `moved`: maybe-initialized, maybe-uninitialized,
 ///   and maybe-moved locals.
+/// - `ever`: locals that may have been assigned since their storage began
+///   (a move does not clear it). Rust's E0384 on an immutable local uses it.
 /// - `paths`: the field paths that may have been moved out of their local,
 ///   one bit per entry of `Ck::mpaths`. The empty path means the whole
 ///   local may have been moved.
@@ -198,7 +200,7 @@ struct State {
 
 impl State {
     fn new(sh: Shape) -> State {
-        State { sh, w: vec![0; 3 * sh.wn + sh.wm] }
+        State { sh, w: vec![0; 4 * sh.wn + sh.wm] }
     }
     fn init(&self) -> &[u64] {
         &self.w[..self.sh.wn]
@@ -221,11 +223,18 @@ impl State {
         let wn = self.sh.wn;
         &mut self.w[2 * wn..3 * wn]
     }
+    fn ever(&self) -> &[u64] {
+        &self.w[3 * self.sh.wn..4 * self.sh.wn]
+    }
+    fn ever_mut(&mut self) -> &mut [u64] {
+        let wn = self.sh.wn;
+        &mut self.w[3 * wn..4 * wn]
+    }
     fn paths(&self) -> &[u64] {
-        &self.w[3 * self.sh.wn..]
+        &self.w[4 * self.sh.wn..]
     }
     fn paths_mut(&mut self) -> &mut [u64] {
-        let a = 3 * self.sh.wn;
+        let a = 4 * self.sh.wn;
         &mut self.w[a..]
     }
     fn join(&mut self, o: &State) -> bool {
@@ -1211,6 +1220,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for l in 0..n {
             if l >= 1 && l <= self.body.arg_count {
                 bit_set(st.init_mut(), l);
+                bit_set(st.ever_mut(), l);
             } else {
                 bit_set(st.uninit_mut(), l);
             }
@@ -1369,6 +1379,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 bit_set(st.uninit_mut(), li);
                 if matches!(s, StmtKind::StorageDead(_)) {
                     self.clear_paths(st, li);
+                    bit_unset(st.ever_mut(), li);
                 }
             }
             // A use for liveness only, as rustc's `FakeRead` and
@@ -1394,12 +1405,15 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     fn write_dest(&mut self, dest: &Place, span: Span, live: &BitSet, st: &mut State) {
         if dest.proj.is_empty() {
             let l = dest.local as usize;
-            if !self.body.locals[l].mutable && bit_has(st.init(), l) {
+            // Rust checks ever-initialized here: a value moved out still
+            // counts (`let a = s; drop(a); a = t;` is E0384).
+            if !self.body.locals[l].mutable && bit_has(st.ever(), l) {
                 let name = self.local_name(dest.local);
                 self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
             }
             self.access(dest, Access::Write, span, live);
             bit_set(st.init_mut(), l);
+            bit_set(st.ever_mut(), l);
             bit_unset(st.uninit_mut(), l);
             bit_unset(st.moved_mut(), l);
             self.clear_paths(st, l);
@@ -2106,7 +2120,9 @@ mod tests {
         bit_set(a.uninit_mut(), 69);
         bit_set(a.paths_mut(), 5);
         bit_set(a.moved_mut(), 3);
+        bit_set(a.ever_mut(), 4);
         assert!(bit_has(a.uninit(), 69) && !bit_has(a.init(), 69) && !bit_has(a.moved(), 69));
+        assert!(bit_has(a.ever(), 4) && !bit_has(a.moved(), 4) && !bit_has(a.ever(), 3));
         assert_eq!(bit_iter(a.paths()).collect::<Vec<_>>(), vec![5]);
         assert!(bit_has(a.moved(), 3) && !bit_has(a.init(), 3));
         let mut b = State::new(sh);
