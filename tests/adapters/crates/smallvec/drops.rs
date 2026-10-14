@@ -2,21 +2,11 @@
 // the back, retain and dedup drop after every call, resize clones then
 // drops its value, and from_elem clones as upstream does.
 use smallvec::SmallVec;
-use std::cell::RefCell;
 
-thread_local! {
-    static LOG: RefCell<String> = RefCell::new(String::new());
-}
-
-fn log(s: &str) {
-    LOG.with(|l| l.borrow_mut().push_str(s));
-}
-
+// The log is stdout itself: each clone and drop prints at once, and
+// `flush` ends the line with the step's name.
 fn flush(what: &str) {
-    LOG.with(|l| {
-        println!("{}: {}", what, l.borrow());
-        l.borrow_mut().clear();
-    });
+    println!("| {}", what);
 }
 
 #[derive(Debug, PartialEq)]
@@ -24,14 +14,14 @@ struct D(u8);
 
 impl Clone for D {
     fn clone(&self) -> D {
-        log(&format!("c{} ", self.0));
+        print!("c{} ", self.0);
         D(self.0)
     }
 }
 
 impl Drop for D {
     fn drop(&mut self) {
-        log(&format!("d{} ", self.0));
+        print!("d{} ", self.0);
     }
 }
 
