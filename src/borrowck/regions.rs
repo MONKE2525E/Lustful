@@ -3124,6 +3124,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && !av.is_empty()
                 && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashIterNew)) && self.call_hash_iter(&avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(b) = target
+                && entry_builtin(b)
+                && self.call_hash_entry(b, &avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowToMut)) && self.call_cow_to_mut(&avs, &dv) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
@@ -3616,6 +3619,70 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             let (a, b) = (mv[at..at + n].to_vec(), iv[at..at + n].to_vec());
             self.relate(t, &a, t, &b, var);
             at += n;
+        }
+        true
+    }
+
+    /// The Entry API (W-STD-B): `map.entry(k)` holds the `&'a mut` loan
+    /// and the map's K and V regions (invariant: it can insert, and the
+    /// probe key flows into K); the `&'a mut V` an Entry method returns
+    /// is that loan's, with the map's V regions; `and_modify` gives the
+    /// same Entry back. A stored value (`or_insert`'s argument) and a
+    /// closure form's closure (all its regions) flow into V. The keys'
+    /// regions never reach the loan.
+    fn call_hash_entry(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::check::Builtin as B;
+        use crate::ty::hash::hash_parts;
+        let Some((t0, v0)) = avs.first() else { return false };
+        // The Entry (or, for `entry`, the map behind its `&mut`) and its K, V.
+        let (holder, entry_args) = if b == B::MapEntry {
+            let TyKind::Ref(_, _, map) = self.body.tys.kind(*t0) else { return false };
+            (map, hash_parts(&self.body.tys, map))
+        } else {
+            (*t0, hash_parts(&self.body.tys, *t0))
+        };
+        let _ = holder;
+        let Some((_, ka)) = entry_args else { return false };
+        let (Some(&kt), Some(&vt)) = (ka.first(), ka.get(1)) else { return false };
+        let (nk, nv) = (self.sc.slots(kt) as usize, self.sc.slots(vt) as usize);
+        let (Some((&own, hv)), Some((&dst, rv))) = (v0.split_first(), dv.split_first()) else { return false };
+        if hv.len() < nk + nv {
+            return false;
+        }
+        let (hk, hvv) = (hv[..nk].to_vec(), hv[nk..nk + nv].to_vec());
+        self.edge(own, dst);
+        match b {
+            B::MapEntry | B::EntryAndModify => {
+                if rv.len() < nk + nv {
+                    return false;
+                }
+                let (rk, rvv) = (rv[..nk].to_vec(), rv[nk..nk + nv].to_vec());
+                self.relate(kt, &hk, kt, &rk, Variance::Inv);
+                self.relate(vt, &hvv, vt, &rvv, Variance::Inv);
+                if b == B::MapEntry
+                    && let Some((t1, v1)) = avs.get(1)
+                {
+                    self.relate(*t1, v1, kt, &rk, Variance::Co);
+                }
+            }
+            _ => {
+                if rv.len() < nv {
+                    return false;
+                }
+                self.relate(vt, &hvv, vt, &rv[..nv], Variance::Inv);
+                if let Some((t1, v1)) = avs.get(1) {
+                    if b == B::EntryOrInsert {
+                        self.relate(*t1, v1, vt, &hvv, Variance::Co);
+                    } else {
+                        self.flow_all(v1, &hvv);
+                    }
+                }
+            }
+        }
+        if b == B::EntryAndModify
+            && let Some((_, v1)) = avs.get(1)
+        {
+            self.flow_all(v1, &hvv);
         }
         true
     }
@@ -5588,6 +5655,16 @@ fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
 fn hash_lookup_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(b, B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::SetContains | B::SetRemove | B::SetGet)
+}
+
+/// `map.entry(k)` and the Entry methods that return the value or the
+/// Entry (W-STD-B, `call_hash_entry`).
+fn entry_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(
+        b,
+        B::MapEntry | B::EntryOrInsert | B::EntryOrDefault | B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify
+    )
 }
 
 /// The builtin iterator calls whose result is an item (or a collection

@@ -539,6 +539,10 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::EntryOrInsert
             | B::EntryOrDefault
             | B::EntryKey
+            | B::EntryOccupied
+            | B::EntryIntoMut
+            | B::EntryInsert
+            | B::EntryGetMut
             | B::SetInsert
             | B::SetContains
             | B::SetRemove
@@ -792,6 +796,28 @@ impl FnGen<'_, '_, '_> {
             B::EntryKey => {
                 let e = ctype(&elem_cty(&recv));
                 Some(format!("({r}->slot ? &(({e}*){r}->slot)->f0 : &{r}->key)"))
+            }
+            // The steps of the closure forms (lower/iter.rs `entry_with`).
+            B::EntryOccupied => Some(format!("({r}->slot != 0)")),
+            B::EntryIntoMut | B::EntryGetMut => {
+                let e = ctype(&elem_cty(&recv));
+                if b == B::EntryGetMut {
+                    return Some(format!("(&(({e}*){r}->slot)->f1)"));
+                }
+                let ev = self.tmp();
+                let _ = writeln!(self.out, "    {} {ev} = {};", ctype(&recv), vals[0]);
+                Some(format!("(&(({e}*){ev}.slot)->f1)"))
+            }
+            B::EntryInsert => {
+                let e = ctype(&elem_cty(&recv));
+                let ev = self.tmp();
+                let _ = writeln!(self.out, "    {} {ev} = {};", ctype(&recv), vals[0]);
+                let _ = writeln!(
+                    self.out,
+                    "    {dc} {t}; {{ {e} *n_{t} = ({e}*)lust_hash_insert_no_grow_slot({ev}.t, {ev}.hash, 0); n_{t}->f0 = {ev}.key; n_{t}->f1 = {}; {t} = &n_{t}->f1; }}",
+                    vals[1]
+                );
+                Some(t)
             }
             B::HashIterNew => {
                 // A borrowing iterator walks the table in place; an owning

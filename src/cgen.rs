@@ -3401,6 +3401,10 @@ impl FnGen<'_, '_, '_> {
             | B::EntryOrInsert
             | B::EntryOrDefault
             | B::EntryKey
+            | B::EntryOccupied
+            | B::EntryIntoMut
+            | B::EntryInsert
+            | B::EntryGetMut
             | B::SetInsert
             | B::SetContains
             | B::SetRemove
@@ -3414,6 +3418,7 @@ impl FnGen<'_, '_, '_> {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
+            B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.

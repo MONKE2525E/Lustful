@@ -735,7 +735,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `F: FnMut(inputs..) -> output`. The closure's arguments are items
     /// (or `&item`, see `fn_mut_param_ref`): free regions, which the
     /// borrow checker takes from the iterator (W-BORROW).
-    fn fn_mut_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+    pub(super) fn fn_mut_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
         self.fn_mut_param_flags(inputs, &vec![false; inputs.len()], output, span)
     }
 

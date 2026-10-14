@@ -413,6 +413,13 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::EntryOrInsert,
     Builtin::EntryOrDefault,
     Builtin::EntryKey,
+    Builtin::EntryOrInsertWith,
+    Builtin::EntryOrInsertWithKey,
+    Builtin::EntryAndModify,
+    Builtin::EntryOccupied,
+    Builtin::EntryIntoMut,
+    Builtin::EntryInsert,
+    Builtin::EntryGetMut,
     Builtin::SetInsert,
     Builtin::SetContains,
     Builtin::SetRemove,
@@ -778,6 +785,13 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::EntryOrInsert | B::EntryOrDefault | B::EntryKey => {
             (&["hash_map::Entry<K, V>"], vec![i.intern("or_insert"), i.intern("or_default"), i.intern("key")], Call::Method)
         }
+        B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => (
+            &["hash_map::Entry<K, V>"],
+            vec![i.intern("or_insert_with"), i.intern("or_insert_with_key"), i.intern("and_modify")],
+            Call::Method,
+        ),
+        // Internal steps of the closure forms, never called by name.
+        B::EntryOccupied | B::EntryIntoMut | B::EntryInsert | B::EntryGetMut => (&[], vec![], Call::Method),
         B::HashIterNew | B::HashIterNext | B::HashIterLen => (
             &["HashMap<K, V, S>", "HashSet<T, S>"],
             vec![

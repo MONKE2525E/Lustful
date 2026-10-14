@@ -251,6 +251,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let r = self.tys.mk_ref(false, k);
                 Some((B::EntryKey, Autoref::Ref, vec![], r, None))
             }
+            // The closure forms. std's bound is FnOnce; lust asks FnMut,
+            // which only refuses closures that move out of a capture (the
+            // expansion calls through `&mut`), never a wrong run.
+            (HashTy::Entry, "or_insert_with") => {
+                let f = self.fn_mut_param(&[], v, name_span);
+                let r = self.tys.mk_ref(true, v);
+                Some((B::EntryOrInsertWith, Autoref::None, vec![f], r, None))
+            }
+            (HashTy::Entry, "or_insert_with_key") => {
+                let rk = self.tys.mk_ref(false, k);
+                let f = self.fn_mut_param(&[rk], v, name_span);
+                let r = self.tys.mk_ref(true, v);
+                Some((B::EntryOrInsertWithKey, Autoref::None, vec![f], r, None))
+            }
+            (HashTy::Entry, "and_modify") => {
+                let rv = self.tys.mk_ref(true, v);
+                let f = self.fn_mut_param(&[rv], UNIT, name_span);
+                Some((B::EntryAndModify, Autoref::None, vec![f], base, None))
+            }
             _ => None,
         };
         let Some((b, autoref, params, ret, q)) = found else {
@@ -258,7 +277,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.expr(a, None);
             }
             let tn = self.tn(base);
-            if DECLARED_ONLY.contains(&n) || matches!(n, "or_insert_with" | "or_insert_with_key" | "and_modify" | "insert_entry") {
+            if DECLARED_ONLY.contains(&n) || matches!(n, "insert_entry") {
                 self.errs.push(Diag::new(
                     "L0640",
                     name_span,
@@ -275,6 +294,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, name_span);
+        // The expansion calls a closure body directly (lower/iter.rs).
+        if matches!(b, B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify)
+            && let Some(&f) = params.first()
+            && let f = self.deep(f)
+            && !matches!(self.kind(f), TyKind::Closure(..) | TyKind::Error)
+        {
+            self.err("L0640", name_span, format!("`Entry::{n}` with a fn item or fn pointer is not implemented yet"), "Pass a closure: `|| Vec::new()`.");
+        }
         if let Some(q) = q {
             let q = self.deep(q);
             self.require_lookup(k, q, s, name_span);

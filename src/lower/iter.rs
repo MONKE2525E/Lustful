@@ -62,6 +62,9 @@ fn expands(b: Builtin) -> bool {
             | B::IterNextBack
             | B::StrCharIndices
             | B::StrBytes
+            | B::EntryOrInsertWith
+            | B::EntryOrInsertWithKey
+            | B::EntryAndModify
             | B::IterFold
             | B::IterForEach
             | B::IterMin
@@ -496,6 +499,61 @@ impl Ex<'_, '_, '_> {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
                 self.next(itp, ty, dest, b == B::IterNextBack)?;
+            }
+            // The Entry closure forms (W-STD-B): the closure runs only on
+            // the branch std runs it on (vacant for the `or_insert_with`
+            // forms, occupied for `and_modify`).
+            B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => {
+                let (en, f) = (arg()?, arg()?);
+                let ety = self.op_ty(&en)?;
+                let el = self.local(ety);
+                self.assign(Place::local(el), Rvalue::Use(en));
+                let fty = self.op_ty(&f)?;
+                let fl = self.local(fty);
+                self.assign(Place::local(fl), Rvalue::Use(f));
+                let r = self.ref_to(false, Place::local(el), ety);
+                let occ = self.local(BOOL);
+                self.call_builtin(Builtin::EntryOccupied, vec![Operand::Move(Place::local(r))], Place::local(occ));
+                let (yes, no) = self.branch(Operand::Copy(Place::local(occ)));
+                let join = self.block();
+                let vr_ty = if b == B::EntryAndModify { None } else { Some(dest_ty) };
+                let (_, kv) = crate::ty::hash::hash_parts(&self.body.tys, ety).ok_or("entry expansion: not an Entry")?;
+                self.cur = yes;
+                match vr_ty {
+                    Some(_) => self.call_builtin(Builtin::EntryIntoMut, vec![Operand::Move(Place::local(el))], dest.clone()),
+                    None => {
+                        let rv_ty = self.body.tys.mk_ref(true, kv[1]);
+                        let rm = self.ref_to(true, Place::local(el), ety);
+                        let rv = self.local(rv_ty);
+                        self.call_builtin(Builtin::EntryGetMut, vec![Operand::Move(Place::local(rm))], Place::local(rv));
+                        let u = self.local(UNIT);
+                        self.call_fn(fty, Place::local(fl), vec![Operand::Move(Place::local(rv))], Place::local(u))?;
+                        self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(el))));
+                    }
+                }
+                self.goto(join);
+                self.cur = no;
+                match vr_ty {
+                    Some(_) => {
+                        let v = self.local(kv[1]);
+                        let fargs = if b == B::EntryOrInsertWithKey {
+                            let kr_ty = self.body.tys.mk_ref(false, kv[0]);
+                            let rk = self.ref_to(false, Place::local(el), ety);
+                            let k = self.local(kr_ty);
+                            self.call_builtin(Builtin::EntryKey, vec![Operand::Move(Place::local(rk))], Place::local(k));
+                            vec![Operand::Copy(Place::local(k))]
+                        } else {
+                            Vec::new()
+                        };
+                        self.call_fn(fty, Place::local(fl), fargs, Place::local(v))?;
+                        self.call_builtin(Builtin::EntryInsert, vec![Operand::Move(Place::local(el)), Operand::Move(Place::local(v))], dest);
+                    }
+                    None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(el)))),
+                }
+                self.goto(join);
+                self.cur = join;
+                self.drop_local(fl);
+                return Ok(());
             }
             // `s.char_indices()` (W-STD-B): (s.chars(), 0), as std builds it.
             B::StrCharIndices => {

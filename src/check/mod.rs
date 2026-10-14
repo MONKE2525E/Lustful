@@ -530,6 +530,16 @@ pub enum Builtin {
     EntryOrInsert,
     EntryOrDefault,
     EntryKey,
+    /// `or_insert_with`, `or_insert_with_key`, `and_modify` (W-STD-B):
+    /// expanded in lower/iter.rs over the four Entry steps below, so the
+    /// closure runs only on the branch std runs it on.
+    EntryOrInsertWith,
+    EntryOrInsertWithKey,
+    EntryAndModify,
+    EntryOccupied,
+    EntryIntoMut,
+    EntryInsert,
+    EntryGetMut,
     SetInsert,
     SetContains,
     SetRemove,
