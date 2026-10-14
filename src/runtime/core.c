@@ -156,18 +156,25 @@ void lust_fmt_bool(lust_String *out, uint8_t v) LUST_BODY({ lust_string_push_cst
 
 #ifdef LUST_IMPL
 #include "escape_table.h"
+#include "unicode_table.h"
+
+/* Binary search over one generated Unicode range table. */
+static int lust_uni_in(const uint32_t ranges[][2], uint32_t n, uint32_t c) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (c < ranges[mid][0]) hi = mid;
+        else if (c > ranges[mid][1]) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+#define LUST_UNI_IN(table, c) lust_uni_in(table, (uint32_t)(sizeof table / sizeof table[0]), c)
 
 /* True when Rust's escape_debug writes this scalar as \u{...}:
    binary search over the generated range table. */
 static int lust_escape_unicode(uint32_t c) {
-    uint32_t lo = 0, hi = (uint32_t)(sizeof lust_escape_ranges / sizeof lust_escape_ranges[0]);
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (c < lust_escape_ranges[mid][0]) hi = mid;
-        else if (c > lust_escape_ranges[mid][1]) lo = mid + 1;
-        else return 1;
-    }
-    return 0;
+    return LUST_UNI_IN(lust_escape_ranges, c);
 }
 #endif
 
@@ -1171,11 +1178,21 @@ uint8_t lust_str_contains(lust_str s, lust_str p) LUST_BODY({
     return 0;
 })
 
-/* Unicode White_Space, as used by Rust's char::is_whitespace. */
-int lust_is_space(uint32_t c) LUST_BODY({
-    return (c >= 9 && c <= 13) || c == 32 || c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
-           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+/* Unicode White_Space, as used by Rust's char::is_whitespace and the
+   str trim methods. The table is generated (unicode_table.h). */
+int lust_is_space(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_whitespace_ranges, c); })
+
+/* Unicode char predicates over the generated range tables.
+   is_alphanumeric is is_alphabetic || is_numeric: the generator
+   asserts that identity for every scalar before it writes the table. */
+int lust_char_is_alphabetic(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_alphabetic_ranges, c); })
+int lust_char_is_numeric(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_numeric_ranges, c); })
+int lust_char_is_alphanumeric(uint32_t c) LUST_BODY({
+    return LUST_UNI_IN(lust_uni_alphabetic_ranges, c) || LUST_UNI_IN(lust_uni_numeric_ranges, c);
 })
+int lust_char_is_lowercase(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_lowercase_ranges, c); })
+int lust_char_is_uppercase(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_uppercase_ranges, c); })
+int lust_char_is_control(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_control_ranges, c); })
 
 lust_str lust_str_trim_start(lust_str s) LUST_BODY({
     uint64_t a = 0;
@@ -1383,9 +1400,17 @@ uint32_t lust_utf8_prev(const uint8_t *p, uint64_t *end) LUST_BODY({
 
 /* char::to_digit. Returns 0xFFFFFFFF for "not a digit". */
 uint32_t lust_digit(uint32_t c, uint32_t radix, lust_loc loc) LUST_BODY({
-    if (radix < 2 || radix > 36) lust_panic_cstr("to_digit: radix is too high (maximum 36)", loc);
+    if (radix < 2 || radix > 36) lust_panic_cstr("to_digit: invalid radix -- radix must be in the range 2 to 36 inclusive", loc);
     uint32_t d = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'z' ? (c | 32) - 'a' + 10 : 0xFFFFFFFFu;
     return d < radix ? d : 0xFFFFFFFFu;
+})
+
+/* char::from_digit. Returns 0xFFFFFFFF for "not a digit in this radix".
+   A radix under 2 is not a panic in Rust: every check is digit < radix. */
+uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY({
+    if (radix > 36) lust_panic_cstr("from_digit: radix is too high (maximum 36)", loc);
+    if (digit >= radix) return 0xFFFFFFFFu;
+    return digit < 10 ? '0' + digit : 'a' + digit - 10;
 })
 
 /* Float formatting, parsing, and casts (src/runtime/float.h). */
