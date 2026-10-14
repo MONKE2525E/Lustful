@@ -622,8 +622,9 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         CTy::Sync(k, _) if k.is_cell_struct() => out.push(t.clone()),
         CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => by_value_deps(e, out),
         // A pointer to a fn pointer still names its typedef, which has
-        // no forward form (a closure capturing a fn pointer by ref).
-        CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
+        // no forward form (a closure capturing a fn pointer by ref, a
+        // `Box<fn()>` inside an `Option` or a lock).
+        CTy::Ref(inner) | CTy::Boxed(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_) | CTy::Boxed(_)) => by_value_deps(inner, out),
         CTy::Unsized(_, inner) => by_value_deps(inner, out),
         CTy::Hash(k, _) if hash::has_struct(*k) => out.push(t.clone()),
         _ => {}
@@ -3114,11 +3115,24 @@ impl FnGen<'_, '_, '_> {
         }
         let v = self.tmp();
         let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
-        let rest: String = args.iter().map(|a| format!(", {a}")).collect();
+        // A dropped parameter (a zero-sized env taken by value, or a
+        // zero-sized argument) is not in the C signature, so it is
+        // not passed here either (see `param_dropped`); the env is
+        // the body fn's first parameter.
+        let mut all: Vec<String> = vec![env.to_string()];
+        all.extend(args.iter().cloned());
+        let dropped: Vec<bool> = self.p.fn_info(f).params.iter().map(|&t| param_dropped(self.p, &cty(&self.p.tys, t))).collect();
+        let mut i = 0;
+        all.retain(|_| {
+            let keep = !dropped.get(i).copied().unwrap_or(false);
+            i += 1;
+            keep
+        });
         if ret_is_large(self.p, f) {
-            let _ = writeln!(out, "  {} {v}; {call}(&{v}, {env}{rest});", ctype(&rt));
+            let rest: String = all.iter().map(|a| format!(", {a}")).collect();
+            let _ = writeln!(out, "  {} {v}; {call}(&{v}{rest});", ctype(&rt));
         } else {
-            let _ = writeln!(out, "  {} {v} = {call}({env}{rest});", ctype(&rt));
+            let _ = writeln!(out, "  {} {v} = {call}({});", ctype(&rt), all.join(", "));
         }
         (v, rt)
     }
