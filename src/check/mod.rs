@@ -1874,6 +1874,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.tys.intern(TyKind::FnDef(self.p.def_id(f), args))
     }
 
+    /// The type of a unit struct used as a value. A generic one (const
+    /// params only: rustc rejects an unused type param) takes its args
+    /// from the path's turbofish (`S::<7>`) or fresh variables, with its
+    /// bounds queued, as the tuple constructor below does.
+    fn unit_value_ty(&mut self, e: ExprId, a: AdtId, span: Span) -> Ty {
+        let p = self.p;
+        let generics = p.gx.adt_generics[a.0 as usize].clone();
+        if generics.params.is_empty() {
+            return self.tys.adt_ty(a);
+        }
+        let args = match p.ast.expr(e) {
+            Expr::Path(segs) => self.value_path_args(a, segs, span),
+            _ => self.fresh_args(&generics),
+        };
+        if !generics.predicates.is_empty() {
+            self.push_predicates(&generics.predicates, &args, span);
+        }
+        self.tys.mk_adt(p.def_of_adt(a), &args)
+    }
+
     /// The callable-item type of a tuple struct or tuple variant
     /// constructor used as a value. It is an `FnDef` over the Adt def
     /// with the variant index as its first (const) argument, so a later
@@ -7203,7 +7223,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match shape {
                     Some(VariantShape::Unit) => {
                         self.set_res(e, Res::Variant(a, 0));
-                        return self.tys.adt_ty(a);
+                        return self.unit_value_ty(e, a, span);
                     }
                     Some(VariantShape::Tuple) => {
                         self.set_res(e, Res::Variant(a, 0));
@@ -15083,15 +15103,44 @@ impl<'p, 'a> Ctx<'p, 'a> {
         matches!(self.kind(t), TyKind::Infer(v) if !v.is_int() && !v.is_float())
     }
 
+    /// Also true for a const argument nothing fixed (`S<?N>` from a
+    /// unit struct value, rustc E0284).
     fn has_unbound_var(&self, t: Ty) -> bool {
         if !self.tys.flags(t).contains_infer() {
             return false;
         }
         match self.tys.kind(self.resolve(t)) {
             TyKind::Infer(v) => !v.is_int() && !v.is_float(),
-            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_unbound_var(e),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) => self.has_unbound_var(e),
+            TyKind::Array(e, n) => self.has_unbound_var(e) || self.unbound_const(n),
             TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_var(e)),
-            TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.has_unbound_var(e))),
+            TyKind::Adt(_, a) => self.tys.args(a).iter().any(|g| match *g {
+                GenericArg::Ty(e) => self.has_unbound_var(e),
+                GenericArg::Const(c) => self.unbound_const(c),
+                GenericArg::Lifetime(_) => false,
+            }),
+            _ => false,
+        }
+    }
+
+    fn unbound_const(&self, c: ConstId) -> bool {
+        matches!(self.tys.const_kind(self.resolve_const(c)), ConstKind::Infer(_))
+    }
+
+    /// True when the type holds a const variable nothing fixed.
+    fn has_unbound_const(&self, t: Ty) -> bool {
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) => self.has_unbound_const(e),
+            TyKind::Array(e, n) => self.unbound_const(n) || self.has_unbound_const(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_const(e)),
+            TyKind::Adt(_, a) | TyKind::FnDef(_, a) => self.tys.args(a).iter().any(|g| match *g {
+                GenericArg::Ty(e) => self.has_unbound_const(e),
+                GenericArg::Const(c) => self.unbound_const(c),
+                GenericArg::Lifetime(_) => false,
+            }),
             _ => false,
         }
     }
@@ -15245,6 +15294,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "Add a type annotation, such as `let v: Vec<i64> = Vec::new();`.",
                 );
             }
+        }
+        // The same for a const argument in an expression that is no
+        // local (`S;` for a unit struct with a const param, rustc E0284):
+        // codegen has no value for it.
+        if self.errs.is_empty()
+            && let Some(i) = (0..self.out.expr_ty.len()).find(|&i| self.has_unbound_const(self.out.expr_ty[i]))
+        {
+            let span = self.span(ExprId(self.out.expr_base + i as u32));
+            self.err(
+                "L0610",
+                span,
+                "type annotations needed: cannot infer the value of a const parameter here",
+                "Name the value with a turbofish such as `S::<3>`, or annotate the type.",
+            );
         }
         // Deferred format tests, with types as bound by now.
         for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
