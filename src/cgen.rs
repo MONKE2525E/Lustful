@@ -319,6 +319,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::MapIntoIter => CTy::Tuple(vec![cty(tys, a[0]), cty(tys, a[1])]),
         K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => cty(tys, a[0]),
         K::MapIntoValues | K::ByNext => cty(tys, a[1]),
+        K::StrSplit => CTy::Ref(Box::new(CTy::Str)),
         _ => iter_item_cty(tys, a[0]),
     }
 }
