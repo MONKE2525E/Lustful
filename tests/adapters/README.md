@@ -14,3 +14,6 @@ built by Cargo against the real crate (the oracle, output pinned in
 `<case>.stdout`) and by lust with the adapter swapped in. A case headed
 `// lust-reject: L####` is valid Rust that lust must reject with that
 code. Regenerate a `.stdout` only from the real crate's output.
+With `LUST=...`, the runner also prints one `crate <package>:` line of
+matched, unsupported, and wrong cases per package (the W-DEPS
+exactness table) before the total.

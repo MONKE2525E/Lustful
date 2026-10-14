@@ -138,6 +138,12 @@ corpus_crate_one() {
 }
 
 for d in "$corpus_root"/tests/adapters/crates/*/; do
+  m0=$lust_match u0=$lust_unsupported w0=$lust_wrong
   corpus_crate_dir "tests/adapters/crates/$(basename "$d")"
+  # One line per crate in lust mode: the W-DEPS exactness table (ARCH
+  # 9.3). The last line stays the total that land.sh reads.
+  if [ -n "${LUST:-}" ] && [ $((lust_match + lust_unsupported + lust_wrong - m0 - u0 - w0)) -gt 0 ]; then
+    echo "crate $(basename "$d"): $((lust_match - m0)) matched, $((lust_unsupported - u0)) unsupported, $((lust_wrong - w0)) wrong"
+  fi
 done
 corpus_finish test-adapters
