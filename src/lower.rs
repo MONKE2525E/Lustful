@@ -594,12 +594,36 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     /// The type of `e` after its recorded coercion, for temporaries
-    /// that hold the coerced operand.
-    fn coerced_ty(&self, e: ExprId) -> Ty {
+    /// that hold the coerced operand: the type `operand` produces (a
+    /// struct field `&[]` into `&[u8]` is a slice, not `&[u8; 0]`).
+    fn coerced_ty(&mut self, e: ExprId) -> Ty {
+        let ty = self.ty(e);
         match self.ck.coerce(e) {
+            Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
             Coerce::Unsize(t) => t,
-            _ => self.ty(e),
+            Coerce::Deref(n) => self.peel(ty, n),
+            Coerce::BoxToRef(n, m) => {
+                let elem = self.peel(ty, n);
+                self.ref_ty(m, elem)
+            }
+            Coerce::MutToShared | Coerce::Reborrow => {
+                let m = self.ck.coerce(e) == Coerce::Reborrow;
+                let inner = self.peel(ty, 1);
+                self.ref_ty(m, inner)
+            }
+            Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => {
+                let mut inner = self.peel(ty, 1);
+                if let Some(b) = self.body.tys.smart_elem(inner) {
+                    inner = b;
+                }
+                let elem = match self.kind(inner) {
+                    TyKind::Array(el, _) => el,
+                    _ => self.body.tys.vec_elem(inner).unwrap_or(ERROR),
+                };
+                let slice = self.body.tys.intern(TyKind::Slice(elem));
+                self.ref_ty(m, slice)
+            }
         }
     }
 
@@ -1978,7 +2002,8 @@ impl<'p, 'a> Lower<'p, 'a> {
             let pl = self.place(init);
             return self.pattern_place(pl, self.ty(init), &[pat], span);
         }
-        let t = self.materialize(init, self.coerced_ty(init), false);
+        let ty = self.coerced_ty(init);
+        let t = self.materialize(init, ty, false);
         Place::local(t)
     }
 
