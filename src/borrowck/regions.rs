@@ -178,6 +178,19 @@ impl RegionTables {
     }
 
     /// The trait method a stub fn stands for (a stub has its own def).
+    /// The region signature body `f` is checked against: its own, its
+    /// template's (an instance), or its trait method's (a trait default
+    /// body: a template fn with the trait method's def, or its stub).
+    pub fn body_sig(&self, p: &Program, f: LocalDefId) -> Option<&RegionSig> {
+        let of = |g: LocalDefId| {
+            self.fns
+                .get(&g)
+                .or_else(|| p.fn_defs.get(g.0 as usize).and_then(|d| self.trait_methods.get(d)))
+                .or_else(|| self.stub_method(p, g).and_then(|m| self.trait_methods.get(&m)))
+        };
+        of(f).or_else(|| of(p.gx.instances.get(&f)?.template_local?))
+    }
+
     fn stub_method(&self, p: &Program, f: LocalDefId) -> Option<DefId> {
         self.stub_methods.get_or_init(|| p.gx.trait_method_stubs.iter().map(|(&m, &s)| (s, m)).collect()).get(&f).copied()
     }
@@ -2142,27 +2155,17 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
+    /// A callee's region signature: its own, its template's, or its trait
+    /// method's (a stub, or a trait default body and its instances).
     fn callee(&self, f: LocalDefId) -> Callee<'p> {
         let p = self.p;
         if p.gx.closure_fns.contains_key(&f) {
             return Callee::Closure;
         }
-        if let Some(s) = p.regions.fns.get(&f) {
-            return Callee::Sig(s);
+        match p.regions.body_sig(p, f) {
+            Some(s) => Callee::Sig(s),
+            None => Callee::Opaque,
         }
-        if let Some(inst) = p.gx.instances.get(&f)
-            && let Some(t) = inst.template_local
-            && let Some(s) = p.regions.fns.get(&t)
-        {
-            return Callee::Sig(s);
-        }
-        if p.gx.fn_class.get(f.0 as usize) == Some(&crate::check::generics::FnClass::Stub)
-            && let Some(m) = p.regions.stub_method(p, f)
-            && let Some(s) = p.regions.trait_methods.get(&m)
-        {
-            return Callee::Sig(s);
-        }
-        Callee::Opaque
     }
 
     /// The trait method behind a vtable call. Lowering upcasts the

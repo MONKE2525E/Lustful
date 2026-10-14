@@ -338,10 +338,7 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
     let of_instance = |g: LocalDefId| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Instance);
     let check = class != FnClass::Instance
         && !(closure && p.gx.closure_fns.get(&f).and_then(|d| p.gx.closures.get(d)).is_some_and(|c| of_instance(c.parent)));
-    let sig = p.regions.fns.get(&f).or_else(|| {
-        let inst = p.gx.instances.get(&f)?;
-        p.regions.fns.get(&inst.template_local?)
-    });
+    let sig = p.regions.body_sig(p, f);
     regions::OwnSig::build(p, body, sig, closure, check)
 }
 
