@@ -499,6 +499,7 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/cell.rs",
     LUST_STD_SRC "std/src/thread/local.rs",
     LUST_STD_SRC "core/src/ops/arith.rs",
+    LUST_STD_SRC "core/src/slice/index.rs",
 };
 #endif
 

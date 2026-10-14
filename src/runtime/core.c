@@ -405,13 +405,22 @@ uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclus
     return end;
 })
 
+/* A `lust_loc` for a line of std source (panic.c's `lust_std_files`
+   index, line, col), for a panic rustc reports there. */
+static lust_loc lust_std_loc(uint32_t file, uint32_t line, uint32_t col) {
+    return (((uint64_t)(LUST_STD_SLOT + file)) << 32) | ((uint64_t)line << 12) | (uint64_t)col;
+}
+
 /* The `start..end` of a `RangeBounds<usize>` argument (tags: 0 Included,
    1 Excluded, 2 Unbounded), checked the way core checks it for
    `Vec::drain` and `String::drain`: the end bound against the length
    first, then the start bound, then their order, with core's exact
    panic texts. An excluded start at the end index fails with the end
-   message, as in core. */
-static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+   message, as in core. The panics report core's own sites in
+   slice/index.rs (`into_slice_range`, std file 12), not the caller:
+   `slice::range` is track_caller to there, and `Vec::drain` is not
+   track_caller at all. */
+static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
     uint64_t end;
     if (e_tag == 0) {
         if (e_val >= len) {
@@ -420,7 +429,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_fmt_u64(&s, e_val);
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
-            lust_panic(&s, loc);
+            lust_panic(&s, lust_std_loc(12, 1005, 52));
         }
         end = e_val + 1;
     } else if (e_tag == 1) {
@@ -430,7 +439,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_fmt_u64(&s, e_val);
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
-            lust_panic(&s, loc);
+            lust_panic(&s, lust_std_loc(12, 1009, 51));
         }
         end = e_val;
     } else {
@@ -440,13 +449,16 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
     if (s_tag == 2) {
         start = 0;
     } else {
+        /* Core's start match: Excluded fails at index.rs:1016,
+           Included at 1020, for every start failure. */
+        lust_loc start_loc = s_tag == 1 ? lust_std_loc(12, 1016, 56) : lust_std_loc(12, 1020, 55);
         if (s_val > len) {
             lust_String s = lust_string_new();
             lust_string_push_cstr(&s, "range start index ");
             lust_fmt_u64(&s, s_val);
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
-            lust_panic(&s, loc);
+            lust_panic(&s, start_loc);
         }
         if (s_tag == 1 && s_val == end) {
             lust_String s = lust_string_new();
@@ -454,7 +466,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_fmt_u64(&s, s_val);
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
-            lust_panic(&s, loc);
+            lust_panic(&s, start_loc);
         }
         if (s_val > end) {
             lust_String s = lust_string_new();
@@ -462,7 +474,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_fmt_u64(&s, s_val);
             lust_string_push_cstr(&s, " but ends at ");
             lust_fmt_u64(&s, end);
-            lust_panic(&s, loc);
+            lust_panic(&s, start_loc);
         }
         start = s_tag == 1 ? s_val + 1 : s_val;
     }
@@ -473,8 +485,9 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
 /* `Vec::drain`: the Vec keeps its buffer and capacity; its length is the
    drain start while the Drain lives (a leaked Drain leaves it so). */
 lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    (void)loc; /* range panics report core's slice/index.rs sites */
     uint64_t start, end;
-    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, loc, &start, &end);
+    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
     lust_VecDrain d = {v, start, start, end, end, v->len - end};
     v->len = start;
     return d;
@@ -485,7 +498,7 @@ lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64
    (a leaked Drain leaves it whole); the drop glue removes the range. */
 lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
     uint64_t start, end;
-    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, loc, &start, &end);
+    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
     if (!(start == v->len || (v->ptr[start] & 0xC0) != 0x80)) {
         lust_String s = lust_string_new();
         lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(start)");
