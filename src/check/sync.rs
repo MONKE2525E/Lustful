@@ -1167,6 +1167,18 @@ pub fn builtin_auto(
     Some(match b {
         // `LocalKey` holds a fn pointer; `AccessError` is a unit struct.
         B::String | B::Chars | B::ExitCode | B::LocalKey | B::AccessError => Some(true),
+        // The std hashers are plain values (BuildHasherDefault<H> holds a
+        // PhantomData<fn() -> H>); the tables and Entry follow their type
+        // arguments, as hashbrown's auto impls do (W-STD-B).
+        B::Hash(k) => {
+            use crate::ty::hash::HashTy as H;
+            if matches!(k, H::RandomState | H::DefaultHasher | H::BuildHasherDefault) {
+                Some(true)
+            } else {
+                let args: Vec<Ty> = tys.adt_parts(t).map(|(_, a)| tys.args(a).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+                each(tys, args, seen)
+            }
+        }
         // `env::Args`, `Rc`, `rc::Weak`, the `RefCell` guards, and the
         // `fmt` types are neither `Send` nor `Sync`.
         B::Args | B::Rc | B::Weak | B::RefGuard | B::RefMutGuard | B::Fmt(_) => Some(false),
@@ -1263,6 +1275,9 @@ pub fn builtin_auto(
             Some(_) => Some(true),
             None => None,
         },
+        // The hash iterators hold their table's state, not fields this
+        // walk sees: not proven either way (W-STD-B).
+        B::Iter(k) if k.is_hash() => return Some(None),
         B::Iter(k) => {
             let Some((_, args)) = crate::ty::iter::iter_parts(tys, t) else { return Some(None) };
             let mut parts = Vec::new();
@@ -1270,7 +1285,8 @@ pub fn builtin_auto(
                 use crate::ty::iter::Field as F;
                 match *f {
                     F::Arg(i) | F::OptArg(i) | F::VecArg(i) => parts.push(args[i as usize]),
-                    F::Usize | F::Bool => {}
+                    // `Chars` and `&str` are always Send and Sync.
+                    F::Usize | F::Bool | F::Chars | F::Str => {}
                     F::SliceRef(i, m) => {
                         let sl = tys.intern(TyKind::Slice(args[i as usize]));
                         parts.push(tys.mk_ref(m, sl));

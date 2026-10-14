@@ -3815,6 +3815,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::OptionIntoIter => args[0].clone(),
             // `&'a str` of the haystack (W-STD-B).
             K::StrSplit => own,
+            // An mpsc receiver's items are its `T` values (W-THREADS).
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => args[0].clone(),
         })
     }
 

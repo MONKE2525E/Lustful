@@ -139,6 +139,17 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             Glue::Default => (format!("{ct} default_{m}(void)"), format!("default_{rm}()")),
             Glue::Drop | Glue::Clone => unreachable!("Arc's own drop and clone"),
             Glue::TlsInit | Glue::TlsDtor => unreachable!("TLS glue is per thread_local! key"),
+            // No hash glue reaches an Arc (its keys are not hashable here,
+            // `has_hash`).
+            Glue::HashValue
+            | Glue::HashKey
+            | Glue::HashOf
+            | Glue::HashEq
+            | Glue::HashClone
+            | Glue::HashKeyQ
+            | Glue::HashEqQ
+            | Glue::HashEqEntry
+            | Glue::HashDrop => unreachable!("hash glue of an Arc"),
         };
         let _ = writeln!(protos, "{proto};");
         let _ = writeln!(defs, "{proto} {{\n  return {call};\n}}\n");

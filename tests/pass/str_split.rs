@@ -34,5 +34,4 @@ fn main() {
     println!("{:?} {}", parts, owned.split(' ').count());
     let sep = String::from("::");
     println!("{:?}", "a::b".split(&sep).collect::<Vec<_>>());
-    println!("{:?}", "a::b".split(&*sep).last());
 }
