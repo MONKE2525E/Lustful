@@ -8725,11 +8725,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(self.normalize_use(ret, span))
     }
 
-    /// `Default::default()` and `From::from(x)` written through the
-    /// trait name, where only the expected type names Self (rustc
-    /// infers it the same way): the call is the assoc call on that
-    /// type. None when the callee is another form, a type of that
-    /// name shadows the trait, or the expected type is not known yet.
+    /// `Default::default()`, `From::from(x)`, and a user trait's fn
+    /// with no `self` (`Mk::mk(8)`) written through the trait name,
+    /// where no arg names Self: the expected type does (rustc infers it
+    /// the same way), and the call is the assoc call on that type. With
+    /// the expected type not known yet, a user trait's call is typed by
+    /// the trait's signature with Self open (`assoc_call_deferred`), so
+    /// a later use can fix it; nothing fixing it is rustc's E0790. None
+    /// when the callee is another form or a type of that name shadows
+    /// the trait.
     fn self_from_expected_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], expected: Option<Ty>, span: Span) -> Option<Ty> {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return None };
@@ -8741,25 +8745,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let lang = &p.gx.lang;
         let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, segs[0].name)?;
-        let wanted = match self.name(segs[1].name) {
-            "default" if tdef == lang.default && args.is_empty() => true,
-            "from" if tdef == lang.from && args.len() == 1 => true,
+        let rec = p.gx.index.trait_record(tdef)?;
+        let lang_fn = match self.name(segs[1].name) {
+            "default" => tdef == lang.default && args.is_empty(),
+            "from" => tdef == lang.from && args.len() == 1,
             _ => false,
         };
-        if !wanted {
+        let user_fn = !lang_fn
+            && rec.method_by_name(segs[1].name).and_then(|m| p.gx.trait_methods.get(&m)).is_some_and(|t| t.self_kind.is_none());
+        if !lang_fn && !user_fn {
             return None;
         }
-        let base = self.deep(expected?);
-        if matches!(self.kind(base), TyKind::Infer(v) if !v.is_int() && !v.is_float()) || base == ERROR {
-            return None;
-        }
-        let rec = p.gx.index.trait_record(tdef)?;
-        let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
-        for _ in 1..rec.generics.params.len() {
-            tr_args.push(GenericArg::Ty(self.new_var(false)));
-        }
-        let args_id = self.tys.intern_args(&tr_args);
-        let hint = TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS };
+        let known = expected.map(|t| self.deep(t)).filter(|&b| b != ERROR && !self.unbound_general(b));
+        let Some(base) = known else {
+            if !user_fn {
+                return None;
+            }
+            let base = self.new_var(false);
+            return self.assoc_call_deferred(e, base, None, tdef, segs[1].name, args, span);
+        };
+        let hint = self.assoc_trait_ref(e, base, None, tdef, rec);
         self.assoc_call(e, callee, base, Some(hint), segs[1].name, args, span)
     }
 
