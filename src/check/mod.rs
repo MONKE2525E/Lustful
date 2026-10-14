@@ -332,10 +332,15 @@ pub enum Builtin {
     IterWindows,
     /// `DoubleEndedIterator::next_back` (W-STD-B).
     IterNextBack,
+    /// `Iterator::size_hint` (W-STD-B).
+    IterSizeHint,
     /// `str::char_indices` and `str::bytes` (W-STD-B): a `CharIndices`,
     /// and a `Copied<slice::Iter<u8>>` (std's `Bytes` wraps exactly that).
     StrCharIndices,
     StrBytes,
+    /// `flatten` and `flat_map` (W-STD-B).
+    IterFlatten,
+    IterFlatMap,
     IterFold,
     IterForEach,
     IterMin,

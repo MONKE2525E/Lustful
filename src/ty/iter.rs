@@ -113,6 +113,14 @@ pub enum IterKind {
     /// char)`; (the `Chars` left, the byte offset of its front), as std
     /// stores it.
     CharIndices,
+    /// `Flatten<I>` (W-STD-B): args `[I, U]` with `U` the inner items'
+    /// `IntoIter`; (iter, frontiter, backiter), as std's FlattenCompat,
+    /// whose `Fuse<I>` drops the outer iterator once it ends (`None`
+    /// here). `flat_map(f)` is `Flatten<Map<I, F>>`, which is what std's
+    /// `FlatMap` runs.
+    Flatten,
+    /// `option::IntoIter<T>` (W-STD-B): args `[T]`, the option itself.
+    OptionIntoIter,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -140,7 +148,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 39] = [
+    pub const ALL: [IterKind; 41] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -180,6 +188,8 @@ impl IterKind {
         IterKind::ByNext,
         IterKind::Windows,
         IterKind::CharIndices,
+        IterKind::Flatten,
+        IterKind::OptionIntoIter,
     ];
 
     /// True for the hashed-collection iterators.
@@ -240,6 +250,8 @@ impl IterKind {
             K::ByNext => (&["core", "iter", "lust"], "ByNext"),
             K::Windows => (&["core", "slice"], "Windows"),
             K::CharIndices => (&["core", "str"], "CharIndices"),
+            K::Flatten => (ADAPT, "Flatten"),
+            K::OptionIntoIter => (&["core", "option"], "IntoIter"),
         }
     }
 
@@ -248,6 +260,7 @@ impl IterKind {
         use IterKind as K;
         match self {
             K::Map | K::FilterMap => 3,
+            K::Flatten => 2,
             K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned | K::ArrayIntoIter | K::ByNext => 2,
             K::MapIter
             | K::MapIterMut
@@ -305,6 +318,8 @@ impl IterKind {
             K::ByNext => "",
             K::Windows => "std::slice::Windows",
             K::CharIndices => "std::str::CharIndices",
+            K::Flatten => "std::iter::Flatten",
+            K::OptionIntoIter => "std::option::IntoIter",
         }
     }
 
@@ -313,7 +328,7 @@ impl IterKind {
     pub fn shown_args(self) -> usize {
         match self {
             IterKind::Map | IterKind::FilterMap => 2,
-            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter => 1,
+            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten => 1,
             k => k.n_args(),
         }
     }
@@ -359,6 +374,8 @@ impl IterKind {
             K::ByNext => &[F::Arg(0)],
             K::Windows => &[F::SliceRef(0, false), F::Usize],
             K::CharIndices => &[F::Chars, F::Usize],
+            K::Flatten => &[F::OptArg(0), F::OptArg(1), F::OptArg(1)],
+            K::OptionIntoIter => &[F::OptArg(0)],
         }
     }
 }
@@ -441,6 +458,8 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
             let ts = tys.intern_tys(&[USIZE, CHAR]);
             tys.intern(TyKind::Tuple(ts))
         }
+        K::Flatten => item_ty(tys, a[1])?,
+        K::OptionIntoIter => a[0],
     })
 }
 

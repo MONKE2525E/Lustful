@@ -6109,6 +6109,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let ts = p.tys.intern_tys(&[USIZE, CHAR]);
                     p.tys.intern(TyKind::Tuple(ts))
                 }
+                K::Flatten => proj(p, ps[1]),
+                K::OptionIntoIter => ps[0],
                 K::VecIntoIter | K::Range | K::RangeInclusive => ps[0],
                 K::Map | K::FilterMap => ps[2],
                 K::Copied | K::Cloned => ps[1],

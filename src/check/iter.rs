@@ -58,8 +58,6 @@ const DECLARED_ONLY: &[&str] = &[
     "rfold",
     "rfind",
     "nth_back",
-    "next_back",
-    "size_hint",
     "len",
     "max_by",
     "min_by",
@@ -276,7 +274,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use Builtin as B;
         use IterKind as K;
         let item = self.iter_item(base);
-        let by_value = !matches!(n, "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek");
+        let by_value =
+            !matches!(n, "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint");
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
         if by_value && derefs > 0 && self.iter_method_known(n) {
@@ -298,6 +297,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             "next" => {
                 let o = self.tys.mk_option(item);
                 (B::IterNext, vec![], o)
+            }
+            // `size_hint` (W-STD-B): the hint the expansions compute.
+            "size_hint" => {
+                let ou = self.tys.mk_option(USIZE);
+                let ts = self.tys.intern_tys(&[USIZE, ou]);
+                let t = self.tys.intern(TyKind::Tuple(ts));
+                (B::IterSizeHint, vec![], t)
             }
             // DoubleEndedIterator::next_back (W-STD-B).
             "next_back" => {
@@ -329,6 +335,30 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (B::IterFilterMap, vec![f], t)
             }
             "enumerate" => (B::IterEnumerate, vec![], mk(self, K::Enumerate, &[base])),
+            // `flatten` and `flat_map` (W-STD-B): the inner items' (or the
+            // closure output's) IntoIter is the second iterator.
+            "flatten" => {
+                let Some(u) = self.flat_inner(item, span) else { return self.iter_bail(args) };
+                (B::IterFlatten, vec![], mk(self, K::Flatten, &[base, u]))
+            }
+            // `flat_map(f)` is `Flatten<Map<I, F>>`, what std's FlatMap runs.
+            "flat_map" => {
+                let out = self.new_var(false);
+                let f = self.fn_mut_param(&[item], out, span);
+                self.set_res(e, Res::BuiltinMethod { b: B::IterFlatMap, derefs, autoref: Autoref::None });
+                self.check_args(&[f], args, span);
+                self.run_obligations(false);
+                // The expansion calls a closure body directly.
+                let fd = self.deep(f);
+                if !matches!(self.kind(fd), TyKind::Closure(..) | TyKind::Error) {
+                    self.err("L0640", span, "`flat_map` with a fn item or fn pointer is not implemented yet", "Pass a closure: `|x| f(x)`.");
+                    return ERROR;
+                }
+                let out = self.deep(out);
+                let Some(u) = self.flat_inner(out, span) else { return ERROR };
+                let m = mk(self, K::Map, &[base, f, out]);
+                return mk(self, K::Flatten, &[m, u]);
+            }
             "rev" => {
                 if !self.double_ended(base) {
                     let tn = self.tn(base);
@@ -615,7 +645,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         matches!(
             n,
             "rposition"
+                | "size_hint"
                 | "next_back"
+                | "flatten"
+                | "flat_map"
                 | "map"
                 | "filter"
                 | "filter_map"
@@ -794,6 +827,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(it::mk_iter(&mut self.tys, k, &[el]))
     }
 
+    /// The `IntoIter` of a `flatten` or `flat_map` inner value: what
+    /// `zip` takes, or `option::IntoIter` for an Option. Anything else is
+    /// L0612 (an array of non-Copy elements L0640), and None.
+    fn flat_inner(&mut self, t: Ty, span: Span) -> Option<Ty> {
+        let t = self.deep(t);
+        if let Some(el) = self.tys.option_elem(t) {
+            return Some(it::mk_iter(&mut self.tys, IterKind::OptionIntoIter, &[el]));
+        }
+        match self.into_iter_ty(t) {
+            Some(u) => {
+                if let Some((IterKind::ArrayIntoIter, ua)) = it::iter_parts(&self.tys, u)
+                    && !it::is_iter(&self.tys, t)
+                    && !self.array_iter_elem_ok(ua[0], span)
+                {
+                    return None;
+                }
+                Some(u)
+            }
+            None => {
+                if !matches!(self.kind(t), TyKind::Error) {
+                    let tn = self.tn(t);
+                    self.err("L0612", span, format!("`{tn}` is not an iterator lust can flatten yet"), "Flatten Vecs, slices, arrays, Options, or iterators.");
+                }
+                None
+            }
+        }
+    }
+
     /// True when `rposition` runs on `t` here: an ExactSizeIterator and
     /// DoubleEndedIterator whose length the expansion knows (`size`).
     fn rposition_ok(&self, t: Ty) -> bool {
@@ -835,6 +896,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             K::ArrayIntoIter | K::RepeatN => true,
             // Only `next`: no `next_back` reaches the user's impl yet.
             K::ByNext => false,
+            // Forward only in lust so far.
+            K::Flatten => false,
+            K::OptionIntoIter => true,
         }
     }
 
@@ -946,6 +1010,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
 /// The adapter and consumer methods `iter_call` answers, by name: the
 /// calls that wrap a `ByNext` iterator.
 const ITER_METHODS: &[&str] = &[
+    "flatten",
+    "flat_map",
     "map",
     "filter",
     "filter_map",

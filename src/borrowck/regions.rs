@@ -3761,6 +3761,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::MapIntoValues | K::ByNext => args[1].clone(),
             // (usize, char): no regions.
             K::CharIndices => Vec::new(),
+            K::Flatten => self.item_slots(a[1], &args[1])?,
+            K::OptionIntoIter => args[0].clone(),
         })
     }
 
@@ -4161,7 +4163,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::RepeatN
             | K::ByNext
             | K::Windows
-            | K::CharIndices => false,
+            | K::CharIndices
+            | K::Flatten
+            | K::OptionIntoIter => false,
         }
     }
 

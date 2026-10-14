@@ -65,6 +65,9 @@ fn expands(b: Builtin) -> bool {
             | B::EntryOrInsertWith
             | B::EntryOrInsertWithKey
             | B::EntryAndModify
+            | B::IterFlatten
+            | B::IterFlatMap
+            | B::IterSizeHint
             | B::IterFold
             | B::IterForEach
             | B::IterMin
@@ -495,6 +498,12 @@ impl Ex<'_, '_, '_> {
                     ),
                 );
             }
+            B::IterSizeHint => {
+                let r = arg()?;
+                let (itp, ty) = self.deref_arg(r)?;
+                let (lo, hi) = self.hint(itp, ty)?;
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Copy(Place::local(lo)), Operand::Move(Place::local(hi))]));
+            }
             B::IterNext | B::IterNextBack => {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
@@ -554,6 +563,30 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
                 self.drop_local(fl);
                 return Ok(());
+            }
+            // `flatten()` and `flat_map(f)` (W-STD-B): (Some(iter), None,
+            // None); flat_map's iter is `Map<I, F>`.
+            B::IterFlatten | B::IterFlatMap => {
+                let i = arg()?;
+                let (_, fa) = self.kind_args(dest_ty).ok_or("iterator expansion: bad flatten iterator")?;
+                let inner = if b == B::IterFlatMap {
+                    let f = arg()?;
+                    let m = self.local(fa[0]);
+                    self.assign(Place::local(m), Rvalue::TupleAgg(fa[0], vec![i, f]));
+                    Operand::Move(Place::local(m))
+                } else {
+                    i
+                };
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad flatten iterator")?;
+                let (o, s) = (self.local(fields[0]), self.local(fields[1]));
+                self.some(&Place::local(o), fields[0], inner);
+                self.none(&Place::local(s), fields[1]);
+                let s2 = self.local(fields[2]);
+                self.none(&Place::local(s2), fields[2]);
+                self.assign(
+                    dest,
+                    Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(o)), Operand::Move(Place::local(s)), Operand::Move(Place::local(s2))]),
+                );
             }
             // `s.char_indices()` (W-STD-B): (s.chars(), 0), as std builds it.
             B::StrCharIndices => {
@@ -938,8 +971,9 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(s), Rvalue::SliceOf(pl.deref()));
                 self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![Operand::Move(Place::local(s))]));
             }
-            // Another iterator (W-STD-B): moved into its `next` wrapper.
-            IterKind::ByNext => self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o])),
+            // Another iterator (W-STD-B): moved into its `next` wrapper; an
+            // Option into its `option::IntoIter`.
+            IterKind::ByNext | IterKind::OptionIntoIter => self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o])),
             _ => return Err("iterator expansion: bad IntoIterator argument".into()),
         }
         Ok(Operand::Move(Place::local(l)))
@@ -1071,6 +1105,78 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = short;
                 self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `Flatten` (W-STD-B), as std's FlattenCompat::next: the front
+            // inner iterator's items, then the next inner value from the
+            // outer iterator, then the back inner iterator's. The outer is a
+            // `Fuse<I>`: one that is not a FusedIterator (a user iterator)
+            // drops once it ends; a fused one stays (std's specialization).
+            K::Flatten => {
+                if back {
+                    return Err("iterator expansion: Flatten is forward-only here".into());
+                }
+                let u = a[1];
+                let (ot, ut) = (self.place_ty(&f(0))?, self.place_ty(&f(1))?);
+                let lp = self.block();
+                self.goto(lp);
+                self.cur = lp;
+                let pull = self.block();
+                let (fs, fnone) = self.switch_opt(&f(1));
+                self.cur = fnone;
+                self.goto(pull);
+                self.cur = fs;
+                let t = self.local(opt);
+                self.next(Self::payload(&f(1)), u, Place::local(t), false)?;
+                let (hit, done) = self.switch_opt(&Place::local(t));
+                self.cur = hit;
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+                self.goto(join);
+                self.cur = done;
+                self.none(&f(1), ut);
+                self.goto(pull);
+                self.cur = pull;
+                let back_side = self.block();
+                let (os, onone) = self.switch_opt(&f(0));
+                self.cur = onone;
+                self.goto(back_side);
+                self.cur = os;
+                let ii = self.item(a[0])?;
+                let oi = self.body.tys.mk_option(ii);
+                let x = self.local(oi);
+                self.next(Self::payload(&f(0)), a[0], Place::local(x), false)?;
+                let (xs, xn) = self.switch_opt(&Place::local(x));
+                self.cur = xs;
+                let xv = self.take(Self::payload(&Place::local(x)), ii);
+                let uo = self.into_iter(xv, u)?;
+                self.some(&f(1), ut, uo);
+                self.goto(lp);
+                self.cur = xn;
+                if !self.fused(a[0]) {
+                    self.none(&f(0), ot);
+                }
+                self.goto(back_side);
+                self.cur = back_side;
+                let (bs, bnone) = self.switch_opt(&f(2));
+                self.cur = bs;
+                self.next(Self::payload(&f(2)), u, dest.clone(), false)?;
+                let (bh, bd) = self.switch_opt(&dest);
+                self.cur = bd;
+                self.none(&f(2), ut);
+                self.goto(join);
+                self.cur = bh;
+                self.goto(join);
+                self.cur = bnone;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `option::IntoIter` (W-STD-B): `self.inner.take()`, from either end.
+            K::OptionIntoIter => {
+                let ot = self.place_ty(&f(0))?;
+                let r = self.ref_to(true, f(0), ot);
+                let nl = self.local(ot);
+                self.none(&Place::local(nl), ot);
+                self.call_builtin(Builtin::MemReplace, vec![Operand::Move(Place::local(r)), Operand::Move(Place::local(nl))], dest);
                 self.goto(join);
             }
             // `CharIndices` (W-STD-B), as std's: the front offset grows by
@@ -2738,6 +2844,126 @@ impl Ex<'_, '_, '_> {
             K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Rev => return self.hint(f(0), a[0]),
             // `CharIndices` forwards to its `Chars`.
             K::CharIndices => return self.hint(f(0), CHARS),
+            // `option::IntoIter`: exact, 0 or 1.
+            K::OptionIntoIter => {
+                let (s, n) = self.switch_opt(&f(0));
+                let j2 = self.block();
+                self.cur = s;
+                set_exact(self, Self::usize_c(1));
+                self.goto(j2);
+                self.cur = n;
+                set_exact(self, Self::usize_c(0));
+                self.goto(j2);
+                self.cur = j2;
+            }
+            // `Flatten`: std's FlattenCompat::size_hint, with the fixed-size
+            // form for array items (ConstSizeIntoIterator).
+            K::Flatten => {
+                let (flo, fhi) = self.flat_side_hint(f(1), a[1])?;
+                let (blo, bhi) = self.flat_side_hint(f(2), a[1])?;
+                let sum = self.local(USIZE);
+                self.call_builtin(Builtin::SaturatingAdd, vec![Operand::Copy(Place::local(flo)), Operand::Copy(Place::local(blo))], Place::local(sum));
+                // The outer iterator's hint ((0, Some(0)) once it ended).
+                let (ilo, ihi) = (self.local(USIZE), self.local(ou));
+                {
+                    let (s, n) = self.switch_opt(&f(0));
+                    let j2 = self.block();
+                    self.cur = s;
+                    let (l, h) = self.hint(Self::payload(&f(0)), a[0])?;
+                    self.assign(Place::local(ilo), Rvalue::Use(Operand::Copy(Place::local(l))));
+                    self.assign(Place::local(ihi), Rvalue::Use(Operand::Move(Place::local(h))));
+                    self.goto(j2);
+                    self.cur = n;
+                    self.assign(Place::local(ilo), Rvalue::Use(Self::usize_c(0)));
+                    self.some(&Place::local(ihi), ou, Self::usize_c(0));
+                    self.goto(j2);
+                    self.cur = j2;
+                }
+                let x = self.item(a[0])?;
+                let none_hi = |this: &mut Self| this.none(&Place::local(hi), ou);
+                match self.const_size(x) {
+                    Some(fixed) => {
+                        // lower = ilo * N + sum (saturating); upper = fhi? + bhi? + N * ihi? (checked).
+                        let prod = self.local(USIZE);
+                        self.call_builtin(Builtin::SaturatingMul, vec![Operand::Copy(Place::local(ilo)), Self::usize_c(fixed)], Place::local(prod));
+                        self.call_builtin(Builtin::SaturatingAdd, vec![Operand::Copy(Place::local(prod)), Operand::Copy(Place::local(sum))], Place::local(lo));
+                        let j2 = self.block();
+                        let mut parts = vec![(fhi, None), (bhi, None), (ihi, Some(fixed))];
+                        let acc = self.local(USIZE);
+                        self.assign(Place::local(acc), Rvalue::Use(Self::usize_c(0)));
+                        let fail = self.block();
+                        for (h, mul) in parts.drain(..) {
+                            let (s, n) = self.switch_opt(&Place::local(h));
+                            self.cur = n;
+                            self.goto(fail);
+                            self.cur = s;
+                            let v = match mul {
+                                Some(m) => {
+                                    let ck = self.local(ou);
+                                    self.call_builtin(Builtin::CheckedMul, vec![Operand::Copy(Self::payload(&Place::local(h))), Self::usize_c(m)], Place::local(ck));
+                                    let (ms, mn) = self.switch_opt(&Place::local(ck));
+                                    self.cur = mn;
+                                    self.goto(fail);
+                                    self.cur = ms;
+                                    Operand::Copy(Self::payload(&Place::local(ck)))
+                                }
+                                None => Operand::Copy(Self::payload(&Place::local(h))),
+                            };
+                            let ck = self.local(ou);
+                            self.call_builtin(Builtin::CheckedAdd, vec![Operand::Copy(Place::local(acc)), v], Place::local(ck));
+                            let (as_, an) = self.switch_opt(&Place::local(ck));
+                            self.cur = an;
+                            self.goto(fail);
+                            self.cur = as_;
+                            self.assign(Place::local(acc), Rvalue::Use(Operand::Copy(Self::payload(&Place::local(ck)))));
+                        }
+                        self.some(&Place::local(hi), ou, Operand::Copy(Place::local(acc)));
+                        self.goto(j2);
+                        self.cur = fail;
+                        none_hi(self);
+                        self.goto(j2);
+                        self.cur = j2;
+                    }
+                    None => {
+                        // (lo, fhi + bhi) only when the outer is exactly empty.
+                        self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(sum))));
+                        let j2 = self.block();
+                        let other = self.block();
+                        let c0 = self.cmp(Eq, Operand::Copy(Place::local(ilo)), Self::usize_c(0));
+                        let (z, nz) = self.branch(c0);
+                        self.cur = nz;
+                        self.goto(other);
+                        self.cur = z;
+                        let (is, inn) = self.switch_opt(&Place::local(ihi));
+                        self.cur = inn;
+                        self.goto(other);
+                        self.cur = is;
+                        let c1 = self.cmp(Eq, Operand::Copy(Self::payload(&Place::local(ihi))), Self::usize_c(0));
+                        let (z2, nz2) = self.branch(c1);
+                        self.cur = nz2;
+                        self.goto(other);
+                        self.cur = z2;
+                        let (fs, fnn) = self.switch_opt(&Place::local(fhi));
+                        self.cur = fnn;
+                        self.goto(other);
+                        self.cur = fs;
+                        let (bs, bnn) = self.switch_opt(&Place::local(bhi));
+                        self.cur = bnn;
+                        self.goto(other);
+                        self.cur = bs;
+                        self.call_builtin(
+                            Builtin::CheckedAdd,
+                            vec![Operand::Copy(Self::payload(&Place::local(fhi))), Operand::Copy(Self::payload(&Place::local(bhi)))],
+                            Place::local(hi),
+                        );
+                        self.goto(j2);
+                        self.cur = other;
+                        none_hi(self);
+                        self.goto(j2);
+                        self.cur = j2;
+                    }
+                }
+            }
             K::Filter | K::FilterMap | K::SkipWhile => {
                 let (_, ih) = self.hint(f(0), a[0])?;
                 self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
@@ -2975,7 +3201,10 @@ impl Ex<'_, '_, '_> {
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
             K::ByNext | K::CharIndices => false,
-            K::Windows => true,
+            K::Windows | K::OptionIntoIter => true,
+            // std's impls: an outer TrustedLen over arrays (or references
+            // to arrays) of a fixed size.
+            K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),
         }
     }
 
@@ -3664,6 +3893,70 @@ impl Ex<'_, '_, '_> {
         self.goto(join);
         self.cur = join;
         Ok(())
+    }
+
+    /// A `Flatten` side (front or back) iterator's hint: its own, or
+    /// `(0, Some(0))` when the slot is empty (W-STD-B).
+    fn flat_side_hint(&mut self, slot: Place, u: Ty) -> Result<(Local, Local), String> {
+        let ou = self.body.tys.mk_option(USIZE);
+        let (lo, hi) = (self.local(USIZE), self.local(ou));
+        let (s, n) = self.switch_opt(&slot);
+        let join = self.block();
+        self.cur = s;
+        let (l, h) = self.hint(Self::payload(&slot), u)?;
+        self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(l))));
+        self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(h))));
+        self.goto(join);
+        self.cur = n;
+        self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+        self.some(&Place::local(hi), ou, Self::usize_c(0));
+        self.goto(join);
+        self.cur = join;
+        Ok((lo, hi))
+    }
+
+    /// True when Rust 1.99 implements FusedIterator for the type: every
+    /// std iterator lust has, and adapters over fused ones; not a user
+    /// iterator (`ByNext`).
+    fn fused(&self, t: Ty) -> bool {
+        match self.kind_args(t) {
+            None => true,
+            Some((IterKind::ByNext, _)) => false,
+            Some((_, a)) => a.iter().all(|&x| self.kind_args(x).is_none() || self.fused(x)),
+        }
+    }
+
+    /// `const_size` of an iterator type's item, read from the kind's
+    /// args (no interning).
+    fn item_const_size(&self, t: Ty) -> Option<u64> {
+        use IterKind as K;
+        let (k, a) = self.kind_args(t)?;
+        match k {
+            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::ArrayIntoIter | K::RepeatN | K::OptionIntoIter => self.const_size(a[0]),
+            K::Map | K::FilterMap => self.const_size(a[2]),
+            K::Copied | K::Cloned | K::ByNext => self.const_size(a[1]),
+            K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
+                self.item_const_size(a[0])
+            }
+            K::Flatten => self.item_const_size(a[1]),
+            _ => None,
+        }
+    }
+
+    /// The fixed length of an array item, `&[T; N]`, or `&mut [T; N]`
+    /// (std's ConstSizeIntoIterator), for `Flatten`'s size_hint.
+    fn const_size(&self, t: Ty) -> Option<u64> {
+        let t = match self.body.tys.kind(t) {
+            TyKind::Ref(_, _, inner) => inner,
+            _ => t,
+        };
+        match self.body.tys.kind(t) {
+            TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
+                ConstKind::Int(n) => Some(n as u64),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// `rposition` (W-STD-B): the index counts down from the exact

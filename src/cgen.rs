@@ -301,6 +301,8 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::SliceIter | K::SliceIterMut => ref_to(a[0]),
         K::Windows => CTy::Slice(Box::new(cty(tys, a[0]))),
         K::CharIndices => CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Char]),
+        K::Flatten => iter_item_cty(tys, a[1]),
+        K::OptionIntoIter => cty(tys, a[0]),
         K::VecIntoIter | K::Range | K::RangeInclusive => cty(tys, a[0]),
         K::Map | K::FilterMap => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
@@ -4426,6 +4428,9 @@ impl FnGen<'_, '_, '_> {
             | B::IterPosition
             | B::IterRposition
             | B::IterWindows
+            | B::IterFlatten
+            | B::IterFlatMap
+            | B::IterSizeHint
             | B::IterNextBack
             | B::StrCharIndices
             | B::StrBytes
