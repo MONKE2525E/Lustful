@@ -257,6 +257,9 @@ fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, 
 
 /// Empties one slot like a dead fn: no C, no reads, no IR.
 fn wipe_slot(caches: &mut Caches, s: usize) {
+    if !caches.out[s].code.is_empty() {
+        caches.wiped_slots.push(s as u32);
+    }
     caches.out[s] = FnOut::default();
     caches.has_out[s] = true;
     caches.ok[s] = true;
@@ -1229,6 +1232,9 @@ fn slot_update(
     // Instance slots are not AST fns: the generic block in `compile`
     // decides after collect which are live.
     for slot in (0..n_slots).filter(|&s| !live[s] && !front.inst_slot[s]) {
+        if !caches.out[slot].code.is_empty() {
+            caches.wiped_slots.push(slot as u32);
+        }
         caches.out[slot] = FnOut::default();
         caches.has_out[slot] = true;
         caches.ok[slot] = true;
@@ -2947,6 +2953,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let n_slots = caches.out.len();
     let groups = cgen::group_fns(n_slots, caches.per_unit);
     let mut dirty_groups = vec![false; groups.len()];
+    // A slot a compile wiped (a removed fn, a dead instance) still
+    // has its old C in its unit's object: reassemble that unit so
+    // the dead C (and any symbol only it named) leaves the link.
+    for s in std::mem::take(&mut caches.wiped_slots) {
+        let g = s as usize / caches.per_unit;
+        if let Some(d) = dirty_groups.get_mut(g) {
+            *d = true;
+        }
+    }
     let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);

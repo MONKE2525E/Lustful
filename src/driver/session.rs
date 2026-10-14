@@ -219,6 +219,14 @@ pub(crate) struct Caches {
     /// the glue. Same reason as `statics_fp`: the edit and the build
     /// that must react to it are usually different requests.
     pub(crate) glue_stale: bool,
+    /// Slots whose generated C a compile wiped since the last build
+    /// (a removed fn or a dead instance, `wipe_slot` and the slot
+    /// update's dead-slot emptying). The next build reassembles their
+    /// units: the old unit object still carries the dead slot's C,
+    /// which can name symbols (a removed static) that no unit defines
+    /// any more. Cleared by the build that reassembles them, like
+    /// `glue_stale` (a check request can do the wiping).
+    pub(crate) wiped_slots: Vec<u32>,
     /// Slots per function unit. Chosen at a full rebuild and fixed
     /// until the next one, so units stay stable; a persistent
     /// session adopts the slot manifest's recorded value instead,
@@ -338,6 +346,7 @@ impl Session {
                 statics_fp: 0,
                 glue_slots_fp: 0,
                 glue_stale: false,
+                wiped_slots: Vec::new(),
                 per_unit: 16,
                 table_cap: 0,
                 base_units: 0,

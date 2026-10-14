@@ -1183,6 +1183,21 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         } else {
             p.name(data.name).hash(&mut h);
         }
+    } else if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
+        // A nested (fn-body) static: collect gives it a def in
+        // `static_defs` but no `Defs` record, so the branch above
+        // misses it. Its value must still fold in: `statics_fingerprint`
+        // is the only record that makes a later build rebuild the
+        // glue unit when a nested static's initializer edits.
+        2u8.hash(&mut h);
+        1u8.hash(&mut h);
+        item.mutable.hash(&mut h);
+        hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
+        hash_const_value(&mut h, p, &item.value, 0);
+        if let Some(k) = item.tls {
+            k.eager.hash(&mut h);
+            hash_def_pub(&mut h, p, p.def_id(k.init));
+        }
     } else {
         3u8.hash(&mut h);
     }
