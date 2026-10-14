@@ -449,6 +449,13 @@ impl<'a> Program<'a> {
     pub fn is_phantom_adt(&self, a: AdtId) -> bool {
         self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::marker::PhantomData"
     }
+    /// True when Adt `a` is std's `VecDeque` (std source,
+    /// W-STD-C): `collect` into it goes through the `Vec` collect
+    /// machinery, whose capacity rules are std's for a deque too
+    /// (check/iter.rs, lower/iter.rs).
+    pub fn is_vec_deque_adt(&self, a: AdtId) -> bool {
+        self.is_std_adt(a) && self.display_path(self.adt(a).name).rsplit("::").next() == Some("VecDeque")
+    }
     /// The adapter crate whose source file holds `span`, if any. The
     /// resolver records each adapter crate's files (W-DEPS).
     pub fn adapter_at(&self, span: Span) -> Option<&crate::resolve::imports::AdapterCrate> {

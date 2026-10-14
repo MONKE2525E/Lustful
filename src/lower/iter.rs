@@ -4947,16 +4947,26 @@ impl Ex<'_, '_, '_> {
             self.assign(dest, Rvalue::Use(Operand::Move(Place::local(m))));
             return Ok(());
         }
-        let Some(elem) = self.body.tys.vec_elem(dest_ty) else { return Err("iterator expansion: collect into an unsupported type".into()) };
-        let v = self.local(dest_ty);
+        // A `VecDeque` destination collects into a `Vec` first and
+        // wraps it at the end: std's deque collect capacity is the
+        // `Vec` one's (W-STD-C phase 2).
+        let deque = self.body.tys.local_adt(dest_ty).filter(|&a| self.p.is_vec_deque_adt(a));
+        let (Some(elem), vec_ty) = (match deque {
+            Some(_) => self.body.tys.adt_first_ty_arg(dest_ty),
+            None => self.body.tys.vec_elem(dest_ty),
+        }, match deque {
+            Some(_) => self.body.tys.mk_vec(self.body.tys.adt_first_ty_arg(dest_ty).unwrap_or(ERROR)),
+            None => dest_ty,
+        }) else { return Err("iterator expansion: collect into an unsupported type".into()) };
+        let v = self.local(vec_ty);
         let with_capacity = |this: &mut Self, cap: Operand| {
             this.assign(Place::local(v), Rvalue::VecLit(elem, Vec::new()));
-            let rv = this.ref_to(true, Place::local(v), dest_ty);
+            let rv = this.ref_to(true, Place::local(v), vec_ty);
             let u = this.local(UNIT);
             this.call_builtin(Builtin::VecReserveExact, vec![Operand::Move(Place::local(rv)), cap], Place::local(u));
         };
         let push = |this: &mut Self, x: Local| {
-            let rv = this.ref_to(true, Place::local(v), dest_ty);
+            let rv = this.ref_to(true, Place::local(v), vec_ty);
             let u = this.local(UNIT);
             let ax = this.take(Place::local(x), elem);
             this.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), ax], Place::local(u));
@@ -5057,7 +5067,7 @@ impl Ex<'_, '_, '_> {
             self.goto(join);
             self.cur = lp;
             let (_, n2, x, _) = self.pull(&itp, ty)?;
-            let rv = self.ref_to(false, Place::local(v), dest_ty);
+            let rv = self.ref_to(false, Place::local(v), vec_ty);
             let (len, capn) = (self.local(USIZE), self.local(USIZE));
             self.call_builtin(Builtin::VecLen, vec![Operand::Copy(Place::local(rv))], Place::local(len));
             self.call_builtin(Builtin::VecCapacity, vec![Operand::Copy(Place::local(rv))], Place::local(capn));
@@ -5067,7 +5077,7 @@ impl Ex<'_, '_, '_> {
             let (lo2, _) = self.hint(itp.clone(), ty)?;
             let add = self.local(USIZE);
             self.call_builtin(Builtin::SaturatingAdd, vec![Operand::Copy(Place::local(lo2)), Self::usize_c(1)], Place::local(add));
-            let rvm = self.ref_to(true, Place::local(v), dest_ty);
+            let rvm = self.ref_to(true, Place::local(v), vec_ty);
             let u = self.local(UNIT);
             self.call_builtin(Builtin::VecReserve, vec![Operand::Move(Place::local(rvm)), Operand::Copy(Place::local(add))], Place::local(u));
             self.goto(ok);
@@ -5078,7 +5088,10 @@ impl Ex<'_, '_, '_> {
             self.goto(join);
         }
         self.cur = join;
-        self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v))));
+        match deque {
+            Some(a) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
+            None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
+        }
         Ok(())
     }
 

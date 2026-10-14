@@ -1050,9 +1050,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // call is its `FromIterator::from_iter(self)`, as rustc's
                 // `collect` is (W-STD-C). The `Target: FromIterator<Item>`
                 // obligation proves the impl's bounds (`T: Ord`).
+                // `VecDeque` is not here: its collect capacity is
+                // `Vec`'s, so it takes the builtin collect below and
+                // lowering wraps the `Vec` (W-STD-C phase 2).
                 let tr = self.resolve(target);
                 if let Some(a) = self.tys.local_adt(tr).or_else(|| self.tys.adt_parts(tr).and_then(|(d, _)| self.tys.local_adt_of(d)))
                     && self.p.is_std_adt(a)
+                    && !self.p.is_vec_deque_adt(a)
                     && args.is_empty()
                 {
                     // Each has one `FromIterator` impl, whose item is the
@@ -1207,6 +1211,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 | "min_by_key"
                 | "max_by_key"
                 | "collect"
+                | "size_hint"
                 | "sum"
                 | "product"
         )
@@ -1553,6 +1558,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !self.unify(el, item) {
                 let want = self.tys.mk_vec(item);
                 self.mismatch(span, want, t);
+                return false;
+            }
+            return true;
+        }
+        // `VecDeque<T>` collects like `Vec<T>` (see the collect arm).
+        if let Some(a) = self.tys.local_adt(t).or_else(|| self.tys.adt_parts(t).and_then(|(d, _)| self.tys.local_adt_of(d)))
+            && self.p.is_vec_deque_adt(a)
+        {
+            let el = self.tys.adt_first_ty_arg(t).unwrap_or(ERROR);
+            if !self.unify(el, item) {
+                self.mismatch(span, el, item);
                 return false;
             }
             return true;
