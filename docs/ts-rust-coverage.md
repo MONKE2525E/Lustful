@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `4c5b70cc` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `45ffdcd7` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -31,7 +31,7 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `std.rc_refcell` | unsupported | 5 | W-STD-B | 246 | 310285 | 6 | 5353 |
+| 1 | `std.rc_refcell` | unsupported | 5 | W-STD-B | 246 | 310285 | 7 | 5549 |
 | 2 | `lifetimes.static_anon` | partial | 6 | W-BORROW | 226 | 301242 | 6 | 3537 |
 | 3 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 6 | 1334 |
 | 4 | `std.runtime` | unsupported | 5 | W-STD-B | 167 | 216508 | 0 | 0 |
