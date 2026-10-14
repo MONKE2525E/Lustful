@@ -3,5 +3,5 @@ load_locale_data ( data : & [ u8 ] ) -> LocaleMessages { LocaleMessages { text :
 from_utf8_lossy ( data ) . trim ( ) . to_string ( ) } } static EN_DATA : & [ u8 ] =
 b"hello locale\n" ; fn en ( ) -> & 'static LocaleMessages { static MESSAGES : OnceLock <
 LocaleMessages > = OnceLock :: new ( ) ; MESSAGES . get_or_init ( || load_locale_data ( EN_DATA ) )
-} fn main ( ) { println ! ( "locale=\'{0}\' bytes={1} same={2}" , en ( ) . text , EN_DATA . len ( )
-, std :: ptr :: eq ( en ( ) , en ( ) ) ) ; }
+} fn main ( ) { println ! ( "locale='{0}' bytes={1} same={2}" , en ( ) . text , EN_DATA . len ( ) ,
+std :: ptr :: eq ( en ( ) , en ( ) ) ) ; }

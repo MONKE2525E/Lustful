@@ -26,14 +26,14 @@ automatically_derived ] impl :: core :: cmp :: Ord for NodeId { # [ inline ] fn 
 automatically_derived ] impl :: core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self ,
 other : & NodeId ) -> bool { self . 0 == other . 0 } } # [ automatically_derived ] impl :: core ::
 cmp :: PartialOrd for NodeId { # [ inline ] fn partial_cmp ( & self , other : & NodeId ) -> :: core
-:: option :: Option < :: core :: cmp :: Ordering > { :: core :: option :: Option :: Some ( :: core
-:: cmp :: Ord :: cmp ( self , other ) ) } } # [ automatically_derived ] impl :: core :: fmt :: Debug
-for NodeId { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core ::
-fmt :: Result { :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "NodeId" , && self .
-0 ) } } impl NodeId { pub const NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self
-) -> bool { self . 0 == 0 } # [ must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } #
-[ must_use ] pub const fn index ( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn
-get ( self ) -> Option < Self > { if self . 0 == 0 { None } else { Some ( self ) } } } # [ doc =
+:: option :: Option < :: core :: cmp :: Ordering > { Some ( :: core :: cmp :: Ord :: cmp ( self ,
+other ) ) } } # [ automatically_derived ] impl :: core :: fmt :: Debug for NodeId { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_tuple_field1_finish ( f , "NodeId" , && self . 0 ) } } impl NodeId { pub const
+NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self ) -> bool { self . 0 == 0 } # [
+must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } # [ must_use ] pub const fn index
+( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn get ( self ) -> Option < Self >
+{ if self . 0 == 0 { None } else { Some ( self ) } } } # [ doc =
 r" A documented handle, as ts-rust writes them." ] pub struct SymbolId ( pub u32 ) ; # [
 automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
 SymbolId { } # [ automatically_derived ] impl :: core :: clone :: Clone for SymbolId { # [ inline ]
@@ -52,17 +52,17 @@ core :: cmp :: Ord :: cmp ( & self . 0 , & other . 0 ) } } # [ automatically_der
 PartialEq for SymbolId { # [ inline ] fn eq ( & self , other : & SymbolId ) -> bool { self . 0 ==
 other . 0 } } # [ automatically_derived ] impl :: core :: cmp :: PartialOrd for SymbolId { # [
 inline ] fn partial_cmp ( & self , other : & SymbolId ) -> :: core :: option :: Option < :: core ::
-cmp :: Ordering > { :: core :: option :: Option :: Some ( :: core :: cmp :: Ord :: cmp ( self ,
-other ) ) } } # [ automatically_derived ] impl :: core :: fmt :: Debug for SymbolId { # [ inline ]
-fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_tuple_field1_finish ( f , "SymbolId" , && self . 0 ) } } impl SymbolId {
-pub const NIL : Self = Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self ) -> bool { self . 0
-== 0 } # [ must_use ] pub const fn is_some ( self ) -> bool { self . 0 != 0 } # [ must_use ] pub
-const fn index ( self ) -> usize { self . 0 as usize } # [ must_use ] pub const fn get ( self ) ->
-Option < Self > { if self . 0 == 0 { None } else { Some ( self ) } } } impl LinkKey for NodeId { # [
-inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( ) ) } } impl LinkKey
-for SymbolId { # [ inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( )
-) } } fn main ( ) { let nil = NodeId :: NIL ; let some = NodeId ( 7 ) ; println ! (
+cmp :: Ordering > { Some ( :: core :: cmp :: Ord :: cmp ( self , other ) ) } } # [
+automatically_derived ] impl :: core :: fmt :: Debug for SymbolId { # [ inline ] fn fmt ( & self , f
+: & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_tuple_field1_finish ( f , "SymbolId" , && self . 0 ) } } impl SymbolId { pub const NIL : Self
+= Self ( 0 ) ; # [ must_use ] pub const fn is_nil ( self ) -> bool { self . 0 == 0 } # [ must_use ]
+pub const fn is_some ( self ) -> bool { self . 0 != 0 } # [ must_use ] pub const fn index ( self )
+-> usize { self . 0 as usize } # [ must_use ] pub const fn get ( self ) -> Option < Self > { if self
+. 0 == 0 { None } else { Some ( self ) } } } impl LinkKey for NodeId { # [ inline ] fn link_slot (
+self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( ) ) } } impl LinkKey for SymbolId { # [
+inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( ) ) } } fn main ( )
+{ let nil = NodeId :: NIL ; let some = NodeId ( 7 ) ; println ! (
 "nil={0} some={1} index={2} get={3:?}" , nil . is_nil ( ) , some . is_some ( ) , some . index ( ) ,
 some . get ( ) ) ; println ! ( "slot={0:?} ord={1}" , some . link_slot ( ) , NodeId ( 3 ) < NodeId (
 7 ) ) ; let words : Vec < String > = vec ! [ :: std :: string :: ToString :: to_string ( & "alpha" )

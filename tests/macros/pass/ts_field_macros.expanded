@@ -54,4 +54,4 @@ into ( ) , strict : false , target : "es2022" . into ( ) , } ; let nulls : HashS
 into ( ) , out_file : "plain.js" . into ( ) , other : String :: new ( ) , } ; substitute ( & mut raw
 , "/proj" ) ; println ! ( "subst={0} {1}" , raw . root_dir , raw . out_file ) ; let mut merged =
 RawOpts :: default ( ) ; take_from ( & raw , & mut merged , & [ "rootDir" ] ) ; println ! (
-"take={0} \'{1}\'" , merged . root_dir , merged . out_file ) ; }
+"take={0} '{1}'" , merged . root_dir , merged . out_file ) ; }

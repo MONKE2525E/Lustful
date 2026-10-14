@@ -4,4 +4,4 @@ wrapping_mul ( 0x100000001b3 ) ; i += 1 ; } h } pub type EmbeddedLib = ( & 'stat
 str , u64 ) ; static EMBEDDED : & [ EmbeddedLib ] = & [ { const TEXT : & str =
 "declare const sample: number;\n" ; const HASH : u64 = snapshot_text_hash ( TEXT ) ; (
 "libs/sample.d.ts" , TEXT , HASH ) } ] ; fn main ( ) { let ( path , text , hash ) = EMBEDDED [ 0 ] ;
-println ! ( "path={2} text=\'{0}\' hash_nonzero={1}" , text . trim ( ) , hash != 0 , path ) ; }
+println ! ( "path={2} text='{0}' hash_nonzero={1}" , text . trim ( ) , hash != 0 , path ) ; }

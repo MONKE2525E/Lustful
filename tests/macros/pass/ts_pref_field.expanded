@@ -23,6 +23,6 @@ editor . new_line . clone ( ) ) , set : | p , v | match v { FieldValue :: String
 . new_line = x , other => { :: core :: panicking :: panic_fmt ( format_args ! (
 "reflect.Set: value of type {0:?} is not assignable to type {1}" , other . type_ ( ) , "String" ) )
 ; } } , } ] ; fn main ( ) { let mut p = Prefs { editor : Editor { tab_size : 4 , new_line : "\n" .
-into ( ) } } ; for f in FIELDS { println ! ( "{0} {1} {2:?} fb=\'{3}\'" , f . name , f . config_tag
-, ( f . get ) ( & p ) , f . fallback_config_tag ) ; } ( FIELDS [ 0 ] . set ) ( & mut p , FieldValue
-:: Int ( 8 ) ) ; println ! ( "tab_size={0}" , p . editor . tab_size ) ; }
+into ( ) } } ; for f in FIELDS { println ! ( "{0} {1} {2:?} fb='{3}'" , f . name , f . config_tag ,
+( f . get ) ( & p ) , f . fallback_config_tag ) ; } ( FIELDS [ 0 ] . set ) ( & mut p , FieldValue ::
+Int ( 8 ) ) ; println ! ( "tab_size={0}" , p . editor . tab_size ) ; }

@@ -27,6 +27,12 @@ user macro expansion, not pretty-printing:
   fragment (doubled `( ( x ) )`, and a parenthesized assignment in
   statement position) are unwrapped; both spellings are the same
   program, and rustc prints neither.
+- String and byte string literals compare by value: their escapes
+  are rewritten one way (rustc re-escapes format strings and prints
+  `include_bytes!` data as `\n`, lust keeps the written form).
+- rustc's `option_env!` value paths (`::core::option::Option::Some`,
+  `::core::option::Option::None::<&'static str>`) map to the prelude
+  forms lust prints.
 
 Derive expansions are not canonicalized: rustc prints generated
 impls and lust has no token form for them yet, so a fixture whose
@@ -472,6 +478,84 @@ def drop_arm_commas(toks):
         out.append(tok)
     return out
 
+ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
+
+
+def literal_value(body, is_bytes):
+    """The value of a string or byte string literal body, or None."""
+    out, i = [], 0
+    while i < len(body):
+        c = body[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        e = body[i + 1:i + 2]
+        if e in ESCAPES:
+            out.append(ESCAPES[e])
+            i += 2
+        elif e == "x":
+            out.append(chr(int(body[i + 2:i + 4], 16)))
+            i += 4
+        elif e == "u" and not is_bytes:
+            close = body.find("}", i)
+            out.append(chr(int(body[i + 3:close], 16)))
+            i = close + 1
+        elif e == "\n":
+            # Line continuation: the newline and the next line's indent go.
+            i += 2
+            while i < len(body) and body[i] in " \t\n\r":
+                i += 1
+        else:
+            return None
+    return "".join(out)
+
+
+def canon_literal(tok):
+    """One spelling per string or byte string literal value: `\\`, `"`,
+    and control characters escaped, `\\xNN` for other bytes outside
+    printable ASCII in byte strings, everything else as itself."""
+    is_bytes = tok.startswith('b"')
+    if not (tok.startswith('"') or is_bytes) or len(tok) < 2 or tok[-1] != '"':
+        return tok
+    value = literal_value(tok[2 if is_bytes else 1:-1], is_bytes)
+    if value is None:
+        return tok
+    out = []
+    for c in value:
+        if c in "\\\"":
+            out.append("\\" + c)
+        elif c in "\n\r\t\0":
+            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t", "\0": "\\0"}[c])
+        elif is_bytes and not (" " <= c <= "~"):
+            out.append("\\x%02x" % ord(c))
+        elif not is_bytes and ord(c) < 0x20:
+            out.append("\\u{%x}" % ord(c))
+        else:
+            out.append(c)
+    return ('b"' if is_bytes else '"') + "".join(out) + '"'
+
+
+OPTION_PATH = ["::", "core", "::", "option", "::", "Option", "::"]
+
+
+def map_option_env(toks):
+    """rustc's `option_env!` values back to lust's prelude forms."""
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i:i + 7] == OPTION_PATH and toks[i + 7:i + 8] == ["Some"]:
+            out.append("Some")
+            i += 8
+            continue
+        if toks[i:i + 7] == OPTION_PATH and toks[i + 7:i + 14] == ["None", "::", "<", "&", "'static", "str", ">"]:
+            out += ["None", "::", "<", "&", "str", ">"]
+            i += 14
+            continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
 def canonicalize(toks):
     toks = strip_prelude(toks)
     toks = drop_macro_rules(toks)
@@ -481,7 +565,8 @@ def canonicalize(toks):
     toks = positionalize_calls(toks)
     toks = unwrap_parens(toks)
     toks = drop_arm_commas(toks)
-    return toks
+    toks = map_option_env(toks)
+    return [canon_literal(t) for t in toks]
 
 
 def main():
