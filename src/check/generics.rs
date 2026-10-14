@@ -7053,10 +7053,11 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
 }
 
 /// True when a written fmt impl's where clauses hold for its selected
-/// args (`ensure_fmt_methods`). `Debug`/`Display` bounds ask the format
-/// site's own question (`has_debug`, `has_display`); `prove_goal` gives
-/// false negatives for tuples and references there. Other bounds take
-/// `prove_goal`, or hold when the args carry references or closures.
+/// args (`ensure_fmt_methods`). A `Debug`/`Display` bound holds when the
+/// format site's structural question (`has_debug`, `has_display`) or
+/// `prove_goal` (written impls) says so, or the arg holds references
+/// or closures; `prove_goal` alone gives false negatives for tuples and
+/// references. Other bounds take `prove_goal`, with the same escape.
 fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplRecord, impl_args: &[GenericArg], tr: TraitRef, self_ty: Ty) -> bool {
     let lang = p.gx.lang;
     let mut other = false;
@@ -7075,7 +7076,13 @@ fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplReco
         }
         let Some(arg) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) else { return false };
         let t = crate::ty::subst(&mut p.tys, arg, impl_args);
-        let ok = if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, t) } else { crate::check::collect::has_display(p, &p.tys, t) };
+        // The structural answer (builtin types, tuples, derives), else a
+        // written impl (`prove_goal`), else an arg the proof cannot see.
+        let structural = if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, t) } else { crate::check::collect::has_display(p, &p.tys, t) };
+        let ok = structural || {
+            let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
+            prove_goal(p, &[], TraitRef { def: d, args, bindings: EMPTY_BINDINGS }) || args_hold_refs(&p.tys, t)
+        };
         if !ok {
             return false;
         }
