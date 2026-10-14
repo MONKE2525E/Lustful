@@ -417,12 +417,14 @@ impl core::ops::MulAssign<u32> for Duration {
 
 impl core::ops::Div<u32> for Duration {
     type Output = Duration;
+    #[track_caller]
     fn div(self, rhs: u32) -> Duration {
         self.checked_div(rhs).expect("divide by zero error when dividing duration by scalar")
     }
 }
 
 impl core::ops::DivAssign<u32> for Duration {
+    #[track_caller]
     fn div_assign(&mut self, rhs: u32) {
         *self = *self / rhs;
     }

@@ -10,7 +10,11 @@
 //
 // Only direct calls pass the location, so the fn may not become a value
 // (a fn pointer, a `dyn Fn`, a generic `F: Fn` argument) and may not be a
-// trait method (dyn calls); both are rejects (L0702), not guesses.
+// trait method (dyn calls); both are rejects (L0702), not guesses. One
+// exception: spliced std trait-op impls (the `Instant`/`SystemTime` and
+// `Duration` operators rustc marks `#[track_caller]`) are allowed,
+// because a concrete operator call is a direct call; a shipped-crate
+// trait impl method therefore skips the L0702 in `check_attrs`.
 //
 // `Location` is a synthetic std Adt (`generics::location_def`) of `file:
 // &str, line: u32, column: u32` with core's Debug, Clone, Copy, PartialEq,
@@ -32,7 +36,8 @@ pub fn is_track_caller(p: &Program, f: LocalDefId) -> bool {
 
 /// The rejects for `#[track_caller]` uses lust does not support, and
 /// rustc's own errors: on `main` (rustc E0648-style), on a trait method or
-/// a trait impl method (L0702: dyn calls cannot pass the location).
+/// a trait impl method (L0702: dyn calls cannot pass the location). A
+/// trait impl method of a shipped std crate is exempt (see the header).
 pub fn check_attrs(p: &Program, errs: &mut Vec<Diag>) {
     for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
@@ -49,7 +54,7 @@ pub fn check_attrs(p: &Program, errs: &mut Vec<Diag>) {
             errs.push(Diag::new("L0110", def.name_span, "`main` function is not allowed to be `#[track_caller]`", "Remove the attribute."));
             continue;
         }
-        if crate::borrowck::impl_trait_method(p, f).is_some() {
+        if crate::borrowck::impl_trait_method(p, f).is_some() && p.fn_shipped_crate(f).is_none() {
             errs.push(generics::dyn_not_yet(def.name_span, "`#[track_caller]` on a trait impl method"));
         }
     }
