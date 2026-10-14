@@ -962,6 +962,10 @@ struct Ctx<'p, 'a> {
     /// Items declared in enclosing blocks, keyed like locals by name and
     /// hygiene context, holding stmt item indexes.
     item_scopes: Vec<Vec<((Sym, CtxtId), u32)>>,
+    /// `scopes.len()` when each `item_scopes` layer was pushed: a local
+    /// below it is declared outside that block, so the block's items
+    /// shadow it (`lookup`).
+    item_scope_starts: Vec<usize>,
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
@@ -1264,6 +1268,7 @@ fn check_fn_mode<'p, 'a>(
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
+        item_scope_starts: Vec::new(),
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
@@ -1339,6 +1344,7 @@ fn check_fn_mode<'p, 'a>(
             })
             .collect();
         cx.item_scopes.push(layer);
+        cx.item_scope_starts.push(cx.scopes.len());
     }
     // A template body keeps its `Param` types: the store answers
     // the structural trait queries on them from the env (`Tys::env`).
@@ -1360,8 +1366,12 @@ fn check_fn_mode<'p, 'a>(
         }
         // A plain parameter name that resolves to a const item or a
         // unit variant is a refutable pattern, not a binding (rustc
-        // E0005); a static name cannot be a pattern at all.
-        if param.pat.is_none() && !param.mutable {
+        // E0005); a static name cannot be a pattern at all. A `mut`
+        // parameter, or one named like an item of the enclosing block
+        // (which hides module items), may name no static or const.
+        if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name, param.span.ctxt).is_some()) {
+            cx.binding_shadows_item(param.name, param.span, false);
+        } else if param.pat.is_none() {
             match cx.pat_ident(param.name) {
                 PatIdent::Const(_) => {
                     cx.err(
@@ -1741,11 +1751,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn lookup(&self, name: Sym, ctxt: CtxtId) -> Option<u32> {
         // The newest visible binding of this name: same context, or one a
         // body-local macro could already see at its definition (ARCH 6.3).
-        self.scopes
+        let at = self
+            .scopes
             .iter()
-            .rev()
-            .find(|((n, _), l)| *n == name && crate::diag::ctxt_can_see_local(ctxt, self.out.locals[*l as usize].span))
-            .map(|&(_, l)| l)
+            .rposition(|((n, _), l)| *n == name && crate::diag::ctxt_can_see_local(ctxt, self.out.locals[*l as usize].span))?;
+        // A block's items are in scope from the block's start, as in
+        // rustc: an item of this name in a block the local was declared
+        // outside of shadows the local (`fn f(x: u32) { static x: .. }`).
+        if let Some(i) = self.item_scopes.iter().rposition(|layer| layer.iter().any(|&(k, _)| k == (name, ctxt)))
+            && at < self.item_scope_starts[i]
+        {
+            return None;
+        }
+        Some(self.scopes[at].1)
     }
 
     // Cross-item reads go through the section 8.2 query functions on
@@ -1812,6 +1830,43 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// a unit variant or struct constructor. Anything else stays a
     /// fresh binding. The binding query records the read, so a body
     /// rechecks when the name's target changes.
+    /// Whether a plain pattern name, with no local shadowing it, is a
+    /// path pattern (a const, static, unit struct, or unit variant), not
+    /// a fresh binding. A block's items come first: a body const or
+    /// static is one; a body fn is not, and it hides module items.
+    fn names_pattern_item(&mut self, name: Sym, ctxt: CtxtId) -> bool {
+        match self.body_item_of(name, ctxt) {
+            Some(crate::check::collect::BodyItem::Fn(_)) => false,
+            Some(_) => true,
+            None => !matches!(self.pat_ident(name), PatIdent::Other),
+        }
+    }
+
+    /// rustc E0530: no binding may shadow a static, and only a plain
+    /// binding (no `mut`, `ref`, or `@`) may name a const, as its path
+    /// pattern (checked before this). A block's items come before module
+    /// items, and a local of the name in between shadows both. Reports
+    /// and returns true when `name` is such a static or const.
+    fn binding_shadows_item(&mut self, name: Sym, span: Span, plain: bool) -> bool {
+        use crate::check::collect::BodyItem;
+        if self.lookup(name, span.ctxt).is_some() {
+            return false;
+        }
+        let what = match self.body_item_of(name, span.ctxt) {
+            Some(BodyItem::Static(_)) => "statics",
+            Some(BodyItem::Const(_)) if !plain => "constants",
+            Some(_) => return false,
+            None => match self.pat_ident(name) {
+                PatIdent::Static => "statics",
+                PatIdent::Const(_) if !plain => "constants",
+                _ => return false,
+            },
+        };
+        let n = self.name(name).to_string();
+        self.err("L0110", span, format!("bindings cannot shadow {what}"), format!("Rename the binding: `{n}` names an item here."));
+        true
+    }
+
     fn pat_ident(&mut self, name: Sym) -> PatIdent {
         use crate::resolve::imports::{BindState, Target};
         let p = self.p;
@@ -4743,6 +4798,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             self.item_scopes.push(layer);
+            self.item_scope_starts.push(self.scopes.len());
         }
         let mut diverges = false;
         for stmt in &block.stmts {
@@ -4801,7 +4857,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // rejects it as refutable where rustc does.
                         Pat::Binding { name, mutable: false, by_ref: false }
                             if self.lookup(*name, self.p.ast.pat_span(*pat).ctxt).is_none()
-                                && !matches!(self.pat_ident(*name), PatIdent::Other) =>
+                                && self.names_pattern_item(*name, self.p.ast.pat_span(*pat).ctxt) =>
                         {
                             if init.is_none() {
                                 let s = self.p.ast.pat_span(*pat);
@@ -4825,6 +4881,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                         Pat::Binding { name, mutable, by_ref } => {
                             let (name, mutable, by_ref) = (*name, *mutable, *by_ref);
+                            self.binding_shadows_item(name, self.p.ast.pat_span(*pat), !mutable && !by_ref);
                             let lty = if by_ref { self.tys.mk_ref(mutable, ty) } else { ty };
                             // The binding's hygiene key is the pattern name's
                             // own context, not the `let` keyword's (ARCH 6.3).
@@ -4884,6 +4941,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         self.scopes.truncate(scope);
         self.item_scopes.pop();
+        self.item_scope_starts.pop();
         t
     }
 
@@ -13532,8 +13590,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.out.pat_res[pi] = PatRes::BodyConst(ci);
             return;
         }
+        // A body fn or static of the name hides module items (a body
+        // static is rejected at the binding below).
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
+            && self.body_item_of(*name, span.ctxt).is_none()
         {
             match self.pat_ident(*name) {
                 PatIdent::Const(idx) => {
@@ -13615,9 +13676,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         return;
                     }
                 }
+                if self.binding_shadows_item(*name, span, !mutable && !by_ref) {
+                    return;
+                }
                 self.bind_pattern_local(pi, *name, *mutable, *by_ref, t, mode, span);
             }
             Pat::At { name, mutable, by_ref, inner } => {
+                if self.binding_shadows_item(*name, span, false) {
+                    return;
+                }
                 self.bind_pattern_local(pi, *name, *mutable, *by_ref, t, mode, span);
                 self.pattern_mode(*inner, t, mode, in_match);
             }
@@ -14301,8 +14368,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => None,
             };
         }
-        if let PatRes::ConstItem(idx) = self.out.pat_res[pi] {
-            return match &self.p.consts[idx as usize].value {
+        let item = match self.out.pat_res[pi] {
+            PatRes::ConstItem(idx) => Some(&self.p.consts[idx as usize].value),
+            PatRes::BodyConst(idx) => Some(&self.p.body_consts[idx as usize].value),
+            _ => None,
+        };
+        if let Some(cv) = item {
+            return match cv {
                 crate::ty::consteval::ConstValue::Int(v) => Some(*v),
                 crate::ty::consteval::ConstValue::Char(c) => Some(*c as i128),
                 _ => None,
@@ -14408,7 +14480,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Pat::Path(_) => {
                 self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_none()
-                    && !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_))
+                    && !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_) | PatRes::BodyConst(_))
                     && matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
             }
             Pat::Tuple(elems) => elems.iter().all(|&s| matches!(p.ast.pat(s), Pat::Rest) || self.irrefutable(s)),
@@ -15446,7 +15518,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Wild => KCov::Yes,
             Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
                 // A const item used as a pattern matches only its value.
-                PatRes::ConstItem(_) => match self.pat_scalar(pat) {
+                PatRes::ConstItem(_) | PatRes::BodyConst(_) => match self.pat_scalar(pat) {
                     Some(x) if self.k_cmp(val, x, sty) == std::cmp::Ordering::Equal => KCov::Yes,
                     Some(_) => KCov::No,
                     None => KCov::Unknown,
