@@ -882,11 +882,25 @@ pub trait TyIntern {
     fn arc_weak_elem(&self, t: Ty) -> Option<Ty> {
         (self.builtin_of(t) == Some(BuiltinTy::Sync(sync::SyncTy::ArcWeak))).then(|| self.adt_first_ty_arg(t)).flatten()
     }
-    /// The value type of a `RefCell` guard and whether it is `RefMut`.
+    /// The value type of a `Mutex<T>` or `RwLock<T>`, with its kind.
+    fn lock_elem(&self, t: Ty) -> Option<(sync::SyncTy, Ty)> {
+        match self.builtin_of(t)? {
+            BuiltinTy::Sync(k) if k.is_lock() => Some((k, self.adt_first_ty_arg(t)?)),
+            _ => None,
+        }
+    }
+    /// The type argument of a `sync::PoisonError<T>`.
+    fn poison_elem(&self, t: Ty) -> Option<Ty> {
+        (self.builtin_of(t) == Some(BuiltinTy::Sync(sync::SyncTy::PoisonError))).then(|| self.adt_first_ty_arg(t)).flatten()
+    }
+    /// The value type of a guard (`Ref`, `RefMut`, or a lock guard) and
+    /// whether it gives `&mut T`.
     fn guard_elem(&self, t: Ty) -> Option<(Ty, bool)> {
         match self.builtin_of(t)? {
             BuiltinTy::RefGuard => Some((self.adt_first_ty_arg(t)?, false)),
             BuiltinTy::RefMutGuard => Some((self.adt_first_ty_arg(t)?, true)),
+            // The lock guards deref the same way (W-THREADS).
+            BuiltinTy::Sync(k) => Some((self.adt_first_ty_arg(t)?, k.guard()?.1)),
             _ => None,
         }
     }

@@ -504,6 +504,15 @@ impl AdtTables {
             // `Arc<T>` and `sync::Weak<T>` are like `Rc` and `rc::Weak`;
             // the atomics take no type args (W-THREADS).
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => return (Variance::Co, DropMode::Owned),
+            // `MutexGuard` and `RwLockWriteGuard` act as `&'b mut T`,
+            // `RwLockReadGuard` as `&'b T` (its `NonNull<T>` is
+            // covariant); none drops the `T`. `PoisonError<T>` owns its
+            // `T`. The locks are invariant (`UnsafeCell`).
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::MutexGuard | crate::ty::sync::SyncTy::RwLockWriteGuard)) => return (Variance::Inv, DropMode::None),
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::RwLockReadGuard)) => return (Variance::Co, DropMode::None),
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::PoisonError)) => return (Variance::Co, DropMode::Owned),
+            // `ScopedJoinHandle<'scope, T>` owns its `T` (an `Arc` of a
+            // packet with an `UnsafeCell`: invariant).
             Some(BuiltinTy::Sync(_)) => return (Variance::Inv, DropMode::Owned),
             None => {}
         }
@@ -525,6 +534,8 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
         ) => return 1,
         // A Debug builder holds `&mut Formatter` (W-STD-B).
         Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
+        // The lock guards borrow their lock (W-THREADS).
+        Some(BuiltinTy::Sync(k)) if k.regions() > 0 => return k.regions(),
         Some(_) => return 0,
         None => {}
     }
@@ -532,6 +543,14 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
         TyKind::Adt(def, _) => p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len() as u32),
         _ => 0,
     }
+}
+
+/// The variance of a builtin type's region params: covariant, but for
+/// `thread::Scope<'scope, 'env>`, invariant in both (std's
+/// `PhantomData<&'scope mut &'scope ()>`), which pins a scoped spawn's
+/// `'scope` to the scope closure's whole body.
+fn builtin_region_variance(tys: &impl TyIntern, t: Ty) -> Variance {
+    if crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::Scope) { Variance::Inv } else { Variance::Co }
 }
 
 /// True when a drop of a value of type `t` drops a `RefCell` guard,
@@ -638,7 +657,7 @@ impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
             TyKind::Adt(def, args) => {
                 let mut at = at;
                 for k in 0..adt_regions(self.p, self.tys, t) {
-                    let rv = if self.tys.builtin_of(t).is_some() { Variance::Co } else { self.p.regions.adts(self.p).region_modes(def, k as usize).0 };
+                    let rv = if self.tys.builtin_of(t).is_some() { builtin_region_variance(self.tys, t) } else { self.p.regions.adts(self.p).region_modes(def, k as usize).0 };
                     f(at, v.then(rv));
                     at += 1;
                 }
@@ -1311,6 +1330,17 @@ impl OwnSig {
         for &a in &cap_srcs {
             for &b in &arg_snks {
                 self.facts.push((a, b));
+            }
+        }
+        // `thread::scope`'s closure (W-THREADS): the scope is live for the
+        // whole call, during which the closure's captures stay borrowed,
+        // so every captured region (and the `Scope`'s `'env`) outlives the
+        // `Scope`'s `'scope` (rustc: `'env: 'scope` from the scope type).
+        if entry.is_some_and(|c| c.scope_body)
+            && let Some(&[_, sc, env]) = self.slots.get(2).map(|v| v.as_slice())
+        {
+            for &u in env_caps.iter().chain(self.slots[1].first().filter(|_| self.slots[1].len() > env_caps.len())).chain([&env]) {
+                self.facts.push((u, sc));
             }
         }
         self.ends = vec![None; self.n_univ as usize + 1];
@@ -2099,7 +2129,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             (TyKind::Adt(ad, aa), TyKind::Adt(bd, ba)) if ad == bd => {
                 for k in 0..adt_regions(self.p, tys, a) {
                     let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
-                    let rv = if tys.builtin_of(a).is_some() { Variance::Co } else { self.p.regions.adts(self.p).region_modes(ad, k as usize).0 };
+                    let rv = if tys.builtin_of(a).is_some() { builtin_region_variance(tys, a) } else { self.p.regions.adts(self.p).region_modes(ad, k as usize).0 };
                     self.edge_v(x, y, v.then(rv));
                     *ia += 1;
                     *ib += 1;
@@ -2733,6 +2763,34 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 return;
             }
         }
+        // `scope.spawn(f)` on `&Scope<'s, _>`: `F: 's` and `T: 's`, and the
+        // handle's own region is `'s` (W-THREADS). The scope closure's
+        // `&Scope` argument is higher-ranked, so `'s` covers its whole
+        // body: two spawned closures borrowing one place both hold it
+        // to the end, as rustc's `'scope`.
+        // `'s` is the `Scope`'s own `'scope` slot (behind the receiver's
+        // reborrow, whose region may be shorter).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::ScopeSpawn)) = target
+            && let Some(&r) = avs.first().and_then(|(_, v)| v.get(1))
+        {
+            for &x in avs.iter().skip(1).flat_map(|(_, v)| v).chain(&srcs).chain(dv.iter().skip(1)) {
+                self.edge(x, r);
+            }
+            if let Some(&h) = dv.first() {
+                self.edge(h, r);
+                self.edge(r, h);
+            }
+            return;
+        }
+        // `thread::spawn(f)`: `F: 'static` and `T: 'static` (W-THREADS).
+        // Every region of the closure (its captured borrows) and of the
+        // handle must be `'static`.
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::ThreadSpawn)) = target {
+            for &x in avs.iter().flat_map(|(_, v)| v).chain(&srcs).chain(&dv) {
+                self.edge(x, 0);
+            }
+            return;
+        }
         // A vtable call takes the trait method's signature, which every
         // impl satisfies (`impl_contract`). The object's hidden regions
         // stay alive through the pointer's region (`MakeDyn`), so a
@@ -3007,7 +3065,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let tys = &self.body.tys;
         let comp: Option<Ty> = match tys.kind(x) {
             TyKind::Slice(e) | TyKind::Array(e, _) => Some(e),
-            _ => tys.vec_elem(x),
+            _ => tys.vec_elem(x).or_else(|| tys.lock_elem(x).map(|l| l.1)).or_else(|| tys.poison_elem(x)),
         };
         // The element type sits at the end of the receiver's slots (after
         // any region params of the container, which these builtins lack).
@@ -5056,6 +5114,14 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecSwapRemove
             | B::VecSplitOff
             | B::SliceToVec
+            | B::Sync(
+                crate::check::sync::SyncOp::MutexLock
+                    | crate::check::sync::SyncOp::RwLockRead
+                    | crate::check::sync::SyncOp::RwLockWrite
+                    | crate::check::sync::SyncOp::LockGetMut
+                    | crate::check::sync::SyncOp::PoisonGetRef
+                    | crate::check::sync::SyncOp::PoisonGetMut
+            )
     )
 }
 
@@ -5107,6 +5173,8 @@ fn has_interior(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_interior(tys, e)),
         TyKind::Adt(_, a) => {
             matches!(tys.builtin_of(t), Some(BuiltinTy::Cell | BuiltinTy::RefCell | BuiltinTy::RefGuard | BuiltinTy::RefMutGuard))
+                || tys.guard_elem(t).is_some()
+                || tys.lock_elem(t).is_some()
                 || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_interior(tys, e)))
         }
         TyKind::Closure(_, a) => closure_fields(tys, a).into_iter().any(|e| has_interior(tys, e)),

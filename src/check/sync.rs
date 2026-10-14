@@ -64,11 +64,55 @@ pub enum SyncOp {
     ArcWeakStrongCount,
     ArcWeakWeakCount,
     ArcWeakPtrEq,
+    /// `Mutex::new(v)` or `RwLock::new(v)` (a `const fn`).
+    LockNew(SyncTy),
+    /// `Mutex::from(v)` or `RwLock::from(v)`.
+    LockFrom(SyncTy),
+    /// `Mutex::default()` or `RwLock::default()`.
+    LockDefault(SyncTy),
+    /// `Mutex::lock`.
+    MutexLock,
+    /// `RwLock::read`.
+    RwLockRead,
+    /// `RwLock::write`.
+    RwLockWrite,
+    /// `get_mut(&mut self) -> LockResult<&mut T>` on a lock.
+    LockGetMut,
+    /// `into_inner(self) -> LockResult<T>` on a lock.
+    LockIntoInner,
+    LockIsPoisoned,
+    LockClearPoison,
+    /// `PoisonError::new(v)`.
+    PoisonNew,
+    PoisonIntoInner,
+    PoisonGetRef,
+    PoisonGetMut,
+    /// `thread::spawn(f)`.
+    ThreadSpawn,
+    /// `thread::current()`.
+    ThreadCurrent,
+    /// `thread::yield_now()`.
+    ThreadYieldNow,
+    /// `thread::panicking()`: always false (a panic aborts).
+    ThreadPanicking,
+    /// `JoinHandle::join(self)`.
+    JoinHandleJoin,
+    /// `JoinHandle::thread(&self) -> &Thread`.
+    JoinHandleThread,
+    JoinHandleIsFinished,
+    /// `Thread::id(&self) -> ThreadId`.
+    ThreadGetId,
+    /// `Thread::name(&self) -> Option<&str>`.
+    ThreadGetName,
+    /// `thread::scope(f)`.
+    ThreadScope,
+    /// `Scope::spawn(&self, f)`.
+    ScopeSpawn,
 }
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 37] = [
+    pub const ALL: [SyncOp; 62] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -106,12 +150,38 @@ impl SyncOp {
         SyncOp::ArcWeakStrongCount,
         SyncOp::ArcWeakWeakCount,
         SyncOp::ArcWeakPtrEq,
+        SyncOp::LockNew(SyncTy::Mutex),
+        SyncOp::LockFrom(SyncTy::Mutex),
+        SyncOp::LockDefault(SyncTy::Mutex),
+        SyncOp::MutexLock,
+        SyncOp::RwLockRead,
+        SyncOp::RwLockWrite,
+        SyncOp::LockGetMut,
+        SyncOp::LockIntoInner,
+        SyncOp::LockIsPoisoned,
+        SyncOp::LockClearPoison,
+        SyncOp::PoisonNew,
+        SyncOp::PoisonIntoInner,
+        SyncOp::PoisonGetRef,
+        SyncOp::PoisonGetMut,
+        SyncOp::ThreadSpawn,
+        SyncOp::ThreadCurrent,
+        SyncOp::ThreadYieldNow,
+        SyncOp::ThreadPanicking,
+        SyncOp::JoinHandleJoin,
+        SyncOp::JoinHandleThread,
+        SyncOp::JoinHandleIsFinished,
+        SyncOp::ThreadGetId,
+        SyncOp::ThreadGetName,
+        SyncOp::ThreadScope,
+        SyncOp::ScopeSpawn,
     ];
 
     /// (types, names, how it is called) for `lust capabilities`.
     pub fn info(self) -> (&'static [&'static str], &'static [&'static str], u8) {
         const ATOMICS: &[&str] = &["std::sync::atomic::Atomic{Bool,I8,U8,I16,U16,I32,U32,I64,U64,Isize,Usize}"];
         const INTS: &[&str] = &["std::sync::atomic::Atomic{I8,U8,I16,U16,I32,U32,I64,U64,Isize,Usize}"];
+        const LOCKS: &[&str] = &["std::sync::Mutex<T>", "std::sync::RwLock<T>"];
         let (m, a, f) = (0u8, 1u8, 2u8);
         match self {
             SyncOp::AtomicNew(_) => (ATOMICS, &["new"], a),
@@ -151,6 +221,31 @@ impl SyncOp {
             SyncOp::ArcWeakStrongCount => (&["std::sync::Weak<T>"], &["strong_count"], m),
             SyncOp::ArcWeakWeakCount => (&["std::sync::Weak<T>"], &["weak_count"], m),
             SyncOp::ArcWeakPtrEq => (&["std::sync::Weak<T>"], &["ptr_eq"], m),
+            SyncOp::LockNew(_) => (LOCKS, &["new"], a),
+            SyncOp::LockFrom(_) => (LOCKS, &["from"], a),
+            SyncOp::LockDefault(_) => (LOCKS, &["default"], a),
+            SyncOp::MutexLock => (&["std::sync::Mutex<T>"], &["lock"], m),
+            SyncOp::RwLockRead => (&["std::sync::RwLock<T>"], &["read"], m),
+            SyncOp::RwLockWrite => (&["std::sync::RwLock<T>"], &["write"], m),
+            SyncOp::LockGetMut => (LOCKS, &["get_mut"], m),
+            SyncOp::LockIntoInner => (LOCKS, &["into_inner"], m),
+            SyncOp::LockIsPoisoned => (LOCKS, &["is_poisoned"], m),
+            SyncOp::LockClearPoison => (LOCKS, &["clear_poison"], m),
+            SyncOp::PoisonNew => (&["std::sync::PoisonError<T>"], &["new"], a),
+            SyncOp::PoisonIntoInner => (&["std::sync::PoisonError<T>"], &["into_inner"], m),
+            SyncOp::PoisonGetRef => (&["std::sync::PoisonError<T>"], &["get_ref"], m),
+            SyncOp::PoisonGetMut => (&["std::sync::PoisonError<T>"], &["get_mut"], m),
+            SyncOp::ThreadSpawn => (&["std::thread"], &["spawn"], f),
+            SyncOp::ThreadCurrent => (&["std::thread"], &["current"], f),
+            SyncOp::ThreadYieldNow => (&["std::thread"], &["yield_now"], f),
+            SyncOp::ThreadPanicking => (&["std::thread"], &["panicking"], f),
+            SyncOp::JoinHandleJoin => (&["std::thread::JoinHandle<T>"], &["join"], m),
+            SyncOp::JoinHandleThread => (&["std::thread::JoinHandle<T>"], &["thread"], m),
+            SyncOp::JoinHandleIsFinished => (&["std::thread::JoinHandle<T>"], &["is_finished"], m),
+            SyncOp::ThreadGetId => (&["std::thread::Thread"], &["id"], m),
+            SyncOp::ThreadGetName => (&["std::thread::Thread"], &["name"], m),
+            SyncOp::ThreadScope => (&["std::thread"], &["scope"], f),
+            SyncOp::ScopeSpawn => (&["std::thread::Scope"], &["spawn"], m),
         }
     }
 }
@@ -160,17 +255,36 @@ impl SyncOp {
 pub enum SyncGlue {
     Debug,
     Default,
+    Clone,
+    Copy,
+    PartialEq,
 }
 
-/// Whether a sync type has the std impl of `g` (None when `t` is not a
-/// sync type). Every atomic is `Debug` and `Default` (and not `Clone`,
-/// `PartialEq`, or `Hash`, which the walks answer by default).
-pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<bool> {
+/// Whether a sync type has the std impl of `g`: Ok(answer), or
+/// Err(T) when the impl holds exactly when `T` has it (`Mutex<T>:
+/// Debug` needs `T: Debug`). None when `t` is not a sync type the table
+/// knows (`Arc` and `sync::Weak` answer through the smart-pointer and
+/// weak paths of the walks, like `Rc` and `rc::Weak`).
+pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool, Ty>> {
+    use SyncGlue as G;
     let k = crate::ty::sync::sync_kind(tys, t)?;
-    // `Arc` and `sync::Weak` answer through the smart-pointer and weak
-    // paths of the walks, like `Rc` and `rc::Weak`.
-    k.atomic_value()?;
-    Some(matches!(g, SyncGlue::Debug | SyncGlue::Default))
+    let elem = tys.adt_first_ty_arg(t);
+    Some(match (k, g) {
+        (SyncTy::Arc | SyncTy::ArcWeak, _) => return None,
+        // `Debug` for `T: ?Sized + Debug`, `Default` for `T: Default`.
+        (SyncTy::Mutex | SyncTy::RwLock, G::Debug | G::Default) => Err(elem?),
+        // A guard is `Debug` (and `Display`) through `T`.
+        (SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard, G::Debug) => Err(elem?),
+        // Every atomic is `Debug` and `Default`.
+        (_, G::Debug | G::Default) if k.atomic_value().is_some() => Ok(true),
+        // `PoisonError`, `JoinHandle`, `Thread`, `ThreadId`, and the join
+        // error are `Debug` for every `T`.
+        (SyncTy::PoisonError | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError, G::Debug) => Ok(true),
+        // `Thread` is `Clone`; `ThreadId` is `Copy` and `Eq`.
+        (SyncTy::Thread, G::Clone) => Ok(true),
+        (SyncTy::ThreadId, G::Clone | G::Copy | G::PartialEq) => Ok(true),
+        _ => Ok(false),
+    })
 }
 
 /// The sync type a written type path names: its full std path
@@ -201,6 +315,11 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
         ["std" | "core", "sync", "atomic", "fence"] => Some(SyncOp::Fence),
         ["std" | "core", "sync", "atomic", "compiler_fence"] => Some(SyncOp::CompilerFence),
         ["std" | "core", "hint", "spin_loop"] => Some(SyncOp::SpinLoop),
+        ["std", "thread", "spawn"] => Some(SyncOp::ThreadSpawn),
+        ["std", "thread", "current"] => Some(SyncOp::ThreadCurrent),
+        ["std", "thread", "yield_now"] => Some(SyncOp::ThreadYieldNow),
+        ["std", "thread", "panicking"] => Some(SyncOp::ThreadPanicking),
+        ["std", "thread", "scope"] => Some(SyncOp::ThreadScope),
         _ => None,
     }
 }
@@ -239,12 +358,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (SyncTy::ArcWeak, _, "strong_count") => SyncOp::ArcWeakStrongCount,
             (SyncTy::ArcWeak, _, "weak_count") => SyncOp::ArcWeakWeakCount,
             (SyncTy::ArcWeak, _, "ptr_eq") => SyncOp::ArcWeakPtrEq,
+            (SyncTy::Mutex | SyncTy::RwLock, _, "new") => SyncOp::LockNew(k),
+            (SyncTy::Mutex | SyncTy::RwLock, _, "from") => SyncOp::LockFrom(k),
+            (SyncTy::Mutex | SyncTy::RwLock, _, "default") => SyncOp::LockDefault(k),
+            (SyncTy::PoisonError, _, "new") => SyncOp::PoisonNew,
             _ => {
                 self.err(
                     "L0640",
                     span,
                     format!("`{}::{i}` is not implemented in lust yet", k.name()),
-                    "Lust supports `new`, `from`, and `default` on the atomics, and `Arc`'s and `Weak`'s counting fns.",
+                    "Lust supports `new`, `from`, and `default` on the atomics and locks, and `Arc`'s and `Weak`'s counting fns; call lock methods with method syntax.",
                 );
                 return Some(None);
             }
@@ -299,6 +422,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (vec![v], sync_ty(&mut self.tys, k, &[]))
             }
             SyncOp::AtomicDefault(k) => (vec![], sync_ty(&mut self.tys, k, &[])),
+            SyncOp::LockNew(k) | SyncOp::LockFrom(k) => (vec![elem], sync_ty(&mut self.tys, k, &[elem])),
+            SyncOp::LockDefault(k) => {
+                self.deferred_default.push((elem, span));
+                (vec![], sync_ty(&mut self.tys, k, &[elem]))
+            }
+            SyncOp::PoisonNew => (vec![elem], sync_ty(&mut self.tys, SyncTy::PoisonError, &[elem])),
+            // `spawn<F, T>(f: F) -> JoinHandle<T>` where `F: FnOnce() -> T
+            // + Send + 'static, T: Send + 'static` (the borrow checker
+            // proves the `'static` parts, borrowck/regions.rs).
+            SyncOp::ThreadSpawn => {
+                let ret = self.new_var(false);
+                let f = self.fn_once_param(&[], ret, span);
+                self.require_send(f, span);
+                self.require_send(ret, span);
+                (vec![f], sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]))
+            }
+            SyncOp::ThreadCurrent => (vec![], sync_ty(&mut self.tys, SyncTy::Thread, &[])),
+            // `scope<'env, F, T>(f: F) -> T` where `F: for<'scope>
+            // FnOnce(&'scope Scope<'scope, 'env>) -> T`: the closure's
+            // `&Scope` is higher-ranked.
+            SyncOp::ThreadScope => {
+                let ret = self.new_var(false);
+                let sc = sync_ty(&mut self.tys, SyncTy::Scope, &[]);
+                let sr = self.tys.mk_ref(false, sc);
+                let f = self.fn_once_param(&[sr], ret, span);
+                if let TyKind::Infer(v) = self.kind(f) {
+                    self.scope_closure_vars.push(v.0);
+                }
+                (vec![f], ret)
+            }
+            SyncOp::ThreadYieldNow => (vec![], UNIT),
+            SyncOp::ThreadPanicking => (vec![], BOOL),
             SyncOp::Fence | SyncOp::CompilerFence => (vec![ord], UNIT),
             SyncOp::SpinLoop => (vec![], UNIT),
             _ => unreachable!("sync methods type in sync_method"),
@@ -329,6 +484,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.check_packed_borrow(recv, span);
             self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref: Autoref::Ref });
             self.check_args(&params, args, span);
+            return Some(ret);
+        }
+        if let Some(ret) = self.lock_method(e, recv, base, derefs, name, span, args) {
             return Some(ret);
         }
         let (k, v) = atomic_of(&self.tys, base)?;
@@ -373,6 +531,117 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref });
         self.check_args(&params, args, span);
         self.lint_atomic_ordering(op, args);
+        Some(ret)
+    }
+
+    /// A fresh closure-argument type with the pending obligations of
+    /// `F: FnOnce(inputs..) -> output`.
+    fn fn_once_param(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+        let f = self.new_var(false);
+        let lang = self.p.gx.lang;
+        let ts = self.tys.intern_tys(inputs);
+        let tuple = self.tys.intern(TyKind::Tuple(ts));
+        let args = self.tys.intern_args(&[GenericArg::Ty(f), GenericArg::Ty(tuple)]);
+        self.obl.push(obligations::Obligation::Trait { trait_ref: TraitRef { def: lang.fn_once, args, bindings: EMPTY_BINDINGS }, span, depth: 0 });
+        if let Some(out) = lang.output_of(lang.fn_once) {
+            self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc: out, trait_args: args, ty: output }, span });
+        }
+        f
+    }
+
+    /// The pending obligation `t: Send`.
+    fn require_send(&mut self, t: Ty, span: Span) {
+        let send = self.p.gx.lang.send;
+        let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        self.obl.push(obligations::Obligation::Trait { trait_ref: TraitRef { def: send, args, bindings: EMPTY_BINDINGS }, span, depth: 0 });
+    }
+
+    /// `LockResult<G>`: `Result<G, PoisonError<G>>`.
+    fn lock_result(&mut self, g: Ty) -> Ty {
+        let pe = sync_ty(&mut self.tys, SyncTy::PoisonError, &[g]);
+        self.tys.mk_result(g, pe)
+    }
+
+    /// Methods on `Mutex<T>`, `RwLock<T>`, and `PoisonError<T>`. The
+    /// guards have none of their own: method calls deref through them.
+    #[allow(clippy::too_many_arguments)]
+    fn lock_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, span: Span, args: &[ExprId]) -> Option<Ty> {
+        let n = self.name(name).to_string();
+        let (op, autoref, ret) = if let Some((k, el)) = self.tys.lock_elem(base) {
+            let guard = |this: &mut Self, g: SyncTy| {
+                let t = sync_ty(&mut this.tys, g, &[el]);
+                this.lock_result(t)
+            };
+            match (k, n.as_str()) {
+                (SyncTy::Mutex, "lock") => (SyncOp::MutexLock, Autoref::Ref, guard(self, SyncTy::MutexGuard)),
+                (SyncTy::RwLock, "read") => (SyncOp::RwLockRead, Autoref::Ref, guard(self, SyncTy::RwLockReadGuard)),
+                (SyncTy::RwLock, "write") => (SyncOp::RwLockWrite, Autoref::Ref, guard(self, SyncTy::RwLockWriteGuard)),
+                (_, "get_mut") => {
+                    let r = self.tys.mk_ref(true, el);
+                    (SyncOp::LockGetMut, Autoref::RefMut, self.lock_result(r))
+                }
+                (_, "into_inner") => (SyncOp::LockIntoInner, Autoref::None, self.lock_result(el)),
+                (_, "is_poisoned") => (SyncOp::LockIsPoisoned, Autoref::Ref, BOOL),
+                (_, "clear_poison") => (SyncOp::LockClearPoison, Autoref::Ref, UNIT),
+                // Stable std methods lust does not have yet.
+                (_, "try_lock" | "try_read" | "try_write") => {
+                    self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `lock`, `read`, or `write`.");
+                    return Some(self.iter_bail(args));
+                }
+                _ => return None,
+            }
+        } else if let Some(k @ (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::Scope)) = crate::ty::sync::sync_kind(&self.tys, base) {
+            match (k, n.as_str()) {
+                // `spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope,
+                // T>` where `F: FnOnce() -> T + Send + 'scope, T: Send +
+                // 'scope` (the regions in borrowck/regions.rs).
+                (SyncTy::Scope, "spawn") => {
+                    let ret = self.new_var(false);
+                    let f = self.fn_once_param(&[], ret, span);
+                    self.require_send(f, span);
+                    self.require_send(ret, span);
+                    let h = sync_ty(&mut self.tys, SyncTy::ScopedJoinHandle, &[ret]);
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::ScopeSpawn), derefs, autoref: Autoref::Ref });
+                    self.check_args(&[f], args, span);
+                    return Some(h);
+                }
+                (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, "join") => {
+                    let el = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
+                    let err = sync_ty(&mut self.tys, SyncTy::JoinError, &[]);
+                    (SyncOp::JoinHandleJoin, Autoref::None, self.tys.mk_result(el, err))
+                }
+                (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, "thread") => {
+                    let th = sync_ty(&mut self.tys, SyncTy::Thread, &[]);
+                    (SyncOp::JoinHandleThread, Autoref::Ref, self.tys.mk_ref(false, th))
+                }
+                (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, "is_finished") => (SyncOp::JoinHandleIsFinished, Autoref::Ref, BOOL),
+                (SyncTy::Thread, "id") => (SyncOp::ThreadGetId, Autoref::Ref, sync_ty(&mut self.tys, SyncTy::ThreadId, &[])),
+                (SyncTy::Thread, "name") => {
+                    let s = self.tys.mk_ref(false, STR);
+                    (SyncOp::ThreadGetName, Autoref::Ref, self.tys.mk_option(s))
+                }
+                (_, "unpark" | "as_u64" | "into_raw" | "as_ptr") => {
+                    self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `join`, `id`, or `name`.");
+                    return Some(self.iter_bail(args));
+                }
+                _ => return None,
+            }
+        } else if let Some(el) = self.tys.poison_elem(base) {
+            match n.as_str() {
+                "into_inner" => (SyncOp::PoisonIntoInner, Autoref::None, el),
+                "get_ref" => (SyncOp::PoisonGetRef, Autoref::Ref, self.tys.mk_ref(false, el)),
+                "get_mut" => (SyncOp::PoisonGetMut, Autoref::RefMut, self.tys.mk_ref(true, el)),
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        if autoref != Autoref::None {
+            self.check_packed_borrow(recv, span);
+        }
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref });
+        self.check_args(&[], args, span);
         Some(ret)
     }
 
@@ -451,6 +720,56 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
     for tr in [lang.clone, lang.debug, lang.default] {
         insert_synthetic(p, ordinal, tr, weak, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
+    // `Mutex<T>` and `RwLock<T>`: Debug and Default through `T`,
+    // `From<T>`. Their guards: `Deref<Target = T>` (and `DerefMut` but
+    // for the read guard), Debug and Display through `T`. `PoisonError`
+    // is Debug and Display for every `T`.
+    let bounded = |p: &mut crate::check::collect::Program, tr: DefId| -> Generics {
+        let args = p.tys.intern_args(&[GenericArg::Ty(p0)]);
+        let mut g = one.clone();
+        g.predicates = vec![Predicate::Trait(Binder::plain(TraitRef { def: tr, args, bindings: EMPTY_BINDINGS }))];
+        g
+    };
+    for k in [SyncTy::Mutex, SyncTy::RwLock] {
+        let t = sync_ty(&mut p.tys, k, &[p0]);
+        for tr in [lang.debug, lang.default] {
+            let g = bounded(p, tr);
+            insert_synthetic(p, ordinal, tr, t, &[], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+        insert_synthetic(p, ordinal, lang.from, t, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    for k in [SyncTy::MutexGuard, SyncTy::RwLockReadGuard, SyncTy::RwLockWriteGuard] {
+        let t = sync_ty(&mut p.tys, k, &[p0]);
+        insert_synthetic(p, ordinal, lang.deref, t, &[], one.clone(), vec![(lang.assoc_target, p0)], Synthetic::Lang, false, span);
+        if k.guard().is_some_and(|g| g.1) {
+            insert_synthetic(p, ordinal, lang.deref_mut, t, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        for tr in [lang.debug, lang.display] {
+            let g = bounded(p, tr);
+            insert_synthetic(p, ordinal, tr, t, &[], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
+    // The thread types: `JoinHandle<T>` and the join error are Debug;
+    // `Thread` is Clone and Debug; `ThreadId` Copy, Eq, and Debug.
+    let jh = sync_ty(&mut p.tys, SyncTy::JoinHandle, &[p0]);
+    insert_synthetic(p, ordinal, lang.debug, jh, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let sjh = sync_ty(&mut p.tys, SyncTy::ScopedJoinHandle, &[p0]);
+    insert_synthetic(p, ordinal, lang.debug, sjh, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let je = sync_ty(&mut p.tys, SyncTy::JoinError, &[]);
+    insert_synthetic(p, ordinal, lang.debug, je, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let th = sync_ty(&mut p.tys, SyncTy::Thread, &[]);
+    for tr in [lang.clone, lang.debug] {
+        insert_synthetic(p, ordinal, tr, th, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    let tid = sync_ty(&mut p.tys, SyncTy::ThreadId, &[]);
+    for tr in [lang.clone, lang.copy, lang.debug, lang.eq] {
+        insert_synthetic(p, ordinal, tr, tid, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    insert_synthetic(p, ordinal, lang.partial_eq, tid, &[tid], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let pe = sync_ty(&mut p.tys, SyncTy::PoisonError, &[p0]);
+    for tr in [lang.debug, lang.display] {
+        insert_synthetic(p, ordinal, tr, pe, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     for k in SyncTy::ALL {
         let Some(v) = k.atomic_value() else { continue };
         let t = sync_ty(&mut p.tys, k, &[]);
@@ -473,19 +792,20 @@ pub fn builtin_auto(
     env: &[Predicate],
     trait_def: DefId,
     t: Ty,
-    seen: &mut Vec<Ty>,
+    seen: &mut Vec<(DefId, Ty)>,
 ) -> Option<Option<bool>> {
     use crate::check::collect::auto_structural;
     use crate::ty::BuiltinTy as B;
     let lang = &p.gx.lang;
     let b = tys.builtin_of(t)?;
-    if trait_def == lang.unpin && !matches!(b, B::Vec | B::Option | B::Boxed | B::Result) {
+    let structural_unpin = matches!(b, B::Vec | B::Option | B::Boxed | B::Result | B::Sync(SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError));
+    if trait_def == lang.unpin && !structural_unpin {
         return Some(Some(true));
     }
     let send = trait_def == lang.send;
     let elem = tys.adt_first_ty_arg(t);
-    let each = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<Ty>| -> Option<bool> {
-        seen.push(t);
+    let each = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<(DefId, Ty)>| -> Option<bool> {
+        seen.push((trait_def, t));
         let mut unknown = false;
         for (part, tr) in parts.into_iter().map(|x| (x, trait_def)) {
             match auto_structural(p, tys, env, tr, part, seen) {
@@ -513,7 +833,7 @@ pub fn builtin_auto(
         // `T` is both (std's unsafe impls).
         B::Sync(SyncTy::Arc | SyncTy::ArcWeak) => {
             let Some(e) = elem else { return Some(None) };
-            seen.push(t);
+            seen.push((trait_def, t));
             let mut unknown = false;
             for tr in [lang.send, lang.sync] {
                 match auto_structural(p, tys, env, tr, e, seen) {
@@ -524,6 +844,37 @@ pub fn builtin_auto(
             }
             if unknown { None } else { Some(true) }
         }
+        // std's impls: `Mutex<T>` is Send and Sync for `T: Send`;
+        // `RwLock<T>` is Send for `T: Send`, Sync for `T: Send + Sync`;
+        // the guards are never Send and are Sync for `T: Sync`;
+        // `PoisonError<T>` follows `T`.
+        B::Sync(SyncTy::Mutex | SyncTy::RwLock | SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard | SyncTy::PoisonError) => {
+            let Some(e) = elem else { return Some(None) };
+            let k = crate::ty::sync::sync_kind(tys, t).expect("a sync type");
+            let needs: &[DefId] = match k {
+                _ if trait_def == lang.unpin => &[lang.unpin],
+                SyncTy::Mutex => &[lang.send],
+                SyncTy::RwLock if send => &[lang.send],
+                SyncTy::RwLock => &[lang.send, lang.sync],
+                SyncTy::PoisonError => &[trait_def],
+                _ if send => return Some(Some(false)),
+                _ => &[lang.sync],
+            };
+            seen.push((trait_def, t));
+            let mut unknown = false;
+            for &tr in needs {
+                match auto_structural(p, tys, env, tr, e, seen) {
+                    Some(false) => return Some(Some(false)),
+                    None => unknown = true,
+                    Some(true) => {}
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        // std's impls: `JoinHandle<T>`, `Thread`, and `ThreadId` are Send
+        // and Sync for every `T`; `Box<dyn Any + Send>` is Send only.
+        B::Sync(SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId) => Some(true),
+        B::Sync(SyncTy::JoinError) => Some(send),
         B::Sync(k) => match k.atomic_value() {
             Some(_) => Some(true),
             None => None,

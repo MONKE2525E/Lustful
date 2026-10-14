@@ -38,6 +38,8 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // A `RefCell` guard formats its value (W-STD-A).
         CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
+        // A lock guard formats its value (W-THREADS).
+        CTy::Sync(k, inner) if k.guard().is_some() => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // An atomic's Debug formats a relaxed load of its value (W-THREADS).
         CTy::Sync(k, _) if let Some(a) = k.atomic_value() => {
             let load = format!("(({})lust_at_load_{}((uint{}_t*){v}, 0, 0))", ctype(&super::sync::vt_of(a)), a.bytes(), a.bytes() * 8);
@@ -294,6 +296,8 @@ fn may_fail(t: &CTy) -> bool {
         CTy::Adt(_) => true,
         CTy::Vec(e) | CTy::Option(e) | CTy::Ref(e) | CTy::Array(e, _) | CTy::Slice(e) | CTy::Boxed(e) | CTy::Rc(e) => may_fail(e),
         CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => may_fail(e),
+        // The locks and their guards format their value (W-THREADS).
+        CTy::Sync(k, e) if k.is_lock() || k.guard().is_some() => may_fail(e),
         // std's cells and boxed slices (W-STD-A) format their contents.
         CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
         CTy::Result(a, b) => may_fail(a) || may_fail(b),

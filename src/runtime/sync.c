@@ -229,3 +229,266 @@ int lust_arc_take_unique(uint64_t *h) LUST_BODY({
     LUST_THREAD_FENCE(2);
     return 1;
 })
+
+/* ---------- Locks: Mutex and RwLock over a futex word ----------
+
+   A `Mutex<T>` is { uint32_t st; uint8_t poison; T v; } and an `RwLock<T>`
+   { uint32_t st; uint32_t wn; uint8_t poison; T v; } (cgen/sync.rs). All
+   zero is unlocked, so `Mutex::new` in a static needs no constructor. The
+   poison flag stays 0: a panic aborts the process. Locking a lock this
+   thread already holds deadlocks, as std's futex locks do on Linux. */
+#ifdef LUST_IMPL
+#if defined(__linux__)
+long syscall(long number, ...);
+#if defined(__x86_64__)
+#define LUST_SYS_FUTEX 202
+#elif defined(__aarch64__)
+#define LUST_SYS_FUTEX 98
+#endif
+#endif
+int sched_yield(void);
+/* Sleep while *p == v (spurious wakeups are fine: callers loop). */
+static void lust_futex_wait(uint32_t *p, uint32_t v) {
+#ifdef LUST_SYS_FUTEX
+    syscall(LUST_SYS_FUTEX, p, 128 /* FUTEX_WAIT_PRIVATE */, v, (void *)0, (void *)0, 0);
+#else
+    (void)p; (void)v;
+    sched_yield();
+#endif
+}
+static void lust_futex_wake(uint32_t *p, int n) {
+#ifdef LUST_SYS_FUTEX
+    syscall(LUST_SYS_FUTEX, p, 129 /* FUTEX_WAKE_PRIVATE */, n, (void *)0, (void *)0, 0);
+#else
+    (void)p; (void)n;
+#endif
+}
+#endif
+
+/* Mutex states: 0 unlocked, 1 locked, 2 locked with waiters (Drepper's
+   futex mutex, as std's). */
+void lust_mutex_lock(uint32_t *st) LUST_BODY({
+    uint32_t zero = 0, one = 1, two = 2, old;
+    if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
+    for (;;) {
+        __atomic_exchange(st, &two, &old, 2);
+        if (old == 0) return;
+        lust_futex_wait(st, 2);
+    }
+})
+
+/* 1 when the lock was taken. */
+int lust_mutex_trylock(uint32_t *st) LUST_BODY({
+    uint32_t zero = 0, one = 1;
+    return __atomic_compare_exchange(st, &zero, &one, 0, 2, 0);
+})
+
+void lust_mutex_unlock(uint32_t *st) LUST_BODY({
+    uint32_t zero = 0, old;
+    __atomic_exchange(st, &zero, &old, 3);
+    if (old == 2) lust_futex_wake(st, 1);
+})
+
+/* RwLock: st is the reader count, or LUST_RW_WRITER while written; st[1]
+   (wn) counts sleepers. Every step is SeqCst, so an unlock that reads
+   wn == 0 happens before a sleeper's increment, and that sleeper's futex
+   wait then sees the changed state and returns at once. */
+#define LUST_RW_WRITER 0xffffffffu
+void lust_rw_read(uint32_t *st) LUST_BODY({
+    for (;;) {
+        uint32_t s;
+        __atomic_load(st, &s, 5);
+        if (s < LUST_RW_WRITER - 1) {
+            uint32_t n = s + 1;
+            if (__atomic_compare_exchange(st, &s, &n, 0, 5, 5)) return;
+            continue;
+        }
+        __atomic_fetch_add(&st[1], 1, 5);
+        lust_futex_wait(st, s);
+        __atomic_fetch_sub(&st[1], 1, 5);
+    }
+})
+
+int lust_rw_tryread(uint32_t *st) LUST_BODY({
+    uint32_t s;
+    __atomic_load(st, &s, 5);
+    while (s < LUST_RW_WRITER - 1) {
+        uint32_t n = s + 1;
+        if (__atomic_compare_exchange(st, &s, &n, 0, 5, 5)) return 1;
+    }
+    return 0;
+})
+
+void lust_rw_read_unlock(uint32_t *st) LUST_BODY({
+    uint32_t w;
+    if (__atomic_fetch_sub(st, 1, 5) == 1) {
+        __atomic_load(&st[1], &w, 5);
+        if (w) lust_futex_wake(st, 0x7fffffff);
+    }
+})
+
+void lust_rw_write(uint32_t *st) LUST_BODY({
+    for (;;) {
+        uint32_t s = 0, wr = LUST_RW_WRITER;
+        if (__atomic_compare_exchange(st, &s, &wr, 0, 5, 5)) return;
+        __atomic_fetch_add(&st[1], 1, 5);
+        lust_futex_wait(st, s);
+        __atomic_fetch_sub(&st[1], 1, 5);
+    }
+})
+
+int lust_rw_trywrite(uint32_t *st) LUST_BODY({
+    uint32_t s = 0, wr = LUST_RW_WRITER;
+    return __atomic_compare_exchange(st, &s, &wr, 0, 5, 5);
+})
+
+void lust_rw_write_unlock(uint32_t *st) LUST_BODY({
+    uint32_t zero = 0, w;
+    __atomic_store(st, &zero, 5);
+    __atomic_load(&st[1], &w, 5);
+    if (w) lust_futex_wake(st, 0x7fffffff);
+})
+
+/* ---------- Threads: spawn, join, current (pthreads) ----------
+
+   A `JoinHandle<T>` points at a packet the generated code allocates:
+   { lust_JoinHdr h; T ret; Env env; } (cgen/sync.rs). The spawned thread
+   runs h.run (a generated trampoline that calls the closure and stores
+   its result), then gives up its reference. The handle and the thread
+   each hold one reference (h.rc); whichever lets go last drops the result
+   (h.drop_ret) and frees the packet. `join` waits, takes the result, and
+   frees the packet. A `Thread` is a counted lust_ThreadInfo; the current
+   thread's lives in a pthread key (no C _Thread_local), whose destructor
+   gives up the thread's reference at thread exit. */
+typedef struct lust_ThreadInfo {
+    uint64_t rc;
+    uint64_t id;
+    const uint8_t *name;
+    uint64_t name_len;
+} lust_ThreadInfo;
+
+/* A `thread::Scope`: the count of its live packets. The scope's end
+   waits until it is 0; a packet counts down when it is freed, after its
+   result dropped, so no scoped thread touches borrowed data after. */
+typedef struct lust_Scope {
+    uint32_t live;
+} lust_Scope;
+
+typedef struct lust_JoinHdr {
+    unsigned long t; /* pthread_t */
+    lust_ThreadInfo *th;
+    uint32_t rc;
+    uint32_t done;
+    void (*run)(struct lust_JoinHdr *);
+    void (*drop_ret)(struct lust_JoinHdr *);
+    lust_Scope *scope; /* 0 for thread::spawn */
+} lust_JoinHdr;
+
+#ifdef LUST_IMPL
+int pthread_create(unsigned long *t, const void *attr, void *(*start)(void *), void *arg);
+int pthread_join(unsigned long t, void **ret);
+int pthread_detach(unsigned long t);
+int pthread_key_create(unsigned int *key, void (*dtor)(void *));
+void *pthread_getspecific(unsigned int key);
+int pthread_setspecific(unsigned int key, const void *v);
+int pthread_once(int *once, void (*init)(void));
+static unsigned int lust_cur_key;
+static int lust_cur_once;
+/* ThreadId(1) is the main thread; spawned threads count from 2 in spawn
+   order, as std assigns them. */
+static uint64_t lust_next_tid = 2;
+static lust_ThreadInfo lust_main_info = {1, 1, (const uint8_t *)"main", 4};
+
+static void lust_thread_info_release(void *p) {
+    lust_ThreadInfo *t = (lust_ThreadInfo *)p;
+    if (t && t != &lust_main_info && __atomic_sub_fetch(&t->rc, 1, 4) == 0) free(t);
+}
+static void lust_cur_key_init(void) { pthread_key_create(&lust_cur_key, lust_thread_info_release); }
+
+/* Frees a packet whose result was moved out or dropped; a scoped one
+   then counts down its scope. */
+static void lust_packet_free(lust_JoinHdr *h) {
+    lust_Scope *sc = h->scope;
+    lust_thread_info_release(h->th);
+    free(h);
+    if (sc && __atomic_sub_fetch(&sc->live, 1, 5) == 0) lust_futex_wake(&sc->live, 0x7fffffff);
+}
+
+static void *lust_thread_entry(void *p) {
+    lust_JoinHdr *h = (lust_JoinHdr *)p;
+    pthread_setspecific(lust_cur_key, h->th);
+    h->run(h);
+    uint32_t one = 1;
+    __atomic_store(&h->done, &one, 3);
+    if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
+        h->drop_ret(h);
+        lust_packet_free(h);
+    }
+    return 0;
+}
+#endif
+
+/* Starts the thread for a filled packet (run, drop_ret, scope, ret, env). */
+void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
+    if (h->scope) __atomic_add_fetch(&h->scope->live, 1, 5);
+    pthread_once(&lust_cur_once, lust_cur_key_init);
+    lust_ThreadInfo *t = (lust_ThreadInfo *)malloc(sizeof(lust_ThreadInfo));
+    if (!t) lust_oom();
+    t->rc = 2; /* the handle's (h->th) and the running thread's (its key) */
+    t->id = __atomic_fetch_add(&lust_next_tid, 1, 0);
+    t->name = 0;
+    t->name_len = 0;
+    h->th = t;
+    h->rc = 2;
+    h->done = 0;
+    if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr("failed to spawn thread", loc);
+})
+
+/* Waits for the thread; the caller then moves the result out and calls
+   lust_join_free. */
+void lust_thread_join(lust_JoinHdr *h) LUST_BODY({ pthread_join(h->t, 0); })
+
+void lust_join_free(lust_JoinHdr *h) LUST_BODY({ lust_packet_free(h); })
+
+/* A dropped JoinHandle detaches its thread. */
+void lust_join_drop(lust_JoinHdr *h) LUST_BODY({
+    pthread_detach(h->t);
+    if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
+        h->drop_ret(h);
+        lust_packet_free(h);
+    }
+})
+
+int lust_join_is_finished(lust_JoinHdr *h) LUST_BODY({
+    uint32_t d;
+    __atomic_load(&h->done, &d, 2);
+    return d != 0;
+})
+
+/* `thread::current()`: a new reference to this thread's info. */
+lust_ThreadInfo *lust_thread_current(void) LUST_BODY({
+    pthread_once(&lust_cur_once, lust_cur_key_init);
+    lust_ThreadInfo *t = (lust_ThreadInfo *)pthread_getspecific(lust_cur_key);
+    if (!t) return &lust_main_info;
+    __atomic_add_fetch(&t->rc, 1, 0);
+    return t;
+})
+
+lust_ThreadInfo *lust_thread_clone(lust_ThreadInfo *t) LUST_BODY({
+    if (t != &lust_main_info) __atomic_add_fetch(&t->rc, 1, 0);
+    return t;
+})
+
+void lust_thread_drop(lust_ThreadInfo *t) LUST_BODY({ lust_thread_info_release(t); })
+
+void lust_thread_yield(void) LUST_BODY({ sched_yield(); })
+
+/* The end of `thread::scope`: waits for every packet of the scope. */
+void lust_scope_wait(lust_Scope *sc) LUST_BODY({
+    for (;;) {
+        uint32_t n;
+        __atomic_load(&sc->live, &n, 5);
+        if (n == 0) return;
+        lust_futex_wait(&sc->live, n);
+    }
+})

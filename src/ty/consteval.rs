@@ -749,7 +749,7 @@ impl Evaluator {
                 }
                 (ConstValue::Int(off as i128), USIZE)
             }
-            Expr::Call { callee, args } => return Ok(Flow::Val(self.call(cx, env, *callee, args, span)?)),
+            Expr::Call { callee, args } => return Ok(Flow::Val(self.call(cx, env, *callee, args, span, expected)?)),
             // Only primitive methods evaluate today (`method_call`
             // below). If user const methods land: run the method
             // body with `call_depth` raised, as the ConstFn call
@@ -1297,6 +1297,7 @@ impl Evaluator {
         callee: ExprId,
         args: &[ExprId],
         span: Span,
+        expected: Option<Ty>,
     ) -> Result<TypedValue, Diag> {
         // `AtomicUsize::new(v)` and the other atomics' `new` are const fns
         // (W-THREADS): the value is the atomic's (its C form is the value).
@@ -1315,6 +1316,21 @@ impl Evaluator {
                 }
                 let t = super::sync::sync_ty(cx.tys(), k, &[]);
                 return Ok((v, t));
+            }
+            // `Mutex::new(v)` and `RwLock::new(v)` are const fns too: an
+            // unlocked, unpoisoned lock around the value.
+            if let Some((&"new", ty_path)) = names.split_last()
+                && let Some(k) = super::sync::SyncTy::by_path(ty_path)
+                && k.is_lock()
+            {
+                let written = segs[segs.len() - 2].type_args();
+                let want = match written.first() {
+                    Some(_) => return Err(outside(span, "a lock initializer with a turbofish")),
+                    None => expected.and_then(|t| cx.tys_ref().adt_first_ty_arg(t)),
+                };
+                let (v, vt) = self.value(cx, env, args[0], want)?;
+                let t = super::sync::sync_ty(cx.tys(), k, &[vt]);
+                return Ok((ConstValue::Aggregate(vec![v]), t));
             }
         }
         // `f64::from_bits(n)` and `f32::from_bits(n)` are const fns.

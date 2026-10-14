@@ -1008,6 +1008,9 @@ struct Ctx<'p, 'a> {
     /// true when its outer reference is higher-ranked (`&item`). W-BORROW:
     /// the other argument regions are free; see `ClosureInfo::free_args`.
     iter_closure_args: std::collections::HashMap<u32, Vec<bool>>,
+    /// W-THREADS: the closure-argument type var of each `thread::scope`
+    /// call (`ClosureInfo::scope_body`).
+    scope_closure_vars: Vec<u32>,
     /// W-BORROW: the closure-argument type vars of generic calls whose
     /// regioned `Fn` bound has a higher-ranked output over its one
     /// elided input lifetime (`F: Fn(&T) -> &U`), with that output's
@@ -1212,6 +1215,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         own_opaques: Vec::new(),
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
+        scope_closure_vars: Vec::new(),
         closure_bound_outputs: std::collections::HashMap::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
@@ -2654,11 +2658,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// An auto trait by structure (section 2.7). None when the
     /// answer needs the param env or inference to move first.
     fn auto_holds(&mut self, trait_def: DefId, t: Ty) -> Option<bool> {
-        let mut seen: Vec<Ty> = Vec::new();
+        let mut seen: Vec<(DefId, Ty)> = Vec::new();
         self.auto_inner(trait_def, t, &mut seen)
     }
 
-    fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
+    fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<(DefId, Ty)>) -> Option<bool> {
         let t = self.deep(t);
         // The answer reads the fields of every Adt in `t` (their
         // layouts' fingerprints cover nested field types).

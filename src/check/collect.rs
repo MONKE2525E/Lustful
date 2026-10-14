@@ -895,12 +895,22 @@ pub fn resolve_ty(
             // The sync and thread types (W-THREADS): by their std path,
             // or by a bare name a module glob of their std module imports.
             if let Some(k) = crate::check::sync::sync_type_named(interner, segs) {
-                if k.arity() == 0 {
+                if k.arity() == 0 && k.regions() == 0 {
                     return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
                 }
                 let args = seg.type_args();
                 if args.len() != k.arity() {
                     return Err(Diag::new("L0110", span, format!("{} takes one type argument", k.name()), format!("Write `{}<T>`.", k.name())));
+                }
+                let lts = match &seg.args {
+                    crate::ast::GenericArgs::Angle(a) => a.iter().filter(|g| matches!(g, crate::ast::GenericArg::Lifetime(_))).count(),
+                    _ => 0,
+                };
+                if lts != 0 && lts != k.regions() as usize {
+                    return Err(Diag::new("L0110", span, format!("`{}` takes {} lifetime argument(s)", k.name(), k.regions()), "Match the number of lifetime parameters."));
+                }
+                if k.arity() == 0 {
+                    return Ok(crate::ty::sync::sync_ty(tys, k, &[]));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 crate::check::sync::check_sync_arg(tys, k, e, span)?;
@@ -4237,6 +4247,9 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if tys.is_exit_code(t) {
                 return true;
             }
+            if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Copy) {
+                return b;
+            }
             if let Some(e) = tys.option_elem(t) {
                 return is_copy(p, tys, e);
             }
@@ -4276,6 +4289,9 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     }
     if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
         return true;
+    }
+    if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Clone) {
+        return b;
     }
     // `Ref`/`RefMut` are not Clone (`Ref::clone` is an associated fn);
     // `Cell<T>` is Clone for `T: Copy`, `RefCell<T>` for `T: Clone`.
@@ -4344,6 +4360,10 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
         _ => {
             if tys.is_string_ty(t) {
                 return true;
+            }
+            // A guard (`Ref`, `MutexGuard`) has no `PartialOrd` or `Hash`.
+            if tys.guard_elem(t).is_some() {
+                return false;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
                 return glue_cmp(p, tys, e, total, seen);
@@ -4416,13 +4436,14 @@ fn adt_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn
 /// impls (`Rc` and `env::Args` are neither Send nor Sync; `Vec`,
 /// `Box`, and `Rc` are Unpin for every element type). None when an
 /// inference variable, a projection, or another form leaves it open.
-/// `seen` holds the types on the walk: a cycle counts as holding.
-pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], trait_def: DefId, t: Ty, seen: &mut Vec<Ty>) -> Option<bool> {
+/// `seen` holds the (trait, type) pairs on the walk: a cycle counts as
+/// holding. The trait is part of the key: `&T: Send` asks `T: Sync`.
+pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], trait_def: DefId, t: Ty, seen: &mut Vec<(DefId, Ty)>) -> Option<bool> {
     let lang = &p.gx.lang;
-    if seen.contains(&t) {
+    if seen.contains(&(trait_def, t)) {
         return Some(true);
     }
-    let all = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<Ty>| -> Option<bool> {
+    let all = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<(DefId, Ty)>| -> Option<bool> {
         let mut unknown = false;
         for e in parts {
             match auto_structural(p, tys, env, trait_def, e, seen) {
@@ -4458,22 +4479,22 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
             if trait_def == lang.unpin {
                 return Some(true);
             }
-            seen.push(t);
+            seen.push((trait_def, t));
             // `&T: Send` needs `T: Sync`; every other pair keeps the trait.
             let need = if trait_def == lang.send && !m.is_mut() { lang.sync } else { trait_def };
             auto_structural(p, tys, env, need, e, seen)
         }
         TyKind::Slice(e) | TyKind::Array(e, _) => {
-            seen.push(t);
+            seen.push((trait_def, t));
             auto_structural(p, tys, env, trait_def, e, seen)
         }
         TyKind::Tuple(ts) => {
-            seen.push(t);
+            seen.push((trait_def, t));
             let elems = tys.tys_of(ts).to_vec();
             all(tys, elems, seen)
         }
         TyKind::Closure(_, a) => {
-            seen.push(t);
+            seen.push((trait_def, t));
             let caps = closure_fields(tys, a);
             all(tys, caps, seen)
         }
@@ -4492,15 +4513,15 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
                 return r;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
-                seen.push(t);
+                seen.push((trait_def, t));
                 return auto_structural(p, tys, env, trait_def, e, seen);
             }
             if let Some((a, b)) = tys.result_args(t) {
-                seen.push(t);
+                seen.push((trait_def, t));
                 return all(tys, vec![a, b], seen);
             }
             if let Some(a) = tys.local_adt(t) {
-                seen.push(t);
+                seen.push((trait_def, t));
                 let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
                 let fields: Vec<Ty> =
@@ -4531,6 +4552,9 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
         _ => {
             if tys.is_string_ty(t) {
                 return true;
+            }
+            if tys.guard_elem(t).is_some() {
+                return false;
             }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
                 return glue_hash(p, tys, e, seen);
@@ -4571,8 +4595,13 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
             if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() {
                 return true;
             }
-            if let Some(b) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Default) {
-                return b;
+            match crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Default) {
+                Some(Ok(b)) => return b,
+                Some(Err(e)) => return glue_default(p, tys, e, seen),
+                None => {}
+            }
+            if tys.guard_elem(t).is_some() {
+                return false;
             }
             if let Some(e) = tys.smart_elem(t) {
                 return glue_default(p, tys, e, seen);
@@ -4616,6 +4645,9 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
             if tys.is_string_ty(t) || tys.is_exit_code(t) {
                 return true;
             }
+            if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::PartialEq) {
+                return b;
+            }
             if tys.guard_elem(t).is_some() {
                 return false;
             }
@@ -4655,8 +4687,10 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
                 return true;
             }
-            if let Some(b) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
-                return b;
+            match crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
+                Some(Ok(b)) => return b,
+                Some(Err(e)) => return glue_debug(p, tys, e, seen),
+                None => {}
             }
             if let Some(e) = tys.cell_elem(t) {
                 return is_copy(p, tys, e) && glue_debug(p, tys, e, seen);
@@ -4688,6 +4722,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         _ => {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
+                || tys.poison_elem(t).is_some()
                 || tys.adt_parts(t).is_some_and(|(d, _)| {
                     d == crate::check::generics::fmt_error_def() || d == generics::utf8_error_def() || d == generics::from_utf8_error_def()
                 })
@@ -4709,7 +4744,14 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
         return true;
     }
-    if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)) {
+    // A join handle detaches (or frees) its thread; a `Thread` is counted.
+    if matches!(
+        crate::ty::sync::sync_kind(tys, t),
+        Some(crate::ty::sync::SyncTy::JoinHandle | crate::ty::sync::SyncTy::ScopedJoinHandle | crate::ty::sync::SyncTy::Thread)
+    ) {
+        return true;
+    }
+    if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)).or_else(|| tys.lock_elem(t).map(|l| l.1)).or_else(|| tys.poison_elem(t)) {
         return needs_drop(p, tys, e);
     }
     if let Some(e) = tys.option_elem(t) {

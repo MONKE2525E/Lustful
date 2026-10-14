@@ -69,6 +69,10 @@ pub struct ClosureInfo {
     /// reference is higher-ranked). `None`: every argument region is
     /// higher-ranked.
     pub free_args: Option<Vec<bool>>,
+    /// W-THREADS: the closure is `thread::scope`'s argument, so its
+    /// captured regions outlive its `Scope`'s `'scope` (rustc's implied
+    /// `'env: 'scope`).
+    pub scope_body: bool,
     /// W-BORROW: per argument, its annotation's regioned type when it
     /// names a lifetime (`|x: &'a T|`: the enclosing fn's `'a`, a free
     /// region the creator ties to that universal), or for any annotation
@@ -312,6 +316,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Infer(v) => self.iter_closure_args.get(&v.0).cloned(),
             _ => None,
         });
+        let scope_body = expected.is_some_and(|t| matches!(self.kind(self.resolve(t)), TyKind::Infer(v) if self.scope_closure_vars.contains(&v.0)));
         let bound_output = expected.and_then(|t| match self.kind(self.resolve(t)) {
             TyKind::Infer(v) => self.closure_bound_outputs.get(&v.0).copied(),
             _ => None,
@@ -467,7 +472,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, input_regions, output_region, bound_output });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(

@@ -2538,15 +2538,58 @@ fn resolve_path_ty(
     // The sync and thread types (W-THREADS): by their std path, or by a
     // bare name a module glob of their std module imports.
     if let Some(k) = crate::check::sync::sync_type_named(interner, segs) {
-        if k.arity() == 0 {
+        if k.arity() == 0 && k.regions() == 0 {
             return no_generics(crate::ty::sync::sync_ty(tys, k, &[]));
         }
         let args = match &seg.args {
+            GenericArgs::Angle(a) if k.arity() == 0 => {
+                if a.iter().any(|g| !matches!(g, AstArg::Lifetime(_))) {
+                    return Err(Diag::new("L0110", span, format!("`{}` takes no type arguments", k.name()), "Remove the type arguments."));
+                }
+                Vec::new()
+            }
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, k.name())?,
+            GenericArgs::None if k.arity() == 0 => Vec::new(),
             _ => return Err(Diag::new("L0110", span, format!("`{}` takes one type argument", k.name()), "Write it with its element type.")),
         };
         let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
         crate::check::sync::check_sync_arg(tys, k, elem, span)?;
+        // Lifetime params (a lock guard's, a scoped handle's, a `Scope`'s
+        // two): none written (each elided) or all; a region signature
+        // keeps them first, as for a user Adt's lifetimes.
+        let n_lts = k.regions() as usize;
+        let written: Vec<ast::Lifetime> = match &seg.args {
+            GenericArgs::Angle(a) => a.iter().filter_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect(),
+            _ => Vec::new(),
+        };
+        if !written.is_empty() && written.len() != n_lts {
+            return Err(Diag::new("L0110", span, format!("`{}` takes {n_lts} lifetime argument(s), but {} were given", k.name(), written.len()), "Match the number of lifetime parameters."));
+        }
+        if scope.infer_cell.is_some()
+            && !scope.annotation
+            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
+        {
+            return Err(Diag::new(
+                "L0203",
+                lt.span,
+                "an explicit lifetime in a type annotation inside a body is not supported yet",
+                "Remove the annotation and let the type be inferred, or write `'_`.",
+            ));
+        }
+        if n_lts > 0 && matches!(scope.regions, RegionMode::Keep { .. }) {
+            let def = tys.builtins().sync_tys[k as usize];
+            let mut all = Vec::new();
+            for i in 0..n_lts {
+                all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
+            }
+            if k.arity() > 0 {
+                all.push(GenericArg::Ty(elem));
+            }
+            return Ok(tys.mk_adt(def, &all));
+        }
+        if k.arity() == 0 {
+            return Ok(crate::ty::sync::sync_ty(tys, k, &[]));
+        }
         return Ok(crate::ty::sync::sync_ty(tys, k, &[elem]));
     }
     // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A).
@@ -3393,6 +3436,8 @@ pub struct ClosureEntry {
     pub output: Ty,
     /// `ClosureInfo::free_args` (W-BORROW).
     pub free_args: Option<Vec<bool>>,
+    /// `ClosureInfo::scope_body` (W-THREADS).
+    pub scope_body: bool,
     /// `ClosureInfo::input_regions` (W-BORROW).
     pub input_regions: Vec<Option<Ty>>,
     /// `ClosureInfo::output_region` (W-BORROW).
@@ -6534,6 +6579,7 @@ pub(crate) struct OwnedClosure {
     pub(crate) inputs: Vec<OwnedTy>,
     pub(crate) output: OwnedTy,
     pub(crate) free_args: Option<Vec<bool>>,
+    pub(crate) scope_body: bool,
     pub(crate) input_regions: Vec<Option<OwnedTy>>,
     pub(crate) output_region: Option<OwnedTy>,
     pub(crate) bound_output: Option<OwnedTy>,
@@ -6551,6 +6597,7 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
             inputs: cl.inputs.iter().map(|&t| snapshot_ty(&c.tys, t)).collect::<Option<Vec<_>>>()?,
             output: snapshot_ty(&c.tys, cl.output)?,
             free_args: cl.free_args.clone(),
+            scope_body: cl.scope_body,
             input_regions: cl.input_regions.iter().map(|o| o.and_then(|t| snapshot_ty(&c.tys, t))).collect(),
             output_region: cl.output_region.and_then(|t| snapshot_ty(&c.tys, t)),
             bound_output: cl.bound_output.and_then(|t| snapshot_ty(&c.tys, t)),
@@ -6645,7 +6692,7 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let scope = p.gx.fn_scopes.get(parent.0 as usize).cloned().unwrap_or_default();
         p.gx.fn_scopes.push(scope);
         p.gx.fn_class.push(class);
-        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), input_regions, output_region, bound_output });
+        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), scope_body: oc.scope_body, input_regions, output_region, bound_output });
         p.gx.closure_fns.insert(id, oc.def);
         out.push(id);
     }

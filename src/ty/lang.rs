@@ -1083,6 +1083,11 @@ const STD_FN_PATHS: &[&str] = &[
     "std/sync/atomic/compiler_fence",
     "core/hint/spin_loop",
     "std/hint/spin_loop",
+    "std/thread/spawn",
+    "std/thread/current",
+    "std/thread/yield_now",
+    "std/thread/panicking",
+    "std/thread/scope",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[
