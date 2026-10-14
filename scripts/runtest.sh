@@ -28,7 +28,7 @@ runtest_case() {
   [ "$(cat rustc.cc)" -eq 0 ] || { report bad "$name" "rustc rejected it"; return; }
   run_cc "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
   rs=$(cat rustc.rs)
-  run_to "./$name.lust" x y >"$name.lust.out" 2>"$name.lust.err"; bs=$?
+  run_to_err "$name.lust.err" "./$name.lust" x y >"$name.lust.out"; bs=$?
   run_cc "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
   # Which run path did it take? glue_shared has three function units, so it must use the file.
   # The glue_*_type_cross_unit tests force a unit split with filler fns, so they must too.

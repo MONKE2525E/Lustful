@@ -10,6 +10,10 @@ case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
 run_cc() { timeout "$case_timeout" "$@"; }
 run_to() { timeout "$run_timeout" "$@"; }
+# run_to_err <errfile> <cmd...>: run_to with only the command's own stderr in <errfile>. A plain
+# `run_to cmd 2>file` also puts timeout's "dumped core" note and bash's "Aborted" job report
+# there when cmd dies by a signal (a panic=abort panic).
+run_to_err() { local e=$1; shift; run_to bash -c 'exec "$@" 2>"$0"' "$e" "$@" 2>/dev/null; }
 jobs=${DIFFTEST_JOBS:-$(nproc)}
 rustc_cache=${DIFFTEST_RUSTC_CACHE:-$HOME/.cache/lust-difftest}
 [ "$rustc_cache" = off ] || mkdir -p "$rustc_cache" || rustc_cache=off
