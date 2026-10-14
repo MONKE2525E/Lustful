@@ -405,7 +405,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             loan_block: Vec::new(),
             loan_stmt: Vec::new(),
             drop_heads,
-            const_index: const_index_locals(body),
+            const_index: {
+                let mut c = const_index_locals(body);
+                if !body.index_exprs.is_empty() {
+                    let user: HashSet<Local> = body.index_exprs.iter().copied().collect();
+                    c.retain(|l, _| !user.contains(l));
+                }
+                c
+            },
             sh: Shape { n: 0, wn: 0, wm: 0 },
             mpaths: Vec::new(),
             mpath_at: Vec::new(),
@@ -1844,13 +1851,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             return;
         }
         let l = p.local as usize;
-        let (path, exact) = self.prefix_of(p);
+        let (path, _) = self.prefix_of(p);
         // A moved field blocks uses of itself, of fields below it, and of every value
-        // that contains it. A sibling field is fine.
+        // that contains it. A sibling field is fine. A place that is not exact below
+        // its prefix (`arr[i]`) may reach any moved path under that prefix.
         let hit = self.moved_paths(st, l).find_map(|m| {
             if is_prefix(m, &path) {
                 Some("use of moved value")
-            } else if exact && is_prefix(&path, m) {
+            } else if is_prefix(&path, m) {
                 Some("use of partially moved value")
             } else {
                 None

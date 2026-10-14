@@ -94,6 +94,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         lower_errs: Vec::new(),
         annotations: Vec::new(),
         promoted: Vec::new(),
+        index_exprs: Vec::new(),
     };
     let mut lw = Lower {
         p,
@@ -499,6 +500,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     b
                 };
                 let i = self.temp(USIZE);
+                self.body.index_exprs.push(i);
                 // The index is a value, not part of the mutable place.
                 let saved = std::mem::take(&mut self.mut_index);
                 self.expr_into(*index, Some(&Place::local(i)));

@@ -267,6 +267,11 @@ pub struct Body<'g> {
     /// `'static`. The value has no bytes, so such a local never dies and
     /// its borrows make no loan.
     pub promoted: Vec<Local>,
+    /// The index temporaries of `a[i]` expressions. Borrowck never treats
+    /// them as constant indexes (rustc's `Index`, not `ConstantIndex`):
+    /// `arr[1]` reads the whole array for move checks. Only borrowck reads
+    /// it; a cached body has none.
+    pub index_exprs: Vec<Local>,
 }
 
 impl Body<'_> {
