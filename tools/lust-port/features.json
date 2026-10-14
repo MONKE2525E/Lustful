@@ -575,8 +575,26 @@
    ]
   },
   {
+   "id": "attrs.non_exhaustive",
+   "title": "#[non_exhaustive] on structs, enums, and variants",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "2",
+   "root_cause": "attrs-cfg",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_non_exhaustive.rs passes (fx-attrs): collect records the mark on the Adt and each variant; across a crate border, struct literals and tuple or unit constructors of a marked type are private, named-field patterns need .., and a match needs a wildcard. Inside the defining crate nothing changes.",
+   "primary_keys": [
+    "attr.non_exhaustive"
+   ],
+   "keys": [
+    "attr.non_exhaustive"
+   ]
+  },
+  {
    "id": "attrs.unsupported",
-   "title": "Attribute names lust rejects (non_exhaustive, serde)",
+   "title": "Attribute names lust rejects (serde)",
    "status": "unsupported",
    "milestone": 4,
    "inventory_step": "2",
@@ -584,9 +602,8 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0522). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0402). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
    "primary_keys": [
-    "attr.non_exhaustive",
     "attr.serde*"
    ],
    "keys": [

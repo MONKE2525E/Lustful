@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 23039,
+  "elapsed_ms": 9165,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -645,7 +645,7 @@
     },
     {
       "id": "attrs.unsupported",
-      "title": "Attribute names lust rejects (non_exhaustive, serde)",
+      "title": "Attribute names lust rejects (serde)",
       "status": "unsupported",
       "milestone": 4,
       "milestone_label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
@@ -654,7 +654,7 @@
       "fix_class": "compiler work",
       "release_safe_rewrite": false,
       "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0522). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
+      "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0402). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
       "findings": 39,
       "raw_uses": 39,
       "prod_uses": 39,

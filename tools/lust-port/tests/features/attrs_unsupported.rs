@@ -1,5 +1,5 @@
 // feature: attrs.unsupported
-// form: the non_exhaustive attribute
-#[non_exhaustive]
-struct Opts { level: i32 }
-fn main() { println!("{}", Opts { level: 1 }.level); }
+// form: a linker attribute lust does not know (used)
+#[used]
+static X: i32 = 3;
+fn main() { println!("{}", X); }
