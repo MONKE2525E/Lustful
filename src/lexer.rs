@@ -633,7 +633,7 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     let value = strings.len() as u32 - 1;
                     Tok::Str(value, Some(push_text(&mut strings, &src[start..i])))
                 } else {
-                    Tok::ByteStr(push_text(&mut strings, &src[start..i]))
+                    byte_str_tok(&mut strings, &src[start..i]).ok_or_else(|| err(start, i, "invalid raw byte or C string literal"))?
                 }
             } else if (s == "b" || s == "c") && b.get(i) == Some(&b'"') {
                 i += 1;
@@ -651,7 +651,7 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         Some(_) => i += 1,
                     }
                 }
-                Tok::ByteStr(push_text(&mut strings, &src[start..i]))
+                byte_str_tok(&mut strings, &src[start..i]).ok_or_else(|| err(start, i, "invalid byte or C string literal"))?
             } else if s == "b" && b.get(i) == Some(&b'\'') {
                 i += 1;
                 if b.get(i) == Some(&b'\\') {
@@ -669,6 +669,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     return Err(err(start, i, "unterminated byte char literal"));
                 }
                 i += 1;
+                if decode_byte_char(&src[start..i]).is_none() {
+                    return Err(err(start, i, "invalid byte char literal"));
+                }
                 strings.push(src[start..i].to_string());
                 Tok::ByteChar(strings.len() as u32 - 1)
             } else if raw_open(b, i).is_some() || b.get(i) == Some(&b'\'') {
@@ -924,6 +927,129 @@ fn must_escape(ch: char) -> Option<&'static str> {
     })
 }
 
+/// One byte escape at `b[i]` (the byte after the backslash): the byte
+/// and the index just past the escape. Byte escapes take the full
+/// `\xHH` range; `\u` is not a byte escape.
+fn byte_escape(b: &[u8], i: usize) -> Option<(u8, usize)> {
+    let c = *b.get(i)?;
+    Some(match c {
+        b'n' => (b'\n', i + 1),
+        b't' => (b'\t', i + 1),
+        b'r' => (b'\r', i + 1),
+        b'0' => (0, i + 1),
+        b'\\' => (b'\\', i + 1),
+        b'\'' => (b'\'', i + 1),
+        b'"' => (b'"', i + 1),
+        b'x' => {
+            let h = |c: u8| (c as char).to_digit(16).map(|v| v as u8);
+            let v = h(*b.get(i + 1)?)? * 16 + h(*b.get(i + 2)?)?;
+            (v, i + 3)
+        }
+        _ => return None,
+    })
+}
+
+/// The bytes of a byte char literal's verbatim token text (`b'x'`),
+/// when it holds exactly one ASCII byte or byte escape.
+pub fn decode_byte_char(text: &str) -> Option<u8> {
+    let inner = text.strip_prefix("b'")?.strip_suffix('\'')?;
+    let b = inner.as_bytes();
+    match b.first() {
+        Some(b'\\') => {
+            let (v, next) = byte_escape(b, 1)?;
+            if next == b.len() { Some(v) } else { None }
+        }
+        Some(&c) if b.len() == 1 && c.is_ascii() && c != b'\'' => Some(c),
+        _ => None,
+    }
+}
+
+/// The bytes of a byte string literal's verbatim token text (`b".."`
+/// or a raw `br".."`, `br#".."#`). Non-ASCII text is not a byte
+/// string in Rust, so it rejects here like any bad escape.
+pub fn decode_byte_str(text: &str) -> Option<Vec<u8>> {
+    if let Some(rest) = text.strip_prefix("br") {
+        let hashes = rest.bytes().take_while(|&c| c == b'#').count();
+        let close = format!("\"{}", "#".repeat(hashes));
+        let inner = rest[hashes..].strip_prefix('"')?.strip_suffix(&close)?;
+        if inner.bytes().any(|c| !c.is_ascii()) {
+            return None;
+        }
+        return Some(inner.bytes().collect());
+    }
+    let inner = text.strip_prefix("b\"")?.strip_suffix('"')?;
+    let b = inner.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if b.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                let (v, next) = byte_escape(b, i + 1)?;
+                out.push(v);
+                i = next;
+            }
+            c if c.is_ascii() => {
+                out.push(c);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Stores a byte or C string literal's text (`b".."`, `br".."`, `c".."`,
+/// `cr".."`) and returns its token, or None when rustc's lexer rejects
+/// the literal (a bad escape, a non-ASCII byte, a NUL in a C string),
+/// as it does in macro input too.
+fn byte_str_tok(strings: &mut Vec<String>, text: &str) -> Option<Tok> {
+    let i = push_text(strings, text);
+    let t = &strings[i as usize];
+    let ok = if t.starts_with('c') { c_str_ok(t) } else { decode_byte_str(t).is_some() };
+    ok.then_some(Tok::ByteStr(i))
+}
+
+/// True when a C string literal's text (`c".."`, `cr#".."#`) is one rustc
+/// accepts: known escapes (bytes up to `\xFF`, `\u{..}`) and no NUL.
+fn c_str_ok(text: &str) -> bool {
+    if text.starts_with("cr") {
+        return !text.contains('\0');
+    }
+    let Some(inner) = text.strip_prefix("c\"").and_then(|t| t.strip_suffix('"')) else { return false };
+    let b = inner.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            0 => return false,
+            b'\\' => match b.get(i + 1) {
+                Some(b'\n') => {
+                    i += 2;
+                    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+                        i += 1;
+                    }
+                }
+                Some(b'x') => match inner.get(i + 2..i + 4).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(v) if v != 0 && inner.as_bytes()[i + 2].is_ascii_hexdigit() => i += 4,
+                    _ => return false,
+                },
+                _ => match lex_escape(inner, &mut i) {
+                    Some(c) if c != '\0' => {}
+                    _ => return false,
+                },
+            },
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// If a raw string opening (`#` run plus `"`) starts at `i`, returns the `#` count.
 fn raw_open(b: &[u8], i: usize) -> Option<usize> {
     let mut hashes = 0;
@@ -1041,20 +1167,28 @@ fn lex_escape(src: &str, i: &mut usize) -> Option<char> {
         b'\\' => '\\',
         b'\'' => '\'',
         b'"' => '"',
+        // Exactly two hex digits (`from_str_radix` alone would take `+1`).
         b'x' => {
-            let v = u8::from_str_radix(src.get(*i..*i + 2)?, 16).ok()?;
+            let digits = src.get(*i..*i + 2).filter(|d| d.bytes().all(|c| c.is_ascii_hexdigit()))?;
+            let v = u8::from_str_radix(digits, 16).ok()?;
             *i += 2;
             if v > 0x7f {
                 return None;
             }
             v as char
         }
+        // `\u{..}`: a hex digit first, then hex digits and `_`, at most six digits.
         b'u' => {
             if b.get(*i) != Some(&b'{') {
                 return None;
             }
             let end = src[*i..].find('}')? + *i;
-            let v = u32::from_str_radix(&src[*i + 1..end].replace('_', ""), 16).ok()?;
+            let digits = &src[*i + 1..end];
+            let hex = digits.bytes().filter(u8::is_ascii_hexdigit).count();
+            if !digits.starts_with(|c: char| c.is_ascii_hexdigit()) || hex > 6 || hex + digits.matches('_').count() != digits.len() {
+                return None;
+            }
+            let v = u32::from_str_radix(&digits.replace('_', ""), 16).ok()?;
             *i = end + 1;
             char::from_u32(v)?
         }

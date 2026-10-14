@@ -7,7 +7,7 @@
 use crate::ast::*;
 use crate::diag::{Diag, Span, not_yet};
 use crate::intern::{Interner, Known, Sym};
-use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree};
+use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree, decode_byte_char, decode_byte_str};
 
 // Stable Appendix A codes for AST v2 forms the parser recognizes but does not
 // build yet. Each code's registry row and explain page name its area.
@@ -530,84 +530,6 @@ fn vis_not_permitted(span: Span) -> Diag {
 /// parser propagates from an enclosing scope onto each `FnDef` in it).
 fn is_allow(attr: &Attr, known: &Known) -> bool {
     attr.path.len() == 1 && attr.path[0].name == known.allow
-}
-
-/// One byte escape at `b[i]` (the byte after the backslash): the byte
-/// and the index just past the escape. Byte escapes take the full
-/// `\xHH` range; `\u` is not a byte escape.
-fn byte_escape(b: &[u8], i: usize) -> Option<(u8, usize)> {
-    let c = *b.get(i)?;
-    Some(match c {
-        b'n' => (b'\n', i + 1),
-        b't' => (b'\t', i + 1),
-        b'r' => (b'\r', i + 1),
-        b'0' => (0, i + 1),
-        b'\\' => (b'\\', i + 1),
-        b'\'' => (b'\'', i + 1),
-        b'"' => (b'"', i + 1),
-        b'x' => {
-            let h = |c: u8| (c as char).to_digit(16).map(|v| v as u8);
-            let v = h(*b.get(i + 1)?)? * 16 + h(*b.get(i + 2)?)?;
-            (v, i + 3)
-        }
-        _ => return None,
-    })
-}
-
-/// The bytes of a byte char literal's verbatim token text (`b'x'`),
-/// when it holds exactly one ASCII byte or byte escape.
-fn decode_byte_char(text: &str) -> Option<u8> {
-    let inner = text.strip_prefix("b'")?.strip_suffix('\'')?;
-    let b = inner.as_bytes();
-    match b.first() {
-        Some(b'\\') => {
-            let (v, next) = byte_escape(b, 1)?;
-            if next == b.len() { Some(v) } else { None }
-        }
-        Some(&c) if b.len() == 1 && c.is_ascii() && c != b'\'' => Some(c),
-        _ => None,
-    }
-}
-
-/// The bytes of a byte string literal's verbatim token text (`b".."`
-/// or a raw `br".."`, `br#".."#`). Non-ASCII text is not a byte
-/// string in Rust, so it rejects here like any bad escape.
-fn decode_byte_str(text: &str) -> Option<Vec<u8>> {
-    if let Some(rest) = text.strip_prefix("br") {
-        let hashes = rest.bytes().take_while(|&c| c == b'#').count();
-        let close = format!("\"{}", "#".repeat(hashes));
-        let inner = rest[hashes..].strip_prefix('"')?.strip_suffix(&close)?;
-        if inner.bytes().any(|c| !c.is_ascii()) {
-            return None;
-        }
-        return Some(inner.bytes().collect());
-    }
-    let inner = text.strip_prefix("b\"")?.strip_suffix('"')?;
-    let b = inner.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => {
-                if b.get(i + 1) == Some(&b'\n') {
-                    i += 2;
-                    while i < b.len() && b[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    continue;
-                }
-                let (v, next) = byte_escape(b, i + 1)?;
-                out.push(v);
-                i = next;
-            }
-            c if c.is_ascii() => {
-                out.push(c);
-                i += 1;
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
 }
 
 /// A token's name for error messages. Never shows the payload, so internal ids (interned
