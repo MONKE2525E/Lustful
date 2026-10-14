@@ -457,14 +457,18 @@ pub fn check_fmt_impl(p: &mut Program, imp: &ast::ImplDef, tr: TraitRef, self_pa
     if tr.def != p.gx.lang.display && tr.def != p.gx.lang.debug {
         return;
     }
-    // `Box` is fundamental, so `impl Display for Box<Local>` passes the
-    // orphan rule, but fmt glue formats a Box through its contents, as
-    // std's blanket impl does: the user's impl never ran (`{}` aborted,
-    // `{:?}` printed the inner type). Rejected until the glue picks it.
-    if let TyKind::Adt(d, _) = p.tys.kind(self_pat)
-        && d == p.tys.builtins().boxed
-    {
-        errs.push(crate::diag::not_yet("L0641", imp.span, "a `Display` or `Debug` impl for a `Box` type"));
+    // The glue calls written impls of structs and enums only
+    // (`gx.fmt_methods`): one for a `Box`, a reference, or a trait
+    // object would never run, the glue formats the pointee instead.
+    if !matches!(p.tys.kind(self_pat), TyKind::Adt(..)) || p.tys.builtin_of(self_pat).is_some() {
+        let tn = crate::check::collect::ty_name(p, &p.tys, self_pat);
+        let trait_name = if tr.def == p.gx.lang.display { "Display" } else { "Debug" };
+        errs.push(Diag::new(
+            "L0641",
+            imp.span,
+            format!("an `impl {trait_name}` for `{tn}` is not supported yet"),
+            "Implement the trait for a struct or enum, such as a local wrapper of the value.",
+        ));
         return;
     }
     let fmt_sym = p.interner.intern("fmt");
