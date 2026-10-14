@@ -53,8 +53,9 @@ impl Default for FxHasher {
 }
 
 impl Hasher for FxHasher {
+    /// Upstream calls `self.write_u64`; on 64-bit targets that is this.
     fn write(&mut self, bytes: &[u8]) {
-        self.write_u64(hash_bytes(bytes));
+        self.add_to_hash(hash_bytes(bytes) as usize);
     }
 
     fn write_u8(&mut self, i: u8) {

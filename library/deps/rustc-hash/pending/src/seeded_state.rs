@@ -25,7 +25,7 @@ impl FxSeededState {
 impl core::hash::BuildHasher for FxSeededState {
     type Hasher = FxHasher;
 
-    fn build_hasher(&self) -> Self::Hasher {
+    fn build_hasher(&self) -> FxHasher {
         FxHasher::with_seed(self.seed)
     }
 }
