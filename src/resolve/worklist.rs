@@ -1035,9 +1035,37 @@ pub fn resolve_crate_cached(
 pub fn mentions_std_platform(text: &str) -> bool {
     text.match_indices("std::").any(|(i, _)| {
         let rest = &text[i + 5..];
-        rest.starts_with('{')
-            || super::imports::STD_PLATFORM_MODULES.iter().any(|m| rest.starts_with(m) && !compiler_std_item(m, &rest[m.len()..]))
+        match rest.strip_prefix('{') {
+            Some(group) => group_names_platform(group),
+            None => super::imports::STD_PLATFORM_MODULES.iter().any(|m| rest.starts_with(m) && !compiler_std_item(m, &rest[m.len()..])),
+        }
     })
+}
+
+/// True when a `use std::{...}` group (`text` starts right after its
+/// `{`) names a platform module as a word before the group closes, so
+/// `use std::{}` and `use std::{rc::Rc}` load no platform crate.
+fn group_names_platform(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut word_start = None;
+    for (i, c) in text.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word_start.get_or_insert(i);
+            continue;
+        }
+        if let Some(st) = word_start.take()
+            && (&text[st..i] == "self" || super::imports::STD_PLATFORM_MODULES.contains(&&text[st..i]))
+        {
+            return true;
+        }
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => return false,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// True for `std::env::args` and `std::process::exit`/`abort` (`rest`
@@ -5489,6 +5517,26 @@ mod tests {
     use crate::driver::graph::Reads;
     use crate::intern::{Interner, Known};
     use crate::protocol::ProfileFlags;
+
+    /// The platform crate loads for a platform module mention, a `std::{..}`
+    /// group that names one (or `self`), and not for compiler-handled items.
+    #[test]
+    fn std_platform_mentions() {
+        for (text, want) in [
+            ("use std::io::Write;", true),
+            ("fn main() { std::fs::write(\"a\", \"b\"); }", true),
+            ("use std::{collections::HashMap, io::{self, Read}};", true),
+            ("use std::{self as s};", true),
+            ("use std::{};", false),
+            ("use std::{rc::Rc, cell::{Cell, RefCell}}; mod io {}", false),
+            ("let n = std::env::args().count(); std::process::exit(0);", false),
+            ("std::env::args_os()", true),
+            ("std::envy", true),
+        ] {
+            assert_eq!(mentions_std_platform(text), want, "{text}");
+        }
+    }
+
 
     /// Routing a big file in parallel pieces answers exactly as one serial
     /// lex: triggers in any piece count (a `use`, a leading `::`, or an
