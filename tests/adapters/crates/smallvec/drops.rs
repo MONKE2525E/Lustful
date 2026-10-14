@@ -1,0 +1,66 @@
+// smallvec 1.15.1 drop and clone order: truncate and clear drop from
+// the back, retain and dedup drop after every call, resize clones then
+// drops its value, and from_elem clones as upstream does.
+use smallvec::SmallVec;
+use std::cell::RefCell;
+
+thread_local! {
+    static LOG: RefCell<String> = RefCell::new(String::new());
+}
+
+fn log(s: &str) {
+    LOG.with(|l| l.borrow_mut().push_str(s));
+}
+
+fn flush(what: &str) {
+    LOG.with(|l| {
+        println!("{}: {}", what, l.borrow());
+        l.borrow_mut().clear();
+    });
+}
+
+#[derive(Debug, PartialEq)]
+struct D(u8);
+
+impl Clone for D {
+    fn clone(&self) -> D {
+        log(&format!("c{} ", self.0));
+        D(self.0)
+    }
+}
+
+impl Drop for D {
+    fn drop(&mut self) {
+        log(&format!("d{} ", self.0));
+    }
+}
+
+fn main() {
+    let mut v: SmallVec<[D; 3]> = SmallVec::new();
+    for i in 0..6u8 {
+        v.push(D(i));
+    }
+    flush("push");
+    v.truncate(3);
+    flush("truncate");
+    v.retain(|d| d.0 != 1);
+    flush("retain");
+    v.resize(5, D(9));
+    flush("resize");
+    v.push(D(9));
+    v.dedup();
+    flush("dedup");
+    let w: SmallVec<[D; 2]> = SmallVec::from_elem(D(4), 2);
+    flush("from_elem inline");
+    let x: SmallVec<[D; 2]> = SmallVec::from_elem(D(5), 3);
+    flush("from_elem heap");
+    let c = v.clone();
+    flush("clone");
+    v.clear();
+    flush("clear");
+    drop(c);
+    flush("drop clone");
+    drop(w);
+    drop(x);
+    flush("drop rest");
+}

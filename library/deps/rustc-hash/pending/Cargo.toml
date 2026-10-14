@@ -1,0 +1,15 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package rustc-hash 2.1.2; release builds
+# use the real crate through Cargo. The driver checks `version` against
+# the resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "rustc-hash"
+version = "2.1.2"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = ["default", "std"]
+# Same fields as upstream: one usize, a unit struct, one usize.
+exact-layout = ["rustc_hash::FxHasher", "rustc_hash::FxBuildHasher", "rustc_hash::seeded_state::FxSeededState"]

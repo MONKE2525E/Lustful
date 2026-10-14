@@ -1,0 +1,10 @@
+{"delta": 0, "alpha": 5, "charlie": 2, "bravo": 3, "echo": 4} len 5 cap 7
+Some(2) Some(3) Some((4, "echo", 4))
+Some(("delta", 0)) Some(("echo", 4))
+Some(5)
+Some(0)
+{"echo": 4, "charlie": 2, "bravo": 3}
+{"echo": 4, "charlie": 12, "bravo": 3, "foxtrot": 10}
+["bravo", "charlie", "echo", "foxtrot"] [10, 4, 12, 3]
+{"bravo": 3, "charlie": 12, "foxtrot": 10} cap 7
+{5, 3, 9, 1} true Some(3)

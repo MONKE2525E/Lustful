@@ -1,5 +1,17 @@
-# Adapter: smallvec (planned)
+# Adapter: smallvec 1.15.1 (pending)
 
-Target upstream version: 1.15.1 (docs/ARCH.md section 3.6). Keeps the
-real `SmallVec<A: Array>` shape with inline storage and spill to the
-Vec core. No intrinsics. Skeleton only in S5.
+The adapter is written and checked against the real crate with rustc
+(pending/README.md), but lust cannot compile it yet. Until then it waits
+in `pending/`, and a dependency on smallvec is L0508 ("no lust adapter
+yet"). The corpus is tests/adapters/crates/smallvec (UNSUPPORTED today).
+
+Blocked on: method arguments typed by an associated type of the Adt's
+parameter (`push(value: A::Item)`, W-TRAITS/W-CHECK-G); method calls
+that autoderef from a user type to builtin slice methods (`Deref<Target
+= [T]>`, W-CHECK-G); `Iterator::size_hint` overrides,
+`DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, the
+`std::vec::IntoIter` type name, and `usize::checked_mul` checks
+(W-STD-A, W-STD-B).
+
+To activate: move `pending/Cargo.toml` and `pending/src` here, then run
+`LUST=target/release/lust scripts/test-adapters.sh smallvec`.

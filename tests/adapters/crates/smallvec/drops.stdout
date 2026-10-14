@@ -1,0 +1,11 @@
+push: 
+truncate: d5 d4 d3 
+retain: d1 
+resize: c9 c9 c9 d9 
+dedup: d9 d9 d9 
+from_elem inline: c4 c4 d4 
+from_elem heap: c5 c5 
+clone: c0 c2 c9 
+clear: d9 d2 d0 
+drop clone: d0 d2 d9 
+drop rest: d4 d4 d5 d5 d5 
