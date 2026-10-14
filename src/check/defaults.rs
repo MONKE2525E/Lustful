@@ -9,7 +9,7 @@
 // infers every parameter instead (rustc's `infer_args`), so it never
 // comes here. A default that names a lifetime is not supported yet.
 use crate::ast::{self, Ast, Expr, GenericArgs, TyExpr};
-use crate::check::generics::{ResolveCx, Scope, names_lifetime, resolve_const_arg, resolve_scoped};
+use crate::check::generics::{ConstScalar, ResolveCx, Scope, check_const_expr_ty, names_lifetime, resolve_const_arg, resolve_scoped};
 use crate::diag::{Diag, Span, not_yet};
 use crate::intern::{Interner, Known, Sym};
 use crate::ty::*;
@@ -151,7 +151,10 @@ fn resolve_default(
         let idx = shift + j as u32;
         match p {
             ast::GenericParam::Type { name, .. } => sc.type_params.push((*name, idx)),
-            ast::GenericParam::Const { name, .. } => sc.const_params.push((*name, idx)),
+            ast::GenericParam::Const { name, ty, .. } => {
+                let t = resolve_scoped(ast, interner, known, cx, tys, *ty, &Scope::default()).unwrap_or(ERROR);
+                sc.const_params.push((*name, idx, t))
+            }
             ast::GenericParam::Lifetime { .. } => {}
         }
     }
@@ -162,8 +165,13 @@ fn resolve_default(
             }
             Ok(Some(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, &sc)?)))
         }
-        ast::GenericParam::Const { default: Some(e), .. } => {
-            Ok(Some(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, &sc, *e, span)?)))
+        ast::GenericParam::Const { default: Some(e), ty, .. } => {
+            let c = resolve_const_arg(ast, interner, known, tys, &sc, *e, span)?;
+            let t = resolve_scoped(ast, interner, known, cx, tys, *ty, &Scope::default()).unwrap_or(ERROR);
+            if let Some(want) = ConstScalar::of(tys, t) {
+                check_const_expr_ty(ast, interner, known, cx, tys, &sc, *e, c, want, span, "this const default")?;
+            }
+            Ok(Some(GenericArg::Const(c)))
         }
         _ => Ok(None),
     }

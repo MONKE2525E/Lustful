@@ -524,6 +524,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
 /// The target of a generic type alias, over its own params (`Param(i)`
 /// in declared order, lifetimes left out).
 fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, Diag> {
+    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
     let mut scope = generics::Scope::default();
     let mut idx = 0u32;
     for g in &a.generics.params {
@@ -532,14 +533,23 @@ fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, D
                 scope.type_params.push((*name, idx));
                 idx += 1;
             }
-            ast::GenericParam::Const { name, .. } => {
-                scope.const_params.push((*name, idx));
+            ast::GenericParam::Const { name, ty, span, .. } => {
+                // The declared type, for the const typing of its uses.
+                let t = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, *ty, &generics::Scope::default())?;
+                if generics::ConstScalar::of(&p.tys, t).is_none() {
+                    return Err(Diag::new(
+                        "L0110",
+                        *span,
+                        "this type is forbidden as the type of a const generic parameter",
+                        "Use an integer type, `bool`, or `char`.",
+                    ));
+                }
+                scope.const_params.push((*name, idx, t));
                 idx += 1;
             }
             ast::GenericParam::Lifetime { lt, .. } => scope.lifetimes.push((lt.name, 0)),
         }
     }
-    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
     generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, a.ty, &scope)
 }
 

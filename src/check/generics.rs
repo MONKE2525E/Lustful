@@ -783,8 +783,9 @@ pub const INFER_MARKER_BASE: u32 = 1 << 29;
 pub struct Scope {
     /// Type parameter name to index in the item's `Generics`.
     pub type_params: Vec<(Sym, u32)>,
-    /// Const parameter name to index in the item's `Generics`.
-    pub const_params: Vec<(Sym, u32)>,
+    /// Const parameter name to index in the item's `Generics`, and
+    /// its declared type (`ERROR` when that did not resolve).
+    pub const_params: Vec<(Sym, u32, Ty)>,
     pub self_ty: Option<Ty>,
     pub assoc_srcs: Vec<AssocSrc>,
     /// Parameter names to their types in this scope instance:
@@ -1238,37 +1239,41 @@ pub(crate) fn const_int_fits(v: u128, it: IntTy) -> bool {
 
 /// Written const generic args of a type path against the declared
 /// types of its const params in `g` (an integer type, `bool`, or
-/// `char`): rustc's E0308 and out-of-range literal errors. Params and
-/// inference variables pass here.
+/// `char`): rustc's E0308 and out-of-range literal errors, on the
+/// evaluated value and on the written expression's type
+/// (`ConstTyper`; a const param passes when its declared type is the
+/// same).
+#[allow(clippy::too_many_arguments)]
 fn check_const_arg_types(
     ast: &Ast,
     interner: &Interner,
     known: &Known,
-    tys: &impl TyIntern,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
     g: &ast::Generics,
+    written: &[AstArg],
     args: &[GenericArg],
     span: Span,
 ) -> Result<(), Diag> {
     let decls = g.params.iter().filter(|p| !matches!(p, ast::GenericParam::Lifetime { .. }));
     let vals = args.iter().filter(|a| !matches!(a, GenericArg::Lifetime(_)));
-    for (param, arg) in decls.zip(vals) {
+    let forms = written.iter().filter(|a| !matches!(a, AstArg::Lifetime(_)));
+    for ((param, arg), form) in decls.zip(vals).zip(forms) {
         let (ast::GenericParam::Const { ty, .. }, GenericArg::Const(c)) = (param, arg) else { continue };
-        let ast::TyExpr::Path(segs) = ast.ty(*ty) else { continue };
-        let [seg] = segs.as_slice() else { continue };
-        let fits = match tys.const_kind(*c) {
-            ConstKind::Int(v) => known.int_ty(seg.name).is_some_and(|it| const_int_fits(v, it)),
-            ConstKind::Bool(_) => seg.name == known.bool,
-            ConstKind::Char(_) => seg.name == known.char,
+        let mut typer = ConstTyper { ast, interner, known, cx, tys: &mut *tys, scope, lets: Vec::new() };
+        let Some(want) = typer.written(*ty) else { continue };
+        let typed = match form {
+            AstArg::Const(e) => typer.expr(*e, Some(want)).is_ok(),
+            // A bare name in a const position (`Arr<N>`).
+            AstArg::Type(t) => match ast.ty(*t) {
+                TyExpr::Path(segs) if segs.len() == 1 => typer.name(segs[0].name).is_none_or(|s| s == want),
+                _ => true,
+            },
             _ => true,
         };
-        if !fits {
-            let tn = crate::intern::source_name(interner.get(seg.name));
-            return Err(Diag::new(
-                "L0110",
-                span,
-                format!("mismatched types: this const argument is not a value of type `{tn}`"),
-                format!("Write a `{tn}` value in its range."),
-            ));
+        if !typed || !want.holds(tys, *c) {
+            return Err(const_mismatch(want, span, "this const argument"));
         }
     }
     Ok(())
@@ -1313,7 +1318,7 @@ fn resolve_const_path_arg(
     {
         return Err(err());
     }
-    if let Some(&(_, i)) = scope.const_params.iter().find(|(n, _)| *n == seg.name) {
+    if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == seg.name) {
         return Ok(tys.intern_const(ConstKind::Param(i)));
     }
     match crate::check::collect::named_const_kind(ast, interner, known, seg.name) {
@@ -1335,7 +1340,7 @@ pub(crate) fn resolve_const_arg(
 ) -> Result<ConstId, Diag> {
     match ast.expr(e) {
         ast::Expr::Path(segs) if segs.len() == 1 => {
-            if let Some(&(_, i)) = scope.const_params.iter().find(|(n, _)| *n == segs[0].name) {
+            if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == segs[0].name) {
                 return Ok(tys.intern_const(ConstKind::Param(i)));
             }
             // A named const item evaluates like the literal forms below.
@@ -1353,6 +1358,381 @@ pub(crate) fn resolve_const_arg(
             None => Err(Diag::new("L0110", span, "const argument must be a constant integer", "Write a literal such as `3`.")),
         },
     }
+}
+
+/// The type of a const generic value or of an array length: an
+/// integer type, `bool`, or `char` (rustc allows no other const
+/// param type).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConstScalar {
+    Int(IntTy),
+    Bool,
+    Char,
+}
+
+impl ConstScalar {
+    pub(crate) fn of(tys: &impl TyIntern, t: Ty) -> Option<ConstScalar> {
+        match tys.kind(t) {
+            TyKind::Int(it) => Some(ConstScalar::Int(it)),
+            TyKind::Bool => Some(ConstScalar::Bool),
+            TyKind::Char => Some(ConstScalar::Char),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ConstScalar::Int(it) => it.name(),
+            ConstScalar::Bool => "bool",
+            ConstScalar::Char => "char",
+        }
+    }
+
+    /// True when an evaluated const is a value of this type. Params
+    /// and inference variables pass (their types are checked where
+    /// they are written).
+    fn holds(self, tys: &impl TyIntern, c: ConstId) -> bool {
+        match (tys.const_kind(c), self) {
+            (ConstKind::Int(v), ConstScalar::Int(it)) => const_int_fits(v, it),
+            (ConstKind::Bool(_), ConstScalar::Bool) | (ConstKind::Char(_), ConstScalar::Char) => true,
+            (ConstKind::Int(_) | ConstKind::Bool(_) | ConstKind::Char(_), _) => false,
+            _ => true,
+        }
+    }
+}
+
+/// What `ConstTyper` knows about one expression's type: `Ok(Some)` a
+/// type it certainly has, `Ok(None)` one that adapts to the expected
+/// type (an unsuffixed integer literal) or that the walk cannot tell,
+/// and `Err` an expression that cannot have the expected type.
+type ConstTyped = Result<Option<ConstScalar>, ()>;
+
+fn const_want(want: Option<ConstScalar>, have: ConstScalar) -> ConstTyped {
+    match want {
+        Some(w) if w != have => Err(()),
+        _ => Ok(Some(have)),
+    }
+}
+
+/// Types a const expression in signature form (an array length, a
+/// const generic argument, a const param default) as rustc types the
+/// anonymous const: E0308, and E0600 for `-` on an unsigned type. The
+/// untyped scalar evaluator in collect computes the value; this walk
+/// covers the same forms for their types: literal suffixes, bool and
+/// char literals, const params and const items by declared type,
+/// casts, const fn calls, operators, blocks with lets, and `if`.
+struct ConstTyper<'x, 'c, T: TyIntern> {
+    ast: &'x Ast,
+    interner: &'x Interner,
+    known: &'x Known,
+    cx: &'x ResolveCx<'c>,
+    tys: &'x mut T,
+    scope: &'x Scope,
+    lets: Vec<(Sym, Option<ConstScalar>)>,
+}
+
+impl<T: TyIntern> ConstTyper<'_, '_, T> {
+    /// The scalar a written type names (a const item's or a const fn
+    /// param's declared type), resolved outside any generic scope.
+    fn written(&mut self, t: ast::TyId) -> Option<ConstScalar> {
+        let ty = resolve_scoped(self.ast, self.interner, self.known, self.cx, self.tys, t, &Scope::default()).ok()?;
+        ConstScalar::of(self.tys, ty)
+    }
+
+    fn expr(&mut self, e: ast::ExprId, want: Option<ConstScalar>) -> ConstTyped {
+        use ast::{Expr, UnOp};
+        use ConstScalar as S;
+        let ast = self.ast;
+        match ast.expr(e) {
+            Expr::Int(_, None) => match want {
+                None | Some(S::Int(_)) => Ok(None),
+                Some(_) => Err(()),
+            },
+            Expr::Int(_, Some(sfx)) => const_want(want, S::Int(IntTy::from_suffix(*sfx))),
+            Expr::Bool(_) => const_want(want, S::Bool),
+            Expr::Char(_) => const_want(want, S::Char),
+            Expr::Float(_) | Expr::Str(_) | Expr::Unit => {
+                if want.is_some() {
+                    Err(())
+                } else {
+                    Ok(None)
+                }
+            }
+            Expr::Block(b) | Expr::ConstBlock(b) => self.block(*b, want),
+            Expr::Unary { op: UnOp::Neg, expr } => {
+                let unsigned = |s: Option<S>| match s {
+                    Some(S::Int(it)) => !it.signed(),
+                    Some(_) => true,
+                    None => false,
+                };
+                if unsigned(want) {
+                    return Err(());
+                }
+                let t = self.expr(*expr, want)?;
+                if unsigned(t) { Err(()) } else { Ok(t) }
+            }
+            Expr::Unary { op: UnOp::Not, expr } => {
+                if want == Some(S::Char) {
+                    return Err(());
+                }
+                let t = self.expr(*expr, want)?;
+                if t == Some(S::Char) { Err(()) } else { Ok(t) }
+            }
+            Expr::Binary { op, lhs, rhs } => self.binary(*op, *lhs, *rhs, want),
+            Expr::Cast { expr, ty } => {
+                self.expr(*expr, None)?;
+                match self.written(*ty) {
+                    Some(s) => const_want(want, s),
+                    None => Ok(None),
+                }
+            }
+            Expr::If { cond, then, els } => {
+                self.expr(*cond, Some(S::Bool))?;
+                let t = self.block(*then, want)?;
+                match els {
+                    Some(x) => {
+                        let u = self.expr(*x, want.or(t))?;
+                        match (t, u) {
+                            (Some(a), Some(b)) if a != b => Err(()),
+                            _ => Ok(t.or(u)),
+                        }
+                    }
+                    None if want.is_some() => Err(()),
+                    None => Ok(None),
+                }
+            }
+            Expr::Path(segs) => {
+                let t = match segs.as_slice() {
+                    [seg] if !seg.has_args() => self.name(seg.name),
+                    [owner, item] if !owner.has_args() => match self.known.int_ty(owner.name) {
+                        Some(it) => match self.interner.get(item.name) {
+                            "MAX" | "MIN" => Some(S::Int(it)),
+                            "BITS" => Some(S::Int(IntTy::U32)),
+                            _ => None,
+                        },
+                        None => self.assoc_const(owner.name, item.name),
+                    },
+                    _ => None,
+                };
+                match t {
+                    Some(s) => const_want(want, s),
+                    None => Ok(None),
+                }
+            }
+            Expr::Call { callee, args } => self.call(*callee, args, want),
+            _ => Ok(None),
+        }
+    }
+
+    fn binary(&mut self, op: ast::BinOp, lhs: ast::ExprId, rhs: ast::ExprId, want: Option<ConstScalar>) -> ConstTyped {
+        use ConstScalar as S;
+        use ast::BinOp as B;
+        let same = |a: Option<S>, b: Option<S>| match (a, b) {
+            (Some(x), Some(y)) if x != y => Err(()),
+            _ => Ok(a.or(b)),
+        };
+        match op {
+            B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge => {
+                let l = self.expr(lhs, None)?;
+                let r = self.expr(rhs, l)?;
+                same(l, r)?;
+                const_want(want, S::Bool)
+            }
+            B::And | B::Or => {
+                self.expr(lhs, Some(S::Bool))?;
+                self.expr(rhs, Some(S::Bool))?;
+                const_want(want, S::Bool)
+            }
+            B::Shl | B::Shr => {
+                let int = |s: Option<S>| matches!(s, None | Some(S::Int(_)));
+                if !int(want) {
+                    return Err(());
+                }
+                let l = self.expr(lhs, want)?;
+                let r = self.expr(rhs, None)?;
+                if int(l) && int(r) { Ok(l) } else { Err(()) }
+            }
+            // Arithmetic and bit operators: both sides and the result
+            // share one type; `&`, `|`, and `^` also take bool.
+            _ => {
+                let bit = matches!(op, B::BitAnd | B::BitOr | B::BitXor);
+                let ok = |s: Option<S>| match s {
+                    Some(S::Char) => false,
+                    Some(S::Bool) => bit,
+                    _ => true,
+                };
+                if !ok(want) {
+                    return Err(());
+                }
+                let l = self.expr(lhs, want)?;
+                let r = self.expr(rhs, want.or(l))?;
+                let t = same(l, r)?;
+                if ok(t) { Ok(t) } else { Err(()) }
+            }
+        }
+    }
+
+    fn block(&mut self, b: ast::BlockId, want: Option<ConstScalar>) -> ConstTyped {
+        let saved = self.lets.len();
+        let out = self.block_body(b, want);
+        self.lets.truncate(saved);
+        out
+    }
+
+    fn block_body(&mut self, b: ast::BlockId, want: Option<ConstScalar>) -> ConstTyped {
+        use crate::ast::{Pat, Stmt};
+        let ast = self.ast;
+        let block = ast.block(b);
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { pat, ty, init, .. } => {
+                    let Pat::Binding { name, .. } = ast.pat(*pat) else { return Ok(None) };
+                    let declared = ty.and_then(|t| self.written(t));
+                    let t = match init {
+                        Some(i) => self.expr(*i, declared)?,
+                        None => None,
+                    };
+                    self.lets.push((*name, declared.or(t)));
+                }
+                Stmt::Expr { expr, .. } => {
+                    self.expr(*expr, None)?;
+                }
+                _ => return Ok(None),
+            }
+        }
+        match block.tail {
+            Some(t) => self.expr(t, want),
+            None if want.is_some() => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    /// A bare name: a block binding, a const param of the item, or a
+    /// free const item (the first of its name, as the evaluator reads).
+    fn name(&mut self, name: Sym) -> Option<ConstScalar> {
+        if let Some(&(_, t)) = self.lets.iter().rev().find(|(n, _)| *n == name) {
+            return t;
+        }
+        if let Some(&(_, _, t)) = self.scope.const_params.iter().find(|(n, ..)| *n == name) {
+            return ConstScalar::of(self.tys, t);
+        }
+        let ast = self.ast;
+        let ty = ast.items.iter().find_map(|item| match &item.kind {
+            ast::ItemKind::Const(c) if c.name == Some(name) => Some(c.ty),
+            _ => None,
+        })?;
+        self.written(ty)
+    }
+
+    /// An inherent associated const by flat type name, when every
+    /// impl that defines it declares the same type.
+    fn assoc_const(&mut self, owner: Sym, name: Sym) -> Option<ConstScalar> {
+        let ast = self.ast;
+        let mut found = None;
+        for item in &ast.items {
+            let ast::ItemKind::Impl(imp) = &item.kind else { continue };
+            if imp.trait_ref.is_some() {
+                continue;
+            }
+            let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
+            if segs.first().map(|s| s.name) != Some(owner) {
+                continue;
+            }
+            for c in imp.consts.iter().filter(|c| c.name == name) {
+                let s = self.written(c.ty)?;
+                if found.is_some_and(|f| f != s) {
+                    return None;
+                }
+                found = Some(s);
+            }
+        }
+        found
+    }
+
+    /// A call to a non-generic const fn (the evaluator's call form):
+    /// its args against the declared param types, its declared return.
+    fn call(&mut self, callee: ast::ExprId, args: &[ast::ExprId], want: Option<ConstScalar>) -> ConstTyped {
+        let ast = self.ast;
+        let ast::Expr::Path(segs) = ast.expr(callee) else { return Ok(None) };
+        let [seg] = segs.as_slice() else { return Ok(None) };
+        let def = ast.items.iter().find_map(|item| match &item.kind {
+            ast::ItemKind::Fn(def)
+                if def.name == seg.name && def.qual.is_const && def.self_param.is_none() && def.params.len() == args.len() =>
+            {
+                Some(def)
+            }
+            _ => None,
+        });
+        let Some(def) = def else { return Ok(None) };
+        if !def.generics.params.is_empty() {
+            return Ok(None);
+        }
+        for (param, &a) in def.params.iter().zip(args) {
+            let p = self.written(param.ty);
+            self.expr(a, p)?;
+        }
+        match def.ret {
+            Some(t) => match self.written(t) {
+                Some(s) => const_want(want, s),
+                None => Ok(None),
+            },
+            None if want.is_some() => Err(()),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Checks one const expression in signature form against the type it
+/// must have: `usize` for an array length, the declared type for a
+/// const argument (`ConstTyper`), and its evaluated value `c` against
+/// that type's range.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_const_expr_ty(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    e: ast::ExprId,
+    c: ConstId,
+    want: ConstScalar,
+    span: Span,
+    what: &str,
+) -> Result<(), Diag> {
+    let mut typer = ConstTyper { ast, interner, known, cx, tys: &mut *tys, scope, lets: Vec::new() };
+    if typer.expr(e, Some(want)).is_ok() && want.holds(tys, c) {
+        return Ok(());
+    }
+    Err(const_mismatch(want, span, what))
+}
+
+/// The declared type of a bare name in a const position (`f::<L>`,
+/// `Arr<N>`): a const param of `scope`, or a free const item. None
+/// when it names neither or its type is no const scalar.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn const_name_ty(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    name: Sym,
+) -> Option<ConstScalar> {
+    ConstTyper { ast, interner, known, cx, tys: &mut *tys, scope, lets: Vec::new() }.name(name)
+}
+
+/// rustc E0308 for a const in signature form; `what` names it
+/// ("this array length").
+fn const_mismatch(want: ConstScalar, span: Span, what: &str) -> Diag {
+    let tn = want.name();
+    Diag::new(
+        "L0110",
+        span,
+        format!("mismatched types: {what} is not a value of type `{tn}`"),
+        format!("Write a `{tn}` value in its range, or cast with `as {tn}`."),
+    )
 }
 
 /// The trait a written trait path names, by its last segment:
@@ -1485,7 +1865,17 @@ fn resolve_trait_path_args(
                             ));
                         }
                     }
-                    AstArg::Const(e) => inputs.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?)),
+                    AstArg::Const(e) => {
+                        let c = resolve_const_arg(ast, interner, known, tys, scope, *e, span)?;
+                        // The trait's declared type for this position (Self is param 0).
+                        let decl = rec.and_then(|r| r.generics.params.iter().filter(|p| !matches!(p.kind, ParamKind::Lifetime)).nth(1 + inputs.len()));
+                        if let Some(ParamKind::Const(t)) = decl.map(|p| p.kind)
+                            && let Some(want) = ConstScalar::of(tys, t)
+                        {
+                            check_const_expr_ty(ast, interner, known, cx, tys, scope, *e, c, want, span, "this const argument")?;
+                        }
+                        inputs.push(GenericArg::Const(c));
+                    }
                     AstArg::Binding { name, span: bspan, kind } => {
                         let assoc = rec.and_then(|r| r.assoc_by_name(*name)).ok_or_else(|| {
                             Diag::new(
@@ -1634,6 +2024,7 @@ pub fn resolve_scoped(
         TyExpr::Array { inner, len } => {
             let e = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
             let n = resolve_const_arg(ast, interner, known, tys, scope, *len, span)?;
+            check_const_expr_ty(ast, interner, known, cx, tys, scope, *len, n, ConstScalar::Int(IntTy::Usize), span, "this array length")?;
             Ok(tys.intern(TyKind::Array(e, n)))
         }
         TyExpr::Ptr { mutable, inner } => {
@@ -2212,7 +2603,11 @@ fn resolve_path_ty(
             }
         };
         if let Some(g) = g_ast {
-            check_const_arg_types(ast, interner, known, tys, g, &gargs, span)?;
+            let written = match &seg.args {
+                GenericArgs::Angle(a) => a.as_slice(),
+                _ => &[],
+            };
+            check_const_arg_types(ast, interner, known, cx, tys, scope, g, written, &gargs, span)?;
         }
         // Omitted trailing params take their defaults.
         let n_written = gargs.iter().filter(|g| !matches!(g, GenericArg::Lifetime(_))).count();
@@ -2687,7 +3082,15 @@ fn build_generics_owned(
                     errs.push(d);
                     ERROR
                 });
-                scope.const_params.push((*name, idx));
+                if cty != ERROR && ConstScalar::of(tys, cty).is_none() {
+                    errs.push(Diag::new(
+                        "L0110",
+                        *span,
+                        "this type is forbidden as the type of a const generic parameter",
+                        "Use an integer type, `bool`, or `char`.",
+                    ));
+                }
+                scope.const_params.push((*name, idx, cty));
                 params.push(ParamDef { name: *name, kind: ParamKind::Const(cty), span: *span });
             }
         }

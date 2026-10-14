@@ -2298,13 +2298,40 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let is_const = matches!(generics.params.get(i).map(|g| g.kind), Some(ParamKind::Const(_)));
             let arg = match w {
                 ast::GenericArg::Type(t) if !is_const => Some(GenericArg::Ty(self.resolve_written(*t))),
-                ast::GenericArg::Const(e) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e)
-                    .map(|v| GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))),
-                ast::GenericArg::Type(t) => match p.ast.ty(*t) {
-                    ast::TyExpr::Path(ps) if ps.len() == 1 => {
-                        crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name)
-                            .map(|k| GenericArg::Const(self.tys.intern_const(k)))
+                // As on a call path (`S::<true>` is a bool, `S::<{ -1 }>`
+                // a negative int), then the written form's type.
+                ast::GenericArg::Const(e) => {
+                    let g = self.const_call_arg(*e);
+                    if let (GenericArg::Const(c), Some(ParamKind::Const(t))) = (g, generics.params.get(i).map(|g| g.kind))
+                        && let Some(want) = generics::ConstScalar::of(&self.tys, t)
+                    {
+                        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                        let typed = generics::check_const_expr_ty(
+                            p.ast,
+                            p.interner,
+                            p.known,
+                            &cx,
+                            &mut self.tys,
+                            &self.body_scope,
+                            *e,
+                            c,
+                            want,
+                            span,
+                            "this const argument",
+                        );
+                        if let Err(d) = typed {
+                            self.errs.push(d);
+                            return self.error_args(&generics);
+                        }
                     }
+                    Some(g)
+                }
+                ast::GenericArg::Type(t) => match p.ast.ty(*t) {
+                    ast::TyExpr::Path(ps) if ps.len() == 1 => match self.const_param(ps[0].name) {
+                        Some((pi, _, val)) => Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(pi))))),
+                        None => crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name)
+                            .map(|k| GenericArg::Const(self.tys.intern_const(k))),
+                    },
                     _ => None,
                 },
                 _ => None,
@@ -4751,7 +4778,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (None, ParamKind::Const(_)) => GenericArg::Const(self.fresh_const_var()),
             });
         }
-        self.check_const_args(generics, &args, span);
+        if self.check_const_args(generics, &args, span) {
+            self.check_written_const_tys(e, generics, explicit, span);
+        }
         let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &args)).collect();
         let ret = subst(&mut self.tys, info.ret, &args);
         let preds = generics.predicates.clone();
@@ -4809,22 +4838,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// by the scalar evaluator. A form it cannot evaluate is an error,
     /// never an unwritten argument (that left the instance unmade).
     fn const_call_arg(&mut self, e: ExprId) -> GenericArg {
-        let p = self.p;
-        let inner = match p.ast.expr(e) {
-            Expr::Block(b) if p.ast.block(*b).stmts.is_empty() => p.ast.block(*b).tail.unwrap_or(e),
-            _ => e,
-        };
-        let kind = match p.ast.expr(inner) {
-            Expr::Bool(b) => Some(ConstKind::Bool(*b)),
-            Expr::Char(c) => Some(ConstKind::Char(*c)),
-            Expr::Path(segs)
-                if segs.len() == 1
-                    && let Some((i, _, val)) = self.const_param(segs[0].name) =>
-            {
-                Some(val.unwrap_or(ConstKind::Param(i)))
-            }
-            _ => crate::check::collect::eval_const_int(p.ast, p.interner, p.known, inner).map(|v| ConstKind::Int(v as u128)),
-        };
+        let kind = self.const_call_kind(e);
         match kind {
             Some(k) => GenericArg::Const(self.tys.intern_const(k)),
             None => {
@@ -4836,6 +4850,91 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     "Write a literal, a const item, or a const param, such as `::<3>`.",
                 );
                 GenericArg::Const(self.fresh_const_var())
+            }
+        }
+    }
+
+    /// The value of a const generic argument expression (see
+    /// `const_call_arg`), or None for a form the evaluator cannot read.
+    fn const_call_kind(&mut self, e: ExprId) -> Option<ConstKind> {
+        let p = self.p;
+        let inner = match p.ast.expr(e) {
+            Expr::Block(b) if p.ast.block(*b).stmts.is_empty() => p.ast.block(*b).tail.unwrap_or(e),
+            _ => e,
+        };
+        match p.ast.expr(inner) {
+            Expr::Bool(b) => Some(ConstKind::Bool(*b)),
+            Expr::Char(c) => Some(ConstKind::Char(*c)),
+            Expr::Path(segs)
+                if segs.len() == 1
+                    && let Some((i, _, val)) = self.const_param(segs[0].name) =>
+            {
+                Some(val.unwrap_or(ConstKind::Param(i)))
+            }
+            _ => crate::check::collect::eval_const_int(p.ast, p.interner, p.known, inner).map(|v| ConstKind::Int(v as u128)),
+        }
+    }
+
+    /// The written forms of a call's turbofish const args against their
+    /// params' declared types (`f::<{ 3u8 }>()` or `f::<L>()` with
+    /// `const L: u8` for a `usize` param, rustc E0308);
+    /// `check_const_args` checks the values. The written args are the
+    /// last entries of `explicit` (a method's impl args come first). An
+    /// entry that is not the written arg's value is left alone.
+    fn check_written_const_tys(&mut self, e: ExprId, generics: &Generics, explicit: &[Option<GenericArg>], span: Span) {
+        let p = self.p;
+        fn angle(seg: Option<&ast::PathSeg>) -> &[ast::GenericArg] {
+            match seg.map(|s| &s.args) {
+                Some(ast::GenericArgs::Angle(a)) => a.as_slice(),
+                _ => &[],
+            }
+        }
+        let written: &[ast::GenericArg] = match p.ast.expr(e) {
+            Expr::MethodCall { generic_args, .. } => generic_args,
+            Expr::Call { callee, .. } => match p.ast.expr(*callee) {
+                Expr::Path(segs) => angle(segs.last()),
+                _ => &[],
+            },
+            Expr::Path(segs) => angle(segs.last()),
+            _ => &[],
+        };
+        let Some(offset) = explicit.len().checked_sub(written.len()) else { return };
+        for (j, w) in written.iter().enumerate() {
+            let i = offset + j;
+            let (Some(Some(GenericArg::Const(c))), Some(ParamKind::Const(t))) = (explicit.get(i), generics.params.get(i).map(|g| g.kind))
+            else {
+                continue;
+            };
+            let t = self.deep(t);
+            let Some(want) = generics::ConstScalar::of(&self.tys, t) else { continue };
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let fits = match w {
+                ast::GenericArg::Const(x) => {
+                    if self.const_call_kind(*x).map(|k| self.tys.intern_const(k)) != Some(*c) {
+                        continue;
+                    }
+                    let scope = &self.body_scope;
+                    generics::check_const_expr_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, scope, *x, *c, want, span, "").is_ok()
+                }
+                // A bare name in a const position (`f::<L>`).
+                ast::GenericArg::Type(t) => match p.ast.ty(*t) {
+                    ast::TyExpr::Path(segs) if segs.len() == 1 => {
+                        let scope = &self.body_scope;
+                        generics::const_name_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, scope, segs[0].name).is_none_or(|s| s == want)
+                    }
+                    _ => true,
+                },
+                _ => true,
+            };
+            if !fits {
+                let tn = self.tn(t);
+                self.err(
+                    "L0110",
+                    span,
+                    format!("mismatched types: this const argument is not a value of type `{tn}`"),
+                    format!("Write a `{tn}` value, or cast with `as {tn}`."),
+                );
+                return;
             }
         }
     }
@@ -6951,12 +7050,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => None,
             }
         };
-        if let Some(&(_, i)) = self.body_scope.const_params.iter().find(|(n, _)| *n == name) {
+        if let Some(&(_, i, _)) = self.body_scope.const_params.iter().find(|(n, ..)| *n == name) {
             return Some((i, decl(self.fid, i)?, None));
         }
         let info = p.gx.instances.get(&self.fid)?;
         let tl = info.template_local?;
-        let &(_, i) = p.gx.fn_scopes.get(tl.0 as usize)?.scope.const_params.iter().find(|(n, _)| *n == name)?;
+        let &(_, i, _) = p.gx.fn_scopes.get(tl.0 as usize)?.scope.const_params.iter().find(|(n, ..)| *n == name)?;
         let GenericArg::Const(c) = *p.tys.args(info.args).get(i as usize)? else { return None };
         Some((i, decl(tl, i)?, Some(p.tys.const_kind(c))))
     }
@@ -9834,10 +9933,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             .iter()
             .map(|a| match a {
                 ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
-                ast::GenericArg::Const(e2) => crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *e2).map(|v| {
-                    let c = self.tys.intern_const(ConstKind::Int(v));
-                    GenericArg::Const(c)
-                }),
+                ast::GenericArg::Const(e2) => Some(self.const_call_arg(*e2)),
                 _ => None,
             })
             .collect();
