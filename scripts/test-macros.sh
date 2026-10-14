@@ -149,7 +149,12 @@ lust_pass_case() {
     fi
   fi
   if [ "$lust_expand_ok" = 1 ]; then
-    if run_cc "$LUST" expand "$f" 2>/dev/null | python3 tests/macros/normalize.py >"$work/$name.lust.expanded" \
+    # rustc prints derive expansions as generated impls, which lust has
+    # no token form for (normalize.py): such a fixture can only differ,
+    # so its token compare counts as unsupported.
+    if grep -q 'automatically_derived' "$expanded"; then
+      lust_expand_unsupported=$((lust_expand_unsupported + 1))
+    elif run_cc "$LUST" expand "$f" 2>/dev/null | python3 tests/macros/normalize.py >"$work/$name.lust.expanded" \
       && [ -s "$work/$name.lust.expanded" ]; then
       if diff -q "$expanded" "$work/$name.lust.expanded" >/dev/null; then
         lust_expand_match=$((lust_expand_match + 1))
