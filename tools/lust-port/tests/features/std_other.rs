@@ -1,6 +1,8 @@
 // feature: std.other
-// form: a std path with no precise rule yet, std::panic::Location
+// form: a std type path with no precise rule yet, std::string::FromUtf16Error
+fn conv(u: &[u16]) -> Result<String, std::string::FromUtf16Error> {
+    String::from_utf16(u)
+}
 fn main() {
-    let l = std::panic::Location::caller();
-    println!("{}", l.line());
+    println!("{:?} {:?}", conv(&[65, 98]), conv(&[0xD800]).is_err());
 }

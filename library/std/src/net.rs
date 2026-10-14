@@ -265,6 +265,14 @@ impl Ipv6Addr {
         self.segments()[0] & 0xff00 == 0xff00
     }
 
+    pub const fn is_unique_local(&self) -> bool {
+        self.segments()[0] & 0xfe00 == 0xfc00
+    }
+
+    pub const fn is_unicast_link_local(&self) -> bool {
+        self.segments()[0] & 0xffc0 == 0xfe80
+    }
+
     /// The IPv4 address of an IPv4-mapped address (`::ffff:a.b.c.d`).
     pub const fn to_ipv4_mapped(&self) -> Option<Ipv4Addr> {
         let s = self.segments();
@@ -377,6 +385,18 @@ impl IpAddr {
         match self {
             IpAddr::V4(a) => a.is_multicast(),
             IpAddr::V6(a) => a.is_multicast(),
+        }
+    }
+
+    /// The canonical form: an IPv4-mapped IPv6 address becomes
+    /// its IPv4 form, every other address stays as it is.
+    pub const fn to_canonical(self) -> IpAddr {
+        match self {
+            IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(a),
+            },
+            IpAddr::V4(_) => self,
         }
     }
 
@@ -656,6 +676,18 @@ impl From<u32> for Ipv4Addr {
 impl From<u128> for Ipv6Addr {
     fn from(bits: u128) -> Ipv6Addr {
         Ipv6Addr::from_bits(bits)
+    }
+}
+
+impl From<Ipv4Addr> for u32 {
+    fn from(a: Ipv4Addr) -> u32 {
+        a.to_bits()
+    }
+}
+
+impl From<Ipv6Addr> for u128 {
+    fn from(a: Ipv6Addr) -> u128 {
+        a.to_bits()
     }
 }
 
