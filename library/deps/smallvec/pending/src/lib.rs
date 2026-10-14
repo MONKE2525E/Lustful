@@ -85,7 +85,7 @@ impl<A: Array> SmallVec<A> {
     /// Takes the Vec's buffer when it is larger than the inline size;
     /// else the items move inline.
     pub fn from_vec(vec: Vec<A::Item>) -> SmallVec<A> {
-        if vec.capacity() <= Self::inline_capacity() {
+        if vec.capacity() <= SmallVec::<A>::inline_capacity() {
             SmallVec { heap_cap: 0, items: vec }
         } else {
             let cap = vec.capacity();
@@ -98,7 +98,7 @@ impl<A: Array> SmallVec<A> {
     }
 
     pub fn inline_size(&self) -> usize {
-        Self::inline_capacity()
+        SmallVec::<A>::inline_capacity()
     }
 
     pub fn len(&self) -> usize {
@@ -110,11 +110,11 @@ impl<A: Array> SmallVec<A> {
     }
 
     pub fn capacity(&self) -> usize {
-        if self.spilled() { self.heap_cap } else { Self::inline_capacity() }
+        if self.spilled() { self.heap_cap } else { SmallVec::<A>::inline_capacity() }
     }
 
     pub fn spilled(&self) -> bool {
-        self.heap_cap > Self::inline_capacity()
+        self.heap_cap > SmallVec::<A>::inline_capacity()
     }
 
     pub fn push(&mut self, value: A::Item) {
@@ -133,7 +133,7 @@ impl<A: Array> SmallVec<A> {
     pub fn grow(&mut self, new_cap: usize) {
         let len = self.items.len();
         assert!(new_cap >= len);
-        if new_cap <= Self::inline_capacity() {
+        if new_cap <= SmallVec::<A>::inline_capacity() {
             if !self.spilled() {
                 return;
             }
@@ -294,8 +294,12 @@ impl<A: Array> SmallVec<A> {
         let mut w: usize = 1;
         let mut r = 1;
         while r < len {
-            let (head, tail) = self.items.split_at_mut(r);
-            if !same_bucket(&mut tail[0], &mut head[w - 1]) {
+            // Item r leaves the Vec for the call (a move, not observable)
+            // so both can be borrowed mutably; then it goes back.
+            let mut cur = self.items.remove(r);
+            let same = same_bucket(&mut cur, &mut self.items[w - 1]);
+            self.items.insert(r, cur);
+            if !same {
                 if r != w {
                     self.items.swap(r, w);
                 }
@@ -317,7 +321,7 @@ where
 {
     pub fn from_slice(slice: &[A::Item]) -> Self {
         let len = slice.len();
-        if len <= Self::inline_capacity() {
+        if len <= SmallVec::<A>::inline_capacity() {
             SmallVec { heap_cap: 0, items: slice.to_vec() }
         } else {
             let b = slice.to_vec();
@@ -367,7 +371,7 @@ where
     /// `elem` inline; past the inline size it builds `vec![elem; n]`
     /// (n - 1 clones, then `elem` itself).
     pub fn from_elem(elem: A::Item, n: usize) -> Self {
-        if n > Self::inline_capacity() {
+        if n > SmallVec::<A>::inline_capacity() {
             let mut v: Vec<A::Item> = Vec::with_capacity(n);
             let mut i = 1;
             while i < n {
@@ -474,7 +478,13 @@ where
     A::Item: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_list().entries(self.items.iter()).finish()
+        let mut list = f.debug_list();
+        let mut i = 0;
+        while i < self.items.len() {
+            list.entry(&self.items[i]);
+            i += 1;
+        }
+        list.finish()
     }
 }
 
@@ -482,8 +492,19 @@ impl<A: Array, B: Array> PartialEq<SmallVec<B>> for SmallVec<A>
 where
     A::Item: PartialEq<B::Item>,
 {
+    /// Slice equality: lengths, then `==` on each pair until one fails.
     fn eq(&self, other: &SmallVec<B>) -> bool {
-        self.items[..] == other.items[..]
+        if self.items.len() != other.items.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.items.len() {
+            if !(self.items[i] == other.items[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 
