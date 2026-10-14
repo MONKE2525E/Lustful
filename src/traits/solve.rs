@@ -343,11 +343,21 @@ impl Solver {
                 return None;
             }
         }
+        // A binding on the obligation (`I: IntoIterator<Item = u32>`)
+        // against the impl's assoc type, normalized the same way: the
+        // blanket's `Item = <I as Iterator>::Item` is the user impl's type.
         let obl_bindings: Vec<(DefId, GenericArg)> = cx.tys().bindings(obl.bindings).to_vec();
         for (assoc, ga) in obl_bindings {
             let GenericArg::Ty(want) = ga else { continue };
             let pat = rec.assoc_ty(assoc)?;
             let have = subst(cx.tys(), pat, &inst);
+            let have = self.normalize_inner(cx, index, env, have, 0);
+            if let TyKind::Projection(a, trait_args) = cx.tys().kind(have)
+                && cx.tys().flags(have).contains_infer()
+            {
+                deferred.push(Predicate::AssocEq(Binder::plain(AssocEqData { assoc: a.0, trait_args, ty: want })));
+                continue;
+            }
             if !cx.unify(want, have) {
                 return None;
             }
