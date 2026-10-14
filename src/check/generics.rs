@@ -3376,6 +3376,38 @@ fn nested_impl_traits(ast: &Ast, id: ast::TyId, out: &mut Vec<ast::TyId>) {
     }
 }
 
+/// The regions of the references in `t` whose referent holds the self
+/// type `st` (rustc's `find_lifetime_for_self`, on resolved types).
+fn self_ref_regions(tys: &impl TyIntern, t: Ty, st: Ty, out: &mut Vec<Region>) {
+    fn holds(tys: &impl TyIntern, t: Ty, st: Ty) -> bool {
+        if t == st {
+            return true;
+        }
+        match tys.kind(t) {
+            TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner) | TyKind::Slice(inner) | TyKind::Array(inner, _) => holds(tys, inner, st),
+            TyKind::Adt(_, args) => tys.args(args).iter().any(|g| g.as_ty().is_some_and(|x| holds(tys, x, st))),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&x| holds(tys, x, st)),
+            _ => false,
+        }
+    }
+    match tys.kind(t) {
+        TyKind::Ref(r, _, inner) => {
+            if holds(tys, inner, st) {
+                out.push(r);
+            }
+            self_ref_regions(tys, inner, st, out);
+        }
+        TyKind::Adt(_, args) => {
+            for g in tys.args(args).to_vec() {
+                if let Some(x) = g.as_ty() {
+                    self_ref_regions(tys, x, st, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The region signature of one fn (W-BORROW, ARCH 5.2): its params and
 /// return resolved again with lifetimes kept. Each elided input lifetime
 /// is its own universal region; elided output lifetimes take `&self`'s,
@@ -3409,6 +3441,7 @@ fn region_sig(
         }
     }
     let mut self_region: Option<Region> = None;
+    let mut self_ambiguous = false;
     let mut skip = 0;
     let self_ty = scope.self_ty_regioned.or(self_ty);
     if let (Some(sp), Some(st)) = (&def.self_param, self_ty) {
@@ -3420,7 +3453,20 @@ fn region_sig(
                 tys.intern(TyKind::Ref(r, Mut::from_bool(sp.kind == ast::SelfKind::RefMut), st))
             }
             ast::SelfKind::Typed => match sp.ty {
-                Some(t) => resolve_scoped(ast, interner, known, cx, tys, t, &ks).ok()?,
+                Some(t) => {
+                    let t = resolve_scoped(ast, interner, known, cx, tys, t, &ks).ok()?;
+                    // rustc's `find_lifetime_for_self`: the one reference
+                    // whose referent holds `Self` (`self: &Box<Self>`);
+                    // several (`&Box<&Self>`) leave no elision at all.
+                    let mut refs = Vec::new();
+                    self_ref_regions(tys, t, st, &mut refs);
+                    match refs.as_slice() {
+                        [r] => self_region = Some(*r),
+                        [] => {}
+                        _ => self_ambiguous = true,
+                    }
+                    t
+                }
                 None => st,
             },
         };
@@ -3441,15 +3487,18 @@ fn region_sig(
         }
         rparams.push(t);
     }
+    // As in rustc, `self` counts for elision only through a reference to
+    // `Self` (above): the lifetimes of a by-value `self` (`Self` is
+    // `W<'a>`, `Box<Self>`) are not input lifetimes.
     let mut inputs: Vec<Region> = Vec::new();
-    for &t in &rparams {
+    for &t in &rparams[skip..] {
         crate::borrowck::regions_of(tys, t, &mut inputs);
     }
     // A written dyn object lifetime is one more input lifetime (E0106).
     if def.params.iter().any(|prm| has_written_dyn_lifetime(ast, prm.ty)) {
         inputs.push(Region::Erased);
     }
-    let elided = self_region.or(if inputs.len() == 1 { Some(inputs[0]) } else { None });
+    let elided = if self_ambiguous { None } else { self_region.or(if inputs.len() == 1 { Some(inputs[0]) } else { None }) };
     let mut rs = scope.clone();
     rs.regions = RegionMode::Keep { next: None, elided };
     let rret = match def.ret {
