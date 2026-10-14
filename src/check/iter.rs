@@ -111,7 +111,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return self.iter_source(e, rt, base, el, derefs, n, name_span, args);
         }
-        if !it::is_iter(&self.tys, base) {
+        if !it::is_iter(&self.tys, base) && !self.param_iter(base) {
             return None;
         }
         let n = self.name(name).to_string();
@@ -238,7 +238,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     ) -> Ty {
         use Builtin as B;
         use IterKind as K;
-        let item = it::item_ty(&mut self.tys, base).unwrap_or(ERROR);
+        let item = self.iter_item(base);
         let by_value = !matches!(n, "next" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "peek");
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
@@ -313,7 +313,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if args.len() != 1 {
                     self.err("L0105", span, format!("`{n}` takes 1 argument"), "Pass the other iterator.");
                 }
-                let oi = it::item_ty(&mut self.tys, other).unwrap_or(ERROR);
+                let oi = self.iter_item(other);
                 if n == "chain" && !self.unify(oi, item) {
                     self.mismatch(self.span(a), item, oi);
                 }
@@ -513,6 +513,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
         ret
     }
 
+    /// True when `t` is an iterator only through a bound: a type
+    /// parameter (`impl Iterator<..>` in argument position is one), an
+    /// opaque type, or a projection, with `Iterator` evidence from the
+    /// env. Its adapters wrap it as the builtin adapter types do; an
+    /// instance checks again with the concrete type, so codegen only
+    /// sees builtin chains. A user iterator type by impl is not one:
+    /// its chains would need the unfused path (docs/ARCH.md 3.4).
+    pub(super) fn param_iter(&mut self, t: Ty) -> bool {
+        let t = self.deep(t);
+        if !self.p.gx.has_generics || !matches!(self.kind(t), TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..)) {
+            return false;
+        }
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: self.p.gx.lang.iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        let snap = self.snapshot_vars();
+        let ok = matches!(self.select_obligation(tr), Selection::ParamEvidence(_));
+        self.rollback_vars(snap);
+        ok
+    }
+
+    /// The item type of an iterator `iter_call` accepts: the builtin
+    /// table, else `<t as Iterator>::Item` normalized in this env (a
+    /// chain over a bound-only iterator, see `param_iter`).
+    pub(super) fn iter_item(&mut self, t: Ty) -> Ty {
+        if let Some(item) = it::item_ty(&mut self.tys, t) {
+            return item;
+        }
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let proj = self.tys.intern(TyKind::Projection(AssocId(self.p.gx.lang.assoc_item), args_id));
+        self.normalize_here(proj)
+    }
+
     /// True for the Iterator methods `iter_call` types.
     fn iter_method_known(&self, n: &str) -> bool {
         matches!(
@@ -607,7 +639,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Vec, slice, or array as a slice iterator, a Vec by value as
     /// `vec::IntoIter`. None for other types.
     fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
-        if it::is_iter(&self.tys, t) {
+        if it::is_iter(&self.tys, t) || self.param_iter(t) {
             return Some(t);
         }
         if let Some(el) = self.tys.vec_elem(t) {

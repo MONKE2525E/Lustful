@@ -12597,7 +12597,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ if self.tys.is_chars_ty(self.resolve(t)) => CHAR,
             _ if crate::ty::iter::is_iter(&self.tys, self.resolve(t)) => {
                 let r = self.deep(t);
-                crate::ty::iter::item_ty(&mut self.tys, r).unwrap_or(ERROR)
+                self.iter_item(r)
             }
             TyKind::Ref(r, m, inner) => {
                 let elem = match self.kind(self.resolve(inner)) {
@@ -12929,8 +12929,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let t = self.deep(t);
                 // A still-unbound variable defers the test to
                 // finish: its type may be a closure signature
-                // that only the second inference pass binds.
-                if matches!(self.kind(t), TyKind::Infer(_)) && !self.kind(t).is_int_infer() {
+                // that only the second inference pass binds. So
+                // does one inside the type (`Vec<?T>` where a
+                // pending `Iterator<Item = T>` bound binds `T`).
+                let unbound = match self.kind(t) {
+                    TyKind::Infer(_) => !self.kind(t).is_int_infer(),
+                    _ => self.tys.flags(t).contains_infer(),
+                };
+                if unbound {
                     self.deferred_fmt.push((t, *spec, self.span(a)));
                     continue;
                 }
