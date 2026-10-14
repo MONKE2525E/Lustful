@@ -369,10 +369,21 @@ impl<K, V> Core<K, V> {
             };
             if from < to {
                 self.decrement_indices(from + 1, to + 1);
-                self.entries[from..=to].rotate_left(1);
+                // `entries[from..=to].rotate_left(1)` as adjacent swaps:
+                // the same order, and no element is dropped or cloned.
+                let mut i = from;
+                while i < to {
+                    self.entries.swap(i, i + 1);
+                    i += 1;
+                }
             } else {
                 self.increment_indices(to, from);
-                self.entries[to..=from].rotate_right(1);
+                // `entries[to..=from].rotate_right(1)`, the same way.
+                let mut i = from;
+                while i > to {
+                    self.entries.swap(i - 1, i);
+                    i -= 1;
+                }
             }
             self.indices.set(bucket, to);
         }
