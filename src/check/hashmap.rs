@@ -102,7 +102,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// structure (derives, core impls) and calls only the written impls
     /// of `gx.written_hash` and `gx.glue_methods`, so a key that reaches
     /// another written `Hash` or `PartialEq` impl (a generic one, say),
-    /// or a lookup through a written `Borrow` impl, rejects with L0640.
+    /// or a lookup through a written `Borrow` impl the glue cannot call
+    /// (not in `gx.borrow_impls`), rejects with L0640.
     /// A key that does not
     /// implement the traits at all is the obligation queue's report.
     pub(super) fn check_hash_key(&mut self, k: Ty, q: Ty, span: Span) {
@@ -127,16 +128,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.errs.push(Diag::new(
                 "L0640",
                 span,
-                format!("a lookup of `{kn}` keys by `{qn}` goes through a written `Borrow` impl, which lust does not support yet"),
+                format!("a lookup of `{kn}` keys by `{qn}` goes through a written `Borrow` impl lust cannot call yet (a generic impl, or one on a generic type)"),
                 "Look up by the key type itself.",
             ));
         }
     }
 
     /// True when `K: Borrow<Q>` holds by one of core's impls the hash
-    /// glue implements (`borrow_expr` in cgen/hash.rs).
+    /// glue implements (`borrow_expr` in cgen/hash.rs), or by a written
+    /// impl it calls (`gx.borrow_impls`).
     fn builtin_borrow(&self, k: Ty, q: Ty) -> bool {
-        if k == q {
+        if k == q || self.tys.local_adt(k).is_some_and(|a| self.p.gx.borrow_impls.contains_key(&(a, q))) {
             return true;
         }
         let tys = &self.tys;

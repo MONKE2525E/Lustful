@@ -1,5 +1,5 @@
-// expect: L0640
-// Valid Rust: a lookup by str through a written Borrow impl.
+// A lookup by str through a written Borrow impl (the derived Hash of
+// K(String) hashes the String as a str, so the lookup finds the key).
 use std::borrow::Borrow;
 use std::collections::HashMap;
 
@@ -15,5 +15,5 @@ impl Borrow<str> for K {
 fn main() {
     let mut m = HashMap::new();
     m.insert(K("a".to_string()), 1);
-    println!("{:?}", m.get("a"));
+    println!("{:?} {:?}", m.get("a"), m.get("b"));
 }

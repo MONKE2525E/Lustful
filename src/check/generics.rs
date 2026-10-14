@@ -3823,6 +3823,11 @@ pub struct GenTables<'a> {
     /// (W-STD-B; iface: W-CGEN reads `hash_impls`).
     pub written_hash: FxMap<AdtId, LocalDefId>,
     pub hash_impls: FxMap<AdtId, Vec<(Ty, LocalDefId)>>,
+    /// The written `Borrow::borrow` of a non-generic `impl Borrow<Q>`
+    /// on a non-generic local Adt, by (Adt, Q): a map or set lookup by
+    /// `&Q` calls it on each candidate key (W-STD-B; iface: W-CGEN
+    /// reads this).
+    pub borrow_impls: FxMap<(AdtId, Ty), LocalDefId>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -3941,6 +3946,7 @@ impl Default for GenTables<'_> {
             build_hashers: FxMap::default(),
             written_hash: FxMap::default(),
             hash_impls: FxMap::default(),
+            borrow_impls: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
@@ -8497,27 +8503,35 @@ fn compute_glue_methods(p: &mut Program) {
     p.gx.glue_methods = out;
 }
 
-/// Fills `written_hash` (W-STD-B): the written `Hash` impls the hash
-/// glue calls, on the terms of `compute_glue_methods` (a non-generic
-/// impl on a non-generic local Adt). An impl with its own `hash_slice`
-/// is left out: slices of the type then hash differently from the
-/// glue's loop, so such keys stay rejected (L0640).
+/// Fills `written_hash` and `borrow_impls` (W-STD-B): the written
+/// `Hash` and `Borrow` impls the hash glue calls, on the terms of
+/// `compute_glue_methods` (a non-generic impl on a non-generic local
+/// Adt). A Hash impl with its own `hash_slice` is left out: slices of
+/// the type then hash differently from the glue's loop, so such keys
+/// stay rejected (L0640).
 fn compute_written_hash(p: &mut Program) {
     use crate::traits::index::Synthetic;
-    let mut out = FxMap::default();
-    for &id in p.gx.index.impls_of_trait(p.gx.lang.hash) {
-        let rec = p.gx.index.get(id);
-        if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
-            continue;
-        }
-        let TyKind::Adt(d, args) = p.tys.kind(rec.self_ty(&p.tys)) else { continue };
-        let Some(a) = p.tys.local_adt_of(d).filter(|_| args == EMPTY_ARGS) else { continue };
-        let named = |n: &str| rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
-        if let (Some(f), None) = (named("hash"), named("hash_slice")) {
-            out.insert(a, f);
+    let (mut hash, mut borrow) = (FxMap::default(), FxMap::default());
+    for tr in [p.gx.lang.hash, p.gx.lang.borrow] {
+        for &id in p.gx.index.impls_of_trait(tr) {
+            let rec = p.gx.index.get(id);
+            if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
+                continue;
+            }
+            let TyKind::Adt(d, args) = p.tys.kind(rec.self_ty(&p.tys)) else { continue };
+            let Some(a) = p.tys.local_adt_of(d).filter(|_| args == EMPTY_ARGS) else { continue };
+            let named = |n: &str| rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
+            if tr == p.gx.lang.hash {
+                if let (Some(f), None) = (named("hash"), named("hash_slice")) {
+                    hash.insert(a, f);
+                }
+            } else if let (Some(f), Some(q)) = (named("borrow"), p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty())) {
+                borrow.insert((a, q), f);
+            }
         }
     }
-    p.gx.written_hash = out;
+    p.gx.written_hash = hash;
+    p.gx.borrow_impls = borrow;
 }
 
 /// The derived traits that need more than the field checks in

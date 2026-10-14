@@ -427,7 +427,7 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
-                let borrowed = borrow_expr(p, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
+                let borrowed = borrow_expr(p, slots, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
                 let eq = eq_expr(p, q, &format!("({qc}*)ctx"), &borrowed, need);
                 (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {eq};\n"))
             }
@@ -437,11 +437,23 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
 }
 
 /// A `Q*` expression for `<K as Borrow<Q>>::borrow` of the key at `k`
-/// (a `K*`): String to str, Vec<T> to [T], one deref of Box/Rc/&T, or
-/// the key itself. The result points at a temporary for the fat forms.
-fn borrow_expr(p: &Program, k: &CTy, q: &CTy, kp: &str) -> String {
+/// (a `K*`): String to str, Vec<T> to [T], one deref of Box/Rc/&T, a
+/// written impl's `borrow` (`gx.borrow_impls`), or the key itself. The
+/// result points at a temporary for the fat forms.
+fn borrow_expr(p: &Program, slots: &[u32], k: &CTy, q: &CTy, kp: &str) -> String {
     if k == q {
         return kp.to_string();
+    }
+    if let CTy::Adt(a) = k
+        && let Some((_, &f)) = p.gx.borrow_impls.iter().find(|((b, t), _)| b == a && cty(&p.tys, *t) == *q)
+    {
+        let call = format!("({}lust_fns[{}])({kp})", fn_ptr_cast(p, f), slots[f.0 as usize]);
+        // `&str` and `&[T]` come back as fat values: point at a temporary.
+        return match q {
+            CTy::Str => format!("((lust_str[]){{ {call} }})"),
+            CTy::Slice(_) => format!("(({}[]){{ {call} }})", ctype(q)),
+            _ => call,
+        };
     }
     match (k, q) {
         (CTy::String, CTy::Str) => format!("((lust_str[]){{ lust_string_as_str({kp}) }})"),
