@@ -5459,7 +5459,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
             // rustc bounds every type parameter by the derived trait,
             // except `Default` on an enum: its default variant is a
             // unit variant, so that impl has no bounds at all.
-            let bounded = !(trait_def == lang.default && is_enum);
+            // Std's `PhantomData<T>` impls have no bounds (std source,
+            // W-STD-C).
+            let bounded = !(trait_def == lang.default && is_enum) && !p.is_phantom_adt(adt);
             for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
                 if !bounded || param.kind != ParamKind::Type {
                     continue;

@@ -105,8 +105,12 @@ named `std` when a file can name a platform module (a byte scan for
 
 ## Std source modules (`STD_MODULES` in src/stdmods.rs, W-STD-C)
 
-Whole std modules in source, generic code included. When a compile can
-mention one (its module segment, such as `time`, as a whole word), the
+Whole std modules in source, generic code included, and overlays: a
+source module that holds only some items of a std module whose other
+items stay compiler-known (`core::marker::PhantomData` next to the
+`Send`/`Sync` lang traits; a path walks into an overlay only for a name
+it defines). When a compile can mention one (a row's trigger word, such
+as `time` or `PhantomData`), the
 driver routes it through the resolver and the loader splices each file
 as a hidden inline module after the user text. The resolver binds the
 hidden module nowhere and walks the row's std paths into it, so imports,
@@ -120,6 +124,7 @@ std's panic messages, and `Self::` in associated const values.
 | Std paths | File | Items | Notes |
 |---|---|---|---|
 | `core::time` | library/core/src/time.rs | `Duration`, `TryFromFloatSecsError` | Every stable method and op; exact Debug (precision, `+`, width, fill, align through the `fmt_align` intrinsic). No `Sum` impls yet (user `Sum` impls are not supported). |
+| `core::marker`, `std::marker` (overlay) | library/core/src/marker.rs | `PhantomData` | Zero-sized; acts as holding `T` for auto traits, unused-param checks, and borrowck variance (`Program::is_phantom_adt`); impls with no bounds on `T`. No `Debug` (needs `type_name`), no `Hash` yet, no `T: ?Sized`. |
 | `std::time` | library/std/src/time.rs | `Instant`, `SystemTime`, `UNIX_EPOCH`, `SystemTimeError`, re-exports of `core::time` | Clocks through `clock_now_raw` / `system_time_raw` (C in src/runtime/stdc.c). No `Error` impl yet. |
 
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)

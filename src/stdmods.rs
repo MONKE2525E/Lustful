@@ -29,25 +29,53 @@ pub struct StdModule {
     pub krate: ShippedCrate,
     /// The std paths that walk into this module: (extern crate, module).
     pub paths: &'static [(&'static str, &'static str)],
+    /// True when the module is the whole std module (`std::time`). An
+    /// overlay (`std::marker`) holds only some items of a std module
+    /// whose other items stay compiler-known: a path walks into it only
+    /// when the overlay defines the next segment.
+    pub full: bool,
+    /// The words whose mention means a compile may need this module.
+    pub triggers: &'static [&'static str],
 }
 
 /// The std modules in source, in splice order.
 pub const STD_MODULES: &[StdModule] = &[
-    StdModule { name: "__lust_core_time", rel: "core/src/time.rs", krate: ShippedCrate::Core, paths: &[("core", "time")] },
-    StdModule { name: "__lust_std_time", rel: "std/src/time.rs", krate: ShippedCrate::Std, paths: &[("std", "time")] },
+    StdModule {
+        name: "__lust_core_time",
+        rel: "core/src/time.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "time")],
+        full: true,
+        triggers: &["time"],
+    },
+    StdModule {
+        name: "__lust_std_time",
+        rel: "std/src/time.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "time")],
+        full: true,
+        triggers: &["time"],
+    },
+    StdModule {
+        name: "__lust_core_marker",
+        rel: "core/src/marker.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "marker"), ("std", "marker")],
+        full: false,
+        triggers: &["PhantomData"],
+    },
 ];
 
-/// The words whose mention means a compile may need the std modules:
-/// each module segment of a row's paths, as a whole word.
+/// The words whose mention means a compile may need the std modules.
 fn trigger_words() -> impl Iterator<Item = &'static str> {
-    STD_MODULES.iter().flat_map(|m| m.paths.iter().map(|(_, seg)| *seg))
+    STD_MODULES.iter().flat_map(|m| m.triggers.iter().copied())
 }
 
-/// True if `src` can mention a std source module: a row's module
-/// segment appears as a whole identifier-like word. A plain byte scan
-/// (it runs on every compile); a hit only costs the splice, a miss on
-/// a real use cannot happen because every path into a module names its
-/// segment.
+/// True if `src` can mention a std source module: a row's trigger
+/// (its module segment, or for an overlay the item names) appears as a
+/// whole identifier-like word. A plain byte scan (it runs on every
+/// compile); a hit only costs the splice, and a real use always names
+/// a trigger.
 pub fn needs(src: &str) -> bool {
     let b = src.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;

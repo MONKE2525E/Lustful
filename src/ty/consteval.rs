@@ -222,6 +222,11 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
             a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| const_ty_compatible(tys, x, y))
         }
         (TyKind::Array(e1, n1), TyKind::Array(e2, n2)) => n1 == n2 && const_ty_compatible(tys, e1, e2),
+        // A generic const fn's result keeps its template type
+        // (`W<T>` from `W::new()`); the call was type-checked as a fn
+        // call, so a parameter on the value side stands for the
+        // caller's type.
+        (TyKind::Param(_), _) => true,
         (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
             let (a, b) = (tys.args(a1), tys.args(a2));
             a.len() == b.len()
@@ -697,6 +702,13 @@ impl Evaluator {
             Expr::StructLit { path, fields, update } => {
                 let Some((adt, variant, ty)) = cx.struct_target(path) else {
                     return Err(outside(span, "this struct literal"));
+                };
+                // A generic struct literal is the expected instance of
+                // its Adt (`static S: K<u8> = K { .. }`); check typed it.
+                let def_of = |t: Ty| cx.tys_ref().adt_parts(t).map(|(d, _)| d);
+                let ty = match expected {
+                    Some(t) if def_of(t).is_some() && def_of(t) == def_of(ty) => t,
+                    _ => ty,
                 };
                 let field_defs = cx.variant_fields(adt, variant);
                 // Privacy first: written fields, and every field when

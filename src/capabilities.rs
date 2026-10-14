@@ -984,6 +984,7 @@ const TYPES: &[&str] = &[
     "std::env::Args (from std::env::args())",
     "str::Chars (from s.chars())",
     "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
+    "std::marker::PhantomData<T> (std source; no Debug or Hash yet)",
 ];
 
 const CONTROL_FLOW: &[&str] = &[

@@ -16167,7 +16167,14 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         if p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {
             return None;
         }
-        Some((adt, variant, self.cx.tys.adt_ty(adt)))
+        // A generic unit value (`PhantomData`) takes the expected
+        // instance of its own Adt.
+        let def = p.def_of_adt(adt);
+        let ty = match expected {
+            Some(t) if self.cx.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
+            _ => self.cx.tys.adt_ty(adt),
+        };
+        Some((adt, variant, ty))
     }
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
         let (adt, variant) = variant_of(self.cx.p, path)?;

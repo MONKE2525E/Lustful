@@ -316,6 +316,12 @@ impl<'a> Program<'a> {
     pub fn is_std_adt(&self, a: AdtId) -> bool {
         self.adts.get(a.0 as usize).is_some_and(|adt| self.std_source_span(adt.span))
     }
+    /// True when Adt `a` is std's `core::marker::PhantomData` (std
+    /// source, W-STD-C): zero-sized, yet it acts as if it held its `T`
+    /// for unused-parameter checks and auto traits.
+    pub fn is_phantom_adt(&self, a: AdtId) -> bool {
+        self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::marker::PhantomData"
+    }
     /// The adapter crate whose source file holds `span`, if any. The
     /// resolver records each adapter crate's files (W-DEPS).
     pub fn adapter_at(&self, span: Span) -> Option<&crate::resolve::imports::AdapterCrate> {
@@ -3378,7 +3384,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         cx.eval_pending(i);
     }
     // Move the results into the program tables, in item order.
-    let CollectCx { p, pending, .. } = cx;
+    let CollectCx { p, pending, errs, .. } = cx;
     let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
     for (item, state) in pending {
         let PendingState::Done(value) = state else { continue };
@@ -3432,6 +3438,19 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
             }
             Some(mutable) => {
                 let name = item.name.unwrap();
+                // A shared static must be `Sync` (rustc E0277); a type
+                // whose answer needs inference stays accepted here.
+                if !mutable {
+                    let mut tys = crate::ty::Tys::new(&p.tys);
+                    if auto_structural(p, &mut tys, &[], p.gx.lang.sync, item.ty, &mut Vec::new()) == Some(false) {
+                        errs.push(Diag::new(
+                            "L0612",
+                            item.span,
+                            format!("`{}` cannot be shared between threads safely", ty_name(p, &p.tys, item.ty)),
+                            "A `static` needs a `Sync` type; use a `const`, a `thread_local!`, or a `Sync` wrapper.",
+                        ));
+                    }
+                }
                 if let Some(sidx) = item.stmt_idx {
                     p.body_items.insert(sidx, BodyItem::Static(item.static_idx));
                 }
@@ -4137,7 +4156,14 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         if self.p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {
             return None;
         }
-        Some((adt, variant, self.p.tys.adt_ty(adt)))
+        // A generic unit value (`PhantomData`) takes the expected
+        // instance of its own Adt.
+        let def = self.p.def_of_adt(adt);
+        let ty = match expected {
+            Some(t) if self.p.tys.adt_parts(t).is_some_and(|(d, _)| d == def) => t,
+            _ => self.p.tys.adt_ty(adt),
+        };
+        Some((adt, variant, ty))
     }
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
         let (adt, variant) = self.variant_of(path)?;
@@ -4353,7 +4379,8 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                     p.adt(a).derives.copy
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
                             && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
-                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty))))
+                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty)))
+                                && derive_args_all(p, a, &mut Vec::new(), &mut |x, _| is_copy(p, tys, x)))
                 }
                 None => false,
             }
@@ -4497,9 +4524,23 @@ fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok:
         return true;
     }
     seen.push(t);
-    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen)));
+    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen))) && derive_args_all(p, a, seen, ok);
     seen.pop();
     all
+}
+
+/// Rustc's derive bounds: a derived impl on a generic Adt bounds every
+/// type parameter by the trait (`#[derive(Clone)] struct W<T>` is
+/// `impl<T: Clone> Clone for W<T>`), even one only a `fn() -> T` or
+/// `PhantomData<T>` field uses. True when `ok` holds for every type
+/// argument of instance `a` (always for std's `PhantomData`, whose
+/// impls have no bounds, and for non-instances).
+fn derive_args_all(p: &Program, a: AdtId, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+    let Some(Some((tdef, args))) = p.gx.adt_instance_of.get(a.0 as usize) else { return true };
+    if p.defs.local_adt(*tdef).is_some_and(|tmpl| p.is_phantom_adt(tmpl)) {
+        return true;
+    }
+    p.tys.args(*args).iter().filter_map(|g| g.as_ty()).all(|x| ok(x, seen))
 }
 
 /// True when `ok` holds for every field type of Adt `a` (the Adt of
@@ -4513,7 +4554,7 @@ fn adt_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn
         return true;
     }
     seen.push(t);
-    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen)));
+    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen))) && derive_args_all(p, a, seen, ok);
     seen.pop();
     all
 }
@@ -4634,6 +4675,11 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
                 }
                 seen.push((trait_def, t));
                 let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                // `PhantomData<T>` has T's auto traits (std source, W-STD-C).
+                if p.is_phantom_adt(a) {
+                    let held: Vec<Ty> = args.iter().filter_map(|g| g.as_ty()).collect();
+                    return all(tys, held, seen);
+                }
                 let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
                 let fields: Vec<Ty> =
                     raw.into_iter().map(|f| if args.is_empty() || !tys.flags(f).contains_param() { f } else { subst(tys, f, &args) }).collect();
@@ -4921,8 +4967,9 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_, '_> {
         let p = self.0;
         let adt = p.adts.get(id.0 as usize)?;
         // Std source module types (W-STD-C) keep std's niches out of
-        // their source form, so no layout query may see them.
-        if p.std_source_span(adt.span) {
+        // their source form, so no layout query may see them; the
+        // field-less `PhantomData` (size 0, align 1) is exact.
+        if p.std_source_span(adt.span) && !p.is_phantom_adt(id) {
             return None;
         }
         if let Some(a) = p.adapter_at(adt.span) {

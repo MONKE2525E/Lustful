@@ -31,7 +31,9 @@ pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<
         .map(|&(id, _)| {
             let def = p.gx.adt_info[id.0 as usize].0;
             let n_lts = p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len());
-            Used { tys: vec![false; p.gx.adt_generics[id.0 as usize].params.len()], lts: vec![false; n_lts] }
+            // `PhantomData<T>` uses its `T` by definition (std source).
+            let phantom = p.is_phantom_adt(id);
+            Used { tys: vec![phantom; p.gx.adt_generics[id.0 as usize].params.len()], lts: vec![false; n_lts] }
         })
         .collect();
     let slot: crate::intern::FxMap<AdtId, usize> = adts.iter().enumerate().map(|(i, &(id, _))| (id, i)).collect();

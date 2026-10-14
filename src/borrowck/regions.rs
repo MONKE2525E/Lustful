@@ -298,6 +298,12 @@ impl AdtTables {
                         t.param_uses(p, f.ty, Variance::Co, DropMode::Owned, &mut var, &mut drop);
                     }
                 }
+                // `PhantomData<T>` acts as a field of type T (std source,
+                // W-STD-C): covariant, and owned for drop.
+                if p.is_phantom_adt(id) {
+                    var.iter_mut().for_each(|x| *x = x.join(Variance::Co));
+                    drop.iter_mut().for_each(|x| *x = x.join(DropMode::Owned));
+                }
                 if t.variance[&def] != var {
                     t.variance.insert(def, var);
                     changed = true;

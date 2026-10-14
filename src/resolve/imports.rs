@@ -1007,14 +1007,29 @@ impl ResolvedTables {
     /// The hidden std source module that segment `seg` names under std
     /// extern `i` (`std::time`), when the std splice defined one
     /// (src/stdmods.rs).
-    pub fn std_module_at(&self, i: u32, seg: Sym, interner: &Interner) -> Option<ModuleId> {
+    /// Also says whether the module is the whole std module (`full`) or
+    /// an overlay that holds only some of its items.
+    pub fn std_module_at(&self, i: u32, seg: Sym, interner: &Interner) -> Option<(ModuleId, bool)> {
         let e = &self.externs[i as usize];
         if !e.is_std_lib || self.std_modules.is_empty() {
             return None;
         }
         let seg = interner.get(seg);
         let row = crate::stdmods::STD_MODULES.iter().find(|m| m.paths.iter().any(|(k, s)| *k == e.name && *s == seg))?;
-        self.std_modules.iter().find(|(n, _)| interner.get(*n) == row.name).map(|(_, m)| *m)
+        self.std_modules.iter().find(|(n, _)| interner.get(*n) == row.name).map(|(_, m)| (*m, row.full))
+    }
+
+    /// The std source module a std path walks into at segment `seg`
+    /// under std extern `i`, given the segment after it (`next`, read in
+    /// `next_ns`): a whole module always, an overlay only when it
+    /// defines `next` (other names stay the compiler's std items).
+    pub fn std_module_walk(&self, i: u32, seg: Sym, next: Option<(Sym, Namespace)>, interner: &Interner) -> Option<ModuleId> {
+        let (m, full) = self.std_module_at(i, seg, interner)?;
+        if full {
+            return Some(m);
+        }
+        let (n, ns) = next?;
+        self.lookup(m, ns, n).is_some().then_some(m)
     }
 
     /// The path target an extern prelude entry resolves to: the
@@ -1177,7 +1192,12 @@ impl ResolvedTables {
                 // their hidden module (W-STD-C).
                 Target::Extern(i)
                     if seg_ns == Namespace::Type
-                        && let Some(m) = self.std_module_at(i, seg, interner) =>
+                        && let Some(m) = self.std_module_walk(
+                            i,
+                            seg,
+                            segs.get(idx + 1).map(|&n| (n, if idx + 2 == segs.len() { ns } else { Namespace::Type })),
+                            interner,
+                        ) =>
                 {
                     cur = Target::Module(m);
                 }
@@ -1763,7 +1783,19 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 }
                 return TryOut::Done(inserted);
             }
-            match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
+            let modres = match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
+                // `use std::marker::PhantomData;`: an item of a std
+                // source overlay module imports from it (W-STD-C).
+                PathRes::Done(Target::Extern(i))
+                    if mod_path.len() == 2
+                        && let Some((m, false)) = tables.std_module_at(i, mod_path[1], interner)
+                        && [Namespace::Type, Namespace::Value, Namespace::Macro].iter().any(|&ns| tables.lookup(m, ns, last).is_some()) =>
+                {
+                    PathRes::Done(Target::Module(m))
+                }
+                other => other,
+            };
+            match modres {
                 PathRes::Done(Target::Module(src)) => {
                     // Bind the name in every namespace that has it.
                     let mut any = false;
@@ -1877,7 +1909,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     if let Some(why) = &tables.externs[i as usize].unsupported {
                         diags.push(unsupported_diag(why, imp.span));
                     } else if mod_path.len() == 1
-                        && let Some(m) = tables.std_module_at(i, last, interner)
+                        && let Some((m, true)) = tables.std_module_at(i, last, interner)
                     {
                         // `use std::time;`: a std source module binds
                         // like a local module (W-STD-C).
