@@ -294,6 +294,9 @@ struct Ck<'b, 'p, 'a> {
     /// Reused operand list of the statement being checked, so a statement
     /// visit does not allocate.
     ops_buf: Vec<&'b Operand>,
+    /// The two-phase receiver loan of the call being checked, while its
+    /// arguments are: until the call activates it, it is a shared borrow.
+    reserved: Option<usize>,
 }
 
 /// The Adt defs that have a user `Drop` impl: every impl of the lang
@@ -398,6 +401,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             mpaths: Vec::new(),
             mpath_at: Vec::new(),
             ops_buf: Vec::new(),
+            reserved: None,
         }
     }
 }
@@ -1431,19 +1435,21 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             callee_op = Operand::Copy(Place::local(callee));
             ops.insert(0, &callee_op);
         }
-        let mut carriers = if self.report { self.carriers(&ops, Some(dest)) } else { Vec::new() };
+        let carriers = if self.report { self.carriers(&ops, Some(dest)) } else { Vec::new() };
         // A two-phase receiver (lowered as reservation, arguments, `FakeRead`,
         // then `&mut`) is activated by the call itself: the other arguments
-        // are read before it in Rust, so it does not hold their reads.
-        if self.two_phase_receiver(b, args)
-            && let Some(c) = carriers.first_mut()
-        {
-            c.1 = false;
+        // are read before it in Rust, so its own loan acts as a shared borrow
+        // for them. Loans it reborrows through (`r.push(v[0])` with
+        // `r = &mut v`) stay as they are.
+        if self.two_phase_receiver(b, args) {
+            let last = self.stmt_base[b as usize] + self.body.blocks[b as usize].stmts.len() - 1;
+            self.reserved = Some(self.loan_at[last] as usize).filter(|&li| li < self.loans.len());
         }
         for (j, o) in ops.iter().enumerate() {
             let live = self.live_for(q, Some(j), &carriers);
             self.operand(o, span, st, &live);
         }
+        self.reserved = None;
         let live = self.live_for(q, None, &[]);
         self.write_dest(dest, span, &live, st);
     }
@@ -1985,8 +1991,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) && self.through_ref(&loan.place) {
                 continue;
             }
+            let mutable = loan.mutable && self.reserved != Some(li);
             let conflict = match kind {
-                Access::Read | Access::BorrowShared => loan.mutable && overlap(p, &loan.place),
+                Access::Read | Access::BorrowShared => mutable && overlap(p, &loan.place),
                 Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place),
                 Access::Dead => loan.place.local == p.local && !self.through_ref(&loan.place),
             };
@@ -1995,7 +2002,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
             let name = self.local_name(loan.place.local);
             let to_ret = self.sol.as_ref().is_some_and(|s| s.to_ret[li]);
-            let (code, msg, fix) = match (kind, loan.mutable) {
+            let (code, msg, fix) = match (kind, mutable) {
                 (Access::Dead, _) if to_ret => (
                     "L0307",
                     format!("cannot return a reference to {name}, which is owned by this function"),

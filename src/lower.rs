@@ -2707,10 +2707,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 };
                 let pl = Self::derefs(pl, derefs);
                 let mt = self.ref_ty(true, recv_ty);
-                if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
-                    // The receiver is reached through an `IndexMut` borrow, which is not
-                    // two-phase: take the `&mut` before the arguments run, so an argument
-                    // that borrows the container again is an error, as in rustc.
+                let via_deref = matches!(callee, Callee::Builtin(b) if self.slice_method_via_deref(b, recv_ty));
+                if via_deref || pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+                    // The receiver is reached through an `IndexMut` borrow or a slice
+                    // method's `DerefMut`/unsize, which is not two-phase: take the `&mut`
+                    // before the arguments run, so an argument that borrows the container
+                    // again is an error, as in rustc.
                     let t = self.temp(mt);
                     self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
                     ops.push(Operand::Move(Place::local(t)));
@@ -2786,6 +2788,16 @@ impl<'p, 'a> Lower<'p, 'a> {
         };
         let d = self.call_dest(dest, self.ty(e));
         self.call_into(target, ops, d, span);
+    }
+
+    /// True when a `&mut self` builtin is a slice method called on a `Vec`
+    /// or an array (`v.swap(..)`, `a.get_mut(..)`): rustc reaches the slice
+    /// through `DerefMut` or an unsize, so its autoref is not a two-phase
+    /// borrow. On a slice place (`s.swap(..)` with `s: &mut [T]`) it is.
+    fn slice_method_via_deref(&self, b: Builtin, recv_ty: Ty) -> bool {
+        use Builtin as B;
+        matches!(b, B::VecSwap | B::VecReverse | B::VecFirstMut | B::VecLastMut | B::VecGetMut | B::IterIterMut)
+            && (self.body.tys.vec_elem(recv_ty).is_some() || matches!(self.kind(recv_ty), TyKind::Array(..)))
     }
 
     fn binary_into(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, dest: Option<&Place>, span: Span) {
