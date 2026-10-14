@@ -12982,12 +12982,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match elem {
                     Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),
                     None if self.recv_elem(t).is_some() => self.recv_elem(t).unwrap_or(ERROR),
-                    None => {
-                        let s = self.span(iter);
-                        let tn = self.tn(t);
-                        self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
-                        ERROR
-                    }
+                    // A user `impl IntoIterator for &W` (or `&mut W`) (W-STD-B).
+                    None => match self.for_trait_iter(for_e, iter, t) {
+                        Some(item) => item,
+                        None => {
+                            let s = self.span(iter);
+                            let tn = self.tn(t);
+                            self.err("L0113", s, format!("cannot iterate over `{tn}`"), "Iterate over a range, `&vec`, or `&mut vec`.");
+                            ERROR
+                        }
+                    },
                 }
             }
             TyKind::Array(elem, _) => elem,
