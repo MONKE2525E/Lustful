@@ -804,7 +804,7 @@ pub(super) fn defer_path_call(cx: &mut Ctx, e: ExprId, tr: TraitRef, name: Sym, 
 /// which points it at the impl `tr` selects once the body's types are
 /// known (`collect` into a std source collection, W-STD-C).
 pub(super) fn defer_trait_method(cx: &mut Ctx, e: ExprId, tr: TraitRef, name: Sym, own: Vec<GenericArg>, derefs: u8, autoref: Autoref) {
-    cx.deferred_methods.push(DeferredMethod { e, tr, name, own, derefs, autoref });
+    cx.deferred_methods.push(DeferredMethod { e, tr, name, own, derefs, autoref, path: false });
 }
 
 /// Confirms a trait method whose impl is still ambiguous (an input
