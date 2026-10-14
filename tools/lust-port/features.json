@@ -723,7 +723,7 @@
   {
    "id": "std.rc_refcell",
    "title": "Weak, RefCell, Cell and OnceCell",
-   "status": "unsupported",
+   "status": "partial",
    "milestone": 5,
    "inventory_step": "5",
    "root_cause": "std-runtime",
