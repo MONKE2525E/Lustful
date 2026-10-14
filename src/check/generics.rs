@@ -4446,6 +4446,12 @@ fn sugar_elision(
         let Ok(t) = resolve_scoped(ast, interner, known, cx, tys, t, &ks) else { return Ok(()) };
         crate::borrowck::regions_of(tys, t, &mut lts);
     }
+    // Only lifetimes written in the inputs count, as rustc counts them:
+    // the regions a substituted type argument carries (`K = &str` in an
+    // instance of `fn(&(K, V)) -> (&K, &V)`, erased in a body) are not
+    // elision candidates (W-STD-C: BTreeMap<_, &str>::iter). Elided
+    // (`Bound(0)`) and named (`Param`) written ones stay.
+    lts.retain(|r| *r != Region::Erased);
     ks.regions = RegionMode::Keep { next: None, elided: if let [r] = lts[..] { Some(r) } else { None } };
     match resolve_scoped(ast, interner, known, cx, tys, out, &ks) {
         Err(d) if d.code == "L0202" => Err(d),
