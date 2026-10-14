@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `734ebbf5` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `87652421` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 91 files, 27981 lines (22.4% of files, 7.2% of lines).
+Core: 406 files, 390709 lines. Compiles today: 134 files, 58206 lines (33.0% of files, 14.9% of lines).
 
-All active prod files: 234 of 773 files compile today (9.2% of lines).
+All active prod files: 341 of 773 files compile today (17.4% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,30 +31,30 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `std.rc_refcell` | partial | 5 | W-STD-B | 246 | 310285 | 24 | 14479 |
-| 2 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 10 | 5514 |
-| 3 | `std.runtime` | unsupported | 5 | W-STD-B | 167 | 216508 | 3 | 798 |
-| 4 | `ext.rustc_hash` | unsupported | 5 | W-DEPS | 139 | 201724 | 1 | 807 |
-| 5 | `traits.impl_trait_arg` | partial | 5 | W-CHECK-G | 96 | 153296 | 3 | 1809 |
-| 6 | `std.lazy_once_lock` | unsupported | 5 | W-STD-B | 63 | 103221 | 1 | 234 |
-| 7 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 1 | 68 |
-| 8 | `threads.thread_local` | unsupported | 7 | W-TLS | 38 | 75561 | 0 | 0 |
-| 9 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
-| 10 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
-| 11 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 0 | 0 |
-| 12 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 1 | 1419 |
-| 13 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 0 | 0 |
-| 14 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 0 | 0 |
-| 15 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 0 | 0 |
+| 1 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 28 | 22211 |
+| 2 | `ext.rustc_hash` | unsupported | 5 | W-DEPS | 139 | 201724 | 25 | 23735 |
+| 3 | `traits.impl_trait_arg` | partial | 5 | W-CHECK-G | 96 | 153296 | 15 | 17972 |
+| 4 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 7 | 3593 |
+| 5 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
+| 6 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
+| 7 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 4 | 1184 |
+| 8 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 2 | 2920 |
+| 9 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 1 | 322 |
+| 10 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 1 | 906 |
+| 11 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 1 | 143 |
+| 12 | `std.hashmap` | unsupported | 4 | W-STD-B | 10 | 17381 | 0 | 0 |
+| 13 | `std.hashmap_hasher` | unsupported | 4 | W-STD-B | 4 | 9817 | 0 | 0 |
+| 14 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
+| 15 | `generics.const_param` | unsupported | 8 | W-CHECK-G | 2 | 4299 | 0 | 0 |
 
 ## Core CLI curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 91 | 22.4 | 7.2 |
-| milestone 4 | 102 | 25.1 | 8.9 |
-| milestone 5 | 331 | 81.5 | 73.3 |
-| milestone 6 | 334 | 82.3 | 74.2 |
+| supported today | 134 | 33.0 | 14.9 |
+| milestone 4 | 174 | 42.9 | 23.7 |
+| milestone 5 | 352 | 86.7 | 80.5 |
+| milestone 6 | 355 | 87.4 | 81.5 |
 | milestone 7 | 400 | 98.5 | 98.0 |
 | milestone 8 | 402 | 99.0 | 99.1 |
 
@@ -62,10 +62,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 234 | 30.3 | 9.2 |
-| milestone 4 | 251 | 32.5 | 10.6 |
-| milestone 5 | 673 | 87.1 | 73.9 |
-| milestone 6 | 678 | 87.7 | 74.6 |
+| supported today | 341 | 44.1 | 17.4 |
+| milestone 4 | 403 | 52.1 | 24.8 |
+| milestone 5 | 699 | 90.4 | 80.6 |
+| milestone 6 | 704 | 91.1 | 81.3 |
 | milestone 7 | 764 | 98.8 | 97.6 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 
