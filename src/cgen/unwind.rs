@@ -26,6 +26,48 @@ impl Unw {
     }
 }
 
+impl FnGen<'_, '_, '_> {
+    /// `catch_unwind(f)` (lowered with no cleanup successor, lower/unwind.rs):
+    /// calls `f`; under panic=unwind a panic in it comes back here and
+    /// becomes `Err(payload)`, with `f`'s value dropped as `call_once`
+    /// drops it. Under panic=abort a panic never returns, so it is `Ok`.
+    pub(super) fn catch_unwind_call(&mut self, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+        let callee = self.callee_of(&ops[0]);
+        let once = !matches!(callee, sync::Callee::Closure(_, false));
+        let (env, env_ty) = self.operand(&ops[0], loc, post);
+        collect_types(&env_ty, &mut self.sig_types);
+        let ret = match &callee {
+            sync::Callee::Closure(f, _) | sync::Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
+            sync::Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            sync::Callee::Ptr(_) => unreachable!("a fn pointer type"),
+        };
+        let res = CTy::Result(Box::new(ret), Box::new(CTy::BoxDyn));
+        collect_types(&res, &mut self.sig_types);
+        let ev = self.tmp();
+        let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
+        let mut call = String::new();
+        let v = self.callee_call_c(&mut call, &callee, &ev, &[]);
+        self.out.push_str(&call);
+        let caught = self.tmp();
+        if self.p.unwind {
+            let _ = writeln!(self.out, "    lust_dyn {caught}p; int {caught} = lust_unw_pending && lust_unw_mine(); if ({caught}) {caught}p = lust_unw_catch();");
+        }
+        if !once && needs_drop_c(self.p, &env_ty) {
+            self.want(Glue::Drop, &env_ty);
+            let _ = writeln!(self.out, "    drop_{}(&{ev});", mangle(&env_ty));
+        }
+        let r = self.tmp();
+        let ok = self.make_variant(&res, 0, &[v]);
+        if self.p.unwind {
+            let err = self.make_variant(&res, 1, &[format!("{caught}p")]);
+            let _ = writeln!(self.out, "    {} {r} = {caught} ? {err} : {ok};", ctype(&res));
+        } else {
+            let _ = writeln!(self.out, "    {} {r} = {ok};", ctype(&res));
+        }
+        r
+    }
+}
+
 /// The blocks of `body` that are cleanup: every block reachable from a
 /// call's unwind successor or a statement's cleanup entry. Lowering
 /// builds them as ladders that only reach each other.

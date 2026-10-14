@@ -2358,6 +2358,8 @@ impl FnGen<'_, '_, '_> {
                     CallTarget::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret) == CTy::Unit,
                     CallTarget::Intrinsic(id) => lang::intrinsic(*id).ret == SigTy::Never,
                     CallTarget::Indirect(c) => matches!(&self.local_cty[*c as usize], CTy::FnPtr(_, r) if **r == CTy::Unit),
+                    // `resume_unwind` and `panic_any` return `!` (W-UNWIND).
+                    CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ResumeUnwind | crate::check::sync::SyncOp::PanicAny)) => true,
                     // Lowering gives a dyn call a destination of the
                     // method's own return type.
                     CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
@@ -2411,8 +2413,10 @@ impl FnGen<'_, '_, '_> {
                     let s = self.format(parts, &loc, &mut post, 4);
                     let _ = writeln!(self.out, "    lust_panic_fmt(&{s}, {loc});\n  }}");
                 } else {
+                    // No runtime argument: Rust's `&'static str` payload
+                    // (W-STD-B's `fmt_parts` inlines literal arguments).
                     let s = self.format(parts, &loc, &mut post, 0);
-                    let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n  }}");
+                    let _ = writeln!(self.out, "    lust_panic_lit(&{s}, {loc});\n  }}");
                 }
                 if let Some(Unw::Goto(b)) = self.unw {
                     let _ = writeln!(self.out, "  lust_unw_take(&ex);\n  goto bb{b};");
@@ -3479,6 +3483,9 @@ impl FnGen<'_, '_, '_> {
         ) = b
         {
             return self.thread_closure_call(op, ops, loc, post);
+        }
+        if b == B::Sync(crate::check::sync::SyncOp::CatchUnwind) {
+            return self.catch_unwind_call(ops, loc, post);
         }
         let mut vals = Vec::new();
         let mut tys = Vec::new();
@@ -5720,10 +5727,41 @@ pub struct SlotFiles<'a> {
     pub of_slot: &'a [u32],
 }
 
+/// The runtime setup `main_unit` emits for panics (`lust_unw_init`):
+/// whether they unwind, the type ids of `&'static str` and `String`
+/// (the message payloads' vtables carry them), and the slot of std's
+/// hook runner when the program can install a hook (`set_hook`).
+pub struct UnwindInit {
+    pub unwind: bool,
+    pub ids: [u64; 4],
+    pub hook_runner: Option<u32>,
+}
+
+/// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot):
+/// None under panic=abort when no hook can be installed.
+pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<UnwindInit> {
+    let runner = p.fns.iter().position(|f| p.std_source_span(f.def.name_span) && p.display_path(f.name) == "std::panic::__lust_run_hook").map(|i| slot_of(LocalDefId(i as u32)));
+    if !p.unwind && runner.is_none() {
+        return None;
+    }
+    let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
+    let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
+    Some(UnwindInit { unwind: p.unwind, ids: [a, b, c, d], hook_runner: runner })
+}
+
 /// Unit 0: the line and file tables (by slot), globals, overlay registration, and `main`.
-/// Rebuilt on every build. Under panic=unwind (`unwind`) it switches the
-/// runtime to unwinding, and a `main` that ends by a panic exits 101.
-pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize], unwind: bool) -> String {
+/// Rebuilt on every build. With `init` (see `unwind_init`) it sets up the
+/// runtime's panic payloads and hook runner; under panic=unwind a `main`
+/// that ends by a panic exits 101.
+pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize], init: Option<UnwindInit>) -> String {
+    let unwind = init.as_ref().is_some_and(|i| i.unwind);
+    let (init, runner) = match init {
+        Some(UnwindInit { unwind, ids: [a, b, c, d], hook_runner }) => (
+            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", unwind as u8),
+            hook_runner.map_or(String::new(), |s| format!("\n  lust_hook_set_runner(lust_fns[{s}]);")),
+        ),
+        None => (String::new(), String::new()),
+    };
     let mut c = unit_header();
     let lines: Vec<String> = slot_lines.iter().map(|l| l.to_string()).collect();
     let _ = writeln!(c, "static const uint32_t lines[{}] = {{{}}};", lines.len().max(1), lines.join(","));
@@ -5744,10 +5782,14 @@ pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays
         "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;{}{}\n  lust_rt_init();\n  lust_base_init();",
         c_string_lit(file.as_bytes()),
         if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "" },
-        if unwind { "\n  lust_unwind_mode = 1;" } else { "" }
+        init
     );
     for u in overlays {
         let _ = writeln!(c, "  lust_overlay_u{u}();");
+    }
+    c.push_str(runner.trim_start_matches('\n'));
+    if !runner.is_empty() {
+        c.push('\n');
     }
     let _ = writeln!(
         c,
@@ -7685,7 +7727,7 @@ mod tests {
         let mut glue = GlueSet::default();
         glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
         let units = [
-            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[], false),
+            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[], None),
             glue_unit(&program, &glue),
             runtime_unit(),
             table_unit(n, &[4]),
@@ -7991,7 +8033,7 @@ impl FnGen<'_, '_, '_> {
             let _ = writeln!(self.out, "    if ({c}->f0 != 1) {c} = tlsinit_{m}({c}, (void *){});", vals[1]);
         }
         if b == Builtin::TlsAccess {
-            let _ = writeln!(self.out, "    if (!{c}) lust_panic_cstr({}, {loc});", c_string_lit(crate::lower::tls::ACCESS_PANIC.as_bytes()));
+            let _ = writeln!(self.out, "    if (!{c}) lust_panic_cstr_owned({}, {loc});", c_string_lit(crate::lower::tls::ACCESS_PANIC.as_bytes()));
             return format!("(&{c}->f1)");
         }
         if b == Builtin::TlsTryAccess {

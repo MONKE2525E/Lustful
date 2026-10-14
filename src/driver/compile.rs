@@ -3181,7 +3181,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered, program.unwind),
+        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered, cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
@@ -3197,7 +3197,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[], program.unwind) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }

@@ -89,11 +89,24 @@ pub enum SyncOp {
     PoisonGetMut,
     /// `thread::spawn(f)`.
     ThreadSpawn,
+    /// `panic::catch_unwind(f)`, `panic::resume_unwind(payload)`, and
+    /// `panic::panic_any(msg)` (W-UNWIND; typed in check/unwind.rs).
+    CatchUnwind,
+    ResumeUnwind,
+    PanicAny,
+    /// `core::intrinsics::panic_hook_swap(new)` and `panic_hook_ref()`:
+    /// the runtime's hook slot, for std's `set_hook`/`take_hook` source.
+    PanicHookSwap,
+    PanicHookRef,
+    /// `core::intrinsics::panic_hook_payload()` and
+    /// `panic_hook_location()`: the panic the hook runs for.
+    PanicHookPayload,
+    PanicHookLocation,
     /// `thread::current()`.
     ThreadCurrent,
     /// `thread::yield_now()`.
     ThreadYieldNow,
-    /// `thread::panicking()`: always false (a panic aborts).
+    /// `thread::panicking()` (runtime/panic.c: unwinding, or in a hook).
     ThreadPanicking,
     /// `JoinHandle::join(self)`.
     JoinHandleJoin,
@@ -157,7 +170,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 99] = [
+    pub const ALL: [SyncOp; 106] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -210,6 +223,13 @@ impl SyncOp {
         SyncOp::PoisonGetRef,
         SyncOp::PoisonGetMut,
         SyncOp::ThreadSpawn,
+        SyncOp::CatchUnwind,
+        SyncOp::ResumeUnwind,
+        SyncOp::PanicAny,
+        SyncOp::PanicHookSwap,
+        SyncOp::PanicHookRef,
+        SyncOp::PanicHookPayload,
+        SyncOp::PanicHookLocation,
         SyncOp::ThreadCurrent,
         SyncOp::ThreadYieldNow,
         SyncOp::ThreadPanicking,
@@ -320,6 +340,13 @@ impl SyncOp {
             SyncOp::ThreadSpawn => (&["std::thread"], &["spawn"], f),
             SyncOp::ThreadCurrent => (&["std::thread"], &["current"], f),
             SyncOp::ThreadYieldNow => (&["std::thread"], &["yield_now"], f),
+            SyncOp::CatchUnwind => (&["std::panic"], &["catch_unwind"], f),
+            SyncOp::ResumeUnwind => (&["std::panic"], &["resume_unwind"], f),
+            SyncOp::PanicAny => (&["std::panic"], &["panic_any"], f),
+            SyncOp::PanicHookSwap => (&["core::intrinsics (std source only)"], &["panic_hook_swap"], f),
+            SyncOp::PanicHookRef => (&["core::intrinsics (std source only)"], &["panic_hook_ref"], f),
+            SyncOp::PanicHookPayload => (&["core::intrinsics (std source only)"], &["panic_hook_payload"], f),
+            SyncOp::PanicHookLocation => (&["core::intrinsics (std source only)"], &["panic_hook_location"], f),
             SyncOp::ThreadPanicking => (&["std::thread"], &["panicking"], f),
             SyncOp::JoinHandleJoin => (&["std::thread::JoinHandle<T>"], &["join"], m),
             SyncOp::JoinHandleThread => (&["std::thread::JoinHandle<T>"], &["thread"], m),
@@ -441,6 +468,9 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
         ["std" | "core", "sync", "atomic", "compiler_fence"] => Some(SyncOp::CompilerFence),
         ["std" | "core", "hint", "spin_loop"] => Some(SyncOp::SpinLoop),
         ["std", "thread", "spawn"] => Some(SyncOp::ThreadSpawn),
+        ["std", "panic", "catch_unwind"] => Some(SyncOp::CatchUnwind),
+        ["std", "panic", "resume_unwind"] => Some(SyncOp::ResumeUnwind),
+        ["std", "panic", "panic_any"] => Some(SyncOp::PanicAny),
         ["std", "thread", "current"] => Some(SyncOp::ThreadCurrent),
         ["std", "thread", "yield_now"] => Some(SyncOp::ThreadYieldNow),
         ["std", "thread", "panicking"] => Some(SyncOp::ThreadPanicking),
@@ -600,6 +630,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (vec![f], sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]))
             }
             SyncOp::ThreadCurrent => (vec![], sync_ty(&mut self.tys, SyncTy::Thread, &[])),
+            SyncOp::CatchUnwind
+            | SyncOp::ResumeUnwind
+            | SyncOp::PanicAny
+            | SyncOp::PanicHookSwap
+            | SyncOp::PanicHookRef
+            | SyncOp::PanicHookPayload
+            | SyncOp::PanicHookLocation => {
+                self.unwind_call_sig(op, span)
+            }
             // `scope<'env, F, T>(f: F) -> T` where `F: for<'scope>
             // FnOnce(&'scope Scope<'scope, 'env>) -> T`: the closure's
             // `&Scope` is higher-ranked.
@@ -767,7 +806,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The pending obligation `t: Send`.
-    fn require_send(&mut self, t: Ty, span: Span) {
+    pub(super) fn require_send(&mut self, t: Ty, span: Span) {
         let send = self.p.gx.lang.send;
         let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
         self.obl.push(obligations::Obligation::Trait { trait_ref: TraitRef { def: send, args, bindings: EMPTY_BINDINGS }, span, depth: 0 });

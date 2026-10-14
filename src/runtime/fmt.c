@@ -819,5 +819,5 @@ void lust_fmt_failed(uint32_t what, lust_loc loc) {
     /* Rust raises these inside std, so they report std's location. */
     if (what == 1) lust_panic_std("a Display implementation returned an error unexpectedly: Error", "alloc/src/string.rs:2953:14");
     if (what == 0) lust_panic_std("a formatting trait implementation returned an error when the underlying stream did not: Error", "alloc/src/fmt.rs:657:14");
-    lust_panic_std("a formatting trait implementation returned an error when the underlying stream did not", "core/src/io/write.rs:411:17");
+    lust_panic_std_lit("a formatting trait implementation returned an error when the underlying stream did not", "core/src/io/write.rs:411:17");
 }

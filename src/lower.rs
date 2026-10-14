@@ -10,6 +10,7 @@ mod any;
 mod closure;
 pub mod iter;
 pub mod tls;
+mod unwind;
 
 struct LoopInfo {
     break_bb: Bb,
@@ -1533,6 +1534,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(Builtin::MemReplace), ops, d, span);
                     }
+                    Res::Builtin(Builtin::Sync(
+                        op @ (crate::check::sync::SyncOp::CatchUnwind
+                        | crate::check::sync::SyncOp::ResumeUnwind
+                        | crate::check::sync::SyncOp::PanicAny),
+                    )) => self.unwind_call(op, args, ops, dest, ty, span),
                     Res::Builtin(b) => {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(b), ops, d, span);

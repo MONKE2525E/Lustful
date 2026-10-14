@@ -81,6 +81,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["LazyLock"],
     },
     StdModule {
+        name: "__lust_std_panic",
+        rel: "std/src/panic.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "panic"), ("core", "panic")],
+        full: false,
+        triggers: &["AssertUnwindSafe", "set_hook", "take_hook", "PanicHookInfo", "UnwindSafe", "RefUnwindSafe"],
+    },
+    StdModule {
         name: "__lust_alloc_collections",
         rel: "alloc/src/collections.rs",
         krate: ShippedCrate::Alloc,

@@ -1977,6 +1977,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (k == ClosureKind::Fn).then_some((ClosureKind::Fn, inputs, out))
                 }
             }
+            // std's `impl<R, F: FnOnce() -> R> FnOnce<()> for
+            // AssertUnwindSafe<F>` (check/unwind.rs).
+            TyKind::Adt(..)
+                if depth < 4 && self.tys.local_adt(t).is_some_and(|a| crate::check::unwind::is_assert_unwind_safe(self.p, a)) =>
+            {
+                let inner = self.tys.adt_first_ty_arg(t)?;
+                let (_, inputs, out) = self.fn_like_facts(inner, depth + 1)?;
+                inputs.is_empty().then_some((ClosureKind::FnOnce, inputs, out))
+            }
             TyKind::Adt(..) if depth < 4 => {
                 let elem = self.tys.boxed_elem(t)?;
                 self.fn_like_facts(elem, depth + 1)

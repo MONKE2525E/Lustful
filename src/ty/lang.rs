@@ -1106,6 +1106,18 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).
     IntrinsicDef { name: "fmt_align", c_symbol: "lust_fmt_align", params: &[S::FmtMut], ret: S::U32, allowed: CORE_STD, implemented: true },
+    // `std::panic` hooks (W-UNWIND; runtime/panic.c): whether a custom
+    // hook is installed, and std's default hook text (file, line, column,
+    // message) for the hook `take_hook` hands out.
+    IntrinsicDef { name: "panic_hook_custom", c_symbol: "lust_hook_custom", params: &[S::Bool], ret: S::Unit, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef {
+        name: "panic_default_hook",
+        c_symbol: "lust_hook_default",
+        params: &[S::Str, S::U32, S::U32, S::Str],
+        ret: S::Unit,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
 ];
 
 /// The intrinsic with this `core::intrinsics` name: its registry id.

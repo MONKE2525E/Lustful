@@ -439,7 +439,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// (L0110, rustc E0277), or not
     /// provably `'static` (L0612 for a type parameter, L0705 otherwise).
     /// An instance skips the `'static` part: its template proved it.
-    fn any_type_ok(&mut self, t: Ty, written: Option<ast::TyId>, refs_ok: bool, unsized_ok: bool, span: Span) -> bool {
+    pub(super) fn any_type_ok(&mut self, t: Ty, written: Option<ast::TyId>, refs_ok: bool, unsized_ok: bool, span: Span) -> bool {
         let p = self.p;
         if self.tys.flags(t).contains_infer() {
             self.err(

@@ -2950,6 +2950,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
         }
         self.flow_all(&srcs, &dv);
+        // `catch_unwind(f)` returns what `f` returns, or a `'static`
+        // payload: the closure's borrows reach the result only through its
+        // output (W-UNWIND).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CatchUnwind)) = target {
+            return;
+        }
         if matches!(target, CallTarget::Dyn(_)) && self.call_dyn_fn(&avs, dt, &dv) {
             return;
         }

@@ -33,6 +33,7 @@ pub mod std_inherent;
 pub mod tls;
 pub mod usefulness;
 pub mod sync;
+pub mod unwind;
 pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
@@ -1281,6 +1282,9 @@ struct Ctx<'p, 'a> {
     /// Unsizing coercion sites, (concrete pointee, dyn type, span)
     /// before zonking; `finish` turns them into vtable requests.
     vtable_sites: Vec<(Ty, Ty, Span)>,
+    /// `catch_unwind` closures and `panic_any` payloads, checked at
+    /// body end (check/unwind.rs).
+    unwind_checks: Vec<unwind::UnwindCheck>,
     /// True once an unsizing coercion made a dyn value from one that
     /// may hold a borrow (see `dyn_static_clean`).
     dyn_borrow_src: bool,
@@ -1514,6 +1518,7 @@ fn check_fn_mode<'p, 'a>(
         closure_bound_outputs: std::collections::HashMap::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
+        unwind_checks: Vec::new(),
         dyn_borrow_src: false,
         call_expected: None,
         deref_depth: 0,
@@ -3117,6 +3122,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Selection::NoImpl;
             }
         }
+        // std's `UnwindSafe` and `RefUnwindSafe` (check/unwind.rs).
+        if let Some(refs) = unwind::unwind_trait(p, tr.def) {
+            let env = self.solve_env();
+            match unwind::unwind_safe(p, &mut self.tys, &env, refs, self_ty, &mut Vec::new()) {
+                Some(true) => return Selection::ParamEvidence(usize::MAX),
+                Some(false) => return Selection::NoImpl,
+                None => {}
+            }
+        }
         if lang.is_auto(tr.def) {
             match self.auto_holds(tr.def, self_ty) {
                 Some(true) => return Selection::ParamEvidence(usize::MAX),
@@ -3191,6 +3205,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         match self.tys.kind(self_ty) {
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) => {}
             TyKind::Closure(..) if trait_def == lang.copy || trait_def == lang.clone => {}
+            // core's `impl Debug for !` (`catch_unwind` of a closure that
+            // always panics gives `Result<!, _>`; W-UNWIND).
+            TyKind::Never => return trait_def == lang.debug,
             _ => return false,
         }
         if trait_def == lang.copy {
@@ -8371,6 +8388,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let text = self.name(name).to_string();
         // The generic interior-write builtins of std source (W-STD-C):
         // the same privilege rule as registry intrinsics.
+        // The panic hook slot of std's `set_hook` source (W-UNWIND).
+        if matches!(text.as_str(), "panic_hook_swap" | "panic_hook_ref" | "panic_hook_payload" | "panic_hook_location") {
+            if self.p.shipped_crate_at(span) != Some(lang::ShippedCrate::Std) {
+                self.err(
+                    "L0642",
+                    span,
+                    format!("intrinsic `core::intrinsics::{text}` can only be called from lust's shipped library crates"),
+                    "Call the public std item that wraps it instead.",
+                );
+                return None;
+            }
+            let op = match text.as_str() {
+                "panic_hook_swap" => sync::SyncOp::PanicHookSwap,
+                "panic_hook_ref" => sync::SyncOp::PanicHookRef,
+                "panic_hook_payload" => sync::SyncOp::PanicHookPayload,
+                _ => sync::SyncOp::PanicHookLocation,
+            };
+            return Some(Res::Builtin(Builtin::Sync(op)));
+        }
         if matches!(text.as_str(), "once_init" | "once_take") {
             if !matches!(self.p.shipped_crate_at(span), Some(lang::ShippedCrate::Core | lang::ShippedCrate::Std)) {
                 self.err(
@@ -16993,6 +17029,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0112", span, format!("`{tn}` does not implement Clone"), "Add #[derive(Clone)] to the type.");
             }
         }
+        self.finish_unwind();
         for (t, span) in std::mem::take(&mut self.deferred_item_args) {
             let t = self.deep(t);
             let TyKind::FnDef(_, args) = self.kind(t) else { continue };
@@ -17731,6 +17768,10 @@ impl<'p> SolveCx for Ctx<'p, '_> {
         }
         if tr.def == lang.sized {
             return Some(self.sized_ok(self_ty));
+        }
+        if let Some(refs) = unwind::unwind_trait(p, tr.def) {
+            let env = self.solve_env();
+            return unwind::unwind_safe(p, &mut self.tys, &env, refs, self_ty, &mut Vec::new());
         }
         if lang.is_auto(tr.def) {
             return self.auto_holds(tr.def, self_ty);

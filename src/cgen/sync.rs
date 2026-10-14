@@ -570,9 +570,23 @@ impl FnGen<'_, '_, '_> {
             | S::ArcWeakWeakCount
             | S::ArcWeakPtrEq => self.arc_builtin(op, vals, tys),
             S::ThreadSpawn | S::ScopeSpawn | S::ThreadScope => unreachable!("closure-taking thread calls go through thread_closure_call"),
+            S::CatchUnwind => unreachable!("catch_unwind goes through catch_unwind_call"),
+            // `resume_unwind` and `panic_any` (cgen/unwind.rs's runtime half).
+            S::ResumeUnwind => format!("(lust_unw_resume_box({}), ((lust_Unit){{}}))", vals[0]),
+            S::PanicAny => format!("(lust_panic_box({}, {loc}), ((lust_Unit){{}}))", vals[0]),
+            // The runtime's hook slot: swap a value of the slot's type in.
+            S::PanicHookSwap => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = {}; lust_hook_swap(&{t}, sizeof {t});", ctype(&tys[0]), vals[0]);
+                t
+            }
+            S::PanicHookRef => "lust_hook_slot()".into(),
+            S::PanicHookPayload => "lust_hook_payload()".into(),
+            S::PanicHookLocation => "lust_hook_location()".into(),
             S::ThreadCurrent => "lust_thread_current()".into(),
             S::ThreadYieldNow => "(lust_thread_yield(), ((lust_Unit){}))".into(),
-            S::ThreadPanicking => if self.p.unwind { "lust_unw_panicking()".into() } else { "((uint8_t)0)".into() },
+            // True while a panic unwinds, and in a panic hook (both modes).
+            S::ThreadPanicking => "lust_unw_panicking()".into(),
             S::JoinHandleJoin => {
                 // `Ok(value)`: the result sits right after the header.
                 let el = match &tys[0] {
@@ -793,7 +807,7 @@ impl FnGen<'_, '_, '_> {
 
     /// What a callable operand calls: a closure's body fn (and whether it
     /// takes its env by value), a fn item's instance, or a fn pointer.
-    fn callee_of(&self, o: &Operand) -> Callee {
+    pub(super) fn callee_of(&self, o: &Operand) -> Callee {
         let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a thread call takes a callable value") };
         // The callable may sit in a field: a closure held in a local
         // is a field of the enclosing closure's env, and a tuple or
@@ -860,7 +874,7 @@ impl FnGen<'_, '_, '_> {
 
     /// A call of `callee` (its env or fn pointer value at `env`) with the
     /// argument expressions, into a fresh variable written to `out`.
-    fn callee_call_c(&mut self, out: &mut String, callee: &Callee, env: &str, args: &[String]) -> String {
+    pub(super) fn callee_call_c(&mut self, out: &mut String, callee: &Callee, env: &str, args: &[String]) -> String {
         match callee {
             Callee::Closure(f, once) => {
                 let e = if *once { env.to_string() } else { format!("&{env}") };

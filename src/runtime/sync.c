@@ -40,15 +40,15 @@ extern void atomic_signal_fence(int);
 
 #define LUST_ATOMIC_WIDTH(N, U, S)                                                                                     \
     U lust_at_load_##N(U *p, uint32_t o, lust_loc loc) LUST_BODY({                                                    \
-        if (o == 1) lust_panic_std("there is no such thing as a release load", LUST_ATOMIC_RS "3997:24");                                       \
-        if (o == 3) lust_panic_std("there is no such thing as an acquire-release load", LUST_ATOMIC_RS "3998:23");                        \
+        if (o == 1) lust_panic_std_lit("there is no such thing as a release load", LUST_ATOMIC_RS "3997:24");                                       \
+        if (o == 3) lust_panic_std_lit("there is no such thing as an acquire-release load", LUST_ATOMIC_RS "3998:23");                        \
         U r;                                                                                                           \
         __atomic_load(p, &r, LUST_MO(o));                                                                              \
         return r;                                                                                                      \
     })                                                                                                                 \
     void lust_at_store_##N(U *p, U v, uint32_t o, lust_loc loc) LUST_BODY({                                           \
-        if (o == 2) lust_panic_std("there is no such thing as an acquire store", LUST_ATOMIC_RS "3981:24");                                   \
-        if (o == 3) lust_panic_std("there is no such thing as an acquire-release store", LUST_ATOMIC_RS "3982:23");                       \
+        if (o == 2) lust_panic_std_lit("there is no such thing as an acquire store", LUST_ATOMIC_RS "3981:24");                                   \
+        if (o == 3) lust_panic_std_lit("there is no such thing as an acquire-release store", LUST_ATOMIC_RS "3982:23");                       \
         __atomic_store(p, &v, LUST_MO(o));                                                                             \
     })                                                                                                                 \
     U lust_at_swap_##N(U *p, U v, uint32_t o) LUST_BODY({                                                             \
@@ -57,8 +57,8 @@ extern void atomic_signal_fence(int);
         return r;                                                                                                      \
     })                                                                                                                 \
     int lust_at_cas_##N(U *p, U cur, U nv, uint32_t s, uint32_t f, U *old, int weak) LUST_BODY({                      \
-        if (f == 3) lust_panic_std("there is no such thing as an acquire-release failure ordering", weak ? LUST_ATOMIC_RS "4184:28" : LUST_ATOMIC_RS "4118:28");            \
-        if (f == 1) lust_panic_std("there is no such thing as a release failure ordering", weak ? LUST_ATOMIC_RS "4185:29" : LUST_ATOMIC_RS "4119:29");                     \
+        if (f == 3) lust_panic_std_lit("there is no such thing as an acquire-release failure ordering", weak ? LUST_ATOMIC_RS "4184:28" : LUST_ATOMIC_RS "4118:28");            \
+        if (f == 1) lust_panic_std_lit("there is no such thing as a release failure ordering", weak ? LUST_ATOMIC_RS "4185:29" : LUST_ATOMIC_RS "4119:29");                     \
         U e = cur;                                                                                                     \
         int ok = __atomic_compare_exchange(p, &e, &nv, 0, LUST_MO_CAS(s, f), LUST_MO(f));                              \
         *old = e;                                                                                                      \
@@ -123,13 +123,13 @@ uint8_t lust_at_fetch_bnand_1(uint8_t *p, uint8_t v, uint32_t o) LUST_BODY({
 
 void lust_at_fence(uint32_t o, lust_loc loc) LUST_BODY({
     (void)loc;
-    if (o == 0) lust_panic_std("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4497:24");
+    if (o == 0) lust_panic_std_lit("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4497:24");
     LUST_THREAD_FENCE(LUST_MO(o));
 })
 
 void lust_at_compiler_fence(uint32_t o, lust_loc loc) LUST_BODY({
     (void)loc;
-    if (o == 0) lust_panic_std("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4582:24");
+    if (o == 0) lust_panic_std_lit("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4582:24");
     LUST_SIGNAL_FENCE(LUST_MO(o));
 })
 
@@ -448,7 +448,7 @@ void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
     h->th = t;
     h->rc = 2;
     h->done = 0;
-    if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr("failed to spawn thread", loc);
+    if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr_owned("failed to spawn thread", loc);
 })
 
 /* Waits for the thread; the caller then moves the result out and calls

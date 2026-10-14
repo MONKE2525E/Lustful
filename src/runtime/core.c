@@ -11,7 +11,8 @@ void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abo
    isize::MAX, or a length sum that wraps usize. Defined before the
    String and Vec cores that call it. */
 void lust_panic_std(const char *msg, const char *where); /* panic.c, included below */
-void lust_vec_capacity_overflow(void) LUST_BODY({ lust_panic_std("capacity overflow", "alloc/src/raw_vec/mod.rs:28:5"); })
+void lust_panic_std_lit(const char *msg, const char *where);
+void lust_vec_capacity_overflow(void) LUST_BODY({ lust_panic_std_lit("capacity overflow", "alloc/src/raw_vec/mod.rs:28:5"); })
 
 void lust_oom_size(uint64_t n) LUST_BODY({
     fprintf(stderr, "memory allocation of %llu bytes failed\n", (unsigned long long)n);
@@ -564,7 +565,7 @@ uint32_t lust_shift_amount(uint64_t b, uint32_t bits, const char *op, lust_loc l
         lust_string_push_cstr(&s, "attempt to shift ");
         lust_string_push_cstr(&s, op);
         lust_string_push_cstr(&s, " with overflow");
-        lust_panic(&s, loc);
+        lust_panic_lit(&s, loc);
         return 0;
     }
     return (uint32_t)b;

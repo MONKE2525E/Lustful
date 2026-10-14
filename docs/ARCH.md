@@ -3742,6 +3742,35 @@ These parts differ from the plan, and why:
   "thread local panicked on drop" line. `main` that ends by a panic
   exits 101 after TLS destructors and the stdout flush.
 
+- Catch and payloads (slice 2). `catch_unwind`, `resume_unwind`, and
+  `panic_any` are compiler-known (check/unwind.rs, lower/unwind.rs,
+  cgen/unwind.rs); `catch_unwind`'s call is lowered with no cleanup
+  successor, which is the catch boundary: codegen calls the closure,
+  and a pending exception becomes `Err(lust_unw_catch())` (the count
+  falls). `AssertUnwindSafe`, `PanicHookInfo`, `set_hook`, `take_hook`,
+  and the `UnwindSafe`/`RefUnwindSafe` marker traits are std source
+  (library/std/src/panic.rs, an overlay). Payload types follow rustc:
+  a `&'static str` when the message is a literal after W-STD-B's
+  literal-argument inlining (and for core's literal messages:
+  overflow, division by zero, unwrap on None, assert without
+  arguments), else a `String`. The runtime builds the `Box<dyn Any +
+  Send>` of those two itself, with vtables over the two type ids main
+  passes in (`lust_unw_init`).
+- Hooks. The hook lives in the runtime as the bytes of std's
+  `Option<Box<dyn Fn(&PanicHookInfo) + Sync + Send>>` (std-only
+  intrinsics `panic_hook_swap`/`panic_hook_ref`). A panic with a hook
+  installed calls std's `__lust_run_hook`, whose slot main registers;
+  `PanicHookInfo` reads the payload and location from the runtime's
+  thread state (lust's region model ties a stored reference to the
+  struct's lifetime). The hook runs in both modes; a panic inside it
+  aborts with Rust's text. `thread::panicking()` reads the runtime in
+  both modes.
+- Unwind safety. `UnwindSafe` and `RefUnwindSafe` answer from one
+  fixed table (check/unwind.rs header), measured against rustc 1.99
+  with one probe per std type; an answer that needs an unknown type
+  rejects (L0820) instead of guessing. `catch_unwind` checks its
+  closure at body end (L0612, rustc E0277).
+
 ### 7.3 Threads, TLS, atomics, sync
 
 - Runtime: pthreads through tcclib-linked libc.

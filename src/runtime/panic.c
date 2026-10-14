@@ -85,6 +85,9 @@ typedef struct {
        modes. */
     int32_t in_fmt;
     int32_t msg_dyn;
+    /* While a custom hook runs: its panic's payload and location. */
+    lust_dyn hook_payload;
+    void *hook_loc;
 } lust_unw_state;
 static unsigned int lust_unw_key;
 static int lust_unw_once;
@@ -115,6 +118,20 @@ static lust_unw_state *lust_unw_peek(void) {
     if (!ready) return 0;
     return (lust_unw_state *)pthread_getspecific(lust_unw_key);
 }
+/* A panic while a panic message formats (std formats it lazily, inside
+   the panic): Rust's nested-panic abort, printing the inner message
+   (blank when it has arguments: `msg_dyn`). Else clears `msg_dyn`. */
+static void lust_fmt_nested_check(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
+    lust_unw_state *st = lust_unw_peek();
+    if (st && st->in_fmt) {
+        fprintf(stderr, "panicked at %s:%u:%u:\n%.*s\nthread panicked while processing panic. aborting.\n", file, (unsigned)line, (unsigned)col,
+                st->msg_dyn ? 0 : (int)len, (const char *)msg);
+        fflush(stderr);
+        abort();
+    }
+    if (st) st->msg_dyn = 0;
+}
+
 static void lust_unw_set_pending(lust_unw_state *s, lust_exc *ex) {
     s->exc = *ex;
     s->pending = 1;
@@ -129,8 +146,8 @@ static int32_t lust_first_panic_take(void) {
 }
 
 /* The default hook's text (std's default_hook) on the current thread. */
-static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col, int32_t count) {
-    fprintf(stderr, "\nthread 'main' (%llu) panicked at %s:%u:%u:\n%.*s\n", lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len,
+static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file, uint64_t flen, uint32_t line, uint32_t col, int32_t count) {
+    fprintf(stderr, "\nthread 'main' (%llu) panicked at %.*s:%u:%u:\n%.*s\n", lust_os_tid(), (int)flen, file, (unsigned)line, (unsigned)col, (int)len,
             (const char *)msg);
     /* A panic while panicking prints a full backtrace in Rust; lust has no
        frames to print, only the header. */
@@ -139,22 +156,146 @@ static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file
     fflush(stderr);
 }
 
-/* Starts a panic in unwind mode: the hook, then the exception pending. */
-static void lust_unw_raise(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
+/* The type ids of `&'static str` and `String` (check/any.rs) and the
+   Box<dyn Any + Send> vtables of the two message payloads (drop, size,
+   align, type id words: check/object.rs). Main sets them when the
+   program unwinds or installs a hook (`lust_unw_init`). */
+static uint64_t lust_any_ids[4];
+static const void *lust_vt_str[5], *lust_vt_string[5];
+
+/* `panic::set_hook` (std source, library/std/src/panic.rs): while a hook
+   is installed, a panic calls the std runner with the payload and
+   location, which calls the hook. Main registers the runner. */
+typedef struct { lust_str file; uint32_t line, col; } lust_location;
+static int32_t lust_hook_on;
+static lust_Unit (*lust_hook_runner)(uint8_t can_unwind);
+
+/* Runs the hook for a panic starting with payload `ex` (message text
+   `msg`), as std's rust_panic_with_hook: a panic inside the hook aborts
+   at once; else the custom hook, or the default text. */
+static void lust_run_hook(lust_exc *ex, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col, int32_t count, int32_t *in_hook) {
+    if (*in_hook) {
+        fprintf(stderr, "panicked at %s:%u:%u:\n%.*s\nthread panicked while processing panic. aborting.\n", file, (unsigned)line, (unsigned)col, (int)len, (const char *)msg);
+        fflush(stderr);
+        abort();
+    }
+    *in_hook = 1;
+    if (lust_hook_on && lust_hook_runner) {
+        lust_location loc;
+        loc.file.ptr = (uint8_t *)file;
+        loc.file.len = strlen(file);
+        loc.line = line;
+        loc.col = col;
+        lust_str sv = ex->s;
+        lust_String so;
+        so.ptr = ex->s.ptr;
+        so.len = ex->s.len;
+        so.cap = ex->s.len;
+        lust_dyn p;
+        if (ex->kind == LUST_EXC_BOX) p = ex->box;
+        else if (ex->kind == LUST_EXC_STR) { p.data = &sv; p.vt = lust_vt_str; }
+        else { p.data = &so; p.vt = lust_vt_string; }
+        lust_unw_state *st = lust_unw_get();
+        st->hook_payload = p;
+        st->hook_loc = &loc;
+        lust_hook_runner(lust_unwind_mode ? 1 : 0);
+        st->hook_loc = 0;
+    } else {
+        lust_default_hook(msg, len, file, strlen(file), line, col, count);
+    }
+    *in_hook = 0;
+}
+
+/* A panic under panic=abort with a hook installed: the hook, then abort
+   (no hook: callers print the default text themselves). */
+static void lust_abort_hooked(lust_exc *ex, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
+    lust_unw_state *s = lust_unw_get();
+    if (!s->in_hook) s->count++;
+    lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
+    fflush(stderr);
+    abort();
+}
+
+/* Starts a panic in unwind mode: the hook (with `msg`, the payload's
+   text), then `ex` pending. */
+static void lust_unw_raise_exc(lust_exc *ex, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
     lust_unw_state *s = lust_unw_get();
     if (s->pending) return;
-    s->count++;
-    s->in_hook = 1;
-    lust_default_hook(msg, len, file, line, col, s->count);
-    s->in_hook = 0;
+    if (!s->in_hook) s->count++;
+    lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
+    lust_unw_set_pending(s, ex);
+}
+
+/* A message panic: the payload is a `&'static str` (LUST_EXC_STR, when
+   Rust's message is a literal) or a `String` with the message. A STR
+   payload keeps its copy for the rest of the run, as a static does. */
+/* The copies behind STR payloads: they live to the end of the run, on
+   this list so they stay reachable. */
+typedef struct lust_static_msg { struct lust_static_msg *next; uint8_t bytes[]; } lust_static_msg;
+static lust_static_msg *lust_static_msgs;
+static uint8_t *lust_static_copy(const uint8_t *msg, uint64_t len) {
+    lust_static_msg *m = (lust_static_msg *)malloc(sizeof(lust_static_msg) + len + 1);
+    if (!m) abort();
+    if (len) memcpy(m->bytes, msg, len);
+    lust_static_msg *head;
+    do { __atomic_load(&lust_static_msgs, &head, 2); m->next = head; } while (!__atomic_compare_exchange(&lust_static_msgs, &head, &m, 0, 3, 2));
+    return m->bytes;
+}
+
+static void lust_unw_raise(uint32_t kind, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
     lust_exc ex;
-    ex.kind = LUST_EXC_STRING;
-    ex.s.ptr = (uint8_t *)lust_alloc(len, 1);
-    if (len) memcpy(ex.s.ptr, msg, len);
+    ex.kind = kind;
+    ex.box.data = 0;
+    ex.box.vt = 0;
+    if (!lust_unwind_mode) {
+        ex.s.ptr = (uint8_t *)msg;
+        ex.s.len = len;
+        lust_abort_hooked(&ex, msg, len, file, line, col);
+    }
+    if (kind == LUST_EXC_STR) {
+        ex.s.ptr = lust_static_copy(msg, len);
+    } else {
+        ex.s.ptr = (uint8_t *)lust_alloc(len, 1);
+        if (len) memcpy(ex.s.ptr, msg, len);
+    }
     ex.s.len = len;
     ex.box.data = 0;
     ex.box.vt = 0;
-    lust_unw_set_pending(s, &ex);
+    lust_unw_raise_exc(&ex, msg, len, file, line, col);
+}
+
+/* The text of a payload, as std's default hook finds it: a `&str` or a
+   `String`, else "Box<dyn Any>". */
+static lust_str lust_exc_text(lust_exc *ex) {
+    lust_str r = ex->s;
+    if (ex->kind != LUST_EXC_BOX) return r;
+    const void *const *vt = ex->box.vt;
+    uint64_t lo = (uint64_t)(uintptr_t)vt[3], hi = (uint64_t)(uintptr_t)vt[4];
+    if (lo == lust_any_ids[0] && hi == lust_any_ids[1]) return *(lust_str *)ex->box.data;
+    if (lo == lust_any_ids[2] && hi == lust_any_ids[3]) return lust_string_as_str((lust_String *)ex->box.data);
+    r.ptr = (uint8_t *)"Box<dyn Any>";
+    r.len = 12;
+    return r;
+}
+
+/* The payload as the Box<dyn Any + Send> a catch returns. */
+static lust_dyn lust_exc_box(lust_exc *ex) {
+    lust_dyn d;
+    if (ex->kind == LUST_EXC_BOX) return ex->box;
+    if (ex->kind == LUST_EXC_STR) {
+        lust_str *p = (lust_str *)lust_alloc(sizeof(lust_str), 8);
+        *p = ex->s;
+        d.data = p;
+        d.vt = lust_vt_str;
+        return d;
+    }
+    lust_String *p = (lust_String *)lust_alloc(sizeof(lust_String), 8);
+    p->ptr = ex->s.ptr;
+    p->len = ex->s.len;
+    p->cap = ex->s.len;
+    d.data = p;
+    d.vt = lust_vt_string;
+    return d;
 }
 
 /* Frees an exception's payload (an uncaught one at a thread root). */
@@ -213,6 +354,95 @@ void lust_unw_dstep(lust_exc *ex, int32_t *u) LUST_BODY({
     *u = 1;
 })
 
+/* Setup from main: the payload type ids (see lust_any_ids), and whether
+   panics unwind. */
+void lust_unw_init(int32_t unwind, uint64_t str_lo, uint64_t str_hi, uint64_t string_lo, uint64_t string_hi) LUST_BODY({
+    lust_unwind_mode = unwind;
+    lust_any_ids[0] = str_lo;
+    lust_any_ids[1] = str_hi;
+    lust_any_ids[2] = string_lo;
+    lust_any_ids[3] = string_hi;
+    lust_vt_str[0] = 0;
+    lust_vt_str[1] = (const void *)(uintptr_t)sizeof(lust_str);
+    lust_vt_str[2] = (const void *)(uintptr_t)8;
+    lust_vt_str[3] = (const void *)(uintptr_t)str_lo;
+    lust_vt_str[4] = (const void *)(uintptr_t)str_hi;
+    lust_vt_string[0] = (const void *)lust_string_drop;
+    lust_vt_string[1] = (const void *)(uintptr_t)sizeof(lust_String);
+    lust_vt_string[2] = (const void *)(uintptr_t)8;
+    lust_vt_string[3] = (const void *)(uintptr_t)string_lo;
+    lust_vt_string[4] = (const void *)(uintptr_t)string_hi;
+})
+
+#ifdef LUST_IMPL
+/* std's hook (`Option<Box<dyn Fn(&PanicHookInfo) + Sync + Send>>`, std
+   source), stored here as bytes: all zero is None. */
+static uint64_t lust_hook_bytes[4];
+static int32_t lust_hook_lock;
+#endif
+
+/* `core::intrinsics::panic_hook_swap`: swaps `n` bytes at `v` with the
+   hook slot. */
+void lust_hook_swap(void *v, uint64_t n) LUST_BODY({
+    int32_t one = 1, zero = 0, old;
+    do { __atomic_exchange(&lust_hook_lock, &one, &old, 2); } while (old);
+    uint8_t tmp[sizeof lust_hook_bytes];
+    if (n > sizeof tmp) abort();
+    memcpy(tmp, lust_hook_bytes, n);
+    memcpy(lust_hook_bytes, v, n);
+    memcpy(v, tmp, n);
+    __atomic_store(&lust_hook_lock, &zero, 3);
+})
+
+/* `core::intrinsics::panic_hook_ref`: the hook slot. */
+void *lust_hook_slot(void) LUST_BODY({ return lust_hook_bytes; })
+
+/* Main registers set_hook's runner (`__lust_run_hook`'s slot). */
+void lust_hook_set_runner(lust_fnptr f) LUST_BODY({ lust_hook_runner = (lust_Unit (*)(uint8_t))f; })
+
+/* `core::intrinsics::panic_hook_payload` and `panic_hook_location`: the
+   panic the calling thread's hook runs for. */
+lust_dyn lust_hook_payload(void) LUST_BODY({ return lust_unw_get()->hook_payload; })
+void *lust_hook_location(void) LUST_BODY({ return lust_unw_get()->hook_loc; })
+
+/* `core::intrinsics::panic_hook_custom`: set_hook installed a hook (1),
+   or take_hook removed it (0). */
+void lust_hook_custom(uint8_t on) LUST_BODY({
+    int32_t v = on;
+    __atomic_store(&lust_hook_on, &v, 3);
+})
+
+/* `core::intrinsics::panic_default_hook`: std's default hook text, for a
+   hook that `take_hook` returned (on the calling thread's panic). */
+void lust_hook_default(lust_str file, uint32_t line, uint32_t col, lust_str msg) LUST_BODY({
+    lust_unw_state *s = lust_unw_peek();
+    lust_default_hook(msg.ptr, msg.len, (const char *)file.ptr, file.len, line, col, s ? s->count : 1);
+})
+
+/* `catch_unwind`'s Err: takes the calling thread's pending exception
+   (the caller saw `lust_unw_mine`), ends its panic (the count falls), and
+   returns the payload as a Box<dyn Any + Send>. */
+lust_dyn lust_unw_catch(void) LUST_BODY({
+    lust_exc ex;
+    lust_unw_take(&ex);
+    lust_unw_get()->count--;
+    return lust_exc_box(&ex);
+})
+
+/* `resume_unwind(payload)`: the payload unwinds again with no hook. */
+void lust_unw_resume_box(lust_dyn b) LUST_BODY({
+    if (!lust_unwind_mode) abort();
+    lust_unw_state *s = lust_unw_get();
+    if (s->pending) return;
+    s->count++;
+    lust_exc ex;
+    ex.kind = LUST_EXC_BOX;
+    ex.box = b;
+    ex.s.ptr = 0;
+    ex.s.len = 0;
+    lust_unw_set_pending(s, &ex);
+})
+
 /* After `main` returns: 101 when it ended by a panic (std's lang_start
    catches it and drops the payload), else 0. */
 int32_t lust_unw_main_exit(void) LUST_BODY({
@@ -225,16 +455,9 @@ int32_t lust_unw_main_exit(void) LUST_BODY({
 /* Prints the default hook text for `msg` at `file:line:col` and aborts;
    in unwind mode it raises the panic and returns. */
 void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) LUST_BODY({
-    lust_unw_state *st = lust_unw_peek();
-    if (st && st->in_fmt) {
-        fprintf(stderr, "panicked at %s:%u:%u:\n%.*s\nthread panicked while processing panic. aborting.\n", file, (unsigned)line, (unsigned)col,
-                st->msg_dyn ? 0 : (int)len, (const char *)msg);
-        fflush(stderr);
-        abort();
-    }
-    if (st) st->msg_dyn = 0;
-    if (lust_unwind_mode) {
-        lust_unw_raise(msg, len, file, line, col);
+    lust_fmt_nested_check(msg, len, file, line, col);
+    if (lust_unwind_mode || lust_hook_on) {
+        lust_unw_raise(LUST_EXC_STRING, msg, len, file, line, col);
         return;
     }
     fprintf(stderr, "\nthread 'main' (%llu) panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
@@ -277,14 +500,42 @@ const char *const *lust_files;
 const uint32_t *lust_slot_file;
 #endif
 
-void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
+#ifdef LUST_IMPL
+/* A message panic at a packed location; `kind` is the unwind payload's
+   type (LUST_EXC_STR or LUST_EXC_STRING), as Rust picks it per site. */
+static void lust_panic_kind(uint32_t kind, const uint8_t *p, uint64_t n, lust_loc loc) {
     uint32_t slot = (uint32_t)(loc >> 40);
+    const char *file;
+    uint32_t line;
     if (slot >= LUST_STD_SLOT) {
-        lust_panic_at(msg->ptr, msg->len, lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW], (loc >> 20) & 0xFFFFF, loc & 0xFFFFF);
+        file = lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW];
+        line = (loc >> 20) & 0xFFFFF;
+    } else {
+        file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
+        line = lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF);
+    }
+    if (lust_unwind_mode || lust_hook_on) {
+        lust_fmt_nested_check(p, n, file, line, loc & 0xFFFFF);
+        lust_unw_raise(kind, p, n, file, line, loc & 0xFFFFF);
         return;
     }
-    const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
-    lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF), loc & 0xFFFFF);
+    lust_panic_at(p, n, file, line, loc & 0xFFFFF);
+}
+#endif
+
+/* A panic with a formatted message (a `String` payload). Takes `msg`:
+   the payload holds a copy, and in unwind mode the caller's temporary is
+   freed here, as the code after the panic never runs. */
+void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
+    lust_panic_kind(LUST_EXC_STRING, msg->ptr, msg->len, loc);
+    lust_string_drop(msg);
+})
+
+/* A panic whose message Rust writes as a literal (a `&'static str`
+   payload): `panic!("text")`, overflow, unwrap on None. Takes `msg`. */
+void lust_panic_lit(lust_String *msg, lust_loc loc) LUST_BODY({
+    lust_panic_kind(LUST_EXC_STR, msg->ptr, msg->len, loc);
+    lust_string_drop(msg);
 })
 
 /* A panic whose message has arguments (`panic!("{}", x)`, assert_eq!,
@@ -323,11 +574,12 @@ void lust_panic_str(lust_str msg, lust_loc loc) LUST_BODY({
     lust_panic(&s, loc);
 })
 
-void lust_panic_cstr(const char *msg, lust_loc loc) LUST_BODY({
-    lust_String s = lust_string_new();
-    lust_string_push_cstr(&s, msg);
-    lust_panic(&s, loc);
-})
+/* A literal message (a `&'static str` payload). */
+void lust_panic_cstr(const char *msg, lust_loc loc) LUST_BODY({ lust_panic_kind(LUST_EXC_STR, (const uint8_t *)msg, strlen(msg), loc); })
+
+/* A fixed message Rust formats at run time (a `String` payload: RefCell's
+   borrow errors, `expect` texts). */
+void lust_panic_cstr_owned(const char *msg, lust_loc loc) LUST_BODY({ lust_panic_kind(LUST_EXC_STRING, (const uint8_t *)msg, strlen(msg), loc); })
 
 /* "attempt to <op> with overflow" (checked integer math). */
 void lust_ovf(const char *op, lust_loc loc) LUST_BODY({
@@ -337,32 +589,60 @@ void lust_ovf(const char *op, lust_loc loc) LUST_BODY({
     lust_string_push_cstr(&s, "attempt to ");
     lust_string_push_cstr(&s, op);
     lust_string_push_cstr(&s, " with overflow");
-    lust_panic(&s, loc);
+    lust_panic_lit(&s, loc);
 })
 
 /* A panic Rust raises at a fixed line of its own std source: `where` is
    "path:line:col" under library/. */
-void lust_panic_std(const char *msg, const char *where) LUST_BODY({
+#ifdef LUST_IMPL
+static void lust_panic_std_kind(uint32_t kind, const char *msg, const char *where) {
     lust_unw_state *st = lust_unw_peek();
     if (st && st->in_fmt) {
         fprintf(stderr, "panicked at " LUST_STD_SRC "%s:\n%s\nthread panicked while processing panic. aborting.\n", where, msg);
         fflush(stderr);
         abort();
     }
-    if (lust_unwind_mode) {
+    if (lust_unwind_mode || lust_hook_on) {
         /* `where` is "path:line:col"; split it for the hook. */
         const char *c2 = strrchr(where, ':'), *c1 = c2;
         while (c1 > where && c1[-1] != ':') c1--;
         char file[256];
         int n = snprintf(file, sizeof file, LUST_STD_SRC "%.*s", (int)(c1 - 1 - where), where);
         (void)n;
-        lust_unw_raise((const uint8_t *)msg, strlen(msg), file, (uint32_t)strtoul(c1, 0, 10), (uint32_t)strtoul(c2 + 1, 0, 10));
+        lust_unw_raise(kind, (const uint8_t *)msg, strlen(msg), file, (uint32_t)strtoul(c1, 0, 10), (uint32_t)strtoul(c2 + 1, 0, 10));
         return;
     }
     fprintf(stderr, "\nthread 'main' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
             lust_os_tid(), where, msg);
     fflush(stderr);
     abort();
+}
+#endif
+
+/* A panic Rust raises with a formatted message (a `String` payload) at a
+   fixed line of its own std source: `where` is "path:line:col" under
+   library/. */
+void lust_panic_std(const char *msg, const char *where) LUST_BODY({ lust_panic_std_kind(LUST_EXC_STRING, msg, where); })
+
+/* As lust_panic_std, for a message std writes as a literal (a `&str`
+   payload: RawVec's capacity overflow, the atomic ordering checks). */
+void lust_panic_std_lit(const char *msg, const char *where) LUST_BODY({ lust_panic_std_kind(LUST_EXC_STR, msg, where); })
+
+/* `panic_any(payload)`: the hook prints the payload's text, then it
+   unwinds (abort mode: aborts). */
+void lust_panic_box(lust_dyn b, lust_loc loc) LUST_BODY({
+    lust_exc ex;
+    ex.kind = LUST_EXC_BOX;
+    ex.box = b;
+    ex.s.ptr = 0;
+    ex.s.len = 0;
+    lust_str t = lust_exc_text(&ex);
+    uint32_t slot = (uint32_t)(loc >> 40);
+    const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
+    uint32_t line = lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF);
+    if (lust_unwind_mode) lust_unw_raise_exc(&ex, t.ptr, t.len, file, line, loc & 0xFFFFF);
+    else if (lust_hook_on) lust_abort_hooked(&ex, t.ptr, t.len, file, line, loc & 0xFFFFF);
+    else lust_panic_kind(LUST_EXC_STR, t.ptr, t.len, loc);
 })
 
 /* ---------- Stdout as Rust's LineWriter ----------

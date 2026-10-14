@@ -119,8 +119,10 @@ def probe_one(path, lust, tmp, env):
     if deps:
         return probe_package(path, deps, lust, tmp, env, res)
     lust_only = head.get("oracle") == "lust-only"
+    panic = head.get("rustc-panic", "abort")
+    # A probe that needs unwinding builds lust with the same strategy.
+    mode = ["-C", "panic=unwind"] if panic == "unwind" else []
     if not lust_only:
-        panic = head.get("rustc-panic", "abort")
         rbin = tmp / (path.stem + ".rustc")
         code, _, err = run(
             ["rustc", "--edition", "2024", "-C", f"panic={panic}", "-o", str(rbin), str(path)],
@@ -132,12 +134,12 @@ def probe_one(path, lust, tmp, env):
         rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT)
         res["rustc_stdout"] = rout
         res["rustc_exit"] = rcode
-    ccode, _, cerr = run([str(lust), "check", str(path)], COMPILE_TIMEOUT, env)
+    ccode, _, cerr = run([str(lust), "check", *mode, str(path)], COMPILE_TIMEOUT, env)
     res["lust_code"] = first_code(cerr)
     if ccode != 0:
         res["verdict"] = "reject"
         return res
-    lcode, lout, lerr = run([str(lust), "run", str(path)], COMPILE_TIMEOUT, env)
+    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env)
     res["lust_stdout"] = lout
     res["lust_exit"] = lcode
     if lust_only:

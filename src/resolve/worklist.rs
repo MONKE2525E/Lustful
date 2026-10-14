@@ -4868,6 +4868,17 @@ impl Rewrite<'_> {
                 {
                     let res = self.tables.resolve_path(module, &full, ns, PathMode::Lexical, true, self.interner);
                     self.apply(segs, res, span, module, ns, scopes);
+                    return;
+                }
+                // An alias of a std module whose item a std source module
+                // defines (`use std::panic; panic::set_hook(..)`,
+                // `use std::sync; sync::LazyLock`) walks into it, as the
+                // full path does (W-UNWIND).
+                if !self.tables.std_modules.is_empty() && full.len() >= 3 {
+                    let res = self.tables.resolve_path(module, &full, ns, PathMode::Lexical, true, self.interner);
+                    if matches!(res, PathRes::Done(t) if !matches!(t, Target::Extern(_))) {
+                        self.apply(segs, res, span, module, ns, scopes);
+                    }
                 }
                 return;
             }

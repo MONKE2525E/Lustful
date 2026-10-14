@@ -6101,7 +6101,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.debug),
         TyKind::Float(_) => true,
-        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        // `impl Debug for !` (a `catch_unwind` of a closure that always
+        // panics gives `Result<!, _>`).
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error | TyKind::Never => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => glue_debug(p, tys, e, seen),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
