@@ -5065,18 +5065,27 @@ mod tests {
     #[test]
     fn deep_chain_lowers_to_linear_ir() {
         let links = 400;
-        let src = format!("fn main() {{ println!(\"{{}}\", 5i64{}); }}\n", ".abs()".repeat(links));
-        let interner = Interner::default();
-        let known = Known::new(&interner);
-        let lexed = lexer::lex(&src, FileId(0), 0, &interner).unwrap();
-        let ast = parser::parse(&lexed, &interner, &known).unwrap();
-        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = crate::check::collect::collect(&ast, &interner, &known, ids).unwrap();
-        let main = program.main.unwrap();
-        let (ck, errs) = crate::check::check_fn(&program, main);
-        assert!(errs.is_empty(), "{errs:?}");
-        let body = lower(&program, main, ck);
-        let stmts: usize = body.blocks.iter().map(|b| b.stmts.len()).sum();
-        assert!(stmts < 20 * links, "linear IR for a {links}-link chain, got {stmts} statements in {} blocks", body.blocks.len());
+        // Lowering a deep chain recurses over the expression spine,
+        // as it does on the driver's pool threads: use their stack.
+        let (stmts, blocks) = std::thread::Builder::new()
+            .stack_size(crate::pool::STACK_SIZE)
+            .spawn(move || {
+                let src = format!("fn main() {{ println!(\"{{}}\", 5i64{}); }}\n", ".abs()".repeat(links));
+                let interner = Interner::default();
+                let known = Known::new(&interner);
+                let lexed = lexer::lex(&src, FileId(0), 0, &interner).unwrap();
+                let ast = parser::parse(&lexed, &interner, &known).unwrap();
+                let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+                let program = crate::check::collect::collect(&ast, &interner, &known, ids).unwrap();
+                let main = program.main.unwrap();
+                let (ck, errs) = crate::check::check_fn(&program, main);
+                assert!(errs.is_empty(), "{errs:?}");
+                let body = lower(&program, main, ck);
+                (body.blocks.iter().map(|b| b.stmts.len()).sum::<usize>(), body.blocks.len())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(stmts < 20 * links, "linear IR for a {links}-link chain, got {stmts} statements in {blocks} blocks");
     }
 }
