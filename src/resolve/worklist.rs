@@ -1414,7 +1414,11 @@ struct FileDisc {
     file_id: FileId,
     /// The module this file's top-level items belong to.
     module: ModuleId,
-    is_root: bool,
+    /// True when this file's submodules live in its own directory for a
+    /// reason its name does not show: it is the crate root, or the
+    /// `mod` declaration that loaded it carried a `#[path]` attribute
+    /// (such a file owns its directory like `mod.rs`, as in rustc).
+    dir_owner: bool,
     /// The `mod` declaration that loaded this file (none at the root).
     parent: Option<ParentDecl>,
     lexed: Option<lexer::Lexed>,
@@ -1455,7 +1459,7 @@ fn outline_mods(
     interner: &Interner,
     diags: &mut Vec<Diag>,
 ) -> FxMap<Vec<Sym>, ModuleId> {
-    let (file_path, file_module, is_root) = (discs[di].path.clone(), discs[di].module, discs[di].is_root);
+    let (file_path, file_module, dir_owner) = (discs[di].path.clone(), discs[di].module, discs[di].dir_owner);
     let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
     inline_modules.insert(Vec::new(), file_module);
     // Inline module paths a cfg turned off: a declaration inside one
@@ -1504,7 +1508,7 @@ fn outline_mods(
             inline_modules.insert(key, child);
         } else if existing.is_none() {
             let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
-            match modules::module_file(&file_path, is_root, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
+            match modules::module_file(&file_path, dir_owner, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
                 Ok(f) => {
                     let fcanon = modules::canonical_string(&f);
                     let ftext = match shared.text_by_path.get(&fcanon) {
@@ -1531,7 +1535,7 @@ fn outline_mods(
                         text: ftext,
                         file_id,
                         module: child,
-                        is_root: false,
+                        dir_owner: decl.path_attr.is_some(),
                         parent: Some(ParentDecl {
                             disc: di,
                             container: decl.container.clone(),
@@ -2380,7 +2384,7 @@ fn resolve_one(
         text: input.root_text.clone(),
         file_id: root_file_id,
         module: job.root_module,
-        is_root: true,
+        dir_owner: true,
         parent: None,
         lexed: None,
         outline: scan::Outline::default(),
@@ -2443,6 +2447,7 @@ fn resolve_one(
                 src: &text,
                 cfg: expand_cfg(&input.env),
                 module_path: module_paths[di].clone(),
+                crate_name: Some(input.crate_name.clone()),
                 client,
             };
             let spliced = menv.splice(di, orig, job);

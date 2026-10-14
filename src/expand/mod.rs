@@ -633,6 +633,11 @@ pub struct ExpandCtx<'a> {
     /// resolve worklist sets it per module file so `super::mac!`,
     /// `self::mac!`, and prescan module tables read from the right module.
     pub module_path: Vec<Sym>,
+    /// The crate name `module_path!` starts with. The resolve worklist
+    /// sets it from the crate being resolved (the Cargo package or the
+    /// single-file crate name); None falls back to the current file's
+    /// stem, which is right only for a crate root file.
+    pub crate_name: Option<String>,
     /// The requesting client's env and shown paths (`for_file` gives `ClientView::PROCESS`).
     pub client: &'a ClientView,
 }
@@ -686,12 +691,17 @@ impl<'a> ExpandCtx<'a> {
             src,
             cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new() },
             module_path: Vec::new(),
+            crate_name: None,
             client: &ClientView::PROCESS,
         }
     }
-    /// The crate name `module_path!` starts with: the file stem, with
-    /// `-` read as `_`, as rustc names a single-file crate.
+    /// The crate name `module_path!` starts with: the name the resolve
+    /// worklist set for this crate, or the file stem with `-` read as
+    /// `_` (as rustc names a single-file crate) when none was set.
     pub fn crate_name(&self) -> String {
+        if let Some(name) = &self.crate_name {
+            return name.replace('-', "_");
+        }
         let path = std::path::Path::new(&self.file_path);
         path.file_stem().map_or_else(|| "crate".to_string(), |s| s.to_string_lossy().replace('-', "_"))
     }

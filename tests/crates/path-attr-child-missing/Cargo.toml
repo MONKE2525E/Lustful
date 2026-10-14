@@ -1,0 +1,8 @@
+# The other side: inner.rs in the stem directory is not found, as in
+# rustc (a #[path] file owns its directory).
+[package]
+name = "path-attr-child-missing"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -2,14 +2,17 @@
 //
 // A crate starts at its root file. `mod foo;` searches one directory: the
 // current file's own directory when the file is a crate root, `mod.rs`,
-// `lib.rs`, or `main.rs`; for any other file `a.rs`, the directory `a/`
-// next to it. Inline modules add one path segment each on top of the
-// search directory of the file that holds them. In the search directory,
-// `foo.rs` and `foo/mod.rs` are the two candidates: both is L0502 (there
-// is no preference order), neither is L0503. `#[path = "..."]` overrides
-// the file; it is relative to the directory of the file that holds the
+// `lib.rs`, or `main.rs`, or when the file was itself loaded by a
+// `#[path]` attribute (such a file owns its directory like `mod.rs`);
+// for any other file `a.rs`, the directory `a/` next to it. Inline
+// modules add one path segment each on top of the search directory of
+// the file that holds them. In the search directory, `foo.rs` and
+// `foo/mod.rs` are the two candidates: both is L0502 (there is no
+// preference order), neither is L0503. `#[path = "..."]` overrides the
+// file; it is relative to the directory of the file that holds the
 // `mod` item, plus the inline module path segments when the item sits in
-// inline modules, as in Rust.
+// inline modules, as in Rust. The caller passes this as `owns_dir`:
+// true for a crate root file and for a `#[path]`-loaded file.
 //
 // A file belongs to exactly one (crate, module) pair per load, but the
 // same file can be a module in two crates (shared part files): file text
@@ -18,10 +21,12 @@
 use crate::diag::{Diag, Span};
 use std::path::{Path, PathBuf};
 
-/// True when `file`'s submodules live in the file's own directory: a
-/// crate root, or a file named `mod.rs`, `lib.rs`, or `main.rs`.
-pub fn is_dir_owner(file: &Path, is_crate_root: bool) -> bool {
-    if is_crate_root {
+/// True when `file`'s submodules live in the file's own directory: the
+/// caller says the file owns its directory (a crate root or a
+/// `#[path]`-loaded file), or the file is named `mod.rs`, `lib.rs`, or
+/// `main.rs`.
+pub fn is_dir_owner(file: &Path, owns_dir: bool) -> bool {
+    if owns_dir {
         return true;
     }
     matches!(file.file_name().and_then(|n| n.to_str()), Some("mod.rs") | Some("lib.rs") | Some("main.rs"))
@@ -29,9 +34,9 @@ pub fn is_dir_owner(file: &Path, is_crate_root: bool) -> bool {
 
 /// The directory `mod foo;` searches, for a declaration in `file` inside
 /// the inline modules `inline_path` (segment names, outermost first).
-pub fn search_dir(file: &Path, is_crate_root: bool, inline_path: &[String]) -> PathBuf {
+pub fn search_dir(file: &Path, owns_dir: bool, inline_path: &[String]) -> PathBuf {
     let parent = file.parent().unwrap_or(Path::new(""));
-    let mut dir = if is_dir_owner(file, is_crate_root) {
+    let mut dir = if is_dir_owner(file, owns_dir) {
         parent.to_path_buf()
     } else {
         let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -48,15 +53,15 @@ pub fn search_dir(file: &Path, is_crate_root: bool, inline_path: &[String]) -> P
 /// `mod` item in a file module (no inline container) this is the file's
 /// own directory even when the file is not a dir owner; that is Rust's
 /// rule for `#[path]` and differs from the default search directory.
-pub fn path_attr_base(file: &Path, is_crate_root: bool, inline_path: &[String]) -> PathBuf {
+pub fn path_attr_base(file: &Path, owns_dir: bool, inline_path: &[String]) -> PathBuf {
     let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
     // A `#[path]` inside inline modules is relative to the *module*
     // directory: the search directory the inline module itself would
-    // use, which adds the file stem only for a non-dir-owner file
-    // that is not the crate root (a crate root named anything, such
-    // as `goport_util_root.rs`, searches its own directory).
+    // use, which adds the file stem only for a file that does not own
+    // its directory (a crate root named anything, such as
+    // `goport_util_root.rs`, searches its own directory).
     if !inline_path.is_empty() {
-        return search_dir(file, is_crate_root, inline_path);
+        return search_dir(file, owns_dir, inline_path);
     }
     dir
 }
@@ -67,14 +72,14 @@ pub fn path_attr_base(file: &Path, is_crate_root: bool, inline_path: &[String]) 
 /// the `#[path]` file is missing).
 pub fn module_file(
     file: &Path,
-    is_crate_root: bool,
+    owns_dir: bool,
     inline_path: &[String],
     name: &str,
     path_attr: Option<&str>,
     span: Span,
 ) -> Result<PathBuf, Diag> {
     if let Some(p) = path_attr {
-        let full = path_attr_base(file, is_crate_root, inline_path).join(p);
+        let full = path_attr_base(file, owns_dir, inline_path).join(p);
         if full.is_file() {
             return Ok(full);
         }
@@ -85,7 +90,7 @@ pub fn module_file(
             "Create the file, or fix the `#[path]` value.",
         ));
     }
-    let dir = search_dir(file, is_crate_root, inline_path);
+    let dir = search_dir(file, owns_dir, inline_path);
     let flat = dir.join(format!("{name}.rs"));
     let nested = dir.join(name).join("mod.rs");
     match (flat.is_file(), nested.is_file()) {
@@ -136,6 +141,10 @@ mod tests {
         // Inline modules add a segment each.
         assert_eq!(search_dir(&src.join("lib.rs"), true, &["inner".into()]), src.join("inner"));
         assert_eq!(search_dir(&src.join("a.rs"), false, &["inner".into()]), src.join("a/inner"));
+        // A file loaded by #[path] owns its directory like mod.rs: its
+        // children live next to it, not in a stem directory.
+        assert_eq!(search_dir(&src.join("sub/m.rs"), true, &[]), src.join("sub"));
+        assert_eq!(search_dir(&src.join("sub/m.rs"), true, &["inner".into()]), src.join("sub/inner"));
     }
 
     #[test]

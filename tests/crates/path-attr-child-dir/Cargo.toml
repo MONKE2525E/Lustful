@@ -1,0 +1,9 @@
+# A #[path]-loaded file owns its directory: its `mod inner;` searches
+# next to it (sub/inner.rs), not in a stem directory (sub/m/inner.rs).
+# module_path! in those files starts with this package's name.
+[package]
+name = "path-attr-child-dir"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
