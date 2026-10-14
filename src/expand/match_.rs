@@ -1671,7 +1671,7 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             // shape check just refused: this parser accepts a lone
             // paren macro call as a crate's last item, rustc does not.
             if ends.is_empty() && macro_call_shape(input, pos).is_none() {
-                for end in pos + 1..=input.len() {
+                for end in pos + 1..=fragment_window(kind, input, pos, usize::MAX) {
                     m.step()?;
                     if probe(m, kind, &input[pos..end]) {
                         ends.push(end);
@@ -1684,9 +1684,12 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
         }
         FragKind::Expr | FragKind::Expr2021 => {
             // One greedy parse, the way rustc's fragment parser runs:
-            // flatten the rest of the input once and ask the parser
-            // where one expression ends, instead of probing every
-            // candidate end (which is cubic on long repetitions).
+            // flatten the input once and ask the parser where one
+            // expression ends, instead of probing every candidate end
+            // (which is cubic on long repetitions). The flattened input
+            // runs past the fragment's window by a few trees, not to the
+            // end of the input (quadratic on long repetitions); see
+            // `greedy_expr_end`.
             m.step()?;
             if kind == FragKind::Expr2021
                 && (matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore)
@@ -1698,12 +1701,9 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
             } else if kind == FragKind::Expr && matches!(input.get(pos), Some(Tt::Tok(t)) if t.tok == Tok::Underscore) {
                 vec![pos + 1]
             } else {
-                let (flat, bounds) = probe_flatten_bounded(m, kind, &input[pos..]);
-                match parser::probe_expr_end(&flat, m.strings, m.interner, m.known) {
-                    Some(flat_end) => match bounds.iter().position(|&b| b == flat_end) {
-                        Some(k) if k > 0 => vec![pos + k],
-                        _ => vec![],
-                    },
+                match greedy_expr_end(m, kind, input, pos) {
+                    Some(Some(end)) => vec![end],
+                    Some(None) => vec![],
                     // The subset parser refuses some valid forms
                     // (closures, `?`, `.await`, async and unsafe
                     // blocks); the recognizer knows their shapes
@@ -1719,7 +1719,16 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
         FragKind::Ty | FragKind::Pat | FragKind::PatParam | FragKind::Stmt => {
             let mut ends = Vec::new();
             let item_at = if kind == FragKind::Stmt { item_end(m, input, pos) } else { None };
-            for end in pos + 1..=input.len() {
+            // Only the longest end counts (see `fragment_end`), so try ends
+            // from the top of the fragment's window down and keep the first
+            // that reads. Trying every end up to the end of the input made a
+            // long repetition cubic.
+            let top = fragment_window(kind, input, pos, usize::MAX).max(item_at.unwrap_or(0));
+            for end in (pos + 1..=top).rev() {
+                // A fragment ending in `..=` does not read (see below).
+                if parsed_kind(kind) && input[end - 1].is_tok(Tok::DotDotEq) {
+                    continue;
+                }
                 m.step()?;
                 let slice = &input[pos..end];
                 // A statement fragment never owns a `;`: a matcher that
@@ -1746,6 +1755,7 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
                     || (kind == FragKind::Ty && is_fn_type(m, slice))
                 {
                     ends.push(end);
+                    break;
                 }
             }
             ends
@@ -1758,6 +1768,133 @@ fn fragment_ends(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> R
         ends.retain(|&end| !matches!(input.get(end.wrapping_sub(1)), Some(Tt::Tok(t)) if t.tok == Tok::DotDotEq));
     }
     Ok(ends)
+}
+
+/// The greedy expression parse at `input[pos]` (see `fragment_ends`):
+/// Some(end in trees) when the parser reads one (Some(None) when it
+/// ends inside a tree), None when the parser refuses the form. The
+/// parser reads a flattened copy of a prefix of the trees, cut a little
+/// past the fragment's window (`fragment_window`) at first. The parser
+/// never backtracks and peeks at most `PARSE_LOOKAHEAD` tokens past
+/// where it stops, so when it stops (or fails) that far before the cut,
+/// the whole input reads the same; otherwise the cut doubles. A parse
+/// of the whole rest per fragment made long repetitions quadratic.
+fn greedy_expr_end(m: &Matcher, kind: FragKind, input: &[Tt], pos: usize) -> Option<Option<usize>> {
+    let window = fragment_window(kind, input, pos, pos + 64);
+    let mut cut = (window + 4).min(input.len());
+    loop {
+        let (flat, bounds) = probe_flatten_bounded(m, kind, &input[pos..cut]);
+        let (flat, strings) = compact_strings(m, flat);
+        let reach = parser::probe_expr_end(&flat, &strings, m.interner, m.known);
+        let (Ok(read) | Err(read)) = reach;
+        if cut < input.len() && read + PARSE_LOOKAHEAD >= flat.len() {
+            cut = (pos + 2 * (cut - pos)).min(input.len());
+            continue;
+        }
+        let end = reach.ok()?;
+        return Some(match bounds.iter().position(|&b| b == end) {
+            Some(k) if k > 0 => Some(pos + k),
+            _ => None,
+        });
+    }
+}
+
+/// How many tokens past its position the parser may peek (it uses
+/// `peek_at(3)` at most; the rest is slack).
+const PARSE_LOOKAHEAD: usize = 8;
+
+/// An upper bound on where a fragment of `kind` at `input[pos]` can end:
+/// the index of the first tree no such fragment holds at its top level,
+/// or `limit` (at most the input's length) when none comes first. A `;`
+/// or `=>` ends every fragment (an item keeps its own `;`). A `,` or `=`
+/// ends a type or pattern outside its `<..>`, as does a `>` that closes
+/// no `<`; `if` and `in` end a pattern, and `|` a `pat_param`. In a
+/// statement or expression a `,` ends the fragment outside a closure's
+/// `|..|` parameters and a turbofish's `::<..>`, and only before any
+/// other `<` (a comparison or a type's arguments, which this scan cannot
+/// tell apart). The end search for a parsed fragment stops here, so a
+/// long repetition costs time in proportion to its length.
+fn fragment_window(kind: FragKind, input: &[Tt], pos: usize, limit: usize) -> usize {
+    let expr_like = matches!(kind, FragKind::Expr | FragKind::Expr2021 | FragKind::Stmt | FragKind::Item);
+    let pat = matches!(kind, FragKind::Pat | FragKind::PatParam);
+    // `<..>` depth: every `<` in a type or pattern, a turbofish's in an expression.
+    let mut depth = 0i64;
+    let mut params_open = false;
+    let mut comma_ends = true;
+    let limit = limit.min(input.len());
+    for j in pos..limit {
+        let Tt::Tok(t) = &input[j] else { continue };
+        let stop = match t.tok {
+            Tok::Semi if kind == FragKind::Item => return j + 1,
+            Tok::Semi | Tok::FatArrow => true,
+            Tok::Comma => kind != FragKind::Item && depth == 0 && !(expr_like && (params_open || !comma_ends)),
+            Tok::Eq => !expr_like && depth == 0,
+            Tok::If | Tok::In => pat && depth == 0,
+            Tok::Pipe => kind == FragKind::PatParam,
+            _ => false,
+        };
+        if stop {
+            return j;
+        }
+        let prev = if j > pos { input.get(j - 1) } else { None };
+        match t.tok {
+            Tok::Lt | Tok::Shl if expr_like && depth == 0 && !matches!(prev, Some(Tt::Tok(p)) if p.tok == Tok::PathSep) => comma_ends = false,
+            Tok::Lt => depth += 1,
+            Tok::Shl => depth += 2,
+            Tok::Gt | Tok::Ge if depth > 0 || !expr_like => depth -= 1,
+            Tok::Shr | Tok::ShrEq if depth > 0 || !expr_like => depth -= 2,
+            // A `|` after an operand is `or`; anywhere else it opens a
+            // closure's parameters, and the next `|` closes them.
+            Tok::Pipe if expr_like && depth == 0 => params_open = !params_open && !prev.is_some_and(ends_operand),
+            _ => {}
+        }
+        if depth < 0 && !expr_like {
+            return j;
+        }
+    }
+    limit
+}
+
+/// True when an expression can end with this tree, so a `|` after it is
+/// the `or` operator. Anything not listed counts as no operand, which
+/// reads the `|` as a closure's: the cautious choice for `fragment_window`.
+fn ends_operand(tree: &Tt) -> bool {
+    match tree {
+        Tt::Delim(..) | Tt::Frag(FragKind::Expr | FragKind::Expr2021 | FragKind::Literal | FragKind::Path | FragKind::Block, _, _) => true,
+        Tt::Frag(..) => false,
+        Tt::Tok(t) => matches!(
+            t.tok,
+            Tok::Ident(_)
+                | Tok::Int(..)
+                | Tok::Float(_)
+                | Tok::Str(..)
+                | Tok::Char(..)
+                | Tok::ByteStr(_)
+                | Tok::ByteChar(_)
+                | Tok::True
+                | Tok::False
+                | Tok::SelfLower
+                | Tok::SelfUpper
+                | Tok::Super
+                | Tok::Crate
+                | Tok::Question
+                | Tok::Await
+        ),
+    }
+}
+
+/// The strings a probe's tokens name, as a table of their own, with the
+/// tokens re-indexed into it. A probe parse copies its string table, and
+/// the expander's grows with the file.
+fn compact_strings(m: &Matcher, mut toks: Vec<Token>) -> (Vec<Token>, Vec<String>) {
+    let mut strings = Vec::new();
+    for t in &mut toks {
+        for i in t.tok.string_indices_mut().into_iter().flatten() {
+            strings.push(m.strings.get(*i as usize).cloned().unwrap_or_default());
+            *i = strings.len() as u32 - 1;
+        }
+    }
+    (toks, strings)
 }
 
 /// True when `trees` is exactly a module path, as `pub(in ...)` takes it.
@@ -2026,7 +2163,7 @@ fn path_ends(m: &mut Matcher, input: &[Tt], pos: usize) -> Vec<usize> {
             if angle_args_ok(m, &inner) {
                 i += 1;
                 if tok_at(input, i).map(|t| t.tok) == Some(Tok::Arrow) {
-                    for end in (i + 2..=input.len()).rev() {
+                    for end in (i + 2..=fragment_window(FragKind::Ty, input, i + 1, usize::MAX)).rev() {
                         if probe(m, FragKind::Ty, &input[i + 1..end]) || is_fn_type(m, &input[i + 1..end]) {
                             i = end;
                             break;
@@ -2239,27 +2376,27 @@ fn probe(m: &mut Matcher, kind: FragKind, slice: &[Tt]) -> bool {
     if let Some(&hit) = m.probe_cache.get(&key) {
         return hit;
     }
-    let toks = probe_flatten(m, kind, slice);
+    let (toks, strings) = compact_strings(m, probe_flatten(m, kind, slice));
     let ok = match kind {
-        FragKind::Expr => parser::probe_expr(&toks, m.strings, m.interner, m.known),
-        FragKind::Ty => parser::probe_ty(&toks, m.strings, m.interner, m.known),
-        FragKind::Pat | FragKind::PatParam => parser::probe_pat(&toks, m.strings, m.interner, m.known),
-        FragKind::Block => parser::probe_block(&toks, m.strings, m.interner, m.known),
+        FragKind::Expr => parser::probe_expr(&toks, &strings, m.interner, m.known),
+        FragKind::Ty => parser::probe_ty(&toks, &strings, m.interner, m.known),
+        FragKind::Pat | FragKind::PatParam => parser::probe_pat(&toks, &strings, m.interner, m.known),
+        FragKind::Block => parser::probe_block(&toks, &strings, m.interner, m.known),
         FragKind::Stmt => {
-            parser::probe_stmt(&toks, m.strings, m.interner, m.known) || {
+            parser::probe_stmt(&toks, &strings, m.interner, m.known) || {
                 // A `let` statement is written without its `;` in a macro
                 // call; try again with one, as a block would need it.
                 let span = toks.last().map_or(Span::default(), |t| t.span);
                 let mut with_semi = toks.clone();
                 with_semi.push(Token { tok: Tok::Semi, span });
-                parser::probe_stmt(&with_semi, m.strings, m.interner, m.known)
+                parser::probe_stmt(&with_semi, &strings, m.interner, m.known)
             }
         }
         FragKind::Item => {
             let mut tokens = toks;
             let end = tokens.last().map_or(Span::default(), |t| t.span);
             tokens.push(Token { tok: Tok::Eof, span: end });
-            let lexed = Lexed { tokens, strings: m.strings.to_vec() };
+            let lexed = Lexed { tokens, strings };
             parser::parse(&lexed, m.interner, m.known).map_or(false, |ast| ast.items.len() == 1)
         }
         _ => false,

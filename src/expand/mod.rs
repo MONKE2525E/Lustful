@@ -1943,9 +1943,18 @@ fn path_call_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<(Vec<Seg>
 /// for the item-position macro rules. A leading item fragment counts,
 /// and any other fragment is looked through to its first tokens.
 fn starts_item(trees: &[Tt], interner: &Interner) -> bool {
+    // Only the head is read: attributes and qualifiers, then the keyword
+    // and one tree after it. Copy that much, not the whole tail callers
+    // pass (a copy per call made long macro inputs quadratic).
+    let head_tree = |t: &Tt| match t {
+        Tt::Frag(..) | Tt::Delim(Delim::Bracket | Delim::Paren, _, _) => true,
+        Tt::Tok(t) => matches!(t.tok, Tok::Pound | Tok::Bang | Tok::Pub | Tok::Const | Tok::Async | Tok::Unsafe | Tok::Extern),
+        Tt::Delim(..) => false,
+    };
+    let head = trees.iter().take_while(|t| head_tree(t)).count() + 2;
     // Splice leading fragments in place so a vis fragment before the
     // item keyword (as in `$v:vis fn`) still reads as an item start.
-    let mut flat: Vec<Tt> = trees.to_vec();
+    let mut flat: Vec<Tt> = trees[..head.min(trees.len())].to_vec();
     loop {
         match flat.first() {
             Some(Tt::Frag(FragKind::Item, _, _)) => return true,

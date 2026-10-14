@@ -305,17 +305,22 @@ pub fn probe_expr(toks: &[Token], strings: &[String], interner: &Interner, known
 }
 
 /// How many leading tokens of `toks` one greedy expression parse
-/// consumes, or None when no expression starts there. The matcher
-/// uses this as rustc's fragment parser does (one parse, no trying
-/// every end). Added for W-MACRO.
-pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> Option<usize> {
+/// consumes (Ok), or how far it read when no expression parses there
+/// (Err). The matcher uses this as rustc's fragment parser does (one
+/// parse, no trying every end), and reads the position to tell whether
+/// a parse of a prefix reads the same as one of the whole input.
+/// Added for W-MACRO.
+pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, known: &Known) -> Result<usize, usize> {
     let mut v: Vec<Token> = toks.to_vec();
     let end = toks.last().map_or(Span::default(), |t| t.span);
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
     let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
-    p.expr().ok().map(|_| p.pos)
+    match p.expr() {
+        Ok(_) => Ok(p.pos),
+        Err(_) => Err(p.pos),
+    }
 }
 
 /// True when `toks` is exactly one type.
