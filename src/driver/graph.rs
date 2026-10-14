@@ -1183,6 +1183,22 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
 /// comparison, not an edit trigger: a `check` request consumes the
 /// edit that moved a value, and the following `build` request sees
 /// an unchanged file.
+/// The (Adt, method slot) pairs glue calls: written Display/Debug `fmt`
+/// methods (`gx.fmt_methods`) and Drop methods (`gx.drop_methods`), in a
+/// stable order. `slots` is the build's fn slot table.
+pub(crate) fn glue_method_slots_fp(p: &Program, slots: &[u32]) -> u64 {
+    let mut h = FxHasher::default();
+    "glue-slots-v1".hash(&mut h);
+    let slot = |f: crate::def::LocalDefId| slots.get(f.0 as usize).copied().unwrap_or(u32::MAX);
+    let mut fm: Vec<(u32, u8, u32)> = p.gx.fmt_methods.iter().map(|(&(a, k), &f)| (a.0, k, slot(f))).collect();
+    fm.sort_unstable();
+    fm.hash(&mut h);
+    let mut dm: Vec<(u32, u32)> = p.gx.drop_methods.iter().map(|(&a, &f)| (a.0, slot(f))).collect();
+    dm.sort_unstable();
+    dm.hash(&mut h);
+    h.finish()
+}
+
 pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
     let mut h = FxHasher::default();
     "statics-v1".hash(&mut h);

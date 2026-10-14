@@ -2994,7 +2994,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Glue an earlier refresh did not reach (no live body used it then)
     // is stale in the set; `add` regenerates it when a body reaches it
     // again, with the same fresh-base rule.
-    let (shared_changed, regenerated) = if caches.glue_stale || caches.objects != Some(req.debug) {
+    // Glue that calls a written `fmt` or `drop` method names the
+    // method instance's slot. A bodies-mode build can move that
+    // instance to a new slot (or point the Adt at another instance);
+    // the old glue then calls an empty slot (a run-time segfault,
+    // W-STD-C daemon probes). Refresh the glue when those slots move.
+    let glue_slots_fp = crate::driver::graph::glue_method_slots_fp(&program, &front.fn_slot);
+    let glue_slots_changed = caches.glue_slots_fp != glue_slots_fp;
+    caches.glue_slots_fp = glue_slots_fp;
+    let (shared_changed, regenerated) = if caches.glue_stale || glue_slots_changed || caches.objects != Some(req.debug) {
         caches.glue_stale = false;
         caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()))
     } else {

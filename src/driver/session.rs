@@ -206,6 +206,9 @@ pub(crate) struct Caches {
     /// fingerprint is the built-state record that survives that gap.
     /// Zero means no build yet.
     pub(crate) statics_fp: u64,
+    /// `graph::glue_method_slots_fp` as of the last glue build: the
+    /// slots that glue calling written `fmt` and `drop` methods names.
+    pub(crate) glue_slots_fp: u64,
     /// A compile since the last build saw a full-mode edit or a const
     /// fn edit, so derived glue text may be stale. Set by any compile
     /// (check requests included), cleared by the build that refreshes
@@ -328,6 +331,7 @@ impl Session {
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,
+                glue_slots_fp: 0,
                 glue_stale: false,
                 per_unit: 16,
                 table_cap: 0,
