@@ -2454,7 +2454,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         crate_ids,
         req.cmd == Cmd::Build,
         &mut front.def_order,
-        resolved_tables.map(Box::new),
+        resolved_tables
+            .map(|mut t| {
+                // Collect checks generic std bodies before `shipped_ranges`
+                // is set below; they read the splice ranges from here.
+                t.std_ranges = std_ranges.clone();
+                t
+            })
+            .map(Box::new),
         &mut caches.gen_reuse,
     ) {
         Ok(p) => p,

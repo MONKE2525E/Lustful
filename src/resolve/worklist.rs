@@ -4009,7 +4009,7 @@ struct Rewrite<'a> {
     list_module: &'a FxMap<ItemListKey, ModuleId>,
     /// Every name some module defines locally, built once over the
     /// frozen tables (`ResolvedTables::local_named_set`).
-    local_names: &'a FxMap<Sym, ()>,
+    local_names: &'a FxMap<Sym, u8>,
     diags: Vec<Diag>,
     /// The type and const params (name, is const) of the item being
     /// rewritten, after its impl's or trait's for a method. As in rustc,
@@ -4569,6 +4569,16 @@ impl Rewrite<'_> {
                         self.apply(segs, vres, span, module);
                         return;
                     }
+                }
+                // A name that no module defines in the namespace asked
+                // here is not a lexical-scope miss: a type parameter `T`
+                // next to a `static T` (value namespace) stays a param
+                // (collect resolves params; W-STD-C).
+                let asked = if names.len() > 1 { Namespace::Type } else { ns };
+                let in_ns = names.first().and_then(|n| self.local_names.get(n)).is_some_and(|m| m & (1 << ns_index(asked)) != 0);
+                if !in_ns {
+                    self.apply(segs, res, span, module);
+                    return;
                 }
                 let first = self.interner.get(names[0]).to_string();
                 self.diags.push(if ns == Namespace::Type {

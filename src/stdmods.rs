@@ -64,6 +64,22 @@ pub const STD_MODULES: &[StdModule] = &[
         full: false,
         triggers: &["PhantomData"],
     },
+    StdModule {
+        name: "__lust_core_cell",
+        rel: "core/src/cell.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "cell"), ("std", "cell")],
+        full: false,
+        triggers: &["OnceCell", "LazyCell"],
+    },
+    StdModule {
+        name: "__lust_std_sync",
+        rel: "std/src/sync.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "sync")],
+        full: false,
+        triggers: &["OnceLock", "LazyLock"],
+    },
 ];
 
 /// The words whose mention means a compile may need the std modules.

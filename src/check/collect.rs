@@ -303,7 +303,11 @@ impl<'a> Program<'a> {
         if span.file != crate::diag::FileId(0) {
             return None;
         }
-        self.shipped_ranges.iter().find(|(lo, hi, _)| span.lo >= *lo && span.lo < *hi).map(|(_, _, k)| *k)
+        let ranges = match &self.resolved {
+            Some(t) if self.shipped_ranges.is_empty() => &t.std_ranges,
+            _ => &self.shipped_ranges,
+        };
+        ranges.iter().find(|(lo, hi, _)| span.lo >= *lo && span.lo < *hi).map(|(_, _, k)| *k)
     }
     /// True when `span` is in the std splice of the selected crate's
     /// root file: shipped std source, not user source (W-STD-C).

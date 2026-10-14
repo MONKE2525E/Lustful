@@ -206,6 +206,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::VecFrom,
     Builtin::MemDrop,
     Builtin::MemForget,
+    Builtin::OnceInit,
+    Builtin::OnceTake,
     Builtin::StringCapacity,
     Builtin::StringReserve,
     Builtin::StringReserveExact,
@@ -576,6 +578,8 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::VecFrom => (&["Vec<T>"], vec![k.from], Call::Associated),
         B::MemDrop => (&["std::mem"], vec![k.drop], Call::Function),
         B::MemForget => (&["std::mem"], vec![i.intern("forget")], Call::Function),
+        B::OnceInit => (&["core::intrinsics (std source only)"], vec![i.intern("once_init")], Call::Function),
+        B::OnceTake => (&["core::intrinsics (std source only)"], vec![i.intern("once_take")], Call::Function),
         B::StringCapacity => (&["String"], vec![k.capacity], Call::Method),
         B::StringReserve => (&["String"], vec![k.reserve], Call::Method),
         B::StringReserveExact => (&["String"], vec![k.reserve_exact], Call::Method),
@@ -985,6 +989,7 @@ const TYPES: &[&str] = &[
     "str::Chars (from s.chars())",
     "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
     "std::marker::PhantomData<T> (std source; no Debug or Hash yet)",
+    "std::cell::{OnceCell, LazyCell} and std::sync::{OnceLock, LazyLock} (std source; single-threaded; static LazyLock not yet)",
 ];
 
 const CONTROL_FLOW: &[&str] = &[

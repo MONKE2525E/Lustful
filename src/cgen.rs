@@ -3089,6 +3089,23 @@ impl FnGen<'_, '_, '_> {
             | B::ConvRcInner => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             // The operand was moved into the call: no drop ever runs.
             B::MemForget => "((lust_Unit){})".into(),
+            // Interior writes of std source cells (W-STD-C): the slot is
+            // an `Option<T>` behind a shared reference. `once_init` runs
+            // only on a `None` slot, so nothing is overwritten.
+            B::OnceInit => {
+                let CTy::Ref(opt) = &tys[0] else { unreachable!() };
+                let some = self.make_variant(opt, 1, &[vals[1].clone()]);
+                let _ = writeln!(self.out, "    *({}) = {some};", vals[0]);
+                "((lust_Unit){})".into()
+            }
+            B::OnceTake => {
+                let CTy::Ref(opt) = &tys[0] else { unreachable!() };
+                let ot = ctype(opt);
+                let (pa, old) = (self.tmp(), self.tmp());
+                let none = self.make_variant(opt, 0, &[]);
+                let _ = writeln!(self.out, "    {ot}* {pa} = {}; {ot} {old} = *{pa}; *{pa} = {none};", vals[0]);
+                old
+            }
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.

@@ -235,6 +235,10 @@ pub struct ResolvedTables {
     /// (`CrateInput::std_splice_lo`): every byte from here on in file 0
     /// is shipped std source.
     pub std_splice_lo: Option<u32>,
+    /// The driver's std splice ranges with their shipped crates, set
+    /// before collect (`Program::shipped_crate_at` reads them while
+    /// `Program::shipped_ranges` is still empty).
+    pub std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
 }
 
 /// The std modules whose items can come from the shipped platform
@@ -318,6 +322,7 @@ impl ResolvedTables {
             std_platform: None,
             std_modules: Vec::new(),
             std_splice_lo: None,
+            std_ranges: Vec::new(),
         }
     }
 
@@ -652,13 +657,15 @@ impl ResolvedTables {
     /// `any_local_named`). The rewrite pass builds this once over the
     /// frozen tables instead of rescanning every module map per
     /// unresolved path, which was quadratic in the module count.
-    pub fn local_named_set(&self) -> FxMap<Sym, ()> {
-        let mut out = FxMap::default();
+    /// The value is a bit set of the namespaces (by `ns_index`) some
+    /// module defines the name in.
+    pub fn local_named_set(&self) -> FxMap<Sym, u8> {
+        let mut out: FxMap<Sym, u8> = FxMap::default();
         for (mi, maps) in self.maps.iter().enumerate() {
-            for m in maps {
+            for (ns, m) in maps.iter().enumerate() {
                 for (name, state) in m {
                     if matches!(state, BindState::One(b) if b.rank == 2 && b.def_module.0 as usize == mi) {
-                        out.insert(*name, ());
+                        *out.entry(*name).or_default() |= 1 << ns;
                     }
                 }
             }

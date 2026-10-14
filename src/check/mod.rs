@@ -238,6 +238,14 @@ pub enum Builtin {
     MemDrop,
     /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
     MemForget,
+    /// `core::intrinsics::once_init(&slot, v)`: writes `Some(v)` into an
+    /// `Option<T>` behind a shared reference. Std source only: the
+    /// interior write of `OnceCell`/`OnceLock` (W-STD-C).
+    OnceInit,
+    /// `core::intrinsics::once_take(&slot)`: moves the value out of an
+    /// `Option<T>` behind a shared reference, leaving `None`. Std source
+    /// only: `LazyLock` takes its init fn this way (W-STD-C).
+    OnceTake,
     StringCapacity,
     StringReserve,
     StringReserveExact,
@@ -7697,6 +7705,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// privilege test with L0642 (docs/ARCH.md sections 3.1 and 3.2).
     fn resolve_intrinsic(&mut self, name: Sym, span: Span) -> Option<Res> {
         let text = self.name(name).to_string();
+        // The generic interior-write builtins of std source (W-STD-C):
+        // the same privilege rule as registry intrinsics.
+        if matches!(text.as_str(), "once_init" | "once_take") {
+            if !matches!(self.p.shipped_crate_at(span), Some(lang::ShippedCrate::Core | lang::ShippedCrate::Std)) {
+                self.err(
+                    "L0642",
+                    span,
+                    format!("intrinsic `core::intrinsics::{text}` can only be called from lust's shipped library crates"),
+                    "Call the public std item that wraps it instead.",
+                );
+                return None;
+            }
+            return Some(Res::Builtin(if text == "once_init" { Builtin::OnceInit } else { Builtin::OnceTake }));
+        }
         let Some(id) = lang::intrinsic_by_name(&text) else {
             self.err(
                 "L0104",
@@ -9706,6 +9728,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::MemDrop | Builtin::MemForget => {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t], UNIT)
+                    }
+                    Builtin::OnceInit | Builtin::OnceTake => {
+                        let t = self.new_var(false);
+                        let o = self.tys.mk_option(t);
+                        let r = self.tys.mk_ref(false, o);
+                        if b == Builtin::OnceInit { (vec![r, t], UNIT) } else { (vec![r], o) }
                     }
                     Builtin::MemSwap => {
                         let t = self.callee_turbo_ty(callee, span);

@@ -125,6 +125,8 @@ std's panic messages, and `Self::` in associated const values.
 |---|---|---|---|
 | `core::time` | library/core/src/time.rs | `Duration`, `TryFromFloatSecsError` | Every stable method and op; exact Debug (precision, `+`, width, fill, align through the `fmt_align` intrinsic). No `Sum` impls yet (user `Sum` impls are not supported). |
 | `core::marker`, `std::marker` (overlay) | library/core/src/marker.rs | `PhantomData` | Zero-sized; acts as holding `T` for auto traits, unused-param checks, and borrowck variance (`Program::is_phantom_adt`); impls with no bounds on `T`. No `Debug` (needs `type_name`), no `Hash` yet, no `T: ?Sized`. |
+| `core::cell`, `std::cell` (overlay) | library/core/src/cell.rs | `OnceCell`, `LazyCell` | Value in a plain `Option<T>`, written through `&self` only by the `once_init` / `once_take` builtins (std source only, L0642 elsewhere). `!Sync`, `Send` as std, invariant in `T`. `OnceCell::into_inner` is not `const` here. |
+| `std::sync` (overlay) | library/std/src/sync.rs | `OnceLock`, `LazyLock` | Single-threaded semantics (threads are W-THREADS). `OnceLock<T>: Sync` misses std's `T: Send` part. A `static LazyLock` needs fn pointers in const eval (L0630 today); `*lazy` and method autoderef need user `Deref` (W-CHECK-G2). |
 | `std::time` | library/std/src/time.rs | `Instant`, `SystemTime`, `UNIX_EPOCH`, `SystemTimeError`, re-exports of `core::time` | Clocks through `clock_now_raw` / `system_time_raw` (C in src/runtime/stdc.c). No `Error` impl yet. |
 
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)
