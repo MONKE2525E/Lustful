@@ -829,30 +829,50 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses visibility: `pub`, `pub(crate)`, `pub(super)`, or `pub(in path)`.
-    /// Tolerant inside the parentheses, as the old skip-to-`)` code was: name
-    /// tokens become the restricted path and other tokens are skipped.
+    /// Parses visibility: `pub`, `pub(crate)`, `pub(self)`, `pub(super)`, or
+    /// `pub(in path)`; the restricted path holds the path's segments.
     fn vis(&mut self) -> PResult<Vis> {
+        self.vis_ctx(false)
+    }
+
+    /// `vis`, where `before_ty` says a type follows (a tuple field): there
+    /// `pub (T)` is `pub` and the type. Anywhere else a group after `pub`
+    /// that is not a restriction is an error, as in rustc (E0704).
+    fn vis_ctx(&mut self, before_ty: bool) -> PResult<Vis> {
         if !self.eat(Tok::Pub) {
             return Ok(Vis::Private);
         }
         if self.peek() != Tok::LParen {
             return Ok(Vis::Public);
         }
-        let start = self.bump().span;
-        let mut path = Vec::new();
-        while self.peek() != Tok::RParen {
-            if self.peek() == Tok::Eof {
-                return Err(syntax(self.span(), "expected `)` in visibility, found end of file"));
+        let short = matches!(self.peek_at(1), Tok::Crate | Tok::SelfLower | Tok::Super) && self.peek_at(2) == Tok::RParen;
+        if !short && self.peek_at(1) != Tok::In {
+            if before_ty {
+                return Ok(Vis::Public);
             }
+            return Err(syntax(self.span(), "incorrect visibility restriction; write `pub(crate)`, `pub(self)`, `pub(super)`, or `pub(in path)`"));
+        }
+        let start = self.bump().span;
+        self.eat(Tok::In);
+        if !short {
+            self.eat(Tok::PathSep);
+        }
+        let mut path = Vec::new();
+        loop {
             match self.bump().tok {
-                Tok::Ident(s) | Tok::Reserved(s) => path.push(PathSeg::plain(s)),
+                Tok::Ident(s) => path.push(PathSeg::plain(s)),
                 Tok::Crate => path.push(PathSeg::plain(self.interner.intern("crate"))),
                 Tok::Super => path.push(PathSeg::plain(self.interner.intern("super"))),
                 Tok::SelfLower => path.push(PathSeg::plain(self.known.self_value)),
                 Tok::SelfUpper => path.push(PathSeg::plain(self.known.self_type)),
-                _ => {}
+                _ => return Err(syntax(self.prev_span(), "expected a module path in `pub(in ...)`")),
             }
+            if !self.eat(Tok::PathSep) {
+                break;
+            }
+        }
+        if self.peek() != Tok::RParen {
+            return Err(syntax(self.span(), "expected `)` after a visibility path"));
         }
         let end = self.bump().span;
         Ok(Vis::Restricted { path, span: start.to(end) })
@@ -2090,7 +2110,7 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while self.peek() != Tok::RParen {
             let fattrs = self.part_attributes()?;
-            let _vis = self.vis()?;
+            let _vis = self.vis_ctx(true)?;
             let span = self.span();
             let ty = self.ty()?;
             fields.push(FieldDef { name: Sym(0), vis: _vis, attrs: fattrs.attrs, ty, span });
@@ -3308,9 +3328,13 @@ impl<'a> Parser<'a> {
             _ => return Ok(lo.unwrap()),
         };
         self.bump();
-        let ends = matches!(self.peek(), Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Comma | Tok::Semi | Tok::Eof)
+        // `_` does not begin a range end (rustc's `can_begin_expr`).
+        let ends = matches!(self.peek(), Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Comma | Tok::Semi | Tok::Eof | Tok::Underscore)
             || (no_struct && self.peek() == Tok::LBrace);
         let hi = if ends { None } else { Some(self.binary(0, no_struct)?) };
+        if inclusive && hi.is_none() {
+            return Err(syntax(self.prev_span(), "inclusive range with no end; write `a..=b`, or `a..` for an open range"));
+        }
         Ok(self.push_expr(Expr::Range { lo, hi, inclusive }, start.to(self.prev_span())))
     }
 
