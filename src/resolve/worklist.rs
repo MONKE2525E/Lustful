@@ -5777,9 +5777,14 @@ impl KindChildren for Expr {
                 k.exprs.push(*callee);
                 k.exprs.extend(args.iter().copied());
             }
-            Expr::MethodCall { recv, args, .. } => {
+            Expr::MethodCall { recv, args, generic_args, .. } => {
                 k.exprs.push(*recv);
                 k.exprs.extend(args.iter().copied());
+                // Imported names in the turbofish (`collect::<HashMap<_, _>>()`).
+                k.tys.extend(generic_args.iter().filter_map(|g| match g {
+                    GenericArg::Type(t) => Some(*t),
+                    _ => None,
+                }));
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => k.exprs.push(*base),
             Expr::Index { base, index } => {
