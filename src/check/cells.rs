@@ -54,6 +54,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mk = |this: &mut Self, which: fn(&BuiltinDefs) -> DefId| this.tys.mk_builtin1(which, elem);
         match b {
             Builtin::RcDowngrade => {
+                // A `Weak` is a thin pointer: no `Weak<dyn Tr>` yet.
+                self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
                 let rc = self.tys.mk_rc(elem);
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r], mk(self, |d| d.weak))

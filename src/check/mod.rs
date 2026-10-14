@@ -975,6 +975,10 @@ struct Ctx<'p, 'a> {
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
     deferred_default: Vec<(Ty, Span)>,
+    /// Element types of Rc fns that lust only has for a sized `T`
+    /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
+    /// `downgrade`, whose `Weak` is a thin pointer).
+    deferred_sized: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -1194,6 +1198,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_ord: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
+        deferred_sized: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -9073,6 +9078,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     Builtin::RcMakeMut => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         self.deferred_clone.push((elem, span));
                         let rc = self.tys.mk_rc(elem);
                         let rm = self.tys.mk_ref(true, rc);
@@ -9081,6 +9087,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     Builtin::RcGetMut => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         let rc = self.tys.mk_rc(elem);
                         let rm = self.tys.mk_ref(true, rc);
                         let r = self.tys.mk_ref(true, elem);
@@ -9094,17 +9101,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::StringFromUtf8 | Builtin::StrFromUtf8 => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         let rc = self.tys.mk_rc(elem);
                         let res = self.tys.mk_result(elem, rc);
                         (vec![rc], res)
                     }
                     Builtin::RcIntoInner => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         let rc = self.tys.mk_rc(elem);
                         (vec![rc], self.tys.mk_option(elem))
                     }
                     Builtin::RcUnwrapOrClone => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         let rc = self.tys.mk_rc(elem);
                         self.deferred_clone.push((elem, span));
                         (vec![rc], elem)
@@ -15129,6 +15139,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !has_default(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` does not implement Default, or lust cannot build its default yet"), "Use `replace` with a value.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_sized) {
+            let t = self.deep(t);
+            if matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Slice(_) | TyKind::Str) {
+                self.errs.push(not_yet("L0641", span, "this `Rc` function on an unsized type"));
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_debug) {

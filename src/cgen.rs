@@ -2930,9 +2930,14 @@ impl FnGen<'_, '_, '_> {
                 );
                 t
             }
-            // An `Rc<dyn Tr>`'s two counts sit right before its value.
+            // An `Rc<dyn Tr>`'s two counts sit right before its value; the
+            // weak count holds the strong refs' implicit weak ref (W-STD-A).
             B::RcStrongCount | B::RcWeakCount if matches!(&tys[0], CTy::Ref(r) if **r == CTy::RcDyn) => {
-                format!("((uint64_t *)(*{}).data)[{}]", vals[0], if b == B::RcStrongCount { -2 } else { -1 })
+                if b == B::RcStrongCount {
+                    format!("((uint64_t *)(*{}).data)[-2]", vals[0])
+                } else {
+                    format!("(((uint64_t *)(*{}).data)[-1] - 1)", vals[0])
+                }
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
@@ -3604,6 +3609,8 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {} {t} = *{}; {t}->weak++;", ctype(&deref_cty(&tys[0])), vals[0]);
                 t
             }
+            // `Rc<dyn Tr>`: the addresses, not the vtables (ptr::addr_eq).
+            B::RcPtrEq if matches!(&tys[0], CTy::Ref(r) if **r == CTy::RcDyn) => format!("((*{}).data == (*{}).data)", vals[0], vals[1]),
             B::RcPtrEq | B::WeakPtrEq => format!("(*{} == *{})", vals[0], vals[1]),
             B::WeakNew => "((void*)~(uint64_t)0)".into(),
             B::WeakUpgrade => {
@@ -5942,7 +5949,8 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 CTy::RcDyn => {
                     // The two counts sit right before the value (`RcI_T`).
                     body.push_str("  uint64_t *h = (uint64_t *)p->data - 2;\n");
-                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); if (h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
+                    // The strong refs hold one implicit weak ref, as for `Rc<T>`.
+                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); if (--h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
                 }
                 CTy::Boxed(e) => {
                     if needs_drop_c(p, e) {
@@ -6499,9 +6507,10 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {d};\n  return r;");
                 }
                 CTy::Rc(e) => {
+                    // The header as `Rc::new` builds it: one implicit weak ref.
                     let it = format!("RcI_{}", mangle(e));
                     let d = def_of(e, &mut need);
-                    let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); r->strong = 1; r->weak = 0; r->v = {d};\n  return r;");
+                    let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); r->strong = 1; r->weak = 1; r->v = {d};\n  return r;");
                 }
                 CTy::Adt(adt_id) => {
                     let adt = p.adt(*adt_id);
