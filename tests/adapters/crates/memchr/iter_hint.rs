@@ -19,4 +19,7 @@ fn main() {
     println!("{:?}", e.size_hint());
     let r: Vec<usize> = memchr::memchr_iter(b'a', h).rev().collect();
     println!("{:?}", r);
+    // An empty needle's lower bound is len + 1, which sizes collect.
+    let all: Vec<usize> = memmem::find_iter(h, "").collect();
+    println!("{} {}", all.len(), all.capacity());
 }
