@@ -11,12 +11,10 @@ that autoderef from a user type to builtin slice methods (`Deref<Target
 = [T]>`, W-CHECK-G); `Iterator::size_hint` overrides,
 `DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, and the `Hasher`
 trait (W-STD-B, in its queue); `into_iter()` on a generic
-`I: IntoIterator` parameter (W-STD-B or W-TRAITS). W-STD-B's queue
-also rejects an `IntoIterator` impl whose `IntoIter` is
-`slice::Iter<'a, T>` (L0110), which `&SmallVec` and `&mut SmallVec`
-use, as upstream does. `drain` (ts-rust calls `drain(..)`) also needs
-`Vec::drain`, `RangeBounds`, and `..` as a value (L9001 today), which
-no package has queued yet (W-STD-A owns Vec).
+`I: IntoIterator` parameter (W-STD-B or W-TRAITS). `drain` (ts-rust
+calls `drain(..)`) also needs `Vec::drain`, `RangeBounds`, and `..` as
+a value (L9001 today), which no package has queued yet (W-STD-A owns
+Vec).
 
 On b/w-traits2 (projections normalized), the core (new, push, spill,
 capacity, clone, into_vec) compiles and prints the same as the real
