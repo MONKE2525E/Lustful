@@ -2599,6 +2599,18 @@ impl<'a> Expander<'a> {
         Ok(out)
     }
 
+    /// Grammar-checks one cfg-disabled node (`trees[start..end]`, its
+    /// attribute run included) before it is dropped, as rustc parses
+    /// all code before cfg stripping. The check parses syntax only:
+    /// no macro inside expands, no name resolution or type check runs,
+    /// and a disabled `mod name;` never loads a file (module loading
+    /// stays with the outline, which already honors cfg).
+    fn check_disabled_syntax(&self, trees: &[Tt], start: usize, end: usize, hint: crate::parser::CfgSyntaxHint) -> Result<(), Diag> {
+        let mut toks = Vec::new();
+        flatten_final(&trees[start..end], &mut toks);
+        crate::parser::check_cfg_syntax(&toks, &self.strings, self.ctx.interner, self.ctx.known, hint)
+    }
+
     /// Handles an attribute run starting at `i` in `trees`, appending any
     /// kept trees to `out`. Returns the next index to walk.
     fn attr_run(
@@ -2674,6 +2686,9 @@ impl<'a> Expander<'a> {
         }
         // A cfg that is off drops the item before expansion can see it,
         // so a disabled compile_error! or include! never runs (6.1).
+        // The dropped node is still grammar-checked (rustc parses
+        // before it strips), except a macro invocation or definition,
+        // whose group rustc does not parse.
         let mut exported = false;
         let mut macro_use_attr = false;
         for (attr, attr_start) in &kept {
@@ -2682,6 +2697,10 @@ impl<'a> Expander<'a> {
                     let on = builtin::eval_cfg(&attr.inner, &self.ctx.cfg, self, attr.span)?;
                     if !on {
                         if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
+                            // A definition body is token trees rustc
+                            // does not grammar-check before stripping;
+                            // only its outer form counts.
+                            check_def_form(trees, &def)?;
                             return Ok(def.end);
                         }
                         // A macro call is boundable even though it is
@@ -2698,12 +2717,14 @@ impl<'a> Expander<'a> {
                             return Ok(end);
                         }
                         if let Some(end) = item_end(trees, after, self.ctx.interner) {
+                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item)?;
                             return Ok(end);
                         }
                         // A statement, match arm, or comma-ended part:
                         // bounded at token level, dropped whole so
                         // nothing inside it expands.
                         if let Some(end) = node_end(trees, after) {
+                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node)?;
                             return Ok(end);
                         }
                         let _ = attr_start;

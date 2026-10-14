@@ -374,6 +374,47 @@ pub fn outline_enabled(env: &CfgEnv, cfgs: &[Vec<TokenTree>], strings: &[String]
     Ok(true)
 }
 
+/// The outline side of `expand_cfg_attr` for a `mod` declaration: false
+/// when one of its `#[cfg_attr(pred, cfg(...))]` splices in a cfg that
+/// is off, so a disabled file module is never loaded. Other spliced
+/// attributes do not gate the declaration.
+pub fn outline_cfg_attr_enabled(
+    env: &CfgEnv,
+    cfg_attrs: &[Vec<TokenTree>],
+    strings: &[String],
+    interner: &Interner,
+    span: Span,
+) -> Result<bool, Diag> {
+    for trees in cfg_attrs {
+        let comma = trees.iter().position(|t| matches!(t, TokenTree::Token(tok) if tok.tok == Tok::Comma));
+        let Some(comma) = comma else {
+            return Err(Diag::new("L0001", span, "malformed `#[cfg_attr]`", "Write `#[cfg_attr(predicate, attribute)]`."));
+        };
+        if !env.eval(&trees[..comma], strings, interner, span)? {
+            continue;
+        }
+        // Each spliced attribute piece runs to the next top-level comma;
+        // a piece that is `cfg(pred)` gates the declaration.
+        let mut start = comma + 1;
+        while start < trees.len() {
+            let mut end = start;
+            while end < trees.len() && !matches!(&trees[end], TokenTree::Token(t) if t.tok == Tok::Comma) {
+                end += 1;
+            }
+            let piece = &trees[start..end];
+            let is_cfg = matches!(piece.first(), Some(TokenTree::Token(t)) if matches!(t.tok, Tok::Ident(s) if interner.get(s) == "cfg"));
+            if is_cfg
+                && let Some(TokenTree::Delim(_, inner, _)) = piece.get(1)
+                && !env.eval(inner, strings, interner, span)?
+            {
+                return Ok(false);
+            }
+            start = end + 1;
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

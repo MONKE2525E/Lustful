@@ -270,6 +270,9 @@ pub struct ModDecl {
     pub path_attr: Option<String>,
     /// The token trees inside each `#[cfg(...)]` on the declaration, raw.
     pub cfg: Vec<Vec<crate::lexer::TokenTree>>,
+    /// The token trees inside each `#[cfg_attr(...)]` on the declaration,
+    /// raw: a true predicate can splice in a `cfg` that disables the mod.
+    pub cfg_attr: Vec<Vec<crate::lexer::TokenTree>>,
     /// True for `mod m { ... }`, false for `mod m;`.
     pub inline: bool,
     /// True when a `#[macro_use]` attribute is present.
@@ -318,6 +321,7 @@ pub struct Outline {
 struct PendingAttrs {
     path_attr: Option<String>,
     cfg: Vec<Vec<crate::lexer::TokenTree>>,
+    cfg_attr: Vec<Vec<crate::lexer::TokenTree>>,
     macro_use: bool,
     macro_export: bool,
     local_inner: bool,
@@ -438,8 +442,9 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                             pending.path_attr = Some(s);
                         }
                     }
-                    Some("cfg") => {
-                        // `cfg(pred)`: the trees inside the first paren group.
+                    Some("cfg") | Some("cfg_attr") => {
+                        // `cfg(pred)` / `cfg_attr(pred, attr)`: the trees
+                        // inside the first paren group.
                         if let Some(open) = body.iter().position(|t| t.tok == Tok::LParen) {
                             let mut d = 0usize;
                             let mut end = body.len();
@@ -456,7 +461,12 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                                     _ => {}
                                 }
                             }
-                            pending.cfg.push(outline_trees(&body[open + 1..end]));
+                            let trees = outline_trees(&body[open + 1..end]);
+                            if name.as_deref() == Some("cfg_attr") {
+                                pending.cfg_attr.push(trees);
+                            } else {
+                                pending.cfg.push(trees);
+                            }
                         }
                     }
                     Some("macro_use") => pending.macro_use = true,
@@ -490,6 +500,7 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                         vis: pending_vis,
                         path_attr: pending.path_attr.take(),
                         cfg: std::mem::take(&mut pending.cfg),
+                        cfg_attr: std::mem::take(&mut pending.cfg_attr),
                         inline,
                         macro_use: pending.macro_use,
                         container: container_of(&braces),

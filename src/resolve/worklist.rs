@@ -1270,8 +1270,16 @@ fn outline_mods(
     let (file_path, file_module, is_root) = (discs[di].path.clone(), discs[di].module, discs[di].is_root);
     let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
     inline_modules.insert(Vec::new(), file_module);
+    // Inline module paths a cfg turned off: a declaration inside one
+    // is disabled with it, so its file module is never loaded.
+    let mut disabled_containers: Vec<Vec<Sym>> = Vec::new();
     for decl in &outline.mods {
-        let enabled = match cfg::outline_enabled(&job.input.env, &decl.cfg, strings, interner, decl.span) {
+        if (1..=decl.container.len()).any(|k| disabled_containers.iter().any(|d| d == &decl.container[..k])) {
+            continue;
+        }
+        let enabled = match cfg::outline_enabled(&job.input.env, &decl.cfg, strings, interner, decl.span)
+            .and_then(|e| Ok(e && cfg::outline_cfg_attr_enabled(&job.input.env, &decl.cfg_attr, strings, interner, decl.span)?))
+        {
             Ok(e) => e,
             Err(d) => {
                 diags.push(d);
@@ -1279,6 +1287,11 @@ fn outline_mods(
             }
         };
         if !enabled {
+            if decl.inline {
+                let mut key = decl.container.clone();
+                key.push(decl.name);
+                disabled_containers.push(key);
+            }
             continue;
         }
         let parent = inline_modules.get(&decl.container).copied().unwrap_or(file_module);

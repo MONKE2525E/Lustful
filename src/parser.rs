@@ -80,6 +80,15 @@ pub struct Parser<'a> {
     block_inner_ok: bool,
     /// Arena node depths, for the `MAX_AST_DEPTH` guard in `push_expr`.
     depths: Depths,
+    /// True for a cfg-disabled syntax check (`check_cfg_syntax`): the
+    /// parse must report grammar errors only, as rustc does before it
+    /// strips disabled code. Unsupported-but-valid forms, unknown
+    /// attributes, and macro calls do not reject in this mode; a macro
+    /// call is one opaque node whose body is not parsed.
+    cfg_syntax: bool,
+    /// True while a cfg syntax check parses one foreign item of an
+    /// extern block, where a variadic `...` parameter is grammar.
+    cfg_foreign: bool,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -98,7 +107,7 @@ const MAX_AST_DEPTH: u32 = 16384;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
-    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, &[])
+    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, &[], false)
 }
 
 /// The file-level `allow` inner attributes a whole parse of `lexed`
@@ -121,6 +130,8 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         scope_allows: Vec::new(),
         block_inner_ok: false,
         depths: Depths::default(),
+        cfg_syntax: false,
+        cfg_foreign: false,
     };
     match p.inner_attributes() {
         Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
@@ -133,7 +144,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
 /// whole parse scopes the file's inner allows over them. A leading
 /// inner run in the piece itself still wins, as in `parse`.
 pub fn parse_seeded(lexed: &Lexed, interner: &Interner, known: &Known, seed_allows: &[Attr]) -> PResult<Ast> {
-    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, seed_allows)
+    parse_tokens(&lexed.tokens, lexed.strings.clone(), interner, known, seed_allows, false)
 }
 
 /// Parses the whole items in `lexed.tokens[range]` into their own `Ast`, as `parse` parses
@@ -171,12 +182,34 @@ pub fn parse_items_seeded(
         let end = v.last().map_or(Span::default(), |t| t.span);
         v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     }
-    parse_tokens(&v, lexed.strings[lo as usize..hi as usize].to_vec(), interner, known, seed_allows)
+    parse_tokens(&v, lexed.strings[lo as usize..hi as usize].to_vec(), interner, known, seed_allows, false)
 }
 
 /// The item loop of `parse` over one token list (ending in `Eof`) and its string table.
-fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known, seed_allows: &[Attr]) -> PResult<Ast> {
-    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: seed_allows.to_vec(), block_inner_ok: false, depths: Depths::default() };
+fn parse_tokens(
+    toks: &[Token],
+    strings: Vec<String>,
+    interner: &Interner,
+    known: &Known,
+    seed_allows: &[Attr],
+    cfg_syntax: bool,
+) -> PResult<Ast> {
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        ast: Ast::default(),
+        interner,
+        known,
+        str_base: 0,
+        depth: 0,
+        deferred: None,
+        let_ok: false,
+        scope_allows: seed_allows.to_vec(),
+        block_inner_ok: false,
+        depths: Depths::default(),
+        cfg_syntax,
+        cfg_foreign: false,
+    };
     p.ast.strings = strings;
     // Inner attributes are permitted only here, before the first item
     // (and before any outer attribute): they scope over the whole file.
@@ -268,8 +301,22 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     toks.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
-    let mut p =
-        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+        ast: std::mem::take(ast),
+        interner,
+        known,
+        str_base,
+        depth: 0,
+        deferred: None,
+        let_ok: false,
+        scope_allows: Vec::new(),
+        block_inner_ok: false,
+        depths: Depths::default(),
+        cfg_syntax: false,
+        cfg_foreign: false,
+    };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     // A fn body block permits inner attributes at its start.
     p.block_inner_ok = true;
@@ -295,7 +342,22 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
+    let mut p = Parser {
+        toks: &v,
+        pos: 0,
+        ast,
+        interner,
+        known,
+        str_base: 0,
+        depth: 0,
+        deferred: None,
+        let_ok: false,
+        scope_allows: Vec::new(),
+        block_inner_ok: false,
+        depths: Depths::default(),
+        cfg_syntax: false,
+        cfg_foreign: false,
+    };
     f(&mut p)
 }
 
@@ -316,7 +378,22 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
+    let mut p = Parser {
+        toks: &v,
+        pos: 0,
+        ast,
+        interner,
+        known,
+        str_base: 0,
+        depth: 0,
+        deferred: None,
+        let_ok: false,
+        scope_allows: Vec::new(),
+        block_inner_ok: false,
+        depths: Depths::default(),
+        cfg_syntax: false,
+        cfg_foreign: false,
+    };
     match p.expr() {
         Ok(_) => Ok(p.pos),
         Err(_) => Err(p.pos),
@@ -359,6 +436,159 @@ pub fn probe_stmt(toks: &[Token], strings: &[String], interner: &Interner, known
         }
         _ => false,
     })
+}
+
+/// Hint for `check_cfg_syntax`: how the expander bounded the disabled
+/// node. An item-shaped node tries item contexts first; any other node
+/// tries statement contexts first. Every other context still runs when
+/// the early ones fail with a syntax error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CfgSyntaxHint {
+    Item,
+    Node,
+}
+
+/// Syntax-checks one cfg-disabled node, as rustc parses all code before
+/// it strips disabled items: grammar errors (L0001) reject, while name,
+/// type, and unsupported-form errors do not. `toks` is the flattened
+/// node including its attribute run, with no final `Eof`; string tokens
+/// index `strings`. The node is parsed inside small wrapper templates,
+/// one per grammar position a cfg can sit in (item, impl or trait item,
+/// statement, field, variant, match arm, and so on), and it is clean
+/// when any one position parses it or stops only at an unsupported
+/// form this parser cannot build (a non-L0001 reject, whose tail this
+/// check cannot see past). No name resolution or type check runs, and
+/// the built AST is dropped.
+pub fn check_cfg_syntax(toks: &[Token], strings: &[String], interner: &Interner, known: &Known, hint: CfgSyntaxHint) -> PResult<()> {
+    if toks.iter().all(|t| t.tok == Tok::Eof) {
+        return Ok(());
+    }
+    // Remap string indices to a small local table so each trial parse
+    // does not clone the file's whole string table.
+    let mut used: Vec<u32> = toks.iter().flat_map(|t| t.tok.string_indices()).collect();
+    used.sort_unstable();
+    used.dedup();
+    let local_strings: Vec<String> = used.iter().map(|&i| strings.get(i as usize).cloned().unwrap_or_default()).collect();
+    let node: Vec<Token> = toks
+        .iter()
+        .filter(|t| t.tok != Tok::Eof)
+        .map(|&t| {
+            let mut t = t;
+            for i in t.tok.string_indices_mut().into_iter().flatten() {
+                *i = used.binary_search(i).unwrap_or(0) as u32;
+            }
+            t
+        })
+        .collect();
+    if node.is_empty() {
+        return Ok(());
+    }
+    let first_span = node.first().map_or(Span::default(), |t| t.span);
+    let last_span = node.last().map_or(Span::default(), |t| t.span);
+    // Wrapper templates by grammar position, as (prefix, suffix) source.
+    const ITEMS: (&str, &str) = ("", "");
+    const IMPL_ITEMS: (&str, &str) = ("struct CfgS; impl CfgS {", "}");
+    const TRAIT_ITEMS: (&str, &str) = ("trait CfgT {", "}");
+    const STMT: (&str, &str) = ("fn cfgf() {", "}");
+    const ARM: (&str, &str) = ("fn cfgf() { match 0 {", "} }");
+    const FIELD: (&str, &str) = ("struct CfgS {", "}");
+    const TUPLE_FIELD: (&str, &str) = ("struct CfgS(", ");");
+    const VARIANT: (&str, &str) = ("enum CfgE {", "}");
+    const PARAM: (&str, &str) = ("fn cfgf(", ") {}");
+    const EXPR_COMMA: (&str, &str) = ("fn cfgf() { let _ = [", "]; }");
+    const LIT_FIELD: (&str, &str) = ("fn cfgf() { let _ = CfgS {", "}; }");
+    const PAT_FIELD: (&str, &str) = ("fn cfgf() { let CfgS {", ".. } = x; }");
+    const GENERIC: (&str, &str) = ("fn cfgf<", ">() {}");
+    const TYPE: (&str, &str) = ("type CfgA = ", ";");
+    const PATTERN: (&str, &str) = ("fn cfgf() { let ", " = x; }");
+    const WHERE_PRED: (&str, &str) = ("fn cfgf() where ", " {}");
+    let mut order: Vec<(&str, &str)> = match hint {
+        CfgSyntaxHint::Item => vec![
+            ITEMS,
+            IMPL_ITEMS,
+            TRAIT_ITEMS,
+            STMT,
+            ARM,
+            FIELD,
+            VARIANT,
+            PARAM,
+            TUPLE_FIELD,
+            LIT_FIELD,
+            PAT_FIELD,
+            EXPR_COMMA,
+            GENERIC,
+            TYPE,
+            PATTERN,
+            WHERE_PRED,
+        ],
+        CfgSyntaxHint::Node => vec![
+            STMT,
+            ARM,
+            ITEMS,
+            IMPL_ITEMS,
+            TRAIT_ITEMS,
+            FIELD,
+            PARAM,
+            TUPLE_FIELD,
+            VARIANT,
+            LIT_FIELD,
+            PAT_FIELD,
+            EXPR_COMMA,
+            GENERIC,
+            TYPE,
+            PATTERN,
+            WHERE_PRED,
+        ],
+    };
+    // A top-level `=>` is a match arm wherever the hint came from.
+    let mut depth = 0usize;
+    let mut has_arm = false;
+    for t in &node {
+        match t.tok {
+            Tok::LParen | Tok::LBrace | Tok::LBracket => depth += 1,
+            Tok::RParen | Tok::RBrace | Tok::RBracket => depth = depth.saturating_sub(1),
+            Tok::FatArrow if depth == 0 => has_arm = true,
+            _ => {}
+        }
+    }
+    if has_arm {
+        order.retain(|c| *c != ARM);
+        order.insert(0, ARM);
+    }
+    let template_toks = |src: &str, span: Span| -> Vec<Token> {
+        if src.is_empty() {
+            return Vec::new();
+        }
+        match crate::lexer::lex(src, span.file, 0, interner) {
+            Ok(lexed) => lexed
+                .tokens
+                .into_iter()
+                .filter(|t| t.tok != Tok::Eof)
+                .map(|mut t| {
+                    t.span = span;
+                    t
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    let mut first_err: Option<Diag> = None;
+    for (prefix, suffix) in order {
+        let mut trial = template_toks(prefix, first_span);
+        trial.extend_from_slice(&node);
+        trial.extend(template_toks(suffix, last_span));
+        trial.push(Token { tok: Tok::Eof, span: Span { lo: last_span.hi, ..last_span } });
+        match parse_tokens(&trial, local_strings.clone(), interner, known, &[], true) {
+            Ok(_) => return Ok(()),
+            Err(d) if d.code != "L0001" => return Ok(()),
+            Err(d) => {
+                if first_err.is_none() {
+                    first_err = Some(d);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| syntax(first_span, "invalid syntax in cfg-disabled code")))
 }
 
 /// Converts a flat token slice into nested token trees. Unbalanced input
@@ -692,6 +922,9 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) => Ok((s, self.bump().span)),
             Tok::SelfUpper => Ok((self.known.self_type, self.bump().span)),
             Tok::Reserved(_) => Err(self.reserved_error(self.span())),
+            // A lifetime is never an identifier in rustc grammar, so a
+            // cfg syntax check reports it as L0001, not the L0203 reject.
+            Tok::Lifetime(_) if self.cfg_syntax => Err(syntax(self.span(), "expected identifier, found lifetime")),
             Tok::Lifetime(_) => Err(lifetime_error(self.span())),
             t => Err(syntax(self.span(), format!("expected identifier, found {}", tok_name(t)))),
         }
@@ -720,6 +953,11 @@ impl<'a> Parser<'a> {
     /// See the `deferred` field. The `MAX_AST_DEPTH` guard defers
     /// this way (see `note_depth`).
     fn defer(&mut self, d: Diag) {
+        // A cfg syntax check reports grammar errors only: a deferred
+        // unsupported-form reject must not hide a later L0001.
+        if self.cfg_syntax && d.code != "L0001" {
+            return;
+        }
         if self.deferred.as_ref().is_none_or(|old| d.span.lo < old.span.lo) {
             self.deferred = Some(d);
         }
@@ -777,7 +1015,10 @@ impl<'a> Parser<'a> {
             if before_ty {
                 return Ok(Vis::Public);
             }
-            return Err(syntax(self.span(), "incorrect visibility restriction; write `pub(crate)`, `pub(self)`, `pub(super)`, or `pub(in path)`"));
+            return Err(syntax(
+                self.span(),
+                "incorrect visibility restriction; write `pub(crate)`, `pub(self)`, `pub(super)`, or `pub(in path)`",
+            ));
         }
         let start = self.bump().span;
         self.eat(Tok::In);
@@ -919,8 +1160,16 @@ impl<'a> Parser<'a> {
     fn expr_kids_depth(&self, e: &Expr) -> u32 {
         let mut m = 0u32;
         match e {
-            Expr::Int(..) | Expr::Bool(_) | Expr::Str(_) | Expr::Char(_) | Expr::Unit | Expr::SelfValue | Expr::Float(_)
-            | Expr::Continue(_) | Expr::Underscore | Expr::MacroCall(_) => {}
+            Expr::Int(..)
+            | Expr::Bool(_)
+            | Expr::Str(_)
+            | Expr::Char(_)
+            | Expr::Unit
+            | Expr::SelfValue
+            | Expr::Float(_)
+            | Expr::Continue(_)
+            | Expr::Underscore
+            | Expr::MacroCall(_) => {}
             Expr::Path(segs) => m = self.path_depth(segs),
             Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => m = self.bd(*b),
             Expr::LabeledBlock { body, .. } | Expr::AsyncBlock { body, .. } => m = self.bd(*body),
@@ -1289,6 +1538,58 @@ impl<'a> Parser<'a> {
                 input,
                 span: start.to(name_span),
             };
+            if self.cfg_syntax {
+                // Only the meta-item grammar runs here: a path, then
+                // nothing, one `(...)` group, or `= literal`. Which
+                // names exist is checked only for enabled code.
+                let rest = &body[bi..];
+                let meta_ok = if rest.is_empty() {
+                    true
+                } else if rest[0].tok == Tok::LParen {
+                    let mut d = 0usize;
+                    let mut end = None;
+                    for (j, t) in rest.iter().enumerate() {
+                        match t.tok {
+                            Tok::LParen => d += 1,
+                            Tok::RParen => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    end = Some(j);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    end == Some(rest.len() - 1)
+                } else if rest[0].tok == Tok::Eq {
+                    let lit = |t: Tok| {
+                        matches!(
+                            t,
+                            Tok::Str(..)
+                                | Tok::ByteStr(_)
+                                | Tok::ByteChar(_)
+                                | Tok::Char(..)
+                                | Tok::Int(..)
+                                | Tok::Float(_)
+                                | Tok::True
+                                | Tok::False
+                        )
+                    };
+                    match rest {
+                        [_, v] => lit(v.tok),
+                        [_, m, v] => m.tok == Tok::Minus && matches!(v.tok, Tok::Int(..) | Tok::Float(_)),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !meta_ok {
+                    return Err(syntax(start, "malformed attribute input"));
+                }
+                out.attrs.push(attr);
+                continue;
+            }
             let k = self.known;
             if path.len() > 1 {
                 // Tool attributes under a known tool namespace are ignored.
@@ -1366,6 +1667,11 @@ impl<'a> Parser<'a> {
     /// Anywhere else the attribute was parsed and would be silently
     /// dropped, which is a false accept.
     fn check_derive_test(&self, parsed: &ParsedAttrs, is_adt: bool, is_fn: bool) -> PResult<()> {
+        // Attribute placement is not grammar: rustc checks it after
+        // cfg stripping, so disabled code does not take this error.
+        if self.cfg_syntax {
+            return Ok(());
+        }
         // Presence of the attribute is what counts: `#[derive()]` on a
         // function is an error in rustc even with an empty list.
         let derive_attr = parsed.attrs.iter().find(|a| a.path.len() == 1 && a.path[0].name == self.known.derive);
@@ -1379,7 +1685,8 @@ impl<'a> Parser<'a> {
             ));
         }
         if !is_fn && parsed.is_test {
-            let span = parsed.attrs.iter().find(|a| a.path.len() == 1 && a.path[0].name == self.known.test).map_or(Span::default(), |a| a.span);
+            let span =
+                parsed.attrs.iter().find(|a| a.path.len() == 1 && a.path[0].name == self.known.test).map_or(Span::default(), |a| a.span);
             return Err(Diag::new(
                 "L0402",
                 span,
@@ -1445,7 +1752,7 @@ impl<'a> Parser<'a> {
         }
         let has_qual = qual.is_const || qual.is_async || qual.is_unsafe || qual.abi.is_some();
         let kind = match self.peek() {
-            Tok::Fn if has_qual && !(qual.is_const && !qual.is_async && !qual.is_unsafe && qual.abi.is_none()) => {
+            Tok::Fn if has_qual && !(qual.is_const && !qual.is_async && !qual.is_unsafe && qual.abi.is_none()) && !self.cfg_syntax => {
                 return Err(if qual.is_async {
                     async_error(start)
                 } else if qual.is_unsafe {
@@ -1467,7 +1774,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Struct if !has_qual => ItemKind::Struct(self.struct_def(derives)?),
             Tok::Enum if !has_qual => ItemKind::Enum(self.enum_def(derives)?),
-            Tok::Impl if vis != Vis::Private => return Err(vis_not_permitted(vis_span)),
+            Tok::Impl if vis != Vis::Private && !self.cfg_syntax => return Err(vis_not_permitted(vis_span)),
             Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => ItemKind::Impl(self.impl_def(true)?),
             Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def(false)?),
             Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
@@ -1485,13 +1792,35 @@ impl<'a> Parser<'a> {
             Tok::Static if !has_qual => ItemKind::Static(self.static_def()?),
             Tok::Type if !has_qual => ItemKind::Type(self.type_alias_def()?),
             // `extern { .. }` and `extern crate ..;`: the qualifier loop ate `extern`.
+            Tok::LBrace if qual.abi.is_some() && self.cfg_syntax => ItemKind::Mod(self.extern_block_cfg(start)?),
             Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
             Tok::Crate if qual.abi.is_some() => ItemKind::ExternCrate(self.extern_crate_def()?),
             _ if qual.is_const => return Err(not_yet(C_CONST, start, "const and static items")),
             _ if qual.is_async => return Err(async_error(start)),
             _ if qual.is_unsafe => return Err(unsafe_error(start)),
+            Tok::Ident(_) if self.cfg_syntax && self.at_ident("union") && matches!(self.peek_at(1), Tok::Ident(_)) => {
+                self.bump(); // `union`
+                let (name, name_span) = self.ident()?;
+                let generics = self.generics(true)?;
+                let where_clause = self.where_clause()?;
+                let fields = self.fields()?;
+                ItemKind::Struct(StructDef {
+                    name,
+                    name_span,
+                    generics,
+                    fields: VariantFields::Struct(fields),
+                    where_clause,
+                    derives: derives.clone(),
+                })
+            }
             Tok::Ident(_) if self.at_ident("union") && matches!(self.peek_at(1), Tok::Ident(_)) => {
                 return Err(not_yet(C_TY, start, "unions"));
+            }
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super if self.cfg_syntax && self.at_path_macro_call() => {
+                self.skip_macro_invocation()?;
+                self.eat(Tok::Semi);
+                self.scope_allows.truncate(scope_mark);
+                return Ok(None);
             }
             Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super if self.at_path_macro_call() => {
                 return Err(macro_error(start));
@@ -1499,11 +1828,7 @@ impl<'a> Parser<'a> {
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
-        self.check_derive_test(
-            &parsed,
-            matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_)),
-            matches!(kind, ItemKind::Fn(_)),
-        )?;
+        self.check_derive_test(&parsed, matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_)), matches!(kind, ItemKind::Fn(_)))?;
         self.scope_allows.truncate(scope_mark);
         Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }))
     }
@@ -1574,6 +1899,47 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(UseTree { leading_colon, prefix, kind: UseKind::Simple { rename }, span: start.to(self.prev_span()) })
+    }
+
+    /// An `extern { ... }` block in a cfg syntax check: foreign fns,
+    /// statics, and types are grammar-checked and then dropped, so the
+    /// dummy `ModDef` carries no items. Enabled code still rejects
+    /// extern blocks as unsupported.
+    fn extern_block_cfg(&mut self, start: Span) -> PResult<ModDef> {
+        self.expect(Tok::LBrace, "`{`")?;
+        let _inner = self.inner_attributes()?;
+        while self.peek() != Tok::RBrace {
+            if self.peek() == Tok::Eof {
+                return Err(syntax(self.span(), "expected `}`, found end of file"));
+            }
+            let _parsed = self.attributes()?;
+            let _vis = self.vis()?;
+            self.eat(Tok::Unsafe);
+            match self.peek() {
+                Tok::Fn => {
+                    self.cfg_foreign = true;
+                    let def = self.fn_def_inner(true);
+                    self.cfg_foreign = false;
+                    let _def = def?;
+                }
+                Tok::Static => {
+                    let _def = self.static_def()?;
+                }
+                Tok::Type => {
+                    self.bump();
+                    let _name = self.ident()?;
+                    let _generics = self.generics(true)?;
+                    self.expect(Tok::Semi, "`;`")?;
+                }
+                Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => {
+                    self.skip_macro_invocation()?;
+                    self.eat(Tok::Semi);
+                }
+                t => return Err(syntax(self.span(), format!("expected a foreign item, found {}", tok_name(t)))),
+            }
+        }
+        self.bump();
+        Ok(ModDef { name: Sym(0), name_span: start, inner_attrs: Vec::new(), body: Some(Vec::new()), span: start.to(self.prev_span()) })
     }
 
     /// A `mod` item: `mod name;` (a file module; the resolver finds the
@@ -1956,6 +2322,13 @@ impl<'a> Parser<'a> {
         while self.peek() != Tok::RParen {
             let pattrs = self.part_attributes()?;
             let start = self.span();
+            if self.cfg_syntax && self.cfg_foreign && (self.peek() == Tok::DotDot || self.peek() == Tok::Ellipsis) {
+                self.bump();
+                if self.peek() == Tok::Dot {
+                    self.bump();
+                }
+                break;
+            }
             if self.peek() == Tok::DotDot {
                 return Err(self.reject(C_CORE, "variadic parameters"));
             }
@@ -1999,7 +2372,7 @@ impl<'a> Parser<'a> {
         // Patterns are not allowed in functions without bodies
         // (rustc E0642): a trait signature takes plain names and
         // `_` only.
-        if body.is_none() {
+        if body.is_none() && !self.cfg_syntax {
             for param in &params {
                 if let Some(pat) = param.pat
                     && !matches!(self.ast.pat(pat), Pat::Wild)
@@ -2182,7 +2555,7 @@ impl<'a> Parser<'a> {
             // Trait items are as visible as their trait.
             let vis_start = self.span();
             let vis = self.vis()?;
-            if vis != Vis::Private {
+            if vis != Vis::Private && !self.cfg_syntax {
                 return Err(vis_not_permitted(vis_start.to(self.prev_span())));
             }
             match self.peek() {
@@ -2196,12 +2569,30 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Type => types.push(self.assoc_type()?),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => consts.push(self.assoc_const()?),
+                Tok::Const | Tok::Unsafe | Tok::Async if self.cfg_syntax => {
+                    while matches!(self.peek(), Tok::Const | Tok::Unsafe | Tok::Async) {
+                        self.bump();
+                    }
+                    if self.eat(Tok::Extern) && matches!(self.peek(), Tok::Str(..)) {
+                        self.bump();
+                    }
+                    let mut def = self.fn_def_inner(true)?;
+                    def.vis = vis;
+                    let mut attrs = parsed.attrs;
+                    attrs.extend(def.attrs);
+                    def.attrs = attrs;
+                    fns.push(def);
+                }
                 // Const fns in traits are unstable in Rust
                 // (E0379) and unsupported here.
                 Tok::Const if self.peek_at(1) == Tok::Fn => return Err(self.reject(C_CONST, "const functions in traits")),
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),
+                Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+                    self.skip_macro_invocation()?;
+                    self.eat(Tok::Semi);
+                }
                 Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
                 t => return Err(syntax(self.span(), format!("expected a trait item, found {}", tok_name(t)))),
             }
@@ -2267,7 +2658,7 @@ impl<'a> Parser<'a> {
             // Trait impl items take the trait's visibility.
             let vis_start = self.span();
             let vis = self.vis()?;
-            if trait_ref.is_some() && vis != Vis::Private {
+            if trait_ref.is_some() && vis != Vis::Private && !self.cfg_syntax {
                 return Err(vis_not_permitted(vis_start.to(self.prev_span())));
             }
             match self.peek() {
@@ -2279,7 +2670,7 @@ impl<'a> Parser<'a> {
                     def.attrs = attrs;
                     fns.push(def);
                 }
-                Tok::Type if trait_ref.is_some() => types.push(self.assoc_type()?),
+                Tok::Type if trait_ref.is_some() || self.cfg_syntax => types.push(self.assoc_type()?),
                 Tok::Type => return Err(self.reject(C_ASSOC, "associated types in inherent impls")),
                 Tok::Const if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) => {
                     let mut def = self.assoc_const()?;
@@ -2296,9 +2687,27 @@ impl<'a> Parser<'a> {
                     def.qual.is_const = true;
                     fns.push(def);
                 }
+                Tok::Unsafe | Tok::Async if self.cfg_syntax => {
+                    while matches!(self.peek(), Tok::Unsafe | Tok::Async | Tok::Const) {
+                        self.bump();
+                    }
+                    if self.eat(Tok::Extern) && matches!(self.peek(), Tok::Str(..)) {
+                        self.bump();
+                    }
+                    let mut def = self.fn_def()?;
+                    def.vis = vis;
+                    let mut attrs = parsed.attrs;
+                    attrs.extend(def.attrs);
+                    def.attrs = attrs;
+                    fns.push(def);
+                }
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
                 Tok::Async => return Err(async_error(self.span())),
+                Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+                    self.skip_macro_invocation()?;
+                    self.eat(Tok::Semi);
+                }
                 Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
                 t => return Err(syntax(self.span(), format!("expected an impl item, found {}", tok_name(t)))),
             }
@@ -2421,8 +2830,14 @@ impl<'a> Parser<'a> {
                 let mut inputs = Vec::new();
                 let mut variadic = false;
                 while self.peek() != Tok::RParen {
-                    if self.peek() == Tok::DotDot && self.peek_at(1) == Tok::Dot {
+                    if (self.peek() == Tok::DotDot && self.peek_at(1) == Tok::Dot) || (self.cfg_syntax && self.peek() == Tok::Ellipsis) {
                         variadic = true;
+                        if self.cfg_syntax {
+                            self.bump();
+                            if self.peek() == Tok::Dot {
+                                self.bump();
+                            }
+                        }
                         break;
                     }
                     let pstart = self.span();
@@ -2440,7 +2855,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(Tok::RParen, "`)`")?;
-                if variadic {
+                if variadic && !self.cfg_syntax {
                     return Err(not_yet(C_TY, start, "variadic function pointer types"));
                 }
                 let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
@@ -2472,11 +2887,26 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(self.push_ty(TyExpr::Infer, start.to(self.prev_span())))
             }
+            Tok::Unsafe if self.cfg_syntax => {
+                self.bump();
+                self.ty()
+            }
             Tok::Unsafe => Err(unsafe_error(start)),
+            Tok::Extern if self.cfg_syntax => {
+                self.bump();
+                if matches!(self.peek(), Tok::Str(..)) {
+                    self.bump();
+                }
+                self.ty()
+            }
             Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Ok(self.push_ty(TyExpr::QPath { self_ty, trait_path, segs }, start.to(self.prev_span())))
+            }
+            Tok::For if self.cfg_syntax => {
+                let _binder = self.opt_binder()?;
+                self.ty()
             }
             Tok::For => {
                 if self.peek_at(1) == Tok::Lt && matches!(self.peek_at(2), Tok::Lifetime(_)) {
@@ -2484,6 +2914,10 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds"))
                 }
+            }
+            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+                let (span, _) = self.skip_macro_invocation()?;
+                Ok(self.push_ty(TyExpr::Unit, span))
             }
             Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => Err(macro_error(start)),
             _ => {
@@ -2514,7 +2948,9 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Minus => self.prefix(false),
             Tok::LBrace => self.block_like_expr(false),
-            Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => self.primary(false, false),
+            Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => {
+                self.primary(false, false)
+            }
             _ => Err(self.reject(C_CONST, "const generic arguments in this form")),
         }
     }
@@ -2677,6 +3113,38 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True at an `unsafe` or `async` item qualifier in a cfg syntax
+    /// check: qualifiers (and an `extern "abi"`) followed by an item
+    /// keyword. An `unsafe { .. }` or `async { .. }` block is not an
+    /// item and stays an expression.
+    fn at_cfg_qualified_item(&self) -> bool {
+        if !matches!(self.peek(), Tok::Unsafe | Tok::Async) {
+            return false;
+        }
+        let mut j = self.pos;
+        let mut saw_extern = false;
+        loop {
+            match self.toks.get(j).map(|t| t.tok) {
+                Some(Tok::Unsafe | Tok::Async | Tok::Const) => j += 1,
+                Some(Tok::Extern) => {
+                    saw_extern = true;
+                    j += 1;
+                    if matches!(self.toks.get(j).map(|t| t.tok), Some(Tok::Str(..))) {
+                        j += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        match self.toks.get(j).map(|t| t.tok) {
+            Some(Tok::Fn | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Struct | Tok::Enum | Tok::Crate) => true,
+            // Only an extern block opens with `{`; a plain unsafe or
+            // async block is an expression.
+            Some(Tok::LBrace) => saw_extern,
+            _ => false,
+        }
+    }
+
     fn block_inner(&mut self) -> PResult<BlockId> {
         let start = self.expect(Tok::LBrace, "`{`")?;
         // Inner attributes at a block's start are permitted only in the
@@ -2741,7 +3209,19 @@ impl<'a> Parser<'a> {
                 self.peek(),
                 Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Use | Tok::Mod | Tok::Trait | Tok::Static | Tok::Type | Tok::Extern
             ) || (self.peek() == Tok::Const && self.peek_at(1) != Tok::LBrace)
+                || (self.cfg_syntax && self.at_cfg_qualified_item())
             {
+                if self.cfg_syntax {
+                    match self.item()? {
+                        Some(item) => {
+                            let idx = self.ast.stmt_items.len() as u32;
+                            self.ast.stmt_items.push(item);
+                            stmts.push(Stmt::Item(idx));
+                        }
+                        None => return Err(syntax(self.span(), "expected an item")),
+                    }
+                    continue;
+                }
                 return Err(self.reject(C_CORE, "items inside function bodies"));
             }
             if self.peek() == Tok::Let {
@@ -2834,7 +3314,9 @@ impl<'a> Parser<'a> {
             } else if self.peek() == Tok::RBrace {
                 tail = Some(expr);
                 tail_attrs = stmt_attrs.attrs;
-            } else if block_like {
+            } else if block_like
+                || (self.cfg_syntax && matches!(self.ast.expr(expr), Expr::MacroCall(m) if m.delim == Delim::Brace))
+            {
                 stmts.push(Stmt::Expr { expr, semi: false, attrs: stmt_attrs.attrs });
             } else {
                 return Err(syntax(self.span(), format!("expected `;` or `}}`, found {}", tok_name(self.peek()))));
@@ -2937,8 +3419,15 @@ impl<'a> Parser<'a> {
                     Pat::Binding { name, mutable, by_ref }
                 }
             }
-            Tok::Int(..) | Tok::Float(_) | Tok::ByteStr(_) | Tok::ByteChar(_) | Tok::Minus | Tok::Str(..) | Tok::Char(..)
-            | Tok::True | Tok::False => {
+            Tok::Int(..)
+            | Tok::Float(_)
+            | Tok::ByteStr(_)
+            | Tok::ByteChar(_)
+            | Tok::Minus
+            | Tok::Str(..)
+            | Tok::Char(..)
+            | Tok::True
+            | Tok::False => {
                 let lo = self.literal_expr()?;
                 if self.eat(Tok::DotDotEq) {
                     let hi = self.pattern_bound()?;
@@ -2971,6 +3460,10 @@ impl<'a> Parser<'a> {
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Pat::QPath { self_ty, trait_path, segs }
+            }
+            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+                self.skip_macro_invocation()?;
+                Pat::Wild
             }
             Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(start)),
             Tok::Ident(_) | Tok::SelfUpper => {
@@ -3183,6 +3676,10 @@ impl<'a> Parser<'a> {
     fn byte_str_expr(&mut self, i: u32, start: Span) -> PResult<Expr> {
         let text = self.ast.strings[(i + self.str_base) as usize].clone();
         if text.starts_with('c') {
+            if self.cfg_syntax {
+                let arr = self.push_expr(Expr::Array(Vec::new()), start);
+                return Ok(Expr::Ref { mutable: false, raw: false, expr: arr });
+            }
             return Err(not_yet(C_LIT, start, "C string literals"));
         }
         let Some(bytes) = decode_byte_str(&text) else { return Err(syntax(start, "invalid byte string literal")) };
@@ -3419,6 +3916,18 @@ impl<'a> Parser<'a> {
             Tok::Amp | Tok::AndAnd => {
                 let double = self.bump().tok == Tok::AndAnd;
                 if !double && self.at_ident("raw") && matches!(self.peek_at(1), Tok::Const | Tok::Mut) {
+                    if self.cfg_syntax {
+                        self.bump(); // `raw`
+                        let mutable = if self.eat(Tok::Mut) {
+                            true
+                        } else {
+                            self.eat(Tok::Const);
+                            false
+                        };
+                        let inner = self.prefix(no_struct)?;
+                        let span = start.to(self.prev_span());
+                        return Ok(self.push_expr(Expr::Ref { mutable, raw: true, expr: inner }, span));
+                    }
                     return Err(not_yet(C_CORE, start, "raw references (`&raw`)"));
                 }
                 let mutable = self.eat(Tok::Mut);
@@ -3511,6 +4020,10 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     if self.peek() == Tok::Await {
+                        if self.cfg_syntax {
+                            self.bump();
+                            continue;
+                        }
                         return Err(async_error(self.span()));
                     }
                     let (name, name_span) = self.ident()?;
@@ -3828,7 +4341,22 @@ impl<'a> Parser<'a> {
                 self.block_inner_ok = false;
                 return self.closure_expr(start);
             }
+            Tok::Unsafe if self.cfg_syntax => {
+                self.bump();
+                Expr::Block(self.block()?)
+            }
             Tok::Unsafe => return Err(unsafe_error(start)),
+            Tok::Async if self.cfg_syntax => {
+                self.bump();
+                if self.peek() == Tok::LBrace {
+                    Expr::Block(self.block()?)
+                } else if self.peek() == Tok::Move && self.peek_at(1) == Tok::LBrace {
+                    self.bump();
+                    Expr::Block(self.block()?)
+                } else {
+                    return self.closure_expr(start);
+                }
+            }
             Tok::Async => return Err(async_error(start)),
             Tok::Const => {
                 self.bump();
@@ -3847,6 +4375,7 @@ impl<'a> Parser<'a> {
                 let scrut = self.binary(3, true)?;
                 Expr::Let { pat, scrut }
             }
+            Tok::Let if self.cfg_syntax => return Err(syntax(start, "expected an expression, found `let`")),
             Tok::Let => return Err(not_yet(C_CORE, start, "let chains outside conditions")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
@@ -3860,6 +4389,9 @@ impl<'a> Parser<'a> {
                 if self.peek_at(1) == Tok::Bang {
                     return self.macro_call();
                 }
+                if self.cfg_syntax && self.at_path_macro_call() {
+                    return self.cfg_macro_expr();
+                }
                 if self.at_offset_of_path() {
                     for _ in 0..6 {
                         self.bump();
@@ -3867,6 +4399,9 @@ impl<'a> Parser<'a> {
                     return self.offset_of_body(start);
                 }
                 if self.at_path_macro_call() {
+                    if self.cfg_syntax {
+                        return self.cfg_macro_expr();
+                    }
                     return Err(macro_error(start));
                 }
                 let path = self.path(false)?;
@@ -3874,6 +4409,10 @@ impl<'a> Parser<'a> {
                     return self.struct_lit(path, start);
                 }
                 Expr::Path(path)
+            }
+            Tok::Reserved(s) if self.cfg_syntax && self.interner.get(s) == "try" && self.peek_at(1) == Tok::LBrace => {
+                self.bump();
+                Expr::Block(self.block()?)
             }
             Tok::Reserved(_) => return Err(self.reserved_error(start)),
             t => return Err(syntax(start, format!("expected an expression, found {}", tok_name(t)))),
@@ -4000,8 +4539,80 @@ impl<'a> Parser<'a> {
             && matches!(self.toks.get(self.pos + 5).map(|t| t.tok), Some(Tok::Bang))
     }
 
+    /// Consumes one macro invocation (`path ! group`, or a
+    /// `macro_rules! name group` definition) at the current token
+    /// without looking inside its group. A cfg syntax check uses this
+    /// in every position, as rustc parses an invocation in disabled
+    /// code as one opaque node and never expands it.
+    fn skip_macro_invocation(&mut self) -> PResult<(Span, Delim)> {
+        let start = self.span();
+        self.eat(Tok::PathSep);
+        let mut last_text = String::new();
+        loop {
+            match self.peek() {
+                Tok::Ident(s) => {
+                    last_text = self.interner.get(s).to_string();
+                    self.bump();
+                }
+                Tok::SelfUpper | Tok::SelfLower | Tok::Crate | Tok::Super => {
+                    self.bump();
+                }
+                t => return Err(syntax(self.span(), format!("expected a macro name, found {}", tok_name(t)))),
+            }
+            if !self.eat(Tok::PathSep) {
+                break;
+            }
+        }
+        self.expect(Tok::Bang, "`!` after a macro name")?;
+        // A definition names the macro before its group.
+        if last_text == "macro_rules" && matches!(self.peek(), Tok::Ident(_)) {
+            self.bump();
+        }
+        let close_of = |t: Tok| match t {
+            Tok::LParen => Some(Tok::RParen),
+            Tok::LBracket => Some(Tok::RBracket),
+            Tok::LBrace => Some(Tok::RBrace),
+            _ => None,
+        };
+        let delim = match self.peek() {
+            Tok::LParen => Delim::Paren,
+            Tok::LBracket => Delim::Bracket,
+            Tok::LBrace => Delim::Brace,
+            _ => return Err(syntax(self.span(), "expected `(` or `[` or `{` after a macro name")),
+        };
+        let first_close = close_of(self.peek()).unwrap();
+        let mut stack = vec![first_close];
+        self.bump();
+        while let Some(&want) = stack.last() {
+            match self.peek() {
+                Tok::Eof => return Err(syntax(start, "unterminated macro invocation")),
+                t if t == want => {
+                    stack.pop();
+                    self.bump();
+                }
+                t => {
+                    if let Some(c) = close_of(t) {
+                        stack.push(c);
+                    }
+                    self.bump();
+                }
+            }
+        }
+        Ok((start.to(self.prev_span()), delim))
+    }
+
+    /// One cfg-syntax macro invocation as an expression: an opaque
+    /// `MacroCall` node with no token trees (they are not parsed).
+    fn cfg_macro_expr(&mut self) -> PResult<ExprId> {
+        let (span, delim) = self.skip_macro_invocation()?;
+        Ok(self.push_expr(Expr::MacroCall(MacroCall { path: Vec::new(), delim, tokens: Vec::new(), span }), span))
+    }
+
     fn macro_call(&mut self) -> PResult<ExprId> {
         let start = self.span();
+        if self.cfg_syntax {
+            return self.cfg_macro_expr();
+        }
         let (name, _) = self.ident()?;
         self.bump(); // `!`
         let k = self.known;
