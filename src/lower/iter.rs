@@ -443,34 +443,34 @@ impl Ex<'_, '_, '_> {
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s))]));
             }
             B::IterMap | B::IterFilter | B::IterFilterMap | B::IterInspect => {
-                let (i, f) = (arg()?, arg()?);
+                let (i, f) = (self.unwrap_op(arg()?)?, arg()?);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, f]));
             }
             B::IterEnumerate => {
-                let i = arg()?;
+                let i = self.unwrap_op(arg()?)?;
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, Self::usize_c(0)]));
             }
             B::IterRev | B::IterCopied | B::IterCloned => {
-                let i = arg()?;
+                let i = self.unwrap_op(arg()?)?;
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i]));
             }
             B::IterTake | B::IterSkip => {
-                let (i, n) = (arg()?, arg()?);
+                let (i, n) = (self.unwrap_op(arg()?)?, arg()?);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, n]));
             }
             B::IterTakeWhile | B::IterSkipWhile => {
-                let (i, p) = (arg()?, arg()?);
+                let (i, p) = (self.unwrap_op(arg()?)?, arg()?);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, Operand::Const(Const::Bool(false)), p]));
             }
             B::IterPeekable => {
-                let i = arg()?;
+                let i = self.unwrap_op(arg()?)?;
                 let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad Peekable")?;
                 let slot = self.local(fields[1]);
                 self.none(&Place::local(slot), fields[1]);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, Operand::Move(Place::local(slot))]));
             }
             B::IterStepBy => {
-                let (i, n) = (arg()?, arg()?);
+                let (i, n) = (self.unwrap_op(arg()?)?, arg()?);
                 // `assert!(step != 0)`, then `step_minus_one`.
                 let ok = self.cmp(crate::ast::BinOp::Ne, n.clone(), Self::usize_c(0));
                 let (good, bad) = self.branch(ok);
@@ -484,7 +484,7 @@ impl Ex<'_, '_, '_> {
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, Operand::Copy(Place::local(m)), Operand::Const(Const::Bool(true))]));
             }
             B::IterChain => {
-                let (a, other) = (arg()?, arg()?);
+                let (a, other) = (self.unwrap_op(arg()?)?, arg()?);
                 let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad Chain")?;
                 let (_, targs) = self.kind_args(dest_ty).ok_or("iterator expansion: bad Chain")?;
                 let bv = self.into_iter(other, targs[1])?;
@@ -494,7 +494,7 @@ impl Ex<'_, '_, '_> {
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(oa)), Operand::Move(Place::local(ob))]));
             }
             B::IterZip => {
-                let (a, other) = (arg()?, arg()?);
+                let (a, other) = (self.unwrap_op(arg()?)?, arg()?);
                 let (_, targs) = self.kind_args(dest_ty).ok_or("iterator expansion: bad Zip")?;
                 let bv = self.into_iter(other, targs[1])?;
                 let (al, bl) = (self.local(targs[0]), self.local(targs[1]));
@@ -686,7 +686,7 @@ impl Ex<'_, '_, '_> {
             // `flatten()` and `flat_map(f)` (W-STD-B): (Some(iter), None,
             // None); flat_map's iter is `Map<I, F>`.
             B::IterFlatten | B::IterFlatMap => {
-                let i = arg()?;
+                let i = self.unwrap_op(arg()?)?;
                 let (_, fa) = self.kind_args(dest_ty).ok_or("iterator expansion: bad flatten iterator")?;
                 let inner = if b == B::IterFlatMap {
                     let f = arg()?;
@@ -1085,6 +1085,26 @@ impl Ex<'_, '_, '_> {
         }
     }
 
+    /// The inner iterator type when `ty` is a std source collection
+    /// iterator struct (collect.rs `collection_iter_inner`): check
+    /// typed its methods as the inner type's, so every expansion
+    /// entry below unwraps field 0 and continues with the inner type.
+    fn wrapper_inner(&mut self, ty: Ty) -> Option<Ty> {
+        self.p.collection_iter_inner(&mut self.body.tys, ty)
+    }
+
+    /// A by-value iterator operand as its inner iterator when it is
+    /// a collection iterator struct (moves field 0 into a fresh
+    /// local); other operands pass through.
+    fn unwrap_op(&mut self, i: Operand) -> Result<Operand, String> {
+        let ty = self.op_ty(&i)?;
+        let Some(inner) = self.wrapper_inner(ty) else { return Ok(i) };
+        let pl = self.op_place(i, ty);
+        let l = self.local(inner);
+        self.assign(Place::local(l), Rvalue::Use(self.take(pl.project(Proj::Field(0)), inner)));
+        Ok(Operand::Move(Place::local(l)))
+    }
+
     /// The iterator place and type behind a `&mut I` argument.
     fn deref_arg(&mut self, r: Operand) -> Result<(Place, Ty), String> {
         let rt = self.op_ty(&r)?;
@@ -1092,12 +1112,16 @@ impl Ex<'_, '_, '_> {
             return Err("iterator expansion: `&mut self` argument is not a reference".into());
         };
         let pl = self.op_place(r, rt);
+        if let Some(inner) = self.wrapper_inner(ty) {
+            return Ok((pl.deref().project(Proj::Field(0)), inner));
+        }
         Ok((pl.deref(), ty))
     }
 
     /// Moves a by-value iterator argument into a fresh local the
     /// consumer owns (dropped when the consumer returns, as in Rust).
     fn own(&mut self, i: Operand) -> Result<(Local, Ty), String> {
+        let i = self.unwrap_op(i)?;
         let ty = self.op_ty(&i)?;
         let l = self.local(ty);
         self.assign(Place::local(l), Rvalue::Use(i));
@@ -1110,6 +1134,10 @@ impl Ex<'_, '_, '_> {
         let ot = self.op_ty(&o)?;
         if ot == want {
             return Ok(o);
+        }
+        // A collection iterator struct chains as its inner iterator.
+        if self.wrapper_inner(ot) == Some(want) {
+            return self.unwrap_op(o);
         }
         let Some((k, _)) = self.kind_args(want) else { return Err("iterator expansion: bad IntoIterator argument".into()) };
         let l = self.local(want);

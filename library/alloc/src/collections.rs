@@ -16,10 +16,13 @@
 //   grows by the same RawVec rule, so `capacity()` matches. Methods
 //   whose result depends on std's ring layout (`as_slices`,
 //   `make_contiguous`, `rotate_*`) are not here.
-// - The iterator types are aliases of the builtin adapters
-//   (`Map<slice::Iter<'a, (K, V)>, fn(&(K, V)) -> (&K, &V)>` and kin), so
-//   the whole adapter set works on them, with std's item types. They
-//   have no `Debug` (std's prints the remaining items).
+// - The iterator types are nominal structs whose one field holds a
+//   builtin adapter (`Map<slice::Iter<'a, (K, V)>, fn(&(K, V)) ->
+//   (&K, &V)>` and kin), so the whole adapter set works on them (the
+//   checker types their methods as the inner type's; see
+//   `collection_iter_inner`), with std's item types. They stay
+//   distinct from the inner types, as std's own iterator structs
+//   are. They have no `Debug` (std's prints the remaining items).
 // Not here yet: `Extend` impls (the `Extend` trait is not on next yet),
 // `VecDeque`'s `FromIterator` (its capacity
 // follows `Vec`'s collect rules, which generic source cannot call yet), `range`, `Index` (`map[&k]` needs user `Index`), `Hash`,
@@ -65,14 +68,79 @@ pub mod btree_map {
 
     pub use super::BTreeMap;
 
-    pub type Iter<'a, K, V> = core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> (&K, &V)>;
-    pub type IterMut<'a, K, V> = core::iter::Map<core::slice::IterMut<'a, (K, V)>, fn(&mut (K, V)) -> (&K, &mut V)>;
-    pub type Keys<'a, K, V> = core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> &K>;
-    pub type Values<'a, K, V> = core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> &V>;
-    pub type ValuesMut<'a, K, V> = core::iter::Map<core::slice::IterMut<'a, (K, V)>, fn(&mut (K, V)) -> &mut V>;
-    pub type IntoIter<K, V> = std::vec::IntoIter<(K, V)>;
-    pub type IntoKeys<K, V> = core::iter::Map<std::vec::IntoIter<(K, V)>, fn((K, V)) -> K>;
-    pub type IntoValues<K, V> = core::iter::Map<std::vec::IntoIter<(K, V)>, fn((K, V)) -> V>;
+    pub struct Iter<'a, K, V> {
+        inner: core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> (&K, &V)>,
+    }
+    pub struct IterMut<'a, K, V> {
+        inner: core::iter::Map<core::slice::IterMut<'a, (K, V)>, fn(&mut (K, V)) -> (&K, &mut V)>,
+    }
+    pub struct Keys<'a, K, V> {
+        inner: core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> &K>,
+    }
+    pub struct Values<'a, K, V> {
+        inner: core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> &V>,
+    }
+    pub struct ValuesMut<'a, K, V> {
+        inner: core::iter::Map<core::slice::IterMut<'a, (K, V)>, fn(&mut (K, V)) -> &mut V>,
+    }
+    pub struct IntoIter<K, V> {
+        inner: std::vec::IntoIter<(K, V)>,
+    }
+    pub struct IntoKeys<K, V> {
+        inner: core::iter::Map<std::vec::IntoIter<(K, V)>, fn((K, V)) -> K>,
+    }
+    pub struct IntoValues<K, V> {
+        inner: core::iter::Map<std::vec::IntoIter<(K, V)>, fn((K, V)) -> V>,
+    }
+
+    impl<'a, K, V> Iterator for Iter<'a, K, V> {
+        type Item = (&'a K, &'a V);
+        fn next(&mut self) -> Option<(&'a K, &'a V)> {
+            self.inner.next()
+        }
+    }
+    impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+        type Item = (&'a K, &'a mut V);
+        fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
+            self.inner.next()
+        }
+    }
+    impl<'a, K, V> Iterator for Keys<'a, K, V> {
+        type Item = &'a K;
+        fn next(&mut self) -> Option<&'a K> {
+            self.inner.next()
+        }
+    }
+    impl<'a, K, V> Iterator for Values<'a, K, V> {
+        type Item = &'a V;
+        fn next(&mut self) -> Option<&'a V> {
+            self.inner.next()
+        }
+    }
+    impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+        type Item = &'a mut V;
+        fn next(&mut self) -> Option<&'a mut V> {
+            self.inner.next()
+        }
+    }
+    impl<K, V> Iterator for IntoIter<K, V> {
+        type Item = (K, V);
+        fn next(&mut self) -> Option<(K, V)> {
+            self.inner.next()
+        }
+    }
+    impl<K, V> Iterator for IntoKeys<K, V> {
+        type Item = K;
+        fn next(&mut self) -> Option<K> {
+            self.inner.next()
+        }
+    }
+    impl<K, V> Iterator for IntoValues<K, V> {
+        type Item = V;
+        fn next(&mut self) -> Option<V> {
+            self.inner.next()
+        }
+    }
 
     fn pair_ref<K, V>(p: &(K, V)) -> (&K, &V) {
         (&p.0, &p.1)
@@ -120,31 +188,31 @@ pub mod btree_map {
         }
 
         pub fn iter(&self) -> Iter<'_, K, V> {
-            self.entries.iter().map(pair_ref as fn(&(K, V)) -> (&K, &V))
+            Iter { inner: self.entries.iter().map(pair_ref as fn(&(K, V)) -> (&K, &V)) }
         }
 
         pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
-            self.entries.iter_mut().map(pair_mut as fn(&mut (K, V)) -> (&K, &mut V))
+            IterMut { inner: self.entries.iter_mut().map(pair_mut as fn(&mut (K, V)) -> (&K, &mut V)) }
         }
 
         pub fn keys(&self) -> Keys<'_, K, V> {
-            self.entries.iter().map(key_ref as fn(&(K, V)) -> &K)
+            Keys { inner: self.entries.iter().map(key_ref as fn(&(K, V)) -> &K) }
         }
 
         pub fn values(&self) -> Values<'_, K, V> {
-            self.entries.iter().map(value_ref as fn(&(K, V)) -> &V)
+            Values { inner: self.entries.iter().map(value_ref as fn(&(K, V)) -> &V) }
         }
 
         pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
-            self.entries.iter_mut().map(value_mut as fn(&mut (K, V)) -> &mut V)
+            ValuesMut { inner: self.entries.iter_mut().map(value_mut as fn(&mut (K, V)) -> &mut V) }
         }
 
         pub fn into_keys(self) -> IntoKeys<K, V> {
-            self.entries.into_iter().map(into_key as fn((K, V)) -> K)
+            IntoKeys { inner: self.entries.into_iter().map(into_key as fn((K, V)) -> K) }
         }
 
         pub fn into_values(self) -> IntoValues<K, V> {
-            self.entries.into_iter().map(into_value as fn((K, V)) -> V)
+            IntoValues { inner: self.entries.into_iter().map(into_value as fn((K, V)) -> V) }
         }
 
         pub fn first_key_value(&self) -> Option<(&K, &V)> {
@@ -548,7 +616,7 @@ pub mod btree_map {
         type Item = (K, V);
         type IntoIter = IntoIter<K, V>;
         fn into_iter(self) -> IntoIter<K, V> {
-            self.entries.into_iter()
+            IntoIter { inner: self.entries.into_iter() }
         }
     }
 
@@ -574,8 +642,25 @@ pub mod btree_set {
 
     pub use super::BTreeSet;
 
-    pub type Iter<'a, T> = core::slice::Iter<'a, T>;
-    pub type IntoIter<T> = std::vec::IntoIter<T>;
+    pub struct Iter<'a, T> {
+        inner: core::slice::Iter<'a, T>,
+    }
+    pub struct IntoIter<T> {
+        inner: std::vec::IntoIter<T>,
+    }
+
+    impl<'a, T> Iterator for Iter<'a, T> {
+        type Item = &'a T;
+        fn next(&mut self) -> Option<&'a T> {
+            self.inner.next()
+        }
+    }
+    impl<T> Iterator for IntoIter<T> {
+        type Item = T;
+        fn next(&mut self) -> Option<T> {
+            self.inner.next()
+        }
+    }
 
     impl<T> BTreeSet<T> {
         pub const fn new() -> BTreeSet<T> {
@@ -595,7 +680,7 @@ pub mod btree_set {
         }
 
         pub fn iter(&self) -> Iter<'_, T> {
-            self.items.iter()
+            Iter { inner: self.items.iter() }
         }
 
         pub fn first(&self) -> Option<&T> {
@@ -870,7 +955,7 @@ pub mod btree_set {
         type Item = T;
         type IntoIter = IntoIter<T>;
         fn into_iter(self) -> IntoIter<T> {
-            self.items.into_iter()
+            IntoIter { inner: self.items.into_iter() }
         }
     }
 
@@ -878,7 +963,7 @@ pub mod btree_set {
         type Item = &'a T;
         type IntoIter = Iter<'a, T>;
         fn into_iter(self) -> Iter<'a, T> {
-            self.items.iter()
+            Iter { inner: self.items.iter() }
         }
     }
 }
@@ -886,9 +971,34 @@ pub mod btree_set {
 pub mod vec_deque {
     pub use super::VecDeque;
 
-    pub type Iter<'a, T> = core::slice::Iter<'a, T>;
-    pub type IterMut<'a, T> = core::slice::IterMut<'a, T>;
-    pub type IntoIter<T> = std::vec::IntoIter<T>;
+    pub struct Iter<'a, T> {
+        inner: core::slice::Iter<'a, T>,
+    }
+    pub struct IterMut<'a, T> {
+        inner: core::slice::IterMut<'a, T>,
+    }
+    pub struct IntoIter<T> {
+        inner: std::vec::IntoIter<T>,
+    }
+
+    impl<'a, T> Iterator for Iter<'a, T> {
+        type Item = &'a T;
+        fn next(&mut self) -> Option<&'a T> {
+            self.inner.next()
+        }
+    }
+    impl<'a, T> Iterator for IterMut<'a, T> {
+        type Item = &'a mut T;
+        fn next(&mut self) -> Option<&'a mut T> {
+            self.inner.next()
+        }
+    }
+    impl<T> Iterator for IntoIter<T> {
+        type Item = T;
+        fn next(&mut self) -> Option<T> {
+            self.inner.next()
+        }
+    }
 
     impl<T> VecDeque<T> {
         pub const fn new() -> VecDeque<T> {
@@ -987,11 +1097,11 @@ pub mod vec_deque {
         }
 
         pub fn iter(&self) -> Iter<'_, T> {
-            self.buf.iter()
+            Iter { inner: self.buf.iter() }
         }
 
         pub fn iter_mut(&mut self) -> IterMut<'_, T> {
-            self.buf.iter_mut()
+            IterMut { inner: self.buf.iter_mut() }
         }
 
         pub fn contains(&self, x: &T) -> bool
@@ -1083,7 +1193,7 @@ pub mod vec_deque {
         type Item = T;
         type IntoIter = IntoIter<T>;
         fn into_iter(self) -> IntoIter<T> {
-            self.buf.into_iter()
+            IntoIter { inner: self.buf.into_iter() }
         }
     }
 
@@ -1091,7 +1201,7 @@ pub mod vec_deque {
         type Item = &'a T;
         type IntoIter = Iter<'a, T>;
         fn into_iter(self) -> Iter<'a, T> {
-            self.buf.iter()
+            Iter { inner: self.buf.iter() }
         }
     }
 
@@ -1099,7 +1209,7 @@ pub mod vec_deque {
         type Item = &'a mut T;
         type IntoIter = IterMut<'a, T>;
         fn into_iter(self) -> IterMut<'a, T> {
-            self.buf.iter_mut()
+            IterMut { inner: self.buf.iter_mut() }
         }
     }
 }

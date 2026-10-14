@@ -393,6 +393,51 @@ impl<'a> Program<'a> {
     pub fn is_std_adt(&self, a: AdtId) -> bool {
         self.adts.get(a.0 as usize).is_some_and(|adt| self.std_source_span(adt.span))
     }
+    /// The inner iterator type when `t` is one of the std source
+    /// collection iterator structs (`alloc::collections::{btree_map,
+    /// btree_set, vec_deque}` iterators, W-STD-C): each is a nominal
+    /// struct whose one field holds a builtin iterator, so check
+    /// types its adapter and consumer methods as the inner type's
+    /// and lowering unwraps field 0 (check/iter.rs, lower/iter.rs).
+    /// The types stay distinct from their inner types, as in Rust.
+    pub fn collection_iter_inner(&self, tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+        let a = tys.local_adt(t)?;
+        if !self.is_std_adt(a) {
+            return None;
+        }
+        let path = self.display_path(self.adt(a).name);
+        const WRAPPERS: &[&str] = &[
+            "alloc::collections::btree_map::Iter",
+            "alloc::collections::btree_map::IterMut",
+            "alloc::collections::btree_map::Keys",
+            "alloc::collections::btree_map::Values",
+            "alloc::collections::btree_map::ValuesMut",
+            "alloc::collections::btree_map::IntoIter",
+            "alloc::collections::btree_map::IntoKeys",
+            "alloc::collections::btree_map::IntoValues",
+            "alloc::collections::btree_set::Iter",
+            "alloc::collections::btree_set::IntoIter",
+            "alloc::collections::vec_deque::Iter",
+            "alloc::collections::vec_deque::IterMut",
+            "alloc::collections::vec_deque::IntoIter",
+        ];
+        if !WRAPPERS.contains(&path.as_str()) {
+            return None;
+        }
+        let field_ty = self.adt(a).variants.first()?.fields.first()?.ty;
+        // A materialized generic instance already carries substituted
+        // field types; a template application still names the struct's
+        // parameters, so instantiate the field at the wrapper type's
+        // own value arguments (as a struct literal does for a field).
+        let is_instance = self.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
+        if is_instance {
+            return Some(field_ty);
+        }
+        let (_, args) = tys.adt_parts(t)?;
+        let value_args: Vec<crate::ty::GenericArg> =
+            tys.args(args).iter().copied().filter(|g| !matches!(g, crate::ty::GenericArg::Lifetime(_))).collect();
+        Some(crate::ty::subst(tys, field_ty, &value_args))
+    }
     /// True when Adt `a` is std's `core::marker::PhantomData` (std
     /// source, W-STD-C): zero-sized, yet it acts as if it held its `T`
     /// for unused-parameter checks and auto traits.

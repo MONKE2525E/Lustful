@@ -118,6 +118,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return self.iter_source(e, rt, base, el, derefs, n, name_span, args);
         }
         if !it::is_iter(&self.tys, base) && !self.param_iter(base) {
+            // A std source collection iterator struct (its one field
+            // holds a builtin iterator): its `Iterator` methods type
+            // as the inner type's, and lowering unwraps field 0
+            // (collect.rs `collection_iter_inner`). Other method
+            // names fall through to normal resolution.
+            if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, base) {
+                let n = self.name(name);
+                if self.iter_method_known(n)
+                    || matches!(n, "next" | "nth" | "any" | "all" | "find" | "find_map" | "position")
+                    || DECLARED_ONLY.contains(&n)
+                {
+                    let n = n.to_string();
+                    return Some(self.iter_call(e, recv, inner, base, derefs, &n, name_span, args, turbofish, expected));
+                }
+            }
             // A user iterator type by value: wrapped once as `ByNext`,
             // which every adapter and consumer takes (W-STD-B).
             let n = self.name(name).to_string();
@@ -139,18 +154,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[base, item]);
             if borrowing {
-                return Some(self.iter_call(e, recv, wrapped, derefs, &n, name_span, args, turbofish, expected));
+                return Some(self.iter_call(e, recv, wrapped, wrapped, derefs, &n, name_span, args, turbofish, expected));
             }
             let i = self.ei(recv);
             self.out.coerce[i] = Coerce::ByNext(wrapped);
-            return Some(self.iter_call(e, recv, wrapped, 0, &n, name_span, args, turbofish, expected));
+            return Some(self.iter_call(e, recv, wrapped, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
         // `Chars` keeps its own `next` and `count` builtins.
         if self.tys.is_chars_ty(base) && (n == "next" || n == "count") {
             return None;
         }
-        Some(self.iter_call(e, recv, base, derefs, &n, name_span, args, turbofish, expected))
+        Some(self.iter_call(e, recv, base, base, derefs, &n, name_span, args, turbofish, expected))
     }
 
     /// The sort and binary-search family on a Vec, slice, or array
@@ -273,13 +288,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(ret)
     }
 
-    /// One method on a builtin iterator receiver.
+    /// One method on a builtin iterator receiver. `actual_base` is
+    /// the receiver's own type when it differs from the builtin
+    /// iterator `base` it wraps (a collection iterator struct): the
+    /// std collection `collect` target defers to a trait method
+    /// whose iterator argument keeps that type.
     #[allow(clippy::too_many_arguments)]
     fn iter_call(
         &mut self,
         e: ExprId,
         recv: ExprId,
         base: Ty,
+        actual_base: Ty,
         derefs: u8,
         n: &str,
         span: Span,
@@ -566,7 +586,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
                     self.obl.push_trait_at(trait_ref, span, 0);
                     let name = self.p.interner.intern("from_iter");
-                    super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(base)], derefs, Autoref::None);
+                    super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(actual_base)], derefs, Autoref::None);
                     return tr;
                 }
                 if !self.collect_target_ok(target, item, span) {
@@ -847,6 +867,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if it::is_iter(&self.tys, t) || self.param_iter(t) {
             return Some(t);
+        }
+        // A collection iterator struct chains as its inner iterator.
+        if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, t) {
+            return Some(inner);
         }
         if let Some(el) = self.tys.vec_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el]));
