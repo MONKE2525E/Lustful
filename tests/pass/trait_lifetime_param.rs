@@ -1,5 +1,4 @@
-// expect: L0203
-// Valid Rust: lifetime params on traits are not supported yet (W-BORROW).
+// A trait with a lifetime param, implemented for `'static`.
 trait Source<'a> {
     fn get(&self) -> &'a str;
 }

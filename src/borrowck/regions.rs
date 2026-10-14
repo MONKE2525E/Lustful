@@ -109,6 +109,32 @@ pub struct RegionSig {
     /// The `Fn*(A..) -> R` bounds on the type params of the fn, its impl,
     /// or its trait, with regions (see `FnBound`).
     pub fn_bounds: Vec<FnBound>,
+    /// The `T: Tr<'a, ..>` bounds on type params (the fn's, its impl's,
+    /// its trait's, and `impl Tr<'a>` arguments) for traits with lifetime
+    /// params, with the written lifetime args (see `TraitLts`).
+    pub trait_bounds: Vec<TraitLts>,
+}
+
+/// A bound `T: Tr<'a, ..>` on type param `param` for a trait with lifetime
+/// params: the lifetime args as written (`Region::Param` of the fn's
+/// universals, or `Region::Static`). A call of a `Tr` method through `T`
+/// instantiates the trait's lifetimes with them, and a call that binds
+/// `T` replays the selected impl's lifetimes against them.
+#[derive(Clone, Debug)]
+pub struct TraitLts {
+    pub param: u32,
+    pub trait_def: DefId,
+    pub lifetimes: Vec<Region>,
+}
+
+/// One impl of a trait with lifetime params (W-BORROW): its regioned Self
+/// type and the lifetime args of its trait ref, over the impl's lifetimes
+/// (`impl Tr<'static> for S`: `[Static]`; `impl<'d> Tr<'d> for S<'d>`:
+/// `[Param(0)]`, matched through Self).
+#[derive(Clone, Debug)]
+pub struct ImplHead {
+    pub self_ty: Ty,
+    pub trait_lifetimes: Vec<Region>,
 }
 
 /// A `F: Fn*(A..) -> R` bound on a type param, with regions: a lifetime
@@ -137,6 +163,8 @@ pub struct RegionTables {
     /// Regioned field types of each user Adt template, by def: per variant,
     /// per field, with the Adt's lifetime params as `Region::Param(i)`.
     pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
+    /// The headers of impls of traits with lifetime params, by impl def.
+    pub impl_heads: FxMap<DefId, ImplHead>,
     adts: std::sync::OnceLock<AdtTables>,
     /// The trait method of each trait method stub (the reverse of
     /// `GenTables::trait_method_stubs`), built on first use.
@@ -1491,6 +1519,10 @@ pub(super) struct Builder<'b, 'p, 'a> {
     closure_reqs: FxMap<DefId, Option<std::rc::Rc<Vec<(End, End)>>>>,
     /// The closures a call's `F: Fn*(..)` bounds linked (`link_bound_closure`).
     bound_linked: Vec<DefId>,
+    /// While a call of a trait method instantiates its signature: the vars
+    /// its first universals (the trait's lifetime params) take
+    /// (`trait_lifetime_seeds`); empty otherwise.
+    seed_univ: Vec<u32>,
     /// The closures `closure_created` has seen.
     created: FxMap<DefId, ()>,
     /// The last check of the fn whose closures `closure_reqs` lowers
@@ -1523,6 +1555,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             closure_args: FxMap::default(),
             closure_reqs: FxMap::default(),
             bound_linked: Vec::new(),
+            seed_univ: Vec::new(),
             created: FxMap::default(),
             root_check: None,
             bind_tys: FxMap::default(),
@@ -2289,7 +2322,10 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         match callee {
             Some((f, Callee::Sig(sig))) => {
                 self.bound_linked.clear();
-                if self.call_sig(f, sig, &avs, dt, &dv) {
+                self.seed_univ = self.trait_lifetime_seeds(f, &avs);
+                let ok = self.call_sig(f, sig, &avs, dt, &dv);
+                self.seed_univ.clear();
+                if ok {
                     // Closures no bound paired: like the opaque rule.
                     let linked = std::mem::take(&mut self.bound_linked);
                     self.link_closure_args(&avs, None, &linked);
@@ -3176,7 +3212,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         if params.len() != sig.params.len() || avs.len() != sig.params.len() {
             return false;
         }
-        let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
+        let mut univ: Vec<u32> = Vec::with_capacity(sig.n_univ as usize);
+        for k in 0..sig.n_univ as usize {
+            let v = match self.seed_univ.get(k) {
+                Some(&v) => v,
+                None => self.fresh(),
+            };
+            univ.push(v);
+        }
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         self.bind_tys.clear();
         let mut ok = true;
@@ -3202,6 +3245,24 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         for &(a, b) in &sig.facts {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
             self.edge(x, y);
+        }
+        // `T: Tr<'a>` for a trait with lifetime params: the type bound to
+        // `T` implements `Tr` with exactly those lifetimes (trait args are
+        // invariant), so its own (this body's bound on a type param, or the
+        // selected impl's header) equal the call's `'a`; unknown ones are
+        // `'static`, never free.
+        for b in &sig.trait_bounds {
+            let n = b.lifetimes.len();
+            let want: Vec<u32> = b.lifetimes.iter().map(|&r| self.inst_region(r, &univ)).collect();
+            let have = match (self.bind_tys.get(&b.param).copied(), binds.get(&b.param).cloned()) {
+                (Some(t), Some(vs)) => self.trait_lts_for(b.trait_def, t, &vs, n),
+                _ => None,
+            }
+            .unwrap_or_else(|| vec![0; n]);
+            for (x, y) in want.into_iter().zip(have) {
+                self.edge(x, y);
+                self.edge(y, x);
+            }
         }
         for pred in preds {
             if let Predicate::TypeOutlives(t, Region::Static) = pred
@@ -3242,6 +3303,142 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             }
         }
         ok
+    }
+
+    /// The vars a call takes for the lifetime params of the callee's trait
+    /// (its universals `0..n`) when `f` is a method of a trait with
+    /// lifetime params (a stub, or a default body and its instances):
+    /// those of the receiver's type (`trait_lts_for`), else `'static`. Never
+    /// fresh: a fresh trait lifetime would let the callee take a borrow for
+    /// less than the trait promises. Empty for any other callee.
+    fn trait_lifetime_seeds(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<u32> {
+        let p = self.p;
+        let trait_method = |g: LocalDefId| p.fn_defs.get(g.0 as usize).copied().filter(|d| p.regions.trait_methods.contains_key(d));
+        let Some(m) = p
+            .regions
+            .stub_method(p, f)
+            .or_else(|| trait_method(f))
+            .or_else(|| trait_method(p.gx.instances.get(&f)?.template_local?))
+        else {
+            return Vec::new();
+        };
+        let Some(trait_def) = p.gx.index.trait_of_method(m) else { return Vec::new() };
+        let n = p.gx.adt_lifetimes.get(&trait_def).map_or(0, |v| v.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        let has_self = p.gx.trait_methods.get(&m).is_some_and(|t| t.self_kind.is_some());
+        if has_self && let Some((rt, rv)) = avs.first() {
+            let (mut t, mut skip) = (*rt, 0usize);
+            while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+                t = inner;
+                skip += 1;
+            }
+            let vars: Vec<u32> = rv.iter().skip(skip).copied().collect();
+            if let Some(seeds) = self.trait_lts_for(trait_def, t, &vars, n) {
+                return seeds;
+            }
+        }
+        vec![0; n]
+    }
+
+    /// The vars of the `n` lifetime params of `trait_def` that Self type `t`
+    /// (erased, slot vars `vars`) implements it with: through this body's
+    /// bound on a type param (`Self` in the trait's own default body: the
+    /// trait's lifetimes), or through the one impl whose header matches
+    /// (`impl Tr<'static> for S`: `'static`; `impl<'d> Tr<'d> for S<'d>`:
+    /// `S`'s region; a lifetime the Self type does not name is free).
+    /// None when neither tells, or when the impl has where-clauses that
+    /// would need a replay of their own.
+    fn trait_lts_for(&mut self, trait_def: DefId, t: Ty, vars: &[u32], n: usize) -> Option<Vec<u32>> {
+        let p = self.p;
+        if self.own.closure {
+            return None;
+        }
+        if let TyKind::Param(j) = self.body.tys.kind(t) {
+            let sig = p.regions.body_sig(p, self.body.fn_id)?;
+            if let Some(b) = sig.trait_bounds.iter().find(|b| b.param == j.0 && b.trait_def == trait_def) {
+                return Some(b.lifetimes.iter().map(|&r| if let Region::Param(k) = r { k + 1 } else { 0 }).collect());
+            }
+            let own_trait = p.fn_defs.get(self.body.fn_id.0 as usize).and_then(|&d| p.gx.index.trait_of_method(d));
+            if j.0 == 0 && own_trait == Some(trait_def) && sig.n_univ as usize >= n {
+                return Some((1..=n as u32).collect());
+            }
+            return None;
+        }
+        let mut found: Option<Vec<u32>> = None;
+        for &id in p.gx.index.impls_of_trait(trait_def) {
+            let rec = p.gx.index.get(id);
+            let Some(pat) = p.tys.args(rec.trait_ref.args).first().and_then(|g| g.as_ty()) else { continue };
+            let mut parts: FxMap<u32, Vec<u32>> = FxMap::default();
+            if !self.match_impl_self(pat, t, vars, &mut 0, &mut parts) {
+                continue;
+            }
+            let head = p.regions.impl_heads.get(&rec.def)?;
+            if found.is_some() || !rec.generics.predicates.iter().all(|pr| !self.lifetime_trait_pred(pr)) {
+                return None;
+            }
+            let mut lts: FxMap<u32, u32> = FxMap::default();
+            self.match_impl_lifetimes(head.self_ty, t, vars, &mut 0, &mut lts);
+            let mut out = Vec::with_capacity(n);
+            for &r in &head.trait_lifetimes {
+                let v = match r {
+                    Region::Param(m) => match lts.get(&m) {
+                        Some(&v) => v,
+                        None => self.fresh(),
+                    },
+                    _ => 0,
+                };
+                out.push(v);
+            }
+            found = Some(out);
+        }
+        found.filter(|v| v.len() == n)
+    }
+
+    /// True for a predicate on a trait with lifetime params.
+    fn lifetime_trait_pred(&self, pr: &Predicate) -> bool {
+        matches!(pr, Predicate::Trait(b) if self.p.gx.adt_lifetimes.get(&b.value.def).is_some_and(|v| !v.is_empty()))
+    }
+
+    /// Matches an impl's regioned Self type against an erased type whose
+    /// slots are `vars` from `*at`, collecting the var of each impl
+    /// lifetime param it names (`Region::Param(k)`).
+    fn match_impl_lifetimes(&mut self, pat: Ty, actual: Ty, vars: &[u32], at: &mut usize, out: &mut FxMap<u32, u32>) {
+        let tys = &self.body.tys;
+        match (tys.kind(pat), tys.kind(actual)) {
+            (TyKind::Ref(r, pm, pi), TyKind::Ref(_, am, ai)) if pm == am => {
+                if let (Region::Param(k), Some(&v)) = (r, vars.get(*at)) {
+                    out.entry(k).or_insert(v);
+                }
+                *at += 1;
+                self.match_impl_lifetimes(pi, ai, vars, at, out);
+            }
+            (TyKind::Adt(pd, pa), TyKind::Adt(ad, aa)) if pd == ad => {
+                let lts: Vec<Region> = tys.args(pa).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let n = adt_regions(self.p, tys, actual) as usize;
+                for (i, r) in lts.into_iter().enumerate().take(n) {
+                    if let (Region::Param(k), Some(&v)) = (r, vars.get(*at + i)) {
+                        out.entry(k).or_insert(v);
+                    }
+                }
+                *at += n;
+                let (xs, ys): (Vec<Ty>, Vec<Ty>) =
+                    (tys.args(pa).iter().filter_map(|g| g.as_ty()).collect(), tys.args(aa).iter().filter_map(|g| g.as_ty()).collect());
+                for (x, y) in xs.into_iter().zip(ys) {
+                    self.match_impl_lifetimes(x, y, vars, at, out);
+                }
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                for (x, y) in tys.tys_of(a).to_vec().into_iter().zip(tys.tys_of(b).to_vec()) {
+                    self.match_impl_lifetimes(x, y, vars, at, out);
+                }
+            }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+                self.match_impl_lifetimes(a, b, vars, at, out)
+            }
+            _ => *at += self.sc.slots(actual) as usize,
+        }
     }
 
     /// A call through the `Fn*` bound of a type param of this body
@@ -4044,7 +4241,13 @@ pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
     }
     let nt = tsig.n_univ as usize;
     let n = 1 + nt + own.n_univ as usize;
-    let mut cx = Contract { p, nt, edges: Vec::new() };
+    // A trait's own lifetime params (the trait method's first universals)
+    // are what the impl header gives them: `'static` (`impl Tr<'static>`),
+    // or the impl's lifetime passed for them (`impl<'d> Tr<'d>`), which
+    // stays a placeholder of the contract.
+    let impl_def = p.fn_defs.get(f.0 as usize).and_then(|&d| p.defs.get(d)).and_then(|d| d.parent);
+    let trait_lts = impl_def.and_then(|d| p.regions.impl_heads.get(&d)).map(|h| h.trait_lifetimes.clone()).unwrap_or_default();
+    let mut cx = Contract { p, nt, trait_lts, edges: Vec::new() };
     for (&t, &i) in tsig.params.iter().zip(&own.params) {
         cx.walk(t, i, Variance::Co, true);
     }
@@ -4124,6 +4327,8 @@ struct Contract<'p, 'a> {
     /// Trait universal count: node 0 is `'static`, `1..=nt` the trait's,
     /// the impl's after them.
     nt: usize,
+    /// The impl-side region of each of the trait's own lifetime params.
+    trait_lts: Vec<Region>,
     edges: Vec<(usize, usize)>,
 }
 
@@ -4132,7 +4337,12 @@ impl Contract<'_, '_> {
     fn node(&self, r: Region, trait_side: bool) -> Option<usize> {
         match r {
             Region::Static => Some(0),
+            // A trait lifetime the header fixes to `'static` is `'static`.
+            Region::Param(k) if trait_side && self.trait_lts.get(k as usize) == Some(&Region::Static) => Some(0),
             Region::Param(k) if trait_side => Some(1 + k as usize),
+            // An impl lifetime the header passes as the trait's `k`-th
+            // lifetime is that one, a placeholder of the contract.
+            Region::Param(m) if let Some(k) = self.trait_lts.iter().position(|&x| x == Region::Param(m)) => Some(1 + k),
             Region::Param(k) => Some(1 + self.nt + k as usize),
             _ => None,
         }

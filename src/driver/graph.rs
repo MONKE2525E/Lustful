@@ -743,6 +743,14 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
         }
         b.output.is_some().hash(h);
     }
+    (rs.trait_bounds.len() as u64).hash(h);
+    for b in &rs.trait_bounds {
+        b.param.hash(h);
+        hash_def_pub(h, p, b.trait_def);
+        for &r in &b.lifetimes {
+            hash_region(h, r);
+        }
+    }
 }
 
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved
@@ -864,6 +872,15 @@ fn impl_content(p: &Program, def: DefId) -> u64 {
     let mut h = FxHasher::default();
     "impl-content-v1".hash(&mut h);
     hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
+    // A header's regions for a trait with lifetime params (W-BORROW):
+    // callers' borrow checks replay them.
+    if let Some(head) = p.regions.impl_heads.get(&def) {
+        let mut seen = Vec::new();
+        hash_regions_deep(&mut h, p, head.self_ty, &mut seen);
+        for &r in &head.trait_lifetimes {
+            hash_region(&mut h, r);
+        }
+    }
     hash_generics(&mut h, p, &rec.generics);
     (rec.assoc_tys.len() as u64).hash(&mut h);
     for (d, t) in &rec.assoc_tys {

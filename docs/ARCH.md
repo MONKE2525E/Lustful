@@ -2970,6 +2970,26 @@ relation check (rustc checks the template; the instance
 sees through type params where the call rules are
 coarser).
 
+Traits may have lifetime params: they are the first
+universals of the trait's methods (and default bodies). A
+bound `T: Tr<'a>` keeps its lifetime args
+(`RegionSig::trait_bounds`; also on an impl's or trait's
+params and `impl Tr<'a>` arguments), an impl header its own
+(`RegionTables::impl_heads`: `impl Tr<'static> for S`, or
+`impl<'d> Tr<'d> for S<'d>` matched through Self). A call of
+a trait method instantiates the trait's lifetimes from the
+receiver's type: this body's bound on a type param (`Self`
+in the trait's own default body: the trait's lifetimes), or
+the one impl whose header matches a concrete type (an impl
+lifetime the Self type does not name is free), else
+`'static`, never fresh. A generic call that binds `T`
+equates the bound's lifetimes with the bound type's (trait
+args are invariant): `impl Mark<'static> for S` makes `S:
+Mark<'a>` force `'a: 'static` (Sol review P0.5). An impl
+whose own where-clauses name such a trait answers `'static`.
+The impl contract (L0734) reads a trait lifetime as the
+impl header's region.
+
 Signature-level checks: an impl method must keep its trait
 method's region contract (L0734: it may promise a
 `'static` result where the trait borrows, never less, and
@@ -3025,8 +3045,11 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   `let` annotation's regions are kept: the binding's slots
   equal `'static` or the fn's named lifetime); lifetimes in
   fn pointer types; lifetimes in a dyn type's trait args;
-  lifetime params on traits; `T: 'a` bounds on named
-  lifetimes and `'a: 'static`.
+  an elided (`'_` or missing) lifetime arg of a trait,
+  lifetime args in a trait's own bounds (supertraits,
+  `Self` where-clauses), and associated types in a trait
+  with lifetime params; `T: 'a` bounds on named lifetimes
+  and `'a: 'static`.
 - L0731: any explicit lifetime turbofish arg (rustc also
   rejects it whenever the fn has a late-bound lifetime,
   E0794).

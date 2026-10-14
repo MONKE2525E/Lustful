@@ -1354,6 +1354,14 @@ fn resolve_trait_path_args(
 ) -> Result<TraitRef, Diag> {
     let rec = cx.index.trait_record(trait_def);
     let n_inputs = rec.map_or(0, |r| r.generics.params.len().saturating_sub(1));
+    if matches!(seg.args, GenericArgs::None) && cx.adt_lifetimes.get(&trait_def).is_some_and(|v| !v.is_empty()) {
+        return Err(Diag::new(
+            "L0203",
+            span,
+            "an elided lifetime argument of a trait is not supported yet",
+            "Write the trait's lifetime arguments, for example `Tr<'a>` or `Tr<'static>`.",
+        ));
+    }
     let (input_args, bindings): (Vec<GenericArg>, Vec<(DefId, GenericArg)>) = match &seg.args {
         GenericArgs::None => (Vec::new(), Vec::new()),
         GenericArgs::Parenthesized { inputs, output } => {
@@ -1385,11 +1393,39 @@ fn resolve_trait_path_args(
         GenericArgs::Angle(args) => {
             let mut inputs: Vec<GenericArg> = Vec::new();
             let mut bindings: Vec<(DefId, GenericArg)> = Vec::new();
+            // A trait's lifetime params (W-BORROW): all written, or none
+            // (an elided trait lifetime is a stated cut below).
+            let n_lts = cx.adt_lifetimes.get(&trait_def).map_or(0, |v| v.len());
+            let given = args.iter().filter(|a| matches!(a, AstArg::Lifetime(_))).count();
+            if given != 0 && given != n_lts {
+                return Err(Diag::new(
+                    "L0110",
+                    span,
+                    format!("trait takes {n_lts} lifetime argument(s), but {given} were given"),
+                    "Match the trait definition's lifetime parameters.",
+                ));
+            }
+            if given == 0 && n_lts != 0 {
+                return Err(Diag::new(
+                    "L0203",
+                    span,
+                    "an elided lifetime argument of a trait is not supported yet",
+                    "Write the trait's lifetime arguments, for example `Tr<'a>` or `Tr<'static>`.",
+                ));
+            }
             for a in args {
                 match a {
                     AstArg::Type(t) => inputs.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?)),
                     AstArg::Lifetime(lt) => {
                         check_lifetime(interner, scope, *lt)?;
+                        if interner.get(lt.name) == "_" {
+                            return Err(Diag::new(
+                                "L0203",
+                                lt.span,
+                                "an elided lifetime argument of a trait is not supported yet",
+                                "Write a named lifetime or `'static`.",
+                            ));
+                        }
                     }
                     AstArg::Const(e) => inputs.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?)),
                     AstArg::Binding { name, span: bspan, kind } => {
@@ -2593,6 +2629,14 @@ fn build_generics_owned(
     (Generics { parent: None, params, predicates }, scope)
 }
 
+/// The span of the first lifetime argument a trait ref writes, if any.
+fn trait_ref_lifetime_span(tref: &ast::TraitRefExpr) -> Option<Span> {
+    tref.path.iter().find_map(|seg| match &seg.args {
+        GenericArgs::Angle(a) => a.iter().find_map(|g| if let AstArg::Lifetime(lt) = g { Some(lt.span) } else { None }),
+        _ => None,
+    })
+}
+
 /// A trait's generics: the synthetic `Self` parameter at index 0,
 /// then the written parameters. The returned scope resolves the
 /// trait's own items (its `Self` type is `Param(0)` and its assoc
@@ -2614,15 +2658,23 @@ pub fn build_trait_generics(
     // `Self` resolves in the trait's own bounds and `where` clauses
     // (`trait T where Self: Sized`), so the seed scope names it.
     let seed = Scope { self_ty: Some(self_ty), ..Scope::default() };
-    // Lifetime params on a trait would need region-aware trait refs and
-    // impl selection (W-BORROW, Sol review P0.5); not supported yet.
-    for p in &g.params {
-        if let ast::GenericParam::Lifetime { lt, .. } = p {
+    // Lifetime params are the trait's own regions (W-BORROW): its methods'
+    // universals `0..n`, instantiated by a bound's or an impl header's
+    // lifetime args. A supertrait or a `Self` where-clause naming a
+    // lifetime would need its own region replay at every impl (Sol review
+    // P0.5), so a lifetime arg in the trait's own bounds is a stated cut.
+    for b in supertraits.iter().chain(w.preds.iter().flat_map(|p| match p {
+        ast::WherePred::Type { bounds, .. } => bounds.as_slice(),
+        _ => &[],
+    })) {
+        if let TraitBound::Trait { trait_ref, .. } = b
+            && let Some(lt_span) = trait_ref_lifetime_span(trait_ref)
+        {
             errs.push(Diag::new(
                 "L0203",
-                lt.span,
-                "lifetime parameters on traits are not supported yet",
-                "Put the lifetime on the methods that need it, or on the types the trait is implemented for.",
+                lt_span,
+                "lifetime arguments in a trait's own bounds are not supported yet",
+                "Move the bound onto the methods or impls that need it.",
             ));
         }
     }
@@ -3083,6 +3135,27 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
             continue;
         }
         p.gx.trait_names.insert(tdef.name, def);
+        // Its lifetime params by name (W-BORROW, keyed by the trait's def
+        // in the Adts' table): trait refs check their arity against them.
+        let lts: Vec<Sym> = tdef
+            .generics
+            .params
+            .iter()
+            .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.name) } else { None })
+            .collect();
+        if !lts.is_empty() {
+            p.gx.adt_lifetimes.insert(def, lts);
+            // A projection through such a trait would carry the trait's
+            // regions in a type that has no slots for them: a stated cut.
+            if let Some(at) = tdef.types.first() {
+                errs.push(Diag::new(
+                    "L0203",
+                    at.name_span,
+                    "associated types in a trait with lifetime parameters are not supported yet",
+                    "Move the lifetime to the methods, or make the type a generic parameter of the trait.",
+                ));
+            }
+        }
         // Associated items: types live in the type namespace, consts and
         // methods in the value namespace. A second item of one name in one
         // namespace is a duplicate (rustc E0428) and joins no record.
@@ -3526,7 +3599,112 @@ fn region_sig(
         .map(|i| scope.region_facts.iter().any(|&(a, b)| a == i || b == i) || !in_inputs.contains(&Region::Param(i)))
         .collect();
     let fn_bounds = fn_bounds_of(ast, interner, known, tys, cx, scope, &def.generics, &def.where_clause);
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds })
+    let mut trait_bounds = trait_lts_of(ast, interner, known, cx, scope, &def.generics, &def.where_clause);
+    for (i, param) in def.params.iter().enumerate() {
+        if let Some(&erased) = params.get(skip + i) {
+            impl_trait_lts(ast, interner, known, tys, cx, scope, param.ty, erased, &mut trait_bounds);
+        }
+    }
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds })
+}
+
+/// The lifetime args of one written trait ref, for a trait with lifetime
+/// params, resolved with regions kept in `scope` (`Region::Param` of its
+/// lifetimes, or `'static`). None for a trait without lifetimes or a ref
+/// that does not resolve (the erased pass reports why).
+fn trait_ref_lts(interner: &Interner, known: &Known, cx: &ResolveCx, scope: &Scope, tref: &ast::TraitRefExpr) -> Option<(DefId, Vec<Region>)> {
+    let trait_def = trait_def_of_path(cx, interner, known, &tref.path, Span::default()).ok()?;
+    let n = cx.adt_lifetimes.get(&trait_def).map_or(0, |v| v.len());
+    if n == 0 {
+        return None;
+    }
+    let mut ks = scope.clone();
+    ks.regions = RegionMode::Keep { next: None, elided: None };
+    let GenericArgs::Angle(args) = &tref.path.last()?.args else { return None };
+    let mut lts = Vec::with_capacity(n);
+    for a in args {
+        if let AstArg::Lifetime(lt) = a {
+            lts.push(scope_region(interner, &ks, Some(*lt), lt.span).ok()?);
+        }
+    }
+    (lts.len() == n).then_some((trait_def, lts))
+}
+
+/// The `T: Tr<'a, ..>` bounds that a generics list and its where clause
+/// put on type params of `scope`, for traits with lifetime params
+/// (W-BORROW, `RegionSig::trait_bounds`). A method also takes its impl's
+/// or trait's.
+pub fn trait_lts_of(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    scope: &Scope,
+    generics: &ast::Generics,
+    where_clause: &ast::WhereClause,
+) -> Vec<crate::borrowck::TraitLts> {
+    let type_param = |t: ast::TyId| match ast.ty(t) {
+        TyExpr::Path(segs) if segs.len() == 1 && matches!(segs[0].args, ast::GenericArgs::None) => {
+            scope.type_params.iter().find(|&&(n, _)| n == segs[0].name).map(|&(_, j)| j)
+        }
+        _ => None,
+    };
+    let mut bounded: Vec<(u32, &[TraitBound])> = Vec::new();
+    for gp in &generics.params {
+        if let ast::GenericParam::Type { name, bounds, .. } = gp
+            && let Some(&(_, j)) = scope.type_params.iter().find(|&&(n, _)| n == *name)
+        {
+            bounded.push((j, bounds));
+        }
+    }
+    for pred in &where_clause.preds {
+        if let ast::WherePred::Type { ty, bounds, .. } = pred
+            && let Some(j) = type_param(*ty)
+        {
+            bounded.push((j, bounds));
+        }
+    }
+    let mut out = Vec::new();
+    for (j, bounds) in bounded {
+        for b in bounds {
+            if let TraitBound::Trait { trait_ref, .. } = b
+                && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
+            {
+                out.push(crate::borrowck::TraitLts { param: j, trait_def, lifetimes });
+            }
+        }
+    }
+    out
+}
+
+/// The `impl Tr<'a>` argument types in a written param type (`w: &mut impl
+/// Tr<'d>`), each with the synthetic type param its erased form names.
+#[allow(clippy::too_many_arguments)]
+fn impl_trait_lts(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &impl TyIntern,
+    cx: &ResolveCx,
+    scope: &Scope,
+    t: ast::TyId,
+    erased: Ty,
+    out: &mut Vec<crate::borrowck::TraitLts>,
+) {
+    match (ast.ty(t), tys.kind(erased)) {
+        (TyExpr::ImplTrait { bounds }, TyKind::Param(j)) => {
+            for b in bounds {
+                if let TraitBound::Trait { trait_ref, .. } = b
+                    && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
+                {
+                    out.push(crate::borrowck::TraitLts { param: j.0, trait_def, lifetimes });
+                }
+            }
+        }
+        (TyExpr::Ref { inner, .. }, TyKind::Ref(_, _, ei)) => impl_trait_lts(ast, interner, known, tys, cx, scope, *inner, ei, out),
+        (TyExpr::Paren(inner), _) => impl_trait_lts(ast, interner, known, tys, cx, scope, *inner, erased, out),
+        _ => {}
+    }
 }
 
 /// The `F: Fn*(A..) -> R` bounds that a generics list and its where
@@ -3789,11 +3967,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 resolve_fn_sig(p.ast, p.interner, p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
             };
             if let Some(mut rs) = region_sig {
-                // `F: Fn*` bounds on the trait's own type params too (W-BORROW).
+                // `F: Fn*` and `T: Tr<'a>` bounds on the trait's own type
+                // params too (W-BORROW).
                 let ast = p.ast;
                 if let ast::ItemKind::Trait(tdef) = &ast.items[item_i].kind {
                     let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                     rs.fn_bounds.extend(fn_bounds_of(ast, p.interner, p.known, &mut p.tys, &cx, &mscope, &tdef.generics, &tdef.where_clause));
+                    rs.trait_bounds.extend(trait_lts_of(ast, p.interner, p.known, &cx, &mscope, &tdef.generics, &tdef.where_clause));
                 }
                 p.regions.trait_methods.insert(method_def, rs);
             }

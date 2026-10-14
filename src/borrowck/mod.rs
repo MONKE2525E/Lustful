@@ -14,7 +14,7 @@
 // 5. Each access is checked against the in-scope loans it conflicts with, and region
 //    relations the signature does not give are L0733.
 mod regions;
-pub use regions::{FnBound, RegionSig, RegionTables, impl_trait_method, regions_of};
+pub use regions::{FnBound, ImplHead, RegionSig, RegionTables, TraitLts, impl_trait_method, regions_of};
 
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};

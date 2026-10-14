@@ -402,7 +402,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
 /// param of the impl; a lifetime hidden in a path (`impl S` for
 /// `struct S<'a>`) is rustc E0726. A named impl lifetime that only an
 /// associated type uses is unconstrained (rustc E0207).
-fn impl_regions(p: &mut Program, imp: &ast::ImplDef, scope: &mut generics::Scope, errs: &mut Vec<Diag>) {
+fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mut generics::Scope, errs: &mut Vec<Diag>) {
     let (ast, interner, known) = (p.ast, p.interner, p.known);
     if let Some(span) = hidden_lifetime(p, imp.self_ty) {
         errs.push(Diag::new(
@@ -424,6 +424,25 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, scope: &mut generics::Scope
             Err(_) => return,
         }
     };
+    // The trait ref's lifetime args, for a trait with lifetime params
+    // (W-BORROW): calls through the impl and trait selection replay them.
+    let mut trait_lts: Vec<Region> = Vec::new();
+    if let Some(tref) = &imp.trait_ref
+        && let Some(seg) = tref.path.last()
+        && let ast::GenericArgs::Angle(args) = &seg.args
+    {
+        for g in args {
+            if let ast::GenericArg::Lifetime(lt) = g {
+                match generics::scope_region(interner, &ks, Some(*lt), lt.span) {
+                    Ok(r) => trait_lts.push(r),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+    if !trait_lts.is_empty() {
+        p.regions.impl_heads.insert(impl_def, crate::borrowck::ImplHead { self_ty: self_r, trait_lifetimes: trait_lts.clone() });
+    }
     // The header's anonymous lifetimes join the impl's params, so the
     // methods' own lifetimes number after them.
     let total = counter.load(std::sync::atomic::Ordering::Relaxed);
@@ -434,7 +453,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, scope: &mut generics::Scope
     ks.lifetimes = scope.lifetimes.clone();
     ks.regions = generics::RegionMode::Keep { next: None, elided: None };
     ks.self_ty_regioned = Some(self_r);
-    let mut in_header: Vec<Region> = Vec::new();
+    let mut in_header: Vec<Region> = trait_lts;
     crate::borrowck::regions_of(&p.tys, self_r, &mut in_header);
     if let Some(tref) = &imp.trait_ref {
         for seg in &tref.path {
@@ -2508,6 +2527,7 @@ pub fn collect_reuse<'a>(
             if let Some((g, w)) = parent_gen.ast_generics {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
+                rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
             }
             p.regions.fns.insert(id, rs);
         }
@@ -2656,7 +2676,7 @@ pub fn collect_reuse<'a>(
                 // already collected.
                 let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
-                impl_regions(&mut p, imp, &mut impl_scope, &mut errs);
+                impl_regions(&mut p, imp, impl_def, &mut impl_scope, &mut errs);
                 // The owner template Adt, when the Self pattern is a
                 // local Adt application (inherent and trait impls).
                 let owner: Option<AdtId> = match p.tys.kind(self_pat) {
