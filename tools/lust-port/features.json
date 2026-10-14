@@ -145,14 +145,14 @@
   {
    "id": "traits.impl_trait_arg",
    "title": "impl Trait in argument position",
-   "status": "partial",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "0",
    "root_cause": "traits-generics",
    "fix_class": "mechanical",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_arg.rs passes (impl Display used by format). _b and _c fail: a method call on an impl Iterator arg (L0104) and impl Into<String> from &str (L0612, From solving). The rewrite to a named type parameter stays release-safe.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_arg.rs, _b, _c, and _d pass (fx-impl-arg): impl Display, Iterator adapters and consumers on an impl Iterator arg, impl Into<String> from &str/String/&String/char (std From impls for String, Box, Rc, and From<T> for T), and impl Trait inside an item binding (impl IntoIterator<Item = impl Into<String>>). Gaps (rejects): a user Iterator type passed to an impl Iterator arg that runs adapters (needs the unfused path), ExactSizeIterator<Item = ..> bindings, Into::into as a fn value, Rc<T> from Box<T>, Into<Arc<str>>.",
    "primary_keys": [
     "type.impl_trait.arg"
    ],
@@ -708,7 +708,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs passes (W-CHECK-G3): callers check in an opaque view (bounds, auto-trait leakage) and a revealed check that replays its picks. Gaps (rejects): Iterator provided methods on an impl Iterator value (as on a type param, L0104); impl Trait in traits; generic callers (template borrowck, L0602); a hidden type that is Copy where the bounds are not (L0602). Argument position is traits.impl_trait_arg.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs passes (W-CHECK-G3): callers check in an opaque view (bounds, auto-trait leakage) and a revealed check that replays its picks. Iterator adapters and consumers on an impl Iterator value work (fx-impl-arg). Gaps (rejects): impl Trait in traits; generic callers (template borrowck, L0602); a hidden type that is Copy where the bounds are not (L0602). Argument position is traits.impl_trait_arg.",
    "primary_keys": [
     "type.impl_trait.ret",
     "type.impl_trait.other"
