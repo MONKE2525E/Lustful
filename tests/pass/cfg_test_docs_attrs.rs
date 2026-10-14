@@ -5,6 +5,11 @@ fn main() {
     println!("ok");
 }
 
+#[cfg(test)]
+extern "C" fn top_ffi<T, U>(a: (T, U)) -> Result<(), u8> {
+    Ok(())
+}
+
 #[doc = "outer"]
 #[::tool_attr]
 #[unsafe(no_mangle)]
@@ -80,7 +85,24 @@ mod tests {
             _ => {}
         }
         assert_eq!(v.len(), 3, "msg {}", 1);
+        /// Doc and attributes on expressions.
+        #[allow(unused)]
+        x + 1;
+        let y = #[allow(unused)] 1;
+        foo(#[a] 1, #[b] 2);
+        // A `{}` macro call ends its statement.
+        my_macro! { anything ;; }
+        [1, 2];
+        my_macro! {}
+        |a: i32| a * 2;
+        my_macro! {}
+        &raw const x;
+        let z = my_macro! {}.len();
     }
+
+    /// A disabled `extern "C"` fn with commas in its generics and return type.
+    #[cfg_attr(miri, ignore)]
+    extern "C" fn ffi<T, U>() -> Result<(), Box<dyn std::error::Error>> {}
 
     /// Doc on a macro.
     macro_rules! m {

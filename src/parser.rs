@@ -1044,6 +1044,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True at a macro call whose group is a `{}` (`m! {..}`, or
+    /// `macro_rules! name {..}`). In statement position rustc ends the
+    /// statement at its `}`, unless a `.` or `?` follows.
+    fn at_brace_macro_call(&self) -> bool {
+        if !self.at_path_macro_call() {
+            return false;
+        }
+        let mut j = self.pos;
+        while self.toks.get(j).map(|t| t.tok) != Some(Tok::Bang) {
+            j += 1;
+        }
+        match self.toks.get(j + 1).map(|t| t.tok) {
+            Some(Tok::LBrace) => true,
+            Some(Tok::Ident(_)) => self.toks.get(j + 2).map(|t| t.tok) == Some(Tok::LBrace),
+            _ => false,
+        }
+    }
+
     /// Parses visibility: `pub`, `pub(crate)`, `pub(self)`, `pub(super)`, or
     /// `pub(in path)`; the restricted path holds the path's segments.
     fn vis(&mut self) -> PResult<Vis> {
@@ -3388,13 +3406,20 @@ impl<'a> Parser<'a> {
             // An inline `const { .. }` block is block-like too: as a
             // statement it needs no `;` and ends at its `}` (rustc).
             let const_block = self.peek() == Tok::Const && self.peek_at(1) == Tok::LBrace;
-            let block_like =
-                labeled || const_block || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
+            // A cfg syntax check reads `m! {..}` as rustc does: a whole
+            // statement, so `m! {} [1]` is two statements, not an index.
+            let brace_mac = self.cfg_syntax && self.at_brace_macro_call();
+            let block_like = labeled
+                || const_block
+                || brace_mac
+                || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
             // A statement (or block tail) block may carry inner attributes.
             self.block_inner_ok = true;
             let expr = if block_like {
                 let e = if labeled {
                     self.expr()?
+                } else if brace_mac {
+                    self.primary(false, false)?
                 } else if const_block {
                     let start = self.span();
                     self.bump();
@@ -3423,7 +3448,9 @@ impl<'a> Parser<'a> {
             // Attributes on an expression statement are stable only for
             // expression kinds with no trailing operator: rustc rejects
             // them on assignments, binary operations, casts, and ranges.
-            if !stmt_attrs.attrs.is_empty()
+            // Disabled code is stripped before that check, so it is exempt.
+            if !self.cfg_syntax
+                && !stmt_attrs.attrs.is_empty()
                 && matches!(
                     self.ast.expr(expr),
                     Expr::Binary { .. } | Expr::Cast { .. } | Expr::Assign { .. } | Expr::AssignOp { .. } | Expr::Range { .. }
@@ -4021,6 +4048,12 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix_inner(&mut self, no_struct: bool, inner_ok: bool) -> PResult<ExprId> {
+        // Outer attributes on any expression are grammar in rustc (the
+        // feature gate runs after cfg stripping), so a cfg syntax check
+        // reads them and goes on to the expression.
+        if self.cfg_syntax && self.peek() == Tok::Pound && self.peek_at(1) == Tok::LBracket {
+            self.part_attributes()?;
+        }
         let start = self.span();
         let e = match self.peek() {
             Tok::Minus => {

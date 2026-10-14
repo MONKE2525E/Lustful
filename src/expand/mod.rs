@@ -2180,6 +2180,8 @@ fn starts_item(trees: &[Tt], interner: &Interner) -> bool {
                 i += 1;
             }
             Some(Tok::Async | Tok::Unsafe | Tok::Extern) => i += 1,
+            // The ABI string of `extern "C" fn`.
+            Some(Tok::Str(..)) if i > 0 && tok_at(trees, i - 1).map(|t| t.tok) == Some(Tok::Extern) => i += 1,
             Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Mod | Tok::Trait | Tok::Type | Tok::Static | Tok::Use) => {
                 return true;
             }
